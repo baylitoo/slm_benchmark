@@ -31,25 +31,58 @@ HTML_TEMPLATE = Template(
   <h2>Summary</h2>
   <table>
     <thead><tr>
-      <th>Model profile</th><th>Docs</th><th>Concurrency</th>
+      <th>Model profile</th><th>Input path</th><th>Docs</th><th>Concurrency</th>
       <th>Wall time</th><th>Throughput (docs/min)</th>
       <th>Valid JSON</th><th>Field accuracy</th>
+      <th>Evidence coverage</th><th>Hallucination rate</th>
+      <th>Judge faithfulness</th><th>Judge completeness</th>
       <th>Avg ms</th><th>p50 ms</th><th>p95 ms</th>
     </tr></thead>
     <tbody>
     {% for row in summary %}
       <tr>
         <td>{{ row.model_profile }}</td>
+        <td>{{ row.ingestion_path }}</td>
         <td>{{ row.docs }}</td>
         <td>{{ row.concurrency }}</td>
         <td>{{ row.wall_seconds }}s</td>
         <td>{{ '%.2f'|format(row.throughput_docs_per_min) if row.throughput_docs_per_min is not none else '—' }}</td>
         <td>{{ '%.1f'|format(row.valid_rate * 100) }}%</td>
         <td>{{ '%.1f'|format(row.field_accuracy * 100 if row.field_accuracy is not none else 0) }}%</td>
+        <td>
+          {{ '%.1f'|format(row.evidence_coverage * 100 if row.evidence_coverage is not none else 0) }}%
+        </td>
+        <td>
+          {{ '%.1f'|format(row.hallucination_rate * 100 if row.hallucination_rate is not none else 0) }}%
+        </td>
+        <td>
+          {{ '%.1f%%'|format(row.get('judge_faithfulness') * 100)
+             if row.get('judge_faithfulness') is not none else 'N/A' }}
+        </td>
+        <td>
+          {{ '%.1f%%'|format(row.get('judge_completeness') * 100)
+             if row.get('judge_completeness') is not none else 'N/A' }}
+        </td>
         <td>{{ '%.0f'|format(row.avg_latency_ms) }}</td>
         <td>{{ row.p50_latency_ms }}</td>
         <td>{{ row.p95_latency_ms }}</td>
       </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Ungrounded Fields</h2>
+  <table>
+    <thead><tr><th>Document</th><th>Model profile</th><th>Potential hallucinations</th></tr></thead>
+    <tbody>
+    {% for row in rows if row.score and row.score.ungrounded_fields %}
+      <tr>
+        <td>{{ row.doc_id }}</td>
+        <td>{{ row.model_profile }}</td>
+        <td class="bad">{{ row.score.ungrounded_fields | join(', ') }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3" class="ok">All extracted fields are grounded.</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -155,6 +188,7 @@ def write_report(run_dir: Path, metrics: dict[str, Any]) -> Path:
         HTML_TEMPLATE.render(
             run_dir=str(run_dir),
             summary=metrics.get("summary", []),
+            rows=metrics.get("rows", []),
             cpu_chart=cpu_chart,
             cpu_peak=f"{max(cpus):.0f}" if cpus else "—",
             cpu_avg=f"{sum(cpus) / len(cpus):.0f}" if cpus else "—",
