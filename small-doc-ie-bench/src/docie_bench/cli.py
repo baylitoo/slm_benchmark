@@ -33,12 +33,15 @@ def benchmark_run(
     output_dir: Path | None = typer.Option(None),
     concurrency: int = typer.Option(1, min=1, max=32),
     repeat: int = typer.Option(1, min=1, help="Repeat the dataset N times (useful for stress testing)"),
+    resume: bool = typer.Option(False, help="Resume a compatible interrupted run in --output-dir"),
     log_level: str = typer.Option("INFO", help="Logging level (DEBUG shows full prompts and LLM output)"),
 ) -> None:
     if (dataset is None) == (document is None):
         raise typer.BadParameter("Provide exactly one of --dataset or --document")
     if document is not None and not eval_mode.uses_judge:
         raise typer.BadParameter("--document requires --eval-mode llm_judge or both")
+    if resume and output_dir is None:
+        raise typer.BadParameter("--resume requires --output-dir")
     configure_logging(log_level)
     result = asyncio.run(
         run_benchmark(
@@ -53,12 +56,14 @@ def benchmark_run(
             document_path=document,
             schema_name=schema_name,
             language=language,
+            resume=resume,
         )
     )
     print(f"[green]Benchmark complete[/green]: {result.run_dir}")
     print(f"Predictions: {result.predictions_path}")
     print(f"Metrics: {result.metrics_path}")
     print(f"Report: {result.report_path}")
+    print(f"Manifest: {result.manifest_path}")
 
 
 @schema_app.command("list")
