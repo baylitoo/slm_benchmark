@@ -5,19 +5,31 @@ import logging
 import re
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from docie_bench.extract.grounding import ground_evidence
 from docie_bench.extract.validators import validate_extraction
-
-logger = logging.getLogger(__name__)
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.openai_client import OpenAICompatibleClient
-from docie_bench.llm.prompts import SYSTEM_PROMPT, build_nuextract_prompts, build_user_prompt
+from docie_bench.llm.prompts import (
+    SCHEMA_PROPOSER_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    VISION_SYSTEM_PROMPT,
+    build_nuextract_prompts,
+    build_schema_proposer_prompt,
+    build_user_prompt,
+    build_vision_user_prompt,
+)
 from docie_bench.ocr.base import text_to_blocks
 from docie_bench.ocr.factory import get_ocr_backend
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
+from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 from docie_bench.schemas.extraction import schema_json
+from docie_bench.vision import DocumentImage, load_document_images
+
+logger = logging.getLogger(__name__)
 
 
 _CURRENCY_MAP = {"€": "EUR", "£": "GBP", "$": "USD", "¥": "JPY", "₣": "CHF"}
@@ -71,10 +83,38 @@ def _norm_date(raw: str) -> str:
         return s
 
 
+def _derive_invoice_subtotal(result: dict[str, Any]) -> None:
+    if result.get("subtotal") is not None:
+        return
+
+    total = result.get("total_ttc")
+    vat = result.get("vat_amount")
+    if not isinstance(total, dict) or not isinstance(vat, dict):
+        return
+
+    try:
+        subtotal = Decimal(str(total["amount"])) - Decimal(str(vat["amount"]))
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return
+    if not subtotal.is_finite() or subtotal < 0:
+        return
+
+    total_currency = total.get("currency")
+    vat_currency = vat.get("currency")
+    if total_currency and vat_currency and total_currency != vat_currency:
+        return
+
+    result["subtotal"] = {
+        "amount": format(subtotal, "f"),
+        "currency": total_currency or vat_currency,
+    }
+
+
 def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> dict[str, Any]:
     """Post-process NuExtract3 output: enforce document_type, strip IBAN spaces,
     null-out empty MoneyFields, and apply fallback normalization for any values the
-    model returned in locale format despite type hints."""
+    model returned in locale format despite type hints. Derive a missing invoice
+    subtotal when total and VAT provide an unambiguous fallback."""
     result: dict[str, Any] = {"document_type": schema_name}
     for key, val in raw.items():
         if key == "document_type":
