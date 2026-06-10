@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from docie_bench.benchmark.dataset import DatasetItem, load_dataset
+from docie_bench.benchmark.dataset import DatasetItem
 from docie_bench.benchmark.judge import EvaluationMode, judge_extraction
 from docie_bench.benchmark.metrics import score_evidence, score_prediction
+from docie_bench.benchmark.registry import DEFAULT_REGISTRY_PATH, resolve_dataset
 from docie_bench.benchmark.report import write_report
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_profiles import ModelProfile, load_judge_profile, load_model_profiles
@@ -68,7 +69,8 @@ class BenchmarkResult:
 
 async def run_benchmark(
     *,
-    dataset_path: Path | None,
+    dataset_path: str | Path | None,
+    dataset_registry_path: Path = DEFAULT_REGISTRY_PATH,
     models_config_path: Path,
     model_profile: str | None = None,
     output_dir: Path | None = None,
@@ -79,12 +81,28 @@ async def run_benchmark(
     document_path: Path | None = None,
     schema_name: str = "invoice",
     language: str | None = None,
+    split: str | None = None,
 ) -> BenchmarkResult:
     settings = get_settings()
     if (dataset_path is None) == (document_path is None):
         raise ValueError("Provide exactly one of dataset_path or document_path")
+    dataset_metadata: dict[str, Any] | None = None
     if dataset_path is not None:
-        base_items = load_dataset(dataset_path)
+        resolved_dataset = resolve_dataset(dataset_path, registry_path=dataset_registry_path)
+        base_items = resolved_dataset.items
+        dataset_metadata = {
+            "reference": resolved_dataset.reference,
+            "version": resolved_dataset.version,
+            "manifest_path": str(resolved_dataset.manifest_path),
+            "dataset_hash": resolved_dataset.dataset_hash,
+            "selected_split": split,
+        }
+        if split is not None:
+            base_items = [item for item in base_items if item.split == split]
+            if not base_items:
+                raise ValueError(
+                    f"Dataset {resolved_dataset.reference} has no documents in split {split!r}"
+                )
     else:
         assert document_path is not None
         base_items = [
@@ -134,6 +152,7 @@ async def run_benchmark(
                 )
                 row = {
                     "doc_id": item.doc_id,
+                    "split": item.split,
                     "schema_name": response.schema_name,
                     "dynamic_schema": response.dynamic_schema,
                     "model_profile": profile.name,
@@ -168,6 +187,7 @@ async def run_benchmark(
             except Exception as exc:  # benchmark must continue unless caller chooses fail-fast later
                 return {
                     "doc_id": item.doc_id,
+                    "split": item.split,
                     "schema_name": item.schema_name,
                     "dynamic_schema": item.dynamic_schema,
                     "model_profile": profile.name,
@@ -198,6 +218,7 @@ async def run_benchmark(
         concurrency=concurrency,
         eval_mode=eval_mode,
     )
+    metrics["dataset"] = dataset_metadata
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, default=str), encoding="utf-8")
     report_path = write_report(run_dir, metrics)

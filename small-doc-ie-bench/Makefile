@@ -1,5 +1,5 @@
 SHELL := /usr/bin/env bash
-DATASET ?= data/sample_dataset/manifest.jsonl
+DATASET ?= sample@1.0.0
 MODEL_PROFILE ?= local_llamacpp
 
 .PHONY: build up-infra up-api up-local-llm down logs test lint format bench smoke
