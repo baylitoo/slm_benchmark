@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from docie_bench.schemas.common import ExtractionValidation, OCRBlock
 from docie_bench.schemas.extraction import get_schema_model
@@ -23,8 +23,13 @@ def _collect_evidence_ids(obj: Any) -> list[str]:
     return ids
 
 
-def validate_extraction(schema_name: str, payload: dict[str, Any], blocks: list[OCRBlock]) -> tuple[dict[str, Any], ExtractionValidation]:
-    model_cls = get_schema_model(schema_name)
+def validate_extraction(
+    schema_name: str,
+    payload: dict[str, Any],
+    blocks: list[OCRBlock],
+    model_cls: type[BaseModel] | None = None,
+) -> tuple[dict[str, Any], ExtractionValidation]:
+    model_cls = model_cls or get_schema_model(schema_name)
     errors: list[str] = []
     warnings: list[str] = []
     try:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -70,3 +70,4 @@ class ExtractionResponse(BaseModel):
     validation: ExtractionValidation
     usage: Usage | None = None
     latency_ms: int
+    dynamic_schema: dict[str, Any] | None = None
