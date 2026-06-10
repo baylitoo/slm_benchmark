@@ -1,5 +1,8 @@
 # Model profiles are runtime endpoints, not hard dependencies.
 # You can run one local llama.cpp server and switch MODEL_PATH, or point profiles to external OpenAI-compatible endpoints.
+# Optional default used by --eval-mode llm_judge/both:
+# judge:
+#   profile: remote_openai_compatible
 profiles:
   local_llamacpp:
     model: local-model
@@ -191,3 +194,19 @@ profiles:
     max_tokens: 900
     timeout_seconds: 300
     prompt_profile: strict_extraction_v1
+
+  # Vision path example. Ollama's OpenAI-compatible endpoint accepts image_url
+  # content for multimodal models. PDFs are rasterized before the request.
+  ollama_qwen25_vl_7b:
+    model: qwen2.5vl:7b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: json_object
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 1200
+    timeout_seconds: 600
+    prompt_profile: strict_extraction_v1
+    vision: true
+    vision_max_pages: 8
+    vision_pdf_dpi: 150

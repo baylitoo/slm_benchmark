@@ -15,6 +15,22 @@ Normalize dates to YYYY-MM-DD when the OCR evidence is unambiguous.
 Normalize currency to ISO-4217 when explicit or strongly indicated by a symbol in the evidence.
 """
 
+SCHEMA_PROPOSER_SYSTEM_PROMPT = """You design compact schemas for document information extraction.
+Return only JSON matching the provided schema.
+Include only useful fields explicitly supported by the document.
+Use stable lower_snake_case names and one of: string, date, number, money.
+Do not include document_type or extraction_notes as fields.
+"""
+
+VISION_SYSTEM_PROMPT = """You are a deterministic document information extraction engine.
+Extract only fields that are explicitly visible in the supplied document images.
+Return only JSON matching the provided schema.
+Use null for missing fields and use an empty evidence_ids list for extracted fields.
+Never invent values, never infer from world knowledge, and never output markdown.
+Normalize dates to YYYY-MM-DD when the document is unambiguous.
+Normalize currency to ISO-4217 when explicit or strongly indicated by a symbol.
+"""
+
 # Per-schema JSON templates for NuExtract3.
 # Leaf values use NuExtract's semantic type system:
 #   "verbatim-string" → extract text exactly as it appears
@@ -95,18 +111,39 @@ def build_user_prompt(
     )
 
 
+def build_vision_user_prompt(
+    *,
+    schema_name: str,
+    schema: dict,
+    page_count: int,
+    language: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> str:
+    metadata = metadata or {}
+    return (
+        f"Task: extract structured fields for schema_name={schema_name!r} from the attached "
+        f"{page_count} document page image(s).\n"
+        f"Language hint: {language or 'unknown'}.\n"
+        f"Metadata: {json.dumps(metadata, ensure_ascii=False)}\n"
+        "JSON Schema:\n"
+        f"{json.dumps(schema, ensure_ascii=False)}\n"
+        "Return the extraction JSON only."
+    )
+
+
 def build_nuextract_prompts(
     *,
     schema_name: str,
     blocks: list[OCRBlock],
     language: str | None = None,
+    template: dict | None = None,
 ) -> tuple[str, str]:
     """Return (system_prompt, user_prompt) in NuExtract3 format.
 
     NuExtract3 uses a special input format: a JSON template with empty values
     followed by the document text. It doesn't use a system prompt.
     """
-    template = _NUEXTRACT_TEMPLATES.get(schema_name, {})
+    template = template if template is not None else _NUEXTRACT_TEMPLATES.get(schema_name, {})
     template_json = json.dumps(template, ensure_ascii=False, indent=2)
     document_text = "\n".join(b.text for b in blocks)
     user_prompt = (
@@ -118,3 +155,13 @@ def build_nuextract_prompts(
         "<|output|>"
     )
     return "", user_prompt
+
+
+def build_schema_proposer_prompt(*, blocks: list[OCRBlock], language: str | None = None) -> str:
+    return (
+        f"Language hint: {language or 'unknown'}.\n"
+        "Propose a reusable extraction schema for documents of this type.\n"
+        "OCR evidence blocks as JSON array:\n"
+        f"{render_ocr_blocks(blocks)}\n"
+        "Return the schema specification JSON only."
+    )
