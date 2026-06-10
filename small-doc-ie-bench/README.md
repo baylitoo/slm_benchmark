@@ -140,6 +140,20 @@ manifest rows) to reuse it without another proposal call. A NuExtract profile ne
 instruction-following `schema_proposer_profile` for first-time inference, but can extract directly
 from a reused dynamic schema.
 
+Dynamic fields support scalar `string`, `date`, `number`, and `money` types plus recursive `object`
+and repeated-row `list` types. Container fields define their reusable children in `fields`.
+
+Invoice extraction includes typed `line_items` with description, SKU, quantity, unit price, line
+total, and tax rate. To evaluate a table, put a list under the matching ground-truth key. Rows are
+aligned by maximum cell similarity before cell accuracy and row precision/recall/F1 are calculated:
+
+```json
+{"ground_truth":{"line_items":[{"description":"Keyboard","quantity":"2","line_total.amount":"150.00"}]}}
+```
+
+Validation checks each `quantity * unit_price` against `line_total`, the sum of line totals against
+the invoice subtotal, and reports mismatches as warnings.
+
 Vision-capable model profiles can bypass OCR for PDFs and images:
 
 ```yaml

@@ -226,6 +226,13 @@ def summarize(
         evidence_grounded = sum(
             r.get("score", {}).get("evidence_grounded", 0) for r in ok_rows
         )
+        row_expected = sum(r.get("score", {}).get("row_expected", 0) for r in ok_rows)
+        row_predicted = sum(r.get("score", {}).get("row_predicted", 0) for r in ok_rows)
+        row_correct = sum(r.get("score", {}).get("row_correct", 0) for r in ok_rows)
+        evidence_row_total = sum(r.get("score", {}).get("evidence_row_total", 0) for r in ok_rows)
+        evidence_rows_grounded = sum(
+            r.get("score", {}).get("evidence_rows_grounded", 0) for r in ok_rows
+        )
         sim_values = [
             r["score"]["avg_similarity"]
             for r in ok_rows
@@ -235,6 +242,8 @@ def summarize(
         faithfulness = [r["overall_faithfulness"] for r in judge_rows]
         completeness = [r["overall_completeness"] for r in judge_rows]
         field_accuracy = field_correct / field_total if field_total else None
+        row_precision = row_correct / row_predicted if row_predicted else None
+        row_recall = row_correct / row_expected if row_expected else None
         judge_faithfulness = (
             round(sum(faithfulness) / len(faithfulness), 4) if faithfulness else None
         )
@@ -250,7 +259,19 @@ def summarize(
                 "ok_rate": len(ok_rows) / n if n else 0,
                 "valid_rate": len(valid_rows) / n if n else 0,
                 "field_accuracy": field_accuracy,
+                "row_precision": row_precision,
+                "row_recall": row_recall,
+                "row_f1": (
+                    2 * row_precision * row_recall / (row_precision + row_recall)
+                    if row_precision is not None
+                    and row_recall is not None
+                    and row_precision + row_recall
+                    else None
+                ),
                 "evidence_coverage": evidence_grounded / evidence_total if evidence_total else None,
+                "evidence_row_coverage": (
+                    evidence_rows_grounded / evidence_row_total if evidence_row_total else None
+                ),
                 "hallucination_rate": (
                     (evidence_total - evidence_grounded) / evidence_total
                     if evidence_total
