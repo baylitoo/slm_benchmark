@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -58,9 +59,22 @@ def _clean_content(text: str) -> str:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return text[start : i + 1]
+                return _fix_bare_keys(text[start : i + 1])
 
-    return text[start:]  # incomplete — return what we have; json.loads will raise
+    return _fix_bare_keys(text[start:])  # incomplete — return what we have; json.loads will raise
+
+
+_BARE_KEY_RE = re.compile(r'(?<=[{,\n])(\s*)(?!")([A-Za-z_]\w*)(\s*:)')
+
+
+def _fix_bare_keys(text: str) -> str:
+    """Quote bare (unquoted) JSON keys emitted as hallucinations.
+
+    e.g. NuExtract mixing document text into output: `zaknur: {` → `"zaknur": {`
+    Only matches after structural positions ({, comma, newline) to avoid
+    touching string values that happen to contain word:colon patterns.
+    """
+    return _BARE_KEY_RE.sub(r'\1"\2"\3', text)
 
 
 class LLMClientError(RuntimeError):
