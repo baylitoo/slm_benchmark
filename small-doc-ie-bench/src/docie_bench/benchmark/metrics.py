@@ -76,7 +76,11 @@ def _decimal_or_none(value: Any) -> Decimal | None:
         return None
 
 
-def score_prediction(ground_truth: dict[str, Any], prediction: dict[str, Any], cfg: MetricConfig | None = None) -> dict[str, Any]:
+def score_prediction(
+    ground_truth: dict[str, Any],
+    prediction: dict[str, Any],
+    cfg: MetricConfig | None = None,
+) -> dict[str, Any]:
     cfg = cfg or MetricConfig()
     rows: list[dict[str, Any]] = []
     correct = 0
@@ -86,7 +90,16 @@ def score_prediction(ground_truth: dict[str, Any], prediction: dict[str, Any], c
         ok, reason, sim = compare_values(expected, actual, cfg)
         correct += int(ok)
         similarity_sum += sim
-        rows.append({"field": path, "expected": expected, "actual": actual, "correct": ok, "similarity": round(sim, 4), "reason": reason})
+        rows.append(
+            {
+                "field": path,
+                "expected": expected,
+                "actual": actual,
+                "correct": ok,
+                "similarity": round(sim, 4),
+                "reason": reason,
+            }
+        )
     total = len(rows)
     return {
         "field_total": total,
@@ -94,4 +107,37 @@ def score_prediction(ground_truth: dict[str, Any], prediction: dict[str, Any], c
         "field_accuracy": correct / total if total else None,
         "avg_similarity": round(similarity_sum / total, 4) if total else None,
         "fields": rows,
+        **score_evidence(prediction),
     }
+
+
+def score_evidence(prediction: dict[str, Any]) -> dict[str, Any]:
+    fields = _evidence_fields(prediction)
+    grounded = [path for path, field in fields if field.get("evidence_ids")]
+    ungrounded = [path for path, field in fields if not field.get("evidence_ids")]
+    total = len(fields)
+    grounded_total = len(grounded)
+    return {
+        "evidence_field_total": total,
+        "evidence_grounded": grounded_total,
+        "evidence_coverage": grounded_total / total if total else None,
+        "hallucination_rate": len(ungrounded) / total if total else None,
+        "ungrounded_fields": ungrounded,
+    }
+
+
+def _evidence_fields(obj: Any, path: str = "") -> list[tuple[str, dict[str, Any]]]:
+    if isinstance(obj, list):
+        fields: list[tuple[str, dict[str, Any]]] = []
+        for index, item in enumerate(obj):
+            fields.extend(_evidence_fields(item, f"{path}.{index}" if path else str(index)))
+        return fields
+    if not isinstance(obj, dict):
+        return []
+    if obj.get("value") is not None or obj.get("amount") is not None:
+        return [(path, obj)]
+    fields = []
+    for key, value in obj.items():
+        child_path = f"{path}.{key}" if path else key
+        fields.extend(_evidence_fields(value, child_path))
+    return fields
