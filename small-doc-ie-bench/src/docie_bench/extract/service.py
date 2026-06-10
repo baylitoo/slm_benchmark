@@ -23,10 +23,11 @@ from docie_bench.llm.prompts import (
     build_vision_user_prompt,
 )
 from docie_bench.ocr.base import text_to_blocks
-from docie_bench.ocr.factory import get_ocr_backend
+from docie_bench.ocr.service import processor_from_settings
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 from docie_bench.schemas.extraction import schema_json
+from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
 
 logger = logging.getLogger(__name__)
@@ -256,9 +257,13 @@ class ExtractionService:
             )
         if ocr_backend_name.lower().strip() == "vision":
             raise ValueError("ocr_backend='vision' requires a model profile with vision: true")
-        backend = get_ocr_backend(ocr_backend_name, language=language)
         t0 = time.perf_counter()
-        blocks = backend.extract(path)
+        ocr_result = processor_from_settings(get_settings()).process(
+            path,
+            backend_name=ocr_backend_name,
+            language=language,
+        )
+        blocks = ocr_result.artifact.blocks
         ocr_ms = int((time.perf_counter() - t0) * 1000)
         logger.debug(
             "ocr_complete",
@@ -268,6 +273,9 @@ class ExtractionService:
                 "docie_path": str(path),
                 "docie_block_count": len(blocks),
                 "docie_ocr_latency_ms": ocr_ms,
+                "docie_ocr_cache_hit": ocr_result.cache_hit,
+                "docie_ocr_cache_key": ocr_result.cache_key,
+                "docie_ocr_quality": ocr_result.artifact.quality.model_dump(mode="json"),
                 "docie_blocks": [{"id": b.id, "text": b.text} for b in blocks],
             },
         )
@@ -278,7 +286,7 @@ class ExtractionService:
             schema_mode=schema_mode,
             dynamic_schema=dynamic_schema,
             language=language,
-            document_hash=hash_file(path),
+            document_hash=ocr_result.artifact.document_hash,
             metadata=metadata or {},
         )
 

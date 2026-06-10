@@ -4,6 +4,10 @@ benchmark:
   fail_fast: false
   concurrency: 1
   save_ocr_cache: true
+  ocr_cache:
+    enabled: true
+    directory: .cache/ocr
+    max_mb: 2048
   metrics:
     string_similarity_threshold: 0.92
     numeric_relative_tolerance: 0.001
