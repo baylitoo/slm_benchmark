@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 from rich import print
 
+from docie_bench.benchmark.judge import EvaluationMode
 from docie_bench.benchmark.runner import run_benchmark
 from docie_bench.logging_config import configure_logging
 from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
@@ -19,14 +20,25 @@ app.add_typer(schema_app, name="schema")
 
 @benchmark_app.command("run")
 def benchmark_run(
-    dataset: Path = typer.Option(..., exists=True, readable=True),
+    dataset: Path | None = typer.Option(None, exists=True, readable=True),
+    document: Path | None = typer.Option(None, exists=True, readable=True),
+    schema_name: str = typer.Option("invoice", help="Schema used with --document"),
+    language: str | None = typer.Option(None, help="Document language used with --document"),
     models_config: Path = typer.Option(Path("configs/models.yaml"), exists=True, readable=True),
     model_profile: str | None = typer.Option(None),
+    eval_mode: EvaluationMode = typer.Option(EvaluationMode.GROUND_TRUTH),
+    judge_profile: str | None = typer.Option(
+        None, help="Judge profile; defaults to judge.profile in models config"
+    ),
     output_dir: Path | None = typer.Option(None),
     concurrency: int = typer.Option(1, min=1, max=32),
     repeat: int = typer.Option(1, min=1, help="Repeat the dataset N times (useful for stress testing)"),
     log_level: str = typer.Option("INFO", help="Logging level (DEBUG shows full prompts and LLM output)"),
 ) -> None:
+    if (dataset is None) == (document is None):
+        raise typer.BadParameter("Provide exactly one of --dataset or --document")
+    if document is not None and not eval_mode.uses_judge:
+        raise typer.BadParameter("--document requires --eval-mode llm_judge or both")
     configure_logging(log_level)
     result = asyncio.run(
         run_benchmark(
@@ -36,6 +48,11 @@ def benchmark_run(
             output_dir=output_dir,
             concurrency=concurrency,
             repeat=repeat,
+            eval_mode=eval_mode,
+            judge_profile=judge_profile,
+            document_path=document,
+            schema_name=schema_name,
+            language=language,
         )
     )
     print(f"[green]Benchmark complete[/green]: {result.run_dir}")
