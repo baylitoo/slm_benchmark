@@ -135,6 +135,7 @@ async def run_benchmark(
                 row = {
                     "doc_id": item.doc_id,
                     "schema_name": response.schema_name,
+                    "language": item.language,
                     "dynamic_schema": response.dynamic_schema,
                     "model_profile": profile.name,
                     "ingestion_path": (
@@ -169,6 +170,7 @@ async def run_benchmark(
                 return {
                     "doc_id": item.doc_id,
                     "schema_name": item.schema_name,
+                    "language": item.language,
                     "dynamic_schema": item.dynamic_schema,
                     "model_profile": profile.name,
                     "ingestion_path": (

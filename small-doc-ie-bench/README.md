@@ -68,6 +68,44 @@ Run benchmark:
 make bench DATASET=data/sample_dataset/manifest.jsonl
 ```
 
+Compare a candidate run with a baseline and enforce regression budgets:
+
+```bash
+docie-bench benchmark compare \
+  runs/baseline \
+  runs/candidate \
+  --budgets configs/regression-budgets.yaml \
+  --output-dir comparison
+```
+
+The command writes `comparison.json`, a compact CI-oriented `verdict.json`, and a
+human-readable `comparison.md`. It exits non-zero when a budget is exceeded, a required
+metric is missing, or the runs have no matched observations. Comparisons use matched
+documents and fields; unmatched samples and small sample sizes are reported as warnings.
+
+Promote and audit named, versioned baselines:
+
+```bash
+docie-bench benchmark baseline promote runs/approved main
+docie-bench benchmark baseline list
+docie-bench benchmark compare main runs/candidate --budgets configs/regression-budgets.yaml
+```
+
+Budget entries select a metric and comparison dimension. `max_regression` is always
+expressed in the metric's native units and works for both higher-is-better quality metrics
+and lower-is-better latency/error metrics:
+
+```yaml
+regression_budgets:
+  - name: invoice-field-accuracy
+    metric: field_accuracy
+    dimension: schema_name
+    selector:
+      schema_name: invoice
+    max_regression: 0.01
+    min_paired_samples: 10
+```
+
 Evaluate with an LLM judge by selecting a judge profile separately from extraction models:
 
 ```yaml
