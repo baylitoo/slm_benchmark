@@ -106,6 +106,7 @@ class OpenAICompatibleClient:
         user_prompt: str,
         schema_name: str,
         schema: dict[str, Any],
+        image_urls: list[str] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         import time as _time
 
@@ -114,11 +115,17 @@ class OpenAICompatibleClient:
             schema_name,
             schema,
         )
+        user_content: str | list[dict[str, Any]] = user_prompt
+        if image_urls:
+            user_content = [{"type": "text", "text": user_prompt}]
+            user_content.extend(
+                {"type": "image_url", "image_url": {"url": image_url}} for image_url in image_urls
+            )
         payload: dict[str, Any] = {
             "model": self.profile.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
             "temperature": self.profile.temperature,
             "top_p": self.profile.top_p,
@@ -140,6 +147,7 @@ class OpenAICompatibleClient:
                 "docie_response_format_style": self.profile.response_format_style,
                 "docie_system_prompt": system_prompt,
                 "docie_user_prompt": user_prompt,
+                "docie_image_count": len(image_urls or []),
             },
         )
 
