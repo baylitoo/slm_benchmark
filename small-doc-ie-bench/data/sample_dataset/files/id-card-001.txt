@@ -1,0 +1,19 @@
+REPUBLIQUE FRANCAISE
+CARTE NATIONALE D'IDENTITE
+
+N° 05HK12345
+
+Nom          : MARTIN
+Prénom(s)    : Sophie Claire
+Né(e) le     : 14.08.1988
+à            : LYON (69)
+Nationalité  : FRANÇAISE
+Sexe         : F
+Taille       : 1,68 m
+
+Valable jusqu'au  : 22/03/2035
+Délivrée le       : 22/03/2025
+Par               : PREFECTURE DU RHONE
+
+MRZ LINE 1 : IDFRASMARTIN<<<<<<<<<<<<<<<<<05HK123452
+MRZ LINE 2 : 8808144F3503224FRA<<<<<<<<<<<6

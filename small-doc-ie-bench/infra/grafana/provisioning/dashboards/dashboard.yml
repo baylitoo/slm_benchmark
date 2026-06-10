@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: docie
+    orgId: 1
+    folder: Document IE
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

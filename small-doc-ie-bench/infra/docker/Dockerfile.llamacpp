@@ -1,0 +1,18 @@
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CMAKE_ARGS="-DLLAMA_NATIVE=ON" \
+    FORCE_CMAKE=1
+
+WORKDIR /srv
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip && pip install "llama-cpp-python[server]>=0.3.0"
+
+EXPOSE 8000

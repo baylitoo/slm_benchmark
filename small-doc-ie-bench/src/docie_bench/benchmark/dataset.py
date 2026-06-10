@@ -1,0 +1,34 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class DatasetItem(BaseModel):
+    doc_id: str
+    file_path: str
+    schema_name: str = "invoice"
+    language: str | None = None
+    ground_truth: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+def load_dataset(path: Path) -> list[DatasetItem]:
+    items: list[DatasetItem] = []
+    base = path.parent
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+            item = DatasetItem.model_validate(raw)
+        except Exception as exc:
+            raise ValueError(f"Invalid dataset row {line_no} in {path}: {exc}") from exc
+        file_path = Path(item.file_path)
+        if not file_path.is_absolute():
+            item.file_path = str((base / file_path).resolve())
+        items.append(item)
+    return items

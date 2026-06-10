@@ -1,0 +1,40 @@
+Metadata-Version: 2.4
+Name: small-doc-ie-bench
+Version: 0.1.0
+Summary: CPU-only benchmark harness for structured document extraction with small LLMs
+Requires-Python: >=3.11
+License-File: LICENSE
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn[standard]>=0.30.0
+Requires-Dist: pydantic>=2.8.0
+Requires-Dist: pydantic-settings>=2.4.0
+Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: tenacity>=8.5.0
+Requires-Dist: orjson>=3.10.0
+Requires-Dist: PyYAML>=6.0.2
+Requires-Dist: rich>=13.7.0
+Requires-Dist: typer>=0.12.0
+Requires-Dist: jsonschema>=4.23.0
+Requires-Dist: prometheus-client>=0.20.0
+Requires-Dist: sqlalchemy>=2.0.32
+Requires-Dist: psycopg[binary]>=3.2.1
+Requires-Dist: alembic>=1.13.2
+Requires-Dist: pdfplumber>=0.11.4
+Requires-Dist: Pillow>=10.4.0
+Requires-Dist: python-dateutil>=2.9.0
+Requires-Dist: jinja2>=3.1.4
+Requires-Dist: pandas>=2.2.2
+Requires-Dist: rapidfuzz>=3.9.6
+Requires-Dist: psutil>=5.9.0
+Provides-Extra: ocr
+Requires-Dist: pytesseract>=0.3.13; extra == "ocr"
+Provides-Extra: paddle
+Requires-Dist: paddleocr>=2.8.0; extra == "paddle"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.2; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23.8; extra == "dev"
+Requires-Dist: ruff>=0.5.6; extra == "dev"
+Requires-Dist: mypy>=1.11.1; extra == "dev"
+Requires-Dist: types-PyYAML>=6.0.12.20240808; extra == "dev"
+Dynamic: license-file

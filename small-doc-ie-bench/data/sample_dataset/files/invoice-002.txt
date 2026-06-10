@@ -1,0 +1,34 @@
+TECHPRO SOLUTIONS SARL
+Siège social : 14 avenue des Lilas, 75011 Paris
+SIRET : 482 910 374 00021 — TVA : FR48491037400
+
+                        FACTURE
+Numéro : TPS-2026-00842              Date d'émission : 03/04/2026
+                                     Date d'échéance : 03/05/2026
+
+FACTURER À :
+Groupe Meridian SA
+12 rue du Commerce
+69002 Lyon
+N° TVA client : FR77123456789
+
+Référence commande : PO-2026-1147
+
+DÉTAIL DES PRESTATIONS
+----------------------------------------------------------------------
+Désignation                          Qté    PU HT (€)    Total HT (€)
+----------------------------------------------------------------------
+Audit sécurité infrastructure         1      3 500,00       3 500,00
+Développement module API REST         5        850,00       4 250,00
+Formation administrateurs (2j)        1      1 200,00       1 200,00
+----------------------------------------------------------------------
+
+                                    Sous-total HT :      8 950,00 €
+                                    TVA 20 %  :          1 790,00 €
+                                    TOTAL TTC :         10 740,00 €
+
+Modalités de paiement : Virement bancaire sous 30 jours
+IBAN : FR76 3000 6000 0112 3456 7890 189
+BIC  : BNPAFRPPXXX
+
+Merci pour votre confiance.

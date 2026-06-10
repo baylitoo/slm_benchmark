@@ -1,0 +1,31 @@
+ACME SAS
+12 avenue de la République — 75011 Paris
+SIRET : 495 281 037 00018     TVA : FR12495281037
+
+                            FACTURE
+Numéro : INV-2026-0001                   Date d'émission : 21/05/2026
+                                         Date d'échéance : 20/06/2026
+
+Destinataire :
+Banque Exemple
+45 rue du Louvre
+75001 Paris
+N° TVA client : FR91234567890
+
+Référence commande : BE-CMD-2026-442
+
+Désignation                              Qté    PU HT      Montant HT
+----------------------------------------------------------------------
+Conseil stratégie digitale (jours)        3    1 200,00     3 600,00
+Audit conformité DORA                     1      850,00       850,00
+Rédaction rapport exécutif                1      550,00       550,00
+----------------------------------------------------------------------
+                                         Brut HT :       5 000,00 €
+                                  Remise 10 %  :          -500,00 €
+                                       Net HT :       4 500,00 €
+                                    TVA 20 % :            900,00 €
+                                 Total TTC :           5 400,00 €
+
+Règlement par virement bancaire sous 30 jours fin de mois.
+IBAN : FR76 1234 5678 9101 1121 3141 516
+BIC  : AGRIFRPP882

@@ -1,0 +1,19 @@
+BUNDESREPUBLIK DEUTSCHLAND
+PERSONALAUSWEIS
+
+Seriennummer : L01X00T471
+
+Familienname : MÜLLER
+Vornamen     : Klaus Dieter
+Geburtsdatum : 07.11.1979
+Geburtsort   : HAMBURG
+Staatsangehörigkeit: DEUTSCH
+Geschlecht   : M
+Größe        : 1,82 m
+
+Gültig bis   : 15.06.2031
+Ausstellungsdatum: 15.06.2021
+Ausstellende Behörde: EINWOHNERMELDEAMT HAMBURG-MITTE
+
+MRZ ZEILE 1 : IDDEUMULLER<<KLAUS<DIETER<<<<<L01X00T471
+MRZ ZEILE 2 : 7911074M3106154DEU<<<<<<<<<<<<8

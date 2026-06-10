@@ -1,0 +1,178 @@
+# Model profiles are runtime endpoints, not hard dependencies.
+# You can run one local llama.cpp server and switch MODEL_PATH, or point profiles to external OpenAI-compatible endpoints.
+profiles:
+  local_llamacpp:
+    model: local-model
+    base_url: http://llm-llamacpp:8000/v1
+    api_key_env: OPENAI_COMPAT_API_KEY
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 180
+    prompt_profile: strict_extraction_v1
+
+  qwen_tiny_cpu:
+    model: qwen-small-instruct-q4
+    base_url: http://llm-llamacpp:8000/v1
+    api_key_env: OPENAI_COMPAT_API_KEY
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 180
+    prompt_profile: strict_extraction_v1
+
+  granite_3b_cpu:
+    model: granite-3b-instruct-q4
+    base_url: http://llm-llamacpp:8000/v1
+    api_key_env: OPENAI_COMPAT_API_KEY
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 240
+    prompt_profile: strict_extraction_v1
+
+  vllm_openai_compatible:
+    model: served-model-name
+    base_url: http://vllm:8000/v1
+    api_key_env: OPENAI_COMPAT_API_KEY
+    response_format_style: vllm_structured_outputs
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 180
+    prompt_profile: strict_extraction_v1
+
+  remote_openai_compatible:
+    model: your-remote-model
+    base_url: ${OPENAI_COMPAT_BASE_URL}
+    api_key_env: OPENAI_COMPAT_API_KEY
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 180
+    prompt_profile: strict_extraction_v1
+
+  # --- Ollama local profiles (ordered by size) ---
+
+  ollama_qwen3_1b:
+    model: qwen3:1.7b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 300
+    prompt_profile: strict_extraction_v1
+
+  ollama_qwen3_4b:
+    model: qwen3:4b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 300
+    prompt_profile: strict_extraction_v1
+
+  ollama_qwen3_8b:
+    model: qwen3:8b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 600
+    prompt_profile: strict_extraction_v1
+
+  # Gemma 4 — vision model, use json_object (not json_schema — returns empty content with Ollama)
+  # Warning: very slow on CPU-only. e2b has 5.1B total params despite "2B effective" label.
+  ollama_gemma4_e2b:
+    model: gemma4:e2b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: json_object
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 600
+    prompt_profile: strict_extraction_v1
+
+  # Gemma 4 QAT — same json_object fix, timeout capped at 300s to avoid multi-hour runs
+  ollama_gemma4_e2b_qat:
+    model: gemma4:e2b-it-qat
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: json_object
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 300
+    prompt_profile: strict_extraction_v1
+
+  ollama_gemma4_e4b_qat:
+    model: gemma4:e4b-it-qat
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: json_object
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 300
+    prompt_profile: strict_extraction_v1
+
+  ollama_gemma4_12b_qat:
+    model: gemma4:12b-it-qat
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: json_object
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 300
+    prompt_profile: strict_extraction_v1
+
+  # NuExtract3 — purpose-built structured extraction model by NuMind
+  # Uses its own <|input|>### Template / ### Document<|output|> format (nuextract_v1 prompt profile).
+  # response_format_style: none — model outputs JSON directly without schema constraints.
+  ollama_nuextract_3b:
+    model: nuextract:3.8b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: none
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 2000
+    timeout_seconds: 300
+    prompt_profile: nuextract_v1
+    stop_sequences: ["<|end-output|>"]
+
+  ollama_nuextract_3b_q8:
+    model: nuextract:3.8b-q8_0
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: none
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 2000
+    timeout_seconds: 300
+    prompt_profile: nuextract_v1
+    stop_sequences: ["<|end-output|>"]
+
+  # Legacy Qwen 2.5 baseline kept for comparison
+  ollama_qwen25_1b:
+    model: qwen2.5:1.5b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 300
+    prompt_profile: strict_extraction_v1

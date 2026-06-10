@@ -1,0 +1,15 @@
+benchmark:
+  default_schema: invoice
+  ocr_backend: pdf_text
+  fail_fast: false
+  concurrency: 1
+  save_ocr_cache: true
+  metrics:
+    string_similarity_threshold: 0.92
+    numeric_relative_tolerance: 0.001
+    numeric_absolute_tolerance: 0.01
+    date_formats:
+      - "%Y-%m-%d"
+      - "%d/%m/%Y"
+      - "%d-%m-%Y"
+      - "%Y/%m/%d"

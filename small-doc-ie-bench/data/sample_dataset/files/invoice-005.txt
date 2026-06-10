@@ -1,0 +1,31 @@
+Factura Electrónica
+IBERMÁTICA DIGITAL S.L.
+CIF: B-84739201
+Calle Gran Vía 48, 3ª planta
+28013 Madrid
+Tel: +34 91 555 0123
+
+Número de factura : IBD-2026-03-0047
+Fecha de emisión  : 22/03/2026
+Fecha de vencimiento: 21/04/2026
+
+Cliente:
+CONSTRUCTORA ALVARADO E HIJOS S.A.
+CIF: A-28194756
+Polígono Industrial Norte, Nave 7
+41010 Sevilla
+
+Concepto                                             Unid.   Precio Unit.   Importe
+-----------------------------------------------------------------------------------
+Desarrollo plataforma web (fase 2)                       1     12.500,00   12.500,00
+Integración API pasarela de pago                         1      2.800,00    2.800,00
+Mantenimiento mensual (marzo 2026)                       1        450,00      450,00
+Licencias software terceros                              3        120,00      360,00
+-----------------------------------------------------------------------------------
+
+                                          Base imponible :   16.110,00 €
+                                          IVA 21 %       :    3.383,10 €
+                                          Total factura  :   19.493,10 €
+
+Forma de pago: Transferencia bancaria 30 días
+IBAN: ES91 2100 0418 4502 0005 1332

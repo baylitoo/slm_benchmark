@@ -1,0 +1,31 @@
+NORTHFIELD CONSULTING LTD
+Company No. 09341872  |  VAT No. GB 291 8472 13
+22 Charlotte Street, London W1T 2NB
+accounts@northfieldconsulting.co.uk
+
+TAX INVOICE
+
+Invoice No.   : NFC-2026-1804                  Invoice Date : 28 Feb 2026
+Purchase Order: GB-PO-78821                    Due Date     : 30 Mar 2026
+
+Bill To:
+Harrow Financial Services plc
+4 Canary Wharf Tower
+London E14 5AB
+VAT No. GB 104 3821 55
+
+Description                                        Hours    Rate (£)   Amount (£)
+---------------------------------------------------------------------------------
+Strategic IT transformation consulting               40      225.00     9,000.00
+Data governance framework review                     12      225.00     2,700.00
+Board presentation & materials (fixed)                -          -        950.00
+Expenses (travel, accommodation)                      -          -        312.75
+---------------------------------------------------------------------------------
+
+                                               Subtotal :   12,962.75
+                                               VAT @ 20%:    2,592.55
+                                               Total Due:   15,555.30 GBP
+
+Payment terms: 30 days net
+Bank: Barclays Bank PLC
+IBAN: GB29 NWBK 6016 1331 9268 19

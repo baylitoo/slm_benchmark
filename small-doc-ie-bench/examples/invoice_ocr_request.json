@@ -1,0 +1,15 @@
+{
+  "schema_name": "invoice",
+  "model_profile": "local_llamacpp",
+  "language": "fr",
+  "document_id": "invoice-demo-001",
+  "ocr_blocks": [
+    {"id":"b1","page":1,"text":"ACME SAS","source":"manual"},
+    {"id":"b2","page":1,"text":"Facture N° INV-2026-0001","source":"manual"},
+    {"id":"b3","page":1,"text":"Date de facture: 21/05/2026","source":"manual"},
+    {"id":"b4","page":1,"text":"Client: Banque Exemple","source":"manual"},
+    {"id":"b5","page":1,"text":"Total HT 1 000,00 EUR","source":"manual"},
+    {"id":"b6","page":1,"text":"TVA 20% 200,00 EUR","source":"manual"},
+    {"id":"b7","page":1,"text":"Total TTC 1 200,00 EUR","source":"manual"}
+  ]
+}

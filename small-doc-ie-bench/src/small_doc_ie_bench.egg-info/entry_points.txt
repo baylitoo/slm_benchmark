@@ -1,0 +1,2 @@
+[console_scripts]
+docie-bench = docie_bench.cli:app

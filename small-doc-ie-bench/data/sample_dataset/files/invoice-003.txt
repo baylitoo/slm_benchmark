@@ -1,0 +1,32 @@
+BRENNER & ASSOCIATES GmbH
+Leopoldstraße 47 · 80802 München
+USt-IdNr.: DE274891023
+
+R E C H N U N G
+
+Rechnungsnummer : BRE-2026-0391
+Rechnungsdatum  : 17.03.2026
+Leistungszeitraum: 01.03.2026 – 31.03.2026
+
+An:
+DataVision GmbH
+Kantstraße 12
+10627 Berlin
+USt-IdNr.: DE198765432
+
+Pos.  Beschreibung                                Menge    EP (€)      Gesamt (€)
+----  ------------------------------------------  ------  ----------  ----------
+1     Softwarelizenz Enterprise (monatlich)            1   2 400,00    2 400,00
+2     Support & Wartung Level 2                        1     600,00      600,00
+3     Onboarding-Workshop (8h)                         1   1 600,00    1 600,00
+4     Reisekosten pauschal                             1     175,50      175,50
+
+                                          Nettobetrag :   4 775,50 €
+                                          MwSt. 19 %  :     907,35 €
+                                          Bruttobetrag:   5 682,85 €
+
+Zahlungsziel: 14 Tage netto
+IBAN: DE89 3704 0044 0532 0130 00
+BIC : COBADEFFXXX
+
+Bitte geben Sie die Rechnungsnummer bei der Überweisung an.

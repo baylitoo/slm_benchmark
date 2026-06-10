@@ -1,0 +1,122 @@
+name: small-doc-ie-bench
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./runs:/app/runs
+      - ocr-cache:/app/.cache/ocr
+    command: ["uvicorn", "docie_bench.api:app", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py", "http://localhost:8080/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  bench:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    env_file: .env
+    profiles: ["tools"]
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./runs:/app/runs
+      - ocr-cache:/app/.cache/ocr
+    entrypoint: ["docie-bench"]
+
+  # Local CPU GGUF server. Bring your own model at ./models/model.gguf or set MODEL_PATH.
+  # This uses llama-cpp-python's OpenAI-compatible server, not an external SaaS endpoint.
+  llm-llamacpp:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.llamacpp
+    profiles: ["local-llm"]
+    environment:
+      MODEL: ${MODEL_PATH:-/models/model.gguf}
+      HOST: ${LLAMA_CPP_HOST:-0.0.0.0}
+      PORT: ${LLAMA_CPP_PORT:-8000}
+      N_CTX: ${LLAMA_CPP_N_CTX:-4096}
+      N_THREADS: ${LLAMA_CPP_N_THREADS:-12}
+      N_BATCH: ${LLAMA_CPP_N_BATCH:-256}
+    volumes:
+      - ./models:/models:ro
+    ports:
+      - "8000:8000"
+    command:
+      - "python"
+      - "-m"
+      - "llama_cpp.server"
+      - "--model"
+      - "${MODEL_PATH:-/models/model.gguf}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--n_ctx"
+      - "${LLAMA_CPP_N_CTX:-4096}"
+      - "--n_threads"
+      - "${LLAMA_CPP_N_THREADS:-12}"
+      - "--n_batch"
+      - "${LLAMA_CPP_N_BATCH:-256}"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: docie
+      POSTGRES_PASSWORD: docie
+      POSTGRES_DB: docie
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docie -d docie"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    profiles: ["observability"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
+  grafana-data:
+  ocr-cache:
