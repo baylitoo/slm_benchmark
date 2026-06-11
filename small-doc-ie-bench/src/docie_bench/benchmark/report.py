@@ -37,7 +37,8 @@ HTML_TEMPLATE = Template(
       <th>Model profile</th><th>Input path</th><th>Docs</th><th>Concurrency</th>
       <th>Wall time</th><th>Throughput (docs/min)</th>
       <th>Valid JSON</th><th>Field accuracy</th>
-      <th>Evidence coverage</th><th>Hallucination rate</th>
+      <th>Row F1</th>
+      <th>Evidence coverage</th><th>Row evidence coverage</th><th>Hallucination rate</th>
       <th>Judge faithfulness</th><th>Judge completeness</th>
       <th>Avg ms</th><th>p50 ms</th><th>p95 ms</th>
     </tr></thead>
@@ -53,7 +54,15 @@ HTML_TEMPLATE = Template(
         <td>{{ '%.1f'|format(row.valid_rate * 100) }}%</td>
         <td>{{ '%.1f'|format(row.field_accuracy * 100 if row.field_accuracy is not none else 0) }}%</td>
         <td>
+          {{ '%.1f%%'|format(row.get('row_f1') * 100)
+             if row.get('row_f1') is not none else 'N/A' }}
+        </td>
+        <td>
           {{ '%.1f'|format(row.evidence_coverage * 100 if row.evidence_coverage is not none else 0) }}%
+        </td>
+        <td>
+          {{ '%.1f%%'|format(row.get('evidence_row_coverage') * 100)
+             if row.get('evidence_row_coverage') is not none else 'N/A' }}
         </td>
         <td>
           {{ '%.1f'|format(row.hallucination_rate * 100 if row.hallucination_rate is not none else 0) }}%
@@ -70,6 +79,43 @@ HTML_TEMPLATE = Template(
         <td>{{ row.p50_latency_ms }}</td>
         <td>{{ row.p95_latency_ms }}</td>
       </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Table Extraction</h2>
+  <table>
+    <thead><tr>
+      <th>Document</th><th>Model profile</th><th>Table</th>
+      <th>Rows correct</th><th>Rows expected</th><th>Rows predicted</th>
+    </tr></thead>
+    <tbody>
+    {% for row in rows if row.score and row.score.tables %}
+      {% for table in row.score.tables %}
+      <tr>
+        <td>{{ row.doc_id }}</td><td>{{ row.model_profile }}</td><td>{{ table.field }}</td>
+        <td>{{ table.row_correct }}</td>
+        <td>{{ table.row_expected }}</td>
+        <td>{{ table.row_predicted }}</td>
+      </tr>
+      {% endfor %}
+    {% else %}
+      <tr><td colspan="6">No table ground truth in this run.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Arithmetic Validation Warnings</h2>
+  <table>
+    <thead><tr><th>Document</th><th>Model profile</th><th>Warnings</th></tr></thead>
+    <tbody>
+    {% for row in rows if row.validation and row.validation.warnings %}
+      <tr>
+        <td>{{ row.doc_id }}</td><td>{{ row.model_profile }}</td>
+        <td class="bad">{{ row.validation.warnings | join('; ') }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3" class="ok">No arithmetic validation warnings.</td></tr>
     {% endfor %}
     </tbody>
   </table>

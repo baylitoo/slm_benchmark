@@ -12,7 +12,9 @@ def test_report_surfaces_evidence_metrics_and_ungrounded_fields(tmp_path):
                 "throughput_docs_per_min": 60.0,
                 "valid_rate": 1.0,
                 "field_accuracy": 1.0,
+                "row_f1": 0.5,
                 "evidence_coverage": 0.5,
+                "evidence_row_coverage": 0.5,
                 "hallucination_rate": 0.5,
                 "avg_latency_ms": 10,
                 "p50_latency_ms": 10,
@@ -23,7 +25,18 @@ def test_report_surfaces_evidence_metrics_and_ungrounded_fields(tmp_path):
             {
                 "doc_id": "doc-1",
                 "model_profile": "test",
-                "score": {"ungrounded_fields": ["vendor_name"]},
+                "score": {
+                    "ungrounded_fields": ["vendor_name"],
+                    "tables": [
+                        {
+                            "field": "line_items",
+                            "row_correct": 1,
+                            "row_expected": 2,
+                            "row_predicted": 1,
+                        }
+                    ],
+                },
+                "validation": {"warnings": ["sum(line_items.line_total) does not match subtotal"]},
             }
         ],
     }
@@ -33,3 +46,8 @@ def test_report_surfaces_evidence_metrics_and_ungrounded_fields(tmp_path):
     assert "Evidence coverage" in report
     assert "Hallucination rate" in report
     assert "vendor_name" in report
+    assert "Row F1" in report
+    assert "Row evidence coverage" in report
+    assert "Arithmetic Validation Warnings" in report
+    assert "sum(line_items.line_total)" in report
+    assert "line_items" in report
