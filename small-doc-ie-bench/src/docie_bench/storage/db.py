@@ -144,23 +144,16 @@ def init_engine(database_url: str | None = None) -> None:
     resolved_url = database_url or get_settings().database_url
     if not resolved_url:
         return
-    if _engine is not None:
-        _engine.dispose()
-    _engine = create_engine(resolved_url, pool_pre_ping=True)
+    # Import model modules before creating metadata.
+    import docie_bench.orchestrator.models  # noqa: F401
+
+    _engine = create_engine(settings.database_url, pool_pre_ping=True)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     Base.metadata.create_all(bind=_engine)
 
 
-def dispose_engine() -> None:
-    global _engine, _SessionLocal
-    if _engine is not None:
-        _engine.dispose()
-    _engine = None
-    _SessionLocal = None
-
-
-def database_enabled() -> bool:
-    return _SessionLocal is not None
+def get_session_factory() -> sessionmaker[Session] | None:
+    return _SessionLocal
 
 
 @contextmanager

@@ -69,67 +69,21 @@ Run benchmark:
 make bench
 ```
 
-Compare a candidate run with a baseline and enforce regression budgets:
+## Distributed orchestration
 
-```bash
-docie-bench benchmark compare \
-  runs/baseline \
-  runs/candidate \
-  --budgets configs/regression-budgets.yaml \
-  --output-dir comparison
-```
+Set `DATABASE_URL` to enable the persistent experiment and worker APIs. Submit a run with
+deterministic task keys through `POST /v1/experiments`, then workers use:
 
-The command writes `comparison.json`, a compact CI-oriented `verdict.json`, and a
-human-readable `comparison.md`. It exits non-zero when a budget is exceeded, a required
-metric is missing, or the runs have no matched observations. Comparisons use matched
-documents and fields; unmatched samples and small sample sizes are reported as warnings.
+- `POST /v1/workers/tasks/claim`
+- `POST /v1/workers/tasks/{task_id}/heartbeat`
+- `POST /v1/workers/tasks/{task_id}/complete`
+- `POST /v1/workers/tasks/{task_id}/fail`
 
-Promote and audit named, versioned baselines:
-
-```bash
-docie-bench benchmark baseline promote runs/approved main
-docie-bench benchmark baseline list
-docie-bench benchmark compare main runs/candidate --budgets configs/regression-budgets.yaml
-```
-
-Budget entries select a metric and comparison dimension. `max_regression` is always
-expressed in the metric's native units and works for both higher-is-better quality metrics
-and lower-is-better latency/error metrics:
-
-```yaml
-regression_budgets:
-  - name: invoice-field-accuracy
-    metric: field_accuracy
-    dimension: schema_name
-    selector:
-      schema_name: invoice
-    max_regression: 0.01
-    min_paired_samples: 10
-```
-
-Run an OCR-only comparison without invoking an LLM:
-
-```bash
-docie-bench benchmark ocr run \
-  --dataset data/ocr_dataset/manifest.jsonl \
-  --backend pdf_text \
-  --backend tesseract
-```
-
-OCR manifests use the normal dataset fields plus one of `ocr_reference_text`,
-`ocr_reference_path`, or `ocr_reference_blocks`. The report includes character error
-rate, word error rate, layout preservation, latency, cache hit rate, and low-quality
-OCR rate. Pass extraction benchmark output with `--extraction-metrics
-runs/<run>/metrics.json` to correlate OCR character accuracy with downstream field
-accuracy.
-
-OCR artifacts are versioned JSON containing blocks, bounding boxes, confidence,
-optional embedded page images, backend metadata, and quality signals. Non-vision
-extraction and judge evaluation share the persistent cache at `OCR_CACHE_DIR`.
-Cache keys include document content, backend, language, backend/runtime version, and
-canonical backend configuration. Entries are checksum-validated, atomically replaced,
-rebuilt after corruption, and evicted least-recently-used when `OCR_CACHE_MAX_MB` is
-exceeded.
+Lease tokens prevent expired workers from publishing duplicate final results. Expired tasks are
+recovered during claims or through `POST /v1/workers/recover`. Runs can be inspected, queried,
+cancelled, and resumed under `/v1/experiments`. The in-process `BenchmarkWorker` supports sync or
+async executors and stores artifacts atomically through the configurable artifact-store protocol;
+`LocalArtifactStore` uses content-addressed paths to keep competing attempts isolated.
 
 Evaluate with an LLM judge by selecting a judge profile separately from extraction models:
 
