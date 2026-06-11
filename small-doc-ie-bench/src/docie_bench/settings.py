@@ -13,12 +13,16 @@ class Settings(BaseSettings):
 
     app_env: str = "local"
     log_level: str = "INFO"
-    api_host: str = "0.0.0.0"
+    api_host: str = "0.0.0.0"  # noqa: S104
     api_port: int = 8080
     max_upload_mb: int = 25
     raw_document_storage: Literal["disabled", "enabled"] = "disabled"
 
     database_url: str | None = None
+    review_claim_lease_seconds: int = Field(default=900, ge=30, le=86400)
+    review_confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    review_evidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    annotation_export_dir: Path = Path("annotations")
 
     default_schema_name: str = "invoice"
     default_model_profile: str = "local_llamacpp"
