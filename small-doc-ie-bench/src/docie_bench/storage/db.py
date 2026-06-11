@@ -41,9 +41,16 @@ def init_engine() -> None:
     settings = get_settings()
     if not settings.database_url:
         return
+    # Import model modules before creating metadata.
+    import docie_bench.orchestrator.models  # noqa: F401
+
     _engine = create_engine(settings.database_url, pool_pre_ping=True)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     Base.metadata.create_all(bind=_engine)
+
+
+def get_session_factory() -> sessionmaker[Session] | None:
+    return _SessionLocal
 
 
 @contextmanager

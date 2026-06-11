@@ -68,6 +68,22 @@ Run benchmark:
 make bench DATASET=data/sample_dataset/manifest.jsonl
 ```
 
+## Distributed orchestration
+
+Set `DATABASE_URL` to enable the persistent experiment and worker APIs. Submit a run with
+deterministic task keys through `POST /v1/experiments`, then workers use:
+
+- `POST /v1/workers/tasks/claim`
+- `POST /v1/workers/tasks/{task_id}/heartbeat`
+- `POST /v1/workers/tasks/{task_id}/complete`
+- `POST /v1/workers/tasks/{task_id}/fail`
+
+Lease tokens prevent expired workers from publishing duplicate final results. Expired tasks are
+recovered during claims or through `POST /v1/workers/recover`. Runs can be inspected, queried,
+cancelled, and resumed under `/v1/experiments`. The in-process `BenchmarkWorker` supports sync or
+async executors and stores artifacts atomically through the configurable artifact-store protocol;
+`LocalArtifactStore` uses content-addressed paths to keep competing attempts isolated.
+
 Evaluate with an LLM judge by selecting a judge profile separately from extraction models:
 
 ```yaml

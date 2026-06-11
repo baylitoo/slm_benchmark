@@ -11,12 +11,14 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.logging_config import configure_logging
+from docie_bench.orchestrator.api import configure_orchestrator, router as orchestrator_router
+from docie_bench.orchestrator.service import OrchestratorService
 from docie_bench.schemas.api import BenchmarkRunRequest, ExtractTextRequest
 from docie_bench.schemas.common import ExtractionResponse
 from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import save_extraction_audit
-from docie_bench.storage.db import init_engine
+from docie_bench.storage.db import get_session_factory, init_engine
 from docie_bench.telemetry import EXTRACTION_LATENCY, EXTRACTION_REQUESTS
 
 settings = get_settings()
@@ -27,6 +29,7 @@ app = FastAPI(
     title="Small Document IE Benchmark API",
     version="0.1.0",
 )
+app.include_router(orchestrator_router)
 
 
 def default_profile() -> ModelProfile:
@@ -56,6 +59,8 @@ def resolve_profile(profile_name: str | None) -> ModelProfile:
 @app.on_event("startup")
 def startup() -> None:
     init_engine()
+    sessions = get_session_factory()
+    configure_orchestrator(OrchestratorService(sessions) if sessions is not None else None)
     settings.ocr_cache_dir.mkdir(parents=True, exist_ok=True)
     settings.runs_dir.mkdir(parents=True, exist_ok=True)
 
