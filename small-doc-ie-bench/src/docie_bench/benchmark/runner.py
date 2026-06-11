@@ -35,7 +35,7 @@ class CpuSampler:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._t0 = 0.0
 
-    def __enter__(self) -> "CpuSampler":
+    def __enter__(self) -> CpuSampler:
         if not _HAS_PSUTIL:
             return self
         self._t0 = time.time()
@@ -144,6 +144,7 @@ async def run_benchmark(
                     "latency_ms": response.latency_ms,
                     "validation": response.validation.model_dump(),
                     "prediction": response.result,
+                    "routing": getattr(response, "routing", None),
                     "ground_truth": item.ground_truth,
                     "score": score_evidence(response.result),
                 }
@@ -165,7 +166,8 @@ async def run_benchmark(
                     except Exception as exc:
                         row["judge_error"] = repr(exc)
                 return row
-            except Exception as exc:  # benchmark must continue unless caller chooses fail-fast later
+            except Exception as exc:
+                # A benchmark continues unless the caller chooses fail-fast later.
                 return {
                     "doc_id": item.doc_id,
                     "schema_name": item.schema_name,
@@ -239,6 +241,9 @@ def summarize(
             round(sum(faithfulness) / len(faithfulness), 4) if faithfulness else None
         )
         n = len(profile_rows)
+        routed_rows = [r["routing"] for r in profile_rows if r.get("routing")]
+        routed_n = len(routed_rows)
+        routed_stages = [stage for route in routed_rows for stage in route.get("stages", [])]
         summary.append(
             {
                 "model_profile": profile,
@@ -246,7 +251,9 @@ def summarize(
                 "docs": n,
                 "concurrency": concurrency,
                 "wall_seconds": round(wall_seconds, 1),
-                "throughput_docs_per_min": round(n / wall_seconds * 60, 2) if wall_seconds else None,
+                "throughput_docs_per_min": (
+                    round(n / wall_seconds * 60, 2) if wall_seconds else None
+                ),
                 "ok_rate": len(ok_rows) / n if n else 0,
                 "valid_rate": len(valid_rows) / n if n else 0,
                 "field_accuracy": field_accuracy,
@@ -256,7 +263,9 @@ def summarize(
                     if evidence_total
                     else None
                 ),
-                "avg_similarity": round(sum(sim_values) / len(sim_values), 4) if sim_values else None,
+                "avg_similarity": (
+                    round(sum(sim_values) / len(sim_values), 4) if sim_values else None
+                ),
                 "judge_faithfulness": judge_faithfulness,
                 "judge_completeness": (
                     round(sum(completeness) / len(completeness), 4) if completeness else None
@@ -272,6 +281,52 @@ def summarize(
                 "avg_latency_ms": sum(r.get("latency_ms", 0) for r in profile_rows) / n if n else 0,
                 "p50_latency_ms": _percentile([r.get("latency_ms", 0) for r in profile_rows], 50),
                 "p95_latency_ms": _percentile([r.get("latency_ms", 0) for r in profile_rows], 95),
+                "routing_accept_rate": (
+                    sum(r.get("terminal_decision") == "accept" for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "routing_escalation_rate": (
+                    sum(r.get("terminal_decision") == "escalate" for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "routing_fallback_rate": (
+                    sum(r.get("fallback_count", 0) > 0 for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "routing_budget_exhaustion_rate": (
+                    sum(bool(r.get("budget_exhausted")) for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "avg_routing_attempts": (
+                    sum(r.get("attempts", 0) for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "avg_routing_latency_ms": (
+                    sum(r.get("latency_ms", 0) for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "avg_routing_tokens": (
+                    sum(r.get("total_tokens", 0) for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "avg_routing_cost_units": (
+                    sum(r.get("cost_units", 0) for r in routed_rows) / routed_n
+                    if routed_n
+                    else None
+                ),
+                "routing_stage_failure_rate": (
+                    sum(stage.get("status") == "error" for stage in routed_stages)
+                    / len(routed_stages)
+                    if routed_stages
+                    else None
+                ),
             }
         )
     return {
