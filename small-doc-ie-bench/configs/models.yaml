@@ -58,6 +58,16 @@ profiles:
     max_tokens: 900
     timeout_seconds: 180
     prompt_profile: strict_extraction_v1
+    # Gateway controls. "required" validates model/capability metadata from GET /models.
+    capability_discovery: optional
+    retry_max_attempts: 3
+    retry_backoff_base_seconds: 1
+    retry_backoff_max_seconds: 8
+    circuit_breaker_failure_threshold: 5
+    circuit_breaker_reset_seconds: 30
+    max_concurrency: 4
+    queue_limit: 32
+    queue_timeout_seconds: 30
 
   # --- Ollama local profiles (ordered by size) ---
 

@@ -23,10 +23,12 @@ from docie_bench.llm.prompts import (
     build_vision_user_prompt,
 )
 from docie_bench.ocr.base import text_to_blocks
-from docie_bench.ocr.factory import get_ocr_backend
+from docie_bench.ocr.service import processor_from_settings
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 from docie_bench.schemas.extraction import schema_json
+from docie_bench.security import redact_fields
+from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 _CURRENCY_MAP = {"€": "EUR", "£": "GBP", "$": "USD", "¥": "JPY", "₣": "CHF"}
 _DATE_FIELD_NAMES = {"issue_date", "due_date", "birth_date", "expiry_date"}
-_DECIMAL_FIELD_NAMES = {"vat_rate"}
+_DECIMAL_FIELD_NAMES = {"vat_rate", "quantity", "tax_rate"}
 
 
 _COUNTRY_ISO: dict[str, str] = {
@@ -48,18 +50,13 @@ _COUNTRY_ISO: dict[str, str] = {
 
 
 def _norm_amount(raw: str) -> str:
-    """Fallback: '4 026,00 €' → '4026.00'. With typed templates the model should output clean numbers."""
+    """Normalize a locale-formatted amount when a model ignores the type hint."""
     s = re.sub(r"[€£$¥₣a-zA-Z]", "", raw).strip()
     if "," in s and "." in s:
         # Ambiguous: detect thousands vs decimal by position
         comma_pos = s.rfind(",")
         dot_pos = s.rfind(".")
-        if dot_pos > comma_pos:
-            # e.g. '1,234.56' — dot is decimal, comma is thousands
-            s = s.replace(",", "")
-        else:
-            # e.g. '1.234,56' — comma is decimal, dot is thousands
-            s = s.replace(".", "").replace(",", ".")
+        s = s.replace(",", "") if dot_pos > comma_pos else s.replace(".", "").replace(",", ".")
     elif "," in s:
         s = s.replace(" ", "").replace(",", ".")
     else:
@@ -119,6 +116,9 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> dict[str,
     for key, val in raw.items():
         if key == "document_type":
             continue  # already set above
+        if isinstance(val, list):
+            result[key] = [_normalize_nested_nuextract(item) for item in val]
+            continue
         if not isinstance(val, dict):
             result[key] = val
             continue
@@ -133,7 +133,8 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> dict[str,
             if isinstance(amt, str):
                 sub["amount"] = _norm_amount(amt)
             if "currency" in sub and isinstance(sub.get("currency"), str):
-                sub["currency"] = _CURRENCY_MAP.get(sub["currency"].strip(), sub["currency"].strip()) or None
+                currency = sub["currency"].strip()
+                sub["currency"] = _CURRENCY_MAP.get(currency, currency) or None
 
         # Date fallback
         if key in _DATE_FIELD_NAMES and isinstance(sub.get("value"), str) and sub["value"]:
@@ -168,6 +169,29 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> dict[str,
     return result
 
 
+def _normalize_nested_nuextract(obj: Any, field_name: str | None = None) -> Any:
+    if isinstance(obj, list):
+        return [_normalize_nested_nuextract(item) for item in obj]
+    if not isinstance(obj, dict):
+        return obj
+    normalized = {
+        key: _normalize_nested_nuextract(value, key)
+        for key, value in obj.items()
+    }
+    if isinstance(normalized.get("amount"), str):
+        normalized["amount"] = _norm_amount(normalized["amount"])
+    if isinstance(normalized.get("currency"), str):
+        currency = normalized["currency"].strip()
+        normalized["currency"] = _CURRENCY_MAP.get(currency, currency) or None
+    if field_name in _DECIMAL_FIELD_NAMES and isinstance(normalized.get("value"), str):
+        normalized["value"] = re.sub(r"[%\s]", "", normalized["value"]).replace(",", ".")
+    if field_name in _DATE_FIELD_NAMES and isinstance(normalized.get("value"), str):
+        normalized["value"] = _norm_date(normalized["value"])
+    if normalized.get("value") == "":
+        return None
+    return normalized
+
+
 def hash_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
@@ -197,14 +221,22 @@ class ExtractionService:
         document_hash: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> ExtractionResponse:
-        blocks = ocr_blocks if ocr_blocks is not None else text_to_blocks(text or "", source="manual")
+        blocks = (
+            ocr_blocks
+            if ocr_blocks is not None
+            else text_to_blocks(text or "", source="manual")
+        )
         logger.debug(
             "ocr_complete",
             extra={
                 "docie_step": "ocr",
                 "docie_backend": "manual",
                 "docie_block_count": len(blocks),
-                "docie_blocks": [{"id": b.id, "text": b.text} for b in blocks],
+                **(
+                    {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
+                    if get_settings().log_document_content
+                    else {}
+                ),
             },
         )
         return await self._extract_blocks(
@@ -256,9 +288,13 @@ class ExtractionService:
             )
         if ocr_backend_name.lower().strip() == "vision":
             raise ValueError("ocr_backend='vision' requires a model profile with vision: true")
-        backend = get_ocr_backend(ocr_backend_name, language=language)
         t0 = time.perf_counter()
-        blocks = backend.extract(path)
+        ocr_result = processor_from_settings(get_settings()).process(
+            path,
+            backend_name=ocr_backend_name,
+            language=language,
+        )
+        blocks = ocr_result.artifact.blocks
         ocr_ms = int((time.perf_counter() - t0) * 1000)
         logger.debug(
             "ocr_complete",
@@ -268,7 +304,11 @@ class ExtractionService:
                 "docie_path": str(path),
                 "docie_block_count": len(blocks),
                 "docie_ocr_latency_ms": ocr_ms,
-                "docie_blocks": [{"id": b.id, "text": b.text} for b in blocks],
+                **(
+                    {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
+                    if get_settings().log_document_content
+                    else {}
+                ),
             },
         )
         return await self._extract_blocks(
@@ -278,7 +318,7 @@ class ExtractionService:
             schema_mode=schema_mode,
             dynamic_schema=dynamic_schema,
             language=language,
-            document_hash=hash_file(path),
+            document_hash=ocr_result.artifact.document_hash,
             metadata=metadata or {},
         )
 
@@ -375,7 +415,9 @@ class ExtractionService:
                 "docie_valid": validation.valid,
                 "docie_errors": validation.errors,
                 "docie_warnings": validation.warnings,
-                "docie_normalized_result": normalized,
+                "docie_normalized_result": redact_fields(
+                    normalized, get_settings().audit_redaction_fields
+                ),
             },
         )
 
@@ -389,7 +431,9 @@ class ExtractionService:
             usage=usage,
             latency_ms=latency_ms,
             dynamic_schema=(
-                dynamic_spec.model_dump(mode="json", exclude_none=True) if dynamic_spec else None
+                dynamic_spec.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+                if dynamic_spec
+                else None
             ),
         )
 
