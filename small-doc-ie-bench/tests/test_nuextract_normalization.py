@@ -58,3 +58,24 @@ def test_does_not_derive_subtotal_for_other_schemas():
     result = _normalize_nuextract_raw(raw, "identity_card")
 
     assert "subtotal" not in result
+
+
+def test_normalizes_nested_line_item_numbers_and_money():
+    result = _normalize_nuextract_raw(
+        {
+            "line_items": [
+                {
+                    "description": {"value": "Consulting"},
+                    "quantity": {"value": "2,5"},
+                    "unit_price": {"amount": "1 200,00", "currency": "€"},
+                    "line_total": {"amount": "3.000,00", "currency": "EUR"},
+                }
+            ]
+        },
+        "invoice",
+    )
+
+    item = result["line_items"][0]
+    assert item["quantity"]["value"] == "2.5"
+    assert item["unit_price"] == {"amount": "1200.00", "currency": "EUR"}
+    assert item["line_total"] == {"amount": "3000.00", "currency": "EUR"}

@@ -7,6 +7,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from docie_bench.schemas.common import DateField, MoneyField, NumberField, TextField
 
 
+class InvoiceLineItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: TextField | None = None
+    sku: TextField | None = None
+    quantity: NumberField | None = None
+    unit_price: MoneyField | None = None
+    line_total: MoneyField | None = None
+    tax_rate: NumberField | None = None
+
+
 class InvoiceExtraction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -26,6 +37,7 @@ class InvoiceExtraction(BaseModel):
     currency: TextField | None = Field(default=None, description="ISO-4217 currency code if explicit")
     iban: TextField | None = None
     payment_terms: TextField | None = None
+    line_items: list[InvoiceLineItem] = Field(default_factory=list)
     extraction_notes: list[str] = Field(default_factory=list)
 
 

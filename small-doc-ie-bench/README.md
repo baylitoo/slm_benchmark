@@ -68,6 +68,44 @@ Run benchmark:
 make bench DATASET=data/sample_dataset/manifest.jsonl
 ```
 
+Compare a candidate run with a baseline and enforce regression budgets:
+
+```bash
+docie-bench benchmark compare \
+  runs/baseline \
+  runs/candidate \
+  --budgets configs/regression-budgets.yaml \
+  --output-dir comparison
+```
+
+The command writes `comparison.json`, a compact CI-oriented `verdict.json`, and a
+human-readable `comparison.md`. It exits non-zero when a budget is exceeded, a required
+metric is missing, or the runs have no matched observations. Comparisons use matched
+documents and fields; unmatched samples and small sample sizes are reported as warnings.
+
+Promote and audit named, versioned baselines:
+
+```bash
+docie-bench benchmark baseline promote runs/approved main
+docie-bench benchmark baseline list
+docie-bench benchmark compare main runs/candidate --budgets configs/regression-budgets.yaml
+```
+
+Budget entries select a metric and comparison dimension. `max_regression` is always
+expressed in the metric's native units and works for both higher-is-better quality metrics
+and lower-is-better latency/error metrics:
+
+```yaml
+regression_budgets:
+  - name: invoice-field-accuracy
+    metric: field_accuracy
+    dimension: schema_name
+    selector:
+      schema_name: invoice
+    max_regression: 0.01
+    min_paired_samples: 10
+```
+
 Evaluate with an LLM judge by selecting a judge profile separately from extraction models:
 
 ```yaml
@@ -95,6 +133,26 @@ Judge results are stored per prediction and aggregated as `judge_faithfulness` a
 `judge_completeness` in `metrics.json`. In `both` mode, `judge_field_accuracy_delta`
 compares aggregate judge faithfulness with labeled field accuracy. Judge failures are
 recorded as `judge_error` without changing extraction success.
+
+### Reproducible and resumable runs
+
+Each benchmark run writes an immutable `manifest.json` with the git state, sanitized selected
+model profiles, model config and dataset hashes, document hashes, dependency versions, system
+resources, invocation arguments, and stable task IDs. Predictions and lifecycle events are
+durably appended, while final prediction, metric, and report artifacts are replaced atomically.
+
+Resume an interrupted run by reusing its output directory:
+
+```bash
+docie-bench benchmark run \
+  --dataset data/sample_dataset/manifest.jsonl \
+  --output-dir runs/my-run \
+  --resume
+```
+
+Resume skips completed and failed terminal tasks, repairs a truncated final JSONL record, and
+refuses to proceed when code, model config, selected profiles, dataset contents, or task inputs
+have drifted. Concurrency may change when resuming because it does not affect task identity.
 
 ## Model profiles
 
@@ -139,6 +197,20 @@ includes `dynamic_schema`; persist that JSON and pass it as `dynamic_schema` on 
 manifest rows) to reuse it without another proposal call. A NuExtract profile needs an
 instruction-following `schema_proposer_profile` for first-time inference, but can extract directly
 from a reused dynamic schema.
+
+Dynamic fields support scalar `string`, `date`, `number`, and `money` types plus recursive `object`
+and repeated-row `list` types. Container fields define their reusable children in `fields`.
+
+Invoice extraction includes typed `line_items` with description, SKU, quantity, unit price, line
+total, and tax rate. To evaluate a table, put a list under the matching ground-truth key. Rows are
+aligned by maximum cell similarity before cell accuracy and row precision/recall/F1 are calculated:
+
+```json
+{"ground_truth":{"line_items":[{"description":"Keyboard","quantity":"2","line_total.amount":"150.00"}]}}
+```
+
+Validation checks each `quantity * unit_price` against `line_total`, the sum of line totals against
+the invoice subtotal, and reports mismatches as warnings.
 
 Vision-capable model profiles can bypass OCR for PDFs and images:
 
