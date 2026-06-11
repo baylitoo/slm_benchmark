@@ -208,13 +208,17 @@ The extraction endpoints return:
 
 ## Security boundaries
 
-This project does not claim PII compliance out of the box. It provides the hooks you need:
+This project does not claim PII compliance out of the box. See
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for deployment guidance, residual risks, and
+security configuration. The API provides:
 
-- request size limits;
-- content-type allowlist;
+- bounded upload, text, and OCR-block limits;
+- MIME allowlisting with content validation;
+- optional API-key authentication and per-tenant in-memory quotas;
+- prompt-injection boundaries for adversarial document content;
 - hash-based audit storage;
-- configurable raw document storage policy;
-- redaction-friendly logging;
+- configurable audit and response field redaction;
+- document-content logging disabled by default;
 - per-run artifacts separated from service logs.
 
 ## Development

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 from sqlalchemy import JSON, DateTime, Integer, MetaData, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -21,7 +22,10 @@ class ExtractionAudit(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC)
+    )
+    tenant_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     schema_name: Mapped[str] = mapped_column(String(64), index=True)
     model_profile: Mapped[str] = mapped_column(String(128), index=True)
     document_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)

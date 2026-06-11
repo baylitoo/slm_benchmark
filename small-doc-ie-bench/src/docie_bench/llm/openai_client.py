@@ -10,6 +10,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.response_format import build_response_format
+from docie_bench.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +146,14 @@ class OpenAICompatibleClient:
                 "docie_model": self.profile.model,
                 "docie_schema_name": schema_name,
                 "docie_response_format_style": self.profile.response_format_style,
-                "docie_system_prompt": system_prompt,
-                "docie_user_prompt": user_prompt,
+                **(
+                    {
+                        "docie_system_prompt": system_prompt,
+                        "docie_user_prompt": user_prompt,
+                    }
+                    if get_settings().log_document_content
+                    else {}
+                ),
                 "docie_image_count": len(image_urls or []),
             },
         )
@@ -176,7 +183,7 @@ class OpenAICompatibleClient:
                 "docie_step": "llm_response",
                 "docie_model": self.profile.model,
                 "docie_schema_name": schema_name,
-                "docie_raw_content": content,
+                **({"docie_raw_content": content} if get_settings().log_document_content else {}),
                 "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
                 "docie_usage": data.get("usage"),
                 "docie_llm_latency_ms": llm_latency_ms,

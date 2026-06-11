@@ -27,6 +27,8 @@ from docie_bench.ocr.factory import get_ocr_backend
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 from docie_bench.schemas.extraction import schema_json
+from docie_bench.security import redact_fields
+from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
 
 logger = logging.getLogger(__name__)
@@ -204,7 +206,11 @@ class ExtractionService:
                 "docie_step": "ocr",
                 "docie_backend": "manual",
                 "docie_block_count": len(blocks),
-                "docie_blocks": [{"id": b.id, "text": b.text} for b in blocks],
+                **(
+                    {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
+                    if get_settings().log_document_content
+                    else {}
+                ),
             },
         )
         return await self._extract_blocks(
@@ -268,7 +274,11 @@ class ExtractionService:
                 "docie_path": str(path),
                 "docie_block_count": len(blocks),
                 "docie_ocr_latency_ms": ocr_ms,
-                "docie_blocks": [{"id": b.id, "text": b.text} for b in blocks],
+                **(
+                    {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
+                    if get_settings().log_document_content
+                    else {}
+                ),
             },
         )
         return await self._extract_blocks(
@@ -375,7 +385,9 @@ class ExtractionService:
                 "docie_valid": validation.valid,
                 "docie_errors": validation.errors,
                 "docie_warnings": validation.warnings,
-                "docie_normalized_result": normalized,
+                "docie_normalized_result": redact_fields(
+                    normalized, get_settings().audit_redaction_fields
+                ),
             },
         )
 
