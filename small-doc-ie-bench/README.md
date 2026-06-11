@@ -68,6 +68,54 @@ Run benchmark:
 make bench DATASET=data/sample_dataset/manifest.jsonl
 ```
 
+Evaluate with an LLM judge by selecting a judge profile separately from extraction models:
+
+```yaml
+judge:
+  profile: remote_openai_compatible
+```
+
+```bash
+docie-bench benchmark run \
+  --dataset data/sample_dataset/manifest.jsonl \
+  --eval-mode both
+```
+
+An unlabeled document does not need a manifest:
+
+```bash
+docie-bench benchmark run \
+  --document data/sample_dataset/files/invoice-001.txt \
+  --schema-name invoice \
+  --model-profile local_llamacpp \
+  --eval-mode llm_judge
+```
+
+Judge results are stored per prediction and aggregated as `judge_faithfulness` and
+`judge_completeness` in `metrics.json`. In `both` mode, `judge_field_accuracy_delta`
+compares aggregate judge faithfulness with labeled field accuracy. Judge failures are
+recorded as `judge_error` without changing extraction success.
+
+### Reproducible and resumable runs
+
+Each benchmark run writes an immutable `manifest.json` with the git state, sanitized selected
+model profiles, model config and dataset hashes, document hashes, dependency versions, system
+resources, invocation arguments, and stable task IDs. Predictions and lifecycle events are
+durably appended, while final prediction, metric, and report artifacts are replaced atomically.
+
+Resume an interrupted run by reusing its output directory:
+
+```bash
+docie-bench benchmark run \
+  --dataset data/sample_dataset/manifest.jsonl \
+  --output-dir runs/my-run \
+  --resume
+```
+
+Resume skips completed and failed terminal tasks, repairs a truncated final JSONL record, and
+refuses to proceed when code, model config, selected profiles, dataset contents, or task inputs
+have drifted. Concurrency may change when resuming because it does not affect task identity.
+
 ## Model profiles
 
 Model profiles live in `configs/models.yaml`. A profile can point to:
@@ -103,6 +151,33 @@ Supported files:
 - `.txt`: already OCR'd text;
 - `.pdf`: text layer via `pdfplumber` or OCR fallback;
 - `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`: OCR backend required.
+
+### Dynamic schemas
+
+Set `schema_mode` to `dynamic` to infer a schema for an unknown OCR-text document. The response
+includes `dynamic_schema`; persist that JSON and pass it as `dynamic_schema` on later requests (or
+manifest rows) to reuse it without another proposal call. A NuExtract profile needs an
+instruction-following `schema_proposer_profile` for first-time inference, but can extract directly
+from a reused dynamic schema.
+
+Vision-capable model profiles can bypass OCR for PDFs and images:
+
+```yaml
+profiles:
+  ollama_qwen25_vl_7b:
+    model: qwen2.5vl:7b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: json_object
+    vision: true
+    vision_max_pages: 8
+    vision_pdf_dpi: 150
+```
+
+With `vision: true`, image files are normalized to PNG and PDF pages are rasterized
+with PyMuPDF, then sent as OpenAI-compatible `image_url` content blocks. `.txt` input
+is intentionally rejected for vision profiles. Benchmark artifacts label each result
+as `vision` or `ocr:<backend>` so the same manifest can compare both paths side by side.
 
 ## Choosing a CPU model
 

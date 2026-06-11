@@ -163,6 +163,8 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> dict[str,
             continue
 
         result[key] = sub
+    if schema_name == "invoice":
+        _derive_invoice_subtotal(result)
     return result
 
 
@@ -179,8 +181,9 @@ def hash_file(path: Path) -> str:
 
 
 class ExtractionService:
-    def __init__(self, profile: ModelProfile) -> None:
+    def __init__(self, profile: ModelProfile, proposer_profile: ModelProfile | None = None) -> None:
         self.profile = profile
+        self.proposer_profile = proposer_profile
 
     async def extract_from_text(
         self,
@@ -188,6 +191,8 @@ class ExtractionService:
         text: str | None,
         ocr_blocks: list[OCRBlock] | None,
         schema_name: str,
+        schema_mode: str = "static",
+        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None = None,
         language: str | None = None,
         document_hash: str | None = None,
         metadata: dict[str, str] | None = None,
@@ -205,6 +210,8 @@ class ExtractionService:
         return await self._extract_blocks(
             blocks=blocks,
             schema_name=schema_name,
+            schema_mode=schema_mode,
+            dynamic_schema=dynamic_schema,
             language=language,
             document_hash=document_hash,
             metadata=metadata or {},
@@ -216,9 +223,39 @@ class ExtractionService:
         path: Path,
         ocr_backend_name: str,
         schema_name: str,
+        schema_mode: str = "static",
+        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None = None,
         language: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> ExtractionResponse:
+        if self.profile.vision:
+            t0 = time.perf_counter()
+            images = load_document_images(
+                path,
+                max_pages=self.profile.vision_max_pages,
+                pdf_dpi=self.profile.vision_pdf_dpi,
+            )
+            logger.debug(
+                "vision_ingestion_complete",
+                extra={
+                    "docie_step": "vision_ingestion",
+                    "docie_path": str(path),
+                    "docie_page_count": len(images),
+                    "docie_ingestion_latency_ms": int((time.perf_counter() - t0) * 1000),
+                },
+            )
+            return await self._extract_blocks(
+                blocks=[],
+                images=images,
+                schema_name=schema_name,
+                schema_mode=schema_mode,
+                dynamic_schema=dynamic_schema,
+                language=language,
+                document_hash=hash_file(path),
+                metadata=metadata or {},
+            )
+        if ocr_backend_name.lower().strip() == "vision":
+            raise ValueError("ocr_backend='vision' requires a model profile with vision: true")
         backend = get_ocr_backend(ocr_backend_name, language=language)
         t0 = time.perf_counter()
         blocks = backend.extract(path)
@@ -236,7 +273,10 @@ class ExtractionService:
         )
         return await self._extract_blocks(
             blocks=blocks,
+            images=None,
             schema_name=schema_name,
+            schema_mode=schema_mode,
+            dynamic_schema=dynamic_schema,
             language=language,
             document_hash=hash_file(path),
             metadata=metadata or {},
@@ -246,18 +286,56 @@ class ExtractionService:
         self,
         *,
         blocks: list[OCRBlock],
+        images: list[DocumentImage] | None = None,
         schema_name: str,
+        schema_mode: str,
+        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
         language: str | None,
         document_hash: str | None,
         metadata: dict[str, str],
     ) -> ExtractionResponse:
         request_id = str(uuid.uuid4())
-        schema = schema_json(schema_name)
-        if self.profile.prompt_profile == "nuextract_v1":
+        started = time.perf_counter()
+        dynamic_spec: DynamicSchemaSpec | None = None
+        model_cls = None
+        nuextract_template = None
+        if schema_mode == "dynamic":
+            if isinstance(dynamic_schema, DynamicSchemaSpec):
+                dynamic_spec = dynamic_schema
+            elif dynamic_schema is not None:
+                dynamic_spec = DynamicSchemaSpec.model_validate(dynamic_schema)
+            else:
+                if not blocks:
+                    raise ValueError(
+                        "Dynamic schema inference requires OCR text; supply a reusable "
+                        "dynamic_schema for vision-only extraction"
+                    )
+                dynamic_spec = await self._propose_schema(blocks=blocks, language=language)
+            schema_name = dynamic_spec.document_type
+            model_cls = DynamicTemplateBuilder.build_model(dynamic_spec)
+            schema = model_cls.model_json_schema()
+            nuextract_template = DynamicTemplateBuilder.build_nuextract_template(dynamic_spec)
+        elif schema_mode == "static":
+            if dynamic_schema is not None:
+                raise ValueError("dynamic_schema can only be supplied when schema_mode='dynamic'")
+            schema = schema_json(schema_name)
+        else:
+            raise ValueError("schema_mode must be 'static' or 'dynamic'")
+        if images:
+            system_prompt = VISION_SYSTEM_PROMPT
+            user_prompt = build_vision_user_prompt(
+                schema_name=schema_name,
+                schema=schema,
+                page_count=len(images),
+                language=language,
+                metadata=metadata,
+            )
+        elif self.profile.prompt_profile == "nuextract_v1":
             system_prompt, user_prompt = build_nuextract_prompts(
                 schema_name=schema_name,
                 blocks=blocks,
                 language=language,
+                template=nuextract_template,
             )
         else:
             system_prompt = SYSTEM_PROMPT
@@ -268,7 +346,6 @@ class ExtractionService:
                 language=language,
                 metadata=metadata,
             )
-        started = time.perf_counter()
         client = OpenAICompatibleClient(self.profile)
         try:
             raw, usage_dict, _raw_response = await client.chat_json(
@@ -276,12 +353,14 @@ class ExtractionService:
                 user_prompt=user_prompt,
                 schema_name=schema_name,
                 schema=schema,
+                image_urls=[image.data_url() for image in images] if images else None,
             )
         finally:
             await client.aclose()
         if self.profile.prompt_profile == "nuextract_v1":
             raw = _normalize_nuextract_raw(raw, schema_name)
-        normalized, validation = validate_extraction(schema_name, raw, blocks)
+        raw = ground_evidence(raw, blocks)
+        normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
         latency_ms = int((time.perf_counter() - started) * 1000)
         usage = Usage.model_validate(usage_dict) if isinstance(usage_dict, dict) else None
 
@@ -309,4 +388,31 @@ class ExtractionService:
             validation=validation,
             usage=usage,
             latency_ms=latency_ms,
+            dynamic_schema=(
+                dynamic_spec.model_dump(mode="json", exclude_none=True) if dynamic_spec else None
+            ),
         )
+
+    async def _propose_schema(
+        self,
+        *,
+        blocks: list[OCRBlock],
+        language: str | None,
+    ) -> DynamicSchemaSpec:
+        profile = self.proposer_profile or self.profile
+        if profile.prompt_profile == "nuextract_v1":
+            raise ValueError(
+                "Dynamic schema inference requires an instruction-following proposer profile "
+                "or a reusable dynamic_schema"
+            )
+        client = OpenAICompatibleClient(profile)
+        try:
+            raw, _usage, _response = await client.chat_json(
+                system_prompt=SCHEMA_PROPOSER_SYSTEM_PROMPT,
+                user_prompt=build_schema_proposer_prompt(blocks=blocks, language=language),
+                schema_name="dynamic_schema_spec",
+                schema=DynamicSchemaSpec.model_json_schema(),
+            )
+        finally:
+            await client.aclose()
+        return DynamicSchemaSpec.model_validate(raw)

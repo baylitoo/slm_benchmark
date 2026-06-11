@@ -91,11 +91,18 @@ def get_schema(schema_name: str) -> dict:
 @app.post("/v1/extract/text", response_model=ExtractionResponse)
 async def extract_text(payload: ExtractTextRequest) -> ExtractionResponse:
     profile = resolve_profile(payload.model_profile)
-    service = ExtractionService(profile)
+    proposer_profile = (
+        resolve_profile(payload.schema_proposer_profile)
+        if payload.schema_proposer_profile
+        else None
+    )
+    service = ExtractionService(profile, proposer_profile=proposer_profile)
     response = await service.extract_from_text(
         text=payload.text,
         ocr_blocks=payload.ocr_blocks,
         schema_name=payload.schema_name,
+        schema_mode=payload.schema_mode,
+        dynamic_schema=payload.dynamic_schema,
         language=payload.language,
         document_hash=payload.document_hash or (hash_bytes(payload.text.encode("utf-8")) if payload.text else None),
         metadata=payload.metadata,
@@ -158,5 +165,10 @@ async def run_benchmark_endpoint(payload: BenchmarkRunRequest) -> dict[str, str]
         model_profile=payload.model_profile,
         output_dir=Path(payload.output_dir) if payload.output_dir else None,
         concurrency=payload.concurrency,
+        resume=payload.resume,
     )
-    return {"run_dir": str(result.run_dir), "metrics_path": str(result.metrics_path)}
+    return {
+        "run_dir": str(result.run_dir),
+        "metrics_path": str(result.metrics_path),
+        "manifest_path": str(result.manifest_path),
+    }

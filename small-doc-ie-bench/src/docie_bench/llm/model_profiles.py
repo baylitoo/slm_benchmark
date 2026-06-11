@@ -21,6 +21,9 @@ class ModelProfile:
     timeout_seconds: float = 180.0
     prompt_profile: str = "strict_extraction_v1"
     stop_sequences: tuple[str, ...] = ()
+    vision: bool = False
+    vision_max_pages: int = 8
+    vision_pdf_dpi: int = 150
 
 
 def _expand_env(value: Any) -> Any:
@@ -30,7 +33,7 @@ def _expand_env(value: Any) -> Any:
 
 
 def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     profiles: dict[str, ModelProfile] = {}
     for name, cfg in data.get("profiles", {}).items():
         cfg = {key: _expand_env(value) for key, value in cfg.items()}
@@ -48,5 +51,23 @@ def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
             timeout_seconds=float(cfg.get("timeout_seconds", 180)),
             prompt_profile=cfg.get("prompt_profile", "strict_extraction_v1"),
             stop_sequences=tuple(cfg.get("stop_sequences") or ()),
+            vision=bool(cfg.get("vision", False)),
+            vision_max_pages=int(cfg.get("vision_max_pages", 8)),
+            vision_pdf_dpi=int(cfg.get("vision_pdf_dpi", 150)),
         )
     return profiles
+
+
+def load_judge_profile(path: str | Path, profile_name: str | None = None) -> ModelProfile:
+    config_path = Path(path)
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    selected_name = profile_name or data.get("judge", {}).get("profile")
+    if not selected_name:
+        raise ValueError(
+            "LLM judge evaluation requires --judge-profile or judge.profile in models.yaml"
+        )
+    profiles = load_model_profiles(config_path)
+    try:
+        return profiles[selected_name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown judge profile {selected_name!r}") from exc

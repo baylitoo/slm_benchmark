@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -11,6 +11,8 @@ class DatasetItem(BaseModel):
     doc_id: str
     file_path: str
     schema_name: str = "invoice"
+    schema_mode: Literal["static", "dynamic"] = "static"
+    dynamic_schema: dict[str, Any] | None = None
     language: str | None = None
     ground_truth: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
