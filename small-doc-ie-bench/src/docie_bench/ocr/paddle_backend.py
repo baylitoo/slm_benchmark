@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -14,19 +15,32 @@ class PaddleOCRBackend(OCRBackend):
         self.lang = lang
         self._engine: Any | None = None
 
+    def configuration(self) -> dict[str, Any]:
+        return {"lang": self.lang, "use_angle_cls": True}
+
+    def version(self) -> str:
+        try:
+            return f"1:paddleocr-{version('paddleocr')}"
+        except PackageNotFoundError:
+            return "1:paddleocr-unknown"
+
     @property
-    def engine(self):
+    def engine(self) -> Any:
         if self._engine is None:
             try:
                 from paddleocr import PaddleOCR
             except ImportError as exc:
-                raise RuntimeError("Install optional dependency: pip install small-doc-ie-bench[paddle]") from exc
+                raise RuntimeError(
+                    "Install optional dependency: pip install small-doc-ie-bench[paddle]"
+                ) from exc
             self._engine = PaddleOCR(use_angle_cls=True, lang=self.lang, show_log=False)
         return self._engine
 
     def extract(self, path: Path) -> list[OCRBlock]:
         if path.suffix.lower() == ".txt":
-            return text_to_blocks(path.read_text(encoding="utf-8", errors="replace"), source="manual")
+            return text_to_blocks(
+                path.read_text(encoding="utf-8", errors="replace"), source="manual"
+            )
 
         result = self.engine.ocr(str(path), cls=True)
         blocks: list[OCRBlock] = []

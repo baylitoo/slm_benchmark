@@ -35,6 +35,7 @@ from docie_bench.benchmark.reproducibility import (
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_profiles import ModelProfile, load_judge_profile, load_model_profiles
 from docie_bench.ocr.factory import get_ocr_backend
+from docie_bench.ocr.service import processor_from_settings
 from docie_bench.settings import get_settings
 
 try:
@@ -348,11 +349,18 @@ async def run_benchmark(
                     row["score"] = score_prediction(item.ground_truth, response.result)
                 if selected_judge is not None:
                     try:
-                        backend = get_ocr_backend(
-                            settings.default_ocr_backend,
-                            language=item.language,
-                        )
-                        blocks = backend.extract(Path(item.file_path))
+                        if hasattr(settings, "ocr_cache_enabled"):
+                            ocr_result = processor_from_settings(settings).process(
+                                Path(item.file_path),
+                                backend_name=settings.default_ocr_backend,
+                                language=item.language,
+                            )
+                            blocks = ocr_result.artifact.blocks
+                        else:
+                            backend = get_ocr_backend(
+                                settings.default_ocr_backend, language=item.language
+                            )
+                            blocks = backend.extract(Path(item.file_path))
                         document_text = "\n".join(block.text for block in blocks)
                         row["judge"] = await judge_extraction(
                             profile=selected_judge,

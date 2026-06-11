@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from docie_bench.schemas.common import OCRBlock
+
 
 class DatasetItem(BaseModel):
     doc_id: str
@@ -14,7 +16,9 @@ class DatasetItem(BaseModel):
     schema_mode: Literal["static", "dynamic"] = "static"
     dynamic_schema: dict[str, Any] | None = None
     language: str | None = None
-    split: str = "unspecified"
+    ocr_reference_text: str | None = None
+    ocr_reference_path: str | None = None
+    ocr_reference_blocks: list[OCRBlock] | None = None
     ground_truth: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
 
@@ -33,5 +37,9 @@ def load_dataset(path: Path) -> list[DatasetItem]:
         file_path = Path(item.file_path)
         if not file_path.is_absolute():
             item.file_path = str((base / file_path).resolve())
+        if item.ocr_reference_path:
+            reference_path = Path(item.ocr_reference_path)
+            if not reference_path.is_absolute():
+                item.ocr_reference_path = str((base / reference_path).resolve())
         items.append(item)
     return items

@@ -9,6 +9,7 @@ The project is designed for a Ryzen-class CPU server with 64 GB RAM and no GPU. 
 - **OpenAI-compatible LLM abstraction**: call local `llama.cpp`, vLLM, Ollama-compatible gateways, or a remote OpenAI-compatible endpoint through one client.
 - **Schema-constrained extraction**: JSON Schema / Pydantic first; no free-form JSON guessing.
 - **OCR modularity**: `pdf_text`, `tesseract`, and `paddleocr` backends behind one interface.
+- **OCR laboratory**: content-addressed OCR artifacts, persistent cache, and no-LLM OCR reports.
 - **Production API**: FastAPI service with health checks, metrics, file-size limits, structured logs, and optional Postgres audit persistence.
 - **Benchmark runner**: run many model profiles over the same dataset and produce JSONL predictions, metrics, and an HTML report.
 - **Docker Compose stack**: API, benchmark container, local llama.cpp-compatible server, Postgres, Prometheus, and Grafana.
@@ -105,6 +106,30 @@ regression_budgets:
     max_regression: 0.01
     min_paired_samples: 10
 ```
+
+Run an OCR-only comparison without invoking an LLM:
+
+```bash
+docie-bench benchmark ocr run \
+  --dataset data/ocr_dataset/manifest.jsonl \
+  --backend pdf_text \
+  --backend tesseract
+```
+
+OCR manifests use the normal dataset fields plus one of `ocr_reference_text`,
+`ocr_reference_path`, or `ocr_reference_blocks`. The report includes character error
+rate, word error rate, layout preservation, latency, cache hit rate, and low-quality
+OCR rate. Pass extraction benchmark output with `--extraction-metrics
+runs/<run>/metrics.json` to correlate OCR character accuracy with downstream field
+accuracy.
+
+OCR artifacts are versioned JSON containing blocks, bounding boxes, confidence,
+optional embedded page images, backend metadata, and quality signals. Non-vision
+extraction and judge evaluation share the persistent cache at `OCR_CACHE_DIR`.
+Cache keys include document content, backend, language, backend/runtime version, and
+canonical backend configuration. Entries are checksum-validated, atomically replaced,
+rebuilt after corruption, and evicted least-recently-used when `OCR_CACHE_MAX_MB` is
+exceeded.
 
 Evaluate with an LLM judge by selecting a judge profile separately from extraction models:
 

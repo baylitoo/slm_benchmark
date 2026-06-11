@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich import print
@@ -24,15 +25,16 @@ from docie_bench.benchmark.registry import (
 )
 from docie_bench.benchmark.runner import run_benchmark
 from docie_bench.logging_config import configure_logging
+from docie_bench.ocr.runner import run_ocr_benchmark
 from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
 
 app = typer.Typer(no_args_is_help=True)
 benchmark_app = typer.Typer(no_args_is_help=True)
-baseline_app = typer.Typer(no_args_is_help=True)
+ocr_app = typer.Typer(no_args_is_help=True)
 schema_app = typer.Typer(no_args_is_help=True)
 dataset_app = typer.Typer(no_args_is_help=True)
 app.add_typer(benchmark_app, name="benchmark")
-benchmark_app.add_typer(baseline_app, name="baseline")
+benchmark_app.add_typer(ocr_app, name="ocr")
 app.add_typer(schema_app, name="schema")
 app.add_typer(dataset_app, name="dataset")
 
@@ -132,6 +134,33 @@ def baseline_promote(
 @baseline_app.command("list")
 def baseline_list(registry_dir: Path = typer.Option(Path(".benchmarks/baselines"))) -> None:
     print(json.dumps(list_baselines(registry_dir), indent=2))
+
+
+@ocr_app.command("run")
+def ocr_benchmark_run(
+    dataset: Annotated[Path, typer.Option(exists=True, readable=True)],
+    backend: Annotated[
+        list[str], typer.Option("--backend", help="Repeat to compare multiple OCR backends")
+    ] = ["pdf_text"],
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    cache_dir: Annotated[Path | None, typer.Option()] = None,
+    cache_max_mb: Annotated[int | None, typer.Option(min=0)] = None,
+    extraction_metrics: Annotated[
+        Path | None, typer.Option(exists=True, readable=True)
+    ] = None,
+) -> None:
+    result = run_ocr_benchmark(
+        dataset_path=dataset,
+        backends=backend,
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+        cache_max_bytes=cache_max_mb * 1024 * 1024 if cache_max_mb is not None else None,
+        extraction_metrics_path=extraction_metrics,
+    )
+    print(f"[green]OCR benchmark complete[/green]: {result.run_dir}")
+    print(f"Artifacts: {result.artifacts_path}")
+    print(f"Metrics: {result.metrics_path}")
+    print(f"Report: {result.report_path}")
 
 
 @schema_app.command("list")
