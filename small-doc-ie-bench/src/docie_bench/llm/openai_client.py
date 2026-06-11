@@ -16,6 +16,7 @@ from docie_bench.llm.model_gateway import (
 )
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.response_format import build_response_format
+from docie_bench.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -152,8 +153,14 @@ class OpenAICompatibleClient:
                 "docie_model": self.profile.model,
                 "docie_schema_name": schema_name,
                 "docie_response_format_style": self.profile.response_format_style,
-                "docie_system_prompt": system_prompt,
-                "docie_user_prompt": user_prompt,
+                **(
+                    {
+                        "docie_system_prompt": system_prompt,
+                        "docie_user_prompt": user_prompt,
+                    }
+                    if get_settings().log_document_content
+                    else {}
+                ),
                 "docie_image_count": len(image_urls or []),
             },
         )
@@ -199,6 +206,30 @@ class OpenAICompatibleClient:
                     "docie_llm_latency_ms": llm_latency_ms,
                 },
             )
+            raise LLMClientError(f"LLM server returned {resp.status_code}: {resp.text[:500]}")
+        data = resp.json()
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMClientError(f"Unexpected LLM response shape: {data}") from exc
+        if isinstance(content, list):
+            # Some multimodal-compatible gateways return content blocks.
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+
+        logger.debug(
+            "llm_response",
+            extra={
+                "docie_step": "llm_response",
+                "docie_model": self.profile.model,
+                "docie_schema_name": schema_name,
+                **({"docie_raw_content": content} if get_settings().log_document_content else {}),
+                "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+                "docie_usage": data.get("usage"),
+                "docie_llm_latency_ms": llm_latency_ms,
+            },
+        )
+
+        content = _clean_content(content)
 
             content = _clean_content(content)
             try:

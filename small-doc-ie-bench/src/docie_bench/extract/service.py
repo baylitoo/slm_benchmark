@@ -27,6 +27,7 @@ from docie_bench.ocr.service import processor_from_settings
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 from docie_bench.schemas.extraction import schema_json
+from docie_bench.security import redact_fields
 from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
 
@@ -231,7 +232,11 @@ class ExtractionService:
                 "docie_step": "ocr",
                 "docie_backend": "manual",
                 "docie_block_count": len(blocks),
-                "docie_blocks": [{"id": b.id, "text": b.text} for b in blocks],
+                **(
+                    {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
+                    if get_settings().log_document_content
+                    else {}
+                ),
             },
         )
         return await self._extract_blocks(
@@ -299,10 +304,11 @@ class ExtractionService:
                 "docie_path": str(path),
                 "docie_block_count": len(blocks),
                 "docie_ocr_latency_ms": ocr_ms,
-                "docie_ocr_cache_hit": ocr_result.cache_hit,
-                "docie_ocr_cache_key": ocr_result.cache_key,
-                "docie_ocr_quality": ocr_result.artifact.quality.model_dump(mode="json"),
-                "docie_blocks": [{"id": b.id, "text": b.text} for b in blocks],
+                **(
+                    {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
+                    if get_settings().log_document_content
+                    else {}
+                ),
             },
         )
         return await self._extract_blocks(
@@ -409,7 +415,9 @@ class ExtractionService:
                 "docie_valid": validation.valid,
                 "docie_errors": validation.errors,
                 "docie_warnings": validation.warnings,
-                "docie_normalized_result": normalized,
+                "docie_normalized_result": redact_fields(
+                    normalized, get_settings().audit_redaction_fields
+                ),
             },
         )
 
