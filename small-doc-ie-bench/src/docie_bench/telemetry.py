@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 EXTRACTION_REQUESTS = Counter(
     "docie_extraction_requests_total",
@@ -20,4 +20,16 @@ OCR_BLOCKS = Histogram(
     "Number of OCR blocks per extraction",
     ["schema_name"],
     buckets=(1, 5, 10, 25, 50, 100, 250, 500, 1000),
+)
+
+REVIEW_ACTIONS = Counter(
+    "docie_review_actions_total",
+    "Human review lifecycle actions",
+    ["action"],
+)
+
+REVIEW_QUEUE_DEPTH = Gauge(
+    "docie_review_queue_depth",
+    "Current review task count by status",
+    ["status"],
 )

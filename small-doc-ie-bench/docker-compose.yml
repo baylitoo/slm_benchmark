@@ -15,6 +15,7 @@ services:
       - ./configs:/app/configs:ro
       - ./data:/app/data
       - ./runs:/app/runs
+      - ./annotations:/app/annotations
       - ocr-cache:/app/.cache/ocr
     command: ["uvicorn", "docie_bench.api:app", "--host", "0.0.0.0", "--port", "8080"]
     healthcheck:

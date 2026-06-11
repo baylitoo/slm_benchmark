@@ -190,6 +190,16 @@ Do not select by leaderboard alone. Select by field-level accuracy under constra
 - `POST /v1/extract/text`
 - `POST /v1/extract/file`
 - `POST /v1/benchmarks/run`
+- `POST /v1/reviews`
+- `GET /v1/reviews`
+- `GET /v1/reviews/metrics`
+- `GET /v1/reviews/{task_id}`
+- `POST /v1/reviews/{task_id}/claim`
+- `POST /v1/reviews/{task_id}/release`
+- `POST /v1/reviews/{task_id}/correct`
+- `POST /v1/reviews/{task_id}/approve`
+- `POST /v1/reviews/{task_id}/reject`
+- `POST /v1/reviews/exports`
 
 The extraction endpoints return:
 
@@ -205,6 +215,24 @@ The extraction endpoints return:
   "latency_ms": 1234
 }
 ```
+
+### Human review workflow
+
+When database persistence is enabled, invalid, low-confidence, and weakly grounded
+extractions are automatically admitted to the review queue. Tasks submitted through
+`POST /v1/reviews` can additionally carry model-disagreement and expected-learning-value
+scores. Every task exposes an explainable priority breakdown.
+
+Reviewers claim tasks with an expiring lease and must send the current `expected_version`
+with every mutation. Stale versions, expired claims, and writes from another reviewer
+return HTTP 409 instead of overwriting work. Corrections use dotted field paths such as
+`invoice_number.value`; every correction revision and lifecycle event is immutable and
+included in the task history.
+
+Approved corrections can be exported with `POST /v1/reviews/exports`. Export versions are
+write-once under `ANNOTATION_EXPORT_DIR`, and only the `train` split is accepted to prevent
+reviewed labels from leaking into evaluation data. Review metrics report queue depth,
+correction rate, reviewer agreement, queue latency, and per-reviewer workload.
 
 ## Security boundaries
 
