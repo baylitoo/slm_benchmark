@@ -176,7 +176,8 @@ def _execute(
         result: object = asyncio.run(invoke())
     except Exception as exc:
         if state.json_output:
-            typer.echo(_json({"error": {"message": str(exc), "type": type(exc).__name__}}))
+            payload = _json({"error": {"message": str(exc), "type": type(exc).__name__}})
+            typer.echo(payload, err=True)
         else:
             typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc

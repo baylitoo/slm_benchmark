@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -196,6 +197,13 @@ def test_remote_runtime_rejects_embedded_credentials() -> None:
     assert adapter.probe(spec).compatible is False
     with pytest.raises(RuntimeConfigurationError, match="HTTP"):
         adapter.start(spec)
+
+
+def test_is_running_uses_psutil_for_pids_not_in_process_table() -> None:
+    adapter = VLLMRuntime(which=lambda name: None)
+    # Fallback branch: pid not tracked in _processes, must probe via psutil
+    assert adapter.is_running(os.getpid())  # the test process itself is alive
+    assert not adapter.is_running(2**31 - 1)  # beyond any OS PID space
 
 
 def test_version_detection_uses_argv_and_no_shell() -> None:

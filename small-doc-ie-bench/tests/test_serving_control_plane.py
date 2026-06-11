@@ -112,7 +112,7 @@ def test_control_plane_normalizes_results_and_supports_sync_and_async_contracts(
     plane, registry, supervisor, planner = make_plane()
 
     assert asyncio.run(plane.list_models()) == [
-        {"name": "tiny", "path": "models\\tiny", "state": "ready"}
+        {"name": "tiny", "path": "models/tiny", "state": "ready"}
     ]
     assert asyncio.run(plane.show_model(" tiny ")) == {"name": "tiny"}
     assert asyncio.run(

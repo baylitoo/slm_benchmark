@@ -15,6 +15,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+import psutil
+
 
 class RuntimeKind(StrEnum):
     VLLM = "vllm"
@@ -282,11 +284,7 @@ class RuntimeAdapter:
         process = self._processes.get(pid)
         if process is not None:
             return process.poll() is None
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
+        return psutil.pid_exists(pid)
 
     def shutdown(self, pid: int | None, *, timeout: float = 10) -> None:
         if pid is None:

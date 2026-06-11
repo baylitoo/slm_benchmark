@@ -12,6 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+import psutil
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _SHA256_PREFIX = "sha256:"
@@ -291,13 +292,17 @@ class ModelRegistry:
         digest = hashlib.sha256()
         size = 0
         try:
-            with temp.open("xb") as output:
-                while chunk := stream.read(_COPY_CHUNK_SIZE):
-                    digest.update(chunk)
-                    size += len(chunk)
-                    output.write(chunk)
-                output.flush()
-                os.fsync(output.fileno())
+            try:
+                with temp.open("xb") as output:
+                    while chunk := stream.read(_COPY_CHUNK_SIZE):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except BaseException:
+                temp.unlink(missing_ok=True)
+                raise
         finally:
             if close_stream:
                 stream.close()
@@ -501,14 +506,23 @@ class ModelRegistry:
         lock_name = hashlib.sha256(key.encode("utf-8")).hexdigest() + ".lock"
         path = self._safe_path("locks", lock_name)
         deadline = time.monotonic() + self.lock_timeout_seconds
+        pid_bytes = str(os.getpid()).encode()
         while True:
             try:
                 descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(descriptor, pid_bytes)
                 os.close(descriptor)
                 break
             except FileExistsError:
                 if time.monotonic() >= deadline:
                     raise RegistryError(f"Timed out waiting for registry lock {key!r}") from None
+                try:
+                    holder_pid = int(path.read_text(encoding="utf-8").strip())
+                    if not psutil.pid_exists(holder_pid):
+                        path.unlink(missing_ok=True)
+                        continue
+                except (OSError, ValueError):
+                    pass
                 time.sleep(0.01)
         try:
             yield

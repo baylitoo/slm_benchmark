@@ -381,7 +381,7 @@ def to_data(value: object) -> object:
     if isinstance(value, Enum):
         return to_data(value.value)
     if isinstance(value, Path):
-        return str(value)
+        return value.as_posix()
     if is_dataclass(value) and not isinstance(value, type):
         return to_data(asdict(value))
     if hasattr(value, "model_dump"):
