@@ -9,9 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from docie_bench.benchmark.dataset import DatasetItem, load_dataset
+from docie_bench.benchmark.dataset import DatasetItem
 from docie_bench.benchmark.judge import EvaluationMode, judge_extraction
 from docie_bench.benchmark.metrics import score_evidence, score_prediction
+from docie_bench.benchmark.registry import DEFAULT_REGISTRY_PATH, resolve_dataset
 from docie_bench.benchmark.report import write_report
 from docie_bench.benchmark.reproducibility import (
     MANIFEST_VERSION,
@@ -99,7 +100,8 @@ class BenchmarkTask:
 
 async def run_benchmark(
     *,
-    dataset_path: Path | None,
+    dataset_path: str | Path | None,
+    dataset_registry_path: Path = DEFAULT_REGISTRY_PATH,
     models_config_path: Path,
     model_profile: str | None = None,
     output_dir: Path | None = None,
@@ -110,15 +112,30 @@ async def run_benchmark(
     document_path: Path | None = None,
     schema_name: str = "invoice",
     language: str | None = None,
-    resume: bool = False,
+    split: str | None = None,
 ) -> BenchmarkResult:
     settings = get_settings()
     if resume and output_dir is None:
         raise ValueError("Resume requires an explicit output_dir")
     if (dataset_path is None) == (document_path is None):
         raise ValueError("Provide exactly one of dataset_path or document_path")
+    dataset_metadata: dict[str, Any] | None = None
     if dataset_path is not None:
-        base_items = load_dataset(dataset_path)
+        resolved_dataset = resolve_dataset(dataset_path, registry_path=dataset_registry_path)
+        base_items = resolved_dataset.items
+        dataset_metadata = {
+            "reference": resolved_dataset.reference,
+            "version": resolved_dataset.version,
+            "manifest_path": str(resolved_dataset.manifest_path),
+            "dataset_hash": resolved_dataset.dataset_hash,
+            "selected_split": split,
+        }
+        if split is not None:
+            base_items = [item for item in base_items if item.split == split]
+            if not base_items:
+                raise ValueError(
+                    f"Dataset {resolved_dataset.reference} has no documents in split {split!r}"
+                )
     else:
         assert document_path is not None
         base_items = [
@@ -311,9 +328,7 @@ async def run_benchmark(
                     "task_id": task.task_id,
                     "task_state": "completed",
                     "doc_id": item.doc_id,
-                    "source_doc_id": task.source_doc_id,
-                    "repetition": task.repetition,
-                    "document_hash": task.document_hash,
+                    "split": item.split,
                     "schema_name": response.schema_name,
                     "language": item.language,
                     "dynamic_schema": response.dynamic_schema,
@@ -353,9 +368,7 @@ async def run_benchmark(
                     "task_id": task.task_id,
                     "task_state": "failed",
                     "doc_id": item.doc_id,
-                    "source_doc_id": task.source_doc_id,
-                    "repetition": task.repetition,
-                    "document_hash": task.document_hash,
+                    "split": item.split,
                     "schema_name": item.schema_name,
                     "language": item.language,
                     "dynamic_schema": item.dynamic_schema,
@@ -398,16 +411,9 @@ async def run_benchmark(
         concurrency=concurrency,
         eval_mode=eval_mode,
     )
-    metrics["reproducibility"] = {
-        "manifest_path": str(manifest_path),
-        "input_fingerprint": manifest["input_fingerprint"],
-        "task_count": len(tasks),
-        "resumed": resume,
-        "tasks_skipped": len(completed_task_ids),
-        "tasks_executed": len(pending_tasks),
-        "warnings": resume_warnings,
-    }
-    atomic_write_json(metrics_path, metrics)
+    metrics["dataset"] = dataset_metadata
+    metrics_path = run_dir / "metrics.json"
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, default=str), encoding="utf-8")
     report_path = write_report(run_dir, metrics)
     return BenchmarkResult(run_dir, predictions_path, metrics_path, report_path, manifest_path)
 

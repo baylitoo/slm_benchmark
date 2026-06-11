@@ -14,6 +14,7 @@ class DatasetItem(BaseModel):
     schema_mode: Literal["static", "dynamic"] = "static"
     dynamic_schema: dict[str, Any] | None = None
     language: str | None = None
+    split: str = "unspecified"
     ground_truth: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
 

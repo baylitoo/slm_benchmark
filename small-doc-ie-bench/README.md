@@ -65,7 +65,7 @@ curl -s http://localhost:8080/v1/extract/text \
 Run benchmark:
 
 ```bash
-make bench DATASET=data/sample_dataset/manifest.jsonl
+make bench
 ```
 
 Compare a candidate run with a baseline and enforce regression budgets:
@@ -115,9 +115,11 @@ judge:
 
 ```bash
 docie-bench benchmark run \
-  --dataset data/sample_dataset/manifest.jsonl \
+  --dataset sample@1.0.0 \
   --eval-mode both
 ```
+
+Run only one split with `--split test`. Each prediction row records its source split.
 
 An unlabeled document does not need a manifest:
 
@@ -181,8 +183,53 @@ profiles:
 `manifest.jsonl`:
 
 ```json
-{"doc_id":"invoice-001","file_path":"data/sample_dataset/files/invoice-001.txt","schema_name":"invoice","language":"fr","ground_truth":{"invoice_number":"INV-2026-0001","vendor_name":"ACME SAS","total_ttc.amount":"1245.30","total_ttc.currency":"EUR","issue_date":"2026-05-21"}}
+{"doc_id":"invoice-001","file_path":"files/invoice-001.txt","schema_name":"invoice","language":"fr","split":"test","ground_truth":{"invoice_number":"INV-2026-0001","vendor_name":"ACME SAS","total_ttc.amount":"1245.30","total_ttc.currency":"EUR","issue_date":"2026-05-21"}}
 ```
+
+### Versioned dataset registry
+
+`data/datasets.yaml` maps stable references such as `sample@1.0.0` to manifests. A version
+pins a dataset SHA-256 and stored statistics. Benchmark runs verify the pinned hash before
+execution and include the resolved reference, version, manifest, and hash in `metrics.json`.
+Omitting `@version` resolves the registry's `latest` version. Direct manifest paths remain
+supported for ad hoc and legacy runs.
+
+Register an immutable semantic version after validation:
+
+```bash
+docie-bench dataset version invoices 1.0.0 \
+  --manifest data/invoices/v1/manifest.jsonl
+```
+
+Inspect statistics and hash, validate integrity and split leakage, or run leakage detection
+on its own:
+
+```bash
+docie-bench dataset inspect invoices@1.0.0
+docie-bench dataset validate invoices@1.0.0
+docie-bench dataset leakage invoices@1.0.0 --near-duplicate-threshold 0.92
+```
+
+Validation checks JSONL rows, unique document IDs, supported and existing files, non-empty
+splits, pinned hashes, and exact/near-duplicate cross-split leakage. Exact detection uses
+document bytes. Near-duplicate detection currently compares normalized text documents and
+is intentionally conservative; OCR must be materialized as `.txt` to near-match PDF/image
+content.
+
+Legacy manifests load with the `unspecified` split. Migrate one to an explicit default split,
+or provide a JSON object mapping document IDs to splits:
+
+```bash
+docie-bench dataset migrate data/legacy/manifest.jsonl data/invoices/v1/manifest.jsonl \
+  --default-split test
+
+docie-bench dataset migrate data/legacy/manifest.jsonl data/invoices/v1/manifest.jsonl \
+  --split-map data/invoices/splits.json
+```
+
+Dataset hashes are stable across manifest relocation and row ordering. They cover each
+semantic manifest row plus the referenced document's SHA-256, so any label, split, metadata,
+schema, or document-content change creates a new dataset identity.
 
 Supported files:
 
