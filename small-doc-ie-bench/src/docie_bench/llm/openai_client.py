@@ -6,8 +6,14 @@ import re
 from typing import Any
 
 import httpx
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from docie_bench.llm.model_gateway import (
+    InvalidModelResponseError,
+    ModelCapabilities,
+    ModelGateway,
+    ModelGatewayError,
+    classify_response_error,
+)
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.response_format import build_response_format
 from docie_bench.settings import get_settings
@@ -78,7 +84,7 @@ def _fix_bare_keys(text: str) -> str:
     return _BARE_KEY_RE.sub(r'\1"\2"\3', text)
 
 
-class LLMClientError(RuntimeError):
+class LLMClientError(ModelGatewayError):
     pass
 
 
@@ -90,16 +96,15 @@ class OpenAICompatibleClient:
             timeout=httpx.Timeout(profile.timeout_seconds),
             headers={"Authorization": f"Bearer {profile.api_key}"},
         )
+        self._gateway = ModelGateway(profile, self._client)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    @retry(
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, LLMClientError)),
-        wait=wait_exponential(multiplier=1, min=1, max=8),
-        stop=stop_after_attempt(2),
-        reraise=True,
-    )
+    async def discover_capabilities(self, *, force: bool = False) -> ModelCapabilities:
+        self._gateway.client = self._client
+        return await self._gateway.discover_capabilities(force=force)
+
     async def chat_json(
         self,
         *,
@@ -111,6 +116,8 @@ class OpenAICompatibleClient:
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         import time as _time
 
+        self._gateway.client = self._client
+        await self._gateway.validate_request(needs_vision=bool(image_urls))
         response_format, extra_body = build_response_format(
             self.profile.response_format_style,
             schema_name,
@@ -158,14 +165,46 @@ class OpenAICompatibleClient:
             },
         )
 
-        t0 = _time.perf_counter()
-        resp = await self._client.post("/chat/completions", json=payload)
-        llm_latency_ms = int((_time.perf_counter() - t0) * 1000)
+        async def operation() -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+            t0 = _time.perf_counter()
+            resp = await self._client.post("/chat/completions", json=payload)
+            llm_latency_ms = int((_time.perf_counter() - t0) * 1000)
 
-        if resp.status_code >= 400:
-            logger.error(
-                "LLM server error",
-                extra={"docie_status_code": resp.status_code, "docie_body": resp.text[:2000]},
+            if resp.status_code >= 400:
+                logger.error(
+                    "LLM server error",
+                    extra={"docie_status_code": resp.status_code, "docie_body": resp.text[:2000]},
+                )
+                raise classify_response_error(resp)
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise InvalidModelResponseError("Model endpoint returned invalid JSON") from exc
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise InvalidModelResponseError(
+                    f"Unexpected LLM response shape: {data}"
+                ) from exc
+            if isinstance(content, list):
+                # Some multimodal-compatible gateways return content blocks.
+                content = "".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+            if not isinstance(content, str):
+                raise InvalidModelResponseError("Model response content must be text")
+
+            logger.debug(
+                "llm_response",
+                extra={
+                    "docie_step": "llm_response",
+                    "docie_model": self.profile.model,
+                    "docie_schema_name": schema_name,
+                    "docie_raw_content": content,
+                    "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+                    "docie_usage": data.get("usage"),
+                    "docie_llm_latency_ms": llm_latency_ms,
+                },
             )
             raise LLMClientError(f"LLM server returned {resp.status_code}: {resp.text[:500]}")
         data = resp.json()
@@ -192,8 +231,15 @@ class OpenAICompatibleClient:
 
         content = _clean_content(content)
 
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise LLMClientError(f"Model returned non-JSON content: {content[:1000]}") from exc
-        return parsed, data.get("usage"), data
+            content = _clean_content(content)
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise InvalidModelResponseError(
+                    f"Model returned non-JSON content: {content[:1000]}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise InvalidModelResponseError("Model returned JSON that is not an object")
+            return parsed, data.get("usage"), data
+
+        return await self._gateway.execute(operation)

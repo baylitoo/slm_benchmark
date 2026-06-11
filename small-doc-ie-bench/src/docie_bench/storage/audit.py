@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from docie_bench.review import enqueue_review
 from docie_bench.schemas.common import ExtractionResponse
 from docie_bench.security import redact_fields
 from docie_bench.settings import get_settings
@@ -23,5 +24,18 @@ def save_extraction_audit(response: ExtractionResponse, *, tenant_id: str | None
                 result_json=redact_fields(response.result, settings.audit_redaction_fields),
                 warnings_json=response.validation.warnings,
                 errors_text="\n".join(response.validation.errors),
+            )
+        )
+    if database_enabled():
+        enqueue_review(
+            ReviewTaskCreate(
+                source_request_id=response.request_id,
+                schema_name=response.schema_name,
+                model_profile=response.model_profile,
+                document_hash=response.document_hash,
+                original_prediction=response.result,
+                validation_valid=response.validation.valid,
+                validation_errors=response.validation.errors,
+                dynamic_schema=response.dynamic_schema,
             )
         )
