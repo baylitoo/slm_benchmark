@@ -167,4 +167,8 @@ async def run_benchmark_endpoint(payload: BenchmarkRunRequest) -> dict[str, str]
         concurrency=payload.concurrency,
         split=payload.split,
     )
-    return {"run_dir": str(result.run_dir), "metrics_path": str(result.metrics_path)}
+    return {
+        "run_dir": str(result.run_dir),
+        "metrics_path": str(result.metrics_path),
+        "manifest_path": str(result.manifest_path),
+    }

@@ -1,0 +1,11 @@
+regression_budgets:
+  - name: fixture-accuracy
+    metric: field_accuracy
+    dimension: aggregate
+    max_regression: 0
+    min_paired_samples: 2
+  - name: fixture-validity
+    metric: valid_rate
+    dimension: aggregate
+    max_regression: 0
+    min_paired_samples: 2

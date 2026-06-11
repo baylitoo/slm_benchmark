@@ -138,6 +138,7 @@ def test_cli_accepts_unlabeled_document_in_judge_mode(monkeypatch, tmp_path: Pat
             predictions_path=tmp_path / "predictions.jsonl",
             metrics_path=tmp_path / "metrics.json",
             report_path=tmp_path / "report.html",
+            manifest_path=tmp_path / "manifest.json",
         )
 
     monkeypatch.setattr("docie_bench.cli.run_benchmark", fake_run_benchmark)

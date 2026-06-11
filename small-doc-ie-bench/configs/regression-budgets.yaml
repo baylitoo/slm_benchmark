@@ -1,0 +1,26 @@
+regression_budgets:
+  - name: aggregate-field-accuracy
+    metric: field_accuracy
+    dimension: aggregate
+    max_regression: 0.01
+    min_paired_samples: 20
+
+  - name: invoice-field-accuracy
+    metric: field_accuracy
+    dimension: schema_name
+    selector:
+      schema_name: invoice
+    max_regression: 0.01
+    min_paired_samples: 10
+
+  - name: aggregate-valid-rate
+    metric: valid_rate
+    dimension: aggregate
+    max_regression: 0.0
+    min_paired_samples: 5
+
+  - name: aggregate-latency
+    metric: avg_latency_ms
+    dimension: aggregate
+    max_regression: 250
+    min_paired_samples: 5

@@ -7,7 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from docie_bench.schemas.common import DateField, MoneyField, NumberField, TextField
 
-DynamicFieldType = Literal["string", "date", "number", "money"]
+DynamicFieldType = Literal["string", "date", "number", "money", "object", "list"]
+ScalarDynamicFieldType = Literal["string", "date", "number", "money"]
 _FIELD_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _RESERVED_FIELDS = {"document_type", "extraction_notes"}
 
@@ -18,6 +19,7 @@ class DynamicFieldSpec(BaseModel):
     name: str = Field(pattern=_FIELD_NAME_RE.pattern, description="Stable snake_case field name")
     type: DynamicFieldType
     description: str | None = Field(default=None, max_length=300)
+    fields: list[DynamicFieldSpec] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
     def validate_name(self) -> DynamicFieldSpec:
@@ -25,6 +27,13 @@ class DynamicFieldSpec(BaseModel):
             raise ValueError("field name must be lower snake_case and at most 64 characters")
         if self.name in _RESERVED_FIELDS:
             raise ValueError(f"field name {self.name!r} is reserved")
+        if self.type in {"object", "list"} and not self.fields:
+            raise ValueError(f"{self.type} field {self.name!r} must define nested fields")
+        if self.type not in {"object", "list"} and self.fields:
+            raise ValueError(f"scalar field {self.name!r} cannot define nested fields")
+        names = [field.name for field in self.fields]
+        if len(names) != len(set(names)):
+            raise ValueError(f"nested field names in {self.name!r} must be unique")
         return self
 
 
@@ -47,13 +56,13 @@ class DynamicSchemaSpec(BaseModel):
 
 
 class DynamicTemplateBuilder:
-    _PYDANTIC_TYPES: dict[DynamicFieldType, type[BaseModel]] = {
+    _PYDANTIC_TYPES: dict[ScalarDynamicFieldType, type[BaseModel]] = {
         "string": TextField,
         "date": DateField,
         "number": NumberField,
         "money": MoneyField,
     }
-    _NUEXTRACT_TYPES: dict[DynamicFieldType, dict[str, str]] = {
+    _NUEXTRACT_TYPES: dict[ScalarDynamicFieldType, dict[str, str]] = {
         "string": {"value": "verbatim-string"},
         "date": {"value": "date"},
         "number": {"value": "number"},
@@ -67,9 +76,9 @@ class DynamicTemplateBuilder:
             "extraction_notes": (list[str], Field(default_factory=list)),
         }
         for field_spec in spec.fields:
-            fields[field_spec.name] = (
-                cls._PYDANTIC_TYPES[field_spec.type] | None,
-                Field(default=None, description=field_spec.description),
+            fields[field_spec.name] = cls._model_field(
+                field_spec,
+                parent_name="".join(part.title() for part in spec.document_type.split("_")),
             )
         model_name = (
             "".join(part.title() for part in spec.document_type.split("_")) + "DynamicExtraction"
@@ -77,5 +86,32 @@ class DynamicTemplateBuilder:
         return create_model(model_name, __config__=ConfigDict(extra="forbid"), **fields)
 
     @classmethod
-    def build_nuextract_template(cls, spec: DynamicSchemaSpec) -> dict[str, dict[str, str]]:
-        return {field.name: dict(cls._NUEXTRACT_TYPES[field.type]) for field in spec.fields}
+    def build_nuextract_template(cls, spec: DynamicSchemaSpec) -> dict[str, Any]:
+        return {field.name: cls._nuextract_field(field) for field in spec.fields}
+
+    @classmethod
+    def _model_field(cls, spec: DynamicFieldSpec, *, parent_name: str) -> tuple[Any, Any]:
+        field_info = Field(default=None, description=spec.description)
+        if spec.type not in {"object", "list"}:
+            return cls._PYDANTIC_TYPES[spec.type] | None, field_info
+
+        nested_name = parent_name + "".join(part.title() for part in spec.name.split("_"))
+        nested_fields = {
+            child.name: cls._model_field(child, parent_name=nested_name)
+            for child in spec.fields
+        }
+        nested_model = create_model(
+            nested_name,
+            __config__=ConfigDict(extra="forbid"),
+            **nested_fields,
+        )
+        if spec.type == "list":
+            return list[nested_model] | None, field_info
+        return nested_model | None, field_info
+
+    @classmethod
+    def _nuextract_field(cls, spec: DynamicFieldSpec) -> Any:
+        if spec.type not in {"object", "list"}:
+            return dict(cls._NUEXTRACT_TYPES[spec.type])
+        nested = {child.name: cls._nuextract_field(child) for child in spec.fields}
+        return [nested] if spec.type == "list" else nested

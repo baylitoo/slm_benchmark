@@ -7,6 +7,12 @@ from pathlib import Path
 import typer
 from rich import print
 
+from docie_bench.benchmark.comparison import (
+    compare_runs,
+    list_baselines,
+    promote_baseline,
+    resolve_run,
+)
 from docie_bench.benchmark.judge import EvaluationMode
 from docie_bench.benchmark.registry import (
     DEFAULT_REGISTRY_PATH,
@@ -22,9 +28,11 @@ from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
 
 app = typer.Typer(no_args_is_help=True)
 benchmark_app = typer.Typer(no_args_is_help=True)
+baseline_app = typer.Typer(no_args_is_help=True)
 schema_app = typer.Typer(no_args_is_help=True)
 dataset_app = typer.Typer(no_args_is_help=True)
 app.add_typer(benchmark_app, name="benchmark")
+benchmark_app.add_typer(baseline_app, name="baseline")
 app.add_typer(schema_app, name="schema")
 app.add_typer(dataset_app, name="dataset")
 
@@ -54,6 +62,8 @@ def benchmark_run(
         raise typer.BadParameter("Provide exactly one of --dataset or --document")
     if document is not None and not eval_mode.uses_judge:
         raise typer.BadParameter("--document requires --eval-mode llm_judge or both")
+    if resume and output_dir is None:
+        raise typer.BadParameter("--resume requires --output-dir")
     configure_logging(log_level)
     result = asyncio.run(
         run_benchmark(
@@ -76,6 +86,52 @@ def benchmark_run(
     print(f"Predictions: {result.predictions_path}")
     print(f"Metrics: {result.metrics_path}")
     print(f"Report: {result.report_path}")
+    print(f"Manifest: {result.manifest_path}")
+
+
+@benchmark_app.command("compare")
+def benchmark_compare(
+    baseline: str = typer.Argument(
+        ..., help="Run path or named baseline (optionally name@version)"
+    ),
+    candidate: str = typer.Argument(..., help="Candidate run path"),
+    budgets: Path | None = typer.Option(None, exists=True, readable=True),
+    output_dir: Path = typer.Option(Path("comparison")),
+    registry_dir: Path = typer.Option(Path(".benchmarks/baselines")),
+) -> None:
+    try:
+        result = compare_runs(
+            resolve_run(baseline, registry_dir=registry_dir),
+            resolve_run(candidate, registry_dir=registry_dir),
+            output_dir=output_dir,
+            budgets_path=budgets,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    color = "green" if result.verdict == "pass" else "red"
+    print(f"[{color}]Comparison verdict: {result.verdict.upper()}[/{color}]")
+    print(f"Verdict: {result.verdict_path}")
+    print(f"Report: {result.report_path}")
+    if result.exit_code:
+        raise typer.Exit(result.exit_code)
+
+
+@baseline_app.command("promote")
+def baseline_promote(
+    run: Path = typer.Argument(..., exists=True, readable=True),
+    name: str = typer.Argument(...),
+    registry_dir: Path = typer.Option(Path(".benchmarks/baselines")),
+) -> None:
+    try:
+        entry = promote_baseline(run, name, registry_dir=registry_dir)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    print(json.dumps(entry, indent=2))
+
+
+@baseline_app.command("list")
+def baseline_list(registry_dir: Path = typer.Option(Path(".benchmarks/baselines"))) -> None:
+    print(json.dumps(list_baselines(registry_dir), indent=2))
 
 
 @schema_app.command("list")
