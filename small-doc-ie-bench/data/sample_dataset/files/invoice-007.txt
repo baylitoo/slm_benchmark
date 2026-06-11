@@ -1,0 +1,13 @@
+ORBITAL OFFICE SUPPLIES
+
+INVOICE INV-2026-007
+Customer: Example Bank
+
+Description                 SKU       Qty    Unit price    Line total
+Ergonomic keyboard          KEY-01      2       75.00 EUR     150.00 EUR
+USB-C docking station       DOC-04      1      180.00 EUR     180.00 EUR
+Recycled notebook pack      NOTE-12     3       10.00 EUR      30.00 EUR
+
+Subtotal: 360.00 EUR
+VAT:       72.00 EUR
+Total:    432.00 EUR

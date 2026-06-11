@@ -57,6 +57,65 @@ def test_dynamic_schema_rejects_duplicate_or_unsafe_fields() -> None:
     with pytest.raises(ValidationError, match="unique"):
         DynamicSchemaSpec.model_validate(raw)
 
+
+def test_dynamic_schema_builds_reusable_nested_list_schema() -> None:
+    spec = DynamicSchemaSpec.model_validate(
+        {
+            "document_type": "delivery_note",
+            "fields": [
+                {"name": "delivery_number", "type": "string"},
+                {
+                    "name": "items",
+                    "type": "list",
+                    "fields": [
+                        {"name": "description", "type": "string"},
+                        {"name": "quantity", "type": "number"},
+                        {
+                            "name": "dimensions",
+                            "type": "object",
+                            "fields": [{"name": "weight", "type": "number"}],
+                        },
+                    ],
+                },
+            ],
+        }
+    )
+
+    model = DynamicTemplateBuilder.build_model(spec)
+    parsed = model.model_validate(
+        {
+            "delivery_number": {"value": "DN-1"},
+            "items": [
+                {
+                    "description": {"value": "Steel plate"},
+                    "quantity": {"value": "2"},
+                    "dimensions": {"weight": {"value": "10.5"}},
+                }
+            ],
+        }
+    )
+    template = DynamicTemplateBuilder.build_nuextract_template(spec)
+
+    assert parsed.items[0].quantity.value == 2
+    assert parsed.items[0].dimensions.weight.value == 10.5
+    assert template["items"] == [
+        {
+            "description": {"value": "verbatim-string"},
+            "quantity": {"value": "number"},
+            "dimensions": {"weight": {"value": "number"}},
+        }
+    ]
+
+
+def test_dynamic_schema_rejects_unconfigured_container() -> None:
+    with pytest.raises(ValidationError, match="must define nested fields"):
+        DynamicSchemaSpec.model_validate(
+            {
+                "document_type": "delivery_note",
+                "fields": [{"name": "items", "type": "list"}],
+            }
+        )
+
     raw = _purchase_order_spec()
     raw["fields"][0]["name"] = "Document Type"
     with pytest.raises(ValidationError, match="pattern"):

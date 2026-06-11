@@ -2,10 +2,12 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.pytest-tmp-*/
 .mypy_cache/
 .ruff_cache/
 .cache/
 runs/
+annotations/
 models/*.gguf
 models/*.bin
 models/*.safetensors

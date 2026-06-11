@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Any
 
 import pdfplumber
 
@@ -11,10 +13,18 @@ from docie_bench.schemas.common import BoundingBox, OCRBlock
 class PdfTextBackend(OCRBackend):
     name = "pdf_text"
 
+    def version(self) -> str:
+        try:
+            return f"1:pdfplumber-{version('pdfplumber')}"
+        except PackageNotFoundError:
+            return "1:pdfplumber-unknown"
+
     def extract(self, path: Path) -> list[OCRBlock]:
         suffix = path.suffix.lower()
         if suffix == ".txt":
-            return text_to_blocks(path.read_text(encoding="utf-8", errors="replace"), source="manual")
+            return text_to_blocks(
+                path.read_text(encoding="utf-8", errors="replace"), source="manual"
+            )
         if suffix != ".pdf":
             raise ValueError(f"pdf_text backend supports .pdf and .txt only, got {path.suffix}")
 
@@ -37,7 +47,7 @@ class PdfTextBackend(OCRBackend):
                             )
                     continue
                 # Group words into approximate lines by top coordinate.
-                rows: list[list[dict]] = []
+                rows: list[list[dict[str, Any]]] = []
                 for word in words:
                     placed = False
                     for row in rows:

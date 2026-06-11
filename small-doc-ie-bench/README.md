@@ -9,6 +9,7 @@ The project is designed for a Ryzen-class CPU server with 64 GB RAM and no GPU. 
 - **OpenAI-compatible LLM abstraction**: call local `llama.cpp`, vLLM, Ollama-compatible gateways, or a remote OpenAI-compatible endpoint through one client.
 - **Schema-constrained extraction**: JSON Schema / Pydantic first; no free-form JSON guessing.
 - **OCR modularity**: `pdf_text`, `tesseract`, and `paddleocr` backends behind one interface.
+- **OCR laboratory**: content-addressed OCR artifacts, persistent cache, and no-LLM OCR reports.
 - **Production API**: FastAPI service with health checks, metrics, file-size limits, structured logs, and optional Postgres audit persistence.
 - **Benchmark runner**: run many model profiles over the same dataset and produce JSONL predictions, metrics, and an HTML report.
 - **Docker Compose stack**: API, benchmark container, local llama.cpp-compatible server, Postgres, Prometheus, and Grafana.
@@ -65,8 +66,70 @@ curl -s http://localhost:8080/v1/extract/text \
 Run benchmark:
 
 ```bash
-make bench DATASET=data/sample_dataset/manifest.jsonl
+make bench
 ```
+
+Compare a candidate run with a baseline and enforce regression budgets:
+
+```bash
+docie-bench benchmark compare \
+  runs/baseline \
+  runs/candidate \
+  --budgets configs/regression-budgets.yaml \
+  --output-dir comparison
+```
+
+The command writes `comparison.json`, a compact CI-oriented `verdict.json`, and a
+human-readable `comparison.md`. It exits non-zero when a budget is exceeded, a required
+metric is missing, or the runs have no matched observations. Comparisons use matched
+documents and fields; unmatched samples and small sample sizes are reported as warnings.
+
+Promote and audit named, versioned baselines:
+
+```bash
+docie-bench benchmark baseline promote runs/approved main
+docie-bench benchmark baseline list
+docie-bench benchmark compare main runs/candidate --budgets configs/regression-budgets.yaml
+```
+
+Budget entries select a metric and comparison dimension. `max_regression` is always
+expressed in the metric's native units and works for both higher-is-better quality metrics
+and lower-is-better latency/error metrics:
+
+```yaml
+regression_budgets:
+  - name: invoice-field-accuracy
+    metric: field_accuracy
+    dimension: schema_name
+    selector:
+      schema_name: invoice
+    max_regression: 0.01
+    min_paired_samples: 10
+```
+
+Run an OCR-only comparison without invoking an LLM:
+
+```bash
+docie-bench benchmark ocr run \
+  --dataset data/ocr_dataset/manifest.jsonl \
+  --backend pdf_text \
+  --backend tesseract
+```
+
+OCR manifests use the normal dataset fields plus one of `ocr_reference_text`,
+`ocr_reference_path`, or `ocr_reference_blocks`. The report includes character error
+rate, word error rate, layout preservation, latency, cache hit rate, and low-quality
+OCR rate. Pass extraction benchmark output with `--extraction-metrics
+runs/<run>/metrics.json` to correlate OCR character accuracy with downstream field
+accuracy.
+
+OCR artifacts are versioned JSON containing blocks, bounding boxes, confidence,
+optional embedded page images, backend metadata, and quality signals. Non-vision
+extraction and judge evaluation share the persistent cache at `OCR_CACHE_DIR`.
+Cache keys include document content, backend, language, backend/runtime version, and
+canonical backend configuration. Entries are checksum-validated, atomically replaced,
+rebuilt after corruption, and evicted least-recently-used when `OCR_CACHE_MAX_MB` is
+exceeded.
 
 Evaluate with an LLM judge by selecting a judge profile separately from extraction models:
 
@@ -77,9 +140,11 @@ judge:
 
 ```bash
 docie-bench benchmark run \
-  --dataset data/sample_dataset/manifest.jsonl \
+  --dataset sample@1.0.0 \
   --eval-mode both
 ```
+
+Run only one split with `--split test`. Each prediction row records its source split.
 
 An unlabeled document does not need a manifest:
 
@@ -95,6 +160,26 @@ Judge results are stored per prediction and aggregated as `judge_faithfulness` a
 `judge_completeness` in `metrics.json`. In `both` mode, `judge_field_accuracy_delta`
 compares aggregate judge faithfulness with labeled field accuracy. Judge failures are
 recorded as `judge_error` without changing extraction success.
+
+### Reproducible and resumable runs
+
+Each benchmark run writes an immutable `manifest.json` with the git state, sanitized selected
+model profiles, model config and dataset hashes, document hashes, dependency versions, system
+resources, invocation arguments, and stable task IDs. Predictions and lifecycle events are
+durably appended, while final prediction, metric, and report artifacts are replaced atomically.
+
+Resume an interrupted run by reusing its output directory:
+
+```bash
+docie-bench benchmark run \
+  --dataset data/sample_dataset/manifest.jsonl \
+  --output-dir runs/my-run \
+  --resume
+```
+
+Resume skips completed and failed terminal tasks, repairs a truncated final JSONL record, and
+refuses to proceed when code, model config, selected profiles, dataset contents, or task inputs
+have drifted. Concurrency may change when resuming because it does not affect task identity.
 
 ## Model profiles
 
@@ -137,8 +222,53 @@ metadata when the endpoint provides it.
 `manifest.jsonl`:
 
 ```json
-{"doc_id":"invoice-001","file_path":"data/sample_dataset/files/invoice-001.txt","schema_name":"invoice","language":"fr","ground_truth":{"invoice_number":"INV-2026-0001","vendor_name":"ACME SAS","total_ttc.amount":"1245.30","total_ttc.currency":"EUR","issue_date":"2026-05-21"}}
+{"doc_id":"invoice-001","file_path":"files/invoice-001.txt","schema_name":"invoice","language":"fr","split":"test","ground_truth":{"invoice_number":"INV-2026-0001","vendor_name":"ACME SAS","total_ttc.amount":"1245.30","total_ttc.currency":"EUR","issue_date":"2026-05-21"}}
 ```
+
+### Versioned dataset registry
+
+`data/datasets.yaml` maps stable references such as `sample@1.0.0` to manifests. A version
+pins a dataset SHA-256 and stored statistics. Benchmark runs verify the pinned hash before
+execution and include the resolved reference, version, manifest, and hash in `metrics.json`.
+Omitting `@version` resolves the registry's `latest` version. Direct manifest paths remain
+supported for ad hoc and legacy runs.
+
+Register an immutable semantic version after validation:
+
+```bash
+docie-bench dataset version invoices 1.0.0 \
+  --manifest data/invoices/v1/manifest.jsonl
+```
+
+Inspect statistics and hash, validate integrity and split leakage, or run leakage detection
+on its own:
+
+```bash
+docie-bench dataset inspect invoices@1.0.0
+docie-bench dataset validate invoices@1.0.0
+docie-bench dataset leakage invoices@1.0.0 --near-duplicate-threshold 0.92
+```
+
+Validation checks JSONL rows, unique document IDs, supported and existing files, non-empty
+splits, pinned hashes, and exact/near-duplicate cross-split leakage. Exact detection uses
+document bytes. Near-duplicate detection currently compares normalized text documents and
+is intentionally conservative; OCR must be materialized as `.txt` to near-match PDF/image
+content.
+
+Legacy manifests load with the `unspecified` split. Migrate one to an explicit default split,
+or provide a JSON object mapping document IDs to splits:
+
+```bash
+docie-bench dataset migrate data/legacy/manifest.jsonl data/invoices/v1/manifest.jsonl \
+  --default-split test
+
+docie-bench dataset migrate data/legacy/manifest.jsonl data/invoices/v1/manifest.jsonl \
+  --split-map data/invoices/splits.json
+```
+
+Dataset hashes are stable across manifest relocation and row ordering. They cover each
+semantic manifest row plus the referenced document's SHA-256, so any label, split, metadata,
+schema, or document-content change creates a new dataset identity.
 
 Supported files:
 
@@ -153,6 +283,20 @@ includes `dynamic_schema`; persist that JSON and pass it as `dynamic_schema` on 
 manifest rows) to reuse it without another proposal call. A NuExtract profile needs an
 instruction-following `schema_proposer_profile` for first-time inference, but can extract directly
 from a reused dynamic schema.
+
+Dynamic fields support scalar `string`, `date`, `number`, and `money` types plus recursive `object`
+and repeated-row `list` types. Container fields define their reusable children in `fields`.
+
+Invoice extraction includes typed `line_items` with description, SKU, quantity, unit price, line
+total, and tax rate. To evaluate a table, put a list under the matching ground-truth key. Rows are
+aligned by maximum cell similarity before cell accuracy and row precision/recall/F1 are calculated:
+
+```json
+{"ground_truth":{"line_items":[{"description":"Keyboard","quantity":"2","line_total.amount":"150.00"}]}}
+```
+
+Validation checks each `quantity * unit_price` against `line_total`, the sum of line totals against
+the invoice subtotal, and reports mismatches as warnings.
 
 Vision-capable model profiles can bypass OCR for PDFs and images:
 
@@ -172,6 +316,56 @@ With `vision: true`, image files are normalized to PNG and PDF pages are rasteri
 with PyMuPDF, then sent as OpenAI-compatible `image_url` content blocks. `.txt` input
 is intentionally rejected for vision profiles. Benchmark artifacts label each result
 as `vision` or `ocr:<backend>` so the same manifest can compare both paths side by side.
+
+## Multi-stage routing
+
+`ExtractionRouter` wraps existing `ExtractionService` instances without changing their
+single-stage API. Policies are Pydantic models, so they can be loaded directly from YAML
+or JSON:
+
+```python
+from docie_bench.extract.routing import (
+    ExtractionRouter, ExtractionServiceStage, RoutingPolicy,
+)
+
+policy = RoutingPolicy.model_validate({
+    "version": "2026-06",
+    "stages": [
+        {
+            "name": "fast",
+            "rules": [{
+                "when": {"status": "success", "validation_valid": True, "min_confidence": 0.85},
+                "decision": "accept",
+                "reason": "fast model passed quality gate",
+            }],
+        },
+        {
+            "name": "accurate",
+            "rules": [{
+                "when": {"status": "success", "validation_valid": True},
+                "decision": "accept",
+                "reason": "fallback model returned a valid extraction",
+            }],
+        },
+    ],
+    "budget": {"max_stages": 2, "max_total_tokens": 4096, "max_latency_ms": 30000},
+})
+router = ExtractionRouter(
+    stages=[
+        ExtractionServiceStage("fast", fast_service),
+        ExtractionServiceStage("accurate", accurate_service),
+    ],
+    policy=policy,
+)
+```
+
+Rules are evaluated in order. A stage can be accepted, sent to the next fallback, escalated,
+or failed. Stage selectors can branch on request context such as file suffix, language, OCR
+confidence, page/block counts, or caller-supplied complexity/capability metadata, plus prior-stage
+validation and metadata. The routed response contains a `routing` audit with every stage output,
+attempt, decision, skipped stage, budget total, and terminal outcome. Benchmark summaries and
+HTML reports aggregate routing acceptance, fallback, escalation, stage failure, latency, tokens,
+cost, budget exhaustion, and average-attempt metrics when this audit is present.
 
 ## Choosing a CPU model
 
@@ -204,6 +398,16 @@ Do not select by leaderboard alone. Select by field-level accuracy under constra
 - `POST /v1/extract/text`
 - `POST /v1/extract/file`
 - `POST /v1/benchmarks/run`
+- `POST /v1/reviews`
+- `GET /v1/reviews`
+- `GET /v1/reviews/metrics`
+- `GET /v1/reviews/{task_id}`
+- `POST /v1/reviews/{task_id}/claim`
+- `POST /v1/reviews/{task_id}/release`
+- `POST /v1/reviews/{task_id}/correct`
+- `POST /v1/reviews/{task_id}/approve`
+- `POST /v1/reviews/{task_id}/reject`
+- `POST /v1/reviews/exports`
 
 The extraction endpoints return:
 
@@ -219,6 +423,24 @@ The extraction endpoints return:
   "latency_ms": 1234
 }
 ```
+
+### Human review workflow
+
+When database persistence is enabled, invalid, low-confidence, and weakly grounded
+extractions are automatically admitted to the review queue. Tasks submitted through
+`POST /v1/reviews` can additionally carry model-disagreement and expected-learning-value
+scores. Every task exposes an explainable priority breakdown.
+
+Reviewers claim tasks with an expiring lease and must send the current `expected_version`
+with every mutation. Stale versions, expired claims, and writes from another reviewer
+return HTTP 409 instead of overwriting work. Corrections use dotted field paths such as
+`invoice_number.value`; every correction revision and lifecycle event is immutable and
+included in the task history.
+
+Approved corrections can be exported with `POST /v1/reviews/exports`. Export versions are
+write-once under `ANNOTATION_EXPORT_DIR`, and only the `train` split is accepted to prevent
+reviewed labels from leaking into evaluation data. Review metrics report queue depth,
+correction rate, reviewer agreement, queue latency, and per-reviewer workload.
 
 ## Security boundaries
 
