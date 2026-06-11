@@ -83,39 +83,36 @@ HTML_TEMPLATE = Template(
     </tbody>
   </table>
 
-  <h2>Table Extraction</h2>
+  <h2>Routing Summary</h2>
   <table>
     <thead><tr>
-      <th>Document</th><th>Model profile</th><th>Table</th>
-      <th>Rows correct</th><th>Rows expected</th><th>Rows predicted</th>
+      <th>Model profile</th><th>Accept</th><th>Fallback</th><th>Escalate</th>
+      <th>Budget exhausted</th><th>Stage failures</th><th>Avg attempts</th>
+      <th>Route ms</th><th>Tokens</th><th>Cost units</th>
     </tr></thead>
     <tbody>
-    {% for row in rows if row.score and row.score.tables %}
-      {% for table in row.score.tables %}
+    {% for row in summary %}
       <tr>
-        <td>{{ row.doc_id }}</td><td>{{ row.model_profile }}</td><td>{{ table.field }}</td>
-        <td>{{ table.row_correct }}</td>
-        <td>{{ table.row_expected }}</td>
-        <td>{{ table.row_predicted }}</td>
+        <td>{{ row.model_profile }}</td>
+        <td>{{ '%.1f%%'|format(row.get('routing_accept_rate') * 100)
+               if row.get('routing_accept_rate') is not none else 'N/A' }}</td>
+        <td>{{ '%.1f%%'|format(row.get('routing_fallback_rate') * 100)
+               if row.get('routing_fallback_rate') is not none else 'N/A' }}</td>
+        <td>{{ '%.1f%%'|format(row.get('routing_escalation_rate') * 100)
+               if row.get('routing_escalation_rate') is not none else 'N/A' }}</td>
+        <td>{{ '%.1f%%'|format(row.get('routing_budget_exhaustion_rate') * 100)
+               if row.get('routing_budget_exhaustion_rate') is not none else 'N/A' }}</td>
+        <td>{{ '%.1f%%'|format(row.get('routing_stage_failure_rate') * 100)
+               if row.get('routing_stage_failure_rate') is not none else 'N/A' }}</td>
+        <td>{{ '%.2f'|format(row.get('avg_routing_attempts'))
+               if row.get('avg_routing_attempts') is not none else 'N/A' }}</td>
+        <td>{{ '%.0f'|format(row.get('avg_routing_latency_ms'))
+               if row.get('avg_routing_latency_ms') is not none else 'N/A' }}</td>
+        <td>{{ '%.0f'|format(row.get('avg_routing_tokens'))
+               if row.get('avg_routing_tokens') is not none else 'N/A' }}</td>
+        <td>{{ '%.3f'|format(row.get('avg_routing_cost_units'))
+               if row.get('avg_routing_cost_units') is not none else 'N/A' }}</td>
       </tr>
-      {% endfor %}
-    {% else %}
-      <tr><td colspan="6">No table ground truth in this run.</td></tr>
-    {% endfor %}
-    </tbody>
-  </table>
-
-  <h2>Arithmetic Validation Warnings</h2>
-  <table>
-    <thead><tr><th>Document</th><th>Model profile</th><th>Warnings</th></tr></thead>
-    <tbody>
-    {% for row in rows if row.validation and row.validation.warnings %}
-      <tr>
-        <td>{{ row.doc_id }}</td><td>{{ row.model_profile }}</td>
-        <td class="bad">{{ row.validation.warnings | join('; ') }}</td>
-      </tr>
-    {% else %}
-      <tr><td colspan="3" class="ok">No arithmetic validation warnings.</td></tr>
     {% endfor %}
     </tbody>
   </table>

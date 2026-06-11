@@ -231,6 +231,56 @@ with PyMuPDF, then sent as OpenAI-compatible `image_url` content blocks. `.txt` 
 is intentionally rejected for vision profiles. Benchmark artifacts label each result
 as `vision` or `ocr:<backend>` so the same manifest can compare both paths side by side.
 
+## Multi-stage routing
+
+`ExtractionRouter` wraps existing `ExtractionService` instances without changing their
+single-stage API. Policies are Pydantic models, so they can be loaded directly from YAML
+or JSON:
+
+```python
+from docie_bench.extract.routing import (
+    ExtractionRouter, ExtractionServiceStage, RoutingPolicy,
+)
+
+policy = RoutingPolicy.model_validate({
+    "version": "2026-06",
+    "stages": [
+        {
+            "name": "fast",
+            "rules": [{
+                "when": {"status": "success", "validation_valid": True, "min_confidence": 0.85},
+                "decision": "accept",
+                "reason": "fast model passed quality gate",
+            }],
+        },
+        {
+            "name": "accurate",
+            "rules": [{
+                "when": {"status": "success", "validation_valid": True},
+                "decision": "accept",
+                "reason": "fallback model returned a valid extraction",
+            }],
+        },
+    ],
+    "budget": {"max_stages": 2, "max_total_tokens": 4096, "max_latency_ms": 30000},
+})
+router = ExtractionRouter(
+    stages=[
+        ExtractionServiceStage("fast", fast_service),
+        ExtractionServiceStage("accurate", accurate_service),
+    ],
+    policy=policy,
+)
+```
+
+Rules are evaluated in order. A stage can be accepted, sent to the next fallback, escalated,
+or failed. Stage selectors can branch on request context such as file suffix, language, OCR
+confidence, page/block counts, or caller-supplied complexity/capability metadata, plus prior-stage
+validation and metadata. The routed response contains a `routing` audit with every stage output,
+attempt, decision, skipped stage, budget total, and terminal outcome. Benchmark summaries and
+HTML reports aggregate routing acceptance, fallback, escalation, stage failure, latency, tokens,
+cost, budget exhaustion, and average-attempt metrics when this audit is present.
+
 ## Choosing a CPU model
 
 Recommended benchmark order:
