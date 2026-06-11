@@ -52,6 +52,8 @@ def benchmark_run(
         raise typer.BadParameter("Provide exactly one of --dataset or --document")
     if document is not None and not eval_mode.uses_judge:
         raise typer.BadParameter("--document requires --eval-mode llm_judge or both")
+    if resume and output_dir is None:
+        raise typer.BadParameter("--resume requires --output-dir")
     configure_logging(log_level)
     result = asyncio.run(
         run_benchmark(
@@ -66,12 +68,14 @@ def benchmark_run(
             document_path=document,
             schema_name=schema_name,
             language=language,
+            resume=resume,
         )
     )
     print(f"[green]Benchmark complete[/green]: {result.run_dir}")
     print(f"Predictions: {result.predictions_path}")
     print(f"Metrics: {result.metrics_path}")
     print(f"Report: {result.report_path}")
+    print(f"Manifest: {result.manifest_path}")
 
 
 @benchmark_app.command("compare")

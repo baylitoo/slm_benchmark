@@ -134,6 +134,26 @@ Judge results are stored per prediction and aggregated as `judge_faithfulness` a
 compares aggregate judge faithfulness with labeled field accuracy. Judge failures are
 recorded as `judge_error` without changing extraction success.
 
+### Reproducible and resumable runs
+
+Each benchmark run writes an immutable `manifest.json` with the git state, sanitized selected
+model profiles, model config and dataset hashes, document hashes, dependency versions, system
+resources, invocation arguments, and stable task IDs. Predictions and lifecycle events are
+durably appended, while final prediction, metric, and report artifacts are replaced atomically.
+
+Resume an interrupted run by reusing its output directory:
+
+```bash
+docie-bench benchmark run \
+  --dataset data/sample_dataset/manifest.jsonl \
+  --output-dir runs/my-run \
+  --resume
+```
+
+Resume skips completed and failed terminal tasks, repairs a truncated final JSONL record, and
+refuses to proceed when code, model config, selected profiles, dataset contents, or task inputs
+have drifted. Concurrency may change when resuming because it does not affect task identity.
+
 ## Model profiles
 
 Model profiles live in `configs/models.yaml`. A profile can point to:

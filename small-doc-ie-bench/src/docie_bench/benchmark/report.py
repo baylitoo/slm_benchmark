@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import html
 import json
 from pathlib import Path
 from typing import Any
 
 from jinja2 import Template
+
+from docie_bench.benchmark.reproducibility import atomic_write_json, atomic_write_text
 
 HTML_TEMPLATE = Template(
     """
@@ -106,9 +109,36 @@ HTML_TEMPLATE = Template(
 
   <h2>Artifacts</h2>
   <ul>
+    <li><code>manifest.json</code></li>
+    <li><code>task-events.jsonl</code></li>
     <li><code>predictions.jsonl</code></li>
     <li><code>metrics.json</code></li>
   </ul>
+  {% if reproducibility %}
+  <h2>Reproducibility</h2>
+  <table>
+    <tbody>
+      <tr>
+        <th>Input fingerprint</th>
+        <td><code>{{ reproducibility.input_fingerprint }}</code></td>
+      </tr>
+      <tr><th>Tasks</th><td>{{ reproducibility.task_count }}</td></tr>
+      <tr><th>Resumed</th><td>{{ reproducibility.resumed }}</td></tr>
+      <tr>
+        <th>Skipped / executed</th>
+        <td>{{ reproducibility.tasks_skipped }} / {{ reproducibility.tasks_executed }}</td>
+      </tr>
+      <tr><th>Manifest</th><td><code>{{ reproducibility.manifest_path }}</code></td></tr>
+      <tr><th>Warnings</th><td>{{ reproducibility.warnings | join('; ') }}</td></tr>
+    </tbody>
+  </table>
+  {% endif %}
+  {% if manifest_json %}
+  <details>
+    <summary><strong>Immutable run manifest</strong></summary>
+    <pre>{{ manifest_json }}</pre>
+  </details>
+  {% endif %}
 </body>
 </html>
 """
@@ -182,21 +212,27 @@ def write_report(run_dir: Path, metrics: dict[str, Any]) -> Path:
     ]
     cpus = [s[1] for s in cpu_samples]
     cpu_chart = _cpu_chart_svg(cpu_samples)
+    manifest_path = run_dir / "manifest.json"
+    manifest_json = ""
+    if manifest_path.exists():
+        manifest_json = html.escape(
+            json.dumps(json.loads(manifest_path.read_text(encoding="utf-8")), indent=2)
+        )
 
     path = run_dir / "report.html"
-    path.write_text(
+    atomic_write_text(
+        path,
         HTML_TEMPLATE.render(
             run_dir=str(run_dir),
             summary=metrics.get("summary", []),
             rows=metrics.get("rows", []),
+            reproducibility=metrics.get("reproducibility"),
+            manifest_json=manifest_json,
             cpu_chart=cpu_chart,
             cpu_peak=f"{max(cpus):.0f}" if cpus else "—",
             cpu_avg=f"{sum(cpus) / len(cpus):.0f}" if cpus else "—",
             cpu_duration=f"{max(s[0] for s in cpu_samples):.0f}" if cpu_samples else "—",
         ),
-        encoding="utf-8",
     )
-    (run_dir / "metrics.pretty.json").write_text(
-        json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    atomic_write_json(run_dir / "metrics.pretty.json", metrics, indent=2)
     return path
