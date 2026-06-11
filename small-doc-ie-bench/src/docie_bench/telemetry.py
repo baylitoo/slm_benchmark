@@ -22,14 +22,39 @@ OCR_BLOCKS = Histogram(
     buckets=(1, 5, 10, 25, 50, 100, 250, 500, 1000),
 )
 
-REVIEW_ACTIONS = Counter(
-    "docie_review_actions_total",
-    "Human review lifecycle actions",
-    ["action"],
+MODEL_GATEWAY_REQUESTS = Counter(
+    "docie_model_gateway_requests_total",
+    "Model gateway attempts and rejected requests",
+    ["model_profile", "model", "outcome"],
 )
 
-REVIEW_QUEUE_DEPTH = Gauge(
-    "docie_review_queue_depth",
-    "Current review task count by status",
-    ["status"],
+MODEL_GATEWAY_RETRIES = Counter(
+    "docie_model_gateway_retries_total",
+    "Model gateway retries",
+    ["model_profile", "model", "classification"],
+)
+
+MODEL_GATEWAY_WAIT = Histogram(
+    "docie_model_gateway_queue_wait_seconds",
+    "Time spent waiting for a model execution slot",
+    ["model_profile", "model"],
+    buckets=(0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 15, 30, 60),
+)
+
+MODEL_GATEWAY_QUEUE_DEPTH = Gauge(
+    "docie_model_gateway_queue_depth",
+    "Current queued model requests",
+    ["model_profile", "model"],
+)
+
+MODEL_GATEWAY_IN_FLIGHT = Gauge(
+    "docie_model_gateway_in_flight",
+    "Current model requests holding an execution slot",
+    ["model_profile", "model"],
+)
+
+MODEL_GATEWAY_CIRCUIT_OPEN = Gauge(
+    "docie_model_gateway_circuit_open",
+    "Whether the model gateway circuit is open",
+    ["model_profile", "model"],
 )

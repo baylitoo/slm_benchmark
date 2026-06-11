@@ -201,7 +201,21 @@ profiles:
     response_format_style: openai_json_schema
     temperature: 0.0
     max_tokens: 900
+    capability_discovery: optional
+    retry_max_attempts: 3
+    circuit_breaker_failure_threshold: 5
+    circuit_breaker_reset_seconds: 30
+    max_concurrency: 2
+    queue_limit: 16
+    queue_timeout_seconds: 30
 ```
+
+The model gateway shares scheduling and circuit-breaker state across clients targeting
+the same endpoint/model. It retries only transient, rate-limited, and invalid-response
+failures; permanent 4xx responses fail immediately. `capability_discovery` can be
+`disabled`, `optional`, or `required`. Discovery uses `GET /models`, verifies the
+configured model id, and validates advertised `vision` and `response_format_styles`
+metadata when the endpoint provides it.
 
 ## Dataset format
 
