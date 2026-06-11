@@ -117,6 +117,30 @@ HTML_TEMPLATE = Template(
     </tbody>
   </table>
 
+  <h2>Arithmetic Validation Warnings</h2>
+  <table>
+    <thead><tr><th>Document</th><th>Model profile</th><th>Warning</th></tr></thead>
+    <tbody>
+    {% set arith_warnings = [] %}
+    {% for row in rows %}
+      {% for w in (row.get('validation') or {}).get('warnings', []) %}
+        {% set _ = arith_warnings.append((row.get('doc_id', ''), row.get('model_profile', ''), w)) %}
+      {% endfor %}
+    {% endfor %}
+    {% if arith_warnings %}
+      {% for doc_id, profile, warning in arith_warnings %}
+      <tr>
+        <td>{{ doc_id }}</td>
+        <td>{{ profile }}</td>
+        <td class="bad">{{ warning }}</td>
+      </tr>
+      {% endfor %}
+    {% else %}
+      <tr><td colspan="3" class="ok">No arithmetic validation warnings.</td></tr>
+    {% endif %}
+    </tbody>
+  </table>
+
   <h2>Ungrounded Fields</h2>
   <table>
     <thead><tr><th>Document</th><th>Model profile</th><th>Potential hallucinations</th></tr></thead>

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterable
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,16 +42,21 @@ def hash_file(path: Path) -> str:
 
 
 def profile_snapshot(profile: ModelProfile) -> dict[str, Any]:
-    snapshot = asdict(profile)
+    if is_dataclass(profile) and not isinstance(profile, type):
+        snapshot = asdict(profile)
+    else:
+        snapshot = vars(profile).copy()
     snapshot.pop("api_key", None)
-    snapshot["stop_sequences"] = list(profile.stop_sequences)
-    parsed_url = urlsplit(profile.base_url)
-    if parsed_url.username or parsed_url.password:
-        hostname = parsed_url.hostname or ""
-        netloc = f"{hostname}:{parsed_url.port}" if parsed_url.port else hostname
-        snapshot["base_url"] = urlunsplit(
-            (parsed_url.scheme, netloc, parsed_url.path, parsed_url.query, parsed_url.fragment)
-        )
+    snapshot["stop_sequences"] = list(getattr(profile, "stop_sequences", ()))
+    base_url = getattr(profile, "base_url", None)
+    if base_url:
+        parsed_url = urlsplit(base_url)
+        if parsed_url.username or parsed_url.password:
+            hostname = parsed_url.hostname or ""
+            netloc = f"{hostname}:{parsed_url.port}" if parsed_url.port else hostname
+            snapshot["base_url"] = urlunsplit(
+                (parsed_url.scheme, netloc, parsed_url.path, parsed_url.query, parsed_url.fragment)
+            )
     return snapshot
 
 

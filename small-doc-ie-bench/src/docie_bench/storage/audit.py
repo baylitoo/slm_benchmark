@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from docie_bench.review import enqueue_review
 from docie_bench.schemas.common import ExtractionResponse
+from docie_bench.schemas.review import ReviewTaskCreate
 from docie_bench.security import redact_fields
 from docie_bench.settings import get_settings
-from docie_bench.storage.db import ExtractionAudit, session_scope
+from docie_bench.storage.db import ExtractionAudit, database_enabled, session_scope
 
 
 def save_extraction_audit(response: ExtractionResponse, *, tenant_id: str | None = None) -> None:

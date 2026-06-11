@@ -200,36 +200,12 @@ class OpenAICompatibleClient:
                     "docie_step": "llm_response",
                     "docie_model": self.profile.model,
                     "docie_schema_name": schema_name,
-                    "docie_raw_content": content,
+                    **({"docie_raw_content": content} if get_settings().log_document_content else {}),
                     "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
                     "docie_usage": data.get("usage"),
                     "docie_llm_latency_ms": llm_latency_ms,
                 },
             )
-            raise LLMClientError(f"LLM server returned {resp.status_code}: {resp.text[:500]}")
-        data = resp.json()
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise LLMClientError(f"Unexpected LLM response shape: {data}") from exc
-        if isinstance(content, list):
-            # Some multimodal-compatible gateways return content blocks.
-            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-
-        logger.debug(
-            "llm_response",
-            extra={
-                "docie_step": "llm_response",
-                "docie_model": self.profile.model,
-                "docie_schema_name": schema_name,
-                **({"docie_raw_content": content} if get_settings().log_document_content else {}),
-                "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
-                "docie_usage": data.get("usage"),
-                "docie_llm_latency_ms": llm_latency_ms,
-            },
-        )
-
-        content = _clean_content(content)
 
             content = _clean_content(content)
             try:

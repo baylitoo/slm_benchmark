@@ -58,3 +58,15 @@ MODEL_GATEWAY_CIRCUIT_OPEN = Gauge(
     "Whether the model gateway circuit is open",
     ["model_profile", "model"],
 )
+
+REVIEW_ACTIONS = Counter(
+    "docie_review_actions_total",
+    "Total human review actions",
+    ["action"],
+)
+
+REVIEW_QUEUE_DEPTH = Gauge(
+    "docie_review_queue_depth",
+    "Current review queue depth by status",
+    ["status"],
+)

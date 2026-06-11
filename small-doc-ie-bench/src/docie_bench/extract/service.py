@@ -234,7 +234,7 @@ class ExtractionService:
                 "docie_block_count": len(blocks),
                 **(
                     {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
-                    if get_settings().log_document_content
+                    if getattr(get_settings(), "log_document_content", False)
                     else {}
                 ),
             },
@@ -306,7 +306,7 @@ class ExtractionService:
                 "docie_ocr_latency_ms": ocr_ms,
                 **(
                     {"docie_blocks": [{"id": b.id, "text": b.text} for b in blocks]}
-                    if get_settings().log_document_content
+                    if getattr(get_settings(), "log_document_content", False)
                     else {}
                 ),
             },

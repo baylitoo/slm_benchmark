@@ -21,6 +21,7 @@ class DatasetItem(BaseModel):
     ocr_reference_blocks: list[OCRBlock] | None = None
     ground_truth: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
+    split: str = "unspecified"
 
 
 def load_dataset(path: Path) -> list[DatasetItem]:

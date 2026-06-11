@@ -114,6 +114,7 @@ async def run_benchmark(
     schema_name: str = "invoice",
     language: str | None = None,
     split: str | None = None,
+    resume: bool = False,
 ) -> BenchmarkResult:
     settings = get_settings()
     if resume and output_dir is None:
@@ -386,7 +387,7 @@ async def run_benchmark(
                     ),
                     "ok": False,
                     "latency_ms": int((time.perf_counter() - started) * 1000),
-                    "error": error,
+                    "error": repr(exc),
                     "ground_truth": item.ground_truth,
                 }
 
@@ -420,6 +421,15 @@ async def run_benchmark(
         eval_mode=eval_mode,
     )
     metrics["dataset"] = dataset_metadata
+    metrics["reproducibility"] = {
+        "resumed": resume,
+        "tasks_skipped": len(completed_task_ids),
+        "tasks_executed": len(pending_tasks),
+        "task_count": len(tasks),
+        "input_fingerprint": manifest.get("input_fingerprint"),
+        "manifest_path": str(manifest_path),
+        "warnings": resume_warnings,
+    }
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, default=str), encoding="utf-8")
     report_path = write_report(run_dir, metrics)

@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
@@ -25,10 +25,41 @@ from docie_bench.security import (
     read_validated_upload,
     redact_fields,
 )
+from docie_bench.review import (
+    ReviewConflictError,
+    ReviewNotFoundError,
+    ReviewValidationError,
+    claim_review,
+    correct_review,
+    decide_review,
+    enqueue_review,
+    export_annotations,
+    get_review,
+    list_reviews,
+    release_review,
+    review_metrics,
+)
+from docie_bench.schemas.review import (
+    AnnotationExportRequest,
+    AnnotationExportView,
+    ClaimRequest,
+    CorrectionRequest,
+    DecisionRequest,
+    ReleaseRequest,
+    ReviewMetricsView,
+    ReviewStatus,
+    ReviewTaskCreate,
+    ReviewTaskView,
+)
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import save_extraction_audit
 from docie_bench.storage.db import get_session_factory, init_engine
-from docie_bench.telemetry import EXTRACTION_LATENCY, EXTRACTION_REQUESTS
+from docie_bench.telemetry import (
+    EXTRACTION_LATENCY,
+    EXTRACTION_REQUESTS,
+    REVIEW_ACTIONS,
+    REVIEW_QUEUE_DEPTH,
+)
 
 settings = get_settings()
 configure_logging(settings.log_level)
