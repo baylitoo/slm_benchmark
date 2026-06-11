@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     default_model_profile: str = "local_llamacpp"
     default_ocr_backend: str = "pdf_text"
     ocr_cache_dir: Path = Path(".cache/ocr")
+    ocr_cache_max_mb: int = Field(default=2048, ge=0)
+    ocr_cache_enabled: bool = True
     runs_dir: Path = Path("runs")
 
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"

@@ -1,0 +1,29 @@
+name: regression-gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  deterministic-regression-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest -q
+      - name: Compare deterministic benchmark fixture
+        run: |
+          docie-bench benchmark compare \
+            tests/fixtures/regression/baseline \
+            tests/fixtures/regression/candidate \
+            --budgets tests/fixtures/regression/budgets.yaml \
+            --output-dir comparison
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-comparison
+          path: comparison/

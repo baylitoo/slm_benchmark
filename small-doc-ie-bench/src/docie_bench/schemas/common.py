@@ -66,8 +66,9 @@ class ExtractionResponse(BaseModel):
     schema_name: str
     model_profile: str
     document_hash: str | None
-    result: dict
+    result: dict[str, Any]
     validation: ExtractionValidation
     usage: Usage | None = None
     latency_ms: int
     dynamic_schema: dict[str, Any] | None = None
+    routing: dict[str, Any] | None = None
