@@ -80,7 +80,7 @@ class ControlPlane:
     @classmethod
     def from_defaults(cls) -> ControlPlane:
         """Build the local control plane from the serving implementation modules."""
-        from docie_bench.serving.planner import HostResources, ResourcePlanner
+        from docie_bench.serving.planner import HostResources, ResourcePlanner, RuntimeName
         from docie_bench.serving.registry import ModelRegistry
         from docie_bench.serving.runtime import default_runtime_adapters
         from docie_bench.serving.supervisor import PersistentSupervisor
@@ -100,7 +100,9 @@ class ControlPlane:
                 cpu_cores=psutil.cpu_count(logical=True) or 1,
                 memory_gb=round(psutil.virtual_memory().available / (1024**3), 4),
                 disk_gb=round(shutil.disk_usage(home.parent).free / (1024**3), 4),
-                available_runtimes=frozenset(runtimes.available_names()),
+                available_runtimes=frozenset(
+                    RuntimeName(name) for name in runtimes.available_names()
+                ),
             ),
         )
         supervisor = _DefaultSupervisor(

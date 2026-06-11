@@ -53,6 +53,8 @@ dev = [
 [project.scripts]
 docie-bench = "docie_bench.cli:app"
 docie-bench-ui = "docie_bench.cli2:main"
+docie = "docie_bench.serving.cli:app"
+docie-serving = "docie_bench.serving.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

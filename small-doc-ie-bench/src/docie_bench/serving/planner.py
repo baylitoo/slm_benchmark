@@ -154,9 +154,7 @@ class ResourcePlanner:
 
         unsupported = sorted(request.required_features - self._FEATURES[runtime])
         if unsupported:
-            failures.append(
-                f"runtime does not support required features: {', '.join(unsupported)}"
-            )
+            failures.append(f"runtime does not support required features: {', '.join(unsupported)}")
 
         context_length = request.context_length or model.context_length
         if model.context_length and context_length and context_length > model.context_length:
@@ -330,7 +328,5 @@ def recommend_runtime(request: PlanningRequest) -> RuntimeRecommendation:
     return ResourcePlanner().recommend(request)
 
 
-def check_runtime_compatibility(
-    request: PlanningRequest, runtime: RuntimeName
-) -> RuntimePlan:
+def check_runtime_compatibility(request: PlanningRequest, runtime: RuntimeName) -> RuntimePlan:
     return ResourcePlanner().evaluate(request, runtime)

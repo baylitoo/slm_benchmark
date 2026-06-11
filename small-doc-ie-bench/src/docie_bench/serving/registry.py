@@ -365,9 +365,7 @@ class ModelRegistry:
                 referenced = {
                     artifact.digest
                     for other_id in index["models"]
-                    for artifact in self._read_manifest_file(
-                        index["models"][other_id]
-                    ).artifacts
+                    for artifact in self._read_manifest_file(index["models"][other_id]).artifacts
                 }
                 for artifact in manifest.artifacts:
                     if artifact.digest not in referenced:

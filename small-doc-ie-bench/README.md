@@ -4,6 +4,26 @@ Enterprise-grade CPU-only benchmark harness for structured information extractio
 
 The project is designed for a Ryzen-class CPU server with 64 GB RAM and no GPU. It separates OCR/layout, model serving, constrained JSON extraction, validation, persistence, and benchmark reporting.
 
+## Model serving factory
+
+The serving control plane turns local and remote inference runtimes into a
+consistent operational workflow. It supports vLLM, llama.cpp, Ollama, and
+OpenAI-compatible remote endpoints, with a content-addressed model registry,
+resource planning, and a persistent local deployment supervisor.
+
+```bash
+docie runtime list
+docie model pull ./path/to/model-manifest.json
+docie plan my-model
+docie serve my-model --runtime llamacpp
+docie list
+docie status my-model
+```
+
+Every command supports deterministic automation output through `--json`.
+See [docs/serving-factory.md](docs/serving-factory.md) for architecture,
+runtime requirements, model manifests, and operational examples.
+
 ## What this project gives you
 
 - **OpenAI-compatible LLM abstraction**: call local `llama.cpp`, vLLM, Ollama-compatible gateways, or a remote OpenAI-compatible endpoint through one client.
