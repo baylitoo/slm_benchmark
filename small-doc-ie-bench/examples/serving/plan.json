@@ -1,0 +1,8 @@
+{
+  "compatible": true,
+  "estimated_memory_gb": 5.8,
+  "model": "Qwen/Qwen3-4B",
+  "replicas": 1,
+  "runtime": "llamacpp",
+  "warnings": []
+}

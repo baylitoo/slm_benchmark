@@ -1,0 +1,9 @@
+{
+  "endpoint": "http://127.0.0.1:8100/v1",
+  "healthy_replicas": 1,
+  "model": "Qwen/Qwen3-4B",
+  "name": "invoice-fast",
+  "replicas": 1,
+  "runtime": "llamacpp",
+  "state": "running"
+}

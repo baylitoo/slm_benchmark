@@ -1,0 +1,11 @@
+[
+  {
+    "model": "Qwen/Qwen3-4B",
+    "revision": "pinned-sha",
+    "runtime_compatibility": [
+      "llamacpp",
+      "vllm"
+    ],
+    "state": "ready"
+  }
+]
