@@ -23,11 +23,14 @@ class OCRCache:
         max_bytes: int = 2 * 1024 * 1024 * 1024,
         lock_timeout_seconds: float = 60.0,
         stale_lock_seconds: float = 3600.0,
+        evict_interval: int = 20,
     ) -> None:
         self.root = root
         self.max_bytes = max_bytes
         self.lock_timeout_seconds = lock_timeout_seconds
         self.stale_lock_seconds = stale_lock_seconds
+        self._evict_interval = evict_interval
+        self._put_count = 0
 
     @staticmethod
     def key(
@@ -92,7 +95,9 @@ class OCRCache:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
-        self.evict()
+        self._put_count += 1
+        if self._put_count % self._evict_interval == 0:
+            self.evict()
         return path
 
     def evict(self) -> int:

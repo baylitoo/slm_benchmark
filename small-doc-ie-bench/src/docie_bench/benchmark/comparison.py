@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from docie_bench.benchmark.reproducibility import atomic_write_json, atomic_write_text
+
 HIGHER_IS_BETTER = {
     "ok_rate",
     "valid_rate",
@@ -98,11 +100,9 @@ def compare_runs(
     comparison_path = output_dir / "comparison.json"
     verdict_path = output_dir / "verdict.json"
     report_path = output_dir / "comparison.md"
-    comparison_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    verdict_path.write_text(
-        json.dumps(verdict_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    report_path.write_text(_markdown_report(payload), encoding="utf-8")
+    atomic_write_json(comparison_path, payload, indent=2)
+    atomic_write_json(verdict_path, verdict_payload, indent=2)
+    atomic_write_text(report_path, _markdown_report(payload))
     return ComparisonResult(
         verdict,
         exit_code,

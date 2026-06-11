@@ -91,7 +91,9 @@ class OrchestratorService:
         query: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        statement = select(BenchmarkRun).order_by(BenchmarkRun.created_at.desc()).limit(limit)
+        statement = select(BenchmarkRun).order_by(BenchmarkRun.created_at.desc())
+        if not tag:
+            statement = statement.limit(limit)
         if owner:
             statement = statement.where(BenchmarkRun.owner == owner)
         if status:
@@ -107,7 +109,7 @@ class OrchestratorService:
         with self.sessions() as session:
             runs = list(session.scalars(statement))
             if tag:
-                runs = [run for run in runs if tag in run.tags]
+                runs = [run for run in runs if tag in run.tags][:limit]
             return [self._run_dict(run, include_tasks=False) for run in runs]
 
     def claim_task(
@@ -383,7 +385,8 @@ class OrchestratorService:
 
     def _refresh_run(self, session: Session, run_id: str, now: dt.datetime) -> None:
         run = session.get(BenchmarkRun, run_id)
-        assert run is not None
+        if run is None:
+            raise OrchestratorError(f"Run {run_id} not found during refresh")
         statuses = list(
             session.scalars(select(BenchmarkTask.status).where(BenchmarkTask.run_id == run_id))
         )

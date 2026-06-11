@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import email.utils
 import logging
+import random
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -426,5 +427,5 @@ class ModelGateway:
             self.profile.retry_backoff_max_seconds,
         )
         if self.profile.retry_jitter_seconds:
-            delay += secrets.SystemRandom().uniform(0, self.profile.retry_jitter_seconds)
+            delay += random.uniform(0, self.profile.retry_jitter_seconds)
         return float(delay)
