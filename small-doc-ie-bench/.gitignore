@@ -7,6 +7,8 @@ __pycache__/
 .ruff_cache/
 .cache/
 runs/
+comparison/
+.benchmarks/
 models/*.gguf
 models/*.bin
 models/*.safetensors

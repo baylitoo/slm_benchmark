@@ -160,10 +160,15 @@ async def run_benchmark_endpoint(payload: BenchmarkRunRequest) -> dict[str, str]
     from docie_bench.benchmark.runner import run_benchmark
 
     result = await run_benchmark(
-        dataset_path=Path(payload.dataset),
+        dataset_path=payload.dataset,
         models_config_path=Path(payload.models_config),
         model_profile=payload.model_profile,
         output_dir=Path(payload.output_dir) if payload.output_dir else None,
         concurrency=payload.concurrency,
+        split=payload.split,
     )
-    return {"run_dir": str(result.run_dir), "metrics_path": str(result.metrics_path)}
+    return {
+        "run_dir": str(result.run_dir),
+        "metrics_path": str(result.metrics_path),
+        "manifest_path": str(result.manifest_path),
+    }

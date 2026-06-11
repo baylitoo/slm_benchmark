@@ -25,7 +25,7 @@ def ground_evidence(
 
 def _copy_and_ground(obj: Any, blocks: list[OCRBlock], match_threshold: float) -> Any:
     if isinstance(obj, list):
-        return [_copy_and_ground(item, blocks, match_threshold) for item in obj]
+        return [_copy_and_ground_row(item, blocks, match_threshold) for item in obj]
     if not isinstance(obj, dict):
         return obj
 
@@ -45,6 +45,28 @@ def _copy_and_ground(obj: Any, blocks: list[OCRBlock], match_threshold: float) -
         result["evidence_ids"] = []
         result["confidence"] = 0.0
     return result
+
+
+def _copy_and_ground_row(obj: Any, blocks: list[OCRBlock], match_threshold: float) -> Any:
+    if not isinstance(obj, dict):
+        return _copy_and_ground(obj, blocks, match_threshold)
+    candidate = " ".join(_row_candidates(obj))
+    evidence_ids, score = _best_match(candidate, blocks) if candidate else ([], 0.0)
+    if score < match_threshold:
+        return _copy_and_ground(obj, blocks, match_threshold)
+    preferred_blocks = [block for block in blocks if block.id in evidence_ids]
+    return _copy_and_ground(obj, preferred_blocks, match_threshold)
+
+
+def _row_candidates(obj: Any) -> list[str]:
+    if isinstance(obj, list):
+        return [candidate for item in obj for candidate in _row_candidates(item)]
+    if not isinstance(obj, dict):
+        return []
+    candidate = _field_candidate(obj)
+    if candidate is not None:
+        return [candidate]
+    return [candidate for value in obj.values() for candidate in _row_candidates(value)]
 
 
 def _field_candidate(field: dict[str, Any]) -> str | None:

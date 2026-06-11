@@ -27,3 +27,4 @@ class BenchmarkRunRequest(BaseModel):
     model_profile: str | None = None
     output_dir: str | None = None
     concurrency: int = Field(default=1, ge=1, le=8)
+    split: str | None = None

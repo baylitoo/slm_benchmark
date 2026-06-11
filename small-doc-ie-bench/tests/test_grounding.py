@@ -52,3 +52,25 @@ def test_ground_evidence_links_value_split_across_adjacent_blocks():
     )
 
     assert grounded["vendor_name"]["evidence_ids"] == ["name-1", "name-2"]
+
+
+def test_ground_evidence_links_each_line_item_cell_to_its_row():
+    blocks = [
+        OCRBlock(id="row-1", text="Consulting 2 100.00 200.00", source="manual"),
+        OCRBlock(id="row-2", text="Hosting 1 50.00 50.00", source="manual"),
+    ]
+    payload = {
+        "line_items": [
+            {
+                "description": {"value": "Hosting"},
+                "quantity": {"value": "1"},
+                "line_total": {"amount": "50.00", "currency": "EUR"},
+            }
+        ]
+    }
+
+    grounded = ground_evidence(payload, blocks)
+
+    assert grounded["line_items"][0]["description"]["evidence_ids"] == ["row-2"]
+    assert grounded["line_items"][0]["quantity"]["evidence_ids"] == ["row-2"]
+    assert grounded["line_items"][0]["line_total"]["evidence_ids"] == ["row-2"]
