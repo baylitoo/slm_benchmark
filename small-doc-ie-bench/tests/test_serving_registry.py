@@ -155,7 +155,7 @@ def test_pull_resumes_partial_http_download_and_verifies_checksum(
         def __exit__(self, *args: object) -> None:
             self.close()
 
-    def urlopen(request: Request) -> Response:
+    def urlopen(request: Request, *, timeout: float | None = None) -> Response:
         requests.append(request)
         return Response(content[8:])
 
