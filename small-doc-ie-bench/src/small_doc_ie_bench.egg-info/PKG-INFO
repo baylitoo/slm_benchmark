@@ -21,12 +21,14 @@ Requires-Dist: sqlalchemy>=2.0.32
 Requires-Dist: psycopg[binary]>=3.2.1
 Requires-Dist: alembic>=1.13.2
 Requires-Dist: pdfplumber>=0.11.4
+Requires-Dist: pymupdf>=1.24.0
 Requires-Dist: Pillow>=10.4.0
 Requires-Dist: python-dateutil>=2.9.0
 Requires-Dist: jinja2>=3.1.4
 Requires-Dist: pandas>=2.2.2
 Requires-Dist: rapidfuzz>=3.9.6
 Requires-Dist: psutil>=5.9.0
+Requires-Dist: questionary>=2.0.0
 Provides-Extra: ocr
 Requires-Dist: pytesseract>=0.3.13; extra == "ocr"
 Provides-Extra: paddle

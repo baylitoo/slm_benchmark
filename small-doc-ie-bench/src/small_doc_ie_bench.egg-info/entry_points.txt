@@ -1,2 +1,5 @@
 [console_scripts]
+docie = docie_bench.serving.cli:app
 docie-bench = docie_bench.cli:app
+docie-bench-ui = docie_bench.cli2:main
+docie-serving = docie_bench.serving.cli:app

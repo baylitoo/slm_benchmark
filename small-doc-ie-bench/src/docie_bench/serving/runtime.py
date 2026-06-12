@@ -382,8 +382,10 @@ class LlamaCppRuntime(RuntimeAdapter):
         {
             RuntimeFeature.BATCHING,
             RuntimeFeature.EMBEDDINGS,
+            RuntimeFeature.LORA,
             RuntimeFeature.QUANTIZATION,
             RuntimeFeature.STRUCTURED_OUTPUT,
+            RuntimeFeature.TOOL_CALLS,
             RuntimeFeature.VISION,
         }
     )

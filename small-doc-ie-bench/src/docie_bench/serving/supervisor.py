@@ -4,7 +4,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -84,7 +84,7 @@ class PersistentSupervisor:
         self._records = self._load()
 
     def list(self) -> tuple[DeploymentRecord, ...]:
-        return tuple(self._records[name] for name in sorted(self._records))
+        return tuple(replace(self._records[name]) for name in sorted(self._records))
 
     def get(self, name: str) -> DeploymentRecord:
         try:
@@ -113,15 +113,7 @@ class PersistentSupervisor:
 
     def stop(self, name: str) -> DeploymentRecord:
         record = self.get(name)
-        record.spec = DeploymentSpec(
-            name=record.spec.name,
-            launch=record.spec.launch,
-            desired_state=DesiredState.STOPPED,
-            restart_policy=record.spec.restart_policy,
-            max_restarts=record.spec.max_restarts,
-            health_failure_threshold=record.spec.health_failure_threshold,
-            health_timeout_seconds=record.spec.health_timeout_seconds,
-        )
+        record.spec = replace(record.spec, desired_state=DesiredState.STOPPED)
         return self.reconcile(name)
 
     def remove(self, name: str) -> None:
@@ -234,10 +226,10 @@ class PersistentSupervisor:
             },
         }
         temporary = self.state_path.with_name(f".{self.state_path.name}.tmp")
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, self.state_path)
 
 

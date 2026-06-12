@@ -16,8 +16,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
 
-import psutil
-
 T = TypeVar("T")
 Result = object | Awaitable[object]
 
@@ -80,6 +78,7 @@ class ControlPlane:
     @classmethod
     def from_defaults(cls) -> ControlPlane:
         """Build the local control plane from the serving implementation modules."""
+        import psutil
         from docie_bench.serving.planner import HostResources, ResourcePlanner, RuntimeName
         from docie_bench.serving.registry import ModelRegistry
         from docie_bench.serving.runtime import default_runtime_adapters

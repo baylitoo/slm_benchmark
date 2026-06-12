@@ -12,7 +12,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
-import psutil
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _SHA256_PREFIX = "sha256:"
@@ -418,6 +417,8 @@ class ModelRegistry:
         hexdigest = normalize_digest(digest).removeprefix(_SHA256_PREFIX)
         return self._safe_path("artifacts", "sha256", hexdigest[:2], hexdigest)
 
+    _DOWNLOAD_TIMEOUT_S = 3600
+
     def _download(self, url: str) -> Path:
         key = hashlib.sha256(url.encode("utf-8")).hexdigest()
         target = self._safe_path("downloads", f"{key}.part")
@@ -427,7 +428,7 @@ class ModelRegistry:
             request = urllib.request.Request(url)  # noqa: S310
             if existing_size:
                 request.add_header("Range", f"bytes={existing_size}-")
-            with urllib.request.urlopen(request) as response:  # noqa: S310
+            with urllib.request.urlopen(request, timeout=self._DOWNLOAD_TIMEOUT_S) as response:  # noqa: S310
                 append = existing_size > 0 and response.status == 206
                 mode = "ab" if append else "wb"
                 with target.open(mode) as output:
@@ -517,6 +518,8 @@ class ModelRegistry:
                 if time.monotonic() >= deadline:
                     raise RegistryError(f"Timed out waiting for registry lock {key!r}") from None
                 try:
+                    import psutil
+
                     holder_pid = int(path.read_text(encoding="utf-8").strip())
                     if not psutil.pid_exists(holder_pid):
                         path.unlink(missing_ok=True)
