@@ -174,8 +174,13 @@ def list_schemas() -> None:
 
 
 @schema_app.command("show")
-def show_schema(name: str) -> None:
-    print(json.dumps(schema_json(name), indent=2, ensure_ascii=False))
+def show_schema(
+    names: list[str] = typer.Argument(..., help="One or more schema names to show"),
+) -> None:
+    for name in names:
+        if len(names) > 1:
+            print(f"# {name}")
+        print(json.dumps(schema_json(name), indent=2, ensure_ascii=False))
 
 
 def _print_json(value: object) -> None:
