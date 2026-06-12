@@ -73,14 +73,23 @@ profiles:
     return dataset, models, policy
 
 
-def _install_fakes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Stub ExtractionService so 'fast' fails the confidence gate and 'accurate' clears it."""
+def _install_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failing: tuple[str, ...] = (),
+) -> None:
+    """Stub ExtractionService so 'fast' fails the confidence gate and 'accurate' clears it.
+
+    Profiles named in ``failing`` raise on extraction to exercise the stage-failure path.
+    """
 
     class FakeService:
         def __init__(self, profile: Any) -> None:
             self.profile = profile
 
         async def extract_from_file(self, **kwargs: Any) -> ExtractionResponse:
+            if self.profile.name in failing:
+                raise RuntimeError(f"{self.profile.name} runtime exploded")
             confidence = 0.5 if self.profile.name == "fast" else 0.95
             return ExtractionResponse(
                 request_id=f"req-{self.profile.name}",
@@ -239,3 +248,73 @@ def test_routing_policy_conflicts_with_model_profile(
                 routing_policy_path=policy,
             )
         )
+
+
+def test_routing_stage_failure_recovers_and_aggregates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 'fast' raises; the route falls back to 'accurate', which accepts. The errored
+    # stage must be recorded and surfaced in routing_stage_failure_rate.
+    dataset, models, policy = _inputs(tmp_path)
+    _install_fakes(monkeypatch, tmp_path, failing=("fast",))
+
+    result = asyncio.run(
+        run_benchmark(
+            dataset_path=dataset,
+            models_config_path=models,
+            output_dir=tmp_path / "run",
+            routing_policy_path=policy,
+        )
+    )
+
+    audit = _predictions(result)[0]["routing"]
+    assert audit["terminal_decision"] == "accept"
+    assert audit["selected_stage"] == "accurate"
+    stages = {stage["stage"]: stage["status"] for stage in audit["stages"]}
+    assert stages == {"fast": "error", "accurate": "success"}
+    metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert metrics["summary"][0]["routing_stage_failure_rate"] == 0.5
+
+
+def test_routing_all_stages_fail_escalates_with_routed_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Every stage raises and the first escalates with no prior response, so the router
+    # returns response=None. The runner must surface that as a failed, routed-labelled row.
+    dataset, models, _ = _inputs(tmp_path)
+    _install_fakes(monkeypatch, tmp_path, failing=("fast", "accurate"))
+    policy = tmp_path / "escalate.yaml"
+    policy.write_text(
+        """
+version: escalate-1
+stages:
+  - name: fast
+    rules:
+      - when: {status: success, validation_valid: true}
+        decision: accept
+        reason: never reached because the stage errors
+    default_decision: escalate
+    default_reason: fast errored with nothing to fall back to
+  - name: accurate
+    rules:
+      - when: {status: success, validation_valid: true}
+        decision: accept
+        reason: also unreachable
+""",
+        encoding="utf-8",
+    )
+
+    result = asyncio.run(
+        run_benchmark(
+            dataset_path=dataset,
+            models_config_path=models,
+            output_dir=tmp_path / "run",
+            routing_policy_path=policy,
+        )
+    )
+
+    row = _predictions(result)[0]
+    assert row["task_state"] == "failed"
+    assert row["model_profile"] == "routed:escalate-1"
+    assert row["ingestion_path"] == "routed"
+    assert "Routing terminated without an accepted response" in row["error"]
