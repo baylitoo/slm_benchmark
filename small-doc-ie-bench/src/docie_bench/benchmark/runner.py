@@ -230,7 +230,11 @@ async def run_benchmark(
         "judge_profile": profile_snapshot(selected_judge) if selected_judge else None,
         "dataset": {
             "kind": "dataset" if dataset_path is not None else "document",
-            "source_hash": hash_file(dataset_path) if dataset_path is not None else None,
+            # dataset_path may be a registry reference (e.g. "sample@1.0.0"), not a
+            # file, so hash the resolved manifest rather than the reference string.
+            "source_hash": (
+                hash_file(resolved_dataset.manifest_path) if dataset_path is not None else None
+            ),
             "items": [
                 {
                     **item.model_dump(exclude={"file_path"}),
@@ -251,7 +255,7 @@ async def run_benchmark(
         "input_fingerprint": stable_hash(inputs),
         "inputs": inputs,
         "invocation": {
-            "dataset_path": str(dataset_path.resolve()) if dataset_path else None,
+            "dataset_path": str(dataset_path) if dataset_path is not None else None,
             "document_path": str(document_path.resolve()) if document_path else None,
             "models_config_path": str(models_config_path.resolve()),
             "model_profile": model_profile,
