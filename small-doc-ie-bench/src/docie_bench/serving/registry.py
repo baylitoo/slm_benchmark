@@ -524,7 +524,7 @@ class ModelRegistry:
                     if not psutil.pid_exists(holder_pid):
                         path.unlink(missing_ok=True)
                         continue
-                except (ImportError, OSError, ValueError):
+                except (OSError, ValueError):
                     pass
                 time.sleep(0.01)
         try:
