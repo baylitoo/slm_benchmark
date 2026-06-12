@@ -1,0 +1,39 @@
+# Example multi-stage routing policy for `docie-bench benchmark run --routing-policy`.
+#
+# Each stage NAME must match a profile name in models.yaml (name convention):
+# adding a model to the cascade is just adding the profile there and referencing
+# its name here. The two stages below use models small enough to run on CPU and
+# are both present after `ollama pull qwen2.5:1.5b` / `ollama pull nuextract:3.8b`.
+#
+# Cascade: a small, fast model first; if it does not clear the quality gate, fall
+# back to NuExtract; if that also fails validation, escalate (e.g. to human review).
+#
+# Note: the `min_confidence` gate only fires when the model emits per-field
+# confidence. If a model returns no confidence, avg_confidence is null and the
+# gate never matches, so the stage always falls back — tune the gate to your model.
+version: cpu-cascade-1
+stages:
+  - name: ollama_qwen25_1b
+    rules:
+      - when:
+          status: success
+          validation_valid: true
+          min_confidence: 0.85
+        decision: accept
+        reason: small fast model cleared the quality gate
+    default_decision: fallback
+    default_reason: small model below the confidence gate
+  - name: ollama_nuextract_3b
+    rules:
+      - when:
+          status: success
+          validation_valid: true
+        decision: accept
+        reason: NuExtract returned a valid extraction
+    default_decision: escalate
+    default_reason: NuExtract failed validation
+budget:
+  max_stages: 2
+  max_latency_ms: 600000
+exhausted_decision: escalate
+exhausted_reason: no stage produced an accepted extraction

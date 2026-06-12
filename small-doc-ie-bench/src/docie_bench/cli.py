@@ -52,6 +52,13 @@ def benchmark_run(
     language: str | None = typer.Option(None, help="Document language used with --document"),
     models_config: Path = typer.Option(Path("configs/models.yaml"), exists=True, readable=True),
     model_profile: str | None = typer.Option(None),
+    routing_policy: Path | None = typer.Option(
+        None,
+        exists=True,
+        readable=True,
+        help="Declarative routing policy (YAML/JSON). Runs each document through the "
+        "multi-stage router; stage names must match profiles in the models config.",
+    ),
     eval_mode: EvaluationMode = typer.Option(EvaluationMode.GROUND_TRUTH),
     judge_profile: str | None = typer.Option(
         None, help="Judge profile; defaults to judge.profile in models config"
@@ -69,6 +76,8 @@ def benchmark_run(
         raise typer.BadParameter("--document requires --eval-mode llm_judge or both")
     if resume and output_dir is None:
         raise typer.BadParameter("--resume requires --output-dir")
+    if routing_policy is not None and model_profile is not None:
+        raise typer.BadParameter("--routing-policy cannot be combined with --model-profile")
     configure_logging(log_level)
     result = asyncio.run(
         run_benchmark(
@@ -86,6 +95,7 @@ def benchmark_run(
             language=language,
             split=split,
             resume=resume,
+            routing_policy_path=routing_policy,
         )
     )
     print(f"[green]Benchmark complete[/green]: {result.run_dir}")

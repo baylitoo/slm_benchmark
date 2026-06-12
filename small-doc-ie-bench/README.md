@@ -341,6 +341,22 @@ attempt, decision, skipped stage, budget total, and terminal outcome. Benchmark 
 HTML reports aggregate routing acceptance, fallback, escalation, stage failure, latency, tokens,
 cost, budget exhaustion, and average-attempt metrics when this audit is present.
 
+### Benchmarking a routed pipeline
+
+Run a whole dataset through a policy and compare it against single-model baselines with
+`--routing-policy`. Each policy stage's `name` must match a profile in your models config
+(name convention), so adding a model to a cascade is just adding the profile and referencing
+its name as a stage. See `configs/routing-policy.example.yaml` for a runnable CPU cascade.
+
+```bash
+docie-bench benchmark run --dataset sample@1.0.0 --routing-policy configs/routing-policy.example.yaml
+```
+
+Routed runs collapse the per-profile sweep into one pass per document (the router selects
+profiles internally), label the result row `routed:<policy version>`, and record the policy in
+the run manifest for reproducibility. `--routing-policy` and `--model-profile` are mutually
+exclusive.
+
 ## Choosing a CPU model
 
 Recommended benchmark order:
