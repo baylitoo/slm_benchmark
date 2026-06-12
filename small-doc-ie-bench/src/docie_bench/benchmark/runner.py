@@ -18,7 +18,6 @@ from docie_bench.benchmark.reproducibility import (
     MANIFEST_VERSION,
     TERMINAL_TASK_STATES,
     append_jsonl,
-    atomic_write_json,
     atomic_write_text,
     canonical_json,
     dependency_snapshot,
@@ -31,6 +30,11 @@ from docie_bench.benchmark.reproducibility import (
     utc_now,
     validate_resume_manifest,
     write_manifest,
+)
+from docie_bench.benchmark.routing_config import (
+    build_extraction_router,
+    load_routing_policy,
+    resolve_routing_profiles,
 )
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_profiles import ModelProfile, load_judge_profile, load_model_profiles
@@ -115,6 +119,7 @@ async def run_benchmark(
     language: str | None = None,
     split: str | None = None,
     resume: bool = False,
+    routing_policy_path: Path | None = None,
 ) -> BenchmarkResult:
     settings = get_settings()
     if resume and output_dir is None:
@@ -152,11 +157,21 @@ async def run_benchmark(
     selected_judge = (
         load_judge_profile(models_config_path, judge_profile) if eval_mode.uses_judge else None
     )
-    selected_profiles = [profiles[model_profile]] if model_profile else list(profiles.values())
-    if selected_judge is not None and model_profile is None:
-        selected_profiles = [
-            profile for profile in selected_profiles if profile.name != selected_judge.name
-        ]
+    routing_policy = None
+    routing_label: str | None = None
+    if routing_policy_path is not None:
+        if model_profile is not None:
+            raise ValueError("routing_policy_path cannot be combined with a single model_profile")
+        routing_policy = load_routing_policy(routing_policy_path)
+        # Distinct profiles the policy references, in stage order, for provenance.
+        selected_profiles = resolve_routing_profiles(routing_policy, profiles)
+        routing_label = f"routed:{routing_policy.version}"
+    else:
+        selected_profiles = [profiles[model_profile]] if model_profile else list(profiles.values())
+        if selected_judge is not None and model_profile is None:
+            selected_profiles = [
+                profile for profile in selected_profiles if profile.name != selected_judge.name
+            ]
     if not selected_profiles:
         raise ValueError("No extraction model profiles selected")
 
@@ -167,7 +182,11 @@ async def run_benchmark(
         "ocr_backend": settings.default_ocr_backend,
     }
     tasks: list[BenchmarkTask] = []
-    for profile in selected_profiles:
+    # When routing, every document runs once through the router (which selects
+    # profiles internally), so the per-profile sweep collapses to a single pass
+    # using the first stage's profile as the carrier for task identity.
+    task_profiles = [selected_profiles[0]] if routing_policy is not None else selected_profiles
+    for profile in task_profiles:
         for repetition in range(repeat):
             for item in base_items:
                 repeated_item = (
@@ -180,7 +199,11 @@ async def run_benchmark(
                     "repetition": repetition,
                     "document_hash": document_hashes[item.file_path],
                     "dataset_item": item.model_dump(exclude={"file_path"}),
-                    "model_profile": profile_snapshot(profile),
+                    "model_profile": (
+                        routing_policy.model_dump(mode="json")
+                        if routing_policy is not None
+                        else profile_snapshot(profile)
+                    ),
                     "task_config": task_config,
                 }
                 tasks.append(
@@ -218,6 +241,9 @@ async def run_benchmark(
         },
         "task_config": task_config,
         "repeat": repeat,
+        "routing_policy": (
+            routing_policy.model_dump(mode="json") if routing_policy is not None else None
+        ),
     }
     manifest = {
         "manifest_version": MANIFEST_VERSION,
@@ -229,6 +255,9 @@ async def run_benchmark(
             "document_path": str(document_path.resolve()) if document_path else None,
             "models_config_path": str(models_config_path.resolve()),
             "model_profile": model_profile,
+            "routing_policy_path": (
+                str(routing_policy_path.resolve()) if routing_policy_path else None
+            ),
             "output_dir": str(output_dir.resolve()) if output_dir else None,
             "concurrency": concurrency,
             "repeat": repeat,
@@ -314,18 +343,37 @@ async def run_benchmark(
             await record_event(task, "running")
             profile = task.profile
             item = task.item
-            service = ExtractionService(profile)
+            routing_active = routing_policy is not None
+            label = routing_label if routing_active else profile.name
+            ingestion_path = (
+                "routed"
+                if routing_active
+                else ("vision" if profile.vision else f"ocr:{settings.default_ocr_backend}")
+            )
+            extract_kwargs: dict[str, Any] = {
+                "path": Path(item.file_path),
+                "ocr_backend_name": settings.default_ocr_backend,
+                "schema_name": item.schema_name,
+                "schema_mode": item.schema_mode,
+                "dynamic_schema": item.dynamic_schema,
+                "language": item.language,
+                "metadata": {"doc_id": item.doc_id, **item.metadata},
+            }
             started = time.perf_counter()
             try:
-                response = await service.extract_from_file(
-                    path=Path(item.file_path),
-                    ocr_backend_name=settings.default_ocr_backend,
-                    schema_name=item.schema_name,
-                    schema_mode=item.schema_mode,
-                    dynamic_schema=item.dynamic_schema,
-                    language=item.language,
-                    metadata={"doc_id": item.doc_id, **item.metadata},
-                )
+                if routing_active:
+                    assert routing_policy is not None
+                    router = build_extraction_router(routing_policy, profiles)
+                    routed = await router.extract_from_file(**extract_kwargs)
+                    response = routed.response
+                    if response is None:
+                        raise RuntimeError(
+                            "Routing terminated without an accepted response: "
+                            f"{routed.audit.terminal_reason}"
+                        )
+                else:
+                    service = ExtractionService(profile)
+                    response = await service.extract_from_file(**extract_kwargs)
                 row = {
                     "task_id": task.task_id,
                     "task_state": "completed",
@@ -334,10 +382,8 @@ async def run_benchmark(
                     "schema_name": response.schema_name,
                     "language": item.language,
                     "dynamic_schema": response.dynamic_schema,
-                    "model_profile": profile.name,
-                    "ingestion_path": (
-                        "vision" if profile.vision else f"ocr:{settings.default_ocr_backend}"
-                    ),
+                    "model_profile": label,
+                    "ingestion_path": ingestion_path,
                     "ok": True,
                     "latency_ms": response.latency_ms,
                     "validation": response.validation.model_dump(),
@@ -381,10 +427,8 @@ async def run_benchmark(
                     "schema_name": item.schema_name,
                     "language": item.language,
                     "dynamic_schema": item.dynamic_schema,
-                    "model_profile": profile.name,
-                    "ingestion_path": (
-                        "vision" if profile.vision else f"ocr:{settings.default_ocr_backend}"
-                    ),
+                    "model_profile": label,
+                    "ingestion_path": ingestion_path,
                     "ok": False,
                     "latency_ms": int((time.perf_counter() - started) * 1000),
                     "error": repr(exc),
