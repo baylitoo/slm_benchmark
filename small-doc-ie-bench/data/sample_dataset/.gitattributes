@@ -1,0 +1,8 @@
+# Pin bundled dataset files to LF line endings.
+#
+# The dataset registry hash (data/datasets.yaml) is computed over each document's
+# byte content. With git's autocrlf enabled, a Windows checkout rewrites these
+# files to CRLF, changing their hashes and breaking `dataset validate` /
+# `benchmark run --dataset sample@<version>` with a "Dataset hash mismatch". See
+# issue #39. Forcing LF keeps the on-disk bytes identical across platforms.
+* text eol=lf
