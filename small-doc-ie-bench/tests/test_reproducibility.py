@@ -111,6 +111,31 @@ def test_task_ids_are_stable_across_concurrency_and_manifests_are_sanitized(
     assert "Immutable run manifest" in first.report_path.read_text(encoding="utf-8")
 
 
+def test_str_dataset_path_from_cli_does_not_assume_path_type(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The Typer CLI passes --dataset through as a str (manifest path or registry
+    # reference), so run_benchmark must not call Path-only methods on it. Every
+    # other test passes a Path, which masked this. See issue #41.
+    dataset, models = _benchmark_inputs(tmp_path)
+    _install_runner_fakes(monkeypatch, tmp_path)
+
+    result = asyncio.run(
+        run_benchmark(
+            dataset_path=str(dataset),
+            models_config_path=models,
+            model_profile="extractor",
+            output_dir=tmp_path / "run",
+        )
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    # source_hash is the resolved manifest's content hash, not a hash of the string.
+    assert manifest["inputs"]["dataset"]["source_hash"].startswith("sha256:")
+    assert manifest["invocation"]["dataset_path"] == str(dataset)
+
+
 def test_resume_repairs_partial_tail_and_executes_only_missing_task(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
