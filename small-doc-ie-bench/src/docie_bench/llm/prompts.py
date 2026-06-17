@@ -36,8 +36,8 @@ Normalize dates to YYYY-MM-DD when the document is unambiguous.
 Normalize currency to ISO-4217 when explicit or strongly indicated by a symbol.
 """
 
-# Per-schema JSON templates for NuExtract3.
-# Leaf values use NuExtract's semantic type system:
+# Per-schema NuExtract type-string templates, shared by the NuExtract v1 and
+# NuExtract3 families. Leaf values use NuExtract's semantic type system:
 #   "verbatim-string" → extract text exactly as it appears
 #   "date"            → output ISO-8601 date (YYYY-MM-DD)
 #   "number"          → output clean decimal (no symbols, no locale separators)
@@ -154,10 +154,13 @@ def build_nuextract_prompts(
     language: str | None = None,
     template: dict | None = None,
 ) -> tuple[str, str]:
-    """Return (system_prompt, user_prompt) in NuExtract3 format.
+    """Return (system_prompt, user_prompt) in NuExtract **v1** format.
 
-    NuExtract3 uses a special input format: a JSON template with empty values
-    followed by the document text. It doesn't use a system prompt.
+    NuExtract v1 (Phi-3 based) uses a special text input format: a JSON template
+    followed by the document text, between `<|input|>` and `<|output|>`. It does
+    not use a system prompt. (NuExtract3 is different — see
+    `build_nuextract3_prompts`, which delivers the template out-of-band via
+    chat_template_kwargs instead of baking it into the prompt.)
     """
     template = template if template is not None else _NUEXTRACT_TEMPLATES.get(schema_name, {})
     template_json = json.dumps(template, ensure_ascii=False, indent=2)
@@ -174,6 +177,28 @@ def build_nuextract_prompts(
         "<|output|>"
     )
     return "", user_prompt
+
+
+def nuextract_template_for(schema_name: str) -> dict:
+    """Return the NuExtract type-string template for a static schema (or {})."""
+    return _NUEXTRACT_TEMPLATES.get(schema_name, {})
+
+
+def build_nuextract3_prompts(
+    *,
+    blocks: list[OCRBlock],
+    has_images: bool,
+) -> tuple[str, str]:
+    """Return (system_prompt, user_prompt) for NuExtract3.
+
+    NuExtract3 receives the extraction template out-of-band via
+    `chat_template_kwargs` (see the `nuextract3` response-format style), so the
+    prompt carries only the document and no system prompt. For image input the
+    document *is* the attached image, so the text body is empty.
+    """
+    if has_images:
+        return "", ""
+    return "", "\n".join(block.text for block in blocks)
 
 
 def build_schema_proposer_prompt(*, blocks: list[OCRBlock], language: str | None = None) -> str:

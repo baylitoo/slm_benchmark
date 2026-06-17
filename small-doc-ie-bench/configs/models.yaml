@@ -220,3 +220,40 @@ profiles:
     vision: true
     vision_max_pages: 8
     vision_pdf_dpi: 150
+
+  # NuExtract3 (numind, 2026) — 4B Qwen3.5-based multimodal VLM, 0-shot structured
+  # extraction. Served by llama-server, NOT Ollama: Ollama silently drops
+  # chat_template_kwargs over GGUF, so the template is ignored (verified 2026-06-17).
+  # The template is delivered via the `nuextract3` response style; vision: true
+  # sends the page image. Setup (seed the canonical models/ store from the GGUF
+  # you already pulled, then serve) is in src/docie_bench/serving/README.md.
+  nuextract3:
+    model: nuextract3
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: nuextract3
+    temperature: 0.2
+    top_p: 1.0
+    max_tokens: 4096
+    timeout_seconds: 600
+    prompt_profile: nuextract3
+    vision: true
+    vision_max_pages: 8
+    vision_pdf_dpi: 150
+
+  # NuExtract3 with reasoning enabled — slower (≈2k extra thinking tokens/doc) and
+  # small VLMs can loop and break JSON validity, but stronger on hard layouts.
+  # Benchmark it against `nuextract3` to measure the reasoning trade-off.
+  nuextract3_think:
+    model: nuextract3
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: nuextract3_think
+    temperature: 0.6
+    top_p: 1.0
+    max_tokens: 8192
+    timeout_seconds: 900
+    prompt_profile: nuextract3
+    vision: true
+    vision_max_pages: 8
+    vision_pdf_dpi: 150

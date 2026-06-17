@@ -25,11 +25,17 @@ def _clean_content(text: str) -> str:
     """Normalise raw LLM output to a single JSON object string.
 
     Handles:
-    - NuExtract3's <|end-output|> continuation (take only what comes before it)
+    - NuExtract3 reasoning mode's <think>...</think> block (keep only the answer)
+    - NuExtract v1's <|end-output|> continuation (take only what comes before it)
     - Markdown code fences (```json ... ```)
     - Run-on text after a complete JSON object (bracket-balance extraction)
     """
-    # Strip NuExtract3 end token and anything after it
+    # NuExtract3 reasoning mode prefixes the answer with a <think>...</think>
+    # block; keep only what follows the final </think>.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+
+    # Strip the NuExtract v1 end token and anything after it
     if "<|end-output|>" in text:
         text = text[: text.index("<|end-output|>")]
 
