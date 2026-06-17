@@ -24,6 +24,14 @@ from docie_bench.benchmark.registry import (
     validate_dataset,
 )
 from docie_bench.benchmark.runner import run_benchmark
+from docie_bench.llm.model_catalog import (
+    DEFAULT_OLLAMA_BASE_URL,
+    append_profile,
+    build_profile_config,
+    default_profile_name,
+    detect_capabilities,
+)
+from docie_bench.llm.model_profiles import load_model_profiles
 from docie_bench.logging_config import configure_logging
 from docie_bench.ocr.runner import run_ocr_benchmark
 from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
@@ -34,11 +42,13 @@ baseline_app = typer.Typer(no_args_is_help=True)
 ocr_app = typer.Typer(no_args_is_help=True)
 schema_app = typer.Typer(no_args_is_help=True)
 dataset_app = typer.Typer(no_args_is_help=True)
+models_app = typer.Typer(no_args_is_help=True)
 app.add_typer(benchmark_app, name="benchmark")
 benchmark_app.add_typer(baseline_app, name="baseline")
 benchmark_app.add_typer(ocr_app, name="ocr")
 app.add_typer(schema_app, name="schema")
 app.add_typer(dataset_app, name="dataset")
+app.add_typer(models_app, name="models")
 
 
 @benchmark_app.command("run")
@@ -191,6 +201,72 @@ def show_schema(
         if len(names) > 1:
             print(f"# {name}")
         print(json.dumps(schema_json(name), indent=2, ensure_ascii=False))
+
+
+@models_app.command("add")
+def models_add(
+    model: str = typer.Argument(
+        ..., help="Ollama model name or hf.co/<repo>:<quant> tag (e.g. gemma4:e2b)"
+    ),
+    name: str | None = typer.Option(None, help="Profile name (default: derived from the model)"),
+    models_config: Path = typer.Option(Path("configs/models.yaml"), exists=True, readable=True),
+    base_url: str = typer.Option(
+        DEFAULT_OLLAMA_BASE_URL, help="OpenAI-compatible endpoint the profile will call"
+    ),
+    vision: bool | None = typer.Option(
+        None, "--vision/--no-vision", help="Force vision on/off (default: auto-detect from Ollama)"
+    ),
+    response_format: str | None = typer.Option(
+        None, help="Override response_format_style (default: json_object, or none for NuExtract)"
+    ),
+    prompt_profile: str | None = typer.Option(None, help="Override prompt_profile"),
+) -> None:
+    """Add a benchmark profile for an Ollama model, auto-detecting its capabilities."""
+    profile_name = name or default_profile_name(model)
+    existing = load_model_profiles(models_config)
+    if profile_name in existing:
+        raise typer.BadParameter(
+            f"Profile {profile_name!r} already exists; pass --name to choose another"
+        )
+
+    capabilities = detect_capabilities(model, base_url)
+    if not capabilities.detected:
+        print(
+            f"[yellow]Could not reach Ollama at {base_url} (or the model is not pulled), "
+            f"so capabilities were not detected. Assuming text-only; pass --vision to override. "
+            f"Pull it first with:[/yellow]\n  ollama pull {model}"
+        )
+    resolved_vision = vision if vision is not None else capabilities.vision
+
+    config = build_profile_config(
+        model,
+        base_url=base_url,
+        vision=resolved_vision,
+        response_format=response_format,
+        prompt_profile=prompt_profile,
+    )
+    append_profile(models_config, profile_name, config)
+
+    print(f"[green]Added profile[/green] [bold]{profile_name}[/bold] -> {model}")
+    print(
+        f"  vision={resolved_vision}  response_format={config['response_format_style']}"
+        f"  prompt={config['prompt_profile']}"
+    )
+    print(
+        "\nBenchmark it:\n  docie-bench benchmark run --dataset <manifest> "
+        f"--model-profile {profile_name}"
+    )
+
+
+@models_app.command("list")
+def models_list(
+    models_config: Path = typer.Option(Path("configs/models.yaml"), exists=True, readable=True),
+) -> None:
+    """List configured model profiles with their key flags."""
+    for profile_name, profile in sorted(load_model_profiles(models_config).items()):
+        tags = ["vision"] if profile.vision else []
+        tags.append(profile.response_format_style)
+        print(f"{profile_name}  [{', '.join(tags)}]  {profile.model}")
 
 
 def _print_json(value: object) -> None:
