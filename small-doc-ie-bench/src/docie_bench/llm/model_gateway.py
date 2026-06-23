@@ -4,7 +4,6 @@ import asyncio
 import email.utils
 import logging
 import random
-import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -427,5 +426,5 @@ class ModelGateway:
             self.profile.retry_backoff_max_seconds,
         )
         if self.profile.retry_jitter_seconds:
-            delay += random.uniform(0, self.profile.retry_jitter_seconds)
+            delay += random.uniform(0, self.profile.retry_jitter_seconds)  # noqa: S311 (retry jitter, not crypto)
         return float(delay)

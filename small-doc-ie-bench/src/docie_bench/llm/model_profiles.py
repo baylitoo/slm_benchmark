@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+# Profile kinds the gateway can dispatch. "passthrough" proxies to an
+# OpenAI-compatible upstream (the default — every existing profile). Solution
+# kinds are handled by a local adapter (see docie_bench.serving.solutions).
+VALID_PROFILE_KINDS = frozenset({"passthrough", "ocr", "pipeline"})
 
 
 @dataclass(frozen=True)
@@ -34,8 +40,16 @@ class ModelProfile:
     max_concurrency: int = 4
     queue_limit: int = 32
     queue_timeout_seconds: float = 30.0
+    # Solution routing. "passthrough" (default) proxies to base_url; other kinds
+    # are served by a local adapter. `options` carries adapter-specific config.
+    kind: str = "passthrough"
+    options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.kind not in VALID_PROFILE_KINDS:
+            raise ValueError(
+                f"kind must be one of {sorted(VALID_PROFILE_KINDS)}, got {self.kind!r}"
+            )
         if self.capability_discovery not in {"disabled", "optional", "required"}:
             raise ValueError("capability_discovery must be disabled, optional, or required")
         for name in (
@@ -71,10 +85,19 @@ def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
         cfg = {key: _expand_env(value) for key, value in cfg.items()}
         api_key_env = cfg.get("api_key_env")
         api_key = os.environ.get(api_key_env, "") if api_key_env else cfg.get("api_key", "")
+        kind = cfg.get("kind", "passthrough")
+        model = cfg.get("model", "")
+        base_url = str(cfg.get("base_url", "")).rstrip("/")
+        # Passthrough profiles still require an upstream; solution kinds (ocr/pipeline)
+        # are served by a local adapter and may omit model/base_url.
+        if kind == "passthrough" and (not model or not base_url):
+            raise ValueError(
+                f"profile {name!r}: 'model' and 'base_url' are required for passthrough profiles"
+            )
         profiles[name] = ModelProfile(
             name=name,
-            model=cfg["model"],
-            base_url=cfg["base_url"].rstrip("/"),
+            model=model,
+            base_url=base_url,
             api_key=api_key or "local-not-used",
             response_format_style=cfg.get("response_format_style", "openai_json_schema"),
             temperature=float(cfg.get("temperature", 0.0)),
@@ -98,6 +121,8 @@ def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
             max_concurrency=int(cfg.get("max_concurrency", 4)),
             queue_limit=int(cfg.get("queue_limit", 32)),
             queue_timeout_seconds=float(cfg.get("queue_timeout_seconds", 30)),
+            kind=kind,
+            options=dict(cfg.get("options") or {}),
         )
     return profiles
 

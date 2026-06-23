@@ -22,6 +22,7 @@ circuit-breaker. Those layer on top later.
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
+from docie_bench.serving.solutions import SolutionError, build_solution
 
 DEFAULT_MODELS_CONFIG = Path("configs/models.yaml")
 
@@ -149,6 +151,11 @@ def create_gateway_app(
                 exc.message, status_code=exc.status_code, error_type=exc.error_type
             )
 
+        # Non-passthrough profiles are served by a local solution adapter
+        # (OCR engine, pipeline, …) rather than proxied to an upstream.
+        if profile.kind != "passthrough":
+            return await _dispatch_solution(profile, body)
+
         # Always forward the upstream model id, regardless of how it was matched.
         body["model"] = profile.model
         url = f"{profile.base_url}/chat/completions"
@@ -217,3 +224,40 @@ async def _forward_stream(
     return StreamingResponse(
         body_iterator(), status_code=upstream.status_code, media_type=media_type
     )
+
+
+async def _dispatch_solution(profile: ModelProfile, body: dict[str, object]) -> Response:
+    """Serve a non-passthrough profile via its local adapter, OpenAI-shaped."""
+    try:
+        solution = build_solution(profile)
+        completion = await solution.complete(body)
+    except SolutionError as exc:
+        return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
+    if body.get("stream"):
+        return _solution_sse(completion)
+    return JSONResponse(completion)
+
+
+def _solution_sse(completion: dict[str, object]) -> StreamingResponse:
+    """Emit a single completion as an OpenAI SSE stream so stream clients work."""
+    choice = completion["choices"][0]  # type: ignore[index]
+    content = choice["message"]["content"]  # type: ignore[index]
+    chunk = {
+        "id": completion.get("id", "chatcmpl-solution"),
+        "object": "chat.completion.chunk",
+        "created": completion.get("created", 0),
+        "model": completion.get("model", ""),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    async def body_iterator() -> AsyncIterator[bytes]:
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(body_iterator(), media_type="text/event-stream")
