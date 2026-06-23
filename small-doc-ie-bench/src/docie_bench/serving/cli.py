@@ -9,6 +9,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import typer
 
@@ -159,6 +160,31 @@ def create_app(
     ) -> None:
         """Assess compatibility and resources without launching."""
         _execute(ctx, lambda plane: plane.plan(model, runtime=runtime, replicas=replicas))
+
+    @app.command()
+    def gateway(
+        host: str = typer.Option("127.0.0.1", help="Bind address."),
+        port: int = typer.Option(8080, min=1, max=65535, help="Port for the unified endpoint."),
+        models_config: Path = typer.Option(
+            Path("configs/models.yaml"),
+            exists=True,
+            readable=True,
+            help="Routing table: profiles -> upstream runtimes.",
+        ),
+    ) -> None:
+        """Serve one OpenAI-compatible endpoint over every configured profile.
+
+        Clients point base_url at http://<host>:<port>/v1 and request a model by
+        profile name (or its upstream id); the gateway routes to the right runtime.
+        """
+        import uvicorn
+
+        from docie_bench.serving.gateway import create_gateway_app
+
+        typer.echo(
+            f"docie gateway -> http://{host}:{port}/v1  (routing from {models_config})"
+        )
+        uvicorn.run(create_gateway_app(models_config), host=host, port=port)
 
     return app
 
