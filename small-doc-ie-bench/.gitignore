@@ -13,3 +13,9 @@ models/*.bin
 models/*.safetensors
 *.pyc
 .DS_Store
+
+# git worktrees scratch (never commit)
+.worktrees/
+
+# local-only datasets (framework stays dataset-agnostic; do not commit datasets)
+data/voxel51_invoices/
