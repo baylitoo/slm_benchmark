@@ -12,14 +12,17 @@ transition. The runner is untouched; the dashboard only reads what it writes.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
-import questionary
+import yaml
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -31,6 +34,7 @@ from textual.worker import Worker, WorkerState
 from docie_bench.cli2 import (
     _ask_dataset,
     _ask_options,
+    _ask_profiles,
     _count_docs,
     _fmt_ms,
     _load_profile_names,
@@ -311,31 +315,77 @@ def _status_text(status: str) -> Text:
 # ── entry point ─────────────────────────────────────────────────────────────
 
 
+def _effective_config(config_path: Path, selected: list[str], all_names: list[str]) -> Path:
+    """Return a models config restricted to ``selected`` profiles.
+
+    The runner is all-or-one (a single ``model_profile`` or every profile), so to race
+    an arbitrary subset under one shared concurrency budget we write a temporary config
+    containing only the chosen profiles and run it with ``model_profile=None``. When the
+    whole set is selected we reuse the original file untouched.
+    """
+    if set(selected) == set(all_names):
+        return config_path
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    profiles = data.get("profiles", {})
+    data["profiles"] = {name: profiles[name] for name in selected if name in profiles}
+    fd, tmp = tempfile.mkstemp(prefix="docie-dash-models-", suffix=".yaml")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(data, fh, sort_keys=False)
+    return Path(tmp)
+
+
 def main() -> None:
-    config_path = _PROJECT_ROOT / "configs" / "models.yaml"
+    parser = argparse.ArgumentParser(
+        prog="docie-bench-dash",
+        description="Live dashboard: watch model profiles race on a dataset.",
+    )
+    parser.add_argument("--models-config", type=Path, default=None, help="Path to a models.yaml.")
+    parser.add_argument("--dataset", type=Path, default=None, help="Path to a manifest.jsonl.")
+    parser.add_argument(
+        "--profile",
+        action="append",
+        dest="profiles",
+        metavar="NAME",
+        help="Profile to include (repeatable). Default: prompt, then all.",
+    )
+    parser.add_argument("--concurrency", type=int, default=None, help="Parallel requests.")
+    parser.add_argument("--repeat", type=int, default=1, help="Passes over the dataset.")
+    args = parser.parse_args()
+
+    config_path = args.models_config or (_PROJECT_ROOT / "configs" / "models.yaml")
     if not config_path.exists():
-        print(f"configs/models.yaml not found at {config_path}")  # noqa: T201
+        print(f"models config not found at {config_path}")  # noqa: T201
+        return
+    all_names = _load_profile_names(config_path)
+    if not all_names:
+        print(f"No model profiles defined in {config_path}")  # noqa: T201
         return
 
-    dataset_path = _ask_dataset()
+    dataset_path = args.dataset or _ask_dataset()
     if not dataset_path:
         return
-
-    profiles = _load_profile_names(config_path)
-    if not profiles:
-        print("No model profiles defined in configs/models.yaml")  # noqa: T201
+    if not dataset_path.exists():
+        print(f"Dataset not found: {dataset_path}")  # noqa: T201
         return
 
-    concurrency, repeat, log_level = _ask_options()
-    if not questionary.confirm(
-        f"Race {len(profiles)} profile(s) live?", default=True
-    ).ask():
+    if args.profiles is not None:
+        selected = args.profiles
+    else:
+        selected = _ask_profiles(config_path) or all_names
+    unknown = [name for name in selected if name not in all_names]
+    if unknown:
+        print(f"Unknown profile(s): {', '.join(unknown)}. Available: {', '.join(all_names)}")  # noqa: T201
         return
+
+    if args.concurrency is not None:
+        concurrency, repeat, log_level = args.concurrency, args.repeat, "INFO"
+    else:
+        concurrency, repeat, log_level = _ask_options()
 
     BenchmarkDashboard(
         dataset_path=dataset_path,
-        config_path=config_path,
-        profiles=profiles,
+        config_path=_effective_config(config_path, selected, all_names),
+        profiles=selected,
         concurrency=concurrency,
         repeat=repeat,
         log_level=log_level,

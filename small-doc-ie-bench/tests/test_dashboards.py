@@ -14,10 +14,27 @@ import pytest
 
 pytest.importorskip("textual")
 
+import yaml  # noqa: E402
 from textual.widgets import DataTable, RichLog  # noqa: E402
 
-from docie_bench.dashboard import BenchmarkDashboard  # noqa: E402
+from docie_bench.dashboard import BenchmarkDashboard, _effective_config  # noqa: E402
 from docie_bench.serving.dashboard import ServingDashboard  # noqa: E402
+
+
+def test_effective_config_filters_to_subset(tmp_path) -> None:
+    config = tmp_path / "models.yaml"
+    profiles = {"a": {"model": "a"}, "b": {"model": "b"}, "c": {"model": "c"}}
+    config.write_text(yaml.safe_dump({"profiles": profiles}), encoding="utf-8")
+    all_names = ["a", "b", "c"]
+
+    # Whole set selected → original file reused untouched.
+    assert _effective_config(config, all_names, all_names) == config
+
+    # Strict subset → a new temp config with only those profiles.
+    out = _effective_config(config, ["a", "c"], all_names)
+    assert out != config
+    data = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert sorted(data["profiles"]) == ["a", "c"]
 
 
 async def test_benchmark_dashboard_polls_event_stream(tmp_path) -> None:
