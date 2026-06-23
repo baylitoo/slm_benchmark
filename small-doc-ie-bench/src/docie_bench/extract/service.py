@@ -17,6 +17,7 @@ from docie_bench.llm.prompts import (
     SCHEMA_PROPOSER_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
+    build_nuextract3_prompts,
     build_nuextract_prompts,
     build_schema_proposer_prompt,
     build_user_prompt,
@@ -361,7 +362,16 @@ class ExtractionService:
             schema = schema_json(schema_name)
         else:
             raise ValueError("schema_mode must be 'static' or 'dynamic'")
-        if images:
+        if self.profile.prompt_profile == "nuextract3":
+            # NuExtract3 gets the template out-of-band via chat_template_kwargs
+            # (the `nuextract3` response style), so the prompt carries only the
+            # document — as the page image (vision) or OCR text. This must win
+            # over the generic vision branch below.
+            system_prompt, user_prompt = build_nuextract3_prompts(
+                blocks=blocks,
+                has_images=bool(images),
+            )
+        elif images:
             system_prompt = VISION_SYSTEM_PROMPT
             user_prompt = build_vision_user_prompt(
                 schema_name=schema_name,
@@ -397,7 +407,7 @@ class ExtractionService:
             )
         finally:
             await client.aclose()
-        if self.profile.prompt_profile == "nuextract_v1":
+        if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw = _normalize_nuextract_raw(raw, schema_name)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
