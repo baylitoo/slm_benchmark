@@ -32,7 +32,8 @@ dependencies = [
   "pandas>=2.2.2",
   "rapidfuzz>=3.9.6",
   "psutil>=5.9.0",
-  "questionary>=2.0.0"
+  "questionary>=2.0.0",
+  "textual>=1.0.0"
 ]
 
 [project.optional-dependencies]
@@ -55,6 +56,8 @@ docie-bench = "docie_bench.cli:app"
 docie-bench-ui = "docie_bench.cli2:main"
 docie = "docie_bench.serving.cli:app"
 docie-serving = "docie_bench.serving.cli:app"
+docie-bench-dash = "docie_bench.dashboard:main"
+docie-serve-dash = "docie_bench.serving.dashboard:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
