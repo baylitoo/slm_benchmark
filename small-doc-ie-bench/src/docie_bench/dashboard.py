@@ -1,13 +1,18 @@
-"""Live benchmark dashboard — watch every model profile race in one terminal view.
+"""Interactive benchmark dashboard — one cohesive Textual app.
 
 Launch with:  docie-bench-dash
 
-This is a thin, *non-invasive* viewer over the existing benchmark runner. It runs a
-single ``run_benchmark`` pass with ``model_profile=None`` (so every profile competes
-under one shared concurrency budget — the numbers stay comparable to a normal
-``docie-bench`` run) and subscribes to the run's live signal: the ``task-events.jsonl``
-file the runner already appends to on every ``queued → running → completed/failed``
-transition. The runner is untouched; the dashboard only reads what it writes.
+Everything happens inside the TUI: a setup screen to pick the dataset and the
+model profiles to race, then a live screen that watches them run. There are no
+external prompts and no flags — selection is in-app.
+
+It stays a thin, non-invasive layer over the existing runner: the live screen
+runs one `run_benchmark` pass and subscribes to the run's own signal — the
+`task-events.jsonl` file the runner appends on every queued/running/completed/
+failed transition. To race an arbitrary *subset* of profiles under one shared
+concurrency budget (so the numbers stay comparable to a normal `docie-bench`
+run), it writes a temporary models config restricted to the chosen profiles and
+runs it with `model_profile=None`. The runner itself is untouched.
 """
 
 from __future__ import annotations
@@ -16,25 +21,33 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
-import questionary
+import yaml
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
-from textual.widgets import DataTable, Footer, Header, ProgressBar, RichLog, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Label,
+    ProgressBar,
+    RichLog,
+    Select,
+    SelectionList,
+    Static,
+)
 from textual.worker import Worker, WorkerState
 
-# Reuse the wizard helpers the interactive UI already ships — single source of truth.
-from docie_bench.cli2 import (
-    _ask_dataset,
-    _ask_options,
-    _count_docs,
-    _fmt_ms,
-    _load_profile_names,
-)
+from docie_bench.cli2 import _count_docs, _find_datasets, _fmt_ms, _load_profile_names
+from docie_bench.settings import get_settings
 
 _HERE = Path(__file__).parent
 _PROJECT_ROOT = _HERE.parent.parent
@@ -46,17 +59,133 @@ _STATE_STYLE = {
     "completed": ("done", "green"),
     "failed": ("failed", "red"),
 }
-_TERMINAL_STATES = {"completed", "failed"}
 
 
-class BenchmarkDashboard(App):
-    """A live, multi-profile benchmark view built on the runner's event stream."""
+def _rel(p: Path) -> Path:
+    """Display a path relative to the project root when possible."""
+    try:
+        return p.relative_to(_PROJECT_ROOT)
+    except ValueError:
+        return p
 
-    TITLE = "docie-bench"
-    SUB_TITLE = "live benchmark dashboard"
+
+def _status_text(status: str) -> Text:
+    label, colour = next(
+        ((lbl, col) for lbl, col in _STATE_STYLE.values() if lbl == status),
+        (status, "white"),
+    )
+    return Text(label, style=colour)
+
+
+def _effective_config(config_path: Path, selected: list[str], all_names: list[str]) -> Path:
+    """Return a models config restricted to ``selected`` profiles.
+
+    The runner is all-or-one (a single ``model_profile`` or every profile), so to race
+    an arbitrary subset under one shared concurrency budget we write a temporary config
+    containing only the chosen profiles and run it with ``model_profile=None``. When the
+    whole set is selected we reuse the original file untouched.
+    """
+    if set(selected) == set(all_names):
+        return config_path
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    profiles = data.get("profiles", {})
+    data["profiles"] = {name: profiles[name] for name in selected if name in profiles}
+    fd, tmp = tempfile.mkstemp(prefix="docie-dash-models-", suffix=".yaml")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(data, fh, sort_keys=False)
+    return Path(tmp)
+
+
+# ── setup screen ──────────────────────────────────────────────────────────────
+
+
+class SetupScreen(Screen):
+    """In-app selection: choose a dataset and the profiles to race."""
 
     CSS = """
-    Screen { layout: vertical; }
+    SetupScreen { align: center top; }
+    #setup { width: 100%; max-width: 90; padding: 1 2; }
+    #setup Label { margin: 1 0 0 0; text-style: bold; }
+    #datasets, #concurrency { width: 100%; }
+    #profiles { height: auto; max-height: 18; border: round $primary; }
+    #controls { height: auto; margin-top: 1; }
+    #run { margin-right: 2; }
+    #hint { color: $text-muted; }
+    """
+
+    BINDINGS = [("q", "quit", "Quit")]
+
+    def __init__(self, *, config_path: Path, datasets: list[Path] | None = None) -> None:
+        super().__init__()
+        self.config_path = config_path
+        self.all_names = _load_profile_names(config_path)
+        self._datasets = _find_datasets() if datasets is None else datasets
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with VerticalScroll(id="setup"):
+            yield Label("Dataset")
+            ds_options = [
+                (f"{_rel(p)}  ({_count_docs(p)} docs)", str(p)) for p in self._datasets
+            ]
+            if ds_options:
+                yield Select(ds_options, value=ds_options[0][1], allow_blank=False, id="datasets")
+            else:
+                yield Static("[red]No datasets found under data/[/]", id="datasets")
+
+            yield Label("Profiles to race  [dim](space to toggle)[/]")
+            yield SelectionList[str](*[(name, name) for name in self.all_names], id="profiles")
+
+            yield Label("Concurrency")
+            yield Select(
+                [("1", 1), ("2", 2), ("4", 4), ("8", 8)],
+                value=2,
+                allow_blank=False,
+                id="concurrency",
+            )
+
+            with Horizontal(id="controls"):
+                yield Button("Run ▶", variant="success", id="run")
+                yield Static("", id="hint")
+        yield Footer()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "run":
+            self._launch()
+
+    def _launch(self) -> None:
+        hint = self.query_one("#hint", Static)
+        if not self._datasets:
+            hint.update("[red]No dataset available.[/]")
+            return
+        selected = list(self.query_one("#profiles", SelectionList).selected)
+        if not selected:
+            hint.update("[red]Select at least one profile.[/]")
+            return
+        dataset_path = Path(self.query_one("#datasets", Select).value)
+        concurrency = int(self.query_one("#concurrency", Select).value)
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")  # noqa: DTZ005 (run id only)
+        run_dir = get_settings().runs_dir / f"dashboard-{stamp}"
+        self.app.push_screen(
+            RunScreen(
+                dataset_path=dataset_path,
+                config_path=_effective_config(self.config_path, selected, self.all_names),
+                profiles=selected,
+                concurrency=concurrency,
+                repeat=1,
+                run_dir=run_dir,
+            )
+        )
+
+
+# ── live run screen ─────────────────────────────────────────────────────────
+
+
+class RunScreen(Screen):
+    """A live, multi-profile benchmark view built on the runner's event stream."""
+
+    CSS = """
     #config { padding: 0 1; color: $text-muted; }
     #overall { height: 1; margin: 0 1; }
     #results { height: auto; max-height: 60%; margin: 1 1 0 1; }
@@ -65,7 +194,6 @@ class BenchmarkDashboard(App):
 
     BINDINGS = [("q", "quit", "Quit")]
 
-    # Columns rendered in the results table, in order: (key, label).
     _COLUMNS = [
         ("profile", "Model Profile"),
         ("status", "Status"),
@@ -102,14 +230,11 @@ class BenchmarkDashboard(App):
         self._per_profile_total = self._docs * repeat
         self._grand_total = self._per_profile_total * max(len(profiles), 1)
 
-        # Set late (or injected by tests). events_path derives from it.
         self._run_dir: Path | None = run_dir
         self._row_keys: dict[str, object] = {}
         self._emitted = 0  # lines of the events file already streamed to the log
         self._finished = False
         self._poll_timer = None
-
-    # ── layout ──────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -139,29 +264,25 @@ class BenchmarkDashboard(App):
             row = [name, _status_text("queued"), f"0/{self._per_profile_total}", *blanks]
             self._row_keys[name] = table.add_row(*row, key=name)
 
-        log = self.query_one("#log", RichLog)
-        log.write("[dim]Waiting for the runner to start…[/]")
-
+        self.query_one("#log", RichLog).write("[dim]Waiting for the runner to start…[/]")
         if self.auto_start:
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")  # noqa: DTZ005 (display id only)
-            from docie_bench.settings import get_settings
-
-            self._run_dir = get_settings().runs_dir / f"dashboard-{stamp}"
             self.run_benchmark_worker()
-
-        # Poll the event stream regardless of who started the run (tests start it manually).
         self._poll_timer = self.set_interval(0.25, self._poll)
 
     # ── benchmark execution (off the UI thread) ─────────────────────────────
 
     @work(thread=True, exit_on_error=False, name="bench")
     def run_benchmark_worker(self):
-        """Run the whole sweep in a worker thread so sync work never stalls the UI."""
+        """Run the sweep in a worker thread so sync work never stalls the UI."""
         from docie_bench.benchmark.runner import run_benchmark
 
         assert self._run_dir is not None
-        self._run_dir.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(self._run_dir / "dashboard.log", encoding="utf-8")
+        # The runner refuses to start in a non-empty dir, so the log must live OUTSIDE
+        # run_dir (a sibling) and run_dir must NOT be pre-created here — the runner makes
+        # it. Writing the log inside run_dir was the FileExistsError bug.
+        self._run_dir.parent.mkdir(parents=True, exist_ok=True)
+        log_path = self._run_dir.parent / f"{self._run_dir.name}.log"
+        handler = logging.FileHandler(log_path, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
         root = logging.getLogger()
         root.addHandler(handler)
@@ -189,8 +310,9 @@ class BenchmarkDashboard(App):
             self._finalize(event.worker.result)
         elif event.state == WorkerState.ERROR:
             self._finished = True
-            log = self.query_one("#log", RichLog)
-            log.write(f"[red]Benchmark failed:[/] {event.worker.error!r}")
+            self.query_one("#log", RichLog).write(
+                f"[red]Benchmark failed:[/] {event.worker.error!r}"
+            )
 
     # ── live polling of task-events.jsonl ───────────────────────────────────
 
@@ -201,14 +323,14 @@ class BenchmarkDashboard(App):
         if not events_path.exists():
             return []
         events: list[dict] = []
-        for line in events_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        for raw in events_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
             if not line:
                 continue
             try:
                 events.append(json.loads(line))
             except json.JSONDecodeError:
-                # A torn final line during an in-flight append; it'll be whole next tick.
+                # A torn final line during an in-flight append; whole next tick.
                 continue
         return events
 
@@ -217,7 +339,6 @@ class BenchmarkDashboard(App):
         if not events:
             return
 
-        # Stream only events we haven't shown yet.
         log = self.query_one("#log", RichLog)
         for ev in events[self._emitted :]:
             state = ev.get("state", "?")
@@ -231,21 +352,20 @@ class BenchmarkDashboard(App):
             )
         self._emitted = len(events)
 
-        # Recompute per-profile counts from scratch (files are tiny).
         counts: dict[str, dict[str, int]] = {}
         for ev in events:
             profile = ev.get("model_profile")
             if profile is None:
                 continue
-            counts.setdefault(profile, {})
             state = ev.get("state", "")
+            counts.setdefault(profile, {})
             counts[profile][state] = counts[profile].get(state, 0) + 1
 
+        if self._finished:
+            return
         table = self.query_one("#results", DataTable)
         done_total = 0
         for profile, row_key in self._row_keys.items():
-            if self._finished:
-                continue  # final summary owns the rows now
             c = counts.get(profile, {})
             done = c.get("completed", 0) + c.get("failed", 0)
             done_total += done
@@ -258,9 +378,7 @@ class BenchmarkDashboard(App):
                 status = "queued"
             table.update_cell(row_key, "status", _status_text(status))
             table.update_cell(row_key, "done", f"{done}/{self._per_profile_total}")
-
-        if not self._finished:
-            self.query_one("#overall", ProgressBar).update(progress=done_total)
+        self.query_one("#overall", ProgressBar).update(progress=done_total)
 
     # ── final summary from metrics.json ─────────────────────────────────────
 
@@ -279,7 +397,6 @@ class BenchmarkDashboard(App):
             if row_key is None:
                 continue
             acc = f"{s['field_accuracy']:.1%}" if s.get("field_accuracy") is not None else "—"
-            sim = s.get("avg_similarity")
             thru = (
                 f"{s['throughput_docs_per_min']:.1f}/min"
                 if s.get("throughput_docs_per_min")
@@ -291,7 +408,6 @@ class BenchmarkDashboard(App):
             table.update_cell(row_key, "p50", _fmt_ms(s.get("p50_latency_ms")))
             table.update_cell(row_key, "p95", _fmt_ms(s.get("p95_latency_ms")))
             table.update_cell(row_key, "thru", thru)
-            _ = sim  # similarity available in metrics.json; omitted to keep the table compact
 
         self.query_one("#overall", ProgressBar).update(progress=self._grand_total)
         report = getattr(result, "report_path", None)
@@ -300,46 +416,33 @@ class BenchmarkDashboard(App):
         log.write("[dim]Press q to quit.[/]")
 
 
-def _status_text(status: str) -> Text:
-    label, colour = next(
-        ((lbl, col) for lbl, col in _STATE_STYLE.values() if lbl == status),
-        (status, "white"),
-    )
-    return Text(label, style=colour)
+# ── app + entry point ─────────────────────────────────────────────────────────
 
 
-# ── entry point ─────────────────────────────────────────────────────────────
+class DocieBenchApp(App):
+    """Single app: setup → live run, all in-app."""
+
+    TITLE = "docie-bench"
+    SUB_TITLE = "interactive benchmark dashboard"
+
+    def __init__(self, *, config_path: Path, initial_screen: Screen | None = None) -> None:
+        super().__init__()
+        self._config_path = config_path
+        self._initial_screen = initial_screen
+
+    def on_mount(self) -> None:
+        self.push_screen(self._initial_screen or SetupScreen(config_path=self._config_path))
 
 
 def main() -> None:
     config_path = _PROJECT_ROOT / "configs" / "models.yaml"
     if not config_path.exists():
-        print(f"configs/models.yaml not found at {config_path}")  # noqa: T201
+        print(f"models config not found at {config_path}")  # noqa: T201
         return
-
-    dataset_path = _ask_dataset()
-    if not dataset_path:
+    if not _load_profile_names(config_path):
+        print(f"No model profiles defined in {config_path}")  # noqa: T201
         return
-
-    profiles = _load_profile_names(config_path)
-    if not profiles:
-        print("No model profiles defined in configs/models.yaml")  # noqa: T201
-        return
-
-    concurrency, repeat, log_level = _ask_options()
-    if not questionary.confirm(
-        f"Race {len(profiles)} profile(s) live?", default=True
-    ).ask():
-        return
-
-    BenchmarkDashboard(
-        dataset_path=dataset_path,
-        config_path=config_path,
-        profiles=profiles,
-        concurrency=concurrency,
-        repeat=repeat,
-        log_level=log_level,
-    ).run()
+    DocieBenchApp(config_path=config_path).run()
 
 
 if __name__ == "__main__":
