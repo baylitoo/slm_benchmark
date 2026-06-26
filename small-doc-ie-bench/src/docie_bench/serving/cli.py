@@ -142,6 +142,26 @@ def create_app(
         )
 
     @app.command()
+    def up(
+        ctx: typer.Context,
+        name: str = typer.Argument(..., help="Model name in the canonical GGUF store."),
+        port: int = typer.Option(
+            8088, min=1, max=65535, help="Bind port (matches the model profile)."
+        ),
+        ctx_size: int = typer.Option(8192, "--ctx-size", min=1, help="llama.cpp context size."),
+    ) -> None:
+        """Serve a store model in the background with its family's llama-server flags."""
+        _execute(
+            ctx,
+            lambda plane: plane.up(name, port=port, context_length=ctx_size),
+            hint=lambda _r: (
+                f"\nServing '{name}' in the background on http://127.0.0.1:{port}/v1\n"
+                f"The model is still loading; once it answers, run:\n"
+                f"docie-bench benchmark run --model-profile {name}"
+            ),
+        )
+
+    @app.command()
     def start(ctx: typer.Context, name: str = typer.Argument(..., help="Deployment name.")) -> None:
         """Start an existing stopped deployment."""
         _execute(ctx, lambda plane: plane.start(name))
@@ -192,6 +212,8 @@ def create_app(
 def _execute(
     ctx: typer.Context,
     operation: Callable[[ControlPlane], Awaitable[object]],
+    *,
+    hint: Callable[[object], str] | None = None,
 ) -> None:
     state = _state(ctx)
 
@@ -208,6 +230,8 @@ def _execute(
             typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     _render(result, json_output=state.json_output)
+    if hint is not None and not state.json_output:
+        typer.echo(hint(result))
 
 
 def _state(ctx: typer.Context) -> _Context:

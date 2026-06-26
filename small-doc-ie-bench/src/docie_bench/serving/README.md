@@ -6,6 +6,10 @@ and **Ollama** can serve from. Each model **family** declares how its prompt
 template must be delivered, so a model is always served *correctly* — not just
 loaded.
 
+**TL;DR** — seed a model once, then `docie up <name>` serves it in the background
+with the right family flags and `docie-bench benchmark run --model-profile <name>`
+tests it. Full flow in [Serve + benchmark](#serve--benchmark--the-one-command-path).
+
 ## Why a canonical `models/` store
 
 Ollama and llama.cpp can run the *same* GGUF, but they cache it differently and
@@ -43,67 +47,94 @@ you can't accidentally deploy a NuExtract3 that ignores its template.
 
 ---
 
-## Setup — local machine (Windows / PowerShell)
+## Serve + benchmark — the one-command path
 
-NuExtract3 end-to-end (the verified path). The model is a 4B multimodal VLM; on a
-CPU-only box use a small quant (`Q4_K_M`, ~2.7 GB).
+Once a model is in the store (seed it once — see below), serve it in the
+**background** with its family's launch flags applied automatically. No separate
+terminal window, no hand-typed `--jinja/--mmproj`:
 
 ```powershell
-# 1. Pull the GGUF once via Ollama (downloads weights + vision projector)
+docie up nuextract3                                 # llama-server, detached, on :8088
+Invoke-RestMethod "http://127.0.0.1:8088/health"    # wait for status: ok (4B VLM loads slowly on CPU)
+docie-bench benchmark run --dataset data\voxel51_invoices\manifest.jsonl --model-profile nuextract3
+docie stop nuextract3                               # when done
+```
+
+`docie up <name> [--port 8088] [--ctx-size 8192]` resolves the GGUF and the family
+contract from the store and deploys it through the supervisor — tracked in
+`deployments.json`, managed with `docie status` / `docie stop` / `docie list`, and
+visible in `docie-serve-dash`. Default port **8088** matches the `nuextract3` /
+`nuextract3_think` profiles' `base_url` (`http://localhost:8088/v1`), so the
+benchmark consumes it unchanged. `docie up` returns immediately; the model keeps
+loading in the background, so wait for `/health` before benchmarking.
+
+> `docie up` launches `llama-server`, so it must be on your **PATH** (see the
+> acquisition note below). If `:8088` is already bound, stop the old server first.
+
+### One-time: seed the store (Windows / PowerShell)
+
+NuExtract3 is a 4B multimodal VLM; on a CPU-only box use a small quant
+(`Q4_K_M`, ~2.7 GB). The GGUF is hard-linked from the Ollama blob — never
+downloaded twice.
+
+```powershell
+# Pull the GGUF once via Ollama (weights + vision projector)
 ollama pull hf.co/numind/NuExtract3-GGUF:Q4_K_M
 
-# 2. Seed the canonical store from that Ollama model (hard-links, no re-download)
+# Seed the canonical store from it (hard-links, no re-download)
 $env:PYTHONPATH = "src"
-python - <<'PY'
+@'
 from pathlib import Path
 from docie_bench.serving.model_store import ModelStore
 store = ModelStore(Path.home() / ".local/share/docie-bench/serving/models")
-entry = store.seed_from_ollama(
-    "hf.co/numind/NuExtract3-GGUF:Q4_K_M", name="nuextract3", family="nuextract3"
-)
-print("model :", entry.model_path)
-print("mmproj:", entry.mmproj_path)
-print("serve :", " ".join(store.llama_server_command("nuextract3", port=8088)))
-PY
-
-# 3. Serve it (use the exact command printed above; --jinja + --mmproj are added
-#    automatically from the family contract). Pick a FREE port (8080 may be taken).
-llama-server --model "$env:USERPROFILE\.local\share\docie-bench\serving\models\nuextract3\model.gguf" `
-             --mmproj "$env:USERPROFILE\.local\share\docie-bench\serving\models\nuextract3\mmproj.gguf" `
-             --alias nuextract3 --jinja --host 127.0.0.1 --port 8088 -c 8192
-
-# 4. In another window: confirm it's really llama-server (JSON, not HTML)
-Invoke-RestMethod "http://127.0.0.1:8088/health"     # -> status : ok
+e = store.seed_from_ollama("hf.co/numind/NuExtract3-GGUF:Q4_K_M", name="nuextract3", family="nuextract3")
+print("model :", e.model_path)
+print("mmproj:", e.mmproj_path)   # must NOT be None for a vision family
+'@ | python -
 ```
 
-> Need `llama-server`? Grab the latest CPU build:
+> Need `llama-server` on PATH (so `docie up` can launch it)? Grab a CPU build:
 > ```powershell
 > $rel = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 > $asset = $rel.assets | Where-Object { $_.name -match 'bin-win-cpu-x64' } | Select-Object -First 1
 > Invoke-WebRequest $asset.browser_download_url -OutFile "$env:TEMP\llamacpp.zip"
 > Expand-Archive "$env:TEMP\llamacpp.zip" -DestinationPath "$env:USERPROFILE\llama-cpp" -Force
+> $env:PATH = "$env:USERPROFILE\llama-cpp;$env:PATH"   # add it to PATH for this session
 > ```
 
-Then run the benchmark against it — `configs/models.yaml` ships `nuextract3`
-(reasoning off) and `nuextract3_think` (reasoning on) pointing at
-`http://localhost:8088/v1`.
+### Manual / under the hood
+
+`docie up nuextract3` runs exactly the invocation below (`--jinja` + `--mmproj`
+come from the family contract). Run it directly only to debug or pass a custom
+flag — note it occupies the terminal:
+
+```powershell
+llama-server --model "$env:USERPROFILE\.local\share\docie-bench\serving\models\nuextract3\model.gguf" `
+             --mmproj "$env:USERPROFILE\.local\share\docie-bench\serving\models\nuextract3\mmproj.gguf" `
+             --alias nuextract3 --jinja --host 127.0.0.1 --port 8088 -c 8192
+```
 
 ## Setup — server (Linux / bash)
 
-```bash
-# 1. Pull once via Ollama (or download the GGUF + mmproj from Hugging Face)
-ollama pull hf.co/numind/NuExtract3-GGUF:Q4_K_M
+`docie up nuextract3` works the same on Linux (with `llama-server` on PATH) and
+is the easy path. Seed once, then:
 
-# 2. Seed the canonical store
+```bash
+ollama pull hf.co/numind/NuExtract3-GGUF:Q4_K_M
 python - <<'PY'
 from pathlib import Path
 from docie_bench.serving.model_store import ModelStore
 store = ModelStore(Path.home() / ".local/share/docie-bench/serving/models")
 store.seed_from_ollama("hf.co/numind/NuExtract3-GGUF:Q4_K_M", name="nuextract3", family="nuextract3")
-print(" ".join(store.llama_server_command("nuextract3", host="0.0.0.0", port=8088)))
 PY
+docie up nuextract3        # detached; manage with docie status / stop / list
+```
 
-# 3. Serve with the printed command (systemd unit recommended for persistence)
+For an explicit, externally-supervised process (e.g. a **systemd** unit bound to
+`0.0.0.0`), run `llama-server` directly with the command
+`store.llama_server_command("nuextract3", host="0.0.0.0", port=8088)` prints:
+
+```bash
 llama-server --model ~/.local/share/docie-bench/serving/models/nuextract3/model.gguf \
              --mmproj ~/.local/share/docie-bench/serving/models/nuextract3/mmproj.gguf \
              --alias nuextract3 --jinja --host 0.0.0.0 --port 8088 -c 8192

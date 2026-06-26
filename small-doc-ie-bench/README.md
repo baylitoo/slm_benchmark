@@ -24,6 +24,23 @@ Every command supports deterministic automation output through `--json`.
 See [docs/serving-factory.md](docs/serving-factory.md) for architecture,
 runtime requirements, model manifests, and operational examples.
 
+### Quickstart — serve a model, then benchmark it
+
+Seed a GGUF into the canonical store once (see
+[src/docie_bench/serving/README.md](src/docie_bench/serving/README.md)), then it's
+three commands — no separate `llama-server` window:
+
+```powershell
+docie up nuextract3        # serve in the background with the right family flags (--jinja/--mmproj, :8088)
+docie-bench benchmark run --dataset data\voxel51_invoices\manifest.jsonl --model-profile nuextract3
+docie stop nuextract3
+```
+
+`docie up <name>` launches the model **detached** via the supervisor and pins the
+port to the model profile's `base_url`, so the benchmark consumes it unchanged.
+To put *every* configured profile behind one OpenAI-compatible `/v1` endpoint,
+run `docie gateway`. Full flow: [serving README](src/docie_bench/serving/README.md).
+
 ## What this project gives you
 
 - **OpenAI-compatible LLM abstraction**: call local `llama.cpp`, vLLM, Ollama-compatible gateways, or a remote OpenAI-compatible endpoint through one client.

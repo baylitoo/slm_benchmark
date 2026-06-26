@@ -6,8 +6,12 @@ from enum import Enum
 from pathlib import Path
 
 import pytest
+from test_serving_supervisor import FakeAdapter
 
-from docie_bench.serving.control_plane import ControlPlane, to_data
+from docie_bench.serving.control_plane import ControlPlane, _DefaultSupervisor, to_data
+from docie_bench.serving.model_store import ModelStore, ModelStoreError
+from docie_bench.serving.runtime import RuntimeKind
+from docie_bench.serving.supervisor import PersistentSupervisor
 
 
 class State(Enum):
@@ -164,6 +168,67 @@ def test_control_plane_rejects_invalid_operations(operation, message: str) -> No
 
     with pytest.raises(ValueError, match=message):
         asyncio.run(operation(plane))
+
+
+def _seed_nuextract3_store(root: Path) -> ModelStore:
+    model_gguf = root.parent / "model.gguf"
+    mmproj_gguf = root.parent / "mmproj.gguf"
+    model_gguf.write_bytes(b"GGUF-weights")
+    mmproj_gguf.write_bytes(b"GGUF-mmproj")
+    store = ModelStore(root)
+    store.add_gguf(
+        name="nuextract3",
+        family="nuextract3",
+        model_gguf=model_gguf,
+        mmproj=mmproj_gguf,
+    )
+    return store
+
+
+def test_up_bridges_store_entry_to_a_correct_llama_server_launch_spec(tmp_path: Path) -> None:
+    # FakeAdapter.start() returns a RuntimeProcess without spawning a process, so this
+    # validates the constructed launch spec/command -- not real STARTING->READY readiness.
+    root = tmp_path / "models"
+    store = _seed_nuextract3_store(root)
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.LLAMACPP: FakeAdapter()},
+    )
+    wrapper = _DefaultSupervisor(supervisor, planner=None, model_store_root=root)
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.up("nuextract3", port=8088))
+
+    launch = supervisor.get("nuextract3").spec.launch
+    assert str(launch.runtime) == "llamacpp"
+    assert launch.model.endswith("model.gguf")
+    assert launch.alias == "nuextract3"
+    assert launch.port == 8088
+    assert launch.context_length == 8192
+    mmproj_posix = store.entry("nuextract3").mmproj_path.as_posix()
+    assert launch.extra_args == ("--jinja", "--mmproj", mmproj_posix)
+    # The bridge derives its flags from the same source as llama_server_command, so the
+    # family flags appear verbatim as a contiguous suffix of the full command.
+    assert store.family_launch_args("nuextract3") == ("--jinja", "--mmproj", mmproj_posix)
+    command = store.llama_server_command("nuextract3", port=8088)
+    assert command[-3:] == ("--jinja", "--mmproj", mmproj_posix)
+
+
+def test_up_missing_entry_raises_with_store_root_and_seeding_pointer(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.LLAMACPP: FakeAdapter()},
+    )
+    wrapper = _DefaultSupervisor(supervisor, planner=None, model_store_root=root)
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    with pytest.raises(ModelStoreError) as excinfo:
+        asyncio.run(plane.up("ghost"))
+
+    message = str(excinfo.value)
+    assert str(root.resolve()) in message
+    assert "Seed it first" in message
 
 
 def test_to_data_sorts_mapping_keys_and_hides_private_attributes() -> None:
