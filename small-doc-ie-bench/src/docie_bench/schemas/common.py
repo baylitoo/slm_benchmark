@@ -22,26 +22,31 @@ class OCRBlock(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+# A field wrapper may be *present with a null value*: models (notably template-based
+# VLMs like NuExtract3) emit `{"value": null}` for an absent optional field rather
+# than omitting it. A null value is therefore valid — it means "field seen, no value".
+
+
 class TextField(BaseModel):
-    value: str
+    value: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
 
 
 class DateField(BaseModel):
-    value: str = Field(description="ISO-8601 date when possible: YYYY-MM-DD")
+    value: str | None = Field(default=None, description="ISO-8601 date when possible: YYYY-MM-DD")
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
 
 
 class NumberField(BaseModel):
-    value: Decimal
+    value: Decimal | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
 
 
 class MoneyField(BaseModel):
-    amount: Decimal
+    amount: Decimal | None = None
     currency: str | None = Field(default=None, min_length=3, max_length=3)
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)

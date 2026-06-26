@@ -394,10 +394,16 @@ async def run_benchmark(
                     "prediction": response.result,
                     "routing": getattr(response, "routing", None),
                     "ground_truth": item.ground_truth,
-                    "score": score_evidence(response.result),
+                    "score": score_evidence(
+                        response.result, evidence_applicable=ingestion_path != "vision"
+                    ),
                 }
                 if eval_mode.uses_ground_truth:
-                    row["score"] = score_prediction(item.ground_truth, response.result)
+                    row["score"] = score_prediction(
+                        item.ground_truth,
+                        response.result,
+                        evidence_applicable=ingestion_path != "vision",
+                    )
                 if selected_judge is not None:
                     try:
                         if hasattr(settings, "ocr_cache_enabled"):

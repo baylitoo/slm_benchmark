@@ -4,7 +4,10 @@ from docie_bench.schemas.common import OCRBlock
 
 def test_invoice_schema_validation():
     blocks = [OCRBlock(id="b1", text="Facture INV-1", source="manual")]
-    payload = {"document_type": "invoice", "invoice_number": {"value": "INV-1", "evidence_ids": ["b1"], "confidence": 0.9}}
+    payload = {
+        "document_type": "invoice",
+        "invoice_number": {"value": "INV-1", "evidence_ids": ["b1"], "confidence": 0.9},
+    }
     normalized, validation = validate_extraction("invoice", payload, blocks)
     assert validation.valid
     assert normalized["invoice_number"]["value"] == "INV-1"
@@ -32,3 +35,18 @@ def test_invoice_line_items_validate_arithmetic_and_evidence_ids():
     assert "Unknown evidence_id referenced by model: missing" in validation.warnings
     assert any("quantity * unit_price" in warning for warning in validation.warnings)
     assert any("sum(line_items.line_total)" in warning for warning in validation.warnings)
+
+
+def test_optional_fields_with_null_value_are_valid():
+    # Template VLMs (NuExtract3) emit {"value": null} for an absent optional field
+    # rather than omitting it; that must validate, not fail with a string_type error.
+    blocks = [OCRBlock(id="b1", text="Invoice", source="manual")]
+    payload = {
+        "document_type": "invoice",
+        "vendor_name": {"value": "Acme"},
+        "due_date": {"value": None},
+        "payment_terms": {"value": None},
+        "line_items": [{"sku": {"value": None}, "quantity": {"value": None}}],
+    }
+    _normalized, validation = validate_extraction("invoice", payload, blocks)
+    assert validation.valid, validation.errors
