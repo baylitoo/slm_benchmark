@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
 import httpx
@@ -154,7 +154,9 @@ def create_gateway_app(
         # Non-passthrough profiles are served by a local solution adapter
         # (OCR engine, pipeline, …) rather than proxied to an upstream.
         if profile.kind != "passthrough":
-            return await _dispatch_solution(profile, body)
+            return await _dispatch_solution(
+                profile, body, profiles=app.state.profiles, http_client=app.state.client
+            )
 
         # Always forward the upstream model id, regardless of how it was matched.
         body["model"] = profile.model
@@ -226,10 +228,16 @@ async def _forward_stream(
     )
 
 
-async def _dispatch_solution(profile: ModelProfile, body: dict[str, object]) -> Response:
+async def _dispatch_solution(
+    profile: ModelProfile,
+    body: dict[str, object],
+    *,
+    profiles: Mapping[str, ModelProfile],
+    http_client: httpx.AsyncClient,
+) -> Response:
     """Serve a non-passthrough profile via its local adapter, OpenAI-shaped."""
     try:
-        solution = build_solution(profile)
+        solution = build_solution(profile, profiles=profiles, http_client=http_client)
         completion = await solution.complete(body)
     except SolutionError as exc:
         return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)

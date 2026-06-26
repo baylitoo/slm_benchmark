@@ -17,9 +17,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from collections.abc import Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Protocol
+
+import httpx
 
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.ocr.factory import get_ocr_backend
@@ -53,16 +56,21 @@ class Solution(Protocol):
     async def complete(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
 
-def build_solution(profile: ModelProfile) -> Solution:
-    """Construct the adapter for a non-passthrough profile."""
+def build_solution(
+    profile: ModelProfile,
+    *,
+    profiles: Mapping[str, ModelProfile] | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> Solution:
+    """Construct the adapter for a non-passthrough profile.
+
+    `profiles`/`http_client` are supplied by the gateway and used by adapters that
+    delegate to another profile (e.g. the OCR→LLM pipeline).
+    """
     if profile.kind == "ocr":
         return OcrSolution(profile)
     if profile.kind == "pipeline":
-        raise SolutionError(
-            "the 'pipeline' adapter is not implemented yet",
-            status_code=501,
-            error_type="not_implemented",
-        )
+        return PipelineSolution(profile, profiles=profiles or {}, http_client=http_client)
     raise SolutionError(
         f"no solution adapter for kind {profile.kind!r}",
         status_code=500,
@@ -86,19 +94,123 @@ class OcrSolution:
 
     async def complete(self, request: dict[str, Any]) -> dict[str, Any]:
         raw, suffix = _extract_document(request)
-        text = await asyncio.to_thread(self._run_ocr, raw, suffix)
+        text = await asyncio.to_thread(_ocr_to_text, self.backend_name, self.language, raw, suffix)
         return _chat_completion(self.profile.name, text)
 
-    def _run_ocr(self, raw: bytes, suffix: str) -> str:
-        backend = get_ocr_backend(self.backend_name, language=self.language)
-        with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-            handle.write(raw)
-            path = Path(handle.name)
+
+class PipelineSolution:
+    """OCR→LLM: OCR the document image, then extract with a passthrough LLM profile.
+
+    `options`: ``ocr_backend`` (default tesseract), ``language``, and ``extractor``
+    (the name of a passthrough LLM profile that performs the structured extraction).
+    The document image in the request is replaced by its OCR text before the
+    extractor is called, so the LLM does the field extraction over real text.
+    """
+
+    def __init__(
+        self,
+        profile: ModelProfile,
+        *,
+        profiles: Mapping[str, ModelProfile],
+        http_client: httpx.AsyncClient | None,
+    ) -> None:
+        self.profile = profile
+        self.backend_name = str(profile.options.get("ocr_backend", "tesseract"))
+        self.language = profile.options.get("language")
+        get_ocr_backend(self.backend_name, language=self.language)  # fail fast
+
+        extractor_name = profile.options.get("extractor")
+        if not extractor_name:
+            raise SolutionError(
+                f"pipeline profile {profile.name!r} requires options.extractor "
+                "(the name of a passthrough LLM profile)",
+                status_code=500,
+                error_type="invalid_profile",
+            )
+        extractor = profiles.get(str(extractor_name))
+        if extractor is None:
+            raise SolutionError(
+                f"pipeline extractor profile {extractor_name!r} is not configured",
+                status_code=500,
+                error_type="invalid_profile",
+            )
+        if extractor.kind != "passthrough":
+            raise SolutionError(
+                f"pipeline extractor {extractor_name!r} must be a passthrough LLM profile",
+                status_code=500,
+                error_type="invalid_profile",
+            )
+        if http_client is None:
+            raise SolutionError(
+                "pipeline adapter requires an HTTP client",
+                status_code=500,
+                error_type="invalid_profile",
+            )
+        self.extractor = extractor
+        self.http = http_client
+
+    async def complete(self, request: dict[str, Any]) -> dict[str, Any]:
+        raw, suffix = _extract_document(request)
+        text = await asyncio.to_thread(_ocr_to_text, self.backend_name, self.language, raw, suffix)
+        # Hand the extractor the original prompt with the image swapped for OCR text.
+        llm_request: dict[str, Any] = {
+            **request,
+            "model": self.extractor.model,
+            "messages": _inject_ocr_text(request.get("messages") or [], text),
+        }
+        llm_request.pop("stream", None)  # the gateway re-streams the final completion
+        url = f"{self.extractor.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.extractor.api_key}",
+            "Content-Type": "application/json",
+        }
         try:
-            blocks = backend.extract(path)
-        finally:
-            path.unlink(missing_ok=True)
-        return "\n".join(block.text for block in blocks)
+            resp = await self.http.post(
+                url, json=llm_request, headers=headers, timeout=self.extractor.timeout_seconds
+            )
+        except httpx.RequestError as exc:
+            raise SolutionError(
+                f"pipeline extractor upstream is unreachable: {exc}",
+                status_code=502,
+                error_type="upstream_unavailable",
+            ) from exc
+        if resp.status_code >= 400:
+            raise SolutionError(
+                f"pipeline extractor returned {resp.status_code}: {resp.text[:200]}",
+                status_code=resp.status_code,
+                error_type="upstream_error",
+            )
+        return resp.json()
+
+
+def _ocr_to_text(backend_name: str, language: object, raw: bytes, suffix: str) -> str:
+    backend = get_ocr_backend(backend_name, language=language)  # type: ignore[arg-type]
+    with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        handle.write(raw)
+        path = Path(handle.name)
+    try:
+        blocks = backend.extract(path)
+    finally:
+        path.unlink(missing_ok=True)
+    return "\n".join(block.text for block in blocks)
+
+
+def _inject_ocr_text(messages: list[dict[str, Any]], ocr_text: str) -> list[dict[str, Any]]:
+    """Return messages with every image_url part replaced by the OCR text part."""
+    rewritten: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        parts = [
+            {"type": "text", "text": ocr_text}
+            if isinstance(part, dict) and part.get("type") == "image_url"
+            else part
+            for part in content
+        ]
+        rewritten.append({**message, "content": parts})
+    return rewritten
 
 
 def _extract_document(request: dict[str, Any]) -> tuple[bytes, str]:

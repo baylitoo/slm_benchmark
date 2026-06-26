@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -70,11 +72,11 @@ def test_decode_data_uri_rejects_non_data_url() -> None:
         _decode_data_uri("https://example.com/a.png")
 
 
-def test_build_solution_unknown_kind_raises() -> None:
+def test_pipeline_without_extractor_raises() -> None:
+    # extractor is checked before the http client, so http_client=None is fine here.
     profile = ModelProfile(name="p", model="", base_url="", api_key="", kind="pipeline")
-    with pytest.raises(SolutionError) as exc:
-        build_solution(profile)
-    assert exc.value.status_code == 501  # reserved but not implemented
+    with pytest.raises(SolutionError):
+        build_solution(profile, profiles={}, http_client=None)
 
 
 @pytest.mark.usefixtures("fake_ocr")
@@ -122,6 +124,55 @@ def test_gateway_solution_error_without_image_is_400(monkeypatch: pytest.MonkeyP
             json={"model": "ocr_fake", "messages": [{"role": "user", "content": "no image"}]},
         )
     assert resp.status_code == 400
+
+
+def test_gateway_pipeline_ocr_then_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "docie_bench.serving.solutions.get_ocr_backend",
+        lambda name, *, language=None: _FakeBackend(),
+    )
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "c",
+                "model": "up-x",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": '{"ok":1}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    profiles = {
+        "llm_x": ModelProfile(name="llm_x", model="up-x", base_url="http://up-x/v1", api_key="k"),
+        "pipe": ModelProfile(
+            name="pipe", model="", base_url="", api_key="", kind="pipeline",
+            options={"ocr_backend": "tesseract", "extractor": "llm_x"},
+        ),
+    }
+    app = create_gateway_app(profiles=profiles, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", json=_image_request("pipe"))
+
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == '{"ok":1}'
+    sent = json.loads(captured[0].content)
+    assert sent["model"] == "up-x"  # forwarded to the extractor's upstream id
+    # the image part was replaced by a text part carrying the OCR output
+    text_parts = [
+        part["text"]
+        for message in sent["messages"]
+        for part in (message["content"] if isinstance(message["content"], list) else [])
+        if part.get("type") == "text"
+    ]
+    assert "HELLO\nWORLD" in text_parts
 
 
 # ── backward compatibility ───────────────────────────────────────────────────
