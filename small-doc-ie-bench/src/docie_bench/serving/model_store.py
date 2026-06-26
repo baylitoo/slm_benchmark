@@ -290,6 +290,20 @@ class ModelStore:
         return [_entry_from_json(value) for _, value in sorted(self._read_index().items())]
 
     # ----------------------------------------------------------------- serving
+    def family_launch_args(self, name: str) -> tuple[str, ...]:
+        """Family-specific llama-server flags for ``name`` (e.g. ``--jinja``, ``--mmproj``).
+
+        This is the single source of truth for the template/vision flags a family
+        needs; both ``llama_server_command`` and the background serving bridge
+        (``docie up``) derive their invocation from it.
+        """
+        entry = self.entry(name)
+        contract = get_family(entry.family)
+        extra = list(contract.llama_server_args)
+        if contract.needs_mmproj and entry.mmproj_path is not None:
+            extra.extend(["--mmproj", entry.mmproj_path.as_posix()])
+        return tuple(extra)
+
     def llama_server_command(
         self,
         name: str,
@@ -306,7 +320,6 @@ class ModelStore:
         the docs needs, sourced from the canonical store.
         """
         entry = self.entry(name)
-        contract = get_family(entry.family)
         command = [
             executable,
             "--model",
@@ -319,10 +332,8 @@ class ModelStore:
             str(port),
             "--ctx-size",
             str(context_length),
-            *contract.llama_server_args,
         ]
-        if contract.needs_mmproj and entry.mmproj_path is not None:
-            command.extend(["--mmproj", entry.mmproj_path.as_posix()])
+        command.extend(self.family_launch_args(name))
         return tuple(command)
 
     def ollama_modelfile(self, name: str) -> str:

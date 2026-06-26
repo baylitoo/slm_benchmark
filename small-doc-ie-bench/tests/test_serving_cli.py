@@ -48,6 +48,10 @@ class FakePlane:
         self.calls.append(("serve", model, kwargs))
         return {"name": kwargs["name"], "state": "running"}
 
+    async def up(self, name: str, **kwargs) -> dict[str, object]:
+        self.calls.append(("up", name, kwargs))
+        return {"name": name, "state": "starting", "endpoint": "http://127.0.0.1:8088/v1"}
+
     async def start(self, name: str) -> dict[str, object]:
         self.calls.append(("start", name))
         return {"name": name, "state": "running"}
@@ -112,6 +116,10 @@ def test_human_list_output_is_a_readable_table() -> None:
             ["serve", "org/tiny", "--name", "invoice", "--runtime", "llamacpp", "--replicas", "2"],
             ("serve", "org/tiny", {"name": "invoice", "replicas": 2, "runtime": "llamacpp"}),
         ),
+        (
+            ["up", "nuextract3", "--port", "9000"],
+            ("up", "nuextract3", {"context_length": 8192, "port": 9000}),
+        ),
         (["start", "invoice"], ("start", "invoice")),
         (["stop", "invoice"], ("stop", "invoice")),
         (
@@ -152,6 +160,22 @@ def test_backend_is_constructed_lazily() -> None:
     assert help_result.exit_code == 0
     assert list_result.exit_code == 0
     assert calls == ["constructed"]
+
+
+def test_up_human_output_ends_with_the_benchmark_command() -> None:
+    result = runner.invoke(create_app(FakePlane()), ["up", "nuextract3"])
+
+    assert result.exit_code == 0, result.output
+    non_empty = [line for line in result.output.splitlines() if line.strip()]
+    assert non_empty[-1] == "docie-bench benchmark run --model-profile nuextract3"
+
+
+def test_up_json_output_omits_the_human_hint() -> None:
+    result = runner.invoke(create_app(FakePlane()), ["--json", "up", "nuextract3"])
+
+    assert result.exit_code == 0, result.output
+    assert "docie-bench benchmark run" not in result.output
+    assert json.loads(result.output)["state"] == "starting"
 
 
 def test_json_errors_are_machine_readable_and_exit_nonzero() -> None:

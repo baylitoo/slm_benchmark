@@ -57,6 +57,14 @@ class Supervisor(Protocol):
         replicas: int,
     ) -> Result: ...
 
+    def serve_store_model(
+        self,
+        name: str,
+        *,
+        port: int,
+        context_length: int,
+    ) -> Result: ...
+
     def start(self, name: str) -> Result: ...
 
     def stop(self, name: str) -> Result: ...
@@ -79,6 +87,7 @@ class ControlPlane:
     def from_defaults(cls) -> ControlPlane:
         """Build the local control plane from the serving implementation modules."""
         import psutil
+
         from docie_bench.serving.planner import HostResources, ResourcePlanner, RuntimeName
         from docie_bench.serving.registry import ModelRegistry
         from docie_bench.serving.runtime import default_runtime_adapters
@@ -107,6 +116,7 @@ class ControlPlane:
         supervisor = _DefaultSupervisor(
             PersistentSupervisor(home / "deployments.json"),
             planner,
+            model_store_root=home / "models",
         )
         return cls(
             registry=cast(Registry, registry),
@@ -172,6 +182,23 @@ class ControlPlane:
                     name=_optional(name),
                     runtime=_optional(runtime),
                     replicas=_replicas(replicas),
+                )
+            )
+        )
+
+    async def up(
+        self,
+        name: str,
+        *,
+        port: int = 8088,
+        context_length: int = 8192,
+    ) -> object:
+        return to_data(
+            await _resolve(
+                self.supervisor.serve_store_model(
+                    _required(name, "model"),
+                    port=port,
+                    context_length=context_length,
                 )
             )
         )
@@ -324,9 +351,15 @@ class _DefaultPlanner:
 
 
 class _DefaultSupervisor:
-    def __init__(self, backend: Any, planner: _DefaultPlanner) -> None:
+    def __init__(
+        self,
+        backend: Any,
+        planner: _DefaultPlanner,
+        model_store_root: Path | None = None,
+    ) -> None:
         self.backend = backend
         self.planner = planner
+        self.model_store_root = model_store_root
 
     def list_deployments(self) -> object:
         return self.backend.list()
@@ -359,6 +392,37 @@ class _DefaultSupervisor:
                 runtime=RuntimeKind(runtime),
                 model=model,
                 alias=deployment_name,
+            ),
+        )
+        return self.backend.deploy(spec)
+
+    def serve_store_model(
+        self, name: str, *, port: int = 8088, context_length: int = 8192
+    ) -> object:
+        from docie_bench.serving.model_store import ModelStore, ModelStoreError
+        from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
+        from docie_bench.serving.supervisor import DeploymentSpec
+
+        if self.model_store_root is None:
+            raise ValueError("model store is not configured")
+        store = ModelStore(self.model_store_root)  # lazy -> avoids from_defaults mkdir side effect
+        try:
+            entry = store.entry(name)
+        except ModelStoreError as exc:
+            raise ModelStoreError(
+                f"{exc} Seed it first (ModelStore.seed_from_ollama / add_gguf — "
+                f"see serving/README.md), then re-run `docie up {name}`."
+            ) from exc
+        spec = DeploymentSpec(
+            name=entry.name,
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.LLAMACPP,
+                model=entry.model_path.as_posix(),
+                alias=entry.name,
+                host="127.0.0.1",
+                port=port,
+                context_length=context_length,
+                extra_args=store.family_launch_args(name),
             ),
         )
         return self.backend.deploy(spec)
