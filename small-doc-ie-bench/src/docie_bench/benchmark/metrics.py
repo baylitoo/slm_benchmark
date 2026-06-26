@@ -83,6 +83,8 @@ def score_prediction(
     ground_truth: dict[str, Any],
     prediction: dict[str, Any],
     cfg: MetricConfig | None = None,
+    *,
+    evidence_applicable: bool = True,
 ) -> dict[str, Any]:
     cfg = cfg or MetricConfig()
     rows: list[dict[str, Any]] = []
@@ -137,7 +139,7 @@ def score_prediction(
             else 0.0
         ),
         "tables": table_scores,
-        **score_evidence(prediction),
+        **score_evidence(prediction, evidence_applicable=evidence_applicable),
     }
 
 
@@ -262,19 +264,37 @@ def _greedy_alignment(similarities: list[list[float]]) -> dict[int, int]:
     return alignment
 
 
-def score_evidence(prediction: dict[str, Any]) -> dict[str, Any]:
+def score_evidence(
+    prediction: dict[str, Any], *, evidence_applicable: bool = True
+) -> dict[str, Any]:
     fields = _evidence_fields(prediction)
+    total = len(fields)
+    evidence_rows = _evidence_rows(prediction)
+    if not evidence_applicable:
+        # Evidence grounding cites OCR blocks; the vision path has none, so grounding
+        # is structurally impossible — report N/A rather than 100% "hallucinated".
+        return {
+            "evidence_applicable": False,
+            "evidence_field_total": total,
+            "evidence_grounded": 0,
+            "evidence_coverage": None,
+            "hallucination_rate": None,
+            "ungrounded_fields": [],
+            "evidence_row_total": len(evidence_rows),
+            "evidence_rows_grounded": 0,
+            "evidence_row_coverage": None,
+            "ungrounded_rows": [],
+        }
     grounded = [path for path, field in fields if field.get("evidence_ids")]
     ungrounded = [path for path, field in fields if not field.get("evidence_ids")]
-    total = len(fields)
     grounded_total = len(grounded)
-    evidence_rows = _evidence_rows(prediction)
     grounded_rows = [
         path
         for path, row_fields in evidence_rows
         if all(field.get("evidence_ids") for field in row_fields)
     ]
     return {
+        "evidence_applicable": True,
         "evidence_field_total": total,
         "evidence_grounded": grounded_total,
         "evidence_coverage": grounded_total / total if total else None,

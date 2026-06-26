@@ -100,3 +100,25 @@ def test_summarize_aggregates_routing_metrics():
     assert summary["avg_routing_tokens"] == 60
     assert summary["avg_routing_cost_units"] == pytest.approx(0.15)
     assert summary["routing_stage_failure_rate"] == pytest.approx(1 / 3)
+
+
+def test_score_evidence_vision_path_is_not_applicable():
+    # Vision extractions have no OCR blocks to cite, so grounding is N/A — not 100%
+    # "hallucinated". Reporting None lets the report distinguish "ungrounded" from "absent".
+    pred = {"invoice_number": {"value": "INV-1", "evidence_ids": []}}
+    ev = score_evidence(pred, evidence_applicable=False)
+    assert ev["evidence_applicable"] is False
+    assert ev["hallucination_rate"] is None
+    assert ev["evidence_coverage"] is None
+    assert ev["ungrounded_fields"] == []
+    # The OCR path still computes grounding as before.
+    assert score_evidence(pred)["hallucination_rate"] == 1.0
+
+
+def test_score_prediction_threads_evidence_applicable_without_touching_field_score():
+    gt = {"invoice_number": "INV-1"}
+    pred = {"invoice_number": {"value": "INV-1", "evidence_ids": []}}
+    score = score_prediction(gt, pred, evidence_applicable=False)
+    assert score["evidence_applicable"] is False
+    assert score["hallucination_rate"] is None
+    assert score["field_correct"] == 1  # field scoring is unaffected by the evidence flag
