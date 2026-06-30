@@ -1,0 +1,84 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Theme tokens. Values are space-separated RGB triples consumed by Tailwind via
+ * `rgb(var(--token) / <alpha-value>)` (see tailwind.config.ts). The `.dark`
+ * class (toggled by next-themes) flips the palette. Dark is the default.
+ */
+@layer base {
+  :root {
+    --background: 248 250 252; /* slate-50 */
+    --foreground: 15 23 42; /* slate-900 */
+    --card: 255 255 255;
+    --elevated: 255 255 255;
+    --border: 226 232 240; /* slate-200 */
+    --input: 226 232 240;
+    --ring: 37 99 235; /* blue-600 */
+    --muted: 241 245 249; /* slate-100 */
+    --muted-foreground: 100 116 139; /* slate-500 */
+    --accent: 37 99 235; /* blue-600 */
+    --accent-foreground: 255 255 255;
+
+    color-scheme: light;
+  }
+
+  .dark {
+    --background: 8 11 18; /* near-black navy */
+    --foreground: 226 232 240; /* slate-200 */
+    --card: 16 20 29;
+    --elevated: 22 27 38;
+    --border: 30 37 51;
+    --input: 30 37 51;
+    --ring: 96 145 255;
+    --muted: 22 27 38;
+    --muted-foreground: 148 163 184; /* slate-400 */
+    --accent: 96 145 255; /* bright blue */
+    --accent-foreground: 9 13 22;
+
+    color-scheme: dark;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  /* Visible, consistent keyboard focus across interactive elements. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+/* Thin scrollbars for code/scroll panels. */
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-border;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  @apply bg-muted-foreground/40;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Subtle dotted grid backdrop for the app shell. */
+.bg-grid {
+  background-image: radial-gradient(
+    rgb(var(--muted-foreground) / 0.12) 1px,
+    transparent 1px
+  );
+  background-size: 22px 22px;
+}
