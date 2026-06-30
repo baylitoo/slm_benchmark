@@ -26,7 +26,9 @@ class Settings(BaseSettings):
         "application/pdf,text/plain,image/png,image/jpeg,image/tiff"
     )
 
-    auth_required: bool = False
+    # Fail closed by default (B3). Local dev sets AUTH_REQUIRED=false in .env;
+    # any networked deployment must populate API_KEYS and leave this on.
+    auth_required: bool = True
     api_keys: SecretStr = Field(default=SecretStr(""))
     rate_limit_requests: int = Field(default=60, ge=0)
     rate_limit_window_seconds: int = Field(default=60, ge=1)

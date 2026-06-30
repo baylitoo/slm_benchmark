@@ -18,6 +18,7 @@ from docie_bench.orchestrator.service import (
     OrchestratorError,
     OrchestratorService,
 )
+from docie_bench.security import TenantDependency
 
 router = APIRouter(prefix="/v1")
 _service: OrchestratorService | None = None
@@ -86,34 +87,40 @@ def resume_experiment(run_id: str, payload: RunAction) -> dict[str, Any]:
 
 
 @router.post("/workers/tasks/claim")
-def claim_task(payload: ClaimRequest) -> dict[str, Any] | None:
+def claim_task(payload: ClaimRequest, tenant: TenantDependency) -> dict[str, Any] | None:
+    # B2: lease owner is the authenticated principal, not the forgeable payload.
     return service().claim_task(
-        worker_id=payload.worker_id,
+        worker_id=tenant.tenant_id,
         lease_seconds=payload.lease_seconds,
         run_id=payload.run_id,
     )
 
 
 @router.post("/workers/tasks/{task_id}/heartbeat")
-def heartbeat_task(task_id: str, payload: LeaseRequest) -> dict[str, Any]:
+def heartbeat_task(task_id: str, payload: LeaseRequest, tenant: TenantDependency) -> dict[str, Any]:
+    data = {**payload.model_dump(), "worker_id": tenant.tenant_id}  # B2
     try:
-        return service().heartbeat(task_id=task_id, **payload.model_dump())
+        return service().heartbeat(task_id=task_id, **data)
     except OrchestratorError as exc:
         raise translate_error(exc) from exc
 
 
 @router.post("/workers/tasks/{task_id}/complete")
-def complete_task(task_id: str, payload: CompleteRequest) -> dict[str, Any]:
+def complete_task(
+    task_id: str, payload: CompleteRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    data = {**payload.model_dump(), "worker_id": tenant.tenant_id}  # B2
     try:
-        return service().complete_task(task_id=task_id, **payload.model_dump())
+        return service().complete_task(task_id=task_id, **data)
     except OrchestratorError as exc:
         raise translate_error(exc) from exc
 
 
 @router.post("/workers/tasks/{task_id}/fail")
-def fail_task(task_id: str, payload: FailRequest) -> dict[str, Any]:
+def fail_task(task_id: str, payload: FailRequest, tenant: TenantDependency) -> dict[str, Any]:
+    data = {**payload.model_dump(), "worker_id": tenant.tenant_id}  # B2
     try:
-        return service().fail_task(task_id=task_id, **payload.model_dump())
+        return service().fail_task(task_id=task_id, **data)
     except OrchestratorError as exc:
         raise translate_error(exc) from exc
 

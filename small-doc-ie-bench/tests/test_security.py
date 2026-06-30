@@ -70,17 +70,18 @@ def test_authentication_and_quotas_are_isolated_per_tenant() -> None:
 
 
 def test_v1_route_enforces_configured_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        api,
-        "quota_manager",
-        TenantQuotaManager(
-            api_keys={"secret": "tenant-a"},
-            auth_required=True,
-            requests_per_window=10,
-            window_seconds=60,
-            max_concurrent=2,
-        ),
+    from docie_bench import security
+
+    manager = TenantQuotaManager(
+        api_keys={"secret": "tenant-a"},
+        auth_required=True,
+        requests_per_window=10,
+        window_seconds=60,
+        max_concurrent=2,
     )
+    # tenant_guard resolves get_quota_manager by name in the security module at
+    # call time, so replacing it here bypasses the lru_cache for this test.
+    monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
     client = TestClient(api.app)
     assert client.get("/v1/schemas").status_code == 401
     response = client.get("/v1/schemas", headers={"X-API-Key": "secret"})
