@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections import Counter
 from typing import Any, cast
 
 from sqlalchemy import func, or_, select, update
@@ -424,10 +425,9 @@ class OrchestratorService:
 
     @classmethod
     def _run_dict(cls, run: BenchmarkRun, *, include_tasks: bool) -> dict[str, Any]:
-        counts: dict[str, int] = {}
-        if include_tasks:
-            for task in run.tasks:
-                counts[task.status] = counts.get(task.status, 0) + 1
+        counts: dict[str, int] = (
+            Counter(task.status for task in run.tasks) if include_tasks else {}
+        )
         result = {
             "id": run.id,
             "name": run.name,
