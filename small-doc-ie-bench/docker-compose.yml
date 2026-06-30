@@ -17,12 +17,106 @@ services:
       - ./runs:/app/runs
       - ./annotations:/app/annotations
       - ocr-cache:/app/.cache/ocr
+      - serving-state:/app/.serving
     command: ["uvicorn", "docie_bench.api:app", "--host", "0.0.0.0", "--port", "8080"]
     healthcheck:
       test: ["CMD", "python", "scripts/healthcheck.py", "http://localhost:8080/healthz"]
       interval: 20s
       timeout: 5s
       retries: 5
+
+  # Self-hosted Inngest server: dashboard + event API (8288) and the Connect
+  # WebSocket gateway (8289). Reuses the project Postgres (separate `inngest` DB,
+  # created by infra/postgres/init.sql) and a dedicated Redis for run state.
+  inngest:
+    image: inngest/inngest
+    command: ["inngest", "start"]
+    # NOTE: do NOT use `env_file: .env` here. The Inngest *binary* reads many
+    # INNGEST_* vars itself (e.g. INNGEST_PORT, INNGEST_DEV, INNGEST_BASE_URL),
+    # so leaking the SDK/client env into the server makes it bind the wrong port
+    # / wrong mode. Pass only what the server needs, explicitly.
+    environment:
+      INNGEST_EVENT_KEY: ${INNGEST_EVENT_KEY:?set INNGEST_EVENT_KEY in .env}
+      INNGEST_SIGNING_KEY: ${INNGEST_SIGNING_KEY:?set INNGEST_SIGNING_KEY in .env}
+      INNGEST_POSTGRES_URI: postgres://docie:docie@postgres:5432/inngest
+      INNGEST_REDIS_URI: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      # Host ports only; the server always listens on 8288/8289 inside the
+      # container. Use distinct var names so they can't collide with the
+      # server's own INNGEST_PORT config.
+      - "${INNGEST_HOST_PORT:-8288}:8288"
+      - "${INNGEST_CONNECT_HOST_PORT:-8289}:8289"
+    healthcheck:
+      test: ["CMD", "inngest", "alpha", "doctor", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # The Connect worker: holds the Inngest functions (extraction, etc.) and dials
+  # OUT to the gateway. Reuses Dockerfile.api for the OCR/vision deps. Scale with
+  # `docker compose up -d --scale worker=3`.
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inngest:
+        condition: service_started
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./runs:/app/runs
+      - ./annotations:/app/annotations
+      - ocr-cache:/app/.cache/ocr
+      - serving-state:/app/.serving
+      # Host Ollama models (read-only) so seed-from-ollama can pull existing GGUF
+      # blobs into the store without re-downloading. Set OLLAMA_MODELS_HOST in
+      # .env to your host path (e.g. C:/Users/<you>/.ollama/models).
+      - ${OLLAMA_MODELS_HOST:-/root/.ollama/models}:/root/.ollama/models:ro
+    command: ["docie-worker"]
+
+  # DocIE Studio web UI (Next.js). NEXT_PUBLIC_* are baked at build time and are
+  # the URLs the BROWSER uses, so they default to localhost:<published port>.
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8080}
+        NEXT_PUBLIC_GRAFANA_URL: ${NEXT_PUBLIC_GRAFANA_URL:-http://localhost:3001}
+        # Host port of the Inngest dashboard (matches INNGEST_HOST_PORT).
+        NEXT_PUBLIC_INNGEST_URL: ${NEXT_PUBLIC_INNGEST_URL:-http://localhost:8290}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${STUDIO_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   bench:
     build:
@@ -85,7 +179,9 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5432:5432"
+      # Host port only for external tools; containers reach it as `postgres:5432`.
+      # Override if you already run Postgres on 5432: set POSTGRES_PORT=5433.
+      - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U docie -d docie"]
       interval: 10s
@@ -113,7 +209,8 @@ services:
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"
+      # Host 3001 to leave 3000 for the DocIE Studio web UI.
+      - "${GRAFANA_PORT:-3001}:3000"
     depends_on:
       - prometheus
 
@@ -121,3 +218,5 @@ volumes:
   postgres-data:
   grafana-data:
   ocr-cache:
+  redis-data:
+  serving-state:
