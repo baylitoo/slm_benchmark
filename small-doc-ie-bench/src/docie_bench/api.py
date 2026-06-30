@@ -1,30 +1,25 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from docie_bench.extract.service import ExtractionService, hash_bytes
+from docie_bench.inngest.serving_api import router as serving_router
+from docie_bench.inngest.studio_api import router as studio_router
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.logging_config import configure_logging
-from docie_bench.orchestrator.api import configure_orchestrator, router as orchestrator_router
+from docie_bench.orchestrator.api import configure_orchestrator
+from docie_bench.orchestrator.api import router as orchestrator_router
 from docie_bench.orchestrator.service import OrchestratorService
-from docie_bench.schemas.api import BenchmarkRunRequest, ExtractTextRequest
-from docie_bench.schemas.common import ExtractionResponse
-from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
-from docie_bench.security import (
-    TenantContext,
-    TenantQuotaManager,
-    parse_api_keys,
-    read_validated_upload,
-    redact_fields,
-)
 from docie_bench.review import (
     ReviewConflictError,
     ReviewNotFoundError,
@@ -39,6 +34,9 @@ from docie_bench.review import (
     release_review,
     review_metrics,
 )
+from docie_bench.schemas.api import BenchmarkRunRequest, ExtractTextRequest
+from docie_bench.schemas.common import ExtractionResponse
+from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
 from docie_bench.schemas.review import (
     AnnotationExportRequest,
     AnnotationExportView,
@@ -50,6 +48,13 @@ from docie_bench.schemas.review import (
     ReviewStatus,
     ReviewTaskCreate,
     ReviewTaskView,
+)
+from docie_bench.security import (
+    TenantContext,
+    TenantQuotaManager,
+    parse_api_keys,
+    read_validated_upload,
+    redact_fields,
 )
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import save_extraction_audit
@@ -77,6 +82,19 @@ app = FastAPI(
     version="0.1.0",
 )
 app.include_router(orchestrator_router)
+app.include_router(studio_router)
+app.include_router(serving_router)
+
+# Allow the DocIE Studio frontend (separate origin) to call the API from the
+# browser. Configure via STUDIO_CORS_ORIGINS (comma-separated); defaults to "*".
+_cors_origins = [o.strip() for o in os.getenv("STUDIO_CORS_ORIGINS", "*").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")

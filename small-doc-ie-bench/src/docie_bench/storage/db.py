@@ -146,6 +146,7 @@ def init_engine(database_url: str | None = None) -> None:
         return
     # Import model modules before creating metadata.
     import docie_bench.orchestrator.models  # noqa: F401
+    import docie_bench.serving.catalog  # noqa: F401
 
     _engine = create_engine(resolved_url, pool_pre_ping=True)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
