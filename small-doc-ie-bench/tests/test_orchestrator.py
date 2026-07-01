@@ -203,6 +203,48 @@ def test_competing_attempt_artifacts_do_not_overwrite_each_other(tmp_path: Path)
     assert Path(second.uri.removeprefix("file:///")).read_bytes() == b"second"
 
 
+def test_worker_routes_require_auth_and_bind_identity_to_principal(
+    service: OrchestratorService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench import security
+    from docie_bench.security import TenantQuotaManager
+
+    manager = TenantQuotaManager(
+        api_keys={"secret": "tenant-x"},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=10,
+    )
+    monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
+    configure_orchestrator(service)
+    client = TestClient(app)
+    headers = {"X-API-Key": "secret"}
+
+    # B1: the worker lease surface is closed without a valid key.
+    assert client.post("/v1/workers/tasks/claim", json={"worker_id": "spoof"}).status_code == 401
+
+    client.post(
+        "/v1/experiments",
+        json={
+            "name": "auth-run",
+            "owner": "api-user",
+            "tasks": [{"key": "model:doc", "payload": {"doc": "1"}}],
+        },
+        headers=headers,
+    )
+    # B2: the forgeable payload worker_id is ignored; the lease owner is the
+    # authenticated principal (tenant-x), not "spoof".
+    claim = client.post(
+        "/v1/workers/tasks/claim",
+        json={"worker_id": "spoof", "lease_seconds": 30},
+        headers=headers,
+    ).json()
+    assert claim["worker_id"] == "tenant-x"
+
+    configure_orchestrator(None)
+
+
 def test_experiment_and_worker_http_api(service: OrchestratorService) -> None:
     configure_orchestrator(service)
     client = TestClient(app)

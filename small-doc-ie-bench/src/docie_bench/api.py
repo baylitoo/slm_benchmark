@@ -1,30 +1,24 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from docie_bench.extract.service import ExtractionService, hash_bytes
+from docie_bench.inngest.serving_api import router as serving_router
+from docie_bench.inngest.studio_api import router as studio_router
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.logging_config import configure_logging
-from docie_bench.orchestrator.api import configure_orchestrator, router as orchestrator_router
+from docie_bench.orchestrator.api import configure_orchestrator
+from docie_bench.orchestrator.api import router as orchestrator_router
 from docie_bench.orchestrator.service import OrchestratorService
-from docie_bench.schemas.api import BenchmarkRunRequest, ExtractTextRequest
-from docie_bench.schemas.common import ExtractionResponse
-from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
-from docie_bench.security import (
-    TenantContext,
-    TenantQuotaManager,
-    parse_api_keys,
-    read_validated_upload,
-    redact_fields,
-)
 from docie_bench.review import (
     ReviewConflictError,
     ReviewNotFoundError,
@@ -39,6 +33,9 @@ from docie_bench.review import (
     release_review,
     review_metrics,
 )
+from docie_bench.schemas.api import BenchmarkRunRequest, ExtractTextRequest
+from docie_bench.schemas.common import ExtractionResponse
+from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
 from docie_bench.schemas.review import (
     AnnotationExportRequest,
     AnnotationExportView,
@@ -50,6 +47,12 @@ from docie_bench.schemas.review import (
     ReviewStatus,
     ReviewTaskCreate,
     ReviewTaskView,
+)
+from docie_bench.security import (
+    TenantDependency,
+    read_validated_upload,
+    redact_fields,
+    tenant_guard,
 )
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import save_extraction_audit
@@ -64,19 +67,29 @@ from docie_bench.telemetry import (
 settings = get_settings()
 configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
-quota_manager = TenantQuotaManager(
-    api_keys=parse_api_keys(settings.api_keys.get_secret_value()),
-    auth_required=settings.auth_required,
-    requests_per_window=settings.rate_limit_requests,
-    window_seconds=settings.rate_limit_window_seconds,
-    max_concurrent=settings.tenant_max_concurrent_requests,
-)
 
 app = FastAPI(
     title="Small Document IE Benchmark API",
     version="0.1.0",
 )
-app.include_router(orchestrator_router)
+# Privileged/destructive routers (worker lease ops + experiment control, studio
+# job triggers, serving control plane) are gated by tenant_guard at include time,
+# so every route they expose requires a valid API key (B1). The guard is cached
+# per request, so worker routes that also declare `tenant` acquire quota once.
+app.include_router(orchestrator_router, dependencies=[Depends(tenant_guard)])
+app.include_router(studio_router, dependencies=[Depends(tenant_guard)])
+app.include_router(serving_router, dependencies=[Depends(tenant_guard)])
+
+# Allow the DocIE Studio frontend (separate origin) to call the API from the
+# browser. Configure via STUDIO_CORS_ORIGINS (comma-separated); defaults to "*".
+_cors_origins = [o.strip() for o in os.getenv("STUDIO_CORS_ORIGINS", "*").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -118,17 +131,6 @@ def resolve_profile(profile_name: str | None) -> ModelProfile:
     raise HTTPException(status_code=400, detail=f"Unknown model_profile={profile_name!r}")
 
 
-async def tenant_guard(
-    x_api_key: Annotated[str | None, Header()] = None,
-) -> AsyncIterator[TenantContext]:
-    context = quota_manager.authenticate(x_api_key)
-    quota_manager.acquire(context)
-    try:
-        yield context
-    finally:
-        quota_manager.release(context)
-
-
 def validate_text_request(payload: ExtractTextRequest) -> None:
     if payload.text is not None and len(payload.text) > settings.max_text_chars:
         raise HTTPException(status_code=413, detail="Text content exceeds configured limit")
@@ -154,9 +156,6 @@ def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> Extrac
     return response.model_copy(
         update={"result": redact_fields(response.result, settings.response_redaction_fields)}
     )
-
-
-TenantDependency = Annotated[TenantContext, Depends(tenant_guard)]
 
 
 @app.on_event("startup")
@@ -307,7 +306,7 @@ def _review_http_error(exc: Exception) -> HTTPException:
 
 @app.post("/v1/reviews", response_model=ReviewTaskView | None)
 def create_review(
-    payload: ReviewTaskCreate, force: bool = Query(default=False)
+    payload: ReviewTaskCreate, _tenant: TenantDependency, force: bool = Query(default=False)
 ) -> ReviewTaskView | None:
     try:
         task = enqueue_review(payload, force=force)
@@ -320,6 +319,7 @@ def create_review(
 
 @app.get("/v1/reviews", response_model=list[ReviewTaskView])
 def review_queue(
+    _tenant: TenantDependency,
     status: ReviewStatus | None = None,
     reviewer_id: str | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
@@ -331,7 +331,7 @@ def review_queue(
 
 
 @app.get("/v1/reviews/metrics", response_model=ReviewMetricsView)
-def get_review_metrics() -> ReviewMetricsView:
+def get_review_metrics(_tenant: TenantDependency) -> ReviewMetricsView:
     try:
         result = review_metrics()
         for review_status, count in result.queue_depth.items():
@@ -342,7 +342,9 @@ def get_review_metrics() -> ReviewMetricsView:
 
 
 @app.post("/v1/reviews/exports", response_model=AnnotationExportView)
-def export_review_annotations(payload: AnnotationExportRequest) -> AnnotationExportView:
+def export_review_annotations(
+    payload: AnnotationExportRequest, _tenant: TenantDependency
+) -> AnnotationExportView:
     try:
         result = export_annotations(
             version=payload.version,
@@ -357,7 +359,7 @@ def export_review_annotations(payload: AnnotationExportRequest) -> AnnotationExp
 
 
 @app.get("/v1/reviews/{task_id}", response_model=ReviewTaskView)
-def review_detail(task_id: int) -> ReviewTaskView:
+def review_detail(task_id: int, _tenant: TenantDependency) -> ReviewTaskView:
     try:
         return get_review(task_id)
     except Exception as exc:
@@ -365,11 +367,13 @@ def review_detail(task_id: int) -> ReviewTaskView:
 
 
 @app.post("/v1/reviews/{task_id}/claim", response_model=ReviewTaskView)
-def claim_review_task(task_id: int, payload: ClaimRequest) -> ReviewTaskView:
+def claim_review_task(
+    task_id: int, payload: ClaimRequest, tenant: TenantDependency
+) -> ReviewTaskView:
     try:
         result = claim_review(
             task_id,
-            reviewer_id=payload.reviewer_id,
+            reviewer_id=tenant.tenant_id,  # B2: provenance = authenticated principal
             expected_version=payload.expected_version,
             lease_seconds=payload.lease_seconds or settings.review_claim_lease_seconds,
         )
@@ -380,11 +384,13 @@ def claim_review_task(task_id: int, payload: ClaimRequest) -> ReviewTaskView:
 
 
 @app.post("/v1/reviews/{task_id}/release", response_model=ReviewTaskView)
-def release_review_task(task_id: int, payload: ReleaseRequest) -> ReviewTaskView:
+def release_review_task(
+    task_id: int, payload: ReleaseRequest, tenant: TenantDependency
+) -> ReviewTaskView:
     try:
         result = release_review(
             task_id,
-            reviewer_id=payload.reviewer_id,
+            reviewer_id=tenant.tenant_id,  # B2
             expected_version=payload.expected_version,
             comment=payload.comment,
         )
@@ -395,11 +401,13 @@ def release_review_task(task_id: int, payload: ReleaseRequest) -> ReviewTaskView
 
 
 @app.post("/v1/reviews/{task_id}/correct", response_model=ReviewTaskView)
-def correct_review_task(task_id: int, payload: CorrectionRequest) -> ReviewTaskView:
+def correct_review_task(
+    task_id: int, payload: CorrectionRequest, tenant: TenantDependency
+) -> ReviewTaskView:
     try:
         result = correct_review(
             task_id,
-            reviewer_id=payload.reviewer_id,
+            reviewer_id=tenant.tenant_id,  # B2
             expected_version=payload.expected_version,
             corrections=payload.corrections,
             comment=payload.comment,
@@ -411,11 +419,13 @@ def correct_review_task(task_id: int, payload: CorrectionRequest) -> ReviewTaskV
 
 
 @app.post("/v1/reviews/{task_id}/approve", response_model=ReviewTaskView)
-def approve_review_task(task_id: int, payload: DecisionRequest) -> ReviewTaskView:
+def approve_review_task(
+    task_id: int, payload: DecisionRequest, tenant: TenantDependency
+) -> ReviewTaskView:
     try:
         result = decide_review(
             task_id,
-            reviewer_id=payload.reviewer_id,
+            reviewer_id=tenant.tenant_id,  # B2
             expected_version=payload.expected_version,
             decision=ReviewStatus.APPROVED,
             comment=payload.comment,
@@ -427,11 +437,13 @@ def approve_review_task(task_id: int, payload: DecisionRequest) -> ReviewTaskVie
 
 
 @app.post("/v1/reviews/{task_id}/reject", response_model=ReviewTaskView)
-def reject_review_task(task_id: int, payload: DecisionRequest) -> ReviewTaskView:
+def reject_review_task(
+    task_id: int, payload: DecisionRequest, tenant: TenantDependency
+) -> ReviewTaskView:
     try:
         result = decide_review(
             task_id,
-            reviewer_id=payload.reviewer_id,
+            reviewer_id=tenant.tenant_id,  # B2
             expected_version=payload.expected_version,
             decision=ReviewStatus.REJECTED,
             comment=payload.comment,

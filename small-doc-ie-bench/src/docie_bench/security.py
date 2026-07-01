@@ -5,11 +5,15 @@ import json
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import HTTPException, UploadFile
+from fastapi import Depends, Header, HTTPException, UploadFile
+
+from docie_bench.settings import get_settings
 
 MIME_BY_SUFFIX = {
     ".pdf": "application/pdf",
@@ -175,3 +179,38 @@ def redact_fields(value: Any, field_names: set[str], replacement: str = "[REDACT
     if isinstance(value, list):
         return [redact_fields(item, field_names, replacement) for item in value]
     return value
+
+
+@lru_cache(maxsize=1)
+def get_quota_manager() -> TenantQuotaManager:
+    """Process-wide tenant quota manager, built once from settings.
+
+    Single source of truth so every router enforces the same auth + rate limit.
+    NOTE: state is per-process; horizontal scale needs a shared store (review H4).
+    Tests that toggle auth_required/api_keys must call get_quota_manager.cache_clear()
+    (and get_settings.cache_clear()).
+    """
+    settings = get_settings()
+    return TenantQuotaManager(
+        api_keys=parse_api_keys(settings.api_keys.get_secret_value()),
+        auth_required=settings.auth_required,
+        requests_per_window=settings.rate_limit_requests,
+        window_seconds=settings.rate_limit_window_seconds,
+        max_concurrent=settings.tenant_max_concurrent_requests,
+    )
+
+
+async def tenant_guard(
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> AsyncIterator[TenantContext]:
+    """FastAPI dependency: authenticate the caller, then bound per-tenant quota."""
+    manager = get_quota_manager()
+    context = manager.authenticate(x_api_key)
+    manager.acquire(context)
+    try:
+        yield context
+    finally:
+        manager.release(context)
+
+
+TenantDependency = Annotated[TenantContext, Depends(tenant_guard)]

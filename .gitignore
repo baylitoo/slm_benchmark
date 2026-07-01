@@ -1,0 +1,6 @@
+# Git worktrees used for parallel agent runs (local-only).
+.worktrees/
+
+# Node dependencies / build output (frontend lives under small-doc-ie-bench/frontend).
+**/node_modules/
+**/.next/

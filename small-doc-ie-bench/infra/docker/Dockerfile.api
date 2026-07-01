@@ -1,3 +1,19 @@
+# Build a portable, statically-linked llama-server (CPU) once. This stage has no
+# dependency on the app source, so it caches across code changes and only
+# rebuilds if these lines change. GGML_NATIVE=OFF keeps the binary portable
+# across CPUs; BUILD_SHARED_LIBS=OFF avoids chasing .so files at runtime.
+FROM python:3.11-slim-bookworm AS llama-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential cmake ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /src \
+ && cmake -S /src -B /src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DLLAMA_CURL=OFF \
+      -DGGML_NATIVE=OFF \
+ && cmake --build /src/build --target llama-server -j
+
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -14,7 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-eng \
     tesseract-ocr-fra \
+    libgomp1 \
   && rm -rf /var/lib/apt/lists/*
+
+# llama-server for the local "deploy" path (serve_store_model). Used by the
+# worker; harmless in the api image.
+COPY --from=llama-builder /src/build/bin/llama-server /usr/local/bin/llama-server
 
 COPY pyproject.toml README.md ./
 COPY src ./src
