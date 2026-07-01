@@ -191,12 +191,18 @@ def get_quota_manager() -> TenantQuotaManager:
     (and get_settings.cache_clear()).
     """
     settings = get_settings()
+    auth_required = settings.auth_required
+    # With auth off (local single-operator dev) every caller collapses into the
+    # one "anonymous" tenant, so per-tenant quotas are pure friction — the chatty
+    # Studio UI (auto-refresh + realtime-token + polling) trips the default
+    # 60/window. Disable them by passing 0 (acquire()'s `> 0` guards then skip the
+    # checks). Networked runs keep auth on and the configured quotas apply.
     return TenantQuotaManager(
         api_keys=parse_api_keys(settings.api_keys.get_secret_value()),
-        auth_required=settings.auth_required,
-        requests_per_window=settings.rate_limit_requests,
+        auth_required=auth_required,
+        requests_per_window=settings.rate_limit_requests if auth_required else 0,
         window_seconds=settings.rate_limit_window_seconds,
-        max_concurrent=settings.tenant_max_concurrent_requests,
+        max_concurrent=settings.tenant_max_concurrent_requests if auth_required else 0,
     )
 
 

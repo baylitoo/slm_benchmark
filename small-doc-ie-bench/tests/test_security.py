@@ -69,6 +69,39 @@ def test_authentication_and_quotas_are_isolated_per_tenant() -> None:
     manager.acquire(tenant_a, now=71)
 
 
+def test_quotas_disabled_when_auth_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With auth off, per-tenant rate/concurrency limits must not fire.
+
+    Regression: the Studio UI is chatty and every caller collapses into the one
+    anonymous tenant, so enforcing the default 60/window throttled the dashboard.
+    """
+    from types import SimpleNamespace
+
+    from docie_bench import security
+
+    # Configure limits that WOULD trip (1/window, 1 concurrent) but with auth off.
+    fake_settings = SimpleNamespace(
+        api_keys=SimpleNamespace(get_secret_value=lambda: ""),
+        auth_required=False,
+        rate_limit_requests=1,
+        rate_limit_window_seconds=60,
+        tenant_max_concurrent_requests=1,
+    )
+    monkeypatch.setattr(security, "get_settings", lambda: fake_settings)
+    security.get_quota_manager.cache_clear()
+    try:
+        manager = security.get_quota_manager()
+        assert manager.requests_per_window == 0  # disabled, not the configured 1
+        assert manager.max_concurrent == 0
+        context = manager.authenticate(None)
+        assert context.tenant_id == "anonymous"
+        # Many concurrent, over-"limit" acquires without release must not 429.
+        for _ in range(5):
+            manager.acquire(context, now=10)
+    finally:
+        security.get_quota_manager.cache_clear()
+
+
 def test_v1_route_enforces_configured_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     from docie_bench import security
 

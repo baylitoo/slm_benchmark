@@ -15,7 +15,6 @@ deployments) are exact since they come from the shared on-disk state.
 from __future__ import annotations
 
 import json
-from functools import lru_cache
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -26,8 +25,14 @@ from docie_bench.settings import get_settings
 router = APIRouter(prefix="/v1/serving", tags=["serving"])
 
 
-@lru_cache(maxsize=1)
 def _control_plane() -> ControlPlane:
+    # NOT cached: deployment/registry state is owned and written by the *worker*
+    # (deploy jobs); this API is a read-only viewer over the shared on-disk state
+    # (DOCIE_SERVING_HOME). A cached ControlPlane holds a PersistentSupervisor that
+    # loads deployments.json once at construction and never reloads, so the Deploy
+    # tab would show a stale snapshot from the API's first read until it restarts.
+    # from_defaults() only reads state (no _save), so rebuilding per request is a
+    # cheap, always-fresh view.
     return ControlPlane.from_defaults()
 
 
