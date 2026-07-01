@@ -13,6 +13,10 @@ class MetricConfig:
     string_similarity_threshold: float = 0.7  # soft: accept near-matches
     numeric_relative_tolerance: float = 0.001
     numeric_absolute_tolerance: float = 0.01
+    # Shortest contained substring accepted as a verbatim-with-context match.
+    # Guards against short substrings bleeding into larger tokens
+    # (e.g. "SA" ∈ "SARL DUPONT") being scored as correct.
+    containment_min_length: int = 3
 
 
 class ValidityGateError(RuntimeError):
@@ -124,8 +128,12 @@ def compare_values(expected: Any, actual: Any, cfg: MetricConfig) -> tuple[bool,
     if exp == act:
         return True, "exact", 1.0
     # Containment: verbatim extraction includes surrounding context.
-    # "LYON" ∈ "LYON (69)"  or  "05HK12345" ∈ "N° 05HK12345"
-    if exp in act or act in exp:
+    # "LYON" ∈ "LYON (69)"  or  "05HK12345" ∈ "N° 05HK12345".
+    # Only accept when the shorter string is a token-boundary match inside the
+    # longer one and is long enough to be meaningful — otherwise short substrings
+    # bleed into larger tokens ("SA" ∈ "SARL DUPONT") and inflate accuracy.
+    short, long = (exp, act) if len(exp) <= len(act) else (act, exp)
+    if len(short) >= cfg.containment_min_length and _token_bounded(short, long):
         return True, "contained", 1.0
     # Token-set ratio: ignores extra tokens and word order.
     token_score = fuzz.token_set_ratio(exp, act) / 100
@@ -136,6 +144,25 @@ def compare_values(expected: Any, actual: Any, cfg: MetricConfig) -> tuple[bool,
     if char_score >= cfg.string_similarity_threshold:
         return True, f"fuzzy:{char_score:.3f}", char_score
     return False, f"string_mismatch:{char_score:.3f}", best
+
+
+def _token_bounded(needle: str, haystack: str) -> bool:
+    """True when `needle` occurs in `haystack` flanked by non-alphanumeric edges.
+
+    Accepts "lyon" in "lyon (69)" (word boundary on both sides) while rejecting
+    "sa" in "sarl dupont" ("sa" runs into the alphanumeric "rl").
+    """
+    start = 0
+    while True:
+        index = haystack.find(needle, start)
+        if index == -1:
+            return False
+        before = haystack[index - 1] if index > 0 else ""
+        after_index = index + len(needle)
+        after = haystack[after_index] if after_index < len(haystack) else ""
+        if not before.isalnum() and not after.isalnum():
+            return True
+        start = index + 1
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

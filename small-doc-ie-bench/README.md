@@ -152,6 +152,39 @@ Judge results are stored per prediction and aggregated as `judge_faithfulness` a
 compares aggregate judge faithfulness with labeled field accuracy. Judge failures are
 recorded as `judge_error` without changing extraction success.
 
+#### Judge calibration gate
+
+The judge is uncalibrated by default, so its scores must not silently block a release.
+`benchmark compare` only lets `judge_faithfulness` / `judge_completeness` budgets **fail**
+when a judge<->human calibration set proves the judge agrees with human labels; otherwise
+those budgets are downgraded to a non-blocking `warn`. Populate a calibration file (see
+`configs/judge_calibration.example.json`) with the judge's recorded scores paired with
+human scores on the same documents, then:
+
+```bash
+docie-bench benchmark judge-calibration configs/judge_calibration.json
+docie-bench benchmark compare baseline candidate \
+  --budgets configs/regression-budgets.yaml \
+  --calibration configs/judge_calibration.json
+```
+
+The gate requires both a large-enough set (>= 30 labeled documents) and a worst-dimension
+mean absolute error within `--max-judge-mae` (default 0.15). A tiny set lacks statistical
+power and is reported as `insufficient_calibration_samples` — it can never certify the judge.
+
+#### Reading `hallucination_rate` by ingestion path
+
+`hallucination_rate` is derived from evidence grounding against OCR text, so each profile
+summary is labelled with how to read it:
+
+- `hallucination_basis: consumed_ocr_text` (`hallucination_reflects_model: true`) — OCR
+  paths ground against the same text the model consumed, so an ungrounded field is a
+  plausible model signal.
+- `hallucination_basis: no_consumed_text` (`hallucination_reflects_model: false`) — **vision**
+  profiles consume page images and grounding runs with no consumed text, so the value is a
+  grounding artifact (near 1.0 by construction), **not** model hallucination. Segment by
+  `ingestion_path` before comparing across profiles.
+
 ### Reproducible and resumable runs
 
 Each benchmark run writes an immutable `manifest.json` with the git state, sanitized selected

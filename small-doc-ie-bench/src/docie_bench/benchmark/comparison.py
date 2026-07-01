@@ -13,8 +13,12 @@ from typing import Any
 
 import yaml
 
+from docie_bench.benchmark.judge_calibration import DEFAULT_MAX_JUDGE_MAE, calibration_gate
 from docie_bench.benchmark.reproducibility import atomic_write_json, atomic_write_text
 
+# Judge scores are only trusted to BLOCK a regression once calibrated against
+# human labels (see judge_calibration). Uncalibrated, they may only warn.
+JUDGE_METRICS = {"judge_faithfulness", "judge_completeness"}
 HIGHER_IS_BETTER = {
     "ok_rate",
     "valid_rate",
@@ -56,6 +60,8 @@ def compare_runs(
     *,
     output_dir: Path,
     budgets_path: Path | None = None,
+    calibration_path: Path | None = None,
+    max_judge_mae: float = DEFAULT_MAX_JUDGE_MAE,
 ) -> ComparisonResult:
     baseline_path = _metrics_path(baseline)
     candidate_path = _metrics_path(candidate)
@@ -65,7 +71,14 @@ def compare_runs(
     candidate_observations = _observations(candidate_metrics)
     comparisons = _compare_observations(baseline_observations, candidate_observations)
     budgets = _load_budgets(budgets_path)
-    checks = _evaluate_budgets(comparisons, budgets)
+    # Gap (a): an uncalibrated judge must not block a release. Measure judge<->human
+    # agreement (default: no calibration -> judge budgets only warn).
+    calibration_report, judge_calibration = calibration_gate(
+        calibration_path, max_mae=max_judge_mae
+    )
+    checks = _evaluate_budgets(
+        comparisons, budgets, judge_calibrated=bool(judge_calibration["calibrated"])
+    )
     failures = [check for check in checks if check["status"] == "fail"]
     errors = [check for check in checks if check["status"] == "error"]
     incompatible = not comparisons
@@ -81,6 +94,7 @@ def compare_runs(
         "verdict": verdict,
         "comparisons": comparisons,
         "budget_checks": checks,
+        "judge_calibration": {"gate": judge_calibration, "report": calibration_report},
         "compatibility_errors": (
             ["No comparable matched observations were found"] if incompatible else []
         ),
@@ -91,6 +105,7 @@ def compare_runs(
         "verdict": verdict,
         "exit_code": exit_code,
         "checks": checks,
+        "judge_calibration": judge_calibration,
         "failed_checks": failures,
         "error_checks": errors,
         "compatibility_errors": (
@@ -349,7 +364,10 @@ def _load_budgets(path: Path | None) -> list[dict[str, Any]]:
 
 
 def _evaluate_budgets(
-    comparisons: list[dict[str, Any]], budgets: list[dict[str, Any]]
+    comparisons: list[dict[str, Any]],
+    budgets: list[dict[str, Any]],
+    *,
+    judge_calibrated: bool = True,
 ) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     for index, budget in enumerate(budgets):
@@ -378,10 +396,22 @@ def _evaluate_budgets(
         for item in matches:
             enough_samples = item["paired_samples"] >= min_paired
             within_budget = item["signed_improvement"] >= -max_regression
+            passed = enough_samples and within_budget
+            status = "pass" if passed else "fail"
+            reason = (
+                "within_budget"
+                if passed
+                else ("insufficient_paired_samples" if not enough_samples else "budget_exceeded")
+            )
+            # Gap (a): an uncalibrated judge may flag but not block. Downgrade a
+            # judge-metric failure to a non-blocking warning; leave passes alone.
+            if not passed and metric in JUDGE_METRICS and not judge_calibrated:
+                status = "warn"
+                reason = "judge_uncalibrated_non_blocking"
             checks.append(
                 {
                     "name": name,
-                    "status": "pass" if enough_samples and within_budget else "fail",
+                    "status": status,
                     "metric": metric,
                     "dimension": dimension,
                     "group": item["group"],
@@ -389,15 +419,7 @@ def _evaluate_budgets(
                     "max_regression": max_regression,
                     "paired_samples": item["paired_samples"],
                     "min_paired_samples": min_paired,
-                    "reason": (
-                        "within_budget"
-                        if enough_samples and within_budget
-                        else (
-                            "insufficient_paired_samples"
-                            if not enough_samples
-                            else "budget_exceeded"
-                        )
-                    ),
+                    "reason": reason,
                 }
             )
     return checks

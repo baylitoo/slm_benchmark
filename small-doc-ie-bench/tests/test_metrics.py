@@ -1,7 +1,38 @@
 import pytest
 
-from docie_bench.benchmark.metrics import score_evidence, score_prediction
+from docie_bench.benchmark.metrics import (
+    MetricConfig,
+    compare_values,
+    score_evidence,
+    score_prediction,
+)
 from docie_bench.benchmark.runner import summarize
+
+
+def test_containment_rejects_short_substring_false_positive():
+    # "SA" is a substring of "SARL" but not a token — must not score as correct.
+    correct, reason, similarity = compare_values("SA", "SARL DUPONT", MetricConfig())
+
+    assert correct is False
+    assert reason != "contained"
+    assert similarity < 1.0
+
+
+def test_containment_keeps_legitimate_verbatim_with_context():
+    # A whole token surrounded by context is a legitimate verbatim match.
+    town_correct, town_reason, _ = compare_values("LYON", "LYON (69)", MetricConfig())
+    ref_correct, ref_reason, _ = compare_values("05HK12345", "N° 05HK12345", MetricConfig())
+
+    assert (town_correct, town_reason) == (True, "contained")
+    assert (ref_correct, ref_reason) == (True, "contained")
+
+
+def test_containment_min_length_downgrades_short_substring_reason():
+    # A 2-char token-bounded value is below containment_min_length, so it must not
+    # be labelled a verbatim "contained" match even if fuzzy scoring later credits it.
+    _correct, reason, _ = compare_values("de", "de gaulle", MetricConfig())
+
+    assert reason != "contained"
 
 
 def test_score_prediction_nested_value():
@@ -97,6 +128,27 @@ def test_summarize_constrained_rate_honours_matching_style():
     assert summary["effective_style_distribution"] == {"openai_json_schema": 1}
 
 
+def test_summarize_labels_vision_hallucination_as_not_model_signal():
+    rows = [
+        {
+            "model_profile": "vlm",
+            "ingestion_path": "vision",
+            "ok": True,
+            "latency_ms": 5,
+            "validation": {"valid": True},
+            "score": {"evidence_field_total": 4, "evidence_grounded": 0},
+        }
+    ]
+
+    summary = summarize(rows)["summary"][0]
+
+    assert summary["hallucination_rate"] == 1.0
+    assert summary["hallucination_basis"] == "no_consumed_text"
+    assert summary["hallucination_ocr_dependent"] is True
+    # For vision the metric is a grounding artifact, not model hallucination.
+    assert summary["hallucination_reflects_model"] is False
+
+
 def test_summarize_constrained_rate_none_when_no_comparable_rows():
     # OCR/pipeline adapters record no response_format_style, and routed rows have
     # no declared style, so neither can be counted as a downgrade — the metric is
@@ -117,6 +169,25 @@ def test_summarize_constrained_rate_none_when_no_comparable_rows():
 
     assert summary["constrained_rate"] is None
     assert summary["effective_style_distribution"] == {}
+
+
+def test_summarize_labels_ocr_hallucination_as_model_signal():
+    rows = [
+        {
+            "model_profile": "txt",
+            "ingestion_path": "ocr:pdf_text",
+            "ok": True,
+            "latency_ms": 5,
+            "validation": {"valid": True},
+            "score": {"evidence_field_total": 4, "evidence_grounded": 3},
+        }
+    ]
+
+    summary = summarize(rows)["summary"][0]
+
+    assert summary["hallucination_rate"] == 0.25
+    assert summary["hallucination_basis"] == "consumed_ocr_text"
+    assert summary["hallucination_reflects_model"] is True
 
 
 def test_summarize_aggregates_routing_metrics():

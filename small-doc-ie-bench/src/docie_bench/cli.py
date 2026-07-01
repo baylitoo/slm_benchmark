@@ -15,6 +15,7 @@ from docie_bench.benchmark.comparison import (
     resolve_run,
 )
 from docie_bench.benchmark.judge import EvaluationMode
+from docie_bench.benchmark.judge_calibration import DEFAULT_MAX_JUDGE_MAE, calibration_gate
 from docie_bench.benchmark.registry import (
     DEFAULT_REGISTRY_PATH,
     detect_leakage,
@@ -150,6 +151,17 @@ def benchmark_compare(
     budgets: Path | None = typer.Option(None, exists=True, readable=True),
     output_dir: Path = typer.Option(Path("comparison")),
     registry_dir: Path = typer.Option(Path(".benchmarks/baselines")),
+    calibration: Path | None = typer.Option(
+        None,
+        exists=True,
+        readable=True,
+        help="Judge<->human calibration set (JSON). Without it, or below the agreement "
+        "threshold, judge_faithfulness/judge_completeness budgets only warn, never block.",
+    ),
+    max_judge_mae: float = typer.Option(
+        DEFAULT_MAX_JUDGE_MAE,
+        help="Max judge<->human mean absolute error to trust the judge as a blocking gate.",
+    ),
 ) -> None:
     try:
         result = compare_runs(
@@ -157,6 +169,8 @@ def benchmark_compare(
             resolve_run(candidate, registry_dir=registry_dir),
             output_dir=output_dir,
             budgets_path=budgets,
+            calibration_path=calibration,
+            max_judge_mae=max_judge_mae,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -166,6 +180,30 @@ def benchmark_compare(
     print(f"Report: {result.report_path}")
     if result.exit_code:
         raise typer.Exit(result.exit_code)
+
+
+@benchmark_app.command("judge-calibration")
+def benchmark_judge_calibration(
+    calibration: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        help="Judge<->human calibration set (JSON) with paired judge_/human_ scores.",
+    ),
+    max_judge_mae: float = typer.Option(
+        DEFAULT_MAX_JUDGE_MAE,
+        help="Max judge<->human mean absolute error to trust the judge as a blocking gate.",
+    ),
+) -> None:
+    """Report judge<->human agreement and whether the judge may block a regression."""
+    try:
+        report, gate = calibration_gate(calibration, max_mae=max_judge_mae)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _print_json({"report": report, "gate": gate})
+    color = "green" if gate["calibrated"] else "yellow"
+    verb = "may block regressions" if gate["calibrated"] else "warns only (non-blocking)"
+    print(f"[{color}]Judge calibration: {gate['reason']} — {verb}[/{color}]")
 
 
 @baseline_app.command("promote")

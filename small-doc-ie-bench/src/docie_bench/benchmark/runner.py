@@ -602,13 +602,15 @@ def summarize(
         )
         n = len(profile_rows)
         effective_style_distribution, constrained_rate = _constrained_style_stats(ok_rows)
+        ingestion_path = profile_rows[0].get("ingestion_path", "unknown")
+        hallucination_semantics = _hallucination_semantics(ingestion_path)
         routed_rows = [r["routing"] for r in profile_rows if r.get("routing")]
         routed_n = len(routed_rows)
         routed_stages = [stage for route in routed_rows for stage in route.get("stages", [])]
         summary.append(
             {
                 "model_profile": profile,
-                "ingestion_path": profile_rows[0].get("ingestion_path", "unknown"),
+                "ingestion_path": ingestion_path,
                 "docs": n,
                 "concurrency": concurrency,
                 "wall_seconds": round(wall_seconds, 1),
@@ -643,6 +645,7 @@ def summarize(
                     if evidence_total
                     else None
                 ),
+                **hallucination_semantics,
                 "avg_similarity": (
                     round(sum(sim_values) / len(sim_values), 4) if sim_values else None
                 ),
@@ -751,6 +754,42 @@ def _constrained_style_stats(
             honoured += 1
     constrained_rate = honoured / comparable if comparable else None
     return distribution, constrained_rate
+
+
+def _hallucination_semantics(ingestion_path: str) -> dict[str, Any]:
+    """Describe how to read hallucination_rate for a given ingestion path.
+
+    Gap (b): hallucination_rate is derived from evidence grounding against OCR text.
+    For OCR paths the model consumed that same text, so an ungrounded field is a
+    plausible model signal. For VISION the model consumed page images and grounding
+    runs with no consumed text (blocks are empty), so the metric is a grounding
+    artifact — near 1.0 by construction — NOT model hallucination. Segment/label it
+    so it cannot be misread as pure model behaviour.
+    """
+    path = str(ingestion_path)
+    if path.startswith("vision"):
+        return {
+            "hallucination_basis": "no_consumed_text",
+            "hallucination_ocr_dependent": True,
+            "hallucination_reflects_model": False,
+        }
+    if path.startswith("ocr:"):
+        return {
+            "hallucination_basis": "consumed_ocr_text",
+            "hallucination_ocr_dependent": True,
+            "hallucination_reflects_model": True,
+        }
+    if path.startswith("routed"):
+        return {
+            "hallucination_basis": "mixed",
+            "hallucination_ocr_dependent": True,
+            "hallucination_reflects_model": False,
+        }
+    return {
+        "hallucination_basis": "unknown",
+        "hallucination_ocr_dependent": True,
+        "hallucination_reflects_model": False,
+    }
 
 
 def _percentile(values: list[float], pct: int) -> float:

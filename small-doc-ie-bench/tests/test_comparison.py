@@ -56,6 +56,38 @@ def _write_budgets(path: Path, budgets: list[dict]) -> Path:
     return path
 
 
+def _judge_row(doc_id: str, *, faithfulness: float) -> dict:
+    return {
+        "doc_id": doc_id,
+        "model_profile": "model",
+        "schema_name": "invoice",
+        "language": "en",
+        "ok": True,
+        "latency_ms": 10,
+        "validation": {"valid": True},
+        "score": {},
+        "judge": {
+            "overall_faithfulness": faithfulness,
+            "overall_completeness": faithfulness,
+        },
+    }
+
+
+def _write_calibration(path: Path, *, count: int, error: float) -> Path:
+    records = [
+        {
+            "doc_id": f"cal-{i}",
+            "human_faithfulness": 0.8,
+            "judge_faithfulness": min(1.0, 0.8 + error),
+            "human_completeness": 0.6,
+            "judge_completeness": min(1.0, 0.6 + error),
+        }
+        for i in range(count)
+    ]
+    path.write_text(json.dumps({"records": records}), encoding="utf-8")
+    return path
+
+
 def test_compare_reports_improvements_across_dimensions(tmp_path):
     baseline = _write_metrics(tmp_path / "baseline", [_row("one", correct=False)])
     candidate = _write_metrics(tmp_path / "candidate", [_row("one", correct=True)])
@@ -166,6 +198,49 @@ def test_missing_budget_metric_is_error_unless_allowed(tmp_path):
     )
 
     assert result.verdict == "error"
+
+
+def test_uncalibrated_judge_regression_does_not_block(tmp_path):
+    # Same judge regression beyond budget; no calibration set -> non-blocking warn.
+    baseline = _write_metrics(tmp_path / "baseline", [_judge_row("one", faithfulness=0.9)])
+    candidate = _write_metrics(tmp_path / "candidate", [_judge_row("one", faithfulness=0.5)])
+    budgets = _write_budgets(
+        tmp_path / "budgets.yaml",
+        [{"metric": "judge_faithfulness", "max_regression": 0, "min_paired_samples": 1}],
+    )
+
+    result = compare_runs(baseline, candidate, output_dir=tmp_path / "out", budgets_path=budgets)
+    verdict = json.loads(result.verdict_path.read_text(encoding="utf-8"))
+
+    assert result.verdict == "pass"
+    assert verdict["judge_calibration"]["reason"] == "no_calibration_provided"
+    assert verdict["checks"][0]["status"] == "warn"
+    assert verdict["checks"][0]["reason"] == "judge_uncalibrated_non_blocking"
+
+
+def test_calibrated_judge_regression_blocks(tmp_path):
+    # Identical regression, but a large low-error calibration set lets the judge block.
+    baseline = _write_metrics(tmp_path / "baseline", [_judge_row("one", faithfulness=0.9)])
+    candidate = _write_metrics(tmp_path / "candidate", [_judge_row("one", faithfulness=0.5)])
+    budgets = _write_budgets(
+        tmp_path / "budgets.yaml",
+        [{"metric": "judge_faithfulness", "max_regression": 0, "min_paired_samples": 1}],
+    )
+    calibration = _write_calibration(tmp_path / "calibration.json", count=30, error=0.05)
+
+    result = compare_runs(
+        baseline,
+        candidate,
+        output_dir=tmp_path / "out",
+        budgets_path=budgets,
+        calibration_path=calibration,
+    )
+    verdict = json.loads(result.verdict_path.read_text(encoding="utf-8"))
+
+    assert result.verdict == "fail"
+    assert verdict["judge_calibration"]["calibrated"] is True
+    assert verdict["checks"][0]["status"] == "fail"
+    assert verdict["checks"][0]["reason"] == "budget_exceeded"
 
 
 def test_baseline_promotion_is_versioned_and_resolvable(tmp_path):
