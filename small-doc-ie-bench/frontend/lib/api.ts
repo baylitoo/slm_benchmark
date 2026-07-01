@@ -158,11 +158,32 @@ export interface SeedOllamaRequest {
   family?: string; // defaults "openai_chat" server-side
 }
 
-/** A completed benchmark run (GET /v1/serving/benchmarks). */
+/** A downloadable run artifact (report.html / predictions.jsonl / metrics.json). */
+export interface RunArtifact {
+  id: string;
+  name: string;
+  media_type?: string;
+  size_bytes?: number;
+  sha256?: string;
+  /** Addressable, path-independent URI: `/v1/studio/artifacts/{id}`. */
+  uri: string;
+}
+
+/**
+ * A durable benchmark run (GET /v1/studio/runs). Keyed by the Inngest event id;
+ * metrics come from the index, artifacts are fetched by id from the blob store.
+ * Legacy `run`/`path` fields are kept optional for back-compat with older rows.
+ */
 export interface BenchmarkRun {
-  run: string;
-  path: string;
-  metrics?: { summary?: Record<string, unknown>[] } | null;
+  event_id?: string;
+  run?: string; // legacy (runs_dir scan)
+  path?: string; // legacy
+  status?: string;
+  dataset?: string | null;
+  model_profile?: string | null;
+  metrics?: { summary?: Record<string, unknown>[]; [k: string]: unknown } | null;
+  artifacts?: RunArtifact[];
+  created_at?: string | null;
   [k: string]: unknown;
 }
 
@@ -308,8 +329,18 @@ export function triggerBenchmark(payload: BenchmarkRequest): Promise<TriggerResp
   });
 }
 
+/**
+ * Durable, tenant-scoped benchmark runs with addressable artifacts
+ * (GET /v1/studio/runs). Reachable from any replica — resolved from the shared
+ * blob store + Postgres index rather than the worker's local filesystem.
+ */
 export function getBenchmarks(): Promise<BenchmarkRun[]> {
-  return request<BenchmarkRun[]>("/v1/serving/benchmarks");
+  return request<BenchmarkRun[]>("/v1/studio/runs");
+}
+
+/** Absolute URL for a run artifact's addressable URI (prepends the API base). */
+export function artifactUrl(uri: string): string {
+  return `${API_BASE}${uri}`;
 }
 
 // ---------------------------------------------------------------------------

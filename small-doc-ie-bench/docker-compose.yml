@@ -18,6 +18,10 @@ services:
       - ./annotations:/app/annotations
       - ocr-cache:/app/.cache/ocr
       - serving-state:/app/.serving
+      # Durable artifact store shared with the worker: the worker writes
+      # report.html/predictions.jsonl here and the api serves them back by id,
+      # so results are reachable regardless of which replica produced them.
+      - artifact-store:/app/artifacts
     command: ["uvicorn", "docie_bench.api:app", "--host", "0.0.0.0", "--port", "8080"]
     healthcheck:
       test: ["CMD", "python", "scripts/healthcheck.py", "http://localhost:8080/healthz"]
@@ -69,8 +73,12 @@ services:
       retries: 5
 
   # The Connect worker: holds the Inngest functions (extraction, etc.) and dials
-  # OUT to the gateway. Reuses Dockerfile.api for the OCR/vision deps. Scale with
-  # `docker compose up -d --scale worker=3`.
+  # OUT to the gateway. Reuses Dockerfile.api for the OCR/vision deps.
+  # Extraction and benchmark runs are replica-safe now that benchmark artifacts
+  # land in the shared `artifact-store` volume + Postgres index (not worker-local
+  # paths), so scale freely: `docker compose up -d --scale worker=3`.
+  # CAVEAT: the in-worker model *deploy* runtime binds 127.0.0.1 in one replica,
+  # so `serving/deploy.requested` still assumes scale=1 (see deploy_model_job).
   worker:
     build:
       context: .
@@ -89,6 +97,7 @@ services:
       - ./annotations:/app/annotations
       - ocr-cache:/app/.cache/ocr
       - serving-state:/app/.serving
+      - artifact-store:/app/artifacts
       # Host Ollama models (read-only) so seed-from-ollama can pull existing GGUF
       # blobs into the store without re-downloading. Set OLLAMA_MODELS_HOST in
       # .env to your host path (e.g. C:/Users/<you>/.ollama/models).
@@ -220,3 +229,4 @@ volumes:
   ocr-cache:
   redis-data:
   serving-state:
+  artifact-store:

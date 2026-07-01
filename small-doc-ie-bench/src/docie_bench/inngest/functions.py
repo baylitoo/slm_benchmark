@@ -138,55 +138,148 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
-async def _run_benchmark_job(data: dict[str, Any]) -> dict[str, Any]:
-    """Run a benchmark over a dataset; returns paths + parsed metrics."""
+# Artifacts persisted to the durable store, in (filename, media_type) order. The
+# large predictions.jsonl only ever lands in the blob store, never Postgres.
+_BENCHMARK_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("metrics.json", "application/json"),
+    ("report.html", "text/html; charset=utf-8"),
+    ("predictions.jsonl", "application/x-ndjson"),
+)
+
+
+def benchmark_idempotency_key(data: dict[str, Any]) -> str:
+    """Stable dedup key for a benchmark request.
+
+    A caller may pass an explicit ``idempotency_key`` (e.g. to force a fresh run
+    with a nonce); otherwise it is derived from the run-defining fields so a
+    double-fire of the *same* request resolves to the existing run. Bookkeeping
+    like ``channel`` and ``tenant_id`` is excluded so it does not perturb the key.
+    """
+    import hashlib
+    import json
+
+    provided = data.get("idempotency_key")
+    if provided:
+        return str(provided)
+    fields = (
+        "dataset",
+        "split",
+        "model_profile",
+        "schema_name",
+        "concurrency",
+        "repeat",
+        "language",
+    )
+    material = {key: data.get(key) for key in fields}
+    digest = hashlib.sha256(
+        json.dumps(material, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return f"bench-{digest[:32]}"
+
+
+async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str, Any]:
+    """Run a benchmark and persist its artifacts to the durable store.
+
+    Returns a path-independent record ``{event_id, status, metrics, artifacts}``
+    where each artifact carries an addressable ``uri`` (``/v1/studio/artifacts/{id}``)
+    reachable from the api/web replicas — never a worker-local filesystem path.
+    """
     import json
 
     from docie_bench.benchmark.runner import run_benchmark
+    from docie_bench.studio.store import default_run_store
 
     dataset = data.get("dataset")
     if not dataset:
         raise ValueError("benchmark event must include a 'dataset' reference or path")
-    result = await run_benchmark(
-        dataset_path=dataset,
-        models_config_path=MODELS_CONFIG_PATH,
-        model_profile=data.get("model_profile"),
-        concurrency=int(data.get("concurrency", 1)),
-        repeat=int(data.get("repeat", 1)),
-        schema_name=data.get("schema_name", "invoice"),
-        language=data.get("language"),
-        split=data.get("split"),
-    )
+
+    store = default_run_store()
+    idempotency_key = benchmark_idempotency_key(data)
+    tenant_id = str(data.get("tenant_id") or "anonymous")
+
+    # Idempotency: claim the run row BEFORE doing work. A redelivery (same
+    # event id) or a duplicate trigger (same idempotency key) short-circuits to
+    # the existing record instead of running the benchmark a second time.
+    if store.enabled:
+        outcome, record = store.claim(
+            event_id=event_id,
+            idempotency_key=idempotency_key,
+            tenant_id=tenant_id,
+            dataset=str(dataset),
+            model_profile=data.get("model_profile"),
+            schema_name=data.get("schema_name", "invoice"),
+        )
+        if outcome == "exists":
+            logger.info("benchmark run %s deduplicated (key=%s)", event_id, idempotency_key)
+            return record
+    else:
+        logger.warning("no DATABASE_URL: benchmark artifacts are not durably indexed")
+
+    try:
+        result = await run_benchmark(
+            dataset_path=dataset,
+            models_config_path=MODELS_CONFIG_PATH,
+            model_profile=data.get("model_profile"),
+            concurrency=int(data.get("concurrency", 1)),
+            repeat=int(data.get("repeat", 1)),
+            schema_name=data.get("schema_name", "invoice"),
+            language=data.get("language"),
+            split=data.get("split"),
+        )
+    except Exception as exc:  # noqa: BLE001 - record failure so the run can retry
+        if store.enabled:
+            store.fail(event_id=event_id, error=str(exc))
+        raise
+
     metrics: dict[str, Any] = {}
     try:
         metrics = json.loads(Path(result.metrics_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         logger.warning("could not read metrics at %s", result.metrics_path)
-    return {
-        "run_dir": str(result.run_dir),
-        "metrics_path": str(result.metrics_path),
-        "report_path": str(result.report_path),
-        "predictions_path": str(result.predictions_path),
-        "metrics": metrics,
+
+    if not store.enabled:
+        # Degraded mode: no durable index. Return metrics inline (still deliverable)
+        # but no addressable artifacts.
+        return {"event_id": event_id, "status": "completed", "metrics": metrics, "artifacts": []}
+
+    paths = {
+        "metrics.json": result.metrics_path,
+        "report.html": result.report_path,
+        "predictions.jsonl": result.predictions_path,
     }
+    stored: list[tuple[str, Any]] = []
+    for name, media_type in _BENCHMARK_ARTIFACTS:
+        source = Path(paths[name])
+        if not source.exists():
+            continue
+        blob = store.blobs.put(name=name, content=source.read_bytes(), media_type=media_type)
+        stored.append((name, blob))
+    return store.complete(event_id=event_id, metrics=metrics, artifacts=stored)
 
 
 @inngest_client.create_function(
     fn_id="benchmark-run",
     trigger=inngest.TriggerEvent(event="benchmark/run.requested"),
+    # Platform-level dedup over 24h; complements the durable DB claim below so a
+    # double-fire cannot double-run even before the worker records anything.
+    idempotency="event.data.idempotency_key",
 )
 async def run_benchmark_job(ctx: inngest.Context) -> dict[str, Any]:
-    """Run a full benchmark over a dataset.
+    """Run a full benchmark over a dataset and persist addressable artifacts.
 
     Event ``data``: ``dataset`` (required), ``split``, ``model_profile``,
-    ``schema_name``, ``concurrency``, ``repeat``, ``language``, ``channel``.
+    ``schema_name``, ``concurrency``, ``repeat``, ``language``, ``channel``,
+    ``tenant_id`` (bound at trigger time), ``idempotency_key`` (optional).
     """
     data = dict(ctx.event.data or {})
     channel = data.get("channel") or f"run:{ctx.event.id}"
+    event_id = ctx.event.id
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "dataset": data.get("dataset")})
     try:
-        result = await ctx.step.run("benchmark", lambda: _run_benchmark_job(data))
+        result = await ctx.step.run(
+            "benchmark", lambda: _run_benchmark_job(data, event_id=event_id)
+        )
     except Exception as exc:  # noqa: BLE001 - surface error then re-raise
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
         raise
@@ -305,7 +398,50 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
-functions = [extract_document, run_benchmark_job, deploy_model_job, seed_ollama_job]
+def _gc_studio_runs_sync() -> dict[str, int]:
+    """Apply the retention policy to the durable Studio run index (blocking)."""
+    from docie_bench.studio.store import default_run_store
+
+    store = default_run_store()
+    if not store.enabled:
+        logger.info("studio run GC skipped: no DATABASE_URL")
+        return {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
+    settings = get_settings()
+    summary = store.gc(
+        max_age_days=settings.studio_run_retention_days,
+        max_runs=settings.studio_run_retention_max,
+    )
+    logger.info("studio run GC: %s", summary)
+    return summary
+
+
+async def _gc_studio_runs() -> dict[str, int]:
+    # Blocking DB + filesystem work -> off the event loop (mirrors seed_ollama_job).
+    return await asyncio.to_thread(_gc_studio_runs_sync)
+
+
+@inngest_client.create_function(
+    fn_id="studio-runs-gc",
+    trigger=inngest.TriggerCron(cron="0 3 * * *"),
+)
+async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
+    """Nightly retention sweep for the Studio run index (rows + orphan blobs).
+
+    Bounds unbounded run accumulation: deletes runs older than
+    ``STUDIO_RUN_RETENTION_DAYS`` or beyond the newest ``STUDIO_RUN_RETENTION_MAX``,
+    and prunes any blob no surviving run still references. Idempotent — a second
+    sweep with nothing to collect is a no-op.
+    """
+    return await ctx.step.run("gc-studio-runs", _gc_studio_runs)
+
+
+functions = [
+    extract_document,
+    run_benchmark_job,
+    deploy_model_job,
+    seed_ollama_job,
+    gc_studio_runs_job,
+]
 
 __all__ = [
     "functions",
@@ -313,4 +449,6 @@ __all__ = [
     "run_benchmark_job",
     "deploy_model_job",
     "seed_ollama_job",
+    "gc_studio_runs_job",
+    "benchmark_idempotency_key",
 ]

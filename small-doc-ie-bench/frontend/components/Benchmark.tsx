@@ -9,13 +9,16 @@ import {
   ChevronRight,
   AlertCircle,
   FolderClosed,
+  Download,
 } from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
+  artifactUrl,
   ApiError,
   ApiUnavailable,
   type BenchmarkRun,
+  type RunArtifact,
   type TriggerResponse,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
@@ -31,7 +34,6 @@ import {
   Skeleton,
   TextInput,
 } from "./ui";
-import { JsonView } from "./JsonView";
 import { ResultPanel } from "./ResultPanel";
 
 export function Benchmark() {
@@ -145,7 +147,7 @@ export function Benchmark() {
       <Card
         icon={<History className="h-5 w-5" />}
         title="Past runs"
-        subtitle="GET /v1/serving/benchmarks"
+        subtitle="GET /v1/studio/runs"
         actions={
           <Button variant="ghost" size="sm" onClick={runs.reload} type="button">
             Reload
@@ -196,16 +198,20 @@ function RunsList({
   return (
     <div className="scroll-thin max-h-[28rem] space-y-2 overflow-auto pr-1">
       {runs.map((run) => {
-        const hasMetrics = Boolean(run.metrics?.summary?.length);
-        const isOpen = open === run.run;
+        const runId = run.event_id ?? run.run ?? "";
+        const label = run.dataset || run.run || run.event_id || "run";
+        const summary = run.metrics?.summary;
+        const hasMetrics = Boolean(summary?.length);
+        const artifacts = run.artifacts ?? [];
+        const isOpen = open === runId;
         return (
           <div
-            key={run.run}
+            key={runId}
             className="overflow-hidden rounded-xl border border-border bg-background"
           >
             <button
               type="button"
-              onClick={() => setOpen(isOpen ? null : run.run)}
+              onClick={() => setOpen(isOpen ? null : runId)}
               className="flex w-full items-center justify-between gap-3 px-3.5 py-3 text-left transition hover:bg-muted/40"
             >
               <div className="flex min-w-0 items-center gap-2">
@@ -214,22 +220,29 @@ function RunsList({
                 ) : (
                   <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
                 )}
-                <span className="truncate text-sm font-medium text-foreground">{run.run}</span>
+                <span className="truncate text-sm font-medium text-foreground">{label}</span>
               </div>
-              <Badge tone={hasMetrics ? "ok" : "neutral"}>
-                {hasMetrics ? "metrics" : "no metrics"}
-              </Badge>
+              <div className="flex shrink-0 items-center gap-2">
+                {run.status && (
+                  <Badge tone={run.status === "completed" ? "ok" : run.status === "failed" ? "err" : "neutral"}>
+                    {run.status}
+                  </Badge>
+                )}
+                <Badge tone={hasMetrics ? "ok" : "neutral"}>
+                  {hasMetrics ? "metrics" : "no metrics"}
+                </Badge>
+              </div>
             </button>
             {isOpen && (
-              <div className={cn("border-t border-border p-3.5")}>
+              <div className={cn("space-y-3 border-t border-border p-3.5")}>
                 {hasMetrics ? (
-                  <JsonView value={run.metrics?.summary} maxHeight="18rem" />
+                  <MetricsTable summary={summary!} />
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    No <code className="rounded bg-muted px-1">metrics.json</code> for this run.{" "}
-                    <span className="break-all">{run.path}</span>
+                    No <code className="rounded bg-muted px-1">metrics.json</code> for this run.
                   </p>
                 )}
+                {artifacts.length > 0 && <ArtifactLinks artifacts={artifacts} />}
               </div>
             )}
           </div>
@@ -237,4 +250,61 @@ function RunsList({
       })}
     </div>
   );
+}
+
+/** Render the benchmark metrics `summary` (array of flat objects) as a table. */
+function MetricsTable({ summary }: { summary: Record<string, unknown>[] }) {
+  const columns = Array.from(new Set(summary.flatMap((r) => Object.keys(r))));
+  return (
+    <div className="scroll-thin overflow-auto rounded-lg border border-border">
+      <table className="w-full text-left text-xs">
+        <thead className="bg-muted/60 uppercase tracking-wide text-muted-foreground">
+          <tr>
+            {columns.map((c) => (
+              <th key={c} className="whitespace-nowrap px-2.5 py-2 font-medium">
+                {c}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {summary.map((row, i) => (
+            <tr key={i} className="border-t border-border">
+              {columns.map((c) => (
+                <td key={c} className="whitespace-nowrap px-2.5 py-1.5 text-foreground/90">
+                  {formatCell(row[c])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Download links for a run's addressable artifacts. */
+function ArtifactLinks({ artifacts }: { artifacts: RunArtifact[] }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {artifacts.map((a) => (
+        <a
+          key={a.id}
+          href={artifactUrl(a.uri)}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium text-foreground transition hover:bg-muted"
+          download
+        >
+          <Download className="h-3.5 w-3.5" />
+          {a.name}
+        </a>
+      ))}
+    </div>
+  );
+}
+
+function formatCell(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(4);
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
