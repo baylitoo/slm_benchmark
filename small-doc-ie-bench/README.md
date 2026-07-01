@@ -168,9 +168,14 @@ docie-bench benchmark compare baseline candidate \
   --calibration configs/judge_calibration.json
 ```
 
-The gate requires both a large-enough set (>= 30 labeled documents) and a worst-dimension
-mean absolute error within `--max-judge-mae` (default 0.15). A tiny set lacks statistical
-power and is reported as `insufficient_calibration_samples` — it can never certify the judge.
+The gate certifies the judge only when **every** scored dimension
+(`faithfulness` and `completeness`) independently clears three bars: at least 30 **real
+labeled pairs** for that dimension (padded rows without both `judge_`/`human_` scores do
+not count), a mean absolute error within `--max-judge-mae` (default 0.15), and a
+judge<->human correlation of at least 0.3. Too few pairs is reported as
+`insufficient_calibration_samples`; a near-constant judge with undefined/zero-variance
+correlation is reported as `correlation_below_threshold`. Either way it can only warn,
+never block — the gate fails closed so an untrustworthy judge can never block a release.
 
 #### Reading `hallucination_rate` by ingestion path
 

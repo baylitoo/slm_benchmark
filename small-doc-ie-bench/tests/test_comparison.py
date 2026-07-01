@@ -74,16 +74,24 @@ def _judge_row(doc_id: str, *, faithfulness: float) -> dict:
 
 
 def _write_calibration(path: Path, *, count: int, error: float) -> Path:
-    records = [
-        {
-            "doc_id": f"cal-{i}",
-            "human_faithfulness": 0.8,
-            "judge_faithfulness": min(1.0, 0.8 + error),
-            "human_completeness": 0.6,
-            "judge_completeness": min(1.0, 0.6 + error),
-        }
-        for i in range(count)
-    ]
+    # Human labels spread across the range so the judge<->human correlation is
+    # well-defined and positive; the judge tracks them at a fixed offset (error)
+    # to control MAE. A constant set would have undefined correlation and could
+    # not certify the judge as a blocking gate.
+    records = []
+    for i in range(count):
+        span = i / max(count - 1, 1)
+        human_faithfulness = round(0.5 + 0.4 * span, 4)
+        human_completeness = round(0.4 + 0.4 * span, 4)
+        records.append(
+            {
+                "doc_id": f"cal-{i}",
+                "human_faithfulness": human_faithfulness,
+                "judge_faithfulness": round(min(1.0, human_faithfulness + error), 4),
+                "human_completeness": human_completeness,
+                "judge_completeness": round(min(1.0, human_completeness + error), 4),
+            }
+        )
     path.write_text(json.dumps({"records": records}), encoding="utf-8")
     return path
 

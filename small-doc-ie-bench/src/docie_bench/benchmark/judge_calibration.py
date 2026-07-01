@@ -20,13 +20,27 @@ from statistics import StatisticsError, correlation, mean
 from typing import Any
 
 # Reuse the same small-sample threshold the comparison gate warns at, so a
-# calibration set below it can never certify the judge as a blocking gate.
+# calibration set below it can never certify the judge as a blocking gate. This
+# counts REAL paired labels per dimension, not padded rows: a file can carry 30
+# rows yet only a handful of dimensions actually labelled.
 MIN_CALIBRATION_SAMPLES = 30
 # The judge is trusted to BLOCK a regression only when its mean absolute error
 # against human labels is at or below this on every scored dimension.
 DEFAULT_MAX_JUDGE_MAE = 0.15
+# Low MAE alone is satisfied by a near-constant judge (always ~0.8), which never
+# actually tracks the human labels. Require a minimum judge<->human correlation
+# per dimension so a constant/zero-variance judge (correlation None) cannot
+# certify as a blocking gate.
+MIN_CALIBRATION_CORRELATION = 0.3
 
 JUDGE_DIMENSIONS = ("faithfulness", "completeness")
+
+# Per-dimension failure reasons, in the order they gate (most fundamental first).
+_DIMENSION_GATE_REASON = {
+    "insufficient_pairs": "insufficient_calibration_samples",
+    "agreement_below_threshold": "agreement_below_threshold",
+    "correlation_below_threshold": "correlation_below_threshold",
+}
 
 
 def load_calibration(path: Path) -> list[dict[str, Any]]:
@@ -80,29 +94,82 @@ def compute_judge_agreement(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _evaluate_dimension(
+    dimension: dict[str, Any], *, max_mae: float, min_correlation: float
+) -> dict[str, Any]:
+    """Decide whether a single judged dimension is calibrated enough to block.
+
+    Gates on the REAL paired-label count first, so a dimension with too few (or
+    zero) pairs is never calibrated regardless of how the file is padded, then on
+    agreement (MAE) and discriminative tracking (correlation).
+    """
+    n = int(dimension.get("n") or 0)
+    mae = dimension.get("mae")
+    corr = dimension.get("correlation")
+    if n < MIN_CALIBRATION_SAMPLES:
+        reason = "insufficient_pairs"
+    elif mae is None or mae > max_mae:
+        reason = "agreement_below_threshold"
+    elif corr is None or corr < min_correlation:
+        # None correlation == constant/zero-variance judge: no discriminative
+        # agreement, so it may not block despite a small MAE.
+        reason = "correlation_below_threshold"
+    else:
+        reason = "within_agreement"
+    return {
+        "n": n,
+        "mae": mae,
+        "correlation": corr,
+        "calibrated": reason == "within_agreement",
+        "reason": reason,
+    }
+
+
 def evaluate_calibration(
-    report: dict[str, Any], *, max_mae: float = DEFAULT_MAX_JUDGE_MAE
+    report: dict[str, Any],
+    *,
+    max_mae: float = DEFAULT_MAX_JUDGE_MAE,
+    min_correlation: float = MIN_CALIBRATION_CORRELATION,
 ) -> dict[str, Any]:
     """Decide whether the judge may BLOCK a regression.
 
-    Requires BOTH a large-enough set (``sample_count >= MIN_CALIBRATION_SAMPLES``)
-    AND worst-dimension MAE within ``max_mae``. A tiny set can show spuriously high
-    agreement, so it is never allowed to certify the judge.
+    A dimension may block only when EVERY gate holds for it: at least
+    ``MIN_CALIBRATION_SAMPLES`` real paired labels, worst-case MAE within
+    ``max_mae``, and judge<->human correlation at least ``min_correlation``. The
+    judge certifies as a blocking gate only when every scored dimension passes, so
+    padding rows or a near-constant judge can never fail open into a block.
     """
-    worst_mae = report.get("worst_mae")
+    dimensions = report.get("dimensions") or {}
+    per_dimension = {
+        name: _evaluate_dimension(
+            dimensions.get(name) or {"n": 0, "mae": None, "correlation": None},
+            max_mae=max_mae,
+            min_correlation=min_correlation,
+        )
+        for name in JUDGE_DIMENSIONS
+    }
     base = {
         "sample_count": report.get("sample_count", 0),
-        "worst_mae": worst_mae,
+        "worst_mae": report.get("worst_mae"),
         "max_mae": max_mae,
         "min_samples": MIN_CALIBRATION_SAMPLES,
+        "min_correlation": min_correlation,
+        "dimensions": per_dimension,
     }
-    if report.get("small_sample", True):
-        return {**base, "calibrated": False, "reason": "insufficient_calibration_samples"}
-    if worst_mae is None:
-        return {**base, "calibrated": False, "reason": "no_paired_labels"}
-    calibrated = worst_mae <= max_mae
-    reason = "within_agreement" if calibrated else "agreement_below_threshold"
-    return {**base, "calibrated": calibrated, "reason": reason}
+    if all(dimension["calibrated"] for dimension in per_dimension.values()):
+        return {**base, "calibrated": True, "reason": "within_agreement"}
+    failing = {
+        dimension["reason"]
+        for dimension in per_dimension.values()
+        if not dimension["calibrated"]
+    }
+    # Surface the most fundamental failure across dimensions.
+    reason = next(
+        gate_reason
+        for dimension_reason, gate_reason in _DIMENSION_GATE_REASON.items()
+        if dimension_reason in failing
+    )
+    return {**base, "calibrated": False, "reason": reason}
 
 
 def calibration_gate(

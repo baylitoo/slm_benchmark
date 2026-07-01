@@ -13,17 +13,24 @@ from docie_bench.benchmark.judge_calibration import (
 
 
 def _records(n: int, *, error: float) -> list[dict[str, float]]:
-    # Judge scores offset from human labels by a fixed error to control MAE.
-    return [
-        {
-            "doc_id": f"doc-{i}",
-            "human_faithfulness": 0.8,
-            "judge_faithfulness": min(1.0, 0.8 + error),
-            "human_completeness": 0.6,
-            "judge_completeness": min(1.0, 0.6 + error),
-        }
-        for i in range(n)
-    ]
+    # Human labels spread monotonically across the 0-1 range so correlation is
+    # well-defined and positive; the judge tracks them at a fixed offset to
+    # control MAE independently.
+    records = []
+    for i in range(n):
+        span = i / max(n - 1, 1)
+        human_faithfulness = round(0.5 + 0.4 * span, 4)
+        human_completeness = round(0.4 + 0.4 * span, 4)
+        records.append(
+            {
+                "doc_id": f"doc-{i}",
+                "human_faithfulness": human_faithfulness,
+                "judge_faithfulness": round(min(1.0, human_faithfulness + error), 4),
+                "human_completeness": human_completeness,
+                "judge_completeness": round(min(1.0, human_completeness + error), 4),
+            }
+        )
+    return records
 
 
 def test_agreement_reports_per_dimension_mae_and_correlation():
@@ -80,6 +87,52 @@ def test_large_high_error_set_is_not_calibrated():
 
     assert gate["calibrated"] is False
     assert gate["reason"] == "agreement_below_threshold"
+
+
+def test_padded_file_without_per_dimension_pairs_does_not_certify():
+    # 30 rows, but only 3 real faithfulness pairs and ZERO completeness pairs. A
+    # gate keyed off len(records)/worst_mae would fail open and certify the judge;
+    # the per-dimension pair count must catch it.
+    records = [
+        {"doc_id": f"faith-{i}", "human_faithfulness": 0.8, "judge_faithfulness": 0.85}
+        for i in range(3)
+    ]
+    records += [{"doc_id": f"pad-{i}"} for i in range(27)]
+
+    report = compute_judge_agreement(records)
+    gate = evaluate_calibration(report)
+
+    assert report["dimensions"]["faithfulness"]["n"] == 3
+    assert report["dimensions"]["completeness"]["n"] == 0
+    assert gate["calibrated"] is False
+    assert gate["reason"] == "insufficient_calibration_samples"
+    assert gate["dimensions"]["faithfulness"]["reason"] == "insufficient_pairs"
+    assert gate["dimensions"]["completeness"]["reason"] == "insufficient_pairs"
+
+
+def test_near_constant_judge_is_not_calibrated_despite_low_mae():
+    # Enough pairs and a tiny MAE, but the judge sits on a constant so its
+    # correlation with the human labels is undefined — no discriminative
+    # agreement, so it may not block.
+    records = [
+        {
+            "doc_id": f"doc-{i}",
+            "human_faithfulness": 0.8,
+            "judge_faithfulness": 0.82,
+            "human_completeness": 0.6,
+            "judge_completeness": 0.62,
+        }
+        for i in range(MIN_CALIBRATION_SAMPLES)
+    ]
+
+    report = compute_judge_agreement(records)
+    gate = evaluate_calibration(report)
+
+    assert report["dimensions"]["faithfulness"]["n"] == MIN_CALIBRATION_SAMPLES
+    assert report["dimensions"]["faithfulness"]["mae"] == pytest.approx(0.02)
+    assert report["dimensions"]["faithfulness"]["correlation"] is None
+    assert gate["calibrated"] is False
+    assert gate["reason"] == "correlation_below_threshold"
 
 
 def test_missing_calibration_path_yields_non_blocking_gate():

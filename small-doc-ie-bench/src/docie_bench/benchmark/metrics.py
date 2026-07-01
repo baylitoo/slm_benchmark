@@ -16,6 +16,10 @@ class MetricConfig:
     # Shortest contained substring accepted as a verbatim-with-context match.
     # Guards against short substrings bleeding into larger tokens
     # (e.g. "SA" ∈ "SARL DUPONT") being scored as correct.
+    # Conscious tradeoff: this also drops legit 2-char token matches such as
+    # "CA" ∈ "CA 90001". No safe carve-out exists — a token-boundary exception
+    # would equally credit "de" ∈ "de gaulle", reintroducing the false positive —
+    # so such short codes fall through to fuzzy scoring instead of "contained".
     containment_min_length: int = 3
 
 
