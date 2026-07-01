@@ -35,7 +35,15 @@ async def publish(channel: str, topic: str, data: Any) -> None:
             data=data,
         )
     except Exception:  # noqa: BLE001 - realtime is best-effort
-        logger.debug("realtime publish failed (channel=%s topic=%s)", channel, topic, exc_info=True)
+        # Best-effort, but not silent: a dropped publish is exactly why a result
+        # or error can vanish from the UI. Log loudly so the delivery gap is
+        # visible; the frontend still recovers the run via GET /runs polling.
+        logger.warning(
+            "realtime publish failed (channel=%s topic=%s); UI falls back to /runs polling",
+            channel,
+            topic,
+            exc_info=True,
+        )
 
 
 async def subscription_token(channel: str, topics: list[str]) -> Any:

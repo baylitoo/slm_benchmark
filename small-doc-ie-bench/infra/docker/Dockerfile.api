@@ -3,6 +3,13 @@
 # rebuilds if these lines change. GGML_NATIVE=OFF keeps the binary portable
 # across CPUs; BUILD_SHARED_LIBS=OFF avoids chasing .so files at runtime.
 FROM python:3.11-slim-bookworm AS llama-builder
+# Bound the compile parallelism. `cmake --build -j` (unbounded) spawns one g++
+# per core; the memory-heavy models/*.cpp batch then peaks well past a
+# memory-limited Docker VM's cap and the OOM-killer stalls the build around
+# 65-70% (looks like a hang). Default to 2 concurrent jobs (~2-4GB peak, works
+# on a stock Docker Desktop). Override on a roomier machine for speed:
+#   docker compose build --build-arg LLAMA_BUILD_JOBS=8 worker
+ARG LLAMA_BUILD_JOBS=2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git build-essential cmake ca-certificates \
   && rm -rf /var/lib/apt/lists/*
@@ -12,7 +19,7 @@ RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /src \
       -DBUILD_SHARED_LIBS=OFF \
       -DLLAMA_CURL=OFF \
       -DGGML_NATIVE=OFF \
- && cmake --build /src/build --target llama-server -j
+ && cmake --build /src/build --target llama-server -j "${LLAMA_BUILD_JOBS}"
 
 FROM python:3.11-slim-bookworm
 

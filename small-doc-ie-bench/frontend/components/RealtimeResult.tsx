@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   useInngestSubscription,
   InngestSubscriptionState,
@@ -9,7 +9,13 @@ import type { Realtime } from "@inngest/realtime";
 import { Radio } from "lucide-react";
 import { getRealtimeToken, type RealtimeToken } from "@/lib/api";
 import { JsonView } from "./JsonView";
+import { PollingResult } from "./PollingResult";
 import { Badge, type BadgeTone } from "./ui";
+
+// If the subscription connects but no `result`/`error` topic arrives within this
+// window, the realtime publish was likely dropped (best-effort on the worker) —
+// fall back to polling GET /runs so a completed run's output still surfaces.
+const FALLBACK_AFTER_MS = 8000;
 
 // The token is minted by the Python backend, so its TS type can't be inferred
 // here. We cast through `unknown` to the hook's expected token type.
@@ -31,11 +37,13 @@ export function RealtimeResult({
   channel,
   topics,
   initialToken,
+  eventId,
   noun = "result",
 }: {
   channel: string;
   topics: string[];
   initialToken: RealtimeToken;
+  eventId: string;
   noun?: string;
 }) {
   const refreshToken = useMemo(
@@ -67,6 +75,28 @@ export function RealtimeResult({
   const progress = byTopic["progress"];
   const errTopic = byTopic["error"];
 
+  // A terminal realtime signal means we don't need the polling fallback.
+  const hasTerminal = result !== undefined || errTopic !== undefined;
+
+  // Arm a one-shot timer: if no terminal topic arrives in the window, the
+  // realtime publish was probably dropped. Reset whenever a terminal arrives.
+  const [timedOut, setTimedOut] = useState(false);
+  useEffect(() => {
+    if (hasTerminal) {
+      setTimedOut(false);
+      return;
+    }
+    const t = setTimeout(() => setTimedOut(true), FALLBACK_AFTER_MS);
+    return () => clearTimeout(t);
+  }, [hasTerminal]);
+
+  // Fall back to polling when the stream is silent-but-connected (timed out) or
+  // the subscription itself failed/closed before delivering a result.
+  const stateBroken =
+    state === InngestSubscriptionState.Error ||
+    state === InngestSubscriptionState.Closed;
+  const fallbackActive = !hasTerminal && (timedOut || stateBroken);
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -76,6 +106,7 @@ export function RealtimeResult({
         <Badge tone={stateTone(state)}>{state}</Badge>
         {result !== undefined && <Badge tone="ok">{noun} received</Badge>}
         {errTopic !== undefined && <Badge tone="err">error</Badge>}
+        {fallbackActive && <Badge tone="warn">realtime silent — polling</Badge>}
       </div>
 
       {error && (
@@ -103,6 +134,8 @@ export function RealtimeResult({
       <Section label={noun}>
         {result !== undefined ? (
           <JsonView value={result} />
+        ) : fallbackActive ? (
+          <PollingResult eventId={eventId} noun={noun} />
         ) : (
           <p className="text-sm text-muted-foreground">Waiting for the {noun}…</p>
         )}
