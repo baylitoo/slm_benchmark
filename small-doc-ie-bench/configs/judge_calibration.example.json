@@ -1,0 +1,12 @@
+{
+  "contract_version": 1,
+  "_readme": "Template for the judge<->human calibration set consumed by `benchmark compare --calibration`. Replace the placeholder records below with REAL data: `judge_*` are the LLM judge's recorded overall_faithfulness/overall_completeness for a document (from a prior `--eval-mode llm_judge` run), and `human_*` are a human reviewer's scores for the same document on the same 0-1 scale. The illustrative rows here are placeholders, not measured labels.",
+  "_caveat": "The gate requires >= 30 REAL labeled pairs per scored dimension (rows lacking both judge_/human_ scores for a dimension do not count), plus MAE within the threshold and a judge<->human correlation >= 0.3; otherwise the judge can only warn, never block. This example has too few rows on purpose.",
+  "judge_model": "REPLACE_WITH_JUDGE_MODEL_ID",
+  "records": [
+    {"doc_id": "invoice-001", "judge_faithfulness": 0.90, "human_faithfulness": 0.85, "judge_completeness": 0.80, "human_completeness": 0.75},
+    {"doc_id": "invoice-002", "judge_faithfulness": 0.70, "human_faithfulness": 0.80, "judge_completeness": 0.60, "human_completeness": 0.65},
+    {"doc_id": "invoice-003", "judge_faithfulness": 1.00, "human_faithfulness": 0.95, "judge_completeness": 0.90, "human_completeness": 0.90},
+    {"doc_id": "invoice-004", "judge_faithfulness": 0.55, "human_faithfulness": 0.50, "judge_completeness": 0.45, "human_completeness": 0.55}
+  ]
+}

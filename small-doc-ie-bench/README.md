@@ -152,6 +152,44 @@ Judge results are stored per prediction and aggregated as `judge_faithfulness` a
 compares aggregate judge faithfulness with labeled field accuracy. Judge failures are
 recorded as `judge_error` without changing extraction success.
 
+#### Judge calibration gate
+
+The judge is uncalibrated by default, so its scores must not silently block a release.
+`benchmark compare` only lets `judge_faithfulness` / `judge_completeness` budgets **fail**
+when a judge<->human calibration set proves the judge agrees with human labels; otherwise
+those budgets are downgraded to a non-blocking `warn`. Populate a calibration file (see
+`configs/judge_calibration.example.json`) with the judge's recorded scores paired with
+human scores on the same documents, then:
+
+```bash
+docie-bench benchmark judge-calibration configs/judge_calibration.json
+docie-bench benchmark compare baseline candidate \
+  --budgets configs/regression-budgets.yaml \
+  --calibration configs/judge_calibration.json
+```
+
+The gate certifies the judge only when **every** scored dimension
+(`faithfulness` and `completeness`) independently clears three bars: at least 30 **real
+labeled pairs** for that dimension (padded rows without both `judge_`/`human_` scores do
+not count), a mean absolute error within `--max-judge-mae` (default 0.15), and a
+judge<->human correlation of at least 0.3. Too few pairs is reported as
+`insufficient_calibration_samples`; a near-constant judge with undefined/zero-variance
+correlation is reported as `correlation_below_threshold`. Either way it can only warn,
+never block — the gate fails closed so an untrustworthy judge can never block a release.
+
+#### Reading `hallucination_rate` by ingestion path
+
+`hallucination_rate` is derived from evidence grounding against OCR text, so each profile
+summary is labelled with how to read it:
+
+- `hallucination_basis: consumed_ocr_text` (`hallucination_reflects_model: true`) — OCR
+  paths ground against the same text the model consumed, so an ungrounded field is a
+  plausible model signal.
+- `hallucination_basis: no_consumed_text` (`hallucination_reflects_model: false`) — **vision**
+  profiles consume page images and grounding runs with no consumed text, so the value is a
+  grounding artifact (near 1.0 by construction), **not** model hallucination. Segment by
+  `ingestion_path` before comparing across profiles.
+
 ### Reproducible and resumable runs
 
 Each benchmark run writes an immutable `manifest.json` with the git state, sanitized selected
