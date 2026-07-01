@@ -77,3 +77,7 @@ class ExtractionResponse(BaseModel):
     latency_ms: int
     dynamic_schema: dict[str, Any] | None = None
     routing: dict[str, Any] | None = None
+    # The response-format style the runtime actually honoured for this
+    # extraction (after any negotiation downgrade); distinguishes constrained
+    # from unconstrained decoding in predictions. None for non-LLM adapters.
+    response_format_style: str | None = None

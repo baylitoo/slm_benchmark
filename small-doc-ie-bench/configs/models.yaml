@@ -4,6 +4,24 @@
 # judge:
 #   profile: remote_openai_compatible
 profiles:
+  # DocIE Studio Playground default. Declares the strongest structured style;
+  # the serving negotiation ladder auto-downgrades openai_json_schema ->
+  # json_object -> none+repair per runtime, so the Playground returns valid JSON
+  # out-of-box even on small Ollama models that emit empty content for
+  # json_schema. capability_discovery=optional lets the probe prune the ladder
+  # when /models advertises support, but never blocks a run.
+  studio_default:
+    model: qwen3:4b
+    base_url: http://localhost:11434/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 300
+    prompt_profile: strict_extraction_v1
+    capability_discovery: optional
+
   local_llamacpp:
     model: local-model
     base_url: http://llm-llamacpp:8000/v1

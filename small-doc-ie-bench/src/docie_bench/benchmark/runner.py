@@ -11,7 +11,13 @@ from typing import Any
 
 from docie_bench.benchmark.dataset import DatasetItem
 from docie_bench.benchmark.judge import EvaluationMode, judge_extraction
-from docie_bench.benchmark.metrics import score_evidence, score_prediction
+from docie_bench.benchmark.metrics import (
+    ValidityGateError,
+    evaluate_constrained_gate,
+    evaluate_validity_gate,
+    score_evidence,
+    score_prediction,
+)
 from docie_bench.benchmark.registry import DEFAULT_REGISTRY_PATH, resolve_dataset
 from docie_bench.benchmark.report import write_report
 from docie_bench.benchmark.reproducibility import (
@@ -120,6 +126,9 @@ async def run_benchmark(
     split: str | None = None,
     resume: bool = False,
     routing_policy_path: Path | None = None,
+    probe: bool = False,
+    valid_rate_threshold: float | None = None,
+    constrained_rate_threshold: float | None = None,
 ) -> BenchmarkResult:
     settings = get_settings()
     if resume and output_dir is None:
@@ -222,6 +231,15 @@ async def run_benchmark(
             "Benchmark task identity collision; dataset rows must be uniquely identified"
         )
 
+    # Capability probe (opt-in). Kept OUT of `inputs` because it records observed
+    # runtime behaviour, not a run input — folding it into input_fingerprint would
+    # make resume non-deterministic. Best-effort: a probe never fails the run.
+    capability_probes: dict[str, Any] = {"enabled": probe}
+    if probe:
+        from docie_bench.llm.capability_probe import run_capability_probes
+
+        capability_probes["results"] = await run_capability_probes(selected_profiles)
+
     git = git_snapshot(Path(__file__).resolve().parents[3])
     inputs = {
         "git": git,
@@ -254,6 +272,7 @@ async def run_benchmark(
         "created_at": utc_now(),
         "input_fingerprint": stable_hash(inputs),
         "inputs": inputs,
+        "capability_probes": capability_probes,
         "invocation": {
             "dataset_path": str(dataset_path) if dataset_path is not None else None,
             "document_path": str(document_path.resolve()) if document_path else None,
@@ -388,6 +407,13 @@ async def run_benchmark(
                     "dynamic_schema": response.dynamic_schema,
                     "model_profile": label,
                     "ingestion_path": ingestion_path,
+                    "response_format_style": getattr(response, "response_format_style", None),
+                    # The style the profile *requested* (None under routing, which
+                    # selects styles internally), so the summary can tell an
+                    # honoured constrained decode apart from a silent downgrade.
+                    "declared_response_format_style": (
+                        None if routing_active else profile.response_format_style
+                    ),
                     "ok": True,
                     "latency_ms": response.latency_ms,
                     "validation": response.validation.model_dump(),
@@ -475,6 +501,38 @@ async def run_benchmark(
         eval_mode=eval_mode,
     )
     metrics["dataset"] = dataset_metadata
+    threshold = (
+        valid_rate_threshold
+        if valid_rate_threshold is not None
+        else getattr(settings, "valid_rate_threshold", 0.0)
+    )
+    gate_failures = evaluate_validity_gate(metrics["summary"], threshold)
+    constrained_threshold = (
+        constrained_rate_threshold
+        if constrained_rate_threshold is not None
+        else getattr(settings, "constrained_rate_threshold", 0.0)
+    )
+    # Report-only: the constrained-downgrade view makes the constrained->
+    # unconstrained collapse visible even when post-repair valid_rate stays high,
+    # but never fails a run by default (keeps existing runs backward-compatible).
+    constrained_downgrades = evaluate_constrained_gate(metrics["summary"], constrained_threshold)
+    metrics["validity_gate"] = {
+        "threshold": threshold,
+        "passed": not gate_failures,
+        "failing_profiles": [
+            {"model_profile": row["model_profile"], "valid_rate": row.get("valid_rate")}
+            for row in gate_failures
+        ],
+        "constrained_rate_threshold": constrained_threshold,
+        "constrained_downgrade_profiles": [
+            {
+                "model_profile": row["model_profile"],
+                "constrained_rate": row.get("constrained_rate"),
+                "valid_rate": row.get("valid_rate"),
+            }
+            for row in constrained_downgrades
+        ],
+    }
     metrics["reproducibility"] = {
         "resumed": resume,
         "tasks_skipped": len(completed_task_ids),
@@ -487,6 +545,15 @@ async def run_benchmark(
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, default=str), encoding="utf-8")
     report_path = write_report(run_dir, metrics)
+    # Fail loudly AFTER persisting metrics/report so the failure is debuggable.
+    if gate_failures:
+        raise ValidityGateError(
+            threshold,
+            [
+                {"model_profile": row["model_profile"], "valid_rate": row.get("valid_rate")}
+                for row in gate_failures
+            ],
+        )
     return BenchmarkResult(run_dir, predictions_path, metrics_path, report_path, manifest_path)
 
 
@@ -534,6 +601,7 @@ def summarize(
             round(sum(faithfulness) / len(faithfulness), 4) if faithfulness else None
         )
         n = len(profile_rows)
+        effective_style_distribution, constrained_rate = _constrained_style_stats(ok_rows)
         routed_rows = [r["routing"] for r in profile_rows if r.get("routing")]
         routed_n = len(routed_rows)
         routed_stages = [stage for route in routed_rows for stage in route.get("stages", [])]
@@ -549,6 +617,13 @@ def summarize(
                 ),
                 "ok_rate": len(ok_rows) / n if n else 0,
                 "valid_rate": len(valid_rows) / n if n else 0,
+                # Fraction of LLM-decoded rows whose effective response-format
+                # style matched the requested one (i.e. NOT silently downgraded
+                # to a weaker rung or none+repair). Post-repair valid_rate can
+                # stay 1.0 while this collapses to ~0 — that gap is the exact
+                # constrained->unconstrained downgrade PR-1 exists to surface.
+                "constrained_rate": constrained_rate,
+                "effective_style_distribution": effective_style_distribution,
                 "field_accuracy": field_accuracy,
                 "row_precision": row_precision,
                 "row_recall": row_recall,
@@ -642,6 +717,40 @@ def summarize(
         "concurrency": concurrency,
         "eval_mode": eval_mode.value,
     }
+
+
+def _constrained_style_stats(
+    ok_rows: list[dict[str, Any]],
+) -> tuple[dict[str, int], float | None]:
+    """Aggregate the per-row effective response-format style for one profile.
+
+    Returns ``(effective_style_distribution, constrained_rate)``:
+
+    - ``effective_style_distribution``: how many LLM-decoded rows landed on each
+      effective style (rows without a recorded style — OCR/pipeline adapters —
+      are excluded).
+    - ``constrained_rate``: fraction of those rows whose effective style equals
+      the requested (declared) style, i.e. the request was honoured rather than
+      silently downgraded. Rows without a declared style (routing selects styles
+      internally) are excluded from the denominator; ``None`` when no comparable
+      row exists.
+    """
+    distribution: dict[str, int] = {}
+    honoured = 0
+    comparable = 0
+    for row in ok_rows:
+        effective = row.get("response_format_style")
+        if effective is None:
+            continue
+        distribution[effective] = distribution.get(effective, 0) + 1
+        declared = row.get("declared_response_format_style")
+        if declared is None:
+            continue
+        comparable += 1
+        if str(effective).lower().strip() == str(declared).lower().strip():
+            honoured += 1
+    constrained_rate = honoured / comparable if comparable else None
+    return distribution, constrained_rate
 
 
 def _percentile(values: list[float], pct: int) -> float:

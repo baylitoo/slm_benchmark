@@ -46,8 +46,19 @@ class Settings(BaseSettings):
     annotation_export_dir: Path = Path("annotations")
 
     default_schema_name: str = "invoice"
-    default_model_profile: str = "local_llamacpp"
+    # Studio-friendly default: strongest structured style declared, with the
+    # serving negotiation ladder auto-downgrading per runtime so the Playground
+    # returns valid JSON out-of-box even on small models.
+    default_model_profile: str = "studio_default"
     default_ocr_backend: str = "pdf_text"
+    # Validity gate: fail a benchmark run loudly when a profile's valid_rate is
+    # below this threshold instead of silently scoring zeros. 0.0 disables it.
+    valid_rate_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Constrained-decode downgrade view: flag (report-only) a profile whose
+    # constrained_rate — the fraction of rows decoded with the requested strong
+    # style rather than silently downgraded — is below this threshold. 0.0
+    # disables it; unlike valid_rate_threshold it never fails a run.
+    constrained_rate_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
     ocr_cache_dir: Path = Path(".cache/ocr")
     ocr_cache_max_mb: int = Field(default=2048, ge=0)
     ocr_cache_enabled: bool = True
