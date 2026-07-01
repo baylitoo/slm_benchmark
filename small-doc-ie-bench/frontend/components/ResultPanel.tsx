@@ -59,6 +59,7 @@ export function ResultPanel({
         channel={trigger.channel}
         topics={trigger.topics}
         initialToken={mode.token}
+        eventId={trigger.event_ids[0]}
         noun={noun}
       />
     );
