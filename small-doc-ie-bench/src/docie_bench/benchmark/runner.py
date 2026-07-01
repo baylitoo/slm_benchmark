@@ -11,7 +11,12 @@ from typing import Any
 
 from docie_bench.benchmark.dataset import DatasetItem
 from docie_bench.benchmark.judge import EvaluationMode, judge_extraction
-from docie_bench.benchmark.metrics import score_evidence, score_prediction
+from docie_bench.benchmark.metrics import (
+    ValidityGateError,
+    evaluate_validity_gate,
+    score_evidence,
+    score_prediction,
+)
 from docie_bench.benchmark.registry import DEFAULT_REGISTRY_PATH, resolve_dataset
 from docie_bench.benchmark.report import write_report
 from docie_bench.benchmark.reproducibility import (
@@ -120,6 +125,8 @@ async def run_benchmark(
     split: str | None = None,
     resume: bool = False,
     routing_policy_path: Path | None = None,
+    probe: bool = False,
+    valid_rate_threshold: float | None = None,
 ) -> BenchmarkResult:
     settings = get_settings()
     if resume and output_dir is None:
@@ -222,6 +229,15 @@ async def run_benchmark(
             "Benchmark task identity collision; dataset rows must be uniquely identified"
         )
 
+    # Capability probe (opt-in). Kept OUT of `inputs` because it records observed
+    # runtime behaviour, not a run input — folding it into input_fingerprint would
+    # make resume non-deterministic. Best-effort: a probe never fails the run.
+    capability_probes: dict[str, Any] = {"enabled": probe}
+    if probe:
+        from docie_bench.llm.capability_probe import run_capability_probes
+
+        capability_probes["results"] = await run_capability_probes(selected_profiles)
+
     git = git_snapshot(Path(__file__).resolve().parents[3])
     inputs = {
         "git": git,
@@ -254,6 +270,7 @@ async def run_benchmark(
         "created_at": utc_now(),
         "input_fingerprint": stable_hash(inputs),
         "inputs": inputs,
+        "capability_probes": capability_probes,
         "invocation": {
             "dataset_path": str(dataset_path) if dataset_path is not None else None,
             "document_path": str(document_path.resolve()) if document_path else None,
@@ -388,6 +405,7 @@ async def run_benchmark(
                     "dynamic_schema": response.dynamic_schema,
                     "model_profile": label,
                     "ingestion_path": ingestion_path,
+                    "response_format_style": getattr(response, "response_format_style", None),
                     "ok": True,
                     "latency_ms": response.latency_ms,
                     "validation": response.validation.model_dump(),
@@ -475,6 +493,20 @@ async def run_benchmark(
         eval_mode=eval_mode,
     )
     metrics["dataset"] = dataset_metadata
+    threshold = (
+        valid_rate_threshold
+        if valid_rate_threshold is not None
+        else getattr(settings, "valid_rate_threshold", 0.0)
+    )
+    gate_failures = evaluate_validity_gate(metrics["summary"], threshold)
+    metrics["validity_gate"] = {
+        "threshold": threshold,
+        "passed": not gate_failures,
+        "failing_profiles": [
+            {"model_profile": row["model_profile"], "valid_rate": row.get("valid_rate")}
+            for row in gate_failures
+        ],
+    }
     metrics["reproducibility"] = {
         "resumed": resume,
         "tasks_skipped": len(completed_task_ids),
@@ -487,6 +519,15 @@ async def run_benchmark(
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, default=str), encoding="utf-8")
     report_path = write_report(run_dir, metrics)
+    # Fail loudly AFTER persisting metrics/report so the failure is debuggable.
+    if gate_failures:
+        raise ValidityGateError(
+            threshold,
+            [
+                {"model_profile": row["model_profile"], "valid_rate": row.get("valid_rate")}
+                for row in gate_failures
+            ],
+        )
     return BenchmarkResult(run_dir, predictions_path, metrics_path, report_path, manifest_path)
 
 

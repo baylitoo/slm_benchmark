@@ -405,6 +405,7 @@ class ExtractionService:
                 schema=schema,
                 image_urls=[image.data_url() for image in images] if images else None,
             )
+            effective_style = getattr(client, "last_response_format_style", None)
         finally:
             await client.aclose()
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
@@ -445,6 +446,7 @@ class ExtractionService:
                 if dynamic_spec
                 else None
             ),
+            response_format_style=effective_style,
         )
 
     async def _propose_schema(

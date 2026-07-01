@@ -78,6 +78,20 @@ def benchmark_run(
     repeat: int = typer.Option(1, min=1, help="Repeat the dataset N times (useful for stress testing)"),
     split: str | None = typer.Option(None, help="Run only this dataset split"),
     resume: bool = typer.Option(False, help="Resume an interrupted run (requires --output-dir)"),
+    probe: bool = typer.Option(
+        True,
+        "--probe/--no-probe",
+        help="Probe each endpoint's honoured response-format styles before the run "
+        "(GET /models + one cheap canary) and record them in the manifest. "
+        "--no-probe skips the canary and relies on runtime downgrade only.",
+    ),
+    valid_rate_threshold: float | None = typer.Option(
+        None,
+        min=0.0,
+        max=1.0,
+        help="Fail the run if any profile's valid_rate is below this threshold "
+        "(defaults to VALID_RATE_THRESHOLD setting; 0 disables the gate).",
+    ),
     log_level: str = typer.Option("INFO", help="Logging level (DEBUG shows full prompts and LLM output)"),
 ) -> None:
     if (dataset is None) == (document is None):
@@ -106,6 +120,8 @@ def benchmark_run(
             split=split,
             resume=resume,
             routing_policy_path=routing_policy,
+            probe=probe,
+            valid_rate_threshold=valid_rate_threshold,
         )
     )
     print(f"[green]Benchmark complete[/green]: {result.run_dir}")

@@ -15,6 +15,46 @@ class MetricConfig:
     numeric_absolute_tolerance: float = 0.01
 
 
+class ValidityGateError(RuntimeError):
+    """Raised when a profile's valid_rate falls below the configured threshold.
+
+    A run that silently scores zeros because every extraction was invalid (e.g.
+    the empty-content defect) is a false negative; the gate turns it into a loud,
+    actionable failure instead.
+    """
+
+    def __init__(self, threshold: float, failures: list[dict[str, Any]]) -> None:
+        self.threshold = threshold
+        self.failures = failures
+        detail = ", ".join(
+            f"{item['model_profile']} valid_rate={item['valid_rate']:.3f}" for item in failures
+        )
+        super().__init__(
+            f"Validity gate failed: {len(failures)} profile(s) below valid_rate "
+            f"threshold {threshold:.3f} ({detail})"
+        )
+
+
+def evaluate_validity_gate(
+    summary_rows: list[dict[str, Any]], threshold: float
+) -> list[dict[str, Any]]:
+    """Return the summary rows whose ``valid_rate`` is below ``threshold``.
+
+    A non-positive threshold disables the gate (returns ``[]``). Rows without a
+    numeric ``valid_rate`` are skipped rather than treated as failures.
+    """
+    if threshold <= 0:
+        return []
+    failures: list[dict[str, Any]] = []
+    for row in summary_rows:
+        valid_rate = row.get("valid_rate")
+        if not isinstance(valid_rate, (int, float)):
+            continue
+        if valid_rate < threshold:
+            failures.append(row)
+    return failures
+
+
 def get_path(payload: dict[str, Any], dotted_path: str) -> Any:
     current: Any = payload
     for part in dotted_path.split("."):

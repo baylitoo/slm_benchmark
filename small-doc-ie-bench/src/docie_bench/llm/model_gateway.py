@@ -102,8 +102,16 @@ _STATES: dict[tuple[str, str], _GatewayState] = {}
 
 
 def reset_gateway_state() -> None:
-    """Clear shared scheduler/circuit state. Intended for tests and process reconfiguration."""
+    """Clear shared scheduler/circuit and capability-probe state.
+
+    Intended for tests and process reconfiguration; clearing the probe cache here
+    keeps the single reset hook honest so a stale probe cannot leak across tests
+    that reuse the same endpoint (that is exactly the empty-content failure mode).
+    """
+    from docie_bench.llm.capability_probe import reset_probe_cache
+
     _STATES.clear()
+    reset_probe_cache()
 
 
 def _state_for(profile: ModelProfile) -> _GatewayState:
