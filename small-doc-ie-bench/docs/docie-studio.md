@@ -67,8 +67,9 @@ Then open:
    deploy action. *(Backend `/v1/serving/*` + `model/deploy.requested` in
    progress; the UI degrades gracefully until they land.)*
 3. **Benchmark** — trigger a dataset benchmark run and view metrics. Trigger is
-   wired (`POST /v1/studio/benchmark`); the results list depends on
-   `/v1/serving/benchmarks`.
+   wired (`POST /v1/studio/benchmark`); the results list (`GET /v1/studio/runs`)
+   renders the metrics table and links each run's downloadable artifacts
+   (`report.html` / `predictions.jsonl` / `metrics.json`) from the durable store.
 4. **Observability** — embeds Grafana (`:3001`) and links the Inngest dashboard
    and raw Prometheus metrics (`/metrics`).
 
@@ -79,11 +80,67 @@ Then open:
 | POST | `/v1/studio/extract` | fire `doc/extract.requested`; returns `{event_ids, channel, topics}` |
 | POST | `/v1/studio/benchmark` | fire `benchmark/run.requested` (needs `dataset`) |
 | GET | `/v1/studio/realtime-token?channel=&topics=` | mint a realtime subscription token (501 if unavailable) |
-| GET | `/v1/studio/runs/{event_id}` | polling fallback: proxy Inngest run status |
+| GET | `/v1/studio/runs/{event_id}` | durable benchmark record (metrics + artifact URIs), else proxy Inngest run status |
+| GET | `/v1/studio/runs?limit=` | list this tenant's durable benchmark runs |
+| GET | `/v1/studio/artifacts/{id}` | download a run artifact (`report.html` / `predictions.jsonl` / `metrics.json`) |
 
 Events carry JSON; documents travel as `content_b64` (base64 bytes) or raw
 `text`. Functions publish best-effort realtime topics (`status`, `progress`,
 `result`, `error`) on the per-request `channel`.
+
+## Durable run + artifact store
+
+A benchmark job runs on the **worker**, whose local filesystem the `api`/`web`
+replicas cannot read. So a run's results are made *addressable* rather than
+returned as worker-local paths:
+
+- **Blob store** (`ArtifactBlobStore`) — a content-addressed directory on the
+  shared `artifact-store` volume (`ARTIFACT_STORE_DIR`, default `/app/artifacts`;
+  swap for an S3/MinIO mount). The worker writes `report.html`,
+  `predictions.jsonl` and `metrics.json` here; the api reads them back by id.
+- **Run index** (`studio_runs` / `studio_run_artifacts` in Postgres) — one row
+  per run keyed by the Inngest `event_id`, holding `{status, metrics summary,
+  artifact URIs, tenant_id}`. The **large `predictions.jsonl` never lands in
+  Postgres** — only the small metrics summary does; the bulk bytes live in the
+  blob store.
+
+`GET /v1/studio/runs/{event_id}` resolves the durable record; each artifact
+carries an addressable `uri` (`/v1/studio/artifacts/{id}`) that
+`GET /v1/studio/artifacts/{id}` streams from `artifact_id → DB row → blob store`
+— **no path travels in the payload**, which is what makes a run produced by one
+worker replica downloadable from the api replica.
+
+### Auth (extends commit d2e62eb)
+
+The whole `/v1/studio` router requires a valid API key (fail-closed). On top of
+that, `tenant_id` is bound to the **authenticated principal at trigger time**
+(never a client body field) and stored on the run row. Downloads and listing are
+filtered by that stored `tenant_id`; a cross-tenant id returns **404** (not 403)
+so a run's existence is never confirmed. Because the owner is the *stored*
+principal, a forged `tenant_id` in a direct Inngest event can only mis-file the
+attacker's own run — it can never read a victim's.
+
+### Idempotency (double-fire ≠ double-run)
+
+Each benchmark event carries an `idempotency_key` (client-supplied, or derived
+from the run-defining fields). The worker **claims the run row before doing any
+work**: a redelivery (same `event_id`) or a duplicate trigger (same
+`idempotency_key`) short-circuits to the existing record instead of running the
+benchmark twice. The function also declares Inngest-native
+`idempotency="event.data.idempotency_key"` for platform-level dedup over 24h.
+Pass a distinct `idempotency_key` (e.g. a nonce) to force a fresh run of an
+identical request.
+
+### Retention / GC
+
+`gc_studio_runs_job` (Inngest cron, `0 3 * * *`) applies a bounded retention
+policy so runs cannot accumulate forever: it deletes runs older than
+`STUDIO_RUN_RETENTION_DAYS` (default 30) or beyond the newest
+`STUDIO_RUN_RETENTION_MAX` (default 500), then prunes any blob no surviving run
+still references (blobs are content-addressed, so a blob shared by a retained run
+is kept). The policy is a plain `RunStore.gc()` callable — the cron just invokes
+it — and is covered by unit tests. Run it out-of-band with
+`docie_bench.studio.store.default_run_store().gc(max_age_days=..., max_runs=...)`.
 
 ## Local dev loop (no Docker)
 

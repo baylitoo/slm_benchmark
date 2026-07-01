@@ -64,6 +64,22 @@ class Settings(BaseSettings):
     ocr_cache_enabled: bool = True
     runs_dir: Path = Path("runs")
 
+    # Durable, addressable artifact store for Studio benchmark runs. Must resolve
+    # to the SAME location on every replica that reads it (a shared volume or an
+    # S3/MinIO mount) — the worker writes here and the api/web replicas read back
+    # by artifact id, never by a worker-local path. Metrics summaries live in
+    # Postgres (small); report.html / predictions.jsonl live only in this store.
+    artifact_store_dir: Path = Path("artifacts")
+    # Retention/GC for the Studio run index (see docie_bench.studio.store.RunStore.gc
+    # and docs/docie-studio.md). Age wins first, then a hard cap on run count.
+    studio_run_retention_days: int = Field(default=30, ge=1, le=3650)
+    studio_run_retention_max: int = Field(default=500, ge=1, le=1_000_000)
+    # Grace window for the orphan-blob mark-and-sweep: a blob physically present
+    # in the store but referenced by no artifact row is only reclaimed once it is
+    # older than this, so a blob an in-flight job just ``put()`` (before its run
+    # ``complete()``-commits the artifact row) is never swept out from under it.
+    studio_orphan_grace_hours: int = Field(default=24, ge=0, le=8760)
+
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
     openai_compat_model: str = "local-model"
