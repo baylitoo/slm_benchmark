@@ -79,4 +79,22 @@ class StudioRunArtifact(Base):
     run: Mapped[StudioRun] = relationship(back_populates="artifacts")
 
 
-__all__ = ["StudioRun", "StudioRunArtifact", "utcnow"]
+class StudioEventOwner(Base):
+    """Lightweight event id -> triggering principal binding.
+
+    Recorded for every triggered job (benchmark *and* extraction), so the
+    run-status route can reject a cross-tenant event id instead of proxying it
+    from the tenant-agnostic Inngest server. Extraction runs have no
+    ``StudioRun`` row, so this is the only ownership signal available for them.
+    """
+
+    __tablename__ = "studio_event_owners"
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+__all__ = ["StudioEventOwner", "StudioRun", "StudioRunArtifact", "utcnow"]

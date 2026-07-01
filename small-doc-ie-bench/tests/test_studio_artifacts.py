@@ -369,3 +369,230 @@ def test_blob_store_rejects_path_traversal_keys(tmp_path: Path) -> None:
         blobs.path_for("../../etc/passwd")
     with pytest.raises(ValueError, match="plain file name"):
         blobs.put(name="../evil.html", content=b"x")
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: a DB row whose blob is gone resolves to 404, never a 500
+# ---------------------------------------------------------------------------
+
+
+def test_open_artifact_with_missing_blob_returns_none(tmp_path: Path) -> None:
+    import shutil
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    art_id = _seed_owned_run(store, tenant="t1", body=b"<html>x</html>")
+    # GC/backup skew or a future object-store backend: the row survives, the blob
+    # file is gone. This must not raise FileNotFoundError out of open_artifact.
+    shutil.rmtree(tmp_path / "b")
+    assert store.open_artifact(art_id, tenant_id="t1") is None
+
+
+def test_download_with_missing_blob_is_404_not_500(tmp_path: Path, monkeypatch) -> None:
+    import shutil
+
+    from docie_bench import security
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    art_id = _seed_owned_run(store, tenant="tenant-a", body=b"<html>secret</html>")
+    shutil.rmtree(tmp_path / "b")  # blob gone, row remains
+    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+
+    manager = TenantQuotaManager(
+        api_keys={"secret-a": "tenant-a"},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=10,
+    )
+    monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
+    client = TestClient(api.app)
+
+    resp = client.get(f"/v1/studio/artifacts/{art_id}", headers={"X-API-Key": "secret-a"})
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: a superseded retry reclaims its orphan blobs (content-addressing kept)
+# ---------------------------------------------------------------------------
+
+
+def test_retry_reclaims_orphan_blob_but_keeps_shared_content(tmp_path: Path) -> None:
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+
+    # First attempt: a unique report + a shared, content-addressed metrics blob.
+    store.claim(event_id="ev1", idempotency_key="k1", tenant_id="t")
+    report_v1 = store.blobs.put(name="report.html", content=b"<v1/>", media_type="text/html")
+    shared = store.blobs.put(name="metrics.json", content=b'{"m":1}', media_type="application/json")
+    store.complete(
+        event_id="ev1",
+        metrics={},
+        artifacts=[("report.html", report_v1), ("metrics.json", shared)],
+    )
+
+    # A DIFFERENT run references the SAME metrics blob (identical content dedups).
+    store.claim(event_id="ev2", idempotency_key="k2", tenant_id="t")
+    shared2 = store.blobs.put(
+        name="metrics.json", content=b'{"m":1}', media_type="application/json"
+    )
+    assert shared2.relkey == shared.relkey
+    store.complete(event_id="ev2", metrics={}, artifacts=[("metrics.json", shared2)])
+
+    # Retry of ev1 supersedes report v1 with v2, orphaning v1's blob.
+    report_v2 = store.blobs.put(name="report.html", content=b"<v2/>", media_type="text/html")
+    store.complete(
+        event_id="ev1",
+        metrics={},
+        artifacts=[("report.html", report_v2), ("metrics.json", shared)],
+    )
+
+    assert not store.blobs.exists(report_v1.relkey)  # orphan reclaimed on retry
+    assert store.blobs.exists(report_v2.relkey)  # new content retained
+    assert store.blobs.exists(shared.relkey)  # still referenced by ev1 + ev2
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: the run-status proxy is tenant-scoped for extraction runs too
+# ---------------------------------------------------------------------------
+
+
+class _FakeResp:
+    status_code = 200
+    text = ""
+
+    def json(self):
+        return [{"status": "Completed"}]
+
+
+class _FakeAsyncClient:
+    def __init__(self, *_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+        pass
+
+    async def __aenter__(self) -> _FakeAsyncClient:
+        return self
+
+    async def __aexit__(self, *_args) -> bool:  # noqa: ANN002
+        return False
+
+    async def get(self, _url: str, headers: dict | None = None) -> _FakeResp:
+        return _FakeResp()
+
+
+def test_event_runs_proxy_is_tenant_scoped_for_extraction(tmp_path: Path, monkeypatch) -> None:
+    from docie_bench import security
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    # Extraction run: only an ownership row exists (no durable StudioRun).
+    store.record_event_owner(event_id="evx", tenant_id="tenant-a")
+    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api.httpx, "AsyncClient", _FakeAsyncClient)
+
+    manager = TenantQuotaManager(
+        api_keys={"secret-a": "tenant-a", "secret-b": "tenant-b"},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=10,
+    )
+    monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
+    client = TestClient(api.app)
+
+    # Cross-tenant id -> 404, never proxied (this is the leak the finding closes).
+    assert client.get("/v1/studio/runs/evx", headers={"X-API-Key": "secret-b"}).status_code == 404
+    # Unknown id with no recorded owner -> 404 (no unscoped proxy fallthrough).
+    assert (
+        client.get("/v1/studio/runs/unknown", headers={"X-API-Key": "secret-a"}).status_code == 404
+    )
+    # The legitimate owner still gets the proxied run status unchanged.
+    owned = client.get("/v1/studio/runs/evx", headers={"X-API-Key": "secret-a"})
+    assert owned.status_code == 200
+    assert owned.json() == [{"status": "Completed"}]
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: a terminally-failed run is re-runnable (key rotates); duplicates dedup
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_failure_rotates_key_while_success_still_dedups(tmp_path: Path) -> None:
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    base = "tenant-a:bench-abc"
+
+    # No prior run -> emit the base key.
+    assert store.effective_idempotency_key(base) == base
+
+    # In-flight run -> a duplicate dedups to the same key.
+    store.claim(event_id="ev1", idempotency_key=base, tenant_id="tenant-a")
+    assert store.effective_idempotency_key(base) == base
+
+    # Terminal failure -> rotate so a re-request is not locked out for the window.
+    store.fail(event_id="ev1", error="model outage")
+    rotated = store.effective_idempotency_key(base)
+    assert rotated != base
+    assert rotated.startswith(base)
+
+    # The rotated run then succeeds -> duplicates dedup to it (no further rotation).
+    store.claim(event_id="ev2", idempotency_key=rotated, tenant_id="tenant-a")
+    store.complete(event_id="ev2", metrics={}, artifacts=[])
+    assert store.effective_idempotency_key(base) == rotated
+
+
+def test_effective_key_does_not_over_match_sibling_client_keys(tmp_path: Path) -> None:
+    """A client-supplied key must not pull an unrelated key sharing its prefix.
+
+    ``base`` terminally failed, but ``base + "bar"`` (a different request) is
+    still running; resolving ``base`` must rotate off ``base`` — never dedup into
+    the sibling run.
+    """
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    base = "tenant-a:foo"
+
+    store.claim(event_id="ev1", idempotency_key=base, tenant_id="tenant-a")
+    store.fail(event_id="ev1", error="boom")
+    store.claim(event_id="ev2", idempotency_key=base + "bar", tenant_id="tenant-a")
+
+    resolved = store.effective_idempotency_key(base)
+    assert resolved != base + "bar"
+    assert resolved.startswith(base + ":r")
+
+
+def test_benchmark_trigger_rotates_key_after_terminal_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from docie_bench import security
+    from docie_bench.inngest.client import inngest_client
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+
+    captured: list[dict] = []
+
+    async def fake_send(event):
+        captured.append(dict(event.data))
+        return [f"ev-{len(captured)}"]
+
+    monkeypatch.setattr(inngest_client, "send", fake_send)
+    manager = TenantQuotaManager(
+        api_keys={"secret-a": "tenant-a"},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=10,
+    )
+    monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
+    client = TestClient(api.app)
+
+    body = {"dataset": "invoices"}
+    first = client.post("/v1/studio/benchmark", json=body, headers={"X-API-Key": "secret-a"})
+    assert first.status_code == 200
+    key1 = captured[0]["idempotency_key"]
+
+    # Simulate the worker running that key and terminally failing (retries exhausted).
+    store.claim(event_id="ev-1", idempotency_key=key1, tenant_id="tenant-a", dataset="invoices")
+    store.fail(event_id="ev-1", error="model outage")
+
+    # An identical re-request now emits a DIFFERENT key so it actually re-runs.
+    second = client.post("/v1/studio/benchmark", json=body, headers={"X-API-Key": "secret-a"})
+    assert second.status_code == 200
+    key2 = captured[1]["idempotency_key"]
+    assert key2 != key1
+    assert key2.startswith(key1)

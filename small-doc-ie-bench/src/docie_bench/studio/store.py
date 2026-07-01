@@ -26,13 +26,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from docie_bench.settings import get_settings
 from docie_bench.storage.db import get_session_factory
-from docie_bench.studio.models import StudioRun, StudioRunArtifact
+from docie_bench.studio.models import StudioEventOwner, StudioRun, StudioRunArtifact
 
 logger = logging.getLogger("docie_bench.studio.store")
 
@@ -231,6 +231,7 @@ class RunStore:
         metrics: dict[str, Any] | None,
         artifacts: Sequence[tuple[str, StoredBlob]],
     ) -> dict[str, Any]:
+        orphans: set[str] = set()
         with self._session() as session:
             run = session.get(StudioRun, event_id)
             if run is None:  # pragma: no cover - complete always follows claim
@@ -239,6 +240,7 @@ class RunStore:
             run.metrics_json = metrics
             run.error_text = None
             # Replace any partial artifacts from a prior attempt.
+            prior_relkeys = {a.relkey for a in run.artifacts}
             run.artifacts.clear()
             session.flush()
             for name, blob in artifacts:
@@ -254,7 +256,25 @@ class RunStore:
                     )
                 )
             session.flush()
-            return _run_to_dict(run)
+            record = _run_to_dict(run)
+            # A retry (or a superseded/crashed prior attempt) leaves blobs behind
+            # that the new artifact set no longer references. A blob is content-
+            # addressed, so it is safe to reclaim only if NO surviving artifact row
+            # — across every run, not just this one — still points at it.
+            if prior_relkeys:
+                still_referenced = set(
+                    session.scalars(
+                        select(StudioRunArtifact.relkey).where(
+                            StudioRunArtifact.relkey.in_(prior_relkeys)
+                        )
+                    ).all()
+                )
+                orphans = prior_relkeys - still_referenced
+        # Delete blobs only AFTER the transaction commits, so a rollback can never
+        # strand a delete of a still-referenced blob (mirrors ``gc()``).
+        for relkey in orphans:
+            self.blobs.delete(relkey)
+        return record
 
     def fail(self, *, event_id: str, error: str) -> dict[str, Any] | None:
         with self._session() as session:
@@ -276,15 +296,72 @@ class RunStore:
             return _run_to_dict(run)
 
     def run_owner(self, event_id: str) -> str | None:
-        """Owning tenant of a run, or ``None`` if no durable row exists.
+        """Owning tenant of an event, or ``None`` if no ownership is recorded.
 
-        Lets the run-status route distinguish "not a benchmark run" (fall through
-        to the Inngest proxy) from "someone else's run" (404) — so a cross-tenant
-        id can never be answered by the unauthenticated proxy path.
+        Consults the durable benchmark run first, then the lightweight event-owner
+        index (extraction runs have no ``StudioRun`` row but are still recorded at
+        trigger time). Lets the run-status route reject a cross-tenant id (404)
+        instead of answering it from the tenant-agnostic Inngest proxy.
         """
         with self._session() as session:
             run = session.get(StudioRun, event_id)
-            return run.tenant_id if run is not None else None
+            if run is not None:
+                return run.tenant_id
+            owner = session.get(StudioEventOwner, event_id)
+            return owner.tenant_id if owner is not None else None
+
+    def record_event_owner(self, *, event_id: str, tenant_id: str) -> None:
+        """Bind an event id to its triggering principal (idempotent).
+
+        Recorded for *every* triggered job — including extraction runs that have no
+        ``StudioRun`` row — so the run-status proxy can be tenant-scoped rather than
+        leaking any event id's status/output to any authenticated caller.
+        """
+        with self._session() as session:
+            if session.get(StudioEventOwner, event_id) is not None:
+                return
+            session.add(
+                StudioEventOwner(event_id=event_id, tenant_id=tenant_id or "anonymous")
+            )
+            try:
+                session.flush()
+            except IntegrityError:
+                # A concurrent trigger already recorded this owner; nothing to do.
+                session.rollback()
+
+    def effective_idempotency_key(self, base_key: str) -> str:
+        """Resolve the dedup key to emit for a fresh benchmark trigger.
+
+        A genuine duplicate of an in-flight or completed run resolves to that run's
+        key so both the platform dedup and the durable claim collapse it. But once
+        the run for ``base_key`` has *terminally failed*, rotate to a fresh key so a
+        legitimate re-request runs again instead of being locked out for the dedup
+        window. The rotation index is the family size, so repeated failures keep
+        rotating and two concurrent post-failure retries derive the same key.
+        """
+        if self._sessions is None:
+            return base_key
+        with self._session() as session:
+            # Match the family exactly: the base key itself or a rotation suffix
+            # (``:r<n>``). A plain ``startswith(base_key)`` would over-match a
+            # *client-supplied* sibling key (``foo`` vs ``foobar``) and misattribute
+            # a re-request into an unrelated run.
+            family = session.scalars(
+                select(StudioRun)
+                .where(
+                    or_(
+                        StudioRun.idempotency_key == base_key,
+                        StudioRun.idempotency_key.startswith(base_key + ":r", autoescape=True),
+                    )
+                )
+                .order_by(StudioRun.created_at.desc(), StudioRun.event_id.desc())
+            ).all()
+            if not family:
+                return base_key
+            head = family[0]
+            if head.status == "failed":
+                return f"{base_key}:r{len(family)}"
+            return head.idempotency_key
 
     def list_runs(self, *, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._session() as session:
@@ -314,7 +391,18 @@ class RunStore:
                 return None  # cross-tenant → 404
             meta = _artifact_to_dict(artifact)
             relkey = artifact.relkey
-        content = self.blobs.read(relkey)
+        try:
+            content = self.blobs.read(relkey)
+        except FileNotFoundError:
+            # The DB row survives but its content-addressed blob is gone (GC/backup
+            # skew, manual cleanup, or a future object-store backend). Treat it as a
+            # clean not-found (404) rather than surfacing an unhandled 500.
+            logger.warning(
+                "artifact %s row present but blob %s is missing from the store",
+                artifact_id,
+                relkey,
+            )
+            return None
         return meta, content
 
     # -- retention / GC ---------------------------------------------------

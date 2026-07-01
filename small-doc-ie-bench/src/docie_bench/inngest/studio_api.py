@@ -62,14 +62,33 @@ class TriggerResponse(BaseModel):
     topics: list[str]
 
 
+def _record_event_owners(event_ids: list[str], tenant_id: str) -> None:
+    """Bind each triggered event id to its principal so ``/runs`` can be scoped.
+
+    Best-effort: if the run index is unconfigured the run-status proxy stays
+    unscoped in that degraded mode (see ``event_runs``).
+    """
+    store = default_run_store()
+    if not store.enabled:
+        return
+    try:
+        for event_id in event_ids:
+            store.record_event_owner(event_id=event_id, tenant_id=tenant_id)
+    except RunStoreUnavailableError:
+        pass
+
+
 @router.post("/extract", response_model=TriggerResponse)
-async def trigger_extract(payload: ExtractRequest) -> TriggerResponse:
+async def trigger_extract(payload: ExtractRequest, tenant: TenantDependency) -> TriggerResponse:
     if not payload.text and not payload.content_b64:
         raise HTTPException(status_code=422, detail="Provide either 'text' or 'content_b64'")
     channel = f"extract:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
     ids = await inngest_client.send(inngest.Event(name=EXTRACT_EVENT, data=data))
+    # Record ownership so the run-status proxy is tenant-scoped: an extraction run
+    # has no durable StudioRun row, so this is its only ownership signal.
+    _record_event_owners(list(ids), tenant.tenant_id)
     return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
 
 
@@ -100,8 +119,20 @@ async def trigger_benchmark(payload: BenchmarkRequest, tenant: TenantDependency)
     # an identical request would collide on one global key — denying one tenant's
     # run and leaking the other's record through the dedup short-circuit. Prefixing
     # covers both the derived and the client-supplied key branches.
-    data["idempotency_key"] = f"{tenant.tenant_id}:{benchmark_idempotency_key(data)}"
+    base_key = f"{tenant.tenant_id}:{benchmark_idempotency_key(data)}"
+    # Rotate the key once the prior run for it has terminally failed, so a
+    # legitimate re-request is not deduped away for the 24h window (a genuine
+    # duplicate of an in-flight/succeeded run still resolves to the same key).
+    store = default_run_store()
+    effective_key = base_key
+    if store.enabled:
+        try:
+            effective_key = store.effective_idempotency_key(base_key)
+        except RunStoreUnavailableError:
+            effective_key = base_key
+    data["idempotency_key"] = effective_key
     ids = await inngest_client.send(inngest.Event(name=BENCHMARK_EVENT, data=data))
+    _record_event_owners(list(ids), tenant.tenant_id)
     return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
 
 
@@ -165,13 +196,21 @@ async def event_runs(event_id: str, tenant: TenantDependency) -> Any:
         except RunStoreUnavailableError:
             owner = None
         if owner is not None:
-            # A durable benchmark run exists: serve it only to its owner. Never
-            # fall through to the (tenant-agnostic) Inngest proxy for it.
+            # Ownership is recorded (benchmark run row or extraction event owner):
+            # serve it only to its owner. A cross-tenant id is 404, never proxied.
             if owner != tenant.tenant_id:
                 raise HTTPException(status_code=404, detail="Run not found")
             record = store.get_run(event_id, tenant_id=tenant.tenant_id)
             if record is not None:
+                # Durable benchmark run: answer from the index.
                 return record
+            # Owned extraction run: fall through to the proxy below (scoped by the
+            # ownership check we just passed).
+        else:
+            # Store is enabled but no ownership is recorded for this id: we cannot
+            # prove the caller owns it, so refuse rather than leak another
+            # principal's run status/output through the tenant-agnostic proxy.
+            raise HTTPException(status_code=404, detail="Run not found")
 
     base = os.getenv("INNGEST_BASE_URL", "http://localhost:8288").rstrip("/")
     headers = {}
