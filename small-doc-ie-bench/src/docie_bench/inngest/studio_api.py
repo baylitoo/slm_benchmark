@@ -146,11 +146,16 @@ class DeployRequest(BaseModel):
 
 
 @router.post("/deploy", response_model=TriggerResponse)
-async def trigger_deploy(payload: DeployRequest) -> TriggerResponse:
+async def trigger_deploy(payload: DeployRequest, tenant: TenantDependency) -> TriggerResponse:
     channel = f"deploy:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
     ids = await inngest_client.send(inngest.Event(name=DEPLOY_EVENT, data=data))
+    # Deploy has no durable StudioRun row; record ownership so the triggering
+    # principal can poll its status via /runs and a cross-tenant id is 404 (never
+    # proxied). Every event-producing trigger records an owner for parity — an
+    # unregistered one would 404 its own status polling (the Deploy.tsx fallback).
+    _record_event_owners(list(ids), tenant.tenant_id)
     return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
 
 
@@ -161,11 +166,17 @@ class SeedOllamaRequest(BaseModel):
 
 
 @router.post("/seed-ollama", response_model=TriggerResponse)
-async def trigger_seed_ollama(payload: SeedOllamaRequest) -> TriggerResponse:
+async def trigger_seed_ollama(
+    payload: SeedOllamaRequest, tenant: TenantDependency
+) -> TriggerResponse:
     channel = f"seed:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
     ids = await inngest_client.send(inngest.Event(name=SEED_EVENT, data=data))
+    # Seed has no durable StudioRun row; record ownership so the triggering
+    # principal can poll its status via /runs (no 404 regression) while a
+    # cross-tenant id stays 404 rather than leaking through the Inngest proxy.
+    _record_event_owners(list(ids), tenant.tenant_id)
     return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
 
 

@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # and docs/docie-studio.md). Age wins first, then a hard cap on run count.
     studio_run_retention_days: int = Field(default=30, ge=1, le=3650)
     studio_run_retention_max: int = Field(default=500, ge=1, le=1_000_000)
+    # Grace window for the orphan-blob mark-and-sweep: a blob physically present
+    # in the store but referenced by no artifact row is only reclaimed once it is
+    # older than this, so a blob an in-flight job just ``put()`` (before its run
+    # ``complete()``-commits the artifact row) is never swept out from under it.
+    studio_orphan_grace_hours: int = Field(default=24, ge=0, le=8760)
 
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))

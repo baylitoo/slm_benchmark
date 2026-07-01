@@ -596,3 +596,141 @@ def test_benchmark_trigger_rotates_key_after_terminal_failure(
     key2 = captured[1]["idempotency_key"]
     assert key2 != key1
     assert key2.startswith(key1)
+
+
+# ---------------------------------------------------------------------------
+# Issue A (was F2): GC is a real mark-and-sweep — it reclaims a crash-orphaned
+# blob (put() committed, run crashed before complete() wrote its artifact row),
+# but spares an in-flight put (within grace) and any blob a retained run keeps.
+# ---------------------------------------------------------------------------
+
+
+def test_gc_sweeps_crash_orphan_blob_but_spares_inflight_and_referenced(tmp_path: Path) -> None:
+    import os
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    now = dt.datetime.now(dt.UTC)
+
+    # Retained run with a committed artifact -> its blob is referenced, must survive.
+    store.claim(event_id="kept", idempotency_key="kk", tenant_id="t")
+    kept_blob = store.blobs.put(name="report.html", content=b"<kept/>", media_type="text/html")
+    store.complete(event_id="kept", metrics={}, artifacts=[("report.html", kept_blob)])
+
+    # The REAL orphan case the prior fix missed: claim() created a running row,
+    # put() wrote the blob, then the worker crashed BEFORE complete() committed the
+    # artifact row. No StudioRunArtifact references the blob and no run is doomed, so
+    # the old row-driven GC could never reclaim it -> a permanent leak.
+    store.claim(event_id="crashed", idempotency_key="kc", tenant_id="t")
+    orphan = store.blobs.put(
+        name="predictions.jsonl", content=b'{"row":1}\n', media_type="application/x-ndjson"
+    )
+    old_ts = (now - dt.timedelta(hours=48)).timestamp()  # aged past the default grace
+    os.utime(store.blobs.path_for(orphan.relkey), (old_ts, old_ts))
+
+    # A freshly put(), still-in-flight blob whose complete() has not run yet: within
+    # the grace window, so it must NOT be swept out from under the running job.
+    inflight = store.blobs.put(
+        name="report.html", content=b"<inflight/>", media_type="text/html"
+    )
+
+    # No orphan_grace_hours override: relies on the 24h default, so this asserts the
+    # sweep BEHAVIOUR (a row-driven-only GC leaves the crash orphan on disk forever).
+    summary = store.gc(max_age_days=3650, max_runs=1000, now=now)
+
+    assert summary["deleted_runs"] == 0  # nothing is time/count-doomed
+    assert summary["deleted_blobs"] == 1  # only the aged crash orphan
+    assert not store.blobs.exists(orphan.relkey)  # crash orphan reclaimed
+    assert store.blobs.exists(inflight.relkey)  # in-flight put spared (within grace)
+    assert store.blobs.exists(kept_blob.relkey)  # still referenced by the retained run
+
+
+def test_gc_grace_refreshes_mtime_when_running_job_reputs_existing_content(
+    tmp_path: Path,
+) -> None:
+    """A running job re-putting pre-existing (content-addressed) bytes refreshes the
+    blob's mtime, so the sweep cannot reclaim it out from under the live job.
+    """
+    import os
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    now = dt.datetime.now(dt.UTC)
+
+    # An old, unreferenced orphan (aged well past grace).
+    orphan = store.blobs.put(name="metrics.json", content=b'{"m":1}', media_type="application/json")
+    old_ts = (now - dt.timedelta(hours=48)).timestamp()
+    os.utime(store.blobs.path_for(orphan.relkey), (old_ts, old_ts))
+
+    # A running job now re-puts the SAME content (dedup: no rewrite). This must
+    # refresh the mtime so the identical bytes are treated as live, not orphaned.
+    again = store.blobs.put(name="metrics.json", content=b'{"m":1}', media_type="application/json")
+    assert again.relkey == orphan.relkey
+
+    summary = store.gc(max_age_days=3650, max_runs=1000, now=now, orphan_grace_hours=1)
+    assert summary["deleted_blobs"] == 0
+    assert store.blobs.exists(orphan.relkey)  # spared: the re-put refreshed its mtime
+
+
+# ---------------------------------------------------------------------------
+# Issue B: deploy + seed run-status polling is owned + tenant-scoped (no 404
+# regression for the triggering principal; cross-tenant/unknown still 404).
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_and_seed_run_status_is_owned_and_tenant_scoped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from docie_bench import security
+    from docie_bench.inngest.client import inngest_client
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api.httpx, "AsyncClient", _FakeAsyncClient)
+
+    sent: list[str] = []
+
+    async def fake_send(event):
+        eid = f"ev-{len(sent)}"
+        sent.append(eid)
+        return [eid]
+
+    monkeypatch.setattr(inngest_client, "send", fake_send)
+    manager = TenantQuotaManager(
+        api_keys={"secret-a": "tenant-a", "secret-b": "tenant-b"},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=10,
+    )
+    monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
+    client = TestClient(api.app)
+
+    # Both infra triggers now require auth (fail closed), like extract/benchmark.
+    assert client.post("/v1/studio/deploy", json={"model": "m"}).status_code == 401
+    assert (
+        client.post("/v1/studio/seed-ollama", json={"reference": "r", "name": "n"}).status_code
+        == 401
+    )
+
+    dep = client.post("/v1/studio/deploy", json={"model": "m"}, headers={"X-API-Key": "secret-a"})
+    seed = client.post(
+        "/v1/studio/seed-ollama",
+        json={"reference": "qwen2.5:1.5b", "name": "q"},
+        headers={"X-API-Key": "secret-a"},
+    )
+    assert dep.status_code == 200
+    assert seed.status_code == 200
+    dep_id = dep.json()["event_ids"][0]
+    seed_id = seed.json()["event_ids"][0]
+
+    for eid in (dep_id, seed_id):
+        # The triggering principal polls run status -> proxied through (no 404).
+        owned = client.get(f"/v1/studio/runs/{eid}", headers={"X-API-Key": "secret-a"})
+        assert owned.status_code == 200
+        assert owned.json() == [{"status": "Completed"}]
+        # A different tenant is refused (404, never proxied).
+        assert (
+            client.get(f"/v1/studio/runs/{eid}", headers={"X-API-Key": "secret-b"}).status_code
+            == 404
+        )
+    # Unknown id with no recorded owner -> 404 (no unscoped proxy fallthrough).
+    assert client.get("/v1/studio/runs/nope", headers={"X-API-Key": "secret-a"}).status_code == 404

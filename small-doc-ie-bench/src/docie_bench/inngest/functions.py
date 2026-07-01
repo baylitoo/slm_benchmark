@@ -410,6 +410,7 @@ def _gc_studio_runs_sync() -> dict[str, int]:
     summary = store.gc(
         max_age_days=settings.studio_run_retention_days,
         max_runs=settings.studio_run_retention_max,
+        orphan_grace_hours=settings.studio_orphan_grace_hours,
     )
     logger.info("studio run GC: %s", summary)
     return summary

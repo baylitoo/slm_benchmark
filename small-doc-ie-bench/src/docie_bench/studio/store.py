@@ -71,7 +71,8 @@ class ArtifactBlobStore:
         relkey = self._relkey(digest, safe_name)
         destination = self.root / relkey
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.exists():
+
+        def _atomic_write() -> None:
             fd, temporary = tempfile.mkstemp(prefix=f".{safe_name}.", dir=destination.parent)
             try:
                 with os.fdopen(fd, "wb") as handle:
@@ -81,6 +82,22 @@ class ArtifactBlobStore:
                 os.replace(temporary, destination)
             finally:
                 Path(temporary).unlink(missing_ok=True)
+
+        if not destination.exists():
+            _atomic_write()
+        else:
+            # Content-addressed dedup: the bytes are already on disk so we skip the
+            # write, but we MUST refresh the mtime. The orphan sweep (``gc``) treats
+            # a blob's mtime as its liveness signal; without this, a job that re-puts
+            # pre-existing content leaves the stale timestamp and the sweep could
+            # reclaim the blob out from under the still-running job.
+            try:
+                os.utime(destination, None)
+            except FileNotFoundError:
+                # Lost a race with a concurrent GC deleting this exact content
+                # between the exists() check and here — recreate it atomically so
+                # the caller still gets a committed blob.
+                _atomic_write()
         return StoredBlob(
             relkey=relkey, sha256=digest, size_bytes=len(content), media_type=media_type
         )
@@ -126,6 +143,35 @@ class ArtifactBlobStore:
                 parent.rmdir()
                 parent = parent.parent
         return removed
+
+    def iter_keys(self) -> Iterator[str]:
+        """Yield the store-relative key of every committed blob under the root.
+
+        Backs the mark-and-sweep in ``RunStore.gc``: a blob on disk that no
+        artifact row references is a leak (e.g. ``put()`` succeeded but the run
+        crashed before ``complete()`` committed its row). Temp files from an
+        in-progress atomic ``put`` (leaf name prefixed with ``.``) are skipped —
+        they are not committed blobs.
+        """
+        root = self.root
+        if not root.exists():
+            return
+        for path in root.rglob("*"):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            yield path.relative_to(root).as_posix()
+
+    def modified_at(self, relkey: str) -> dt.datetime | None:
+        """Last-modified time of a blob (UTC), or ``None`` if it is gone."""
+        try:
+            path = self.path_for(relkey)
+        except ValueError:
+            return None
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            return None
+        return dt.datetime.fromtimestamp(mtime, tz=dt.UTC)
 
 
 def default_blob_store() -> ArtifactBlobStore:
@@ -413,15 +459,32 @@ class RunStore:
         max_age_days: int,
         max_runs: int,
         now: dt.datetime | None = None,
+        orphan_grace_hours: float | None = None,
     ) -> dict[str, int]:
         """Delete runs older than ``max_age_days`` or beyond the newest
-        ``max_runs``, then delete any blob no surviving artifact references.
+        ``max_runs``, then mark-and-sweep any blob no surviving artifact references.
 
         Age is applied first; the count cap then trims the survivors. Blobs are
         content-addressed, so a blob shared by a retained run is kept.
+
+        Blob reclamation has two sources:
+
+          - *row-driven*: a blob orphaned by a deleted run is reclaimed
+            immediately (the run is gone, so the reference is provably dead);
+          - *mark-and-sweep*: a blob physically present in the store that NO
+            surviving ``StudioRunArtifact`` row references is a leak — e.g.
+            ``put()`` committed the bytes but the run crashed (or ``complete()``
+            rolled back) before its artifact row was written. Such a blob has no
+            row to drive its cleanup, so the sweep enumerates on-disk keys
+            directly. To avoid deleting a blob an in-flight job just ``put()`` but
+            has not yet ``complete()``-committed, only orphans older than
+            ``orphan_grace_hours`` are swept (defaults to the configured grace).
         """
         current = now or dt.datetime.now(dt.UTC)
         cutoff = current - dt.timedelta(days=max_age_days)
+        if orphan_grace_hours is None:
+            orphan_grace_hours = float(get_settings().studio_orphan_grace_hours)
+        orphan_cutoff = current - dt.timedelta(hours=orphan_grace_hours)
         with self._session() as session:
             all_runs = session.scalars(
                 select(StudioRun).order_by(StudioRun.created_at.desc())
@@ -437,34 +500,55 @@ class RunStore:
                     doomed_ids.add(run.event_id)
                 else:
                     survivors += 1
-            if not doomed_ids:
-                return {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": survivors}
 
-            doomed_relkeys = set(
-                session.scalars(
-                    select(StudioRunArtifact.relkey).where(
+            orphans: set[str] = set()
+            if doomed_ids:
+                doomed_relkeys = set(
+                    session.scalars(
+                        select(StudioRunArtifact.relkey).where(
+                            StudioRunArtifact.run_event_id.in_(doomed_ids)
+                        )
+                    ).all()
+                )
+                # Delete child artifact rows explicitly: a core DELETE does not fire
+                # ORM cascade, and sqlite does not enforce ON DELETE CASCADE by default.
+                session.execute(
+                    delete(StudioRunArtifact).where(
                         StudioRunArtifact.run_event_id.in_(doomed_ids)
                     )
-                ).all()
-            )
-            # Delete child artifact rows explicitly: a core DELETE does not fire
-            # ORM cascade, and sqlite does not enforce ON DELETE CASCADE by default.
-            session.execute(
-                delete(StudioRunArtifact).where(StudioRunArtifact.run_event_id.in_(doomed_ids))
-            )
-            session.execute(delete(StudioRun).where(StudioRun.event_id.in_(doomed_ids)))
-            session.flush()
-            # A relkey is safe to delete only if no *surviving* artifact uses it.
-            still_referenced = set(
-                session.scalars(
-                    select(StudioRunArtifact.relkey).where(
-                        StudioRunArtifact.relkey.in_(doomed_relkeys)
-                    )
-                ).all()
-            )
-            orphans = doomed_relkeys - still_referenced
+                )
+                session.execute(delete(StudioRun).where(StudioRun.event_id.in_(doomed_ids)))
+                session.flush()
+                # A relkey is safe to delete only if no *surviving* artifact uses it.
+                still_referenced = set(
+                    session.scalars(
+                        select(StudioRunArtifact.relkey).where(
+                            StudioRunArtifact.relkey.in_(doomed_relkeys)
+                        )
+                    ).all()
+                )
+                orphans = doomed_relkeys - still_referenced
+            # Every relkey any surviving artifact row still points at — the retain
+            # set the mark-and-sweep must never touch (guard 1: content-addressed
+            # sharing across runs).
+            referenced = set(session.scalars(select(StudioRunArtifact.relkey)).all())
 
+        # Row-driven reclamation first: these are provably dead (their run is gone),
+        # so they are reclaimed regardless of age.
         deleted_blobs = sum(1 for relkey in orphans if self.blobs.delete(relkey))
+        # Mark-and-sweep for crash orphans: on-disk blobs with no surviving row.
+        # Runs even when nothing was time/count-doomed, because a crashed upload
+        # leaves no run to delete. Grace-gated so an in-flight ``put()`` is safe.
+        # Snapshot the keys first: ``delete`` prunes now-empty digest directories,
+        # which would corrupt a lazy directory walk mid-iteration.
+        for relkey in list(self.blobs.iter_keys()):
+            if relkey in referenced or relkey in orphans:
+                continue
+            modified = self.blobs.modified_at(relkey)
+            if modified is not None and modified >= orphan_cutoff:
+                continue  # within grace: may be an in-flight, not-yet-committed put
+            if self.blobs.delete(relkey):
+                deleted_blobs += 1
         return {
             "deleted_runs": len(doomed_ids),
             "deleted_blobs": deleted_blobs,
