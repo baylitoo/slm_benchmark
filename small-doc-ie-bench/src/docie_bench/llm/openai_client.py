@@ -136,10 +136,13 @@ class OpenAICompatibleClient:
         """Issue one minimal completion with a single style; report if honored.
 
         Bypasses the gateway retry/circuit machinery so a probe never trips the
-        breaker. Returns ``False`` only for a *served* non-honor (a 4xx/5xx or an
-        empty/invalid 200); transport errors PROPAGATE so the caller records the
-        endpoint as unreachable rather than falsely marking every style rejected
-        (which would prune the ladder and re-introduce the empty-content bug).
+        breaker. Returns ``False`` only for a *genuine* non-honor — a permanent
+        4xx ("style unsupported") or an empty/invalid 200. Transient signals
+        (429/5xx/timeouts/connection) are INCONCLUSIVE and PROPAGATE, classified
+        exactly like the runtime path via ``classify_response_error``, so the
+        caller records the endpoint as flaky rather than falsely marking the
+        style rejected (which would prune the ladder and re-introduce the
+        empty-content bug on a single transient blip during the canary).
         """
         response_format, extra_body = build_response_format(style, "probe", schema)
         payload: dict[str, Any] = {
@@ -159,6 +162,13 @@ class OpenAICompatibleClient:
         payload.update(extra_body)
         resp = await self._client.post("/chat/completions", json=payload)
         if resp.status_code >= 400:
+            # Classify like the runtime: a retryable (transient/rate-limited)
+            # status is inconclusive and must NOT be recorded as a rejection, so
+            # propagate it. Only a permanent status is a genuine "style
+            # unsupported" signal that legitimately rejects the style.
+            error = classify_response_error(resp)
+            if error.retryable:
+                raise error
             return False
         try:
             content = resp.json()["choices"][0]["message"]["content"]

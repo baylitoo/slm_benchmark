@@ -146,6 +146,13 @@ def test_benchmark_nonzero_ok_rate_and_probe_persisted(
     # CI-style assertion: the ladder makes ok_rate non-zero despite json_schema
     # returning empty content.
     assert summary["ok_rate"] == 1.0
+    # The constrained->unconstrained downgrade is visible even though post-repair
+    # validity stays high: json_schema was requested but every doc decoded with
+    # the downgraded json_object rung, so constrained_rate collapses to 0.
+    assert summary["valid_rate"] == 1.0
+    assert summary["constrained_rate"] == 0.0
+    assert summary["effective_style_distribution"] == {"json_object": 1}
+    assert metrics["validity_gate"]["passed"] is True
 
     rows = [
         json.loads(line)

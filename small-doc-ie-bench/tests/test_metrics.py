@@ -53,6 +53,72 @@ def test_summarize_aggregates_evidence_metrics():
     assert summary["hallucination_rate"] == 0.25
 
 
+def test_summarize_surfaces_constrained_downgrade_while_valid_rate_high():
+    # Every row parses after repair (valid_rate stays 1.0) but the requested
+    # strong style (openai_json_schema) was silently downgraded to json_object on
+    # every doc. constrained_rate must expose that gap the validity gate is blind
+    # to; the effective-style distribution records where decoding actually landed.
+    rows = [
+        {
+            "model_profile": "downgraded",
+            "ok": True,
+            "latency_ms": 10,
+            "validation": {"valid": True},
+            "response_format_style": "json_object",
+            "declared_response_format_style": "openai_json_schema",
+            "score": {"field_total": 1, "field_correct": 1},
+        }
+        for _ in range(3)
+    ]
+
+    summary = summarize(rows)["summary"][0]
+
+    assert summary["valid_rate"] == 1.0
+    assert summary["constrained_rate"] == 0.0
+    assert summary["effective_style_distribution"] == {"json_object": 3}
+
+
+def test_summarize_constrained_rate_honours_matching_style():
+    rows = [
+        {
+            "model_profile": "honoured",
+            "ok": True,
+            "latency_ms": 10,
+            "validation": {"valid": True},
+            "response_format_style": "openai_json_schema",
+            "declared_response_format_style": "openai_json_schema",
+            "score": {"field_total": 1, "field_correct": 1},
+        }
+    ]
+
+    summary = summarize(rows)["summary"][0]
+
+    assert summary["constrained_rate"] == 1.0
+    assert summary["effective_style_distribution"] == {"openai_json_schema": 1}
+
+
+def test_summarize_constrained_rate_none_when_no_comparable_rows():
+    # OCR/pipeline adapters record no response_format_style, and routed rows have
+    # no declared style, so neither can be counted as a downgrade — the metric is
+    # None rather than a misleading 0.
+    rows = [
+        {
+            "model_profile": "ocr",
+            "ok": True,
+            "latency_ms": 10,
+            "validation": {"valid": True},
+            "response_format_style": None,
+            "declared_response_format_style": None,
+            "score": {"field_total": 1, "field_correct": 1},
+        }
+    ]
+
+    summary = summarize(rows)["summary"][0]
+
+    assert summary["constrained_rate"] is None
+    assert summary["effective_style_distribution"] == {}
+
+
 def test_summarize_aggregates_routing_metrics():
     rows = [
         {

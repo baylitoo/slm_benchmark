@@ -194,6 +194,84 @@ async def test_probe_is_best_effort_on_transport_error() -> None:
     assert probe.advertised_styles is None
 
 
+@pytest.mark.parametrize("status", [503, 429])
+async def test_probe_transient_status_does_not_reject_style(status: int) -> None:
+    # A single transient blip (503/429) on the one canary must NOT be recorded as
+    # a style rejection: doing so would prune the strongest constrained style for
+    # EVERY document in the run and downgrade to weaker decoding. It is
+    # inconclusive, exactly like the runtime path treats the same status.
+    profile = _profile(capability_discovery="optional")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "test-model",
+                            "capabilities": {
+                                "response_format_styles": ["openai_json_schema", "json_object"]
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(status, json={"error": "temporarily unavailable"})
+
+    client = await _client(profile, handler)
+    try:
+        probe = await probe_endpoint(client, now=0.0)
+    finally:
+        await client.aclose()
+
+    # The transient status is inconclusive: nothing is rejected/pruned.
+    assert probe.rejected_styles == ()
+    assert probe.source == "error"
+    # The strongest constrained style is still on the ladder for real documents.
+    assert "openai_json_schema" in client._negotiated_ladder()
+
+
+async def test_probe_permanent_status_rejects_style() -> None:
+    # A permanent 4xx ("style unsupported") is a genuine rejection signal, unlike
+    # a transient status — the ladder legitimately downgrades to json_object.
+    profile = _profile(capability_discovery="optional")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "test-model",
+                            "capabilities": {
+                                "response_format_styles": ["openai_json_schema", "json_object"]
+                            },
+                        }
+                    ]
+                },
+            )
+        import json as _json
+
+        payload = _json.loads(request.read().decode("utf-8"))
+        rf = payload.get("response_format")
+        style = rf.get("type") if rf else "none"
+        if style == "json_schema":
+            return httpx.Response(400, json={"error": "response_format not supported"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": "yes"}'}}]})
+
+    client = await _client(profile, handler)
+    try:
+        probe = await probe_endpoint(client, now=0.0)
+    finally:
+        await client.aclose()
+
+    assert probe.rejected_styles == ("openai_json_schema",)
+    assert probe.confirmed_styles == ("json_object",)
+    assert probe.source == "probe"
+
+
 async def test_run_capability_probes_skips_non_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

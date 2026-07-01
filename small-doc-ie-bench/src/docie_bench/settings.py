@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # Validity gate: fail a benchmark run loudly when a profile's valid_rate is
     # below this threshold instead of silently scoring zeros. 0.0 disables it.
     valid_rate_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Constrained-decode downgrade view: flag (report-only) a profile whose
+    # constrained_rate — the fraction of rows decoded with the requested strong
+    # style rather than silently downgraded — is below this threshold. 0.0
+    # disables it; unlike valid_rate_threshold it never fails a run.
+    constrained_rate_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
     ocr_cache_dir: Path = Path(".cache/ocr")
     ocr_cache_max_mb: int = Field(default=2048, ge=0)
     ocr_cache_enabled: bool = True

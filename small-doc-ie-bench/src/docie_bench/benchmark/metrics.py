@@ -55,6 +55,32 @@ def evaluate_validity_gate(
     return failures
 
 
+def evaluate_constrained_gate(
+    summary_rows: list[dict[str, Any]], threshold: float
+) -> list[dict[str, Any]]:
+    """Return summary rows whose ``constrained_rate`` fell below ``threshold``.
+
+    Surfaces the constrained->unconstrained downgrade that post-repair
+    ``valid_rate`` is blind to: a profile can score ``valid_rate=1.0`` while
+    every strong (schema-constrained) decode was silently downgraded to a weaker
+    rung or none+repair. A non-positive ``threshold`` disables the check
+    (returns ``[]``); rows without a numeric ``constrained_rate`` (no comparable
+    LLM-decoded row — e.g. OCR/pipeline or routed profiles) are skipped rather
+    than treated as failures. Report-only: unlike ``valid_rate`` this never
+    fails a run by default, so existing runs keep passing.
+    """
+    if threshold <= 0:
+        return []
+    failures: list[dict[str, Any]] = []
+    for row in summary_rows:
+        constrained_rate = row.get("constrained_rate")
+        if not isinstance(constrained_rate, (int, float)):
+            continue
+        if constrained_rate < threshold:
+            failures.append(row)
+    return failures
+
+
 def get_path(payload: dict[str, Any], dotted_path: str) -> Any:
     current: Any = payload
     for part in dotted_path.split("."):
