@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,40 +40,49 @@ def test_load_document_images_normalizes_image_to_png(tmp_path: Path) -> None:
 
 
 def test_load_document_images_rasterizes_pdf_pages(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakePixmap:
-        def tobytes(self, output: str) -> bytes:
-            assert output == "png"
-            return b"png-page"
+    captured: dict[str, object] = {}
 
-    class FakePage:
-        def get_pixmap(self, *, matrix, alpha: bool):
-            assert matrix == ("matrix", 150 / 72, 150 / 72)
-            assert alpha is False
-            return FakePixmap()
+    class FakeParser:
+        def __init__(self, **kwargs) -> None:
+            captured["init"] = kwargs
 
-    class FakeDocument:
-        page_count = 2
+        def screenshot(self, path, *, page_numbers):
+            captured["path"] = path
+            captured["page_numbers"] = page_numbers
+            # Returned out of order to prove _rasterize_pdf sorts by page.
+            return [
+                SimpleNamespace(page_num=2, width=8, height=6, image_bytes=b"png-page-2"),
+                SimpleNamespace(page_num=1, width=8, height=6, image_bytes=b"png-page-1"),
+            ]
 
-        def __enter__(self):
-            return self
+    monkeypatch.setattr("docie_bench.vision.LiteParse", FakeParser)
 
-        def __exit__(self, *_):
-            return None
+    images = load_document_images(Path("scan.pdf"), max_pages=2, pdf_dpi=150)
 
-        def load_page(self, index: int):
-            assert index in {0, 1}
-            return FakePage()
-
-    fake_fitz = SimpleNamespace(
-        open=lambda path: FakeDocument(),
-        Matrix=lambda x, y: ("matrix", x, y),
-    )
-    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
-
-    images = load_document_images(Path("scan.pdf"), max_pages=2)
-
+    assert captured["init"] == {"dpi": 150.0, "quiet": True}
+    assert captured["page_numbers"] is None
     assert [image.page for image in images] == [1, 2]
-    assert [image.data for image in images] == [b"png-page", b"png-page"]
+    assert [image.data for image in images] == [b"png-page-1", b"png-page-2"]
+    assert all(image.media_type == "image/png" for image in images)
+
+
+def test_load_document_images_rejects_pdf_exceeding_max_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeParser:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def screenshot(self, path, *, page_numbers):
+            return [
+                SimpleNamespace(page_num=n, width=8, height=6, image_bytes=b"p")
+                for n in (1, 2, 3)
+            ]
+
+    monkeypatch.setattr("docie_bench.vision.LiteParse", FakeParser)
+
+    with pytest.raises(ValueError, match="vision_max_pages is 2"):
+        load_document_images(Path("scan.pdf"), max_pages=2)
 
 
 @pytest.mark.asyncio

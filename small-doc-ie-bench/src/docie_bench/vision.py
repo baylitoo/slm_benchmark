@@ -5,6 +5,7 @@ import io
 from dataclasses import dataclass
 from pathlib import Path
 
+from liteparse import LiteParse
 from PIL import Image
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
@@ -53,31 +54,14 @@ def _image_to_png(image: Image.Image, *, page: int) -> DocumentImage:
 
 
 def _rasterize_pdf(path: Path, *, max_pages: int, pdf_dpi: int) -> list[DocumentImage]:
-    try:
-        import fitz
-    except ImportError as exc:
-        raise RuntimeError(
-            "PDF vision ingestion requires PyMuPDF. Install project dependencies or "
-            "`pip install pymupdf`."
-        ) from exc
-
-    images: list[DocumentImage] = []
-    with fitz.open(path) as document:
-        if document.page_count > max_pages:
-            raise ValueError(
-                f"PDF has {document.page_count} pages; vision_max_pages is {max_pages}"
-            )
-        scale = pdf_dpi / 72
-        matrix = fitz.Matrix(scale, scale)
-        for page_index in range(document.page_count):
-            pixmap = document.load_page(page_index).get_pixmap(matrix=matrix, alpha=False)
-            images.append(
-                DocumentImage(
-                    page=page_index + 1,
-                    media_type="image/png",
-                    data=pixmap.tobytes("png"),
-                )
-            )
-    if not images:
+    # liteparse renders pages via PDFium; screenshot() returns PNG bytes per page.
+    parser = LiteParse(dpi=float(pdf_dpi), quiet=True)
+    screenshots = parser.screenshot(path, page_numbers=None)
+    if not screenshots:
         raise ValueError("PDF contains no pages")
-    return images
+    if len(screenshots) > max_pages:
+        raise ValueError(f"PDF has {len(screenshots)} pages; vision_max_pages is {max_pages}")
+    return [
+        DocumentImage(page=shot.page_num, media_type="image/png", data=shot.image_bytes)
+        for shot in sorted(screenshots, key=lambda shot: shot.page_num)
+    ]

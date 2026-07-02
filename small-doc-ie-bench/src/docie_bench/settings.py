@@ -62,6 +62,15 @@ class Settings(BaseSettings):
     ocr_cache_dir: Path = Path(".cache/ocr")
     ocr_cache_max_mb: int = Field(default=2048, ge=0)
     ocr_cache_enabled: bool = True
+    # PDF/image ingestion via liteparse (PDFium spatial text + pluggable OCR).
+    ocr_dpi: int = Field(default=150, ge=72, le=600)
+    # Optional VLM-backed OCR server implementing the liteparse OCR API spec. When
+    # set, the pdf_text backend routes text-poor/scanned pages through it instead
+    # of the built-in Tesseract. Relevant only for text-only extraction models that
+    # cannot read the page image themselves; vision-capable profiles receive page
+    # images directly and never hit this path.
+    ocr_server_url: str | None = None
+    ocr_language: str | None = None
     runs_dir: Path = Path("runs")
 
     # Durable, addressable artifact store for Studio benchmark runs. Must resolve

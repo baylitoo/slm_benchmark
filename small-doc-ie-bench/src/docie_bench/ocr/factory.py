@@ -9,7 +9,7 @@ from docie_bench.ocr.tesseract_backend import TesseractBackend
 def get_ocr_backend(name: str, *, language: str | None = None) -> OCRBackend:
     normalized = name.lower().strip()
     if normalized == "pdf_text":
-        return PdfTextBackend()
+        return PdfTextBackend(language=language)
     if normalized == "tesseract":
         return TesseractBackend()
     if normalized == "paddleocr":
