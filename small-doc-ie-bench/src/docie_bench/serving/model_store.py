@@ -179,6 +179,26 @@ def _link_or_copy(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)  # cross-device or unsupported FS
 
 
+def _assert_within(path: Path, root: Path, *, label: str) -> Path:
+    """Resolve ``path`` and require it to stay within ``root`` (block traversal).
+
+    Both the Ollama ``reference`` (-> manifest path) and the store ``name`` (->
+    destination dir) are attacker-influenced strings joined into filesystem
+    paths. Legitimate references legitimately contain '/' and ':' (e.g.
+    ``hf.co/numind/NuExtract3-GGUF:Q4_K_M``) and resolve *inside* the root, so we
+    can't blanket-reject separators — instead resolve and enforce containment,
+    which rejects only ``..``/absolute escapes.
+    """
+    resolved = path.resolve()
+    root_resolved = root.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise ModelStoreError(
+            f"Refusing {label}: resolved path escapes {root_resolved} "
+            f"(possible path traversal)"
+        )
+    return resolved
+
+
 class ModelStore:
     """A canonical on-disk GGUF store served by both llama.cpp and Ollama."""
 
@@ -203,9 +223,16 @@ class ModelStore:
         weights — and vision projector, if present — into the store under stable
         ``*.gguf`` names.
         """
+        if not reference.strip() or not name.strip():
+            raise ModelStoreError("seed requires a non-empty reference and name")
         contract = get_family(family)
         home = ollama_home or default_ollama_home()
         manifest_path = _ollama_manifest_path(home, reference)
+        # Containment: a crafted reference ("../../..") must not read manifests
+        # outside Ollama's manifests root, and a crafted store name must not write
+        # blobs outside the store root.
+        _assert_within(manifest_path, home / "manifests", label=f"Ollama reference {reference!r}")
+        _assert_within(self.root / name, self.root, label=f"store name {name!r}")
         if not manifest_path.is_file():
             raise ModelStoreError(
                 f"Ollama manifest not found for {reference!r} at {manifest_path}. "
