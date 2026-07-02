@@ -155,6 +155,56 @@ def test_health_failures_degrade_then_restart(tmp_path: Path) -> None:
     assert recovered.restart_count == 1
 
 
+def test_await_ready_polls_until_healthy(tmp_path: Path) -> None:
+    # A model that is still loading refuses connections on the first probes and
+    # only becomes healthy once loaded. deploy() spawns + probes ONCE (fail);
+    # await_ready must keep re-probing until READY instead of freezing at
+    # STARTING.
+    adapter = FakeAdapter()
+    adapter.health_results = [
+        HealthResult(False, None, "Connection refused"),  # deploy-time probe
+        HealthResult(False, None, "Connection refused"),  # await_ready poll 1
+        HealthResult(True, 200),  # await_ready poll 2 -> loaded
+    ]
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.VLLM: adapter},
+    )
+    # High threshold so the readiness window cannot trip degrade-and-kill.
+    started = supervisor.deploy(_deployment(health_failure_threshold=10))
+    assert started.state == LifecycleState.STARTING
+    assert started.consecutive_health_failures == 1
+
+    ready = supervisor.await_ready(
+        "invoice", timeout_s=30, interval_s=0.01, sleep=lambda _: None
+    )
+
+    assert ready.state == LifecycleState.READY
+    assert ready.consecutive_health_failures == 0
+    assert adapter.starts == 1  # never killed/restarted while loading
+
+
+def test_await_ready_returns_last_state_on_timeout(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    # Never becomes healthy: every probe refuses the connection.
+    adapter.health = lambda spec, *, timeout=2: HealthResult(  # type: ignore[method-assign]
+        False, None, "Connection refused"
+    )
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.VLLM: adapter},
+    )
+    supervisor.deploy(_deployment(health_failure_threshold=10))
+
+    calls: list[float] = []
+    record = supervisor.await_ready(
+        "invoice", timeout_s=0.0, interval_s=0.01, sleep=calls.append
+    )
+
+    assert record.state != LifecycleState.READY
+    assert calls == []  # timeout_s=0 -> no polling loop, honest early return
+
+
 def test_never_restart_policy_leaves_failed_process_stopped(tmp_path: Path) -> None:
     adapter = FakeAdapter()
     supervisor = PersistentSupervisor(

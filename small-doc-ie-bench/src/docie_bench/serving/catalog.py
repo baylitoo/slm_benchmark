@@ -16,7 +16,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, select
+from sqlalchemy import BigInteger, DateTime, String, Text, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from docie_bench.serving.model_store import FAMILIES, StoreEntry
@@ -35,7 +35,11 @@ class ModelStoreEntry(Base):
     model_path: Mapped[str] = mapped_column(Text)
     mmproj_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # BigInteger: GGUF blobs routinely exceed Postgres INTEGER's ~2.147 GB cap
+    # (a 7B Q4 is ~4 GB), which would overflow on insert. This app uses
+    # create_all (no migrations), so an EXISTING database must be migrated
+    # manually: ALTER TABLE model_store_entry ALTER COLUMN size_bytes TYPE BIGINT.
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
