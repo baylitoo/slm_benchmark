@@ -55,11 +55,9 @@ from docie_bench.security import (
     tenant_guard,
 )
 from docie_bench.settings import get_settings
-from docie_bench.storage.audit import save_extraction_audit
+from docie_bench.storage.audit import record_extraction
 from docie_bench.storage.db import get_session_factory, init_engine
 from docie_bench.telemetry import (
-    EXTRACTION_LATENCY,
-    EXTRACTION_REQUESTS,
     REVIEW_ACTIONS,
     REVIEW_QUEUE_DEPTH,
 )
@@ -81,11 +79,28 @@ app.include_router(studio_router, dependencies=[Depends(tenant_guard)])
 app.include_router(serving_router, dependencies=[Depends(tenant_guard)])
 
 # Allow the DocIE Studio frontend (separate origin) to call the API from the
-# browser. Configure via STUDIO_CORS_ORIGINS (comma-separated); defaults to "*".
-_cors_origins = [o.strip() for o in os.getenv("STUDIO_CORS_ORIGINS", "*").split(",") if o.strip()]
+# browser. Defaults to the local Studio UI origins; override via
+# STUDIO_CORS_ORIGINS (comma-separated). Set "*" explicitly to allow any origin.
+_DEFAULT_CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+
+def parse_cors_origins(raw: str | None) -> list[str]:
+    """Parse STUDIO_CORS_ORIGINS into an allow-origins list.
+
+    Empty/unset falls back to the explicit localhost Studio origins rather than
+    a wildcard, so a networked deployment does not default to allowing any
+    origin. Users can still opt into "*" explicitly.
+    """
+    if raw is None:
+        return list(_DEFAULT_CORS_ORIGINS)
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return origins or list(_DEFAULT_CORS_ORIGINS)
+
+
+_cors_origins = parse_cors_origins(os.getenv("STUDIO_CORS_ORIGINS"))
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins or ["*"],
+    allow_origins=_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -150,7 +165,7 @@ def validate_text_request(payload: ExtractTextRequest) -> None:
 
 
 def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> ExtractionResponse:
-    save_extraction_audit(response, tenant_id=tenant_id)
+    record_extraction(response, tenant_id=tenant_id)
     if not settings.response_redaction_fields:
         return response
     return response.model_copy(
@@ -220,12 +235,6 @@ async def extract_text(
         or (hash_bytes(payload.text.encode("utf-8")) if payload.text else None),
         metadata=payload.metadata,
     )
-    EXTRACTION_REQUESTS.labels(
-        response.schema_name, response.model_profile, str(response.validation.valid).lower()
-    ).inc()
-    EXTRACTION_LATENCY.labels(response.schema_name, response.model_profile).observe(
-        response.latency_ms / 1000
-    )
     return finalize_response(response, tenant_id=tenant.tenant_id)
 
 
@@ -264,12 +273,6 @@ async def extract_file(
         )
     finally:
         tmp_path.unlink(missing_ok=True)
-    EXTRACTION_REQUESTS.labels(
-        response.schema_name, response.model_profile, str(response.validation.valid).lower()
-    ).inc()
-    EXTRACTION_LATENCY.labels(response.schema_name, response.model_profile).observe(
-        response.latency_ms / 1000
-    )
     return finalize_response(response, tenant_id=tenant.tenant_id)
 
 

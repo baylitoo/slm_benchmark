@@ -33,6 +33,7 @@ from docie_bench.inngest.realtime import (
 )
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.settings import get_settings
+from docie_bench.storage.audit import record_extraction
 
 logger = logging.getLogger("docie_bench.inngest.functions")
 
@@ -62,6 +63,22 @@ def _resolve_profile(name: str | None) -> ModelProfile:
     )
 
 
+def _record_observability(response: Any, tenant_id: str | None) -> None:
+    """Best-effort audit row + metrics for the Studio extraction path.
+
+    Runs inside the memoized extract step, so it must never raise: a transient DB
+    failure would otherwise re-run the (expensive) LLM extraction on Inngest retry
+    and double-insert the audit row. NOTE: the Prometheus counters land in the
+    worker's in-process registry, which is NOT scraped in Connect mode — the
+    durable audit row (shared Postgres) is what actually surfaces Studio
+    extractions for observability.
+    """
+    try:
+        record_extraction(response, tenant_id=tenant_id)
+    except Exception:  # noqa: BLE001 - observability must not fail/retry the job
+        logger.warning("record_extraction failed for a Studio extraction", exc_info=True)
+
+
 async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     """Run one extraction from event data; returns a JSON-serializable result."""
     schema_name = data.get("schema_name", "invoice")
@@ -69,6 +86,7 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     profile = _resolve_profile(data.get("model_profile"))
     service = ExtractionService(profile)
 
+    tenant_id = data.get("tenant_id")
     text = data.get("text")
     if text is not None:
         response = await service.extract_from_text(
@@ -79,6 +97,7 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
             document_hash=hash_bytes(text.encode("utf-8")),
             metadata={"source": "inngest"},
         )
+        _record_observability(response, tenant_id)
         return response.model_dump(mode="json")
 
     content_b64 = data.get("content_b64")
@@ -105,6 +124,7 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
         )
     finally:
         tmp_path.unlink(missing_ok=True)
+    _record_observability(response, tenant_id)
     return response.model_dump(mode="json")
 
 

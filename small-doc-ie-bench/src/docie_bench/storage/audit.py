@@ -6,6 +6,7 @@ from docie_bench.schemas.review import ReviewTaskCreate
 from docie_bench.security import redact_fields
 from docie_bench.settings import get_settings
 from docie_bench.storage.db import ExtractionAudit, database_enabled, session_scope
+from docie_bench.telemetry import EXTRACTION_LATENCY, EXTRACTION_REQUESTS
 
 
 def save_extraction_audit(response: ExtractionResponse, *, tenant_id: str | None = None) -> None:
@@ -40,3 +41,21 @@ def save_extraction_audit(response: ExtractionResponse, *, tenant_id: str | None
                 dynamic_schema=response.dynamic_schema,
             )
         )
+
+
+def record_extraction(response: ExtractionResponse, *, tenant_id: str | None = None) -> None:
+    """Emit the observability side effects for one extraction: Prometheus metrics
+    plus the durable audit row.
+
+    Shared by the sync API handlers and the async Studio (Inngest) worker path so
+    both surface identically in the Observability tab / Grafana. Increments the
+    request counter, observes latency, then persists the audit row (same order and
+    labels/fields the sync path has always used).
+    """
+    EXTRACTION_REQUESTS.labels(
+        response.schema_name, response.model_profile, str(response.validation.valid).lower()
+    ).inc()
+    EXTRACTION_LATENCY.labels(response.schema_name, response.model_profile).observe(
+        response.latency_ms / 1000
+    )
+    save_extraction_audit(response, tenant_id=tenant_id)
