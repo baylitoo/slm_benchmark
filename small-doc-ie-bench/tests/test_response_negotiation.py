@@ -13,7 +13,11 @@ from typing import Any
 import httpx
 import pytest
 
-from docie_bench.llm.model_gateway import InvalidModelResponseError, reset_gateway_state
+from docie_bench.llm.model_gateway import (
+    InvalidModelResponseError,
+    ModelGatewayError,
+    reset_gateway_state,
+)
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.openai_client import OpenAICompatibleClient
 from docie_bench.llm.response_format import style_ladder
@@ -108,6 +112,131 @@ async def test_json_schema_empty_content_downgrades_to_json_object() -> None:
     assert styles_seen == ["json_schema", "json_object"]
     # The EFFECTIVE style is recorded so unconstrained decoding is distinguishable.
     assert client.last_response_format_style == "json_object"
+
+
+def _grammar_error() -> httpx.Response:
+    # Mirrors this project's Ollama: a hard HTTP 400 (not empty 200) when a
+    # strong response_format style cannot be compiled into a sampler grammar.
+    return httpx.Response(
+        400,
+        json={
+            "error": {
+                "message": (
+                    "Failed to initialize samplers: failed to parse grammar: "
+                    "unexpected end of input"
+                )
+            }
+        },
+    )
+
+
+async def test_json_schema_grammar_400_downgrades_to_json_object() -> None:
+    styles_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payload = json.loads(request.read().decode("utf-8"))
+        rf = payload.get("response_format")
+        style = rf.get("type") if rf else "none"
+        styles_seen.append(style)
+        # Ollama defect: json_schema hard-fails with a grammar-compilation 400.
+        if style == "json_schema":
+            return _grammar_error()
+        # json_object honoured -> valid JSON.
+        return _completion('{"invoice_number": {"value": "INV-1"}}')
+
+    client = await _client(_profile(capability_discovery="disabled"), handler)
+    try:
+        result = await _chat(client)
+    finally:
+        await client.aclose()
+
+    assert result == {"invoice_number": {"value": "INV-1"}}
+    # It tried json_schema first, got a grammar 400, then downgraded to json_object.
+    assert styles_seen == ["json_schema", "json_object"]
+    assert client.last_response_format_style == "json_object"
+
+
+async def test_generic_style_non_grammar_400_still_raises() -> None:
+    # A 400 whose body is NOT a grammar/schema-compilation failure is a genuine
+    # bad request; it must raise, not trigger a downgrade. This is what makes the
+    # marker gate meaningful (vs. blindly downgrading every generic 400).
+    styles_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payload = json.loads(request.read().decode("utf-8"))
+        rf = payload.get("response_format")
+        styles_seen.append(rf.get("type") if rf else "none")
+        return httpx.Response(
+            400, json={"error": {"message": "invalid request: unknown field 'foo'"}}
+        )
+
+    client = await _client(_profile(capability_discovery="disabled"), handler)
+    try:
+        with pytest.raises(ModelGatewayError):
+            await _chat(client)
+    finally:
+        await client.aclose()
+    # No downgrade attempted: only the declared style was tried before raising.
+    assert styles_seen == ["json_schema"]
+
+
+async def test_generic_400_mentioning_json_schema_still_raises() -> None:
+    # The markers are narrow (only true compile-failure phrases). A genuine
+    # bad-request 400 that merely ECHOES the style name ("json_schema") — e.g. an
+    # unsupported-style error — must still raise, not spuriously downgrade. This
+    # guards the SHARED sync /v1/extract + CLI path from masking real 400s.
+    styles_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payload = json.loads(request.read().decode("utf-8"))
+        rf = payload.get("response_format")
+        styles_seen.append(rf.get("type") if rf else "none")
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "response_format.type 'json_schema' is not supported by this model"
+                }
+            },
+        )
+
+    client = await _client(_profile(capability_discovery="disabled"), handler)
+    try:
+        with pytest.raises(ModelGatewayError):
+            await _chat(client)
+    finally:
+        await client.aclose()
+    # 'json_schema' appears in the body but is not a compile failure -> no downgrade.
+    assert styles_seen == ["json_schema"]
+
+
+async def test_singleton_style_grammar_400_raises_without_downgrade() -> None:
+    # A purpose-built style has no weaker rung; a grammar 400 must surface as an
+    # error (retryable by the gateway) rather than silently switching families.
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _grammar_error()
+
+    client = await _client(
+        _profile(response_format_style="vllm_guided_json", capability_discovery="disabled"),
+        handler,
+    )
+    try:
+        with pytest.raises(ModelGatewayError):
+            await _chat(client)
+    finally:
+        await client.aclose()
+    assert calls == 1
+    assert client.last_response_format_style is None
 
 
 async def test_effective_style_matches_declared_when_honored() -> None:
