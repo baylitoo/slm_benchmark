@@ -302,7 +302,7 @@ schema, or document-content change creates a new dataset identity.
 Supported files:
 
 - `.txt`: already OCR'd text;
-- `.pdf`: text layer via `pdfplumber` or OCR fallback;
+- `.pdf`: spatial text layer via `liteparse` (PDFium), with OCR fallback for scanned pages;
 - `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`: OCR backend required.
 
 ### Dynamic schemas

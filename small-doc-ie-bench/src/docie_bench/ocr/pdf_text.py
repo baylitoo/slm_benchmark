@@ -4,20 +4,55 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-import pdfplumber
+from liteparse import LiteParse
 
 from docie_bench.ocr.base import OCRBackend, stable_block_id, text_to_blocks
 from docie_bench.schemas.common import BoundingBox, OCRBlock
+from docie_bench.settings import get_settings
 
 
 class PdfTextBackend(OCRBackend):
+    """PDF text backend built on liteparse (PDFium spatial text + pluggable OCR).
+
+    PDFium extracts a PDF's native text layer fast and with spatial geometry;
+    pages without a usable text layer (scanned) are OCR'd by liteparse — the
+    built-in Tesseract by default, or a VLM-backed server when ``ocr_server_url``
+    is configured. The VLM route matters only for text-only extraction models
+    that cannot read the page image themselves; vision-capable profiles bypass
+    OCR entirely and receive page images directly (see ``docie_bench.vision``).
+    """
+
     name = "pdf_text"
+
+    def __init__(
+        self,
+        *,
+        language: str | None = None,
+        ocr_server_url: str | None = None,
+        dpi: int | None = None,
+    ) -> None:
+        settings = get_settings()
+        self._language = language or settings.ocr_language
+        self._ocr_server_url = (
+            ocr_server_url if ocr_server_url is not None else settings.ocr_server_url
+        )
+        self._dpi = int(dpi if dpi is not None else settings.ocr_dpi)
 
     def version(self) -> str:
         try:
-            return f"1:pdfplumber-{version('pdfplumber')}"
+            return f"1:liteparse-{version('liteparse')}"
         except PackageNotFoundError:
-            return "1:pdfplumber-unknown"
+            return "1:liteparse-unknown"
+
+    def configuration(self) -> dict[str, Any]:
+        # Part of the OCR cache key: changing the OCR route/dpi/language must
+        # invalidate cached artifacts.
+        return {
+            "engine": "liteparse",
+            "dpi": self._dpi,
+            "ocr_server_url": self._ocr_server_url or "",
+            "language": self._language or "",
+        }
 
     def extract(self, path: Path) -> list[OCRBlock]:
         suffix = path.suffix.lower()
@@ -28,53 +63,36 @@ class PdfTextBackend(OCRBackend):
         if suffix != ".pdf":
             raise ValueError(f"pdf_text backend supports .pdf and .txt only, got {path.suffix}")
 
+        parser = LiteParse(
+            ocr_enabled=True,
+            ocr_server_url=self._ocr_server_url,
+            ocr_language=self._language,
+            dpi=float(self._dpi),
+            quiet=True,
+        )
+        result = parser.parse(path)
+
         blocks: list[OCRBlock] = []
-        with pdfplumber.open(str(path)) as pdf:
-            for page_idx, page in enumerate(pdf.pages, start=1):
-                words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False)
-                if not words:
-                    text = page.extract_text() or ""
-                    for idx, line in enumerate(text.splitlines()):
-                        line = line.strip()
-                        if line:
-                            blocks.append(
-                                OCRBlock(
-                                    id=stable_block_id(page_idx, idx, line),
-                                    text=line,
-                                    page=page_idx,
-                                    source="pdf_text",
-                                )
-                            )
+        for page in result.pages:
+            for idx, item in enumerate(page.text_items):
+                text = (item.text or "").strip()
+                if not text:
                     continue
-                # Group words into approximate lines by top coordinate.
-                rows: list[list[dict[str, Any]]] = []
-                for word in words:
-                    placed = False
-                    for row in rows:
-                        if abs(row[0]["top"] - word["top"]) < 3:
-                            row.append(word)
-                            placed = True
-                            break
-                    if not placed:
-                        rows.append([word])
-                for idx, row in enumerate(rows):
-                    row = sorted(row, key=lambda item: item["x0"])
-                    text = " ".join(item["text"] for item in row).strip()
-                    if not text:
-                        continue
-                    bbox = BoundingBox(
-                        x0=min(float(item["x0"]) for item in row),
-                        y0=min(float(item["top"]) for item in row),
-                        x1=max(float(item["x1"]) for item in row),
-                        y1=max(float(item["bottom"]) for item in row),
+                bbox = BoundingBox(
+                    x0=float(item.x),
+                    y0=float(item.y),
+                    x1=float(item.x) + float(item.width),
+                    y1=float(item.y) + float(item.height),
+                )
+                confidence = getattr(item, "confidence", None)
+                blocks.append(
+                    OCRBlock(
+                        id=stable_block_id(page.page_num, idx, text),
+                        text=text,
+                        page=page.page_num,
+                        bbox=bbox,
+                        source="pdf_text",
+                        confidence=float(confidence) if confidence is not None else None,
                     )
-                    blocks.append(
-                        OCRBlock(
-                            id=stable_block_id(page_idx, idx, text),
-                            text=text,
-                            page=page_idx,
-                            bbox=bbox,
-                            source="pdf_text",
-                        )
-                    )
+                )
         return blocks
