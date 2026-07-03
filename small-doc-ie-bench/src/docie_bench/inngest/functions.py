@@ -25,6 +25,8 @@ import inngest
 
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.client import inngest_client
+from docie_bench.llm.capability_probe import probe_endpoint
+from docie_bench.llm.openai_client import OpenAICompatibleClient
 from docie_bench.inngest.realtime import (
     TOPIC_ERROR,
     TOPIC_RESULT,
@@ -340,9 +342,9 @@ def _record_deploy_placement(*, model_name: str, record: Any) -> None:
 
     Best-effort: without DATABASE_URL the catalog is unavailable — log and skip
     (the deploy itself still succeeds, it is just not discoverable).
-    NOTE: the recorded endpoint is the control plane's worker-local
-    ``127.0.0.1`` URL; making it an advertised/reachable address is the
-    endpoint-binding follow-up.
+    The recorded endpoint is the control plane's *advertised* URL
+    (``DOCIE_ADVERTISE_HOST``, default 127.0.0.1) — reachable from other
+    containers when compose sets it to the worker service name.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
@@ -364,6 +366,41 @@ def _record_deploy_placement(*, model_name: str, record: Any) -> None:
             "no DATABASE_URL: placement for %r not recorded; store:%s will not resolve",
             model_name,
             model_name,
+        )
+
+
+async def _probe_and_persist_style(model_name: str, deployment_name: str) -> None:
+    """Canary-probe a fresh deployment and persist its known-good style.
+
+    Persist rule is literally ``negotiated_style = probe.effective_style``:
+    None on ``source="error"`` (resolver falls back to the engine default),
+    the declared family style on ``source="skipped"`` (non-generic families
+    like nuextract3 are never canaried), and the confirmed style on a real
+    probe — no special-casing.
+
+    ENTIRELY best-effort: a probe failure must never fail the deploy; the
+    style simply stays NULL and the placement resolver's precedence ladder
+    (family contract, then engine default) takes over.
+    """
+    from docie_bench.serving.catalog import ModelCatalog
+
+    try:
+        # Placement was just written, negotiated_style is still None -> this
+        # yields the declared family/engine style, which is what gets probed.
+        profile = resolve_store_profile(model_name)
+        client = OpenAICompatibleClient(profile)
+        try:
+            probe = await probe_endpoint(client, force=True)
+        finally:
+            await client.aclose()
+        style = probe.effective_style if probe.source != "error" else None
+        ModelCatalog().set_placement_style(deployment_name, style)
+    except Exception:  # noqa: BLE001 - probe failure must never fail the deploy
+        logger.warning(
+            "probe-at-deploy failed for %r; negotiated_style stays NULL and the "
+            "resolver falls back to the engine default",
+            model_name,
+            exc_info=True,
         )
 
 
@@ -392,6 +429,10 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             context_length=int(data.get("context_length", 8192)),
         )
     _record_deploy_placement(model_name=str(model), record=record)
+    if isinstance(record, dict) and str(record.get("state") or "") == "ready":
+        spec = record.get("spec") or {}
+        deployment_name = str(spec.get("name") or model)
+        await _probe_and_persist_style(str(model), deployment_name)
     return record
 
 
