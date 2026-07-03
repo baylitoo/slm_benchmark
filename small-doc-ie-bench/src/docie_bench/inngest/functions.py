@@ -32,6 +32,10 @@ from docie_bench.inngest.realtime import (
     publish,
 )
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
+from docie_bench.serving.placement_resolver import (
+    STORE_PROFILE_PREFIX,
+    resolve_store_profile,
+)
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 
@@ -43,10 +47,19 @@ MODELS_CONFIG_PATH = Path("configs/models.yaml")
 def _resolve_profile(name: str | None) -> ModelProfile:
     """Resolve a model profile by name, falling back to the env default.
 
-    Mirrors ``docie_bench.api.resolve_profile`` but never raises (jobs prefer a
-    sensible default over a hard failure); an unknown name is logged.
+    Mirrors ``docie_bench.api.resolve_profile`` but never raises for plain
+    profile names (jobs prefer a sensible default over a hard failure); an
+    unknown name is logged.
+
+    EXCEPTION — ``store:<name>``: the PlacementError propagates (surfacing on
+    the job's ``error`` realtime topic) instead of falling back to the env
+    default. An explicit ``store:`` ref means "extract with the deployment I
+    just made"; silently substituting the env-default upstream is exactly the
+    deploy/extraction disconnect this resolver exists to fix.
     """
     settings = get_settings()
+    if name and name.startswith(STORE_PROFILE_PREFIX):
+        return resolve_store_profile(name[len(STORE_PROFILE_PREFIX) :])
     if name and MODELS_CONFIG_PATH.exists():
         profiles = load_model_profiles(MODELS_CONFIG_PATH)
         if name in profiles:
@@ -314,6 +327,46 @@ def _serving_control_plane() -> Any:
     return ControlPlane.from_defaults()
 
 
+# RuntimeKind value -> gateway/extraction "engine" (the serving backend flavour
+# the placement resolver keys its style defaults on).
+_ENGINE_BY_RUNTIME: dict[str, str] = {
+    "llamacpp": "llama-server",
+    "ollama": "ollama",
+}
+
+
+def _record_deploy_placement(*, model_name: str, record: Any) -> None:
+    """Persist the deployment's placement so ``store:<name>`` can resolve it.
+
+    Best-effort: without DATABASE_URL the catalog is unavailable — log and skip
+    (the deploy itself still succeeds, it is just not discoverable).
+    NOTE: the recorded endpoint is the control plane's worker-local
+    ``127.0.0.1`` URL; making it an advertised/reachable address is the
+    endpoint-binding follow-up.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    if not isinstance(record, dict):
+        return
+    spec = record.get("spec") or {}
+    launch = spec.get("launch") or {}
+    runtime = str(launch.get("runtime") or "")
+    try:
+        ModelCatalog().record_placement(
+            str(spec.get("name") or model_name),
+            model_name=model_name,
+            engine=_ENGINE_BY_RUNTIME.get(runtime, runtime or "llama-server"),
+            endpoint=str(record.get("endpoint") or ""),
+            state=str(record.get("state") or "unknown"),
+        )
+    except CatalogUnavailableError:
+        logger.warning(
+            "no DATABASE_URL: placement for %r not recorded; store:%s will not resolve",
+            model_name,
+            model_name,
+        )
+
+
 async def _run_deploy(data: dict[str, Any]) -> Any:
     """Deploy a model via the control plane (in-worker subprocess runtime).
 
@@ -326,17 +379,20 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     cp = _serving_control_plane()
     runtime = data.get("runtime")
     if runtime:
-        return await cp.serve(
+        record = await cp.serve(
             model,
             name=data.get("name"),
             runtime=runtime,
             replicas=int(data.get("replicas", 1)),
         )
-    return await cp.up(
-        model,
-        port=int(data.get("port", 8088)),
-        context_length=int(data.get("context_length", 8192)),
-    )
+    else:
+        record = await cp.up(
+            model,
+            port=int(data.get("port", 8088)),
+            context_length=int(data.get("context_length", 8192)),
+        )
+    _record_deploy_placement(model_name=str(model), record=record)
+    return record
 
 
 @inngest_client.create_function(

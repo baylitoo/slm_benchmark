@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import shutil
 from collections.abc import Awaitable, Mapping, Sequence, Set
@@ -16,6 +17,8 @@ from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 Result = object | Awaitable[object]
@@ -448,7 +451,31 @@ class _DefaultSupervisor:
         return self.backend.deploy(replace(record.spec, desired_state=DesiredState.RUNNING))
 
     def stop(self, name: str) -> object:
-        return self.backend.stop(name)
+        result = self.backend.stop(name)
+        _clear_placement(name)
+        return result
+
+    def remove(self, name: str) -> object:
+        result = self.backend.remove(name)
+        _clear_placement(name)
+        return result
+
+
+def _clear_placement(name: str) -> None:
+    """Drop the catalog placement of a stopped/removed deployment (best-effort).
+
+    Without this, ``store:<model>`` would keep resolving to a dead endpoint
+    after ``docie stop``. Best-effort by design: a missing DATABASE_URL or a DB
+    hiccup must never block stopping a local process.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        ModelCatalog().clear_placement(name)
+    except CatalogUnavailableError:
+        pass  # no DATABASE_URL -> nothing was ever recorded; nothing to clear
+    except Exception:  # noqa: BLE001 - staleness cleanup must not fail the stop
+        logger.warning("could not clear catalog placement for %r", name, exc_info=True)
 
 
 def to_data(value: object) -> object:

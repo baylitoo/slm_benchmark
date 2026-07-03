@@ -54,6 +54,12 @@ from docie_bench.security import (
     redact_fields,
     tenant_guard,
 )
+from docie_bench.serving.placement_resolver import (
+    STORE_PROFILE_PREFIX,
+    PlacementNotFoundError,
+    PlacementNotReadyError,
+    resolve_store_profile,
+)
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 from docie_bench.storage.db import get_session_factory, init_engine
@@ -136,6 +142,15 @@ def default_profile() -> ModelProfile:
 def resolve_profile(profile_name: str | None) -> ModelProfile:
     if profile_name is None:
         return default_profile()
+    if profile_name.startswith(STORE_PROFILE_PREFIX):
+        # "store:<name>" targets a live deployment of a store model; the
+        # resolver reads the placement the deploy job recorded in the catalog.
+        try:
+            return resolve_store_profile(profile_name[len(STORE_PROFILE_PREFIX) :])
+        except PlacementNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PlacementNotReadyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     config_path = Path("configs/models.yaml")
     if config_path.exists():
         profiles = load_model_profiles(config_path)
