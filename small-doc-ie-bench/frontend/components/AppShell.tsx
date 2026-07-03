@@ -172,7 +172,7 @@ export function AppShell() {
                 hidden={item.id !== active}
                 className={item.id === active ? "animate-fade-in" : undefined}
               >
-                {item.id === "playground" && <Playground />}
+                {item.id === "playground" && <Playground active={active === "playground"} />}
                 {item.id === "deploy" && <Deploy active={active === "deploy"} />}
                 {item.id === "benchmark" && <Benchmark />}
                 {item.id === "observability" && <Observability />}
