@@ -225,10 +225,38 @@ def _up_plane(tmp_path: Path) -> tuple[ControlPlane, PersistentSupervisor]:
     return ControlPlane(None, None, wrapper, None), supervisor  # type: ignore[arg-type]
 
 
-def test_serve_store_model_binds_all_interfaces(tmp_path: Path) -> None:
-    # Bind 0.0.0.0 so api/bench containers on the compose network can reach the
-    # auth-less llama-server (trusted private networks only — see the SECURITY
-    # note in control_plane.serve_store_model).
+def test_serve_store_model_binds_loopback_by_default(tmp_path: Path, monkeypatch) -> None:
+    # The default (host-native CLI, no DOCIE_ADVERTISE_HOST) advertises loopback,
+    # so the auth-less llama-server must also BIND loopback — a laptop `docie up`
+    # never exposes the model on LAN/Wi-Fi interfaces.
+    monkeypatch.delenv("DOCIE_ADVERTISE_HOST", raising=False)
+    plane, supervisor = _up_plane(tmp_path)
+
+    asyncio.run(plane.up("nuextract3", port=8088))
+
+    assert supervisor.get("nuextract3").spec.launch.host == "127.0.0.1"
+
+
+@pytest.mark.parametrize("advertise", ["localhost", "::1"])
+def test_serve_store_model_binds_loopback_for_loopback_aliases(
+    tmp_path: Path, monkeypatch, advertise: str
+) -> None:
+    monkeypatch.setenv("DOCIE_ADVERTISE_HOST", advertise)
+    plane, supervisor = _up_plane(tmp_path)
+
+    asyncio.run(plane.up("nuextract3", port=8088))
+
+    assert supervisor.get("nuextract3").spec.launch.host == "127.0.0.1"
+
+
+def test_serve_store_model_binds_all_interfaces_when_advertised_beyond_loopback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Only a non-loopback advertise (compose sets the worker service name so
+    # api/bench containers dial in) justifies the 0.0.0.0 bind of the auth-less
+    # llama-server (trusted private networks only — see the SECURITY note in
+    # control_plane.serve_store_model).
+    monkeypatch.setenv("DOCIE_ADVERTISE_HOST", "worker")
     plane, supervisor = _up_plane(tmp_path)
 
     asyncio.run(plane.up("nuextract3", port=8088))
@@ -242,8 +270,7 @@ def test_advertise_host_default_127(tmp_path: Path, monkeypatch) -> None:
 
     record = asyncio.run(plane.up("nuextract3", port=8088))
 
-    # Bind and advertise are independent: bound to all interfaces, advertised
-    # (record endpoint + launch spec endpoint) as loopback by default.
+    # Advertised URL (record endpoint + launch spec endpoint) is loopback by default.
     assert supervisor.get("nuextract3").spec.launch.endpoint == "http://127.0.0.1:8088/v1"
     assert record["endpoint"] == "http://127.0.0.1:8088/v1"
 

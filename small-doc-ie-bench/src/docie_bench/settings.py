@@ -90,9 +90,11 @@ class Settings(BaseSettings):
     studio_orphan_grace_hours: int = Field(default=24, ge=0, le=8760)
 
     # Hostname baked into a deployment's *advertised* endpoint (the URL recorded
-    # in the placement catalog + used by the deploy health check). The runtime
-    # itself binds 0.0.0.0; this only controls how others reach it. Default
-    # suits the host-native CLI; compose sets it to the `worker` service name.
+    # in the placement catalog + used by the deploy health check). It also gates
+    # the runtime's bind interface: loopback advertise (the default, host-native
+    # CLI) keeps the auth-less llama-server bound to 127.0.0.1; a non-loopback
+    # value (compose sets the `worker` service name) binds 0.0.0.0 so api/bench
+    # containers can reach it.
     # NOTE: declared here for documentation/discoverability — the serving layer
     # reads DOCIE_ADVERTISE_HOST from os.environ directly (like
     # DOCIE_SERVING_HOME) to stay decoupled from app settings.
