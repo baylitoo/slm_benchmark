@@ -89,6 +89,15 @@ class Settings(BaseSettings):
     # ``complete()``-commits the artifact row) is never swept out from under it.
     studio_orphan_grace_hours: int = Field(default=24, ge=0, le=8760)
 
+    # Hostname baked into a deployment's *advertised* endpoint (the URL recorded
+    # in the placement catalog + used by the deploy health check). The runtime
+    # itself binds 0.0.0.0; this only controls how others reach it. Default
+    # suits the host-native CLI; compose sets it to the `worker` service name.
+    # NOTE: declared here for documentation/discoverability — the serving layer
+    # reads DOCIE_ADVERTISE_HOST from os.environ directly (like
+    # DOCIE_SERVING_HOME) to stay decoupled from app settings.
+    docie_advertise_host: str = "127.0.0.1"
+
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
     openai_compat_model: str = "local-model"

@@ -42,7 +42,10 @@ class FakeAdapter:
         self.next_pid += 1
         self.running.add(self.next_pid)
         self.log_paths.append(log_path)
-        return RuntimeProcess(spec.runtime, f"http://{spec.host}:{spec.port}/v1", self.next_pid)
+        # Mirror RuntimeAdapter.endpoint(): an explicit advertised endpoint wins
+        # over the bind host:port (the bind/advertise seam probe deploys rely on).
+        endpoint = spec.endpoint or f"http://{spec.host}:{spec.port}/v1"
+        return RuntimeProcess(spec.runtime, endpoint, self.next_pid)
 
     def is_running(self, pid: int | None) -> bool:
         return pid in self.running

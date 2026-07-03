@@ -421,14 +421,23 @@ class _DefaultSupervisor:
                 f"{exc} Seed it first (ModelStore.seed_from_ollama / add_gguf — "
                 f"see serving/README.md), then re-run `docie up {name}`."
             ) from exc
+        # Bind vs advertise are independent seams: `host` becomes llama-server's
+        # --host (the bind interface), while `endpoint` is the URL recorded on the
+        # DeploymentRecord and used by the health check + placement catalog. The
+        # advertised host defaults to 127.0.0.1 (host-native CLI); compose sets
+        # DOCIE_ADVERTISE_HOST to the worker service name so api/bench containers
+        # resolve it (matching the DOCIE_SERVING_HOME os.environ precedent above).
+        advertise_host = os.environ.get("DOCIE_ADVERTISE_HOST", "127.0.0.1")
         spec = DeploymentSpec(
             name=entry.name,
             launch=RuntimeLaunchSpec(
                 runtime=RuntimeKind.LLAMACPP,
                 model=entry.model_path.as_posix(),
                 alias=entry.name,
-                host="127.0.0.1",
+                # SECURITY: Bind 0.0.0.0 so api/bench containers on the compose network can reach the runtime; llama-server is auth-less, so this exposes the model to anything sharing the network/host — acceptable only on a trusted private network.
+                host="0.0.0.0",  # noqa: S104 - deliberate cross-container bind, see above
                 port=port,
+                endpoint=f"http://{advertise_host}:{port}/v1",
                 context_length=context_length,
                 extra_args=store.family_launch_args(name),
             ),
