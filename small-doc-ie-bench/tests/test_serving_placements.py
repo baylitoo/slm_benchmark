@@ -225,6 +225,17 @@ _READY_RECORD: dict[str, Any] = {
 
 class _ReadyControlPlane:
     async def up(self, name: str, *, port: int, context_length: int) -> dict[str, Any]:
+        # Mirror the real seam: since the master reconciliation, `up`-path
+        # placement recording happens INSIDE serve_store_model (shared with
+        # host-native `docie up`), not in _run_deploy. A stub control plane
+        # must reproduce that write or the probe has no placement to update.
+        ModelCatalog().record_placement(
+            _READY_RECORD["spec"]["name"],
+            model_name=name,
+            engine="llama-server",
+            endpoint=_READY_RECORD["endpoint"],
+            state=_READY_RECORD["state"],
+        )
         return dict(_READY_RECORD)
 
 
