@@ -15,7 +15,14 @@ export interface ExtractRequest {
   content_b64?: string;
   filename?: string;
   schema_name?: string;
+  /** Free-text models.yaml/CLI profile name. Retained for back-compat. */
   model_profile?: string;
+  /**
+   * Explicit live-deployment selector = a DeploymentRecord `spec.name`. The
+   * backend resolves it to that deployment's runtime endpoint (PR-a resolver);
+   * it wins over `model_profile`. The Playground sends only this field.
+   */
+  deployment?: string;
   ocr_backend?: string;
   language?: string;
 }
@@ -367,6 +374,18 @@ export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse>
 // ---------------------------------------------------------------------------
 // Derived helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Deployments that can actually serve an extraction: lifecycle `ready` AND a
+ * concrete `endpoint` AND a `spec.name` (the token the backend resolver keys
+ * on). starting/degraded/failed/stopped are excluded. Mirrors the resolver's
+ * "live/selectable" definition (PR-a).
+ */
+export function selectableDeployments(records: DeploymentRecord[]): DeploymentRecord[] {
+  return records.filter(
+    (r) => r.state === "ready" && !!r.endpoint && !!r.spec?.name,
+  );
+}
 
 /** Human-readable byte size, e.g. 1234567 -> "1.2 MB". */
 export function formatBytes(bytes: number | null | undefined): string {
