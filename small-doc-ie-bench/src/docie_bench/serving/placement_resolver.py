@@ -22,6 +22,9 @@ Style precedence (the load-bearing rule):
 
 from __future__ import annotations
 
+import ipaddress
+import urllib.parse
+
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.catalog import ModelCatalog
 from docie_bench.serving.model_store import FAMILIES, FamilyContract, TemplateDelivery
@@ -65,6 +68,26 @@ def _resolve_style(
         # declared style is binding — never swap in an engine default.
         return contract.response_format_style
     return ENGINE_DEFAULT_STYLE.get(engine, _FALLBACK_STYLE)
+
+
+def endpoint_is_loopback(url: str) -> bool:
+    """True when ``url``'s host is only reachable from its own machine.
+
+    The deploy runtime records its endpoint from the WORKER's point of view, so
+    a loopback (127.0.0.0/8, ``localhost``, ``::1``) or unspecified (0.0.0.0)
+    host is worker-local: in the split api/worker compose topology no other
+    container can ever reach it. Callers that run in a different process/host
+    than the deploy runtime should reject such endpoints up front instead of
+    burning the client's timeout on doomed connect retries.
+    """
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
 
 
 def resolve_store_profile(name: str, *, catalog: ModelCatalog | None = None) -> ModelProfile:
@@ -115,5 +138,6 @@ __all__ = [
     "PlacementError",
     "PlacementNotFoundError",
     "PlacementNotReadyError",
+    "endpoint_is_loopback",
     "resolve_store_profile",
 ]

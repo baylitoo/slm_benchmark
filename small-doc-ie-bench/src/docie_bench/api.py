@@ -58,6 +58,7 @@ from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
     PlacementNotFoundError,
     PlacementNotReadyError,
+    endpoint_is_loopback,
     resolve_store_profile,
 )
 from docie_bench.settings import get_settings
@@ -146,11 +147,29 @@ def resolve_profile(profile_name: str | None) -> ModelProfile:
         # "store:<name>" targets a live deployment of a store model; the
         # resolver reads the placement the deploy job recorded in the catalog.
         try:
-            return resolve_store_profile(profile_name[len(STORE_PROFILE_PREFIX) :])
+            profile = resolve_store_profile(profile_name[len(STORE_PROFILE_PREFIX) :])
         except PlacementNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except PlacementNotReadyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if endpoint_is_loopback(profile.base_url):
+            # The deploy runtime records its endpoint from the WORKER's point of
+            # view; in the documented api/worker compose topology a loopback
+            # endpoint is unreachable from this process. Fail fast (worker-only
+            # for now) instead of burning timeout_seconds x retries on doomed
+            # connects. Deployments recorded with an advertised (non-loopback)
+            # endpoint pass this guard untouched.
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    f"{profile_name} resolved to {profile.base_url}, which is "
+                    "loopback on the worker that deployed it and not reachable "
+                    "from the API. Run the extraction through the worker "
+                    "(POST /v1/studio/extract) or record a non-loopback "
+                    "advertised endpoint at deploy time."
+                ),
+            )
+        return profile
     config_path = Path("configs/models.yaml")
     if config_path.exists():
         profiles = load_model_profiles(config_path)

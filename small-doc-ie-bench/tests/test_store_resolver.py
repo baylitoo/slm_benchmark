@@ -21,6 +21,7 @@ from docie_bench.serving.placement_resolver import (
     ENGINE_DEFAULT_STYLE,
     PlacementNotFoundError,
     PlacementNotReadyError,
+    endpoint_is_loopback,
     resolve_store_profile,
 )
 
@@ -49,12 +50,13 @@ def _place(
     engine: str = "llama-server",
     state: str = "ready",
     negotiated_style: str | None = None,
+    endpoint: str = _ENDPOINT,
 ) -> None:
     ModelCatalog().record_placement(
         name,
         model_name=name,
         engine=engine,
-        endpoint=_ENDPOINT,
+        endpoint=endpoint,
         state=state,
         negotiated_style=negotiated_style,
     )
@@ -153,6 +155,63 @@ def test_api_resolve_profile_store_maps_error_to_http(_sqlite_catalog: None) -> 
     with pytest.raises(HTTPException) as not_ready:
         resolve_profile("store:qwen2.5-1.5b")
     assert not_ready.value.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("url", "loopback"),
+    [
+        ("http://127.0.0.1:8088/v1", True),
+        ("http://localhost:8088/v1", True),
+        ("http://[::1]:8088/v1", True),
+        ("http://127.1.2.3:8088/v1", True),
+        ("http://0.0.0.0:8088/v1", True),  # unspecified: unreachable as recorded
+        ("http://worker:8088/v1", False),
+        ("http://192.168.1.20:8088/v1", False),
+        ("https://models.example/v1", False),
+    ],
+)
+def test_endpoint_is_loopback(url: str, loopback: bool) -> None:
+    assert endpoint_is_loopback(url) is loopback
+
+
+def test_api_resolve_profile_rejects_worker_loopback_endpoint(_sqlite_catalog: None) -> None:
+    """The placement endpoint is recorded from the WORKER's point of view; in
+    the documented api/worker compose topology the API can never reach the
+    worker's 127.0.0.1, so resolving it 'successfully' would burn
+    timeout_seconds x retries per request. Fail fast with 501 (worker-only)."""
+    from docie_bench.api import resolve_profile
+
+    _seed("qwen2.5-1.5b", family="openai_chat")
+    _place("qwen2.5-1.5b")  # loopback _ENDPOINT
+
+    with pytest.raises(HTTPException) as excinfo:
+        resolve_profile("store:qwen2.5-1.5b")
+    assert excinfo.value.status_code == 501
+    assert "127.0.0.1:8088" in excinfo.value.detail
+    # The message must point at the working alternatives.
+    assert "/v1/studio/extract" in excinfo.value.detail
+
+
+def test_api_resolve_profile_accepts_advertised_endpoint(_sqlite_catalog: None) -> None:
+    """A non-loopback (advertised) endpoint passes the guard untouched."""
+    from docie_bench.api import resolve_profile
+
+    _seed("qwen2.5-1.5b", family="openai_chat")
+    _place("qwen2.5-1.5b", endpoint="http://worker:8088/v1")
+
+    profile = resolve_profile("store:qwen2.5-1.5b")
+    assert profile.base_url == "http://worker:8088/v1"
+
+
+def test_inngest_resolve_profile_allows_worker_local_endpoint(_sqlite_catalog: None) -> None:
+    """The worker resolves its own deployments, so loopback IS reachable there
+    — the guard is API-only."""
+    from docie_bench.inngest.functions import _resolve_profile
+
+    _seed("qwen2.5-1.5b", family="openai_chat")
+    _place("qwen2.5-1.5b")
+
+    assert _resolve_profile("store:qwen2.5-1.5b").base_url == _ENDPOINT
 
 
 def test_inngest_resolve_profile_store_raises(_sqlite_catalog: None) -> None:
