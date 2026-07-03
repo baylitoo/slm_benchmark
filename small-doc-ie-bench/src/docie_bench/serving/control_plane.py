@@ -442,7 +442,12 @@ class _DefaultSupervisor:
         # post-spawn probe sees "Connection refused" and the record freezes at
         # STARTING forever; await_ready re-probes until it is honestly serving.
         self.backend.deploy(spec)
-        return self.backend.await_ready(spec.name)
+        record = self.backend.await_ready(spec.name)
+        # Record the placement at the same seam stop()/remove() clear it, so
+        # every deploy surface — host-native `docie up` and the worker's Inngest
+        # job alike — makes store:<name> resolvable, not just the worker path.
+        _record_placement(name, record)
+        return record
 
     def start(self, name: str) -> object:
         from docie_bench.serving.supervisor import DesiredState
@@ -459,6 +464,39 @@ class _DefaultSupervisor:
         result = self.backend.remove(name)
         _clear_placement(name)
         return result
+
+
+def _record_placement(model_name: str, record: object) -> None:
+    """Upsert the catalog placement of a deployed store model (best-effort).
+
+    Symmetric with ``_clear_placement``: recording lives at the supervisor seam
+    so CLI and job deploys behave identically (the error hint "Deploy it first
+    (... `docie up <name>`)" in the placement resolver depends on this).
+    Best-effort by design — a missing DATABASE_URL or a DB hiccup must never
+    fail a deploy that already succeeded; the deployment is then just not
+    discoverable via ``store:<model_name>``.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    spec = getattr(record, "spec", None)
+    state = getattr(record, "state", None)
+    try:
+        ModelCatalog().record_placement(
+            str(getattr(spec, "name", None) or model_name),
+            model_name=model_name,
+            # serve_store_model always launches llama.cpp (RuntimeKind.LLAMACPP).
+            engine="llama-server",
+            endpoint=str(getattr(record, "endpoint", None) or ""),
+            state=str(getattr(state, "value", state) or "unknown"),
+        )
+    except CatalogUnavailableError:
+        logger.warning(
+            "no DATABASE_URL: placement for %r not recorded; store:%s will not resolve",
+            model_name,
+            model_name,
+        )
+    except Exception:  # noqa: BLE001 - discoverability must not fail the deploy
+        logger.warning("could not record catalog placement for %r", model_name, exc_info=True)
 
 
 def _clear_placement(name: str) -> None:

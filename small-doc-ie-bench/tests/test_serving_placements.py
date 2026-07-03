@@ -99,22 +99,33 @@ def test_set_placement_style_updates_and_noops_when_missing(_sqlite_catalog: Non
     catalog.set_placement_style("no-such-deployment", "json_object")  # must not raise
 
 
-def test_run_deploy_records_placement(_sqlite_catalog: None, monkeypatch) -> None:
+_SERVE_RECORD: dict[str, Any] = {
+    "spec": {"name": "invoice-extractor", "launch": {"runtime": "llamacpp"}},
+    "endpoint": "http://127.0.0.1:8088/v1",
+    "state": "ready",
+}
+
+
+class _FakeServeControlPlane:
+    async def serve(
+        self, model: str, *, name: str | None, runtime: str | None, replicas: int
+    ) -> dict[str, Any]:
+        return _SERVE_RECORD
+
+
+def test_run_deploy_records_placement_for_runtime_deploys(
+    _sqlite_catalog: None, monkeypatch
+) -> None:
+    """The explicit-runtime `serve` path bypasses serve_store_model, so the
+    worker job records its placement itself (the `up` path records at the
+    control-plane seam instead — see the tests below)."""
     from docie_bench.inngest import functions
 
-    record = {
-        "spec": {"name": "invoice-extractor", "launch": {"runtime": "llamacpp"}},
-        "endpoint": "http://127.0.0.1:8088/v1",
-        "state": "ready",
-    }
-
-    class _FakeControlPlane:
-        async def up(self, name: str, *, port: int, context_length: int) -> dict[str, Any]:
-            return record
-
-    monkeypatch.setattr(functions, "_serving_control_plane", lambda: _FakeControlPlane())
-    result = asyncio.run(functions._run_deploy({"model": "invoice-extractor"}))
-    assert result is record
+    monkeypatch.setattr(functions, "_serving_control_plane", lambda: _FakeServeControlPlane())
+    result = asyncio.run(
+        functions._run_deploy({"model": "invoice-extractor", "runtime": "llamacpp"})
+    )
+    assert result is _SERVE_RECORD
 
     placement = ModelCatalog().get_placement("invoice-extractor")
     assert placement is not None
@@ -129,18 +140,79 @@ def test_run_deploy_survives_missing_database(monkeypatch) -> None:
     from docie_bench.inngest import functions
 
     db.dispose_engine()
-    record = {
-        "spec": {"name": "invoice-extractor", "launch": {"runtime": "llamacpp"}},
-        "endpoint": "http://127.0.0.1:8088/v1",
-        "state": "ready",
-    }
+    monkeypatch.setattr(functions, "_serving_control_plane", lambda: _FakeServeControlPlane())
+    result = asyncio.run(
+        functions._run_deploy({"model": "invoice-extractor", "runtime": "llamacpp"})
+    )
+    assert result is _SERVE_RECORD
 
-    class _FakeControlPlane:
-        async def up(self, name: str, *, port: int, context_length: int) -> dict[str, Any]:
-            return record
 
-    monkeypatch.setattr(functions, "_serving_control_plane", lambda: _FakeControlPlane())
-    assert asyncio.run(functions._run_deploy({"model": "invoice-extractor"})) is record
+def _up_plane(tmp_path: Path) -> Any:
+    """A real ControlPlane over serve_store_model (seeded store + fake adapter)."""
+    from test_serving_control_plane import _seed_nuextract3_store
+    from test_serving_supervisor import FakeAdapter
+
+    from docie_bench.serving.control_plane import ControlPlane
+    from docie_bench.serving.runtime import RuntimeKind
+    from docie_bench.serving.supervisor import PersistentSupervisor
+
+    root = tmp_path / "models"
+    _seed_nuextract3_store(root)
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: FakeAdapter()}
+    )
+    wrapper = _DefaultSupervisor(supervisor, planner=None, model_store_root=root)
+    return ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+
+def test_docie_up_records_placement_at_the_control_plane_seam(
+    _sqlite_catalog: None, tmp_path: Path
+) -> None:
+    """Placement recording lives in serve_store_model — the seam host-native
+    `docie up` and the worker deploy share, symmetric with stop() clearing it —
+    so the resolver's 'Deploy it first (... `docie up <name>`)' hint is
+    truthful for CLI users, not only for Inngest deploys."""
+    plane = _up_plane(tmp_path)
+
+    asyncio.run(plane.up("nuextract3", port=8088))
+
+    placement = ModelCatalog().get_placement("nuextract3")
+    assert placement is not None
+    assert placement["model_name"] == "nuextract3"
+    assert placement["engine"] == "llama-server"
+    assert placement["endpoint"] == "http://127.0.0.1:8088/v1"
+    assert placement["state"] == "ready"
+
+
+def test_up_without_database_is_best_effort(tmp_path: Path) -> None:
+    """A deploy that succeeded must never fail on placement recording."""
+    db.dispose_engine()
+    plane = _up_plane(tmp_path)
+
+    record = asyncio.run(plane.up("nuextract3", port=8088))
+    assert record["state"] == "ready"
+
+
+def test_cli_stop_lazily_initializes_engine(tmp_path: Path, monkeypatch) -> None:
+    """`docie stop` runs in a process that never calls init_engine(): the
+    catalog seam lazily initializes it from DATABASE_URL, otherwise the
+    staleness cleanup silently no-ops and store:<name> keeps resolving to a
+    dead endpoint after every stop — the exact staleness the stop/remove hooks
+    exist to prevent."""
+    from docie_bench.settings import get_settings
+
+    db.dispose_engine()
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'catalog.db'}")
+    get_settings.cache_clear()
+    try:
+        _record(ModelCatalog())  # ModelCatalog() itself lazy-initializes the engine
+        supervisor = _DefaultSupervisor(_FakeSupervisorBackend(), planner=None)
+
+        supervisor.stop("invoice-extractor")
+        assert ModelCatalog().get_placement("invoice-extractor") is None
+    finally:
+        get_settings.cache_clear()
+        db.dispose_engine()
 
 
 class _FakeSupervisorBackend:

@@ -336,8 +336,12 @@ _ENGINE_BY_RUNTIME: dict[str, str] = {
 
 
 def _record_deploy_placement(*, model_name: str, record: Any) -> None:
-    """Persist the deployment's placement so ``store:<name>`` can resolve it.
+    """Persist a runtime-specified deployment's placement.
 
+    Only the ``serve`` (explicit runtime) path records here: store-model deploys
+    (``up``) record their placement inside the control plane's
+    ``serve_store_model`` seam, which host-native ``docie up`` shares — so CLI
+    and job deploys stay symmetric (mirroring ``_clear_placement`` on stop).
     Best-effort: without DATABASE_URL the catalog is unavailable — log and skip
     (the deploy itself still succeeds, it is just not discoverable).
     NOTE: the recorded endpoint is the control plane's worker-local
@@ -385,13 +389,16 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             runtime=runtime,
             replicas=int(data.get("replicas", 1)),
         )
+        # Runtime-specified deploys bypass serve_store_model, so record here;
+        # the `up` path records inside the control-plane seam it shares with
+        # host-native `docie up` (see _record_deploy_placement's docstring).
+        _record_deploy_placement(model_name=str(model), record=record)
     else:
         record = await cp.up(
             model,
             port=int(data.get("port", 8088)),
             context_length=int(data.get("context_length", 8192)),
         )
-    _record_deploy_placement(model_name=str(model), record=record)
     return record
 
 

@@ -20,7 +20,7 @@ from sqlalchemy import BigInteger, DateTime, String, Text, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from docie_bench.serving.model_store import FAMILIES, StoreEntry
-from docie_bench.storage.db import Base, session_scope
+from docie_bench.storage.db import Base, get_session_factory, init_engine, session_scope
 
 
 def _utcnow() -> dt.datetime:
@@ -126,6 +126,16 @@ class CatalogUnavailableError(RuntimeError):
 
 class ModelCatalog:
     """CRUD over the Postgres model-store catalog (requires DATABASE_URL)."""
+
+    def __init__(self) -> None:
+        # Lazily initialize the shared engine: host-native CLI entrypoints
+        # (`docie up` / `docie stop`) never call init_engine(), so without this
+        # every placement write/clear from the CLI silently hit session=None and
+        # store:<name> kept resolving to endpoints of stopped deployments.
+        # init_engine() is a no-op without DATABASE_URL (session_scope then
+        # yields None and each method raises CatalogUnavailableError as before).
+        if get_session_factory() is None:
+            init_engine()
 
     def upsert(self, entry: StoreEntry, *, size_bytes: int | None = None) -> dict[str, Any]:
         with session_scope() as session:
