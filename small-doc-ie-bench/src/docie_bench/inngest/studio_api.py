@@ -51,6 +51,10 @@ class ExtractRequest(BaseModel):
     content_b64: str | None = None
     filename: str | None = None
     schema_name: str = "invoice"
+    # Explicit live-deployment selector (a DeploymentRecord ``spec.name``). Wins
+    # over ``model_profile``; forwarded verbatim into the event data (auto-included
+    # by ``model_dump(exclude_none=True)`` below) for the worker's resolver.
+    deployment: str | None = None
     model_profile: str | None = None
     ocr_backend: str | None = None
     language: str | None = None

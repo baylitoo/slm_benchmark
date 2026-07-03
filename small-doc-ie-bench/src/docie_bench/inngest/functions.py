@@ -33,11 +33,8 @@ from docie_bench.inngest.realtime import (
     TOPIC_STATUS,
     publish,
 )
-from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
-from docie_bench.serving.placement_resolver import (
-    STORE_PROFILE_PREFIX,
-    resolve_store_profile,
-)
+from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 
@@ -46,36 +43,21 @@ logger = logging.getLogger("docie_bench.inngest.functions")
 MODELS_CONFIG_PATH = Path("configs/models.yaml")
 
 
-def _resolve_profile(name: str | None) -> ModelProfile:
-    """Resolve a model profile by name, falling back to the env default.
+def _resolve_profile(
+    *, model_profile: str | None = None, deployment: str | None = None
+) -> ModelProfile:
+    """Resolve a model profile for an extraction job.
 
-    Mirrors ``docie_bench.api.resolve_profile`` but never raises for plain
-    profile names (jobs prefer a sensible default over a hard failure); an
-    unknown name is logged.
-
-    EXCEPTION — ``store:<name>``: the PlacementError propagates (surfacing on
-    the job's ``error`` realtime topic) instead of falling back to the env
-    default. An explicit ``store:`` ref means "extract with the deployment I
-    just made"; silently substituting the env-default upstream is exactly the
-    deploy/extraction disconnect this resolver exists to fix.
+    Delegates to the shared resolver (see
+    ``docie_bench.serving.profile_resolver``): an explicit ``deployment`` routes to
+    that live runtime via the gateway mechanism, ``model_profile`` selects a
+    models.yaml/deployment profile (a ``store:<name>`` ref routes via the Postgres
+    placement the deploy job recorded — its PlacementError propagates too), and
+    neither yields the honest default loaded from models.yaml. Unlike the old
+    env-synth fallback, an unknown/not-ready explicit selector RAISES —
+    ``extract_document`` surfaces it on the error topic.
     """
-    settings = get_settings()
-    if name and name.startswith(STORE_PROFILE_PREFIX):
-        return resolve_store_profile(name[len(STORE_PROFILE_PREFIX) :])
-    if name and MODELS_CONFIG_PATH.exists():
-        profiles = load_model_profiles(MODELS_CONFIG_PATH)
-        if name in profiles:
-            return profiles[name]
-        if name != settings.default_model_profile:
-            logger.warning("unknown model_profile=%r; using env default", name)
-    return ModelProfile(
-        name=name or settings.default_model_profile,
-        model=settings.openai_compat_model,
-        base_url=settings.openai_compat_base_url.rstrip("/"),
-        api_key=settings.openai_compat_api_key.get_secret_value(),
-        response_format_style=settings.openai_compat_response_format_style,
-        timeout_seconds=settings.openai_compat_timeout_seconds,
-    )
+    return resolve_extraction_profile(model_profile=model_profile, deployment=deployment)
 
 
 def _record_observability(response: Any, tenant_id: str | None) -> None:
@@ -98,7 +80,9 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     """Run one extraction from event data; returns a JSON-serializable result."""
     schema_name = data.get("schema_name", "invoice")
     language = data.get("language")
-    profile = _resolve_profile(data.get("model_profile"))
+    profile = _resolve_profile(
+        model_profile=data.get("model_profile"), deployment=data.get("deployment")
+    )
     service = ExtractionService(profile)
 
     tenant_id = data.get("tenant_id")
@@ -155,7 +139,10 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
       - ``content_b64`` (str)     -- base64-encoded document bytes (PDF/image)
       - ``filename`` (str)        -- used to infer file type for ``content_b64``
       - ``schema_name`` (str)     -- target schema (default ``"invoice"``)
-      - ``model_profile`` (str?)  -- profile from configs/models.yaml
+      - ``deployment`` (str?)     -- name of a LIVE deployment to route to (wins
+                                     over ``model_profile``; not-ready => error)
+      - ``model_profile`` (str?)  -- profile from configs/models.yaml (or a live
+                                     deployment name)
       - ``ocr_backend`` (str?)    -- OCR backend for ``content_b64``
       - ``language`` (str?)
       - ``channel`` (str?)        -- realtime channel to publish to
@@ -338,8 +325,12 @@ _ENGINE_BY_RUNTIME: dict[str, str] = {
 
 
 def _record_deploy_placement(*, model_name: str, record: Any) -> None:
-    """Persist the deployment's placement so ``store:<name>`` can resolve it.
+    """Persist a runtime-specified deployment's placement.
 
+    Only the ``serve`` (explicit runtime) path records here: store-model deploys
+    (``up``) record their placement inside the control plane's
+    ``serve_store_model`` seam, which host-native ``docie up`` shares — so CLI
+    and job deploys stay symmetric (mirroring ``_clear_placement`` on stop).
     Best-effort: without DATABASE_URL the catalog is unavailable — log and skip
     (the deploy itself still succeeds, it is just not discoverable).
     The recorded endpoint is the control plane's *advertised* URL
@@ -383,6 +374,7 @@ async def _probe_and_persist_style(model_name: str, deployment_name: str) -> Non
     (family contract, then engine default) takes over.
     """
     from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.placement_resolver import resolve_store_profile
 
     try:
         # Placement was just written, negotiated_style is still None -> this
@@ -422,13 +414,18 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             runtime=runtime,
             replicas=int(data.get("replicas", 1)),
         )
+        # Runtime-specified deploys bypass serve_store_model, so record here;
+        # the `up` path records inside the control-plane seam it shares with
+        # host-native `docie up` (see _record_deploy_placement's docstring).
+        _record_deploy_placement(model_name=str(model), record=record)
     else:
         record = await cp.up(
             model,
             port=int(data.get("port", 8088)),
             context_length=int(data.get("context_length", 8192)),
         )
-    _record_deploy_placement(model_name=str(model), record=record)
+    # Placement recording for the `up` path lives inside the control-plane seam
+    # (shared with host-native `docie up`); only the probe is triggered here.
     if isinstance(record, dict) and str(record.get("state") or "") == "ready":
         spec = record.get("spec") or {}
         deployment_name = str(spec.get("name") or model)
