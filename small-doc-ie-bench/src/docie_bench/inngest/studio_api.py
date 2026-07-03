@@ -85,6 +85,9 @@ async def trigger_extract(payload: ExtractRequest, tenant: TenantDependency) -> 
     channel = f"extract:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
+    # Bind provenance to the authenticated principal (mirrors trigger_benchmark) so
+    # the worker's audit row is tenant-scoped rather than anonymous.
+    data["tenant_id"] = tenant.tenant_id
     ids = await inngest_client.send(inngest.Event(name=EXTRACT_EVENT, data=data))
     # Record ownership so the run-status proxy is tenant-scoped: an extraction run
     # has no durable StudioRun row, so this is its only ownership signal.

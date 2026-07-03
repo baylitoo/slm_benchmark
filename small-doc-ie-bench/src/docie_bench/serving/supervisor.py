@@ -193,6 +193,32 @@ class PersistentSupervisor:
         self._save()
         return record
 
+    def await_ready(
+        self,
+        name: str,
+        *,
+        timeout_s: float = 60.0,
+        interval_s: float = 2.0,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> DeploymentRecord:
+        """Re-run reconcile() until the deployment is READY or the timeout elapses.
+
+        The deploy path spawns the runtime and probes health ONCE immediately —
+        but the model takes seconds to load, so that first probe sees
+        "Connection refused" and the record freezes at STARTING forever (there
+        is no background reconcile, and the API cannot reach the worker-local
+        endpoint). reconcile() performs the health check here in the worker,
+        where 127.0.0.1 IS reachable, so this bounded loop re-probes until the
+        process is actually serving. Returns whatever state is reached — an
+        honest final record, never a busy-wait past ``timeout_s``.
+        """
+        deadline = self._clock() + timeout_s
+        record = self.reconcile(name)
+        while record.state != LifecycleState.READY and self._clock() < deadline:
+            sleep(interval_s)
+            record = self.reconcile(name)
+        return record
+
     def _may_restart(self, record: DeploymentRecord) -> bool:
         if record.endpoint is None and record.state == LifecycleState.STOPPED:
             return True

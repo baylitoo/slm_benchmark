@@ -7,6 +7,7 @@ operations API.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import shutil
@@ -193,13 +194,17 @@ class ControlPlane:
         port: int = 8088,
         context_length: int = 8192,
     ) -> object:
+        # serve_store_model is synchronous and now blocks in await_ready() (a
+        # bounded time.sleep poll until the model is serving). Run it in a thread
+        # so it does not stall the worker's asyncio loop — the Inngest Connect
+        # heartbeats and any concurrent realtime/extraction steps must keep
+        # flowing on the scale-1 worker while a large GGUF loads.
         return to_data(
-            await _resolve(
-                self.supervisor.serve_store_model(
-                    _required(name, "model"),
-                    port=port,
-                    context_length=context_length,
-                )
+            await asyncio.to_thread(
+                self.supervisor.serve_store_model,
+                _required(name, "model"),
+                port=port,
+                context_length=context_length,
             )
         )
 
@@ -424,8 +429,17 @@ class _DefaultSupervisor:
                 context_length=context_length,
                 extra_args=store.family_launch_args(name),
             ),
+            # A large GGUF can take a while to load; keep the readiness poll from
+            # tripping reconcile's degrade-and-kill while the model is still
+            # coming up (there is no background reconcile, so this threshold only
+            # matters during await_ready below).
+            health_failure_threshold=60,
         )
-        return self.backend.deploy(spec)
+        # Spawn, then wait for the model to finish loading. Without this the sole
+        # post-spawn probe sees "Connection refused" and the record freezes at
+        # STARTING forever; await_ready re-probes until it is honestly serving.
+        self.backend.deploy(spec)
+        return self.backend.await_ready(spec.name)
 
     def start(self, name: str) -> object:
         from docie_bench.serving.supervisor import DesiredState

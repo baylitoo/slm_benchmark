@@ -77,6 +77,47 @@ def test_seed_from_ollama_hardlinks_model_and_projector(tmp_path: Path) -> None:
     assert [e.name for e in store.list()] == ["nuextract3"]
 
 
+def test_seed_rejects_reference_path_traversal(tmp_path: Path) -> None:
+    """A crafted reference must not read manifests outside the manifests root."""
+    home = tmp_path / "ollama"
+    (home / "manifests").mkdir(parents=True)
+    store = ModelStore(tmp_path / "models")
+    with pytest.raises(ModelStoreError, match="traversal|escapes"):
+        store.seed_from_ollama(
+            "../../../../../../etc/passwd",
+            name="evil",
+            family="openai_chat",
+            ollama_home=home,
+        )
+
+
+def test_seed_rejects_store_name_path_traversal(tmp_path: Path) -> None:
+    """A crafted store name must not write blobs outside the store root."""
+    home = _fake_ollama_home(tmp_path, ("registry.ollama.ai", "library", "m"), "latest",
+                             with_projector=False)
+    store = ModelStore(tmp_path / "models")
+    with pytest.raises(ModelStoreError, match="traversal|escapes"):
+        store.seed_from_ollama(
+            "m:latest",
+            name="../../../../evil",
+            family="openai_chat",
+            ollama_home=home,
+        )
+
+
+def test_seed_allows_legit_hf_reference_with_slashes(tmp_path: Path) -> None:
+    """Containment must NOT reject legitimate refs that contain '/' and ':'."""
+    home = _fake_ollama_home(tmp_path, ("hf.co", "numind", "NuExtract3-GGUF"), "Q4_K_M")
+    store = ModelStore(tmp_path / "models")
+    entry = store.seed_from_ollama(
+        "hf.co/numind/NuExtract3-GGUF:Q4_K_M",
+        name="nuextract3",
+        family="nuextract3",
+        ollama_home=home,
+    )
+    assert entry.name == "nuextract3"
+
+
 def test_seed_missing_manifest_raises(tmp_path: Path) -> None:
     home = tmp_path / "ollama"
     (home / "blobs").mkdir(parents=True)

@@ -16,7 +16,11 @@ from docie_bench.llm.model_gateway import (
     classify_response_error,
 )
 from docie_bench.llm.model_profiles import ModelProfile
-from docie_bench.llm.response_format import build_response_format, style_ladder
+from docie_bench.llm.response_format import (
+    build_response_format,
+    is_generic_style,
+    style_ladder,
+)
 from docie_bench.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -89,6 +93,28 @@ def _fix_bare_keys(text: str) -> str:
     touching string values that happen to contain word:colon patterns.
     """
     return _BARE_KEY_RE.sub(r'\1"\2"\3', text)
+
+
+# Substrings (matched case-insensitively) that mark an HTTP 400 as a
+# grammar/schema-compilation failure rather than a genuine bad request. Some
+# backends (e.g. this project's Ollama) reject a strong response_format style
+# with a hard 400 whose body reads like "Failed to initialize samplers: failed
+# to parse grammar ..." instead of returning empty 200 content. For a generic
+# style that is downgradable, this is the same signal as empty content: the rung
+# is unsupported, so walk to the next weaker one instead of hard-failing.
+# Narrow, specific compile-failure phrases only. Bare "grammar"/"json_schema"
+# were too broad: a genuine bad-request 400 that merely echoes the style name
+# (e.g. "response_format.type 'json_schema' is not supported") would spuriously
+# downgrade on the SHARED sync /v1/extract + CLI paths, masking a real error.
+_GRAMMAR_ERROR_MARKERS: tuple[str, ...] = (
+    "failed to parse grammar",
+    "initialize samplers",
+)
+
+
+def _is_grammar_compilation_error(body: str) -> bool:
+    lowered = body.lower()
+    return any(marker in lowered for marker in _GRAMMAR_ERROR_MARKERS)
 
 
 class LLMClientError(ModelGatewayError):
@@ -259,6 +285,34 @@ class OpenAICompatibleClient:
                 llm_latency_ms = int((_time.perf_counter() - t0) * 1000)
 
                 if resp.status_code >= 400:
+                    # Some backends reject a strong response_format style with a
+                    # hard HTTP 400 (grammar/schema failed to compile) instead of
+                    # returning empty 200 content. For a downgradable generic
+                    # style this is the same "rung unsupported" signal, so walk to
+                    # the next weaker style instead of hard-failing.
+                    if (
+                        resp.status_code == 400
+                        and not is_last_rung
+                        and is_generic_style(style)
+                        and _is_grammar_compilation_error(resp.text)
+                    ):
+                        last_invalid = InvalidModelResponseError(
+                            f"Style {style!r} rejected with grammar/schema "
+                            f"compilation error: {resp.text[:1000]}"
+                        )
+                        logger.warning(
+                            "structured-output downgrade",
+                            extra={
+                                "docie_step": "response_format_downgrade",
+                                "docie_model_profile": self.profile.name,
+                                "docie_model": self.profile.model,
+                                "docie_schema_name": schema_name,
+                                "docie_from_style": style,
+                                "docie_to_style": ladder[position + 1],
+                                "docie_reason": "grammar_compilation_error",
+                            },
+                        )
+                        continue
                     logger.error(
                         "LLM server error",
                         extra={
