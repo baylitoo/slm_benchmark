@@ -211,7 +211,7 @@ def test_inngest_resolve_profile_allows_worker_local_endpoint(_sqlite_catalog: N
     _seed("qwen2.5-1.5b", family="openai_chat")
     _place("qwen2.5-1.5b")
 
-    assert _resolve_profile("store:qwen2.5-1.5b").base_url == _ENDPOINT
+    assert _resolve_profile(model_profile="store:qwen2.5-1.5b").base_url == _ENDPOINT
 
 
 def test_inngest_resolve_profile_store_raises(_sqlite_catalog: None) -> None:
@@ -221,11 +221,15 @@ def test_inngest_resolve_profile_store_raises(_sqlite_catalog: None) -> None:
     from docie_bench.inngest.functions import _resolve_profile
 
     with pytest.raises(PlacementNotFoundError):
-        _resolve_profile("store:never-seeded")
+        _resolve_profile(model_profile="store:never-seeded")
 
 
-def test_inngest_resolve_profile_plain_names_still_default(_sqlite_catalog: None) -> None:
+def test_inngest_resolve_profile_unknown_plain_name_refuses(_sqlite_catalog: None) -> None:
+    """Post-#63 the shared resolver REFUSES unknown explicit selectors (the old
+    silent env-default fallback was the closed backdoor), for plain names and
+    store: refs alike."""
     from docie_bench.inngest.functions import _resolve_profile
+    from docie_bench.serving.profile_resolver import ProfileResolutionError
 
-    profile = _resolve_profile("no-such-profile")  # unchanged: falls back, no raise
-    assert profile.name == "no-such-profile"
+    with pytest.raises(ProfileResolutionError):
+        _resolve_profile(model_profile="no-such-profile")

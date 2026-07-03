@@ -31,11 +31,8 @@ from docie_bench.inngest.realtime import (
     TOPIC_STATUS,
     publish,
 )
-from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
-from docie_bench.serving.placement_resolver import (
-    STORE_PROFILE_PREFIX,
-    resolve_store_profile,
-)
+from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 
@@ -44,36 +41,21 @@ logger = logging.getLogger("docie_bench.inngest.functions")
 MODELS_CONFIG_PATH = Path("configs/models.yaml")
 
 
-def _resolve_profile(name: str | None) -> ModelProfile:
-    """Resolve a model profile by name, falling back to the env default.
+def _resolve_profile(
+    *, model_profile: str | None = None, deployment: str | None = None
+) -> ModelProfile:
+    """Resolve a model profile for an extraction job.
 
-    Mirrors ``docie_bench.api.resolve_profile`` but never raises for plain
-    profile names (jobs prefer a sensible default over a hard failure); an
-    unknown name is logged.
-
-    EXCEPTION — ``store:<name>``: the PlacementError propagates (surfacing on
-    the job's ``error`` realtime topic) instead of falling back to the env
-    default. An explicit ``store:`` ref means "extract with the deployment I
-    just made"; silently substituting the env-default upstream is exactly the
-    deploy/extraction disconnect this resolver exists to fix.
+    Delegates to the shared resolver (see
+    ``docie_bench.serving.profile_resolver``): an explicit ``deployment`` routes to
+    that live runtime via the gateway mechanism, ``model_profile`` selects a
+    models.yaml/deployment profile (a ``store:<name>`` ref routes via the Postgres
+    placement the deploy job recorded — its PlacementError propagates too), and
+    neither yields the honest default loaded from models.yaml. Unlike the old
+    env-synth fallback, an unknown/not-ready explicit selector RAISES —
+    ``extract_document`` surfaces it on the error topic.
     """
-    settings = get_settings()
-    if name and name.startswith(STORE_PROFILE_PREFIX):
-        return resolve_store_profile(name[len(STORE_PROFILE_PREFIX) :])
-    if name and MODELS_CONFIG_PATH.exists():
-        profiles = load_model_profiles(MODELS_CONFIG_PATH)
-        if name in profiles:
-            return profiles[name]
-        if name != settings.default_model_profile:
-            logger.warning("unknown model_profile=%r; using env default", name)
-    return ModelProfile(
-        name=name or settings.default_model_profile,
-        model=settings.openai_compat_model,
-        base_url=settings.openai_compat_base_url.rstrip("/"),
-        api_key=settings.openai_compat_api_key.get_secret_value(),
-        response_format_style=settings.openai_compat_response_format_style,
-        timeout_seconds=settings.openai_compat_timeout_seconds,
-    )
+    return resolve_extraction_profile(model_profile=model_profile, deployment=deployment)
 
 
 def _record_observability(response: Any, tenant_id: str | None) -> None:
@@ -96,7 +78,9 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     """Run one extraction from event data; returns a JSON-serializable result."""
     schema_name = data.get("schema_name", "invoice")
     language = data.get("language")
-    profile = _resolve_profile(data.get("model_profile"))
+    profile = _resolve_profile(
+        model_profile=data.get("model_profile"), deployment=data.get("deployment")
+    )
     service = ExtractionService(profile)
 
     tenant_id = data.get("tenant_id")
@@ -153,7 +137,10 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
       - ``content_b64`` (str)     -- base64-encoded document bytes (PDF/image)
       - ``filename`` (str)        -- used to infer file type for ``content_b64``
       - ``schema_name`` (str)     -- target schema (default ``"invoice"``)
-      - ``model_profile`` (str?)  -- profile from configs/models.yaml
+      - ``deployment`` (str?)     -- name of a LIVE deployment to route to (wins
+                                     over ``model_profile``; not-ready => error)
+      - ``model_profile`` (str?)  -- profile from configs/models.yaml (or a live
+                                     deployment name)
       - ``ocr_backend`` (str?)    -- OCR backend for ``content_b64``
       - ``language`` (str?)
       - ``channel`` (str?)        -- realtime channel to publish to

@@ -14,7 +14,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.serving_api import router as serving_router
 from docie_bench.inngest.studio_api import router as studio_router
-from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
+from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.logging_config import configure_logging
 from docie_bench.orchestrator.api import configure_orchestrator
 from docie_bench.orchestrator.api import router as orchestrator_router
@@ -59,7 +59,10 @@ from docie_bench.serving.placement_resolver import (
     PlacementNotFoundError,
     PlacementNotReadyError,
     endpoint_is_loopback,
-    resolve_store_profile,
+)
+from docie_bench.serving.profile_resolver import (
+    ProfileResolutionError,
+    resolve_extraction_profile,
 )
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
@@ -129,29 +132,27 @@ async def enforce_request_content_length(request: Request, call_next):
     return await call_next(request)
 
 
-def default_profile() -> ModelProfile:
-    return ModelProfile(
-        name=settings.default_model_profile,
-        model=settings.openai_compat_model,
-        base_url=settings.openai_compat_base_url.rstrip("/"),
-        api_key=settings.openai_compat_api_key.get_secret_value(),
-        response_format_style=settings.openai_compat_response_format_style,
-        timeout_seconds=settings.openai_compat_timeout_seconds,
-    )
-
-
 def resolve_profile(profile_name: str | None) -> ModelProfile:
-    if profile_name is None:
-        return default_profile()
-    if profile_name.startswith(STORE_PROFILE_PREFIX):
-        # "store:<name>" targets a live deployment of a store model; the
-        # resolver reads the placement the deploy job recorded in the catalog.
-        try:
-            profile = resolve_store_profile(profile_name[len(STORE_PROFILE_PREFIX) :])
-        except PlacementNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except PlacementNotReadyError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    """Resolve a request's ``model_profile`` via the shared resolver.
+
+    ``None`` deterministically resolves ``settings.default_model_profile``
+    (``studio_default``) FROM ``configs/models.yaml`` — the honest label, not the
+    old env-synthesized profile. An unknown name is a 400 (unchanged surface).
+    ``store:<name>`` refs resolve via the Postgres placement recorded at deploy
+    time — mapped to 404 (never deployed) / 409 (not ready). Note: these direct
+    endpoints run in the api container, so a name that resolves to a worker-local
+    deployment endpoint is unreachable here (deployment routing is supported via
+    the worker ``/v1/studio/extract`` path — see profile_resolver).
+    """
+    try:
+        profile = resolve_extraction_profile(model_profile=profile_name)
+    except PlacementNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PlacementNotReadyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ProfileResolutionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if profile_name and profile_name.startswith(STORE_PROFILE_PREFIX):
         if endpoint_is_loopback(profile.base_url):
             # The deploy runtime records its endpoint from the WORKER's point of
             # view; in the documented api/worker compose topology a loopback
@@ -169,15 +170,7 @@ def resolve_profile(profile_name: str | None) -> ModelProfile:
                     "advertised endpoint at deploy time."
                 ),
             )
-        return profile
-    config_path = Path("configs/models.yaml")
-    if config_path.exists():
-        profiles = load_model_profiles(config_path)
-        if profile_name in profiles:
-            return profiles[profile_name]
-    if profile_name == settings.default_model_profile:
-        return default_profile()
-    raise HTTPException(status_code=400, detail=f"Unknown model_profile={profile_name!r}")
+    return profile
 
 
 def validate_text_request(payload: ExtractTextRequest) -> None:
