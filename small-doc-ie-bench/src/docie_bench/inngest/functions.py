@@ -49,9 +49,11 @@ def _resolve_profile(
     Delegates to the shared resolver (see
     ``docie_bench.serving.profile_resolver``): an explicit ``deployment`` routes to
     that live runtime via the gateway mechanism, ``model_profile`` selects a
-    models.yaml/deployment profile, and neither yields the honest default loaded
-    from models.yaml. Unlike the old env-synth fallback, an unknown/not-ready
-    explicit selector RAISES — ``extract_document`` surfaces it on the error topic.
+    models.yaml/deployment profile (a ``store:<name>`` ref routes via the Postgres
+    placement the deploy job recorded — its PlacementError propagates too), and
+    neither yields the honest default loaded from models.yaml. Unlike the old
+    env-synth fallback, an unknown/not-ready explicit selector RAISES —
+    ``extract_document`` surfaces it on the error topic.
     """
     return resolve_extraction_profile(model_profile=model_profile, deployment=deployment)
 
@@ -312,6 +314,50 @@ def _serving_control_plane() -> Any:
     return ControlPlane.from_defaults()
 
 
+# RuntimeKind value -> gateway/extraction "engine" (the serving backend flavour
+# the placement resolver keys its style defaults on).
+_ENGINE_BY_RUNTIME: dict[str, str] = {
+    "llamacpp": "llama-server",
+    "ollama": "ollama",
+}
+
+
+def _record_deploy_placement(*, model_name: str, record: Any) -> None:
+    """Persist a runtime-specified deployment's placement.
+
+    Only the ``serve`` (explicit runtime) path records here: store-model deploys
+    (``up``) record their placement inside the control plane's
+    ``serve_store_model`` seam, which host-native ``docie up`` shares — so CLI
+    and job deploys stay symmetric (mirroring ``_clear_placement`` on stop).
+    Best-effort: without DATABASE_URL the catalog is unavailable — log and skip
+    (the deploy itself still succeeds, it is just not discoverable).
+    NOTE: the recorded endpoint is the control plane's worker-local
+    ``127.0.0.1`` URL; making it an advertised/reachable address is the
+    endpoint-binding follow-up.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    if not isinstance(record, dict):
+        return
+    spec = record.get("spec") or {}
+    launch = spec.get("launch") or {}
+    runtime = str(launch.get("runtime") or "")
+    try:
+        ModelCatalog().record_placement(
+            str(spec.get("name") or model_name),
+            model_name=model_name,
+            engine=_ENGINE_BY_RUNTIME.get(runtime, runtime or "llama-server"),
+            endpoint=str(record.get("endpoint") or ""),
+            state=str(record.get("state") or "unknown"),
+        )
+    except CatalogUnavailableError:
+        logger.warning(
+            "no DATABASE_URL: placement for %r not recorded; store:%s will not resolve",
+            model_name,
+            model_name,
+        )
+
+
 async def _run_deploy(data: dict[str, Any]) -> Any:
     """Deploy a model via the control plane (in-worker subprocess runtime).
 
@@ -324,17 +370,23 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     cp = _serving_control_plane()
     runtime = data.get("runtime")
     if runtime:
-        return await cp.serve(
+        record = await cp.serve(
             model,
             name=data.get("name"),
             runtime=runtime,
             replicas=int(data.get("replicas", 1)),
         )
-    return await cp.up(
-        model,
-        port=int(data.get("port", 8088)),
-        context_length=int(data.get("context_length", 8192)),
-    )
+        # Runtime-specified deploys bypass serve_store_model, so record here;
+        # the `up` path records inside the control-plane seam it shares with
+        # host-native `docie up` (see _record_deploy_placement's docstring).
+        _record_deploy_placement(model_name=str(model), record=record)
+    else:
+        record = await cp.up(
+            model,
+            port=int(data.get("port", 8088)),
+            context_length=int(data.get("context_length", 8192)),
+        )
+    return record
 
 
 @inngest_client.create_function(

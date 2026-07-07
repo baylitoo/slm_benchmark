@@ -40,6 +40,10 @@ from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.serving.gateway import GatewayRoutingError
 from docie_bench.serving.gateway import resolve_profile as gateway_resolve_profile
 from docie_bench.serving.model_store import FAMILIES
+from docie_bench.serving.placement_resolver import (
+    STORE_PROFILE_PREFIX,
+    resolve_store_profile,
+)
 from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
 from docie_bench.serving.supervisor import DeploymentRecord, PersistentSupervisor
 from docie_bench.settings import Settings, get_settings
@@ -257,6 +261,16 @@ def resolve_extraction_profile(
                 f"deployment {deployment!r} is not a live (ready) deployment"
             )
         return _synthesize_profile(record, yaml_profiles)
+
+    # (1b) "store:<name>" -> the Postgres placement the deploy job recorded for a
+    # store model (catalog-backed, so it works from any replica with DATABASE_URL
+    # and carries the deploy-time negotiated response-format style). Sibling of
+    # the deployments.json route above: same live-runtime target, different
+    # source of truth. PlacementError propagates (richer than
+    # ProfileResolutionError: callers map not-found/not-ready to 404/409) — an
+    # explicit store: ref must never fall through to the yaml/env table.
+    if model_profile and model_profile.startswith(STORE_PROFILE_PREFIX):
+        return resolve_store_profile(model_profile[len(STORE_PROFILE_PREFIX) :])
 
     table = build_profile_table(yaml_profiles, live)
 

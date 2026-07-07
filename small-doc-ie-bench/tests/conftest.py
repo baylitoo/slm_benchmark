@@ -12,6 +12,12 @@ import pytest
 os.environ.setdefault("AUTH_REQUIRED", "false")
 os.environ.setdefault("API_KEYS", "")
 
+# ModelCatalog lazily runs init_engine() (so CLI entrypoints work without an
+# explicit init), which reads DATABASE_URL from settings. Force it empty so a
+# developer's local .env pointing at the live compose Postgres can never be
+# picked up mid-test: tests that need a database init one explicitly (sqlite).
+os.environ.setdefault("DATABASE_URL", "")
+
 
 @pytest.fixture(autouse=True)
 def _reset_quota_cache():

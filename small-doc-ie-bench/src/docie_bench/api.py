@@ -54,6 +54,12 @@ from docie_bench.security import (
     redact_fields,
     tenant_guard,
 )
+from docie_bench.serving.placement_resolver import (
+    STORE_PROFILE_PREFIX,
+    PlacementNotFoundError,
+    PlacementNotReadyError,
+    endpoint_is_loopback,
+)
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
@@ -132,14 +138,39 @@ def resolve_profile(profile_name: str | None) -> ModelProfile:
     ``None`` deterministically resolves ``settings.default_model_profile``
     (``studio_default``) FROM ``configs/models.yaml`` — the honest label, not the
     old env-synthesized profile. An unknown name is a 400 (unchanged surface).
-    Note: these direct endpoints run in the api container, so a name that resolves
-    to a worker-local deployment endpoint is unreachable here (deployment routing
-    is supported via the worker ``/v1/studio/extract`` path — see profile_resolver).
+    ``store:<name>`` refs resolve via the Postgres placement recorded at deploy
+    time — mapped to 404 (never deployed) / 409 (not ready). Note: these direct
+    endpoints run in the api container, so a name that resolves to a worker-local
+    deployment endpoint is unreachable here (deployment routing is supported via
+    the worker ``/v1/studio/extract`` path — see profile_resolver).
     """
     try:
-        return resolve_extraction_profile(model_profile=profile_name)
+        profile = resolve_extraction_profile(model_profile=profile_name)
+    except PlacementNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PlacementNotReadyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProfileResolutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if profile_name and profile_name.startswith(STORE_PROFILE_PREFIX):
+        if endpoint_is_loopback(profile.base_url):
+            # The deploy runtime records its endpoint from the WORKER's point of
+            # view; in the documented api/worker compose topology a loopback
+            # endpoint is unreachable from this process. Fail fast (worker-only
+            # for now) instead of burning timeout_seconds x retries on doomed
+            # connects. Deployments recorded with an advertised (non-loopback)
+            # endpoint pass this guard untouched.
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    f"{profile_name} resolved to {profile.base_url}, which is "
+                    "loopback on the worker that deployed it and not reachable "
+                    "from the API. Run the extraction through the worker "
+                    "(POST /v1/studio/extract) or record a non-loopback "
+                    "advertised endpoint at deploy time."
+                ),
+            )
+    return profile
 
 
 def validate_text_request(payload: ExtractTextRequest) -> None:

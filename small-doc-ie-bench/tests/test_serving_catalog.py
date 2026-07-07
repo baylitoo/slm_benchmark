@@ -54,3 +54,37 @@ def test_large_size_bytes_round_trips_through_catalog(_sqlite_catalog: None) -> 
     listed = catalog.list()
     assert [row["size_bytes"] for row in listed] == [_BIG_SIZE]
     assert catalog.get("qwen2.5-7b-q4")["size_bytes"] == _BIG_SIZE
+
+
+def test_store_view_includes_placement_or_null(_sqlite_catalog: None) -> None:
+    """GET /v1/serving/store entries carry where (and whether) a model is served,
+    so the Playground/any UI can pick a live deployment without guessing."""
+    catalog = ModelCatalog()
+    catalog.upsert(
+        StoreEntry(
+            name="qwen2.5-7b-q4",
+            family="openai_chat",
+            model_path=Path("/models/qwen2.5-7b-q4.gguf"),
+        )
+    )
+
+    assert catalog.get("qwen2.5-7b-q4")["placement"] is None
+    assert [row["placement"] for row in catalog.list()] == [None]
+
+    catalog.record_placement(
+        "qwen2.5-7b-q4",
+        model_name="qwen2.5-7b-q4",
+        engine="llama-server",
+        endpoint="http://127.0.0.1:8088/v1",
+        state="ready",
+    )
+
+    placement = catalog.get("qwen2.5-7b-q4")["placement"]
+    assert placement is not None
+    assert placement["engine"] == "llama-server"
+    assert placement["endpoint"] == "http://127.0.0.1:8088/v1"
+    assert placement["state"] == "ready"
+    assert placement["negotiated_style"] is None
+    assert placement["updated_at"] is not None
+    listed = catalog.list()
+    assert listed[0]["placement"]["state"] == "ready"
