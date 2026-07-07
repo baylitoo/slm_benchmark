@@ -30,6 +30,7 @@ upstream — the alias is the addressable served id.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Sequence
@@ -63,12 +64,21 @@ class ProfileResolutionError(ValueError):
 
 @dataclass(frozen=True)
 class _Traits:
-    """The template-sensitive traits inherited when synthesizing a profile."""
+    """The family traits inherited when synthesizing a profile from its family.
+
+    Carries the template-sensitive traits (style / prompt / vision / stop) AND the
+    generation params (temperature / max_tokens / timeout) so a family-synthesized
+    profile runs with the family's intended tuning rather than bare ModelProfile
+    defaults — e.g. NuExtract3 needs 4096 tokens, not the 900 default.
+    """
 
     response_format_style: str
     prompt_profile: str
     vision: bool
     stop_sequences: tuple[str, ...] = ()
+    temperature: float = 0.0
+    max_tokens: int = 900
+    timeout_seconds: float = 180.0
 
 
 def _serving_home() -> Path:
@@ -125,11 +135,36 @@ def _match_yaml_profile(
     return matches[0] if matches else None
 
 
-def _family_traits(name: str) -> _Traits | None:
-    """Traits from the deployment's store-entry family (ModelCatalog + FAMILIES).
+def _store_family(name: str) -> str | None:
+    """The deployment's family from the on-disk model-store index (no DB).
 
-    Best-effort: no DATABASE_URL (unit tests) or a transient DB error must never
-    break routing — inheritance simply falls through to defaults.
+    ``StoreEntry.family`` is recorded in ``<serving_home>/models/index.json`` at
+    seed/deploy time, so family/vision/generation inheritance needs no
+    DATABASE_URL. Read the index file directly (not via ``ModelStore``, whose
+    ``__init__`` mkdirs) to keep resolution side-effect-free. Best-effort: a
+    missing/corrupt index or an absent entry yields ``None`` (fall back to the
+    catalog).
+    """
+    index_path = _serving_home() / "models" / "index.json"
+    try:
+        if not index_path.is_file():
+            return None
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # pragma: no cover - a disk hiccup must not break routing
+        logger.warning("model-store index read failed for %r", name, exc_info=True)
+        return None
+    entry = data.get(name) if isinstance(data, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    family = entry.get("family")
+    return str(family) if family else None
+
+
+def _catalog_family(name: str) -> str | None:
+    """The deployment's family from the Postgres catalog (best-effort; needs DB).
+
+    Only consulted when the on-disk store entry is absent. No DATABASE_URL (unit
+    tests) or a transient DB error must never break routing — it yields ``None``.
     """
     try:
         from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
@@ -143,7 +178,25 @@ def _family_traits(name: str) -> _Traits | None:
         return None
     if not view:
         return None
-    family = FAMILIES.get(str(view.get("family", "")))
+    family = view.get("family")
+    return str(family) if family else None
+
+
+def _family_traits(name: str) -> _Traits | None:
+    """Traits from the deployment's store-entry family (on-disk store, then catalog).
+
+    Family is read from the on-disk ``StoreEntry.family`` FIRST (no DATABASE_URL),
+    falling back to the Postgres catalog only when the store entry is absent. The
+    matched ``FamilyContract`` is the single source of truth for the family's
+    template traits AND its generation defaults (temperature / max_tokens /
+    timeout), so a family-synthesized profile carries the family's intended tuning
+    instead of bare ModelProfile defaults. Best-effort: no family found -> ``None``
+    (the caller then uses conservative defaults).
+    """
+    family_name = _store_family(name) or _catalog_family(name)
+    if family_name is None:
+        return None
+    family = FAMILIES.get(family_name)
     if family is None:
         return None
     return _Traits(
@@ -151,6 +204,9 @@ def _family_traits(name: str) -> _Traits | None:
         prompt_profile=family.prompt_profile,
         vision=family.vision,
         stop_sequences=family.stop_sequences,
+        temperature=family.default_temperature,
+        max_tokens=family.default_max_tokens,
+        timeout_seconds=family.default_timeout_seconds,
     )
 
 
@@ -198,6 +254,9 @@ def _synthesize_profile(
         prompt_profile=traits.prompt_profile,
         vision=traits.vision,
         stop_sequences=traits.stop_sequences,
+        temperature=traits.temperature,
+        max_tokens=traits.max_tokens,
+        timeout_seconds=traits.timeout_seconds,
     )
 
 
