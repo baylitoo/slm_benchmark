@@ -15,10 +15,43 @@ from collections.abc import Awaitable, Mapping, Sequence, Set
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
+
+if TYPE_CHECKING:
+    from docie_bench.serving.runtime import RuntimeLaunchSpec
 
 T = TypeVar("T")
 Result = object | Awaitable[object]
+
+
+def reachable_launch(
+    launch: RuntimeLaunchSpec,
+    *,
+    bind_host: str,
+    advertise_host: str,
+) -> RuntimeLaunchSpec:
+    """Split the conflated launch ``host`` into a BIND host and an ADVERTISE host.
+
+    The runtime process binds ``bind_host`` (all interfaces inside its container,
+    via ``build_command``'s ``--host``) while the DeploymentRecord advertises
+    ``http://{advertise_host}:{port}/v1`` — reusing the existing ``spec.endpoint``
+    override that ``RuntimeAdapter.endpoint`` returns verbatim (runtime.py:240)
+    while ``build_command`` still binds ``spec.host``. This is what makes the
+    recorded endpoint cross-container reachable instead of a worker-local
+    ``127.0.0.1`` that only resolves to the deployer's own loopback.
+
+    REMOTE keeps its user-supplied endpoint untouched: that URL is the real
+    upstream, not a local bind target, so overriding it would break routing.
+    """
+    from docie_bench.serving.runtime import RuntimeKind
+
+    if launch.runtime == RuntimeKind.REMOTE:
+        return launch
+    return replace(
+        launch,
+        host=bind_host,
+        endpoint=f"http://{advertise_host}:{launch.port}/v1",
+    )
 
 
 class Registry(Protocol):
@@ -361,10 +394,33 @@ class _DefaultSupervisor:
         backend: Any,
         planner: _DefaultPlanner,
         model_store_root: Path | None = None,
+        *,
+        advertise_host: str | None = None,
+        bind_host: str | None = None,
     ) -> None:
         self.backend = backend
         self.planner = planner
         self.model_store_root = model_store_root
+        # None => resolve lazily from settings at deploy time (so the running
+        # container's DOCIE_SERVING_* env wins); tests inject explicit hosts to
+        # avoid the get_settings lru_cache dance.
+        self._advertise_host = advertise_host
+        self._bind_host = bind_host
+
+    def _reachability_hosts(self) -> tuple[str, str]:
+        """Return ``(bind_host, advertise_host)`` for a deploy on this node."""
+        if self._bind_host is not None and self._advertise_host is not None:
+            return self._bind_host, self._advertise_host
+        from docie_bench.settings import get_settings
+
+        settings = get_settings()
+        bind = self._bind_host if self._bind_host is not None else settings.serving_bind_host
+        advertise = (
+            self._advertise_host
+            if self._advertise_host is not None
+            else settings.serving_advertise_host
+        )
+        return bind, advertise
 
     def list_deployments(self) -> object:
         return self.backend.list()
@@ -391,14 +447,17 @@ class _DefaultSupervisor:
             if recommendation.runtime is None:
                 raise ValueError(recommendation.explanation)
             runtime = str(recommendation.runtime)
-        spec = DeploymentSpec(
-            name=deployment_name,
-            launch=RuntimeLaunchSpec(
+        bind_host, advertise_host = self._reachability_hosts()
+        launch = reachable_launch(
+            RuntimeLaunchSpec(
                 runtime=RuntimeKind(runtime),
                 model=model,
                 alias=deployment_name,
             ),
+            bind_host=bind_host,
+            advertise_host=advertise_host,
         )
+        spec = DeploymentSpec(name=deployment_name, launch=launch)
         return self.backend.deploy(spec)
 
     def serve_store_model(
@@ -418,17 +477,22 @@ class _DefaultSupervisor:
                 f"{exc} Seed it first (ModelStore.seed_from_ollama / add_gguf — "
                 f"see serving/README.md), then re-run `docie up {name}`."
             ) from exc
-        spec = DeploymentSpec(
-            name=entry.name,
-            launch=RuntimeLaunchSpec(
+        bind_host, advertise_host = self._reachability_hosts()
+        launch = reachable_launch(
+            RuntimeLaunchSpec(
                 runtime=RuntimeKind.LLAMACPP,
                 model=entry.model_path.as_posix(),
                 alias=entry.name,
-                host="127.0.0.1",
                 port=port,
                 context_length=context_length,
                 extra_args=store.family_launch_args(name),
             ),
+            bind_host=bind_host,
+            advertise_host=advertise_host,
+        )
+        spec = DeploymentSpec(
+            name=entry.name,
+            launch=launch,
             # A large GGUF can take a while to load; keep the readiness poll from
             # tripping reconcile's degrade-and-kill while the model is still
             # coming up (there is no background reconcile, so this threshold only
