@@ -163,6 +163,8 @@ export interface SeedOllamaRequest {
   reference: string; // e.g. "qwen2.5:1.5b"
   name: string; // store entry name
   family?: string; // defaults "openai_chat" server-side
+  /** On-disk vision projector (GGUF) for needs_mmproj families whose pull ships none. */
+  mmproj?: string;
 }
 
 /** A downloadable run artifact (report.html / predictions.jsonl / metrics.json). */
