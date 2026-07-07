@@ -7,6 +7,7 @@ mirroring ``tests/test_gateway.py``'s profiles-dict injection.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -253,6 +254,94 @@ def test_no_match_falls_back_to_conservative_defaults(models_config: Path) -> No
     assert profile.vision is False
     assert profile.response_format_style == "openai_json_schema"
     assert profile.prompt_profile == "strict_extraction_v1"
+
+
+# ── (g') family synthesis from the ON-DISK store index (no DB) + generation params ─
+#
+# When a store deploy's served id matches NO models.yaml profile, the profile is
+# synthesized from its store-entry FAMILY. Two regressions guarded here:
+#   * Finding 2 — family/vision must come from the on-disk StoreEntry.family, so a
+#     NuExtract deploy resolves vision=True with NO Postgres catalog available.
+#   * Finding 1 — the family path must also carry the family's generation params
+#     (max_tokens / temperature / timeout), not the bare ModelProfile defaults, or
+#     a deployed NuExtract3 silently runs at 900 tokens / temp 0.0 / 180s.
+
+
+@pytest.fixture
+def store_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point the resolver's serving home at a tmp store and register a family entry.
+
+    Returns an installer that writes ``<home>/models/index.json`` so the resolver's
+    on-disk family lookup is hermetic (never the machine's real ~/.local store).
+    """
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+
+    def _install(name: str, family: str) -> None:
+        models_dir = tmp_path / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "index.json").write_text(
+            json.dumps(
+                {
+                    name: {
+                        "name": name,
+                        "family": family,
+                        "model_path": f"/store/{name}/model.gguf",
+                        "mmproj_path": f"/store/{name}/mmproj.gguf",
+                        "source": "test",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    return _install
+
+
+def _no_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the Postgres catalog explode if consulted, proving the store path alone
+    is enough (family/vision must NOT depend on a DB being reachable)."""
+
+    class _Boom:
+        def __init__(self) -> None:
+            raise RuntimeError("catalog must not be consulted when the store entry exists")
+
+    monkeypatch.setattr("docie_bench.serving.catalog.ModelCatalog", _Boom)
+
+
+def test_family_vision_from_store_index_without_catalog(
+    models_config: Path, store_home, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding 2: a store entry with family=nuextract3 -> vision=True with NO DB.
+    store_home("nux-store", "nuextract3")
+    _no_catalog(monkeypatch)
+    record = _record(
+        name="nux-store", runtime=RuntimeKind.LLAMACPP, model="/p/x.gguf", alias="nux-store"
+    )
+    profile = resolve_extraction_profile(
+        deployment="nux-store", models_config_path=models_config, deployments=[record]
+    )
+    assert profile.vision is True
+    assert profile.response_format_style == "nuextract3"
+    assert profile.prompt_profile == "nuextract3"
+
+
+def test_family_synth_carries_generation_params(
+    models_config: Path, store_home, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding 1: the family-synth path must carry the nuextract3 generation params
+    # (4096 / 0.2 / 600), NOT the ModelProfile defaults (900 / 0.0 / 180). The
+    # deployment's served id (alias) matches no yaml profile -> family path.
+    store_home("nux-store", "nuextract3")
+    _no_catalog(monkeypatch)
+    record = _record(
+        name="nux-store", runtime=RuntimeKind.LLAMACPP, model="/p/x.gguf", alias="nux-store"
+    )
+    profile = resolve_extraction_profile(
+        deployment="nux-store", models_config_path=models_config, deployments=[record]
+    )
+    assert profile.max_tokens == 4096
+    assert profile.temperature == pytest.approx(0.2)
+    assert profile.timeout_seconds == pytest.approx(600.0)
 
 
 # ── precedence: deployment wins over model_profile ─────────────────────────────

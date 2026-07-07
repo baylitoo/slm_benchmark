@@ -170,6 +170,10 @@ class SeedOllamaRequest(BaseModel):
     reference: str  # e.g. "qwen2.5:1.5b" or "hf.co/numind/NuExtract3-GGUF:Q4_K_M"
     name: str  # store entry name
     family: str = "openai_chat"
+    # Optional on-disk vision projector (GGUF) for needs_mmproj families whose
+    # pulled model ships no projector layer (e.g. a separately-downloaded
+    # NuExtract3 mmproj). Path must be reachable inside the serving container.
+    mmproj: str | None = None
 
 
 @router.post("/seed-ollama", response_model=TriggerResponse)
