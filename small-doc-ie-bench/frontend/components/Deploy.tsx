@@ -23,6 +23,7 @@ import {
   ApiError,
   ApiUnavailable,
   type StoreEntry,
+  type ModelFamily,
   type TriggerResponse,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
@@ -416,16 +417,26 @@ function SeedForm({
   families,
   onSeeded,
 }: {
-  families: { name: string }[] | null;
+  families: ModelFamily[] | null;
   onSeeded: () => void;
 }) {
   const { toast } = useToast();
   const [reference, setReference] = useState("");
   const [name, setName] = useState("");
   const [family, setFamily] = useState("openai_chat");
+  const [mmproj, setMmproj] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+
+  // Vision families (e.g. nuextract3) are served by llama-server with a projector;
+  // surface an explicit mmproj input so a GGUF pull without a projector layer is
+  // still deployable (the server refuses a needs_mmproj seed with no projector).
+  const selectedFamily = useMemo(
+    () => (families ?? []).find((f) => f.name === family) ?? null,
+    [families, family],
+  );
+  const needsMmproj = selectedFamily?.needs_mmproj === true;
 
   async function onSeed(e: React.FormEvent) {
     e.preventDefault();
@@ -441,6 +452,7 @@ function SeedForm({
         reference: reference.trim(),
         name: name.trim(),
         family,
+        ...(mmproj.trim() ? { mmproj: mmproj.trim() } : {}),
       });
       setTrigger(res);
       toast({ title: "Seeding started", description: name.trim(), tone: "success" });
@@ -503,6 +515,19 @@ function SeedForm({
             ))}
           </Select>
         </Field>
+
+        {needsMmproj && (
+          <Field
+            label="Vision projector (mmproj)"
+            hint="Path to an mmproj GGUF, if the pulled model ships none. Reachable inside the serving container."
+          >
+            <TextInput
+              value={mmproj}
+              onChange={(e) => setMmproj(e.target.value)}
+              placeholder="/models/nuextract3/mmproj.gguf"
+            />
+          </Field>
+        )}
 
         {error && (
           <p className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">

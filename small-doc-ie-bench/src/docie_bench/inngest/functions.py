@@ -387,13 +387,16 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     reference = data.get("reference")
     name = data.get("name")
     family = data.get("family", "openai_chat")
+    # Explicit vision projector for needs_mmproj families (e.g. nuextract3) whose
+    # pulled GGUF ships no projector layer — the store otherwise refuses the seed.
+    mmproj = data.get("mmproj") or None
     if not reference or not name:
         raise ValueError("seed event must include 'reference' and 'name'")
 
     store = ModelStore(_serving_home() / "models")
     # Blocking file I/O (hard-link or copy of multi-GB blobs) -> off the loop.
     entry = await asyncio.to_thread(
-        store.seed_from_ollama, reference, name=name, family=family
+        store.seed_from_ollama, reference, name=name, family=family, mmproj_source=mmproj
     )
     size = entry.model_path.stat().st_size if entry.model_path.exists() else None
     return ModelCatalog().upsert(entry, size_bytes=size)

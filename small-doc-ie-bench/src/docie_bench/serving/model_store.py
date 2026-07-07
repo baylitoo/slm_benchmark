@@ -216,12 +216,20 @@ class ModelStore:
         family: str,
         ollama_home: Path | None = None,
         link: bool = True,
+        mmproj_source: str | Path | None = None,
     ) -> StoreEntry:
         """Register a model already pulled by Ollama, without re-downloading.
 
         Reads Ollama's manifest for ``reference`` and hard-links (or copies) its
         weights — and vision projector, if present — into the store under stable
         ``*.gguf`` names.
+
+        ``mmproj_source`` supplies a vision projector explicitly (an on-disk GGUF,
+        e.g. one downloaded separately from Hugging Face). It takes precedence over
+        the projector embedded in the Ollama manifest and is the ONLY way to make a
+        ``needs_mmproj`` family (NuExtract3) deployable when the pulled GGUF ships
+        no projector layer — the exact gap that otherwise leaves vision families
+        un-servable via the seed path.
         """
         if not reference.strip() or not name.strip():
             raise ModelStoreError("seed requires a non-empty reference and name")
@@ -248,17 +256,31 @@ class ModelStore:
         model_blob = _blob_path(home, model_digest)
         if not model_blob.is_file():
             raise ModelStoreError(f"Ollama model blob is missing: {model_blob}")
-        mmproj_blob = _blob_path(home, projector_digest) if projector_digest else None
+
+        # Resolve the vision projector: an explicit ``mmproj_source`` wins over the
+        # manifest's projector layer (some GGUF pulls ship none). ``.is_file()``
+        # rather than a mere digest presence check so a dangling projector digest
+        # cannot masquerade as a usable projector for a ``needs_mmproj`` family.
+        explicit_mmproj: Path | None = None
+        if mmproj_source is not None:
+            explicit_mmproj = Path(mmproj_source)
+            if not explicit_mmproj.is_file():
+                raise ModelStoreError(f"mmproj not found: {explicit_mmproj}")
+        manifest_mmproj = _blob_path(home, projector_digest) if projector_digest else None
+        if manifest_mmproj is not None and not manifest_mmproj.is_file():
+            manifest_mmproj = None
+        mmproj_blob = explicit_mmproj or manifest_mmproj
         if contract.needs_mmproj and mmproj_blob is None:
             raise ModelStoreError(
-                f"Family {family!r} requires a vision projector but {reference!r} has none"
+                f"Family {family!r} requires a vision projector but {reference!r} has none. "
+                f"Pass mmproj_source=<projector.gguf> (or pull a GGUF that includes one)."
             )
 
         destination = self.root / name
         model_path = destination / "model.gguf"
         _transfer(model_blob, model_path, link=link)
         mmproj_path: Path | None = None
-        if mmproj_blob is not None and mmproj_blob.is_file():
+        if mmproj_blob is not None:
             mmproj_path = destination / "mmproj.gguf"
             _transfer(mmproj_blob, mmproj_path, link=link)
 
