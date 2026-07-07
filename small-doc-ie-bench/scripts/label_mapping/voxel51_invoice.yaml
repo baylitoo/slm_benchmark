@@ -1,0 +1,64 @@
+# Declarative label mapping for the Voxel51 invoice dataset.
+#
+# Consumed by docie_bench.benchmark.label_mapping.apply_mapping, which turns a
+# raw annotation into (ground_truth, label_provenance). A new dataset onboards by
+# adding a YAML like this one instead of writing a bespoke build script.
+#
+# provenance: "asserted" = the value is printed on the document.
+#             "derived"  = the value is computed from other labels.
+#
+# NOTE (authoritative): Voxel51 invoices carry NO printed grand total (TTC). The
+# total is therefore a DERIVED hypothesis (subtotal + vat), recorded here as
+# `derived` provenance. `field_accuracy_derived` and the label audit's
+# `total_ttc_reconciled: null` exist to keep that fact visible — this is a
+# measured hypothesis, not a label to be "corrected".
+schema_name: invoice
+schema_mode: static
+
+mappings:
+  - source: invoice_number
+    target: invoice_number
+    transform: identity
+    provenance: asserted
+  - source: vendor.name
+    target: vendor_name
+    transform: identity
+    provenance: asserted
+  - source: invoice_date
+    target: invoice_date
+    transform: to_iso_date
+    provenance: asserted
+  - source: totals.subtotal
+    target: subtotal.amount
+    transform: normalize_amount
+    provenance: asserted
+  - source: totals.vat
+    target: vat.amount
+    transform: normalize_amount
+    provenance: asserted
+
+tables:
+  - source: line_items
+    target: line_items
+    provenance: asserted
+    columns:
+      - source: description
+        target: description
+        transform: identity
+      - source: quantity
+        target: quantity
+        transform: normalize_quantity
+      - source: line_total
+        target: line_total.amount
+        transform: normalize_amount
+
+derived:
+  # No printed TTC on Voxel51 invoices -> total is subtotal + vat. The evaluator
+  # anchors on subtotal: vat missing falls back to subtotal-only; subtotal
+  # missing skips the target entirely (never crashes).
+  - target: total_ttc.amount
+    formula: sum
+    inputs:
+      - subtotal.amount
+      - vat.amount
+    provenance: derived
