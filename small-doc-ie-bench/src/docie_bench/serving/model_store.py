@@ -67,7 +67,14 @@ class FamilyContract:
     needs_mmproj: bool = False
     vision: bool = False
     stop_sequences: tuple[str, ...] = ()
+    # Generation defaults inherited by a family-synthesized profile (a store deploy
+    # whose served id matches no models.yaml profile). These are the single source
+    # of truth for a family's tuning, so such a deployment runs with the family's
+    # intended params — NOT the bare ModelProfile defaults (900 / 0.0 / 180), which
+    # would silently degrade a model like NuExtract3 that needs 4096 tokens.
     default_temperature: float = 0.0
+    default_max_tokens: int = 900
+    default_timeout_seconds: float = 180.0
     # Can Ollama serve this family *faithfully* (respecting its template)?
     # False for CHAT_TEMPLATE_KWARGS families: Ollama drops chat_template_kwargs.
     ollama_faithful: bool = True
@@ -84,6 +91,8 @@ FAMILIES: dict[str, FamilyContract] = {
         needs_mmproj=True,
         vision=True,
         default_temperature=0.2,
+        default_max_tokens=4096,
+        default_timeout_seconds=600.0,
         ollama_faithful=False,
     ),
     "nuextract_v1": FamilyContract(
@@ -93,6 +102,8 @@ FAMILIES: dict[str, FamilyContract] = {
         prompt_profile="nuextract_v1",
         stop_sequences=("<|end-output|>",),
         default_temperature=0.0,
+        default_max_tokens=2000,
+        default_timeout_seconds=300.0,
         ollama_faithful=True,
     ),
     "openai_chat": FamilyContract(
