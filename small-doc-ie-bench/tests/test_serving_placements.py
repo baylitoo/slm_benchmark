@@ -215,6 +215,143 @@ def test_cli_stop_lazily_initializes_engine(tmp_path: Path, monkeypatch) -> None
         db.dispose_engine()
 
 
+# ----------------------------------------------------------- probe-at-deploy
+_READY_RECORD: dict[str, Any] = {
+    "spec": {"name": "invoice-extractor", "launch": {"runtime": "llamacpp"}},
+    "endpoint": "http://127.0.0.1:8088/v1",
+    "state": "ready",
+}
+
+
+class _ReadyControlPlane:
+    async def up(self, name: str, *, port: int, context_length: int) -> dict[str, Any]:
+        # Mirror the real seam: since the master reconciliation, `up`-path
+        # placement recording happens INSIDE serve_store_model (shared with
+        # host-native `docie up`), not in _run_deploy. A stub control plane
+        # must reproduce that write or the probe has no placement to update.
+        ModelCatalog().record_placement(
+            _READY_RECORD["spec"]["name"],
+            model_name=name,
+            engine="llama-server",
+            endpoint=_READY_RECORD["endpoint"],
+            state=_READY_RECORD["state"],
+        )
+        return dict(_READY_RECORD)
+
+
+def _seed_entry(name: str = "invoice-extractor", family: str = "openai_chat") -> None:
+    from docie_bench.serving.model_store import StoreEntry
+
+    ModelCatalog().upsert(
+        StoreEntry(name=name, family=family, model_path=Path(f"/models/{name}/model.gguf"))
+    )
+
+
+def _capability_probe(effective_style: str | None, source: str) -> Any:
+    from docie_bench.llm.capability_probe import CapabilityProbe
+
+    return CapabilityProbe(
+        base_url="http://127.0.0.1:8088/v1",
+        model="invoice-extractor",
+        declared_style="openai_json_schema",
+        effective_style=effective_style,
+        confirmed_styles=(effective_style,) if effective_style and source == "probe" else (),
+        rejected_styles=(),
+        advertised_styles=None,
+        vision=None,
+        source=source,
+        fingerprint="test",
+    )
+
+
+def _deploy_with_probe(monkeypatch, probe_result: Any) -> Any:
+    """Run _run_deploy with the control plane and probe stubbed out."""
+    from docie_bench.inngest import functions
+
+    monkeypatch.setattr(functions, "_serving_control_plane", lambda: _ReadyControlPlane())
+
+    async def fake_probe(client: Any, **kwargs: Any) -> Any:
+        if isinstance(probe_result, Exception):
+            raise probe_result
+        return probe_result
+
+    monkeypatch.setattr(functions, "probe_endpoint", fake_probe)
+    return asyncio.run(functions._run_deploy({"model": "invoice-extractor"}))
+
+
+def test_probe_at_deploy_persists_effective_style(_sqlite_catalog: None, monkeypatch) -> None:
+    _seed_entry()
+    _deploy_with_probe(monkeypatch, _capability_probe("json_object", "probe"))
+
+    placement = ModelCatalog().get_placement("invoice-extractor")
+    assert placement is not None
+    assert placement["negotiated_style"] == "json_object"
+
+
+def test_probe_skipped_persists_declared_style(_sqlite_catalog: None, monkeypatch) -> None:
+    """source="skipped" (non-generic family): the declared style IS the result —
+    the persist rule is literally negotiated_style = probe.effective_style."""
+    _seed_entry(family="nuextract3")
+    _deploy_with_probe(monkeypatch, _capability_probe("nuextract3", "skipped"))
+
+    assert ModelCatalog().get_placement("invoice-extractor")["negotiated_style"] == "nuextract3"
+
+
+def test_probe_error_leaves_style_null(_sqlite_catalog: None, monkeypatch) -> None:
+    _seed_entry()
+    _deploy_with_probe(monkeypatch, _capability_probe("openai_json_schema", "error"))
+
+    assert ModelCatalog().get_placement("invoice-extractor")["negotiated_style"] is None
+
+
+def test_probe_exception_does_not_fail_deploy(_sqlite_catalog: None, monkeypatch) -> None:
+    _seed_entry()
+    record = _deploy_with_probe(monkeypatch, RuntimeError("endpoint exploded"))
+
+    # The deploy record is still returned and the placement survives, style NULL.
+    assert record["state"] == "ready"
+    placement = ModelCatalog().get_placement("invoice-extractor")
+    assert placement is not None
+    assert placement["negotiated_style"] is None
+
+
+def test_probe_not_run_when_deploy_not_ready(_sqlite_catalog: None, monkeypatch) -> None:
+    from docie_bench.inngest import functions
+
+    _seed_entry()
+    starting = dict(_READY_RECORD, state="starting")
+
+    class _StartingControlPlane:
+        async def up(self, name: str, *, port: int, context_length: int) -> dict[str, Any]:
+            return starting
+
+    calls: list[Any] = []
+
+    async def fake_probe(client: Any, **kwargs: Any) -> Any:
+        calls.append(client)
+        return _capability_probe("json_object", "probe")
+
+    monkeypatch.setattr(functions, "_serving_control_plane", lambda: _StartingControlPlane())
+    monkeypatch.setattr(functions, "probe_endpoint", fake_probe)
+
+    asyncio.run(functions._run_deploy({"model": "invoice-extractor"}))
+    assert calls == []  # nothing to canary until the deployment is ready
+
+
+def test_resolver_uses_persisted_style_after_probe(_sqlite_catalog: None, monkeypatch) -> None:
+    """End-to-end within the stack: deploy records the placement, the probe
+    persists the negotiated style, and store:<name> resolution returns it
+    (instead of the llama-server engine default openai_json_schema)."""
+    from docie_bench.serving.placement_resolver import resolve_store_profile
+
+    _seed_entry()
+    _deploy_with_probe(monkeypatch, _capability_probe("json_object", "probe"))
+
+    profile = resolve_store_profile("invoice-extractor")
+    assert profile.response_format_style == "json_object"
+    assert profile.base_url == "http://127.0.0.1:8088/v1"
+
+
 class _FakeSupervisorBackend:
     def __init__(self) -> None:
         self.stopped: list[str] = []

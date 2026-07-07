@@ -421,14 +421,33 @@ class _DefaultSupervisor:
                 f"{exc} Seed it first (ModelStore.seed_from_ollama / add_gguf — "
                 f"see serving/README.md), then re-run `docie up {name}`."
             ) from exc
+        # Bind vs advertise are related seams: `host` becomes llama-server's
+        # --host (the bind interface), while `endpoint` is the URL recorded on the
+        # DeploymentRecord and used by the health check + placement catalog. The
+        # advertised host defaults to 127.0.0.1 (host-native CLI); compose sets
+        # DOCIE_ADVERTISE_HOST to the worker service name so api/bench containers
+        # resolve it (matching the DOCIE_SERVING_HOME os.environ precedent above).
+        # SECURITY: the bind is GATED on the advertise host. llama-server is
+        # auth-less, so binding 0.0.0.0 exposes the model to anything on the
+        # network — only worth it when someone beyond loopback must reach it,
+        # i.e. when the advertised host is non-loopback (compose). A loopback
+        # advertise means only this host ever dials in, so bind loopback and a
+        # host-native `docie up` stays exactly as private as before (and no
+        # Windows firewall prompt). Loopback-advertise + 0.0.0.0-bind is never
+        # a useful combination: nothing remote can use an endpoint it cannot
+        # resolve back to the runtime.
+        advertise_host = os.environ.get("DOCIE_ADVERTISE_HOST", "127.0.0.1")
+        loopback = advertise_host in ("127.0.0.1", "localhost", "::1")
+        bind_host = "127.0.0.1" if loopback else "0.0.0.0"  # noqa: S104 - gated cross-container bind, see above
         spec = DeploymentSpec(
             name=entry.name,
             launch=RuntimeLaunchSpec(
                 runtime=RuntimeKind.LLAMACPP,
                 model=entry.model_path.as_posix(),
                 alias=entry.name,
-                host="127.0.0.1",
+                host=bind_host,
                 port=port,
+                endpoint=f"http://{advertise_host}:{port}/v1",
                 context_length=context_length,
                 extra_args=store.family_launch_args(name),
             ),

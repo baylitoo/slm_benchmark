@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     # ``complete()``-commits the artifact row) is never swept out from under it.
     studio_orphan_grace_hours: int = Field(default=24, ge=0, le=8760)
 
+    # Hostname baked into a deployment's *advertised* endpoint (the URL recorded
+    # in the placement catalog + used by the deploy health check). It also gates
+    # the runtime's bind interface: loopback advertise (the default, host-native
+    # CLI) keeps the auth-less llama-server bound to 127.0.0.1; a non-loopback
+    # value (compose sets the `worker` service name) binds 0.0.0.0 so api/bench
+    # containers can reach it.
+    # NOTE: declared here for documentation/discoverability — the serving layer
+    # reads DOCIE_ADVERTISE_HOST from os.environ directly (like
+    # DOCIE_SERVING_HOME) to stay decoupled from app settings.
+    docie_advertise_host: str = "127.0.0.1"
+
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
     openai_compat_model: str = "local-model"
