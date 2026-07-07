@@ -77,13 +77,35 @@ services:
   # Extraction and benchmark runs are replica-safe now that benchmark artifacts
   # land in the shared `artifact-store` volume + Postgres index (not worker-local
   # paths), so scale freely: `docker compose up -d --scale worker=3`.
-  # CAVEAT: the in-worker model *deploy* runtime binds 127.0.0.1 in one replica,
-  # so `serving/deploy.requested` still assumes scale=1 (see deploy_model_job).
+  #
+  # Model *deploy* reachability (PR-1): the in-worker runtime now BINDS 0.0.0.0
+  # (DOCIE_SERVING_BIND_HOST) and ADVERTISES its compose service name
+  # (DOCIE_SERVING_ADVERTISE_HOST=worker) in the DeploymentRecord, so the api
+  # container reaches it at `worker:8088` over the compose network (no published
+  # port needed — do NOT add a `ports:` mapping, that would expose 0.0.0.0).
+  # CAVEAT: `serving/deploy.requested` still assumes `--scale worker=1`. Under
+  # scale>1, `worker` round-robins across replicas and the advertised name may
+  # resolve to a replica that never ran the deploy. This is now guarded: the
+  # control plane FAILS FAST at deploy time when the advertise host resolves to
+  # more than one address (an actionable error, not a silent intermittent one).
+  # Deterministic deploy under scale>1 needs a dedicated single-replica serving
+  # service (deferred; PR-1 follow-up) — until then keep the worker at one
+  # replica for deploys.
   worker:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
+    environment:
+      # Advertise the compose service name so the recorded endpoint is
+      # cross-container reachable (never a worker-local 127.0.0.1 loopback).
+      DOCIE_SERVING_ADVERTISE_HOST: ${DOCIE_SERVING_ADVERTISE_HOST:-worker}
+      # Opt INTO an all-interfaces bind so sibling containers (the api) can reach
+      # the in-worker runtime over the compose network. The code default is the
+      # safe loopback 127.0.0.1 (so a local `docie up`/`docie serve` never exposes
+      # the unauth runtime on the LAN); Docker overrides it here, on the private
+      # compose network only (no `ports:` mapping — do NOT publish this).
+      DOCIE_SERVING_BIND_HOST: ${DOCIE_SERVING_BIND_HOST:-0.0.0.0}
     restart: unless-stopped
     depends_on:
       postgres:

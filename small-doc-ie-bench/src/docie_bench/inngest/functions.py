@@ -399,10 +399,21 @@ async def deploy_model_job(ctx: inngest.Context) -> Any:
     Event ``data``: ``model`` (required, store-entry name or model id),
     ``runtime``, ``name``, ``port``, ``context_length``, ``replicas``, ``channel``.
 
-    NOTE: requires worker ``scale=1`` (the runtime binds worker-local
-    ``127.0.0.1`` and Inngest may route to any replica) and the ``llama-server``
-    binary on PATH + a seeded model store; without them deploys fail cleanly on
-    the ``error`` topic.
+    Reachability (PR-1): the runtime now binds ``DOCIE_SERVING_BIND_HOST``
+    (0.0.0.0) and the DeploymentRecord advertises ``DOCIE_SERVING_ADVERTISE_HOST``
+    (the compose service name, e.g. ``worker``), so the api container resolves a
+    cross-container-reachable endpoint instead of a worker-local loopback.
+
+    NOTE: still requires worker ``scale=1``. The advertised service name
+    round-robins under ``--scale worker>1`` and may resolve to a replica that
+    never ran the deploy (deterministic scale>1 needs a dedicated single-replica
+    serving service; deferred). This is no longer a silent, intermittent failure:
+    the control plane now FAILS FAST at deploy time when the advertise host
+    resolves to more than one address (see
+    ``_DefaultSupervisor._guard_deterministic_advertise``), surfacing a clear
+    error on the ``error`` topic instead of recording a flaky endpoint. Also needs
+    the ``llama-server`` binary on PATH + a seeded model store; without them
+    deploys fail cleanly on the ``error`` topic.
     """
     data = dict(ctx.event.data or {})
     channel = data.get("channel") or f"run:{ctx.event.id}"

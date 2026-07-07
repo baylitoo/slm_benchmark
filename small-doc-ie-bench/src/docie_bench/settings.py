@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -88,6 +88,31 @@ class Settings(BaseSettings):
     # older than this, so a blob an in-flight job just ``put()`` (before its run
     # ``complete()``-commits the artifact row) is never swept out from under it.
     studio_orphan_grace_hours: int = Field(default=24, ge=0, le=8760)
+
+    # Cross-container serving reachability (PR-1). A deployed runtime's process
+    # binds ``serving_bind_host`` (all interfaces inside its container) while the
+    # DeploymentRecord advertises ``serving_advertise_host`` — a name every replica
+    # resolves to the node that runs the runtime. The two are split so the recorded
+    # endpoint (read by the api/other replicas via profile_resolver) is
+    # cross-container reachable instead of a worker-local loopback. Local CLI keeps
+    # 127.0.0.1 (same host); Docker sets DOCIE_SERVING_ADVERTISE_HOST to the deploy
+    # service name (see docker-compose.yml). DOCIE_-prefixed aliases mirror
+    # DOCIE_SERVING_HOME so all serving knobs share one namespace.
+    #
+    # Both default to the SAFE local value 127.0.0.1 (loopback). `docie up` /
+    # `docie serve` run same-host, so a loopback bind never exposes the unauth
+    # runtime on the LAN. The Docker path deliberately opts INTO an all-interfaces
+    # bind by setting DOCIE_SERVING_BIND_HOST=0.0.0.0 in compose (paired with the
+    # advertise service name) so sibling containers can reach it over the compose
+    # network — see docker-compose.yml / .env.example.
+    serving_advertise_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices("DOCIE_SERVING_ADVERTISE_HOST", "serving_advertise_host"),
+    )
+    serving_bind_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices("DOCIE_SERVING_BIND_HOST", "serving_bind_host"),
+    )
 
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
