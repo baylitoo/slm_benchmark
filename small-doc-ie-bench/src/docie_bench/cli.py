@@ -14,6 +14,7 @@ from docie_bench.benchmark.comparison import (
     promote_baseline,
     resolve_run,
 )
+from docie_bench.benchmark.cost import estimate_run_cost
 from docie_bench.benchmark.judge import EvaluationMode
 from docie_bench.benchmark.judge_calibration import DEFAULT_MAX_JUDGE_MAE, calibration_gate
 from docie_bench.benchmark.registry import (
@@ -102,6 +103,19 @@ def benchmark_run(
         "downgraded — is below this threshold "
         "(defaults to CONSTRAINED_RATE_THRESHOLD setting; 0 disables the check).",
     ),
+    cost_ceiling: float | None = typer.Option(
+        None,
+        min=0.0,
+        help="Max total USD a paid (priced) profile may spend. A run aborts pre-flight "
+        "if the conservative upper-bound estimate exceeds it. Required to run any "
+        "priced profile (or use --dry-run-cost).",
+    ),
+    dry_run_cost: bool = typer.Option(
+        False,
+        "--dry-run-cost",
+        help="Print a conservative upper-bound cost estimate for priced profiles and "
+        "exit without calling any API or running the benchmark.",
+    ),
     log_level: str = typer.Option("INFO", help="Logging level (DEBUG shows full prompts and LLM output)"),
 ) -> None:
     if (dataset is None) == (document is None):
@@ -113,6 +127,17 @@ def benchmark_run(
     if routing_policy is not None and model_profile is not None:
         raise typer.BadParameter("--routing-policy cannot be combined with --model-profile")
     configure_logging(log_level)
+    if dry_run_cost:
+        _print_cost_dry_run(
+            dataset=dataset,
+            dataset_registry=dataset_registry,
+            document=document,
+            models_config=models_config,
+            model_profile=model_profile,
+            split=split,
+            repeat=repeat,
+        )
+        return
     result = asyncio.run(
         run_benchmark(
             dataset_path=dataset,
@@ -133,6 +158,7 @@ def benchmark_run(
             probe=probe,
             valid_rate_threshold=valid_rate_threshold,
             constrained_rate_threshold=constrained_rate_threshold,
+            cost_ceiling=cost_ceiling,
         )
     )
     print(f"[green]Benchmark complete[/green]: {result.run_dir}")
@@ -140,6 +166,40 @@ def benchmark_run(
     print(f"Metrics: {result.metrics_path}")
     print(f"Report: {result.report_path}")
     print(f"Manifest: {result.manifest_path}")
+
+
+def _print_cost_dry_run(
+    *,
+    dataset: str | None,
+    dataset_registry: Path,
+    document: Path | None,
+    models_config: Path,
+    model_profile: str | None,
+    split: str | None,
+    repeat: int,
+) -> None:
+    """Print a conservative upper-bound cost estimate; make no API call.
+
+    Echoes profile names and dollar amounts only — never an api_key.
+    """
+    profiles = load_model_profiles(models_config)
+    selected = [profiles[model_profile]] if model_profile else list(profiles.values())
+    if dataset is not None:
+        items = resolve_dataset(dataset, registry_path=dataset_registry).items
+        if split is not None:
+            items = [item for item in items if item.split == split]
+        doc_count = len(items) * repeat
+    else:
+        doc_count = repeat
+    estimate = estimate_run_cost(selected, doc_count)
+    if not estimate.per_profile:
+        print("[yellow]No priced (paid) profiles selected — nothing to estimate.[/yellow]")
+        return
+    print(f"[bold]Dry-run cost estimate[/bold] (conservative upper bound, {doc_count} docs):")
+    for item in estimate.per_profile:
+        print(f"  {item.profile_name}: ${item.usd:.4f}")
+    print(f"[bold]Total upper bound: ${estimate.total_usd:.4f}[/bold]")
+    print("This is a spend ceiling (worst-case max_tokens output), not a forecast. No API called.")
 
 
 @benchmark_app.command("compare")

@@ -275,3 +275,51 @@ profiles:
     vision: true
     vision_max_pages: 8
     vision_pdf_dpi: 150
+
+  # --- Competitors (PR-4) ---------------------------------------------------
+  # These three profiles let DL competitors and hosted APIs be ranked on the SAME
+  # benchmark as the local LLMs above, with three DISTINCT cost units kept apart:
+  # abstract routing cost_units | local tokens | paid $ (N/A never $0 when it does
+  # not apply). To benchmark an adapter kind (donut/ocr), point the benchmark's
+  # base_url at the gateway and the model at the adapter profile name (the same
+  # wiring the ocr/pipeline kinds already use) — the gateway serves it locally.
+
+  # Donut — end-to-end VisionEncoderDecoder DL competitor (optional extra: [donut]).
+  # Donut emits its OWN fixed schema; field_map maps its keys to benchmark fields
+  # and supported_fields declares what it can produce so the fields it cannot are
+  # reported as schema_coverage, not scored as silent zeros.
+  donut_cord:
+    kind: donut
+    options:
+      model: naver-clova-ix/donut-base-finetuned-cord-v2
+      task_prompt: "<s_cord-v2>"
+      field_map:
+        nm: vendor_name
+        total_price: total
+      supported_fields: [vendor_name, total]
+
+  # docTR — OCR competitor behind the existing `ocr` kind (optional extra: [doctr]).
+  ocr_doctr:
+    kind: ocr
+    options:
+      backend: doctr
+      language: en
+
+  # Hosted OpenAI-compatible API — NO adapter needed, just a passthrough + pricing.
+  # `pricing` (USD per 1K tokens) makes this profile "paid": the benchmark refuses
+  # to run it without --cost-ceiling or --dry-run-cost. The key comes only from
+  # api_key_env and is used solely as a Bearer header — never logged or reported.
+  openai_gpt4o_mini:
+    kind: passthrough
+    model: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 900
+    timeout_seconds: 120
+    prompt_profile: strict_extraction_v1
+    pricing:
+      input_usd_per_1k: 0.00015
+      output_usd_per_1k: 0.0006

@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -26,6 +28,8 @@ import httpx
 
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.ocr.factory import get_ocr_backend
+
+logger = logging.getLogger(__name__)
 
 _DATA_URI_SUFFIX = {
     "image/png": ".png",
@@ -71,6 +75,8 @@ def build_solution(
         return OcrSolution(profile)
     if profile.kind == "pipeline":
         return PipelineSolution(profile, profiles=profiles or {}, http_client=http_client)
+    if profile.kind == "donut":
+        return DonutSolution(profile)
     raise SolutionError(
         f"no solution adapter for kind {profile.kind!r}",
         status_code=500,
@@ -96,6 +102,120 @@ class OcrSolution:
         raw, suffix = _extract_document(request)
         text = await asyncio.to_thread(_ocr_to_text, self.backend_name, self.language, raw, suffix)
         return _chat_completion(self.profile.name, text)
+
+
+class DonutSolution:
+    """End-to-end DL competitor: a Donut VisionEncoderDecoder over the page image.
+
+    Donut emits its OWN fixed output schema (e.g. CORD's ``nm``/``price``), which
+    is mapped to benchmark schema fields through an explicit ``options.field_map``
+    (``{donut_source_key: schema_field}``). Only fields the model can produce are
+    emitted, and the adapter declares its ``supported_fields`` so the benchmark
+    scores ground-truth ∩ supported and reports the rest as unsupported coverage
+    rather than silent zeros.
+
+    ``options``: ``field_map`` (required), ``supported_fields`` (defaults to the
+    field_map targets), ``model`` (HF id), ``task_prompt`` (Donut decoder prompt).
+    torch/transformers are lazy-imported at first inference — construction (and
+    the whole test suite) never needs the heavy deps or model weights.
+    """
+
+    def __init__(self, profile: ModelProfile) -> None:
+        self.profile = profile
+        field_map = profile.options.get("field_map")
+        if not isinstance(field_map, Mapping) or not field_map:
+            raise SolutionError(
+                f"donut profile {profile.name!r} requires options.field_map "
+                "({donut_output_key: schema_field})",
+                status_code=500,
+                error_type="invalid_profile",
+            )
+        self.field_map: dict[str, str] = {str(k): str(v) for k, v in field_map.items()}
+        supported = profile.options.get("supported_fields")
+        self.supported_fields: list[str] = (
+            [str(name) for name in supported]
+            if isinstance(supported, (list, tuple))
+            else list(self.field_map.values())
+        )
+        # A supported field with no mapping source would always be null at runtime;
+        # catch that misconfiguration at construction, not as a silent runtime null.
+        mapped_targets = set(self.field_map.values())
+        unmapped_supported = [name for name in self.supported_fields if name not in mapped_targets]
+        if unmapped_supported:
+            raise SolutionError(
+                f"donut profile {profile.name!r}: supported_fields {unmapped_supported} "
+                "have no field_map entry (would always emit null)",
+                status_code=500,
+                error_type="invalid_profile",
+            )
+        self.model_name = str(
+            profile.options.get("model", "naver-clova-ix/donut-base-finetuned-cord-v2")
+        )
+        self.task_prompt = str(profile.options.get("task_prompt", "<s_cord-v2>"))
+
+    async def complete(self, request: dict[str, Any]) -> dict[str, Any]:
+        raw, _suffix = _extract_document(request)
+        parsed = await asyncio.to_thread(_run_donut, self.model_name, self.task_prompt, raw)
+        mapped = self._map_fields(parsed)
+        return _chat_completion(self.profile.name, json.dumps(mapped, ensure_ascii=False))
+
+    def _map_fields(self, parsed: Mapping[str, Any]) -> dict[str, Any]:
+        """Map Donut's fixed output keys onto supported schema fields.
+
+        Unsupported schema fields are OMITTED entirely (never emitted as null),
+        so the benchmark's missing-path scores them as unsupported coverage rather
+        than a wrong value. Unmapped Donut source keys are logged, not dropped
+        silently, so field_map drift is visible.
+        """
+        out: dict[str, Any] = {}
+        for source_key, target_field in self.field_map.items():
+            if target_field not in self.supported_fields:
+                continue
+            # `{"value": ...}` matches the field-wrapper shape metrics.get_path unwraps.
+            out[target_field] = {"value": parsed.get(source_key)}
+        unmapped = [key for key in parsed if key not in self.field_map]
+        if unmapped:
+            logger.debug("donut unmapped source keys ignored: %s", sorted(unmapped))
+        return out
+
+
+def _run_donut(model_name: str, task_prompt: str, raw: bytes) -> dict[str, Any]:
+    """Run Donut inference on the document image, returning its fixed-key dict.
+
+    Lazy-imports the heavy DL stack so importing this module (and the test suite)
+    never needs torch/transformers. Tests monkeypatch this function to avoid model
+    weights. Fails fast with an actionable optional-extra hint when deps are absent.
+    """
+    try:
+        import io
+
+        import torch
+        from PIL import Image
+        from transformers import DonutProcessor, VisionEncoderDecoderModel
+    except ImportError as exc:  # pragma: no cover - exercised only without the extra
+        raise SolutionError(
+            "the donut adapter needs optional deps: pip install small-doc-ie-bench[donut]",
+            status_code=500,
+            error_type="missing_dependency",
+        ) from exc
+
+    processor = DonutProcessor.from_pretrained(model_name)
+    model = VisionEncoderDecoderModel.from_pretrained(model_name)
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    pixel_values = processor(image, return_tensors="pt").pixel_values
+    decoder_input_ids = processor.tokenizer(
+        task_prompt, add_special_tokens=False, return_tensors="pt"
+    ).input_ids
+    with torch.no_grad():
+        outputs = model.generate(
+            pixel_values,
+            decoder_input_ids=decoder_input_ids,
+            max_length=model.decoder.config.max_position_embeddings,
+        )
+    token_ids = outputs.sequences if hasattr(outputs, "sequences") else outputs
+    sequence = processor.batch_decode(token_ids)[0]
+    parsed = processor.token2json(sequence)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class PipelineSolution:

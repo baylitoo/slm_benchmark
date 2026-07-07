@@ -40,6 +40,7 @@ HTML_TEMPLATE = Template(
       <th>Row F1</th>
       <th>Evidence coverage</th><th>Row evidence coverage</th><th>Hallucination rate</th>
       <th>Judge faithfulness</th><th>Judge completeness</th>
+      <th>Schema coverage</th><th>Tokens/doc</th><th>Cost $/doc</th>
       <th>Avg ms</th><th>p50 ms</th><th>p95 ms</th>
     </tr></thead>
     <tbody>
@@ -74,6 +75,19 @@ HTML_TEMPLATE = Template(
         <td>
           {{ '%.1f%%'|format(row.get('judge_completeness') * 100)
              if row.get('judge_completeness') is not none else 'N/A' }}
+        </td>
+        <td>
+          {{ '%.1f%%'|format(row.get('schema_coverage') * 100)
+             if row.get('schema_coverage') is not none else 'full' }}
+        </td>
+        <td>
+          {{ '%.0f'|format(row.get('avg_tokens'))
+             if row.get('avg_tokens') is not none else 'N/A' }}
+        </td>
+        <td>
+          {{ ('~$%.4f'|format(row.get('avg_cost_usd_per_doc')) if row.get('cost_estimated')
+              else '$%.4f'|format(row.get('avg_cost_usd_per_doc')))
+             if row.get('avg_cost_usd_per_doc') is not none else 'N/A' }}
         </td>
         <td>{{ '%.0f'|format(row.avg_latency_ms) }}</td>
         <td>{{ row.p50_latency_ms }}</td>

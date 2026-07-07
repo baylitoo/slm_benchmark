@@ -11,7 +11,28 @@ import yaml
 # Profile kinds the gateway can dispatch. "passthrough" proxies to an
 # OpenAI-compatible upstream (the default — every existing profile). Solution
 # kinds are handled by a local adapter (see docie_bench.serving.solutions).
-VALID_PROFILE_KINDS = frozenset({"passthrough", "ocr", "pipeline"})
+# "donut" is an end-to-end DL competitor served by a local VisionEncoderDecoder.
+VALID_PROFILE_KINDS = frozenset({"passthrough", "ocr", "pipeline", "donut"})
+
+
+@dataclass(frozen=True)
+class Pricing:
+    """Static per-token vendor pricing, in US dollars per 1,000 tokens.
+
+    One unit throughout the codebase: dollars / 1K tokens. `estimate_run_cost`
+    (pre-flight upper bound) and the post-hoc `avg_cost_usd_per_doc` summary both
+    apply the SAME formula so a dry-run estimate and a real run are comparable.
+    A profile carrying a `Pricing` block is "paid" — it trips the cost guard.
+    """
+
+    input_usd_per_1k: float = 0.0
+    output_usd_per_1k: float = 0.0
+
+    def usd_for(self, prompt_tokens: float, completion_tokens: float) -> float:
+        return (
+            prompt_tokens / 1000.0 * self.input_usd_per_1k
+            + completion_tokens / 1000.0 * self.output_usd_per_1k
+        )
 
 
 @dataclass(frozen=True)
@@ -44,6 +65,14 @@ class ModelProfile:
     # are served by a local adapter. `options` carries adapter-specific config.
     kind: str = "passthrough"
     options: Mapping[str, Any] = field(default_factory=dict)
+    # Paid hosted-API pricing. Present => this profile bills real money and the
+    # benchmark's cost guard refuses to run it without a ceiling/dry-run.
+    pricing: Pricing | None = None
+
+    @property
+    def is_paid(self) -> bool:
+        """True iff the profile has vendor pricing configured (bills real money)."""
+        return self.pricing is not None
 
     def __post_init__(self) -> None:
         if self.kind not in VALID_PROFILE_KINDS:
@@ -94,6 +123,15 @@ def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
             raise ValueError(
                 f"profile {name!r}: 'model' and 'base_url' are required for passthrough profiles"
             )
+        pricing_cfg = cfg.get("pricing")
+        pricing = (
+            Pricing(
+                input_usd_per_1k=float(pricing_cfg.get("input_usd_per_1k", 0.0)),
+                output_usd_per_1k=float(pricing_cfg.get("output_usd_per_1k", 0.0)),
+            )
+            if isinstance(pricing_cfg, Mapping)
+            else None
+        )
         profiles[name] = ModelProfile(
             name=name,
             model=model,
@@ -123,6 +161,7 @@ def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
             queue_timeout_seconds=float(cfg.get("queue_timeout_seconds", 30)),
             kind=kind,
             options=dict(cfg.get("options") or {}),
+            pricing=pricing,
         )
     return profiles
 
