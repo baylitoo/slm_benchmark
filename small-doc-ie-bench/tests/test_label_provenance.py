@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -22,15 +23,16 @@ SPEC_PATH = (
 )
 
 
-def _spec() -> dict:
-    return yaml.safe_load(SPEC_PATH.read_text(encoding="utf-8"))
+def _spec() -> dict[str, Any]:
+    spec: dict[str, Any] = yaml.safe_load(SPEC_PATH.read_text(encoding="utf-8"))
+    return spec
 
 
 # --- (1) reducer invariants -------------------------------------------------
 
 
-def test_reducer_holds_both_invariants_on_synthetic_score():
-    fields = [
+def test_reducer_holds_both_invariants_on_synthetic_score() -> None:
+    fields: list[dict[str, Any]] = [
         {"field": "invoice_number", "correct": True},
         {"field": "subtotal.amount", "correct": True},
         {"field": "vat.amount", "correct": False},
@@ -57,7 +59,7 @@ def test_reducer_holds_both_invariants_on_synthetic_score():
     assert (counts["derived_correct"], counts["derived_total"]) == (1, 3)
 
 
-def test_aggregate_field_accuracy_derived_none_when_no_derived():
+def test_aggregate_field_accuracy_derived_none_when_no_derived() -> None:
     ok_rows = [
         {
             "score": {"fields": [{"field": "invoice_number", "correct": True}]},
@@ -73,7 +75,7 @@ def test_aggregate_field_accuracy_derived_none_when_no_derived():
 # --- (2) prefix bucketing ---------------------------------------------------
 
 
-def test_prefix_bucketing_and_exact_match_precedence():
+def test_prefix_bucketing_and_exact_match_precedence() -> None:
     provenance = {
         "line_items": "derived",
         "subtotal.amount": "asserted",
@@ -90,7 +92,7 @@ def test_prefix_bucketing_and_exact_match_precedence():
 # --- (3) declarative mapping (round trip -> hand-specified target) -----------
 
 
-def test_apply_mapping_produces_expected_ground_truth_and_provenance():
+def test_apply_mapping_produces_expected_ground_truth_and_provenance() -> None:
     annotation = {
         "doc_id": "inv-1",
         "file_path": "inv-1.pdf",
@@ -122,7 +124,7 @@ def test_apply_mapping_produces_expected_ground_truth_and_provenance():
     assert provenance["line_items"] == "asserted"
 
 
-def test_apply_mapping_derived_skips_missing_anchor_without_crashing():
+def test_apply_mapping_derived_skips_missing_anchor_without_crashing() -> None:
     # No subtotal -> derived total is skipped entirely (mirrors historical elif).
     annotation = {"invoice_number": "INV-2", "totals": {"vat": "50"}}
     ground_truth, provenance = apply_mapping(annotation, _spec())
@@ -130,7 +132,7 @@ def test_apply_mapping_derived_skips_missing_anchor_without_crashing():
     assert "total_ttc.amount" not in provenance
 
 
-def test_apply_mapping_derived_falls_back_to_subtotal_only():
+def test_apply_mapping_derived_falls_back_to_subtotal_only() -> None:
     annotation = {"invoice_number": "INV-3", "totals": {"subtotal": "900"}}
     ground_truth, _ = apply_mapping(annotation, _spec())
     assert ground_truth["total_ttc.amount"] == 900.0
@@ -139,7 +141,7 @@ def test_apply_mapping_derived_falls_back_to_subtotal_only():
 # --- (4) label audit --------------------------------------------------------
 
 
-def test_audit_reconciled_null_when_total_derived():
+def test_audit_reconciled_null_when_total_derived() -> None:
     item = DatasetItem(
         doc_id="inv-1",
         file_path="inv-1.pdf",
@@ -155,7 +157,7 @@ def test_audit_reconciled_null_when_total_derived():
     assert "total_not_reconciled" not in record["findings"]
 
 
-def test_audit_consistency_flag_fires_on_line_item_mismatch():
+def test_audit_consistency_flag_fires_on_line_item_mismatch() -> None:
     item = DatasetItem(
         doc_id="inv-2",
         file_path="inv-2.pdf",
@@ -172,7 +174,7 @@ def test_audit_consistency_flag_fires_on_line_item_mismatch():
     assert "line_items_sum_mismatch" in record["findings"]
 
 
-def test_audit_reconciles_printed_total_and_flags_mismatch():
+def test_audit_reconciles_printed_total_and_flags_mismatch() -> None:
     # A printed (asserted) total that does NOT equal subtotal + vat is flagged.
     item = DatasetItem(
         doc_id="inv-3",
@@ -189,7 +191,7 @@ def test_audit_reconciles_printed_total_and_flags_mismatch():
     assert "total_not_reconciled" in record["findings"]
 
 
-def test_audit_flags_provenance_key_not_in_ground_truth():
+def test_audit_flags_provenance_key_not_in_ground_truth() -> None:
     item = DatasetItem(
         doc_id="inv-4",
         file_path="inv-4.pdf",
@@ -204,7 +206,40 @@ def test_audit_flags_provenance_key_not_in_ground_truth():
 # --- (5) backward compatibility + end-to-end through summarize --------------
 
 
-def test_manifest_row_without_provenance_scores_and_buckets_as_asserted(tmp_path: Path):
+def test_empty_provenance_does_not_change_dataset_hash(tmp_path: Path) -> None:
+    # Adding label_provenance must not perturb the identity of a pre-provenance
+    # manifest: an empty sidecar hashes exactly like a row that never had the field.
+    from docie_bench.benchmark.registry import dataset_hash
+
+    doc = tmp_path / "inv.txt"
+    doc.write_text("invoice", encoding="utf-8")
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        '{"doc_id":"a","file_path":"inv.txt","ground_truth":{"invoice_number":"INV-1"}}\n',
+        encoding="utf-8",
+    )
+    without = dataset_hash(load_dataset(manifest))
+
+    item = DatasetItem(doc_id="a", file_path=str(doc), ground_truth={"invoice_number": "INV-1"})
+    with_empty = dataset_hash([item])
+    assert without == with_empty
+
+    # A populated sidecar IS a labeling change and must change the hash.
+    labeled = item.model_copy(update={"label_provenance": {"invoice_number": "asserted"}})
+    assert dataset_hash([labeled]) != without
+
+
+def test_audit_reports_explicit_zero_vat(tmp_path: Path) -> None:
+    item = DatasetItem(
+        doc_id="z",
+        file_path="z.pdf",
+        ground_truth={"subtotal.amount": 100.0, "vat.amount": 0.0, "total_ttc.amount": 100.0},
+    )
+    record = audit_item(item)
+    assert record["checks"]["vat"] == 0.0
+
+
+def test_manifest_row_without_provenance_scores_and_buckets_as_asserted(tmp_path: Path) -> None:
     doc = tmp_path / "inv.txt"
     doc.write_text("invoice", encoding="utf-8")
     manifest = tmp_path / "manifest.jsonl"
@@ -223,7 +258,7 @@ def test_manifest_row_without_provenance_scores_and_buckets_as_asserted(tmp_path
     assert seg["field_accuracy_derived"] is None
 
 
-def test_summarize_segments_field_accuracy_by_provenance():
+def test_summarize_segments_field_accuracy_by_provenance() -> None:
     gt = {"invoice_number": "INV-1", "subtotal.amount": "1000", "total_ttc.amount": "1200"}
     pred = {
         "invoice_number": {"value": "INV-1"},

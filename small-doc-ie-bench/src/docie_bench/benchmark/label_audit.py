@@ -105,7 +105,14 @@ def audit_item(item: DatasetItem, cfg: MetricConfig | None = None) -> dict[str, 
     findings: list[str] = []
 
     subtotal = _amount(ground_truth.get("subtotal.amount"))
-    vat = _amount(ground_truth.get("vat.amount") or ground_truth.get("tax.amount"))
+    # Explicit key check, not `a or b`: a legitimate zero VAT is falsy and would
+    # otherwise fall through to the tax.amount lookup and misreport vat as null.
+    vat_raw = (
+        ground_truth["vat.amount"]
+        if "vat.amount" in ground_truth
+        else ground_truth.get("tax.amount")
+    )
+    vat = _amount(vat_raw)
     total = _amount(ground_truth.get("total_ttc.amount"))
 
     for name, amount in (("subtotal", subtotal), ("vat", vat), ("total_ttc", total)):
