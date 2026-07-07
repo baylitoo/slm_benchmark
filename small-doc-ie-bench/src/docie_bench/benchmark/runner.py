@@ -4,11 +4,13 @@ import asyncio
 import json
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from docie_bench.benchmark.cost import enforce_cost_guard, summarize_profile_cost
 from docie_bench.benchmark.dataset import DatasetItem
 from docie_bench.benchmark.judge import EvaluationMode, judge_extraction
 from docie_bench.benchmark.metrics import (
@@ -129,6 +131,7 @@ async def run_benchmark(
     probe: bool = False,
     valid_rate_threshold: float | None = None,
     constrained_rate_threshold: float | None = None,
+    cost_ceiling: float | None = None,
 ) -> BenchmarkResult:
     settings = get_settings()
     if resume and output_dir is None:
@@ -183,6 +186,11 @@ async def run_benchmark(
             ]
     if not selected_profiles:
         raise ValueError("No extraction model profiles selected")
+
+    # Cost guard (pre-flight, before any manifest write or upstream call). A paid
+    # profile refuses to run without a ceiling; a real run aborts if the
+    # conservative upper-bound estimate exceeds it. No-op when nothing is paid.
+    enforce_cost_guard(selected_profiles, len(base_items) * repeat, cost_ceiling)
 
     document_hashes = {item.file_path: hash_file(Path(item.file_path)) for item in base_items}
     task_config = {
@@ -416,6 +424,13 @@ async def run_benchmark(
                     ),
                     "ok": True,
                     "latency_ms": response.latency_ms,
+                    # Real token usage from the upstream (LLM profiles only). None
+                    # for DL adapters that report no tokens; the cost accounting
+                    # reads this to compute local `tokens` and, for paid profiles,
+                    # `$/doc` — the row-build drop this fixes was the silent gap.
+                    "usage": (
+                        usage.model_dump() if (usage := getattr(response, "usage", None)) else None
+                    ),
                     "validation": response.validation.model_dump(),
                     "prediction": response.result,
                     "routing": getattr(response, "routing", None),
@@ -425,10 +440,19 @@ async def run_benchmark(
                     ),
                 }
                 if eval_mode.uses_ground_truth:
+                    # A fixed-schema competitor (Donut) declares the fields it can
+                    # emit; ground-truth fields it cannot produce leave the accuracy
+                    # denominator (schema_coverage) instead of scoring 0.
+                    supported = profile.options.get("supported_fields")
                     row["score"] = score_prediction(
                         item.ground_truth,
                         response.result,
                         evidence_applicable=ingestion_path != "vision",
+                        supported_fields=(
+                            [str(name) for name in supported]
+                            if isinstance(supported, (list, tuple))
+                            else None
+                        ),
                     )
                 if selected_judge is not None:
                     try:
@@ -499,6 +523,7 @@ async def run_benchmark(
         wall_seconds=wall_seconds,
         concurrency=concurrency,
         eval_mode=eval_mode,
+        profiles=profiles,
     )
     metrics["dataset"] = dataset_metadata
     threshold = (
@@ -563,7 +588,16 @@ def summarize(
     wall_seconds: float = 0.0,
     concurrency: int = 1,
     eval_mode: EvaluationMode = EvaluationMode.GROUND_TRUTH,
+    profiles: Mapping[str, ModelProfile] | None = None,
 ) -> dict[str, Any]:
+    """Aggregate per-profile metrics.
+
+    ``profiles`` (name -> ModelProfile) supplies pricing so paid profiles get a
+    real ``avg_cost_usd_per_doc``; when ``None`` (the default) the $ column stays
+    N/A for every profile. Local ``tokens`` (``avg_tokens``) are read from row
+    usage and are independent of pricing; the abstract routing ``cost_units``
+    aggregation below is unchanged.
+    """
     by_profile: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_profile.setdefault(row["model_profile"], []).append(row)
@@ -607,6 +641,23 @@ def summarize(
         routed_rows = [r["routing"] for r in profile_rows if r.get("routing")]
         routed_n = len(routed_rows)
         routed_stages = [stage for route in routed_rows for stage in route.get("stages", [])]
+        # Cost accounting — three DISTINCT units. `avg_tokens` (local) from row
+        # usage; `avg_cost_usd_per_doc` (paid $) only when the profile has pricing,
+        # else None/N-A (never $0). Routing `cost_units` stays in its own sub-table.
+        profile_pricing = (
+            getattr(profiles[profile], "pricing", None)
+            if profiles is not None and profile in profiles
+            else None
+        )
+        cost = summarize_profile_cost(profile_rows, profile_pricing)
+        coverage_values = [
+            r["score"]["schema_coverage"]
+            for r in ok_rows
+            if r.get("score", {}).get("schema_coverage") is not None
+        ]
+        schema_coverage = (
+            round(sum(coverage_values) / len(coverage_values), 4) if coverage_values else None
+        )
         summary.append(
             {
                 "model_profile": profile,
@@ -664,6 +715,14 @@ def summarize(
                 "avg_latency_ms": sum(r.get("latency_ms", 0) for r in profile_rows) / n if n else 0,
                 "p50_latency_ms": _percentile([r.get("latency_ms", 0) for r in profile_rows], 50),
                 "p95_latency_ms": _percentile([r.get("latency_ms", 0) for r in profile_rows], 95),
+                # Local tokens unit — None for DL adapters that report no usage.
+                "avg_tokens": cost.avg_tokens,
+                # Paid $ unit — None (N/A, never $0) unless the profile has pricing.
+                "avg_cost_usd_per_doc": cost.avg_cost_usd_per_doc,
+                "cost_estimated": cost.cost_estimated,
+                # Fraction of the schema a fixed-schema competitor (Donut) attempts;
+                # None for full-schema profiles (all fields scored).
+                "schema_coverage": schema_coverage,
                 "routing_accept_rate": (
                     sum(r.get("terminal_decision") == "accept" for r in routed_rows) / routed_n
                     if routed_n

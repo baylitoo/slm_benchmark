@@ -44,6 +44,16 @@ ocr = [
 paddle = [
   "paddleocr>=2.8.0"
 ]
+# Donut end-to-end DL competitor. Heavy; lazy-imported by the donut adapter.
+donut = [
+  "torch>=2.2.0",
+  "transformers>=4.44.0",
+  "Pillow>=10.4.0"
+]
+# docTR OCR competitor. Lazy-imported by the doctr backend.
+doctr = [
+  "python-doctr>=0.8.0"
+]
 dev = [
   "pytest>=8.3.2",
   "pytest-asyncio>=0.23.8",

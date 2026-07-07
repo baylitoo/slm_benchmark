@@ -31,7 +31,7 @@ def stable_block_id(page: int, index: int, text: str) -> str:
 
 def text_to_blocks(
     text: str,
-    source: Literal["pdf_text", "tesseract", "paddleocr", "manual", "unknown"] = "manual",
+    source: Literal["pdf_text", "tesseract", "paddleocr", "doctr", "manual", "unknown"] = "manual",
 ) -> list[OCRBlock]:
     blocks: list[OCRBlock] = []
     for idx, line in enumerate(line.strip() for line in text.splitlines()):

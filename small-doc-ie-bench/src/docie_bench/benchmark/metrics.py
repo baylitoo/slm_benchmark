@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from functools import cache
@@ -182,13 +183,35 @@ def score_prediction(
     cfg: MetricConfig | None = None,
     *,
     evidence_applicable: bool = True,
+    supported_fields: Collection[str] | None = None,
 ) -> dict[str, Any]:
+    """Score a prediction against ground truth.
+
+    ``supported_fields`` (a fixed-schema competitor like Donut declares the schema
+    fields it can produce): when given, ground-truth fields OUTSIDE that set are
+    excluded from scoring entirely — they leave the accuracy denominator instead of
+    being scored 0 via the missing-path, mirroring ``evidence_applicable=False``.
+    ``schema_coverage`` = supported∩GT / GT reports how much of the schema the
+    competitor even attempts. ``None`` (the default) scores every field exactly as
+    before — the existing path is byte-identical.
+    """
     cfg = cfg or MetricConfig()
+    if supported_fields is None:
+        scored_ground_truth = ground_truth
+        schema_coverage: float | None = None
+        unsupported_fields: list[str] = []
+    else:
+        supported_set = set(supported_fields)
+        scored_ground_truth = {
+            path: expected for path, expected in ground_truth.items() if path in supported_set
+        }
+        unsupported_fields = [path for path in ground_truth if path not in supported_set]
+        schema_coverage = (len(scored_ground_truth) / len(ground_truth)) if ground_truth else None
     rows: list[dict[str, Any]] = []
     table_scores: list[dict[str, Any]] = []
     correct = 0
     similarity_sum = 0.0
-    for path, expected in ground_truth.items():
+    for path, expected in scored_ground_truth.items():
         actual = get_path(prediction, path)
         if isinstance(expected, list):
             table = score_table(path, expected, actual if isinstance(actual, list) else [], cfg)
@@ -223,6 +246,8 @@ def score_prediction(
         "field_correct": correct,
         "field_accuracy": correct / total if total else None,
         "avg_similarity": round(similarity_sum / total, 4) if total else None,
+        "schema_coverage": schema_coverage,
+        "unsupported_fields": unsupported_fields,
         "fields": rows,
         "table_total": len(table_scores),
         "row_expected": row_expected,
