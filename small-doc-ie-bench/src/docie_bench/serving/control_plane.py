@@ -11,7 +11,8 @@ import asyncio
 import inspect
 import os
 import shutil
-from collections.abc import Awaitable, Mapping, Sequence, Set
+import socket
+from collections.abc import Awaitable, Callable, Mapping, Sequence, Set
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -52,6 +53,26 @@ def reachable_launch(
         host=bind_host,
         endpoint=f"http://{advertise_host}:{launch.port}/v1",
     )
+
+
+# Advertise hosts that are same-host by construction: a deploy on this node is
+# always reachable at these, so the round-robin guard never applies to them.
+_LOOPBACK_ADVERTISE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _resolve_ipv4(host: str) -> tuple[str, ...]:
+    """Return the distinct IPv4 addresses ``host`` resolves to (``()`` on failure).
+
+    Fail-open: an unresolvable name yields ``()`` (the caller must treat "can't
+    resolve" as "can't prove non-deterministic" and allow the deploy) rather than
+    raising, so a transient/absent DNS entry never blocks a legitimate deploy.
+    """
+    try:
+        _name, _aliases, addresses = socket.gethostbyname_ex(host)
+    except OSError:
+        return ()
+    # gethostbyname_ex may repeat addresses; keep first-seen order, deduped.
+    return tuple(dict.fromkeys(addresses))
 
 
 class Registry(Protocol):
@@ -397,6 +418,7 @@ class _DefaultSupervisor:
         *,
         advertise_host: str | None = None,
         bind_host: str | None = None,
+        resolve_host: Callable[[str], Sequence[str]] | None = None,
     ) -> None:
         self.backend = backend
         self.planner = planner
@@ -406,6 +428,9 @@ class _DefaultSupervisor:
         # avoid the get_settings lru_cache dance.
         self._advertise_host = advertise_host
         self._bind_host = bind_host
+        # Name-resolution hook for the deterministic-addressing guard; injectable
+        # so tests can simulate a scaled (multi-A-record) service without DNS.
+        self._resolve_host = resolve_host or _resolve_ipv4
 
     def _reachability_hosts(self) -> tuple[str, str]:
         """Return ``(bind_host, advertise_host)`` for a deploy on this node."""
@@ -421,6 +446,43 @@ class _DefaultSupervisor:
             else settings.serving_advertise_host
         )
         return bind, advertise
+
+    def _guard_deterministic_advertise(self, advertise_host: str) -> None:
+        """Refuse a deploy whose advertise host does not name a single node.
+
+        A deployed runtime lives on exactly ONE node — the container that ran the
+        deploy. If the advertised name round-robins across replicas (e.g. a
+        ``docker compose up --scale worker>1`` service, whose embedded DNS returns
+        one A-record per replica), the persisted endpoint may later resolve to a
+        replica that never ran the deploy, so ``worker`` deploys become
+        *intermittently* unreachable instead of reliably working. This turns that
+        silent, load-balancer-roulette failure into a clear, actionable error at
+        deploy time (finding 2 / PR-1 follow-up).
+
+        Detection assumes Compose's per-replica DNS round-robin (N A-records under
+        ``--scale N``); a Swarm VIP would collapse to a single virtual IP and not
+        trip this — that model is out of scope for this compose stack.
+
+        Fail-open by design: a same-host loopback advertise (local ``docie up``),
+        an unresolvable name, or a single resolved address is always allowed — we
+        only refuse when we can positively prove ambiguity (>1 distinct address).
+        """
+        if advertise_host in _LOOPBACK_ADVERTISE_HOSTS:
+            return
+        addresses = tuple(self._resolve_host(advertise_host))
+        if len(addresses) <= 1:
+            return
+        raise ValueError(
+            f"advertise host {advertise_host!r} resolves to {len(addresses)} "
+            f"addresses ({', '.join(addresses)}); the deployed runtime lives on "
+            f"exactly one node, so a round-robin service name (e.g. a "
+            f"--scale worker>1 compose service) would record an endpoint that "
+            f"resolves to a replica which never ran the deploy — an intermittent "
+            f"failure. Pin deploys to a single-replica service: keep the deploy "
+            f"worker at scale=1, or point DOCIE_SERVING_ADVERTISE_HOST at a "
+            f"dedicated single-replica 'serving' service so the advertised name "
+            f"always resolves to the one node running the runtime."
+        )
 
     def list_deployments(self) -> object:
         return self.backend.list()
@@ -448,6 +510,10 @@ class _DefaultSupervisor:
                 raise ValueError(recommendation.explanation)
             runtime = str(recommendation.runtime)
         bind_host, advertise_host = self._reachability_hosts()
+        # REMOTE advertises the user's real upstream (reachable_launch skips it),
+        # so its advertise host plays no role — don't fail-fast on it.
+        if RuntimeKind(runtime) != RuntimeKind.REMOTE:
+            self._guard_deterministic_advertise(advertise_host)
         launch = reachable_launch(
             RuntimeLaunchSpec(
                 runtime=RuntimeKind(runtime),
@@ -478,6 +544,9 @@ class _DefaultSupervisor:
                 f"see serving/README.md), then re-run `docie up {name}`."
             ) from exc
         bind_host, advertise_host = self._reachability_hosts()
+        # Store models always run the in-worker LLAMACPP subprocess (never REMOTE),
+        # so guard the advertise host unconditionally here.
+        self._guard_deterministic_advertise(advertise_host)
         launch = reachable_launch(
             RuntimeLaunchSpec(
                 runtime=RuntimeKind.LLAMACPP,

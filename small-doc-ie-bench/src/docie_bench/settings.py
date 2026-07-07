@@ -98,12 +98,19 @@ class Settings(BaseSettings):
     # 127.0.0.1 (same host); Docker sets DOCIE_SERVING_ADVERTISE_HOST to the deploy
     # service name (see docker-compose.yml). DOCIE_-prefixed aliases mirror
     # DOCIE_SERVING_HOME so all serving knobs share one namespace.
+    #
+    # Both default to the SAFE local value 127.0.0.1 (loopback). `docie up` /
+    # `docie serve` run same-host, so a loopback bind never exposes the unauth
+    # runtime on the LAN. The Docker path deliberately opts INTO an all-interfaces
+    # bind by setting DOCIE_SERVING_BIND_HOST=0.0.0.0 in compose (paired with the
+    # advertise service name) so sibling containers can reach it over the compose
+    # network — see docker-compose.yml / .env.example.
     serving_advertise_host: str = Field(
         default="127.0.0.1",
         validation_alias=AliasChoices("DOCIE_SERVING_ADVERTISE_HOST", "serving_advertise_host"),
     )
     serving_bind_host: str = Field(
-        default="0.0.0.0",  # noqa: S104 - in-container bind so other replicas can reach it
+        default="127.0.0.1",
         validation_alias=AliasChoices("DOCIE_SERVING_BIND_HOST", "serving_bind_host"),
     )
 

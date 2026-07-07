@@ -43,6 +43,15 @@ _BIND = "0.0.0.0"  # noqa: S104 - the in-container all-interfaces bind under tes
 _LOOPBACK = ("127.0.0.1", _BIND, "localhost")
 
 
+def _single_ip(_host: str) -> tuple[str, ...]:
+    """A single-A-record resolver stub: a scale=1 service resolves to one node.
+
+    Injected into the deploy-path tests so the deterministic-addressing guard is a
+    hermetic no-op (no real DNS) instead of relying on the ambient resolver.
+    """
+    return ("10.0.0.2",)
+
+
 class EndpointHonoringAdapter:
     """A stub runtime that records ``spec.endpoint`` (the advertise URL) verbatim.
 
@@ -145,7 +154,12 @@ def test_serve_store_model_binds_all_and_advertises_service_name(tmp_path: Path)
         tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: EndpointHonoringAdapter()}
     )
     wrapper = _DefaultSupervisor(
-        supervisor, planner=None, model_store_root=root, advertise_host="serving", bind_host=_BIND
+        supervisor,
+        planner=None,
+        model_store_root=root,
+        advertise_host="serving",
+        bind_host=_BIND,
+        resolve_host=_single_ip,
     )
     plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
 
@@ -161,7 +175,11 @@ def test_serve_generic_path_also_splits_bind_and_advertise(tmp_path: Path) -> No
         tmp_path / "state.json", adapters={RuntimeKind.VLLM: EndpointHonoringAdapter()}
     )
     wrapper = _DefaultSupervisor(
-        supervisor, planner=None, advertise_host="serving", bind_host=_BIND
+        supervisor,
+        planner=None,
+        advertise_host="serving",
+        bind_host=_BIND,
+        resolve_host=_single_ip,
     )
     plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
 
@@ -185,7 +203,12 @@ def test_two_supervisors_over_one_state_read_the_advertise_endpoint(tmp_path: Pa
         state, adapters={RuntimeKind.LLAMACPP: EndpointHonoringAdapter()}
     )
     wrapper = _DefaultSupervisor(
-        deployer, planner=None, model_store_root=root, advertise_host="serving", bind_host=_BIND
+        deployer,
+        planner=None,
+        model_store_root=root,
+        advertise_host="serving",
+        bind_host=_BIND,
+        resolve_host=_single_ip,
     )
     asyncio.run(ControlPlane(None, None, wrapper, None).up("inv", port=8088))  # type: ignore[arg-type]
 
@@ -257,4 +280,137 @@ def test_settings_advertise_defaults_to_loopback_for_local_cli() -> None:
     # compose-only service name leaks into the laptop path).
     from docie_bench.settings import Settings
 
-    assert Settings().serving_advertise_host == "127.0.0.1"
+    # _env_file=None keeps this hermetic regardless of any ambient .env.
+    assert Settings(_env_file=None).serving_advertise_host == "127.0.0.1"
+
+
+def test_settings_bind_defaults_to_loopback_not_all_interfaces() -> None:
+    # SECURITY (finding 1): the code default must be the SAFE loopback, so a local
+    # `docie up`/`docie serve` (ControlPlane.from_defaults, no injected host) never
+    # binds the unauthenticated runtime on ALL interfaces / the LAN. The Docker
+    # path opts INTO 0.0.0.0 explicitly via DOCIE_SERVING_BIND_HOST in compose.
+    from docie_bench.settings import Settings
+
+    assert Settings(_env_file=None).serving_bind_host == "127.0.0.1"
+
+
+def test_settings_bind_env_override_opts_into_all_interfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Docker path sets DOCIE_SERVING_BIND_HOST=0.0.0.0 to reach sibling
+    # containers over the private compose network.
+    from docie_bench.settings import Settings, get_settings
+
+    monkeypatch.setenv("DOCIE_SERVING_BIND_HOST", _BIND)
+    get_settings.cache_clear()
+    try:
+        assert Settings(_env_file=None).serving_bind_host == _BIND
+    finally:
+        get_settings.cache_clear()
+
+
+# ── finding 2: deterministic single-replica addressing (fail-fast guard) ────────
+
+
+def _multi_ip(_host: str) -> tuple[str, ...]:
+    """A round-robin resolver stub: a --scale worker>1 service returns N A-records."""
+    return ("10.0.0.2", "10.0.0.3", "10.0.0.4")
+
+
+def test_up_fails_fast_when_advertise_host_round_robins_across_replicas(
+    tmp_path: Path,
+) -> None:
+    # Under `--scale worker>1` the advertised name resolves to several replicas;
+    # the deployed runtime lives on exactly one, so the recorded endpoint would be
+    # intermittently unreachable. The guard must refuse the deploy up front.
+    root = tmp_path / "models"
+    _seed_store(root)
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: EndpointHonoringAdapter()}
+    )
+    wrapper = _DefaultSupervisor(
+        supervisor,
+        planner=None,
+        model_store_root=root,
+        advertise_host="worker",
+        bind_host=_BIND,
+        resolve_host=_multi_ip,
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="resolves to 3 addresses"):
+        asyncio.run(plane.up("inv", port=8088))
+    # And nothing was persisted — the deploy was refused before recording a record.
+    assert supervisor.list() == ()
+
+
+def test_serve_fails_fast_when_advertise_host_round_robins(tmp_path: Path) -> None:
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.VLLM: EndpointHonoringAdapter()}
+    )
+    wrapper = _DefaultSupervisor(
+        supervisor,
+        planner=None,
+        advertise_host="worker",
+        bind_host=_BIND,
+        resolve_host=_multi_ip,
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="single-replica"):
+        asyncio.run(plane.serve("org/model", name="dep", runtime="vllm", replicas=1))
+
+
+def test_deploy_allows_single_replica_advertise(tmp_path: Path) -> None:
+    # A scale=1 service resolves to exactly one node — the guard must NOT fire.
+    root = tmp_path / "models"
+    _seed_store(root)
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: EndpointHonoringAdapter()}
+    )
+    wrapper = _DefaultSupervisor(
+        supervisor,
+        planner=None,
+        model_store_root=root,
+        advertise_host="worker",
+        bind_host=_BIND,
+        resolve_host=_single_ip,
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.up("inv", port=8088))
+    assert supervisor.get("inv").spec.launch.endpoint == "http://worker:8088/v1"
+
+
+def test_deploy_allows_loopback_advertise_without_resolving(tmp_path: Path) -> None:
+    # Local CLI advertises 127.0.0.1 (same host); the guard skips it entirely and
+    # must never call the resolver (proven by a resolver that would fail the test).
+    root = tmp_path / "models"
+    _seed_store(root)
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: EndpointHonoringAdapter()}
+    )
+
+    def _boom(_host: str) -> tuple[str, ...]:
+        raise AssertionError("resolver must not be called for a loopback advertise host")
+
+    wrapper = _DefaultSupervisor(
+        supervisor,
+        planner=None,
+        model_store_root=root,
+        advertise_host="127.0.0.1",
+        bind_host="127.0.0.1",
+        resolve_host=_boom,
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.up("inv", port=8088))
+    assert supervisor.get("inv").spec.launch.endpoint == "http://127.0.0.1:8088/v1"
+
+
+def test_resolve_ipv4_returns_empty_on_unresolvable_name() -> None:
+    # Fail-open contract: an unresolvable name yields () so the guard allows the
+    # deploy (can't prove non-determinism) rather than raising.
+    from docie_bench.serving.control_plane import _resolve_ipv4
+
+    assert _resolve_ipv4("docie-nonexistent-host.invalid") == ()

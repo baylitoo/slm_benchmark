@@ -352,11 +352,16 @@ async def deploy_model_job(ctx: inngest.Context) -> Any:
     (the compose service name, e.g. ``worker``), so the api container resolves a
     cross-container-reachable endpoint instead of a worker-local loopback.
 
-    NOTE: still requires worker ``scale=1`` — the advertised service name
+    NOTE: still requires worker ``scale=1``. The advertised service name
     round-robins under ``--scale worker>1`` and may resolve to a replica that
     never ran the deploy (deterministic scale>1 needs a dedicated single-replica
-    serving service; deferred). Also needs the ``llama-server`` binary on PATH +
-    a seeded model store; without them deploys fail cleanly on the ``error`` topic.
+    serving service; deferred). This is no longer a silent, intermittent failure:
+    the control plane now FAILS FAST at deploy time when the advertise host
+    resolves to more than one address (see
+    ``_DefaultSupervisor._guard_deterministic_advertise``), surfacing a clear
+    error on the ``error`` topic instead of recording a flaky endpoint. Also needs
+    the ``llama-server`` binary on PATH + a seeded model store; without them
+    deploys fail cleanly on the ``error`` topic.
     """
     data = dict(ctx.event.data or {})
     channel = data.get("channel") or f"run:{ctx.event.id}"
