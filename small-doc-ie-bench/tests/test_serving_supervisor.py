@@ -332,6 +332,20 @@ def test_log_tail_uses_pre_spawn_offset(tmp_path: Path) -> None:
     assert "PRIOR ATTEMPT" not in failed.last_error
 
 
+def test_reallocation_signals_do_not_leak_into_persisted_state(tmp_path: Path) -> None:
+    # exited_after_start / log_offset are in-memory-only: they must not appear in
+    # deployments.json (log_offset churns every reconcile) nor, by extension, in
+    # the /deployments API payload or the Studio deployments table.
+    state_path = tmp_path / "state.json"
+    supervisor = PersistentSupervisor(state_path, adapters={RuntimeKind.VLLM: FakeAdapter()})
+    supervisor.deploy(_deployment())
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    record_json = payload["deployments"]["invoice"]
+    assert "exited_after_start" not in record_json
+    assert "log_offset" not in record_json
+
+
 def test_launch_exception_marks_not_exited_after_start(tmp_path: Path) -> None:
     # The :160 launch-exception path (never spawned, e.g. missing binary) is a
     # different failure: the reallocation caller must NOT treat it as a bind

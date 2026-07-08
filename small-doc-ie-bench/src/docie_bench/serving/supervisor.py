@@ -334,6 +334,12 @@ def _record_to_dict(record: DeploymentRecord) -> dict[str, Any]:
     value["spec"]["launch"]["runtime"] = record.spec.launch.runtime.value
     value["spec"]["launch"]["extra_args"] = list(record.spec.launch.extra_args)
     value["spec"]["launch"]["env"] = dict(record.spec.launch.env)
+    # In-memory-only reallocation signals: drop them from the persisted/served
+    # payload so they never leak into deployments.json (log_offset churns every
+    # reconcile), the /deployments API, or the Studio deployments table.
+    # _record_from_dict already ignores them (they reset to defaults on reload).
+    value.pop("exited_after_start", None)
+    value.pop("log_offset", None)
     return value
 
 
