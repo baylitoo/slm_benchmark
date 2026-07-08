@@ -114,6 +114,30 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("DOCIE_SERVING_BIND_HOST", "serving_bind_host"),
     )
 
+    # Per-deploy port allocation window. When a deploy supplies no explicit port
+    # the control plane picks the first free port in [start, end] that is neither
+    # held by a non-removed deployment record nor bound by a live socket, so two
+    # concurrent store deploys land on distinct ports with no operator input.
+    # 8088 stays the first pick, so single-deploy behavior is unchanged. Widen
+    # the window (or stop a deployment) if it exhausts. DOCIE_-prefixed aliases
+    # mirror the other serving knobs.
+    serving_port_range_start: int = Field(
+        default=8088,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices(
+            "DOCIE_SERVING_PORT_RANGE_START", "serving_port_range_start"
+        ),
+    )
+    serving_port_range_end: int = Field(
+        default=8188,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices(
+            "DOCIE_SERVING_PORT_RANGE_END", "serving_port_range_end"
+        ),
+    )
+
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
     openai_compat_model: str = "local-model"

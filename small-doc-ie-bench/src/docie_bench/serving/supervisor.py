@@ -64,6 +64,24 @@ class DeploymentRecord:
     consecutive_health_failures: int = 0
     last_error: str | None = None
     updated_at: float = field(default_factory=time.time)
+    # True once a runtime process was observed to start and then exit on its own
+    # (crash / bind collision) — as opposed to a launch that never spawned (a
+    # missing binary raises before start). The reallocation caller uses this to
+    # tell "port collided, try another" from "unfixable, don't churn ports".
+    # Transient/advisory: not restored on reload (a fresh process reconciles anew).
+    # metadata serialize=False keeps this internal signal out of every JSON-facing
+    # projection (to_data, deployments.json) so it never leaks into the API/Studio.
+    exited_after_start: bool = field(default=False, metadata={"serialize": False})
+    # Byte offset into logs_dir/{name}.log captured immediately BEFORE the current
+    # process was spawned. The exit branch reads only bytes past this offset so the
+    # surfaced tail is *this* attempt's stderr, not a prior restart's (the log is
+    # opened "ab" and accumulates across restarts). serialize=False for the same
+    # reason: it churns every reconcile and is meaningless outside this process.
+    log_offset: int = field(default=0, metadata={"serialize": False})
+
+    def __post_init__(self) -> None:
+        if self.log_offset < 0:
+            raise ValueError("log_offset must be non-negative")
 
 
 class PersistentSupervisor:
@@ -139,24 +157,39 @@ class PersistentSupervisor:
             self._save()
             return record
 
+        log_path = self.logs_dir / f"{record.spec.name}.log"
         running = record.endpoint is not None and adapter.is_running(record.pid)
         if not running:
             is_restart = record.endpoint is not None
             if record.pid is not None:
+                # The process was up on the prior pass and has since exited on its
+                # own — surface the real reason (its stderr tail from THIS attempt,
+                # via the pre-spawn offset) instead of a bare, undiagnosable string,
+                # and flag it so the deploy caller can reallocate off a bad port.
                 record.pid = None
                 record.state = LifecycleState.FAILED
-                record.last_error = "runtime process exited"
+                record.exited_after_start = True
+                record.last_error = self._log_tail(log_path, record.log_offset) or (
+                    "runtime process exited"
+                )
             if not self._may_restart(record):
                 record.updated_at = self._clock()
                 self._save()
                 return record
+            # Capture the log size BEFORE spawning so the next exit branch tails
+            # only this process's output (the log is opened "ab" and accumulates).
+            record.log_offset = self._log_size(log_path)
             try:
                 process = adapter.start(
                     record.spec.launch,
-                    log_path=self.logs_dir / f"{record.spec.name}.log",
+                    log_path=log_path,
                 )
             except Exception as exc:
+                # Never spawned (e.g. missing binary): NOT a started-then-exited
+                # failure, so do not signal reallocation — it fails identically on
+                # every port. The exception message is the honest reason.
                 record.state = LifecycleState.FAILED
+                record.exited_after_start = False
                 record.last_error = str(exc)
                 record.restart_count += 1
                 record.updated_at = self._clock()
@@ -166,6 +199,7 @@ class PersistentSupervisor:
             record.endpoint = process.endpoint
             record.state = LifecycleState.STARTING
             record.last_error = None
+            record.exited_after_start = False
             if is_restart:
                 record.restart_count += 1
 
@@ -211,13 +245,59 @@ class PersistentSupervisor:
         where 127.0.0.1 IS reachable, so this bounded loop re-probes until the
         process is actually serving. Returns whatever state is reached — an
         honest final record, never a busy-wait past ``timeout_s``.
+
+        A *terminally* FAILED record (exited/never-spawned with no restarts left)
+        short-circuits immediately: reconcile keeps respawning while restarts
+        remain (returning STARTING), so once it returns FAILED with ``_may_restart``
+        false nothing more will happen — polling on would just burn the whole
+        ``timeout_s``. This is what keeps collision recovery (serve_store_model /
+        serve) from blocking ~60s per exhausted attempt. A slow-loading model stays
+        alive (STARTING/DEGRADED), never trips this, and keeps waiting.
         """
         deadline = self._clock() + timeout_s
         record = self.reconcile(name)
         while record.state != LifecycleState.READY and self._clock() < deadline:
+            if record.state == LifecycleState.FAILED and not self._may_restart(record):
+                break
             sleep(interval_s)
             record = self.reconcile(name)
         return record
+
+    @staticmethod
+    def _log_size(log_path: Path) -> int:
+        try:
+            return log_path.stat().st_size
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _log_tail(
+        log_path: Path, offset: int, *, max_bytes: int = 2048, max_lines: int = 20
+    ) -> str | None:
+        """Return the runtime stderr written since ``offset`` (bounded), or None.
+
+        Reads only the bytes past the pre-spawn ``offset`` so a prior restart's
+        output (the log is opened "ab") never masks this attempt's real error, and
+        caps the result so a chatty runtime cannot bloat ``deployments.json`` (the
+        tail is persisted onto ``last_error``). None => nothing new/unreadable, so
+        the caller keeps its generic fallback string.
+        """
+        try:
+            with log_path.open("rb") as handle:
+                handle.seek(max(0, offset))
+                data = handle.read()
+        except OSError:
+            return None
+        if not data:
+            return None
+        text = data.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None
+        lines = text.splitlines()[-max_lines:]
+        tail = "\n".join(lines)
+        if len(tail) > max_bytes:
+            tail = tail[-max_bytes:]
+        return tail
 
     def _may_restart(self, record: DeploymentRecord) -> bool:
         if record.endpoint is None and record.state == LifecycleState.STOPPED:
@@ -267,6 +347,12 @@ def _record_to_dict(record: DeploymentRecord) -> dict[str, Any]:
     value["spec"]["launch"]["runtime"] = record.spec.launch.runtime.value
     value["spec"]["launch"]["extra_args"] = list(record.spec.launch.extra_args)
     value["spec"]["launch"]["env"] = dict(record.spec.launch.env)
+    # In-memory-only reallocation signals: drop them from the persisted/served
+    # payload so they never leak into deployments.json (log_offset churns every
+    # reconcile), the /deployments API, or the Studio deployments table.
+    # _record_from_dict already ignores them (they reset to defaults on reload).
+    value.pop("exited_after_start", None)
+    value.pop("log_offset", None)
     return value
 
 

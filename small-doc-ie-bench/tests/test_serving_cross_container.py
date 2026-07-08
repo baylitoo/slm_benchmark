@@ -180,6 +180,12 @@ def test_serve_generic_path_also_splits_bind_and_advertise(tmp_path: Path) -> No
         advertise_host="serving",
         bind_host=_BIND,
         resolve_host=_single_ip,
+        # serve() now auto-allocates (all vLLM serves otherwise collided on the
+        # RuntimeLaunchSpec default 8000); inject a fixed window + always-free
+        # prober so this stays hermetic and the advertise URL derives from the
+        # ALLOCATED port, not a hardcoded default.
+        port_range=(8088, 8188),
+        port_probe=lambda _host, _port: True,
     )
     plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
 
@@ -187,7 +193,10 @@ def test_serve_generic_path_also_splits_bind_and_advertise(tmp_path: Path) -> No
 
     launch = supervisor.get("dep").spec.launch
     assert launch.host == _BIND
-    assert launch.endpoint == "http://serving:8000/v1"
+    assert 8088 <= launch.port <= 8188
+    # The advertise URL still embeds whatever port allocation chose (bind/advertise
+    # split preserved), just no longer the old 8000 default.
+    assert launch.endpoint == f"http://serving:{launch.port}/v1"
 
 
 # ── the persisted record: cross-replica read yields the advertise endpoint ──────

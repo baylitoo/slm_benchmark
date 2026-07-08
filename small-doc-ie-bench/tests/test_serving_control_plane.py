@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -8,10 +9,16 @@ from pathlib import Path
 import pytest
 from test_serving_supervisor import FakeAdapter
 
-from docie_bench.serving.control_plane import ControlPlane, _DefaultSupervisor, to_data
+from docie_bench.serving.control_plane import (
+    ControlPlane,
+    PortAllocator,
+    _DefaultSupervisor,
+    _socket_is_free,
+    to_data,
+)
 from docie_bench.serving.model_store import ModelStore, ModelStoreError
-from docie_bench.serving.runtime import RuntimeKind
-from docie_bench.serving.supervisor import PersistentSupervisor
+from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
+from docie_bench.serving.supervisor import DeploymentRecord, DeploymentSpec, PersistentSupervisor
 
 
 class State(Enum):
@@ -229,6 +236,306 @@ def test_up_missing_entry_raises_with_store_root_and_seeding_pointer(tmp_path: P
     message = str(excinfo.value)
     assert str(root.resolve()) in message
     assert "Seed it first" in message
+
+
+# ── PR-B: per-deploy port allocation ────────────────────────────────────────────
+
+
+def _always_free(_host: str, _port: int) -> bool:
+    return True
+
+
+def _loopback_hosts() -> dict[str, object]:
+    # Advertise 127.0.0.1 so the deterministic-addressing guard is a no-op and no
+    # resolver/DNS is touched (mirrors the local-CLI path).
+    return {"advertise_host": "127.0.0.1", "bind_host": "127.0.0.1"}
+
+
+def _seed_openai_store(root: Path, name: str) -> ModelStore:
+    model_gguf = root.parent / f"{name}.gguf"
+    model_gguf.write_bytes(b"GGUF-weights")
+    store = ModelStore(root)
+    store.add_gguf(name=name, family="openai_chat", model_gguf=model_gguf)
+    return store
+
+
+def test_allocator_recommend_is_deterministic_and_skips_reserved() -> None:
+    allocator = PortAllocator(range_start=8088, range_end=8188)
+    # Pure function of (range, reserved): 8088/8089 held by records -> 8090.
+    first = allocator.recommend(bind_host="127.0.0.1", reserved={8088, 8089})
+    second = allocator.recommend(bind_host="127.0.0.1", reserved={8088, 8089})
+    assert first == second == 8090
+
+
+def test_allocator_reserved_honored_across_states_including_stopped(tmp_path: Path) -> None:
+    # A STOPPED record still reserves its port (it can be start()-ed later); only
+    # remove() frees it. Proven through _DefaultSupervisor._reserved_ports.
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: FakeAdapter()}
+    )
+    supervisor.deploy(
+        DeploymentSpec(
+            name="held",
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.LLAMACPP, model="/m.gguf", alias="held", port=8090
+            ),
+        )
+    )
+    supervisor.stop("held")  # STOPPED, but must keep 8090 reserved
+    wrapper = _DefaultSupervisor(supervisor, planner=None)
+    assert 8090 in wrapper._reserved_ports()
+    assert 8090 not in wrapper._reserved_ports(exclude_name="held")
+
+
+def test_allocator_skips_bound_socket() -> None:
+    # Even with no record holding a port, a probe that reports it bound is skipped.
+    def probe(_host: str, port: int) -> bool:
+        return port != 8088  # 8088 "bound" by something the record-scan can't see
+
+    allocator = PortAllocator(range_start=8088, range_end=8188, probe=probe)
+    assert allocator.allocate(bind_host="127.0.0.1", reserved=set()) == 8089
+
+
+def test_range_exhaustion_raises_clear_error() -> None:
+    allocator = PortAllocator(range_start=8088, range_end=8089)
+    with pytest.raises(RuntimeError, match="no free port in range 8088-8089"):
+        allocator.recommend(bind_host="127.0.0.1", reserved={8088, 8089})
+
+
+def test_absent_port_no_longer_pins_8088(tmp_path: Path) -> None:
+    # Guards against the dead-code regression: up(port=None) with 8088 already held
+    # by another record must NOT land on 8088.
+    root = tmp_path / "models"
+    _seed_openai_store(root, "a")
+    _seed_openai_store(root, "b")
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: FakeAdapter()}
+    )
+    wrapper = _DefaultSupervisor(
+        supervisor,
+        planner=None,
+        model_store_root=root,
+        port_range=(8088, 8188),
+        port_probe=_always_free,
+        **_loopback_hosts(),
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.up("a", port=8088))  # explicit -> pins 8088
+    asyncio.run(plane.up("b", port=None))  # absent -> must allocate elsewhere
+
+    assert supervisor.get("a").spec.launch.port == 8088
+    assert supervisor.get("b").spec.launch.port != 8088
+    assert supervisor.get("b").spec.launch.port == 8089
+
+
+def test_explicit_override_is_honored_without_probing(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    _seed_openai_store(root, "a")
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: FakeAdapter()}
+    )
+
+    def _boom(_host: str, _port: int) -> bool:
+        raise AssertionError("prober must not be consulted for an explicit override")
+
+    wrapper = _DefaultSupervisor(
+        supervisor,
+        planner=None,
+        model_store_root=root,
+        port_range=(8088, 8188),
+        port_probe=_boom,
+        **_loopback_hosts(),
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.up("a", port=9001))  # outside the range on purpose
+    assert supervisor.get("a").spec.launch.port == 9001
+
+
+class _ReallocBackend:
+    """Backend whose await_ready FAILS (started-then-exited) on ``bad_ports``.
+
+    Lets the reallocation loop be driven deterministically with no real sockets,
+    sleeps, or restart churn: the first (bad) port returns FAILED+exited, the next
+    returns READY. Records the deploy order so the test can prove the loop advanced.
+    """
+
+    def __init__(self, bad_ports: set[int]) -> None:
+        self.bad_ports = bad_ports
+        self.records: dict[str, DeploymentRecord] = {}
+        self.deployed_ports: list[int] = []
+
+    def list(self) -> tuple[DeploymentRecord, ...]:
+        return tuple(self.records.values())
+
+    def deploy(self, spec: DeploymentSpec) -> DeploymentRecord:
+        record = DeploymentRecord(spec=spec, state=LifecycleState.STOPPED)
+        self.records[spec.name] = record
+        self.deployed_ports.append(spec.launch.port)
+        return record
+
+    def await_ready(self, name: str) -> DeploymentRecord:
+        record = self.records[name]
+        if record.spec.launch.port in self.bad_ports:
+            record.state = LifecycleState.FAILED
+            record.exited_after_start = True
+            record.last_error = "bind: address already in use"
+            record.pid = None
+        else:
+            record.state = LifecycleState.READY
+            record.endpoint = record.spec.launch.endpoint
+            record.pid = 4242
+        return record
+
+
+def test_reallocates_on_immediate_exit_and_rebuilds_endpoint(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    _seed_openai_store(root, "a")
+    backend = _ReallocBackend(bad_ports={8088})
+    wrapper = _DefaultSupervisor(
+        backend,
+        planner=None,
+        model_store_root=root,
+        port_range=(8088, 8188),
+        port_probe=_always_free,
+        advertise_host="serving",  # non-loopback so the endpoint embeds the port
+        bind_host="0.0.0.0",  # noqa: S104 - the in-container all-interfaces bind
+        resolve_host=lambda _host: ("10.0.0.2",),
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    record = to_data(asyncio.run(plane.up("a", port=None)))
+    assert isinstance(record, dict)
+
+    # First port collided (8088), loop advanced to 8089 and it came up READY.
+    assert backend.deployed_ports == [8088, 8089]
+    assert record["state"] == "ready"
+    # The endpoint was rebuilt THROUGH reachable_launch on the second attempt, so it
+    # embeds the reallocated port — not the stale first one.
+    assert record["spec"]["launch"]["port"] == 8089
+    assert record["endpoint"] == "http://serving:8089/v1"
+
+
+class _CaptureBackend:
+    def __init__(self) -> None:
+        self.specs: list[DeploymentSpec] = []
+
+    def list(self) -> tuple[DeploymentRecord, ...]:
+        return ()
+
+    def deploy(self, spec: DeploymentSpec) -> DeploymentRecord:
+        self.specs.append(spec)
+        return DeploymentRecord(spec=spec, state=LifecycleState.READY)
+
+    def await_ready(self, name: str) -> DeploymentRecord:
+        spec = self.specs[-1]
+        return DeploymentRecord(
+            spec=spec,
+            state=LifecycleState.READY,
+            endpoint=spec.launch.endpoint,
+            pid=4242,
+        )
+
+
+def test_serve_allocates_and_skips_remote(tmp_path: Path) -> None:
+    del tmp_path
+    backend = _CaptureBackend()
+    probe_calls: list[tuple[str, int]] = []
+
+    def probe(host: str, port: int) -> bool:
+        probe_calls.append((host, port))
+        return True
+
+    wrapper = _DefaultSupervisor(
+        backend,
+        planner=None,
+        port_range=(8088, 8188),
+        port_probe=probe,
+        **_loopback_hosts(),
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.serve("org/model", name="vllm-dep", runtime="vllm", replicas=1))
+    assert backend.specs[-1].launch.port == 8088  # allocated from the window
+    assert probe_calls == [("127.0.0.1", 8088)]
+
+    probe_calls.clear()
+    asyncio.run(
+        plane.serve("m", name="remote-dep", runtime="remote", replicas=1)
+    )
+    # REMOTE binds nothing locally -> no allocation, no probe, default port kept.
+    assert backend.specs[-1].launch.port == 8000
+    assert probe_calls == []
+
+
+def test_serve_reallocates_on_immediate_exit(tmp_path: Path) -> None:
+    # The vLLM serve() path now shares serve_store_model's bounded reallocation
+    # loop: a raced bind (first port exits immediately) advances to the next free
+    # port and rebuilds the advertised endpoint through reachable_launch.
+    del tmp_path
+    backend = _ReallocBackend(bad_ports={8088})
+    wrapper = _DefaultSupervisor(
+        backend,
+        planner=None,
+        port_range=(8088, 8188),
+        port_probe=_always_free,
+        advertise_host="serving",  # non-loopback so the endpoint embeds the port
+        bind_host="0.0.0.0",  # noqa: S104 - the in-container all-interfaces bind
+        resolve_host=lambda _host: ("10.0.0.2",),
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    # runtime="vllm" so the (None) planner is never consulted.
+    record = asyncio.run(plane.serve("org/model", name="vllm-dep", runtime="vllm", replicas=1))
+    assert isinstance(record, dict)
+
+    assert backend.deployed_ports == [8088, 8089]
+    assert record["state"] == "ready"
+    assert record["spec"]["launch"]["port"] == 8089
+    assert record["endpoint"] == "http://serving:8089/v1"
+
+
+def test_to_data_excludes_internal_reallocation_signals() -> None:
+    # exited_after_start / log_offset are internal-only reconciler signals; the API
+    # payload and deploy result (both via to_data) must not surface them, while the
+    # public fields still serialize.
+    record = DeploymentRecord(
+        spec=DeploymentSpec(
+            name="d",
+            launch=RuntimeLaunchSpec(runtime=RuntimeKind.LLAMACPP, model="/m.gguf", alias="d"),
+        ),
+        state=LifecycleState.FAILED,
+        exited_after_start=True,
+        log_offset=4096,
+    )
+
+    data = to_data(record)
+
+    assert isinstance(data, dict)
+    assert "exited_after_start" not in data
+    assert "log_offset" not in data
+    assert data["state"] == LifecycleState.FAILED.value
+    assert data["spec"]["launch"]["model"] == "/m.gguf"
+
+
+def test_socket_is_free_probes_ipv6_bind_host() -> None:
+    # An IPv6 bind host must be probed with the right family; an AF_INET-only probe
+    # would fail the bind for every port and wedge allocation into a bogus
+    # range-exhausted error.
+    if not socket.has_ipv6:
+        pytest.skip("no IPv6 support on this host")
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as held:
+            held.bind(("::1", 0))
+            port = held.getsockname()[1]
+            # Held by a live socket -> reads as taken (family resolved correctly).
+            assert _socket_is_free("::1", port) is False
+    except OSError:
+        pytest.skip("IPv6 loopback not available on this host")
+    # Released -> the same port binds again on the IPv6 family (the load-bearing
+    # assertion: an AF_INET-only probe could never return True for an IPv6 host).
+    assert _socket_is_free("::1", port) is True
 
 
 def test_to_data_sorts_mapping_keys_and_hides_private_attributes() -> None:

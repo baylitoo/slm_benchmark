@@ -51,6 +51,63 @@ async def list_deployments() -> Any:
     return await _control_plane().list_deployments()
 
 
+@router.get("/ports")
+async def serving_ports() -> dict[str, Any]:
+    """Record-derived view of the serving port window for the Deploy admin table.
+
+    Approximate by design: like the rest of this module it reads the shared
+    on-disk deployment state from the *api* netns and CANNOT socket-probe the
+    worker's binds, so used/free/recommended are derived purely from the records.
+    ``recommended_next`` is an explicit HINT computed by the SAME
+    ``PortAllocator.recommend`` the worker uses, so the UI and the worker agree in
+    logic; the worker re-derives and socket-probes authoritatively at deploy time
+    and may legitimately pick a different port. Never a reservation.
+    """
+    from docie_bench.serving.control_plane import PortAllocator
+
+    settings = get_settings()
+    start = settings.serving_port_range_start
+    end = settings.serving_port_range_end
+    bind_host = settings.serving_bind_host
+
+    records = await _control_plane().list_deployments()
+    deployments: list[dict[str, Any]] = []
+    used: set[int] = set()
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            spec = record.get("spec") or {}
+            launch = spec.get("launch") or {}
+            port = launch.get("port")
+            if not isinstance(port, int):
+                continue
+            deployments.append(
+                {
+                    "name": spec.get("name"),
+                    "port": port,
+                    "state": record.get("state"),
+                }
+            )
+            used.add(port)
+
+    allocator = PortAllocator(range_start=start, range_end=end)
+    try:
+        recommended_next: int | None = allocator.recommend(bind_host=bind_host, reserved=used)
+    except RuntimeError:
+        recommended_next = None  # range exhausted -> no hint, not a 500
+
+    free_sample = [port for port in range(start, end + 1) if port not in used][:10]
+
+    return {
+        "range": {"start": start, "end": end},
+        "deployments": sorted(deployments, key=lambda item: item["port"]),
+        "used": sorted(used),
+        "free_sample": free_sample,
+        "recommended_next": recommended_next,
+    }
+
+
 @router.get("/deployments/{name}")
 async def deployment_status(name: str) -> Any:
     try:

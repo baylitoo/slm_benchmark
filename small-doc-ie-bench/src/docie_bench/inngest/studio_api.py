@@ -147,7 +147,10 @@ class DeployRequest(BaseModel):
     model: str
     name: str | None = None
     runtime: str | None = None
-    port: int = 8088
+    # None => the control plane auto-allocates a free port at deploy time; the
+    # UI sends no port unless the operator explicitly overrides it. model_dump(
+    # exclude_none=True) at trigger time drops a None so the worker sees no port.
+    port: int | None = None
     context_length: int = 8192
     replicas: int = 1
 

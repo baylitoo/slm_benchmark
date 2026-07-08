@@ -55,6 +55,17 @@ export interface DeployRequest {
   [k: string]: unknown;
 }
 
+// Record-derived view of the serving port window (GET /v1/serving/ports).
+// `recommended_next` is a HINT: the worker re-derives + socket-probes at deploy
+// time and may pick differently — never treat it as a reservation.
+export interface PortsView {
+  range: { start: number; end: number };
+  deployments: { name: string | null; port: number; state: string | null }[];
+  used: number[];
+  free_sample: number[];
+  recommended_next: number | null;
+}
+
 export interface BenchmarkRequest {
   dataset: string; // required server-side (POST /v1/studio/benchmark)
   split?: string;
@@ -320,6 +331,11 @@ export function getRuntimes(): Promise<RuntimeCapability[]> {
 
 export function getDeployments(): Promise<DeploymentRecord[]> {
   return request<DeploymentRecord[]>("/v1/serving/deployments");
+}
+
+/** Live port-allocation view for the Deploy admin table (record-derived). */
+export function getPorts(): Promise<PortsView> {
+  return request<PortsView>("/v1/serving/ports");
 }
 
 /** Deploy returns the same trigger shape as extract: { event_ids, channel, topics }. */

@@ -17,6 +17,7 @@ import {
   getStore,
   getFamilies,
   getDeployments,
+  getPorts,
   deployModel,
   seedOllama,
   formatBytes,
@@ -24,6 +25,7 @@ import {
   ApiUnavailable,
   type StoreEntry,
   type ModelFamily,
+  type PortsView,
   type TriggerResponse,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
@@ -57,7 +59,11 @@ export function Deploy({ active = true }: { active?: boolean }) {
   return (
     <div className="space-y-6">
       <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
-        <DeployForm store={store} onDeployed={() => deployments.refresh()} />
+        <DeployForm
+          store={store}
+          active={active}
+          onDeployed={() => deployments.refresh()}
+        />
         <SeedForm families={families.data} onSeeded={() => store.refresh()} />
       </div>
 
@@ -92,9 +98,11 @@ export function Deploy({ active = true }: { active?: boolean }) {
 
 function DeployForm({
   store,
+  active,
   onDeployed,
 }: {
   store: ReturnType<typeof usePolling<StoreEntry[]>>;
+  active: boolean;
   onDeployed: () => void;
 }) {
   const { toast } = useToast();
@@ -102,12 +110,34 @@ function DeployForm({
   const [runtime, setRuntime] = useState<string>(""); // "" = auto / store-entry deploy
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [name, setName] = useState("");
-  const [port, setPort] = useState("8088");
+  // Port is DISPLAY-ONLY until the operator edits it. `portDirty` gates whether
+  // we send it at all: an untouched prefill closes the page-load race (a stale
+  // recommendation between poll and submit) by sending NO port, letting the
+  // worker allocate authoritatively at deploy time.
+  const [port, setPort] = useState("");
+  const [portDirty, setPortDirty] = useState(false);
   const [contextLength, setContextLength] = useState("8192");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+
+  // Live port view — only polled while the Advanced panel is open (and Deploy is
+  // the active, visible section), so a collapsed panel costs nothing.
+  const ports = usePolling<PortsView>(getPorts, POLL_MS, active && showAdvanced);
+  const portsData = ports.data;
+
+  // Prefill the field from the recommended port until the operator types — never
+  // clobber their edit.
+  useEffect(() => {
+    if (!portDirty && portsData?.recommended_next != null) {
+      setPort(String(portsData.recommended_next));
+    }
+  }, [portsData?.recommended_next, portDirty]);
+
+  const usedPorts = portsData?.used ?? [];
+  const portConflict =
+    portDirty && port.trim() !== "" && usedPorts.includes(Number(port));
 
   const models = store.data ?? [];
   const selectedEntry = useMemo(
@@ -137,7 +167,10 @@ function DeployForm({
         model: selected,
         ...(runtime ? { runtime } : {}),
         ...(name.trim() ? { name: name.trim() } : {}),
-        ...(port.trim() ? { port: Number(port) } : {}),
+        // Only send a port when the operator explicitly overrode the prefill; an
+        // untouched recommendation is sent as NO port so the worker allocates
+        // authoritatively (and the page-load-race stale value never ships).
+        ...(portDirty && port.trim() ? { port: Number(port) } : {}),
         ...(contextLength.trim() ? { context_length: Number(contextLength) } : {}),
       };
       const res = await deployModel(payload);
@@ -238,30 +271,54 @@ function DeployForm({
             Advanced options
           </button>
           {showAdvanced && (
-            <div className="mt-3 grid animate-fade-in gap-4 sm:grid-cols-3">
-              <Field label="Deployment name" hint="Optional alias.">
-                <TextInput
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="(model name)"
-                />
-              </Field>
-              <Field label="Port">
-                <TextInput
-                  type="number"
-                  value={port}
-                  onChange={(e) => setPort(e.target.value)}
-                  placeholder="8088"
-                />
-              </Field>
-              <Field label="Context length">
-                <TextInput
-                  type="number"
-                  value={contextLength}
-                  onChange={(e) => setContextLength(e.target.value)}
-                  placeholder="8192"
-                />
-              </Field>
+            <div className="mt-3 animate-fade-in space-y-4">
+              <div className="grid gap-4 sm:grid-cols-3">
+                <Field label="Deployment name" hint="Optional alias.">
+                  <TextInput
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="(model name)"
+                  />
+                </Field>
+                <Field
+                  label="Port"
+                  hint={
+                    portDirty
+                      ? "Sent as an explicit override."
+                      : "Auto-allocated at deploy time (prefilled with the recommended port)."
+                  }
+                >
+                  <TextInput
+                    type="number"
+                    value={port}
+                    onChange={(e) => {
+                      setPort(e.target.value);
+                      setPortDirty(true);
+                    }}
+                    placeholder={
+                      portsData?.recommended_next != null
+                        ? String(portsData.recommended_next)
+                        : "auto"
+                    }
+                  />
+                  {portConflict && (
+                    <p className="mt-1 flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+                      <AlertCircle className="h-3.5 w-3.5" />
+                      Port {port} is already in use — the deploy will fail on bind.
+                    </p>
+                  )}
+                </Field>
+                <Field label="Context length">
+                  <TextInput
+                    type="number"
+                    value={contextLength}
+                    onChange={(e) => setContextLength(e.target.value)}
+                    placeholder="8192"
+                  />
+                </Field>
+              </div>
+
+              <PortsAdmin ports={ports} />
             </div>
           )}
         </div>
@@ -285,6 +342,53 @@ function DeployForm({
         </div>
       )}
     </Card>
+  );
+}
+
+function PortsAdmin({ ports }: { ports: ReturnType<typeof usePolling<PortsView>> }) {
+  const data = ports.data;
+  const range = data?.range;
+  const recommended = data?.recommended_next;
+
+  return (
+    <div className="rounded-xl border border-border bg-muted/20 p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="text-xs font-medium text-foreground">
+          Port allocation
+          {range && (
+            <span className="ml-2 font-normal text-muted-foreground">
+              window {range.start}–{range.end}
+            </span>
+          )}
+          {recommended != null ? (
+            <span className="ml-2 font-normal text-muted-foreground">
+              · next free ≈ <span className="text-foreground">{recommended}</span> (hint)
+            </span>
+          ) : data ? (
+            <span className="ml-2 font-normal text-amber-600 dark:text-amber-400">
+              · window exhausted
+            </span>
+          ) : null}
+        </div>
+        <LiveIndicator
+          live={ports.live}
+          refreshing={ports.refreshing}
+          lastUpdated={ports.lastUpdated}
+          onRefresh={ports.refresh}
+        />
+      </div>
+      <DataTable
+        rows={data?.deployments ?? null}
+        loading={ports.loading}
+        error={ports.error}
+        emptyLabel="No ports in use"
+        emptyDescription="Deploy a model — its port appears here on the next refresh."
+      />
+      <p className="mt-2 text-xs text-muted-foreground">
+        The recommended port is a hint; the worker re-checks and allocates authoritatively at
+        deploy time. Leave the port field untouched to let it choose.
+      </p>
+    </div>
   );
 }
 

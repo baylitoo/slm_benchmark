@@ -60,16 +60,31 @@ docie-bench benchmark run --dataset data\voxel51_invoices\manifest.jsonl --model
 docie stop nuextract3                               # when done
 ```
 
-`docie up <name> [--port 8088] [--ctx-size 8192]` resolves the GGUF and the family
+`docie up <name> [--port <n>] [--ctx-size 8192]` resolves the GGUF and the family
 contract from the store and deploys it through the supervisor — tracked in
 `deployments.json`, managed with `docie status` / `docie stop` / `docie list`, and
-visible in `docie-serve-dash`. Default port **8088** matches the `nuextract3` /
-`nuextract3_think` profiles' `base_url` (`http://localhost:8088/v1`), so the
-benchmark consumes it unchanged. `docie up` returns immediately; the model keeps
+visible in `docie-serve-dash`. `docie up` returns immediately; the model keeps
 loading in the background, so wait for `/health` before benchmarking.
 
+**Port allocation.** Omit `--port` and the deploy auto-assigns the first free port
+in `DOCIE_SERVING_PORT_RANGE_START`–`DOCIE_SERVING_PORT_RANGE_END` (default
+**8088–8188**) that is neither held by an existing deployment record nor bound by a
+live socket — so two concurrent deploys land on distinct ports with no manual
+guessing. **8088 stays the first pick**, so a single deploy still matches the
+`nuextract3` / `nuextract3_think` profiles' `base_url` (`http://localhost:8088/v1`)
+unchanged. Pass an explicit `--port <n>` to pin one; it is honored verbatim (no
+probing, no silent reallocation), and if that port is already bound the deploy
+fails on bind — the real `llama-server` stderr is surfaced onto the deployment's
+`last_error`, and an *auto-allocated* deploy reallocates to a free port (bounded).
+This is best-effort, not race-free: a probed-free port can be grabbed before the
+runtime binds it, and a worker cannot observe a concurrent host-native `docie up`,
+so the bind is the authoritative arbiter. `GET /v1/serving/ports` returns the
+window, the deployment→port map, used/free ports, and a `recommended_next` hint
+(the Studio Deploy tab renders this live).
+
 > `docie up` launches `llama-server`, so it must be on your **PATH** (see the
-> acquisition note below). If `:8088` is already bound, stop the old server first.
+> acquisition note below). A bind collision no longer freezes at a bare "runtime
+> process exited": the actual bind error is read back from the runtime log.
 
 ### One-time: seed the store (Windows / PowerShell)
 
