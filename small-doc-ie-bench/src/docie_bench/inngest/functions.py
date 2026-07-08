@@ -451,12 +451,41 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("seed event must include 'reference' and 'name'")
 
     store = ModelStore(_serving_home() / "models")
-    # Blocking file I/O (hard-link or copy of multi-GB blobs) -> off the loop.
+    # Blocking file I/O (hard-link or copy of multi-GB blobs, plus a one-time
+    # full-file rehash to verify integrity) -> off the loop. The rehash adds one
+    # multi-GB read per seed; acceptable as a one-time, threaded cost.
     entry = await asyncio.to_thread(
         store.seed_from_ollama, reference, name=name, family=family, mmproj_source=mmproj
     )
     size = entry.model_path.stat().st_size if entry.model_path.exists() else None
-    return ModelCatalog().upsert(entry, size_bytes=size)
+    # Upsert is MANDATORY: Studio derives visibility EXCLUSIVELY from the Postgres
+    # catalog, so an un-queryable seed (index.json written, no catalog row) is a
+    # FAILED seed, not a silent success. Do NOT swallow CatalogUnavailableError.
+    try:
+        return ModelCatalog().upsert(entry, size_bytes=size)
+    except Exception:  # noqa: BLE001 - compensate then re-raise the ORIGINAL error
+        # Roll back the just-written on-disk entry so the seed is all-or-nothing:
+        # both index.json + catalog row, or neither. The compensation itself must
+        # never mask the original failure (the bug this PR exists to kill).
+        try:
+            await asyncio.to_thread(store.remove_entry, name)
+        except Exception:  # noqa: BLE001 - log; never shadow the original error
+            logger.exception("seed compensation remove_entry failed for %r", name)
+        raise
+
+
+async def _publish_error_safely(channel: str, message: str) -> None:
+    """Publish an error-topic message without ever masking the caller's error.
+
+    ``publish`` is already best-effort, but if a misconfigured realtime backend
+    makes it raise, that exception must not replace the original job failure on
+    the way out of an ``except``. Swallow-and-log here so the caller can re-raise
+    the ORIGINAL exception.
+    """
+    try:
+        await publish(channel, TOPIC_ERROR, {"message": message})
+    except Exception:  # noqa: BLE001 - a failed error-publish must not mask the original
+        logger.exception("failed to publish error to channel %s", channel)
 
 
 @inngest_client.create_function(
@@ -470,13 +499,23 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
     ``family`` (default "openai_chat"), ``channel``.
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "seeding", "reference": data.get("reference")})
     try:
         result = await ctx.step.run("seed-ollama", lambda: _run_seed_ollama(data))
-    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
-        await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - log traceback, surface error, re-raise
+        # logger.exception BEFORE publish so a full traceback lands in worker logs
+        # even when realtime is unconfigured (empty logs were how seed failures
+        # went invisible). _publish_error_safely guards against a publish that
+        # itself raises masking the original. Same pattern belongs on the
+        # extract/deploy jobs (follow-up); scoped here to the seed job.
+        logger.exception(
+            "seed_ollama_job failed (reference=%s name=%s)",
+            data.get("reference"),
+            data.get("name"),
+        )
+        await _publish_error_safely(channel, str(exc))
         raise
     await publish(channel, TOPIC_RESULT, result)
     return result

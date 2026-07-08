@@ -27,6 +27,7 @@ integrating NuExtract3 (verified 2026-06-17):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -190,6 +191,34 @@ def _link_or_copy(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)  # cross-device or unsupported FS
 
 
+def _sha256_file(path: Path) -> str:
+    """Chunked sha256 of ``path`` as bare lowercase hex (no ``sha256:`` prefix).
+
+    Mirrors ``extract.service.hash_file`` but keeps the serving layer
+    self-contained (no cross-layer import) and returns bare hex so it compares
+    directly against an Ollama manifest digest's hex tail.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_hex(digest: str | None) -> str | None:
+    """Hex tail of a canonical ``sha256:<hex>`` digest, else ``None``.
+
+    ``None`` means "no canonical digest to verify against" — the caller falls
+    back to a best-effort copy-fidelity check. Guarding on the ``sha256:`` prefix
+    means a non-sha256 manifest digest (should Ollama ever emit one) skips the
+    canonical comparison rather than false-failing an otherwise valid transfer.
+    """
+    prefix = "sha256:"
+    if digest and digest.startswith(prefix):
+        return digest[len(prefix) :]
+    return None
+
+
 def _assert_within(path: Path, root: Path, *, label: str) -> Path:
     """Resolve ``path`` and require it to stay within ``root`` (block traversal).
 
@@ -287,13 +316,26 @@ class ModelStore:
                 f"Pass mmproj_source=<projector.gguf> (or pull a GGUF that includes one)."
             )
 
+        # An explicit mmproj_source is an HF download with no manifest digest, so
+        # only copy-fidelity is checkable there; the manifest projector layer has
+        # its canonical digest. Verify BOTH blobs before writing the index so a
+        # canonical model.gguf / index entry only ever appears fully verified.
+        mmproj_digest = None if explicit_mmproj is not None else projector_digest
         destination = self.root / name
         model_path = destination / "model.gguf"
-        _transfer(model_blob, model_path, link=link)
         mmproj_path: Path | None = None
-        if mmproj_blob is not None:
-            mmproj_path = destination / "mmproj.gguf"
-            _transfer(mmproj_blob, mmproj_path, link=link)
+        try:
+            _transfer_verified(model_blob, model_path, link=link, expected_digest=model_digest)
+            if mmproj_blob is not None:
+                mmproj_path = destination / "mmproj.gguf"
+                _transfer_verified(
+                    mmproj_blob, mmproj_path, link=link, expected_digest=mmproj_digest
+                )
+        except BaseException:
+            # A verify failure on either blob must leave zero partial state (no
+            # stray model.gguf when mmproj fails). Bounded by ``name``.
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
 
         entry = StoreEntry(
             name=name,
@@ -322,13 +364,21 @@ class ModelStore:
             raise ModelStoreError(f"GGUF not found: {model_gguf}")
         if contract.needs_mmproj and mmproj is None:
             raise ModelStoreError(f"Family {family!r} requires an mmproj (vision projector)")
+        # HF/on-disk GGUFs carry no canonical manifest digest, so only
+        # copy-fidelity is verifiable (expected_digest=None) — best-effort, per
+        # the HF trust boundary. Still routed through _transfer_verified so no
+        # path writes the canonical name un-verified.
         destination = self.root / name
         model_path = destination / "model.gguf"
-        _transfer(model_gguf, model_path, link=link)
         mmproj_path: Path | None = None
-        if mmproj is not None:
-            mmproj_path = destination / "mmproj.gguf"
-            _transfer(Path(mmproj), mmproj_path, link=link)
+        try:
+            _transfer_verified(model_gguf, model_path, link=link, expected_digest=None)
+            if mmproj is not None:
+                mmproj_path = destination / "mmproj.gguf"
+                _transfer_verified(Path(mmproj), mmproj_path, link=link, expected_digest=None)
+        except BaseException:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
         entry = StoreEntry(
             name=name,
             family=family,
@@ -432,12 +482,33 @@ class ModelStore:
     def _write_entry(self, entry: StoreEntry) -> None:
         index = self._read_index()
         index[entry.name] = entry.to_json()
+        self._write_index(index)
+
+    def _write_index(self, index: dict[str, Any]) -> None:
         temporary = self._index_path.with_suffix(".json.tmp")
         temporary.write_text(
             json.dumps(index, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
         temporary.replace(self._index_path)
+
+    def remove_entry(self, name: str) -> None:
+        """Remove store entry ``name``: drop its index key, then delete its dir.
+
+        Compensation for a seed whose catalog upsert failed, making the seed
+        all-or-nothing. Ordering matters: rewrite the index WITHOUT the key first
+        (atomic temp+replace) so a failure can never leave the index pointing at
+        deleted files — an unreferenced directory is harmless, a dangling index
+        reference is exactly the error-producing partial state this PR removes.
+        Bounded by ``name`` (containment-checked) so it can only ever touch
+        ``root/name`` and that one index key, never a pre-existing unrelated entry.
+        """
+        destination = _assert_within(self.root / name, self.root, label=f"store name {name!r}")
+        index = self._read_index()
+        if name in index:
+            del index[name]
+            self._write_index(index)
+        shutil.rmtree(destination, ignore_errors=True)
 
 
 def _select_layer(layers: list[dict[str, Any]], needle: str) -> str | None:
@@ -454,6 +525,53 @@ def _transfer(source: Path, destination: Path, *, link: bool) -> None:
     else:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
+
+
+def _transfer_verified(
+    source: Path,
+    destination: Path,
+    *,
+    link: bool,
+    expected_digest: str | None,
+) -> None:
+    """Transfer ``source`` to ``destination`` and refuse a mislabeled/corrupt result.
+
+    Writes into a sibling ``*.tmp`` first, sha256s it, and ``os.replace`` moves it
+    onto the canonical ``destination`` name ONLY when the hash matches. So the
+    canonical file never appears unless it is fully written and verified; on any
+    mismatch or error the tmp is removed and ``ModelStoreError`` is raised,
+    leaving no partial/mislabeled file behind.
+
+    Verification target:
+      * ``expected_digest`` is a canonical ``sha256:<hex>`` (an Ollama manifest
+        layer digest) -> the dest is checked against the CANONICAL content hash.
+        This catches a wrong-sha even for hard links, i.e. a corrupt SOURCE blob,
+        because a same-inode tmp still hashes to the source's real (wrong) bytes.
+      * ``expected_digest`` is ``None`` (or non-sha256) -> best-effort
+        copy-fidelity only (source hash == dest hash). For a hard link this is
+        trivially true (same inode); for a copy it catches a truncated/altered
+        copy. There is no canonical digest to assert here (HF trust boundary).
+    """
+    tmp = destination.with_name(destination.name + ".tmp")
+    try:
+        _transfer(source, tmp, link=link)
+        got = _sha256_file(tmp)
+        want = _canonical_hex(expected_digest)
+        canonical = want is not None
+        if want is None:
+            want = _sha256_file(source)  # copy-fidelity fallback
+        if got.lower() != want.lower():
+            kind = "manifest digest" if canonical else "source copy"
+            raise ModelStoreError(
+                f"blob integrity check failed for {destination.name}: "
+                f"got sha256:{got} != want sha256:{want} ({kind}; source={source})"
+            )
+        os.replace(tmp, destination)
+    except BaseException:
+        # Never leave a half-written or mislabeled tmp behind, even on
+        # KeyboardInterrupt / a mid-transfer crash.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _entry_from_json(value: dict[str, Any]) -> StoreEntry:
