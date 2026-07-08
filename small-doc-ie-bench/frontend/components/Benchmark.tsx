@@ -33,6 +33,10 @@ import {
   Field,
   Skeleton,
   TextInput,
+  TableShell,
+  THead,
+  Th,
+  Td,
 } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 
@@ -207,7 +211,7 @@ function RunsList({
         return (
           <div
             key={runId}
-            className="overflow-hidden rounded-xl border border-border bg-background"
+            className="overflow-hidden rounded-lg border border-border bg-card"
           >
             <button
               type="button"
@@ -256,30 +260,28 @@ function RunsList({
 function MetricsTable({ summary }: { summary: Record<string, unknown>[] }) {
   const columns = Array.from(new Set(summary.flatMap((r) => Object.keys(r))));
   return (
-    <div className="scroll-thin overflow-auto rounded-lg border border-border">
-      <table className="w-full text-left text-xs">
-        <thead className="bg-muted/60 uppercase tracking-wide text-muted-foreground">
-          <tr>
+    <TableShell className="text-xs">
+      <THead>
+        <tr>
+          {columns.map((c) => (
+            <Th key={c} className="px-2.5 py-2">
+              {c}
+            </Th>
+          ))}
+        </tr>
+      </THead>
+      <tbody>
+        {summary.map((row, i) => (
+          <tr key={i} className="border-t border-border">
             {columns.map((c) => (
-              <th key={c} className="whitespace-nowrap px-2.5 py-2 font-medium">
-                {c}
-              </th>
+              <Td key={c} className="whitespace-nowrap px-2.5 py-1.5 text-xs">
+                {formatCell(row[c])}
+              </Td>
             ))}
           </tr>
-        </thead>
-        <tbody>
-          {summary.map((row, i) => (
-            <tr key={i} className="border-t border-border">
-              {columns.map((c) => (
-                <td key={c} className="whitespace-nowrap px-2.5 py-1.5 text-foreground/90">
-                  {formatCell(row[c])}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+        ))}
+      </tbody>
+    </TableShell>
   );
 }
 

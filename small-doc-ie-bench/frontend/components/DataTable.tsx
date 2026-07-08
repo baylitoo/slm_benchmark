@@ -1,6 +1,6 @@
 "use client";
 
-import { ComingSoon, EmptyState, Skeleton } from "./ui";
+import { ComingSoon, EmptyState, Skeleton, TableShell, THead, Th, Td } from "./ui";
 import { JsonView } from "./JsonView";
 
 /**
@@ -45,37 +45,33 @@ export function DataTable({
   const columns = Array.from(new Set(objs.flatMap((r) => Object.keys(r))));
 
   return (
-    <div className="scroll-thin overflow-auto rounded-xl border border-border">
-      <table className="w-full text-left text-sm">
-        <thead className="bg-muted/60 text-xs uppercase tracking-wide text-muted-foreground">
-          <tr>
+    <TableShell>
+      <THead>
+        <tr>
+          {columns.map((c) => (
+            <Th key={c}>{c}</Th>
+          ))}
+        </tr>
+      </THead>
+      <tbody>
+        {objs.map((row, i) => (
+          <tr
+            key={i}
+            className="border-t border-border transition-colors hover:bg-muted/40"
+          >
             {columns.map((c) => (
-              <th key={c} className="whitespace-nowrap px-3 py-2.5 font-medium">
-                {c}
-              </th>
+              <Td
+                key={c}
+                className="max-w-[24rem] truncate whitespace-nowrap"
+                title={cellTitle(row[c])}
+              >
+                {renderCell(row[c])}
+              </Td>
             ))}
           </tr>
-        </thead>
-        <tbody>
-          {objs.map((row, i) => (
-            <tr
-              key={i}
-              className="border-t border-border transition-colors hover:bg-muted/40"
-            >
-              {columns.map((c) => (
-                <td
-                  key={c}
-                  className="max-w-[24rem] truncate whitespace-nowrap px-3 py-2.5 text-foreground/90"
-                  title={cellTitle(row[c])}
-                >
-                  {renderCell(row[c])}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+        ))}
+      </tbody>
+    </TableShell>
   );
 }
 

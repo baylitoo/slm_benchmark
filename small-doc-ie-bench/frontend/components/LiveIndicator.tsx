@@ -40,7 +40,7 @@ export function LiveIndicator({
   return (
     <div className="flex items-center gap-2">
       <span
-        className="flex items-center gap-1.5 rounded-full border border-border bg-muted px-2.5 py-1 text-xs text-muted-foreground"
+        className="flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1 text-xs text-muted-foreground"
         title={live ? "Auto-refresh is active" : "Auto-refresh paused (tab hidden or inactive)"}
       >
         <StatusDot tone={live ? "ok" : "neutral"} pulse={live} />
@@ -53,7 +53,7 @@ export function LiveIndicator({
         onClick={onRefresh}
         aria-label="Refresh now"
         title="Refresh now"
-        className="grid h-7 w-7 place-items-center rounded-lg border border-border bg-muted text-muted-foreground transition hover:text-foreground"
+        className="grid h-7 w-7 place-items-center rounded-lg border border-border bg-transparent text-muted-foreground transition hover:bg-muted hover:text-foreground"
       >
         <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
       </button>

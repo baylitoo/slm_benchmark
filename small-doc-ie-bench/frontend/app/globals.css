@@ -6,36 +6,43 @@
  * Theme tokens. Values are space-separated RGB triples consumed by Tailwind via
  * `rgb(var(--token) / <alpha-value>)` (see tailwind.config.ts). The `.dark`
  * class (toggled by next-themes) flips the palette. Dark is the default.
+ *
+ * Clean-minimal palette: true monochrome-neutral (cool zinc) + one accent
+ * (indigo). Hairline borders do the structural work; shadows stay barely-there.
  */
 @layer base {
   :root {
-    --background: 248 250 252; /* slate-50 */
-    --foreground: 15 23 42; /* slate-900 */
-    --card: 255 255 255;
-    --elevated: 255 255 255;
-    --border: 226 232 240; /* slate-200 */
-    --input: 226 232 240;
-    --ring: 37 99 235; /* blue-600 */
-    --muted: 241 245 249; /* slate-100 */
-    --muted-foreground: 100 116 139; /* slate-500 */
-    --accent: 37 99 235; /* blue-600 */
+    /* neutral scale — cool zinc, mono */
+    --background: 252 252 253; /* app canvas, near-white */
+    --card: 255 255 255; /* surface */
+    --elevated: 255 255 255; /* popovers/toasts (add hairline, not weight) */
+    --muted: 246 246 247; /* zinc-100-ish fills, track, thead */
+    --muted-foreground: 113 113 122; /* zinc-500 secondary text */
+    --foreground: 24 24 27; /* zinc-900 primary text */
+    --border: 228 228 231; /* zinc-200 — HAIRLINE only */
+    --input: 228 228 231;
+
+    /* single accent — indigo */
+    --accent: 88 101 242; /* one accent */
     --accent-foreground: 255 255 255;
+    --ring: 88 101 242;
 
     color-scheme: light;
   }
 
   .dark {
-    --background: 8 11 18; /* near-black navy */
-    --foreground: 226 232 240; /* slate-200 */
-    --card: 16 20 29;
-    --elevated: 22 27 38;
-    --border: 30 37 51;
-    --input: 30 37 51;
-    --ring: 96 145 255;
-    --muted: 22 27 38;
-    --muted-foreground: 148 163 184; /* slate-400 */
-    --accent: 96 145 255; /* bright blue */
-    --accent-foreground: 9 13 22;
+    --background: 9 9 11; /* zinc-950, true near-black */
+    --card: 17 17 19; /* raised surface */
+    --elevated: 24 24 27; /* zinc-900 popovers/toasts */
+    --muted: 24 24 27;
+    --muted-foreground: 161 161 170; /* zinc-400 */
+    --foreground: 237 237 240;
+    --border: 39 39 42; /* zinc-800 hairline */
+    --input: 39 39 42;
+
+    --accent: 124 133 255; /* brighter indigo for dark contrast */
+    --accent-foreground: 9 9 11;
+    --ring: 124 133 255;
 
     color-scheme: dark;
   }
@@ -53,9 +60,9 @@
     @apply bg-background text-foreground font-sans antialiased;
   }
 
-  /* Visible, consistent keyboard focus across interactive elements. */
+  /* Visible, purposeful keyboard focus across interactive elements. */
   :focus-visible {
-    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+    @apply outline-none ring-2 ring-ring/60 ring-offset-2 ring-offset-background;
   }
 }
 
@@ -74,10 +81,11 @@
   background: transparent;
 }
 
-/* Subtle dotted grid backdrop for the app shell. */
+/* Subtle dotted grid backdrop. Kept available but unused — the app canvas is a
+   flat `bg-background` for a calmer Linear-like surface. */
 .bg-grid {
   background-image: radial-gradient(
-    rgb(var(--muted-foreground) / 0.12) 1px,
+    rgb(var(--muted-foreground) / 0.06) 1px,
     transparent 1px
   );
   background-size: 22px 22px;

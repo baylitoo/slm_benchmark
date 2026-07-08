@@ -60,17 +60,17 @@ export function AppShell() {
       {/* Sidebar */}
       <aside
         className={cn(
-          "fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r border-border bg-card transition-transform lg:static lg:translate-x-0",
+          "fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r border-border bg-card transition-transform dark:bg-background lg:static lg:translate-x-0",
           mobileOpen ? "translate-x-0" : "-translate-x-full",
         )}
       >
-        <div className="flex h-16 items-center justify-between gap-2 border-b border-border px-5">
+        <div className="flex h-14 items-center justify-between gap-2 border-b border-border px-5">
           <div className="flex items-center gap-2.5">
-            <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent text-accent-foreground shadow-glow">
-              <Layers className="h-5 w-5" />
+            <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-accent-foreground">
+              <Layers className="h-[18px] w-[18px]" />
             </span>
             <div className="leading-tight">
-              <p className="text-sm font-semibold text-foreground">
+              <p className="text-[15px] font-semibold tracking-tight text-foreground">
                 DocIE <span className="text-accent">Studio</span>
               </p>
               <p className="text-[11px] text-muted-foreground">Control panel</p>
@@ -99,9 +99,9 @@ export function AppShell() {
                 }}
                 aria-current={isActive ? "page" : undefined}
                 className={cn(
-                  "group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition",
+                  "group relative flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-[background,color] duration-150 ease-swift",
                   isActive
-                    ? "bg-accent/10 text-accent"
+                    ? "bg-muted text-foreground before:absolute before:inset-y-1.5 before:left-0 before:w-0.5 before:rounded-full before:bg-accent"
                     : "text-muted-foreground hover:bg-muted hover:text-foreground",
                 )}
               >
@@ -123,7 +123,7 @@ export function AppShell() {
         </nav>
 
         <div className="border-t border-border p-3">
-          <div className="flex items-center gap-2 rounded-xl border border-border bg-muted/50 px-3 py-2">
+          <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2">
             <StatusDot tone={HEALTH_META[health].tone} pulse={health !== "offline"} />
             <div className="min-w-0">
               <p className="truncate text-xs font-medium text-foreground">
@@ -139,7 +139,7 @@ export function AppShell() {
 
       {/* Main column */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-20 flex h-16 items-center justify-between gap-3 border-b border-border bg-card/80 px-4 backdrop-blur sm:px-6">
+        <header className="sticky top-0 z-20 flex h-14 items-center justify-between gap-3 border-b border-border bg-card/70 px-4 backdrop-blur sm:px-6">
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -150,19 +150,21 @@ export function AppShell() {
               <Menu className="h-5 w-5" />
             </button>
             <div>
-              <h1 className="text-base font-semibold text-foreground">{current.label}</h1>
+              <h1 className="text-[15px] font-semibold tracking-tightish text-foreground">
+                {current.label}
+              </h1>
               <p className="hidden text-xs text-muted-foreground sm:block">{current.desc}</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <code className="hidden max-w-[260px] truncate rounded-lg border border-border bg-muted px-2.5 py-1.5 text-xs text-muted-foreground md:inline-block">
+            <code className="hidden max-w-[260px] truncate rounded-md border border-border bg-muted px-2.5 py-1.5 text-xs text-muted-foreground md:inline-block">
               {API_BASE}
             </code>
             <ThemeToggle />
           </div>
         </header>
 
-        <main className="flex-1 bg-grid">
+        <main className="flex-1 bg-background">
           <div className="mx-auto max-w-6xl p-4 sm:p-6">
             {/* All sections stay mounted; only the active one is shown so a
                 running extraction (or any in-flight job) survives nav changes. */}

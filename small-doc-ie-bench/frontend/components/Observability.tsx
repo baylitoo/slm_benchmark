@@ -84,9 +84,9 @@ function LinkTile({
       href={href}
       target="_blank"
       rel="noreferrer"
-      className="group flex items-start gap-3 rounded-xl border border-border bg-background p-4 transition hover:border-accent hover:shadow-card"
+      className="group flex items-start gap-3 rounded-xl border border-border bg-card p-4 transition hover:border-accent/50 hover:shadow-card"
     >
-      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-border bg-muted text-accent">
+      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-border bg-muted text-muted-foreground">
         {icon}
       </span>
       <div className="min-w-0">

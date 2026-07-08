@@ -26,6 +26,7 @@ import {
   type StoreEntry,
   type ModelFamily,
   type PortsView,
+  type DeploymentRecord,
   type TriggerResponse,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
@@ -40,9 +41,15 @@ import {
   Field,
   Select,
   Skeleton,
+  StatusDot,
   TextInput,
   ComingSoon,
+  TableShell,
+  THead,
+  Th,
+  Td,
 } from "./ui";
+import type { BadgeTone } from "./ui";
 import { DataTable } from "./DataTable";
 import { LiveIndicator } from "./LiveIndicator";
 import { ResultPanel } from "./ResultPanel";
@@ -88,7 +95,132 @@ export function Deploy({ active = true }: { active?: boolean }) {
           emptyDescription="Deploy a model above — it'll appear here on the next refresh."
         />
       </Card>
+
+      <PortsProcesses deployments={deployments} />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Ports & processes — a presentation-only, curated view over the SAME
+// `deployments` poll already running above (no new fetch). Reads raw records so
+// every lifecycle state (running / stopped / error) is visible.
+// ---------------------------------------------------------------------------
+
+function stateTone(state: string | undefined, hasError: boolean): BadgeTone {
+  if (hasError) return "err";
+  switch (state) {
+    case "running":
+    case "ready":
+      return "ok";
+    case "starting":
+    case "pending":
+      return "warn";
+    case "stopped":
+    case undefined:
+      return "neutral";
+    default:
+      return "neutral";
+  }
+}
+
+function PortsProcesses({
+  deployments,
+}: {
+  deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
+}) {
+  const rows = deployments.data;
+
+  return (
+    <Card
+      icon={<Server className="h-5 w-5" />}
+      title="Ports & processes"
+      subtitle="Live ports, PIDs and endpoints for each deployment."
+      actions={
+        <LiveIndicator
+          live={deployments.live}
+          refreshing={deployments.refreshing}
+          lastUpdated={deployments.lastUpdated}
+          onRefresh={deployments.refresh}
+        />
+      }
+    >
+      {deployments.loading && !rows ? (
+        <div className="space-y-2">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-10 w-full" />
+          ))}
+        </div>
+      ) : deployments.error && !rows ? (
+        <ComingSoon error={deployments.error} />
+      ) : !rows || rows.length === 0 ? (
+        <EmptyState
+          title="No ports in use"
+          description="Deploy a model above — its port and process appear here on the next refresh."
+        />
+      ) : (
+        <TableShell>
+          <THead>
+            <tr>
+              <Th>Name</Th>
+              <Th>Port</Th>
+              <Th>Runtime</Th>
+              <Th>State</Th>
+              <Th>PID</Th>
+              <Th>Endpoint</Th>
+            </tr>
+          </THead>
+          <tbody>
+            {rows.map((d, i) => {
+              const launch = d.spec?.launch ?? {};
+              const name = d.spec?.name ?? launch.model ?? "—";
+              const hasError = Boolean(d.last_error);
+              const tone = stateTone(d.state, hasError);
+              return (
+                <tr
+                  key={d.spec?.name ?? `${name}-${i}`}
+                  className="border-t border-border transition-colors hover:bg-muted/40"
+                >
+                  <Td className="max-w-[16rem] truncate font-medium text-foreground">
+                    {name}
+                  </Td>
+                  <Td className="font-mono tabular-nums">
+                    {launch.port ?? "—"}
+                  </Td>
+                  <Td>
+                    <Badge tone="neutral">{launch.runtime ?? "—"}</Badge>
+                  </Td>
+                  <Td>
+                    <span className="inline-flex items-center gap-1.5">
+                      <StatusDot tone={tone} pulse={tone === "ok"} />
+                      <Badge tone={tone} className="capitalize">
+                        {hasError ? "error" : d.state ?? "unknown"}
+                      </Badge>
+                    </span>
+                  </Td>
+                  <Td className="font-mono tabular-nums">{d.pid ?? "—"}</Td>
+                  <Td className="max-w-[18rem] truncate">
+                    {d.endpoint ? (
+                      <a
+                        href={d.endpoint}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-mono text-xs text-accent hover:underline"
+                        title={d.endpoint}
+                      >
+                        {d.endpoint.replace(/^https?:\/\//, "")}
+                      </a>
+                    ) : (
+                      "—"
+                    )}
+                  </Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </TableShell>
+      )}
+    </Card>
   );
 }
 
@@ -214,7 +346,7 @@ function DeployForm({
       <form onSubmit={onDeploy} className="space-y-5">
         {/* Model picker */}
         <div>
-          <p className="mb-1.5 flex items-center gap-1 text-xs font-medium text-foreground">
+          <p className="mb-1.5 flex items-center gap-1 text-xs font-medium text-muted-foreground">
             Model <span className="text-rose-500">*</span>
           </p>
           <ModelPicker
@@ -227,7 +359,7 @@ function DeployForm({
         {/* Runtime picker — scoped to the selected model's backends */}
         {selected && (
           <div className="animate-fade-in">
-            <p className="mb-1.5 text-xs font-medium text-foreground">Runtime</p>
+            <p className="mb-1.5 text-xs font-medium text-muted-foreground">Runtime</p>
             <div
               role="radiogroup"
               aria-label="Runtime"
@@ -441,10 +573,10 @@ function ModelPicker({
             aria-checked={isSel}
             onClick={() => onSelect(m.name)}
             className={cn(
-              "flex w-full items-start justify-between gap-3 rounded-xl border p-3 text-left transition",
+              "flex w-full items-start justify-between gap-3 rounded-lg border p-3 text-left transition",
               isSel
-                ? "border-accent bg-accent/5 ring-1 ring-accent/40"
-                : "border-border bg-background hover:border-accent/40 hover:bg-muted/40",
+                ? "border-accent bg-accent/[0.04] shadow-ring"
+                : "border-border bg-card hover:bg-muted/50",
             )}
           >
             <div className="min-w-0">
@@ -504,7 +636,7 @@ function RuntimeChip({
         "inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm transition",
         checked
           ? "border-accent bg-accent/10 text-accent"
-          : "border-border bg-background text-muted-foreground hover:text-foreground",
+          : "border-border bg-card text-muted-foreground hover:bg-muted/50 hover:text-foreground",
       )}
     >
       {label}

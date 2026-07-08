@@ -47,7 +47,7 @@ export function ResultPanel({
 
   if (mode.kind === "connecting") {
     return (
-      <p className="flex items-center gap-2 text-sm text-muted-foreground">
+      <p className="flex items-center gap-2 text-[13px] text-muted-foreground">
         <Spinner /> Connecting to live updates…
       </p>
     );

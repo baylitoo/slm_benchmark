@@ -14,9 +14,17 @@ import {
   type DeploymentRecord,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
-import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
-import { Button, Card, Field, Select, TextArea, TextInput, Badge } from "./ui";
+import {
+  Button,
+  Card,
+  Field,
+  Select,
+  TextArea,
+  TextInput,
+  Badge,
+  SegmentedControl,
+} from "./ui";
 import { ResultPanel } from "./ResultPanel";
 
 type InputMode = "text" | "file";
@@ -117,24 +125,15 @@ export function Playground({ active = true }: { active?: boolean }) {
         subtitle="Paste text or upload a document, then run extraction."
       >
         <form onSubmit={onSubmit} className="space-y-4">
-          <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
-            {(["text", "file"] as InputMode[]).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setInputMode(m)}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 transition",
-                  inputMode === m
-                    ? "bg-card text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {m === "text" ? <FileText className="h-4 w-4" /> : <Upload className="h-4 w-4" />}
-                {m === "text" ? "Paste text" : "Upload file"}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl<InputMode>
+            ariaLabel="Input mode"
+            value={inputMode}
+            onChange={setInputMode}
+            options={[
+              { value: "text", label: "Paste text", icon: <FileText className="h-4 w-4" /> },
+              { value: "file", label: "Upload file", icon: <Upload className="h-4 w-4" /> },
+            ]}
+          />
 
           {inputMode === "text" ? (
             <Field label="Document text">
@@ -147,7 +146,7 @@ export function Playground({ active = true }: { active?: boolean }) {
             </Field>
           ) : (
             <Field label="Document file" hint="PDF or image; encoded to base64 in your browser.">
-              <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-muted/30 px-4 py-8 text-center transition hover:border-accent hover:bg-muted/50">
+              <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-muted/30 px-4 py-8 text-center transition hover:border-accent/50 hover:bg-muted/50">
                 <Upload className="h-6 w-6 text-muted-foreground" />
                 <span className="text-sm text-foreground">
                   {file ? file.name : "Click to choose a PDF or image"}
