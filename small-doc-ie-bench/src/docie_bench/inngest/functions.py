@@ -438,8 +438,12 @@ def _serving_home() -> Path:
 
 async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     """Seed a GGUF from the host's Ollama into the store + record it in the catalog."""
-    from docie_bench.serving.catalog import ModelCatalog
-    from docie_bench.serving.model_store import ModelStore
+    from docie_bench.serving.catalog import (
+        CatalogUnavailableError,
+        ModelCatalog,
+        available_backends,
+    )
+    from docie_bench.serving.model_store import FAMILIES, ModelStore
 
     reference = data.get("reference")
     name = data.get("name")
@@ -458,12 +462,42 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
         store.seed_from_ollama, reference, name=name, family=family, mmproj_source=mmproj
     )
     size = entry.model_path.stat().st_size if entry.model_path.exists() else None
-    # Upsert is MANDATORY: Studio derives visibility EXCLUSIVELY from the Postgres
-    # catalog, so an un-queryable seed (index.json written, no catalog row) is a
-    # FAILED seed, not a silent success. Do NOT swallow CatalogUnavailableError.
+    # Catalog registration has two distinct failure modes and they must NOT be
+    # conflated:
+    #   * NO catalog configured (dev/local: DATABASE_URL unset) -> the catalog is
+    #     genuinely unavailable. The on-disk store entry is a complete, usable
+    #     seed; it is simply not registered in the Postgres catalog (Studio won't
+    #     list it). Degrade gracefully: keep the on-disk entry, warn, succeed.
+    #   * A catalog that IS configured but whose WRITE fails -> a real, half-done
+    #     seed (on-disk entry with no catalog row). That is fatal: compensate by
+    #     rolling back the on-disk entry so the seed is all-or-nothing.
+    # CatalogUnavailableError is a subclass of Exception, so it MUST be caught
+    # first — otherwise the generic handler would wrongly compensate the no-DB
+    # case (the local/dev regression this fix removes).
     try:
         return ModelCatalog().upsert(entry, size_bytes=size)
-    except Exception:  # noqa: BLE001 - compensate then re-raise the ORIGINAL error
+    except CatalogUnavailableError:
+        contract = FAMILIES.get(entry.family)
+        logger.warning(
+            "no catalog configured (no DATABASE_URL): seed %r written to the store but "
+            "NOT catalog-registered (store-only; Studio will not list it until a catalog "
+            "is configured)",
+            name,
+        )
+        return {
+            "name": entry.name,
+            "family": entry.family,
+            "vision": bool(contract and contract.vision),
+            "available_backends": available_backends(entry.family),
+            "has_mmproj": entry.mmproj_path is not None,
+            "source": entry.source,
+            "size_bytes": size,
+            "placement": None,
+            "created_at": None,
+            "updated_at": None,
+            "catalog_registered": False,
+        }
+    except Exception:  # noqa: BLE001 - configured catalog write FAILED: compensate then re-raise
         # Roll back the just-written on-disk entry so the seed is all-or-nothing:
         # both index.json + catalog row, or neither. The compensation itself must
         # never mask the original failure (the bug this PR exists to kill).
@@ -517,7 +551,16 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
         )
         await _publish_error_safely(channel, str(exc))
         raise
-    await publish(channel, TOPIC_RESULT, result)
+    # The seed already SUCCEEDED (blob transferred, index + catalog written) and
+    # is durable. A post-success realtime publish sits OUTSIDE the try/except, so
+    # if this publish raised it would mark the whole run failed even though the
+    # work is done — and Inngest would then RETRY a completed seed. Guard it: a
+    # result-publish failure is logged, never fatal (the UI still recovers the
+    # result via /runs polling).
+    try:
+        await publish(channel, TOPIC_RESULT, result)
+    except Exception:  # noqa: BLE001 - result is durable; a failed publish must not fail the run
+        logger.exception("failed to publish seed result to channel %s", channel)
     return result
 
 

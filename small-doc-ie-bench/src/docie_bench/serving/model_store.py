@@ -481,8 +481,25 @@ class ModelStore:
 
     def _write_entry(self, entry: StoreEntry) -> None:
         index = self._read_index()
+        # A NEW name: the blob transfer just created root/name and this is the
+        # first index reference to it. If the index write then crashes, that dir
+        # is an orphan (no index key) -> clean it up so no partial state remains.
+        # An EXISTING name (re-seed): the on-disk index already references
+        # root/name; _write_index is atomic (temp + replace), so a failure leaves
+        # the OLD index entry intact and still pointing at root/name. Deleting the
+        # dir there would create a dangling reference — exactly the state this
+        # store avoids — so only orphan-clean the fresh-seed case.
+        is_new = entry.name not in index
         index[entry.name] = entry.to_json()
-        self._write_index(index)
+        try:
+            self._write_index(index)
+        except BaseException:
+            if is_new:
+                destination = _assert_within(
+                    self.root / entry.name, self.root, label=f"store name {entry.name!r}"
+                )
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
 
     def _write_index(self, index: dict[str, Any]) -> None:
         temporary = self._index_path.with_suffix(".json.tmp")
