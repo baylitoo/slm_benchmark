@@ -381,9 +381,14 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
         # host-native `docie up` (see _record_deploy_placement's docstring).
         _record_deploy_placement(model_name=str(model), record=record)
     else:
+        # No port => the control plane auto-allocates the first free port in
+        # DOCIE_SERVING_PORT_RANGE_* (record + socket pre-filtered). An explicit
+        # port is honored verbatim. Drop the old 8088 fallback: pinning it here
+        # made auto-allocation dead code and collided every concurrent deploy.
+        raw_port = data.get("port")
         record = await cp.up(
             model,
-            port=int(data.get("port", 8088)),
+            port=int(raw_port) if raw_port is not None else None,
             context_length=int(data.get("context_length", 8192)),
         )
     return record

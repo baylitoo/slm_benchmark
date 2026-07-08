@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import socket
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence, Set
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
@@ -61,6 +62,93 @@ def reachable_launch(
 # Advertise hosts that are same-host by construction: a deploy on this node is
 # always reachable at these, so the round-robin guard never applies to them.
 _LOOPBACK_ADVERTISE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+# Bound on the reallocate-on-bind-collision loop in serve_store_model. Keeps a
+# genuinely wedged host from spinning through the whole range × restarts; each
+# attempt already re-tries the launch up to the spec's max_restarts internally.
+_MAX_PORT_ALLOC_ATTEMPTS = 3
+
+
+def _socket_is_free(host: str, port: int) -> bool:
+    """Return True if ``(host, port)`` can be bound right now (worker-local probe).
+
+    Best-effort liveness: tries to ``bind()`` a throwaway TCP socket with
+    ``SO_REUSEADDR`` deliberately OFF, so a port already held by a live runtime
+    fails the bind and reads as taken. Portable (no ``SO_REUSEPORT``, which is
+    Linux-only) so it behaves the same on Windows dev and the Linux worker. This
+    only sees the prober's OWN network namespace — the api container cannot use it
+    to see the worker's binds — and it is racy by construction (the port can be
+    grabbed between this probe and the real ``llama-server`` bind). The launch's
+    bind is the authoritative arbiter; this just pre-filters the obvious cases.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+        return True
+
+
+class PortAllocator:
+    """Pick a serving port free of both deployment records and live sockets.
+
+    ``recommend`` is a pure function of ``(range, reserved)`` — the lowest port in
+    the window not held by a record — and is shared by the ``/ports`` API hint and
+    the worker's ``allocate`` so the two cannot disagree in *logic*. ``allocate``
+    additionally socket-probes (worker-local) and returns the first port that is
+    both record-free and bindable. They can still differ in *result* because only
+    the worker probes sockets; that is expected and documented, never a bug.
+
+    NOT race-free: a probed-free port can be grabbed before ``llama-server`` binds
+    it, and a worker cannot see a concurrent host-native ``docie up`` (its
+    supervisor is lru-cached and never reloads ``deployments.json``). This is a
+    best-effort pre-filter; the real bind is the arbiter and the deploy path
+    reallocates on a bind-collision exit.
+    """
+
+    def __init__(
+        self,
+        *,
+        range_start: int,
+        range_end: int,
+        probe: Callable[[str, int], bool] = _socket_is_free,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not 1 <= range_start <= 65535 or not 1 <= range_end <= 65535:
+            raise ValueError("port range bounds must be between 1 and 65535")
+        if range_start > range_end:
+            raise ValueError("port range start must not exceed end")
+        self.range_start = range_start
+        self.range_end = range_end
+        self._probe = probe
+        self._clock = clock
+
+    def _ports(self) -> range:
+        return range(self.range_start, self.range_end + 1)
+
+    def _exhausted(self) -> RuntimeError:
+        return RuntimeError(
+            f"no free port in range {self.range_start}-{self.range_end}; stop a "
+            f"deployment or widen DOCIE_SERVING_PORT_RANGE_START/"
+            f"DOCIE_SERVING_PORT_RANGE_END"
+        )
+
+    def recommend(self, *, bind_host: str, reserved: Set[int]) -> int:
+        """Lowest record-free port in the window (pure; no socket probing)."""
+        del bind_host  # record-derived only; symmetry with allocate()
+        for port in self._ports():
+            if port not in reserved:
+                return port
+        raise self._exhausted()
+
+    def allocate(self, *, bind_host: str, reserved: Set[int]) -> int:
+        """First port that is both record-free and bindable on ``bind_host``."""
+        for port in self._ports():
+            if port in reserved:
+                continue
+            if self._probe(bind_host, port):
+                return port
+        raise self._exhausted()
 
 
 def _resolve_ipv4(host: str) -> tuple[str, ...]:
@@ -119,7 +207,7 @@ class Supervisor(Protocol):
         self,
         name: str,
         *,
-        port: int,
+        port: int | None,
         context_length: int,
     ) -> Result: ...
 
@@ -248,7 +336,7 @@ class ControlPlane:
         self,
         name: str,
         *,
-        port: int = 8088,
+        port: int | None = None,
         context_length: int = 8192,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
@@ -422,6 +510,8 @@ class _DefaultSupervisor:
         advertise_host: str | None = None,
         bind_host: str | None = None,
         resolve_host: Callable[[str], Sequence[str]] | None = None,
+        port_range: tuple[int, int] | None = None,
+        port_probe: Callable[[str, int], bool] | None = None,
     ) -> None:
         self.backend = backend
         self.planner = planner
@@ -434,6 +524,11 @@ class _DefaultSupervisor:
         # Name-resolution hook for the deterministic-addressing guard; injectable
         # so tests can simulate a scaled (multi-A-record) service without DNS.
         self._resolve_host = resolve_host or _resolve_ipv4
+        # Port-allocation window + socket prober. None => read the window from
+        # settings at deploy time (container env wins); tests inject a fixed range
+        # and a fake prober so they never touch real sockets.
+        self._port_range = port_range
+        self._port_probe = port_probe
 
     def _reachability_hosts(self) -> tuple[str, str]:
         """Return ``(bind_host, advertise_host)`` for a deploy on this node."""
@@ -449,6 +544,34 @@ class _DefaultSupervisor:
             else settings.serving_advertise_host
         )
         return bind, advertise
+
+    def _port_allocator(self) -> PortAllocator:
+        """Build the allocator; range from settings unless a test injected one."""
+        if self._port_range is not None:
+            start, end = self._port_range
+        else:
+            from docie_bench.settings import get_settings
+
+            settings = get_settings()
+            start = settings.serving_port_range_start
+            end = settings.serving_port_range_end
+        probe = self._port_probe if self._port_probe is not None else _socket_is_free
+        return PortAllocator(range_start=start, range_end=end, probe=probe)
+
+    def _reserved_ports(self, *, exclude_name: str | None = None) -> set[int]:
+        """Ports held by every non-removed deployment record (the record-scan).
+
+        Every record reserves its port regardless of state — a STOPPED record can
+        be ``start()``-ed and must not lose its port — with the sole exception of
+        the deployment being (re)deployed right now, so a redeploy can reclaim its
+        own port instead of drifting to a new one. Only ``remove()`` frees a port.
+        """
+        reserved: set[int] = set()
+        for record in self.backend.list():
+            if exclude_name is not None and record.spec.name == exclude_name:
+                continue
+            reserved.add(record.spec.launch.port)
+        return reserved
 
     def _guard_deterministic_advertise(self, advertise_host: str) -> None:
         """Refuse a deploy whose advertise host does not name a single node.
@@ -513,15 +636,27 @@ class _DefaultSupervisor:
                 raise ValueError(recommendation.explanation)
             runtime = str(recommendation.runtime)
         bind_host, advertise_host = self._reachability_hosts()
+        runtime_kind = RuntimeKind(runtime)
         # REMOTE advertises the user's real upstream (reachable_launch skips it),
-        # so its advertise host plays no role — don't fail-fast on it.
-        if RuntimeKind(runtime) != RuntimeKind.REMOTE:
+        # so its advertise host plays no role — don't fail-fast on it, and don't
+        # allocate a local port (it binds nothing here).
+        launch_kwargs: dict[str, Any] = {}
+        if runtime_kind != RuntimeKind.REMOTE:
             self._guard_deterministic_advertise(advertise_host)
+            # All non-REMOTE serve() paths otherwise default to RuntimeLaunchSpec's
+            # port 8000, so every concurrent serve would collide there; allocate a
+            # free port instead (record + socket pre-filtered, best-effort).
+            allocator = self._port_allocator()
+            launch_kwargs["port"] = allocator.allocate(
+                bind_host=bind_host,
+                reserved=self._reserved_ports(exclude_name=deployment_name),
+            )
         launch = reachable_launch(
             RuntimeLaunchSpec(
-                runtime=RuntimeKind(runtime),
+                runtime=runtime_kind,
                 model=model,
                 alias=deployment_name,
+                **launch_kwargs,
             ),
             bind_host=bind_host,
             advertise_host=advertise_host,
@@ -530,10 +665,10 @@ class _DefaultSupervisor:
         return self.backend.deploy(spec)
 
     def serve_store_model(
-        self, name: str, *, port: int = 8088, context_length: int = 8192
+        self, name: str, *, port: int | None = None, context_length: int = 8192
     ) -> object:
         from docie_bench.serving.model_store import ModelStore, ModelStoreError
-        from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
+        from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
 
         if self.model_store_root is None:
@@ -550,32 +685,62 @@ class _DefaultSupervisor:
         # Store models always run the in-worker LLAMACPP subprocess (never REMOTE),
         # so guard the advertise host unconditionally here.
         self._guard_deterministic_advertise(advertise_host)
-        launch = reachable_launch(
-            RuntimeLaunchSpec(
-                runtime=RuntimeKind.LLAMACPP,
-                model=entry.model_path.as_posix(),
-                alias=entry.name,
-                port=port,
-                context_length=context_length,
-                extra_args=store.family_launch_args(name),
-            ),
-            bind_host=bind_host,
-            advertise_host=advertise_host,
-        )
-        spec = DeploymentSpec(
-            name=entry.name,
-            launch=launch,
-            # A large GGUF can take a while to load; keep the readiness poll from
-            # tripping reconcile's degrade-and-kill while the model is still
-            # coming up (there is no background reconcile, so this threshold only
-            # matters during await_ready below).
-            health_failure_threshold=60,
-        )
-        # Spawn, then wait for the model to finish loading. Without this the sole
-        # post-spawn probe sees "Connection refused" and the record freezes at
-        # STARTING forever; await_ready re-probes until it is honestly serving.
-        self.backend.deploy(spec)
-        record = self.backend.await_ready(spec.name)
+        allocator = self._port_allocator()
+        # Ports already tried in THIS call: after deploy() replaces the record, the
+        # just-failed port is no longer record-reserved, so without this the loop
+        # could re-pick it (relying only on the socket probe / external binder).
+        # Accumulating them keeps reallocation deterministic and prober-independent.
+        tried: set[int] = set()
+        record: Any = None
+        for _attempt in range(_MAX_PORT_ALLOC_ATTEMPTS):
+            if port is not None:
+                # Operator override is a command, not a suggestion: honor it
+                # verbatim (no probing, no reallocation) and let the bind arbitrate.
+                chosen = port
+            else:
+                reserved = self._reserved_ports(exclude_name=entry.name) | tried
+                chosen = allocator.allocate(bind_host=bind_host, reserved=reserved)
+            tried.add(chosen)
+            launch = reachable_launch(
+                RuntimeLaunchSpec(
+                    runtime=RuntimeKind.LLAMACPP,
+                    model=entry.model_path.as_posix(),
+                    alias=entry.name,
+                    port=chosen,
+                    context_length=context_length,
+                    extra_args=store.family_launch_args(name),
+                ),
+                bind_host=bind_host,
+                advertise_host=advertise_host,
+            )
+            spec = DeploymentSpec(
+                name=entry.name,
+                launch=launch,
+                # A large GGUF can take a while to load; keep the readiness poll from
+                # tripping reconcile's degrade-and-kill while the model is still
+                # coming up (there is no background reconcile, so this threshold only
+                # matters during await_ready below). This is the OPPOSITE case from a
+                # bind collision (which exits immediately -> FAILED, not slow-loading).
+                health_failure_threshold=60,
+            )
+            # Spawn, then wait for the model to finish loading. Without this the sole
+            # post-spawn probe sees "Connection refused" and the record freezes at
+            # STARTING forever; await_ready re-probes until it is honestly serving.
+            self.backend.deploy(spec)
+            record = self.backend.await_ready(spec.name)
+            if record.state == LifecycleState.READY:
+                break
+            # Reallocate ONLY on a started-then-exited failure (the structural
+            # signature of a bind collision) and never for an explicit override.
+            # A slow-loading model keeps is_running True and never enters this
+            # branch; an unfixable failure (missing binary) never set the flag, so
+            # we don't churn the whole range on it. The exit reason (llama-server's
+            # real stderr tail) is already on record.last_error via the supervisor.
+            exited = getattr(record, "exited_after_start", False)
+            if port is not None or record.state != LifecycleState.FAILED or not exited:
+                break
+            # else: loop -> allocate the next free port and rebuild the spec THROUGH
+            # reachable_launch so the advertised endpoint reflects the new port.
         # Record the placement at the same seam stop()/remove() clear it, so
         # every deploy surface — host-native `docie up` and the worker's Inngest
         # job alike — makes store:<name> resolvable, not just the worker path.

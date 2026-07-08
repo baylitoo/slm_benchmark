@@ -257,6 +257,102 @@ def test_launch_failure_is_persisted_without_crashing_reconcile(tmp_path: Path) 
     assert record.last_error == "runtime unavailable"
 
 
+class LogWritingAdapter:
+    """Writes ``message`` to the log on each start, then reports the process dead.
+
+    Simulates ``llama-server`` printing a bind error to its log and exiting
+    immediately — the fast-exit case the supervisor must surface (its real stderr)
+    instead of the bare "runtime process exited".
+    """
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        self.next_pid = 300
+        self.starts = 0
+
+    def start(
+        self, spec: RuntimeLaunchSpec, *, log_path: Path | None = None
+    ) -> RuntimeProcess:
+        self.starts += 1
+        self.next_pid += 1
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("ab") as handle:
+                handle.write(self.message.encode("utf-8"))
+        return RuntimeProcess(spec.runtime, f"http://{spec.host}:{spec.port}/v1", self.next_pid)
+
+    def is_running(self, pid: int | None) -> bool:
+        del pid
+        return False  # exited right after start
+
+    def shutdown(self, pid: int | None, *, timeout: float = 10) -> None:
+        del pid, timeout
+
+    def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> HealthResult:
+        del spec, timeout
+        return HealthResult(False, None, "Connection refused")
+
+
+def test_exited_process_surfaces_log_tail_into_last_error(tmp_path: Path) -> None:
+    adapter = LogWritingAdapter("bind: address already in use\n")
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.VLLM: adapter},
+        logs_dir=tmp_path / "logs",
+    )
+    # max_restarts=0 so the exit is terminal on the next reconcile (no restart
+    # resets last_error) and the surfaced reason is asserted directly.
+    supervisor.deploy(_deployment(max_restarts=0))
+    failed = supervisor.reconcile("invoice")
+
+    assert failed.state == LifecycleState.FAILED
+    assert failed.exited_after_start is True
+    assert failed.last_error is not None
+    assert "address already in use" in failed.last_error
+    assert failed.last_error != "runtime process exited"
+
+
+def test_log_tail_uses_pre_spawn_offset(tmp_path: Path) -> None:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True)
+    # A prior attempt's output is already in the log (opened "ab", accumulates).
+    (logs_dir / "invoice.log").write_bytes(b"PRIOR ATTEMPT should be excluded\n")
+
+    adapter = LogWritingAdapter("address already in use\n")
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.VLLM: adapter},
+        logs_dir=logs_dir,
+    )
+    supervisor.deploy(_deployment(max_restarts=0))
+    failed = supervisor.reconcile("invoice")
+
+    assert failed.last_error is not None
+    assert "address already in use" in failed.last_error
+    assert "PRIOR ATTEMPT" not in failed.last_error
+
+
+def test_launch_exception_marks_not_exited_after_start(tmp_path: Path) -> None:
+    # The :160 launch-exception path (never spawned, e.g. missing binary) is a
+    # different failure: the reallocation caller must NOT treat it as a bind
+    # collision, so exited_after_start stays False and the message is the reason.
+    adapter = FakeAdapter()
+
+    def fail_start(*args: Any, **kwargs: Any) -> RuntimeProcess:
+        raise RuntimeError("llama-server not found")
+
+    adapter.start = fail_start  # type: ignore[method-assign]
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.VLLM: adapter}
+    )
+
+    record = supervisor.deploy(_deployment())
+
+    assert record.state == LifecycleState.FAILED
+    assert record.exited_after_start is False
+    assert record.last_error == "llama-server not found"
+
+
 def test_corrupt_state_is_rejected(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     state_path.write_text("{not-json", encoding="utf-8")

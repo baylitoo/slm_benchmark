@@ -145,8 +145,12 @@ def create_app(
     def up(
         ctx: typer.Context,
         name: str = typer.Argument(..., help="Model name in the canonical GGUF store."),
-        port: int = typer.Option(
-            8088, min=1, max=65535, help="Bind port (matches the model profile)."
+        port: int | None = typer.Option(
+            None,
+            min=1,
+            max=65535,
+            help="Bind port. Omit to auto-allocate the first free port in "
+            "DOCIE_SERVING_PORT_RANGE_* (8088-8188 by default).",
         ),
         ctx_size: int = typer.Option(8192, "--ctx-size", min=1, help="llama.cpp context size."),
     ) -> None:
@@ -154,8 +158,10 @@ def create_app(
         _execute(
             ctx,
             lambda plane: plane.up(name, port=port, context_length=ctx_size),
-            hint=lambda _r: (
-                f"\nServing '{name}' in the background on http://127.0.0.1:{port}/v1\n"
+            # Read the actual port back off the record: with no --port the control
+            # plane allocates one, so a hardcoded 8088 hint would be wrong.
+            hint=lambda record: (
+                f"\nServing '{name}' in the background on {_deploy_endpoint(record)}\n"
                 f"The model is still loading; once it answers, run:\n"
                 f"docie-bench benchmark run --model-profile {name}"
             ),
@@ -207,6 +213,22 @@ def create_app(
         uvicorn.run(create_gateway_app(models_config), host=host, port=port)
 
     return app
+
+
+def _deploy_endpoint(record: object) -> str:
+    """Best-effort endpoint string from a to_data'd deployment record for hints."""
+    if isinstance(record, Mapping):
+        endpoint = record.get("endpoint")
+        if isinstance(endpoint, str) and endpoint:
+            return endpoint
+        launch = record.get("spec")
+        if isinstance(launch, Mapping):
+            inner = launch.get("launch")
+            if isinstance(inner, Mapping):
+                port = inner.get("port")
+                if port is not None:
+                    return f"http://127.0.0.1:{port}/v1"
+    return "the allocated port (see the record above)"
 
 
 def _execute(
