@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -12,6 +13,7 @@ from docie_bench.serving.control_plane import (
     ControlPlane,
     PortAllocator,
     _DefaultSupervisor,
+    _socket_is_free,
     to_data,
 )
 from docie_bench.serving.model_store import ModelStore, ModelStoreError
@@ -426,6 +428,15 @@ class _CaptureBackend:
         self.specs.append(spec)
         return DeploymentRecord(spec=spec, state=LifecycleState.READY)
 
+    def await_ready(self, name: str) -> DeploymentRecord:
+        spec = self.specs[-1]
+        return DeploymentRecord(
+            spec=spec,
+            state=LifecycleState.READY,
+            endpoint=spec.launch.endpoint,
+            pid=4242,
+        )
+
 
 def test_serve_allocates_and_skips_remote(tmp_path: Path) -> None:
     del tmp_path
@@ -456,6 +467,75 @@ def test_serve_allocates_and_skips_remote(tmp_path: Path) -> None:
     # REMOTE binds nothing locally -> no allocation, no probe, default port kept.
     assert backend.specs[-1].launch.port == 8000
     assert probe_calls == []
+
+
+def test_serve_reallocates_on_immediate_exit(tmp_path: Path) -> None:
+    # The vLLM serve() path now shares serve_store_model's bounded reallocation
+    # loop: a raced bind (first port exits immediately) advances to the next free
+    # port and rebuilds the advertised endpoint through reachable_launch.
+    del tmp_path
+    backend = _ReallocBackend(bad_ports={8088})
+    wrapper = _DefaultSupervisor(
+        backend,
+        planner=None,
+        port_range=(8088, 8188),
+        port_probe=_always_free,
+        advertise_host="serving",  # non-loopback so the endpoint embeds the port
+        bind_host="0.0.0.0",  # noqa: S104 - the in-container all-interfaces bind
+        resolve_host=lambda _host: ("10.0.0.2",),
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    # runtime="vllm" so the (None) planner is never consulted.
+    record = asyncio.run(plane.serve("org/model", name="vllm-dep", runtime="vllm", replicas=1))
+    assert isinstance(record, dict)
+
+    assert backend.deployed_ports == [8088, 8089]
+    assert record["state"] == "ready"
+    assert record["spec"]["launch"]["port"] == 8089
+    assert record["endpoint"] == "http://serving:8089/v1"
+
+
+def test_to_data_excludes_internal_reallocation_signals() -> None:
+    # exited_after_start / log_offset are internal-only reconciler signals; the API
+    # payload and deploy result (both via to_data) must not surface them, while the
+    # public fields still serialize.
+    record = DeploymentRecord(
+        spec=DeploymentSpec(
+            name="d",
+            launch=RuntimeLaunchSpec(runtime=RuntimeKind.LLAMACPP, model="/m.gguf", alias="d"),
+        ),
+        state=LifecycleState.FAILED,
+        exited_after_start=True,
+        log_offset=4096,
+    )
+
+    data = to_data(record)
+
+    assert isinstance(data, dict)
+    assert "exited_after_start" not in data
+    assert "log_offset" not in data
+    assert data["state"] == LifecycleState.FAILED.value
+    assert data["spec"]["launch"]["model"] == "/m.gguf"
+
+
+def test_socket_is_free_probes_ipv6_bind_host() -> None:
+    # An IPv6 bind host must be probed with the right family; an AF_INET-only probe
+    # would fail the bind for every port and wedge allocation into a bogus
+    # range-exhausted error.
+    if not socket.has_ipv6:
+        pytest.skip("no IPv6 support on this host")
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as held:
+            held.bind(("::1", 0))
+            port = held.getsockname()[1]
+            # Held by a live socket -> reads as taken (family resolved correctly).
+            assert _socket_is_free("::1", port) is False
+    except OSError:
+        pytest.skip("IPv6 loopback not available on this host")
+    # Released -> the same port binds again on the IPv6 family (the load-bearing
+    # assertion: an AF_INET-only probe could never return True for an IPv6 host).
+    assert _socket_is_free("::1", port) is True
 
 
 def test_to_data_sorts_mapping_keys_and_hides_private_attributes() -> None:

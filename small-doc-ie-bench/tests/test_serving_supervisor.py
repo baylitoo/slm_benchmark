@@ -205,6 +205,30 @@ def test_await_ready_returns_last_state_on_timeout(tmp_path: Path) -> None:
     assert calls == []  # timeout_s=0 -> no polling loop, honest early return
 
 
+def test_await_ready_early_returns_on_terminal_failure(tmp_path: Path) -> None:
+    # A terminally FAILED deployment (exited, no restarts left) must NOT keep
+    # polling to the deadline — the collision-recovery path would otherwise block
+    # ~timeout_s per exhausted attempt. Slow-loading (alive) models still wait.
+    adapter = FakeAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.VLLM: adapter},
+    )
+    # NEVER + running once, then the process vanishes -> reconcile returns FAILED
+    # with no restart possible (terminal).
+    deployed = supervisor.deploy(_deployment(restart_policy=RestartPolicy.NEVER))
+    assert deployed.pid is not None
+    adapter.running.remove(deployed.pid)
+
+    calls: list[float] = []
+    record = supervisor.await_ready(
+        "invoice", timeout_s=60.0, interval_s=0.01, sleep=calls.append
+    )
+
+    assert record.state == LifecycleState.FAILED
+    assert calls == []  # long timeout, yet no busy-wait: terminal short-circuits
+
+
 def test_never_restart_policy_leaves_failed_process_stopped(tmp_path: Path) -> None:
     adapter = FakeAdapter()
     supervisor = PersistentSupervisor(

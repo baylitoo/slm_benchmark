@@ -69,12 +69,15 @@ class DeploymentRecord:
     # missing binary raises before start). The reallocation caller uses this to
     # tell "port collided, try another" from "unfixable, don't churn ports".
     # Transient/advisory: not restored on reload (a fresh process reconciles anew).
-    exited_after_start: bool = False
+    # metadata serialize=False keeps this internal signal out of every JSON-facing
+    # projection (to_data, deployments.json) so it never leaks into the API/Studio.
+    exited_after_start: bool = field(default=False, metadata={"serialize": False})
     # Byte offset into logs_dir/{name}.log captured immediately BEFORE the current
     # process was spawned. The exit branch reads only bytes past this offset so the
     # surfaced tail is *this* attempt's stderr, not a prior restart's (the log is
-    # opened "ab" and accumulates across restarts).
-    log_offset: int = 0
+    # opened "ab" and accumulates across restarts). serialize=False for the same
+    # reason: it churns every reconcile and is meaningless outside this process.
+    log_offset: int = field(default=0, metadata={"serialize": False})
 
     def __post_init__(self) -> None:
         if self.log_offset < 0:
@@ -242,10 +245,20 @@ class PersistentSupervisor:
         where 127.0.0.1 IS reachable, so this bounded loop re-probes until the
         process is actually serving. Returns whatever state is reached — an
         honest final record, never a busy-wait past ``timeout_s``.
+
+        A *terminally* FAILED record (exited/never-spawned with no restarts left)
+        short-circuits immediately: reconcile keeps respawning while restarts
+        remain (returning STARTING), so once it returns FAILED with ``_may_restart``
+        false nothing more will happen — polling on would just burn the whole
+        ``timeout_s``. This is what keeps collision recovery (serve_store_model /
+        serve) from blocking ~60s per exhausted attempt. A slow-loading model stays
+        alive (STARTING/DEGRADED), never trips this, and keeps waiting.
         """
         deadline = self._clock() + timeout_s
         record = self.reconcile(name)
         while record.state != LifecycleState.READY and self._clock() < deadline:
+            if record.state == LifecycleState.FAILED and not self._may_restart(record):
+                break
             sleep(interval_s)
             record = self.reconcile(name)
         return record

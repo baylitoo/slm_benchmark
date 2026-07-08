@@ -15,7 +15,7 @@ import shutil
 import socket
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence, Set
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
@@ -80,10 +80,20 @@ def _socket_is_free(host: str, port: int) -> bool:
     to see the worker's binds — and it is racy by construction (the port can be
     grabbed between this probe and the real ``llama-server`` bind). The launch's
     bind is the authoritative arbiter; this just pre-filters the obvious cases.
+
+    The family is resolved from ``host`` via ``getaddrinfo`` rather than hard-wiring
+    ``AF_INET``: an IPv6 bind host (e.g. ``::`` / ``::1``) cannot bind on an IPv4
+    socket, so an IPv4-only probe would fail *every* port and wedge allocation into
+    a bogus range-exhausted error.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    family, socktype, proto, _canonname, sockaddr = infos[0]
+    with socket.socket(family, socktype, proto) as sock:
         try:
-            sock.bind((host, port))
+            sock.bind(sockaddr)
         except OSError:
             return False
         return True
@@ -616,6 +626,61 @@ class _DefaultSupervisor:
     def deployment_status(self, name: str) -> object:
         return self.backend.get(name)
 
+    def _deploy_with_port_reallocation(
+        self,
+        *,
+        launch_and_await: Callable[[int], Any],
+        bind_host: str,
+        exclude_name: str,
+        port_override: int | None,
+    ) -> Any:
+        """Deploy through a bounded allocate → deploy → await loop, reallocating the
+        port only on a started-then-exited FAILED record (the bind-collision
+        signature). Shared by serve() and serve_store_model so the vLLM and
+        store-model paths recover from a raced port identically instead of only the
+        latter having the loop.
+
+        ``launch_and_await(port)`` builds the spec at ``port``, deploys it, and
+        returns the awaited record — the caller owns the runtime-specific spec so
+        this stays generic. An explicit ``port_override`` is a command, not a
+        suggestion: honored verbatim with no probing and no reallocation, letting
+        the real bind arbitrate. A slow-loading model keeps is_running True (never
+        FAILED+exited), so it never triggers a realloc; an unfixable failure
+        (missing binary) never sets exited_after_start, so the range is not churned.
+        """
+        from docie_bench.serving.runtime import LifecycleState
+
+        allocator = self._port_allocator()
+        # Ports already tried in THIS call: after deploy() replaces the record, the
+        # just-failed port is no longer record-reserved, so without this the loop
+        # could re-pick it (relying only on the socket probe / external binder).
+        # Accumulating them keeps reallocation deterministic and prober-independent.
+        tried: set[int] = set()
+        record: Any = None
+        for _attempt in range(_MAX_PORT_ALLOC_ATTEMPTS):
+            if port_override is not None:
+                chosen = port_override
+            else:
+                reserved = self._reserved_ports(exclude_name=exclude_name) | tried
+                chosen = allocator.allocate(bind_host=bind_host, reserved=reserved)
+            tried.add(chosen)
+            record = launch_and_await(chosen)
+            if record.state == LifecycleState.READY:
+                break
+            # Reallocate ONLY on a started-then-exited failure and never for an
+            # explicit override; the exit reason (the runtime's real stderr tail) is
+            # already on record.last_error via the supervisor.
+            exited = getattr(record, "exited_after_start", False)
+            if (
+                port_override is not None
+                or record.state != LifecycleState.FAILED
+                or not exited
+            ):
+                break
+            # else: loop -> allocate the next free port and rebuild the spec THROUGH
+            # reachable_launch so the advertised endpoint reflects the new port.
+        return record
+
     def serve(
         self,
         model: str,
@@ -638,37 +703,54 @@ class _DefaultSupervisor:
         bind_host, advertise_host = self._reachability_hosts()
         runtime_kind = RuntimeKind(runtime)
         # REMOTE advertises the user's real upstream (reachable_launch skips it),
-        # so its advertise host plays no role — don't fail-fast on it, and don't
-        # allocate a local port (it binds nothing here).
-        launch_kwargs: dict[str, Any] = {}
-        if runtime_kind != RuntimeKind.REMOTE:
-            self._guard_deterministic_advertise(advertise_host)
-            # All non-REMOTE serve() paths otherwise default to RuntimeLaunchSpec's
-            # port 8000, so every concurrent serve would collide there; allocate a
-            # free port instead (record + socket pre-filtered, best-effort).
-            allocator = self._port_allocator()
-            launch_kwargs["port"] = allocator.allocate(
+        # so its advertise host plays no role — don't fail-fast on it, don't
+        # allocate a local port, and don't await/reallocate (it binds nothing here).
+        if runtime_kind == RuntimeKind.REMOTE:
+            launch = reachable_launch(
+                RuntimeLaunchSpec(runtime=runtime_kind, model=model, alias=deployment_name),
                 bind_host=bind_host,
-                reserved=self._reserved_ports(exclude_name=deployment_name),
+                advertise_host=advertise_host,
             )
-        launch = reachable_launch(
-            RuntimeLaunchSpec(
-                runtime=runtime_kind,
-                model=model,
-                alias=deployment_name,
-                **launch_kwargs,
-            ),
+            return self.backend.deploy(DeploymentSpec(name=deployment_name, launch=launch))
+
+        self._guard_deterministic_advertise(advertise_host)
+
+        def _launch_and_await(chosen: int) -> Any:
+            # All non-REMOTE serve() paths otherwise default to RuntimeLaunchSpec's
+            # port 8000, so every concurrent serve would collide there; the
+            # allocated ``chosen`` (record + socket pre-filtered) is bound instead.
+            launch = reachable_launch(
+                RuntimeLaunchSpec(
+                    runtime=runtime_kind,
+                    model=model,
+                    alias=deployment_name,
+                    port=chosen,
+                ),
+                bind_host=bind_host,
+                advertise_host=advertise_host,
+            )
+            # Mirror serve_store_model's high threshold: await_ready re-probes a
+            # still-loading runtime (vLLM weights load slowly) and the default 3
+            # would degrade-and-kill it mid-load. A bind collision still exits fast
+            # (FAILED+exited), so reallocation stays responsive.
+            spec = DeploymentSpec(
+                name=deployment_name, launch=launch, health_failure_threshold=60
+            )
+            self.backend.deploy(spec)
+            return self.backend.await_ready(spec.name)
+
+        return self._deploy_with_port_reallocation(
+            launch_and_await=_launch_and_await,
             bind_host=bind_host,
-            advertise_host=advertise_host,
+            exclude_name=deployment_name,
+            port_override=None,
         )
-        spec = DeploymentSpec(name=deployment_name, launch=launch)
-        return self.backend.deploy(spec)
 
     def serve_store_model(
         self, name: str, *, port: int | None = None, context_length: int = 8192
     ) -> object:
         from docie_bench.serving.model_store import ModelStore, ModelStoreError
-        from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
+        from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
 
         if self.model_store_root is None:
@@ -685,22 +767,8 @@ class _DefaultSupervisor:
         # Store models always run the in-worker LLAMACPP subprocess (never REMOTE),
         # so guard the advertise host unconditionally here.
         self._guard_deterministic_advertise(advertise_host)
-        allocator = self._port_allocator()
-        # Ports already tried in THIS call: after deploy() replaces the record, the
-        # just-failed port is no longer record-reserved, so without this the loop
-        # could re-pick it (relying only on the socket probe / external binder).
-        # Accumulating them keeps reallocation deterministic and prober-independent.
-        tried: set[int] = set()
-        record: Any = None
-        for _attempt in range(_MAX_PORT_ALLOC_ATTEMPTS):
-            if port is not None:
-                # Operator override is a command, not a suggestion: honor it
-                # verbatim (no probing, no reallocation) and let the bind arbitrate.
-                chosen = port
-            else:
-                reserved = self._reserved_ports(exclude_name=entry.name) | tried
-                chosen = allocator.allocate(bind_host=bind_host, reserved=reserved)
-            tried.add(chosen)
+
+        def _launch_and_await(chosen: int) -> Any:
             launch = reachable_launch(
                 RuntimeLaunchSpec(
                     runtime=RuntimeKind.LLAMACPP,
@@ -719,28 +787,22 @@ class _DefaultSupervisor:
                 # A large GGUF can take a while to load; keep the readiness poll from
                 # tripping reconcile's degrade-and-kill while the model is still
                 # coming up (there is no background reconcile, so this threshold only
-                # matters during await_ready below). This is the OPPOSITE case from a
-                # bind collision (which exits immediately -> FAILED, not slow-loading).
+                # matters during await_ready). OPPOSITE case from a bind collision
+                # (which exits immediately -> FAILED, not slow-loading).
                 health_failure_threshold=60,
             )
             # Spawn, then wait for the model to finish loading. Without this the sole
             # post-spawn probe sees "Connection refused" and the record freezes at
             # STARTING forever; await_ready re-probes until it is honestly serving.
             self.backend.deploy(spec)
-            record = self.backend.await_ready(spec.name)
-            if record.state == LifecycleState.READY:
-                break
-            # Reallocate ONLY on a started-then-exited failure (the structural
-            # signature of a bind collision) and never for an explicit override.
-            # A slow-loading model keeps is_running True and never enters this
-            # branch; an unfixable failure (missing binary) never set the flag, so
-            # we don't churn the whole range on it. The exit reason (llama-server's
-            # real stderr tail) is already on record.last_error via the supervisor.
-            exited = getattr(record, "exited_after_start", False)
-            if port is not None or record.state != LifecycleState.FAILED or not exited:
-                break
-            # else: loop -> allocate the next free port and rebuild the spec THROUGH
-            # reachable_launch so the advertised endpoint reflects the new port.
+            return self.backend.await_ready(spec.name)
+
+        record = self._deploy_with_port_reallocation(
+            launch_and_await=_launch_and_await,
+            bind_host=bind_host,
+            exclude_name=entry.name,
+            port_override=port,
+        )
         # Record the placement at the same seam stop()/remove() clear it, so
         # every deploy surface — host-native `docie up` and the worker's Inngest
         # job alike — makes store:<name> resolvable, not just the worker path.
@@ -823,7 +885,17 @@ def to_data(value: object) -> object:
     if isinstance(value, Path):
         return value.as_posix()
     if is_dataclass(value) and not isinstance(value, type):
-        return to_data(asdict(value))
+        # Shallow public-field dict (recursion below re-descends into nested
+        # dataclasses), honoring ``metadata={"serialize": False}`` so internal-only
+        # fields — e.g. DeploymentRecord.exited_after_start / log_offset — never
+        # leak into the /deployments API payload or the deploy result. asdict()
+        # would deep-convert them in; fields() lets us drop them by intent.
+        public = {
+            f.name: getattr(value, f.name)
+            for f in fields(value)
+            if f.metadata.get("serialize", True)
+        }
+        return to_data(public)
     if hasattr(value, "model_dump"):
         return to_data(value.model_dump(mode="json"))
     if isinstance(value, Mapping):
