@@ -21,6 +21,13 @@ class DatasetItem(BaseModel):
     ocr_reference_blocks: list[OCRBlock] | None = None
     split: str = "unspecified"
     ground_truth: dict[str, Any] = Field(default_factory=dict)
+    # Parallel sidecar keyed by the SAME dotted paths as ``ground_truth`` (e.g.
+    # ``total_ttc.amount``). Values are ``"asserted"`` (printed on the document)
+    # or ``"derived"`` (computed from other labels, e.g. subtotal+vat). A missing
+    # key defaults to ``"asserted"`` so pre-provenance manifests score identically.
+    # Kept out of ``ground_truth`` values so ``get_path``/``compare_values`` never
+    # see a provenance wrapper.
+    label_provenance: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
 
 

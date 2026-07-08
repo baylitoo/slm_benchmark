@@ -18,6 +18,7 @@ from docie_bench.benchmark.metrics import (
     score_evidence,
     score_prediction,
 )
+from docie_bench.benchmark.provenance import aggregate_provenance_segments
 from docie_bench.benchmark.registry import DEFAULT_REGISTRY_PATH, resolve_dataset
 from docie_bench.benchmark.report import write_report
 from docie_bench.benchmark.reproducibility import (
@@ -420,6 +421,7 @@ async def run_benchmark(
                     "prediction": response.result,
                     "routing": getattr(response, "routing", None),
                     "ground_truth": item.ground_truth,
+                    "label_provenance": item.label_provenance,
                     "score": score_evidence(
                         response.result, evidence_applicable=ingestion_path != "vision"
                     ),
@@ -469,6 +471,7 @@ async def run_benchmark(
                     "latency_ms": int((time.perf_counter() - started) * 1000),
                     "error": repr(exc),
                     "ground_truth": item.ground_truth,
+                    "label_provenance": item.label_provenance,
                 }
 
     coroutines = [run_one(task) for task in pending_tasks]
@@ -607,6 +610,9 @@ def summarize(
         routed_rows = [r["routing"] for r in profile_rows if r.get("routing")]
         routed_n = len(routed_rows)
         routed_stages = [stage for route in routed_rows for stage in route.get("stages", [])]
+        # Provenance segmentation is a pure reduction over each row's
+        # score["fields"] + label_provenance sidecar; metrics.py is untouched.
+        provenance_segments = aggregate_provenance_segments(ok_rows)
         summary.append(
             {
                 "model_profile": profile,
@@ -627,6 +633,12 @@ def summarize(
                 "constrained_rate": constrained_rate,
                 "effective_style_distribution": effective_style_distribution,
                 "field_accuracy": field_accuracy,
+                # Asserted (printed) vs derived (computed, e.g. total_ttc =
+                # subtotal + vat) segmentation. field_accuracy_derived makes the
+                # model-vs-derived-hypothesis gap a visible segment distinct from
+                # model-vs-asserted; the invariant asserted+derived == field_total
+                # holds by construction (see provenance.py).
+                **provenance_segments,
                 "row_precision": row_precision,
                 "row_recall": row_recall,
                 "row_f1": (

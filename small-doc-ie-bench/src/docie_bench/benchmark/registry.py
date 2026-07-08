@@ -66,6 +66,12 @@ def document_hash(path: Path) -> str:
 
 def _canonical_item(item: DatasetItem) -> dict[str, Any]:
     value = item.model_dump(mode="json", exclude_none=True)
+    # An empty provenance sidecar must not perturb dataset identity: pre-provenance
+    # manifests keep their pinned dataset_hash. A *populated* sidecar is a real
+    # labeling change and is intentionally hashed. (exclude_none keeps {} — an
+    # empty dict is not None — so drop it explicitly.)
+    if not value.get("label_provenance"):
+        value.pop("label_provenance", None)
     value["file_hash"] = document_hash(Path(item.file_path))
     del value["file_path"]
     return value
