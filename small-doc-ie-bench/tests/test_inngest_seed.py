@@ -4,8 +4,10 @@ Covers PR-A's inngest-side guarantees, all against STUBBED collaborators (a fake
 Ollama home built from real content-addressed blobs, a fake catalog, and a fake
 Inngest context) — no live stack, no model pulls:
 
-* (c) a failing catalog upsert re-raises AND compensates (the just-seeded on-disk
-      entry is removed), so a seed is all-or-nothing.
+* (c) a CONFIGURED catalog whose upsert fails (generic write error) re-raises AND
+      compensates (the just-seeded on-disk entry is removed), so a seed is
+      all-or-nothing. (A genuinely unavailable catalog degrades store-only instead;
+      that path is covered by test_seed_integrity.py.)
 * (d) a seed-step failure logs a full traceback to worker logs AND publishes the
       error topic AND re-raises the original error.
 * (e) an error-publish that itself raises does not mask the original failure.
@@ -26,7 +28,6 @@ import pytest
 from docie_bench.inngest import functions
 from docie_bench.inngest.functions import seed_ollama_job
 from docie_bench.inngest.realtime import TOPIC_ERROR
-from docie_bench.serving.catalog import CatalogUnavailableError
 from docie_bench.serving.model_store import ModelStore
 
 # The decorated job is an inngest ``Function`` wrapper; call its underlying async
@@ -86,20 +87,24 @@ async def test_run_seed_ollama_compensates_when_catalog_upsert_fails(
     monkeypatch.setenv("OLLAMA_MODELS", str(home))
 
     class _FailingCatalog:
+        """A CONFIGURED catalog (DB reachable) whose WRITE fails — the fatal path."""
+
         def __init__(self) -> None:
             pass
 
         def upsert(self, entry: object, *, size_bytes: int | None = None) -> dict[str, Any]:
-            raise CatalogUnavailableError("DATABASE_URL is not configured")
+            raise RuntimeError("unique violation / connection reset")
 
     monkeypatch.setattr("docie_bench.serving.catalog.ModelCatalog", _FailingCatalog)
 
     data = {"reference": "m:latest", "name": "seeded", "family": "openai_chat"}
-    with pytest.raises(CatalogUnavailableError):
+    # A configured catalog whose write fails is FATAL: the generic error re-raises.
+    with pytest.raises(RuntimeError, match="unique violation"):
         await functions._run_seed_ollama(data)
 
-    # Compensation: the on-disk entry the seed just wrote is rolled back, so the
-    # seed left NEITHER an index row NOR a store dir (all-or-nothing).
+    # Compensation: the on-disk entry the seed just wrote is rolled back through the
+    # REAL ModelStore.remove_entry, so the seed left NEITHER an index row NOR a
+    # store dir (all-or-nothing).
     store = ModelStore(serving / "models")
     assert store.list() == []
     assert not (serving / "models" / "seeded").exists()
@@ -114,11 +119,13 @@ async def test_run_seed_ollama_compensation_failure_does_not_mask_original(
     monkeypatch.setenv("OLLAMA_MODELS", str(home))
 
     class _FailingCatalog:
+        """A CONFIGURED catalog whose WRITE fails with a distinct error type."""
+
         def __init__(self) -> None:
             pass
 
         def upsert(self, entry: object, *, size_bytes: int | None = None) -> dict[str, Any]:
-            raise CatalogUnavailableError("DATABASE_URL is not configured")
+            raise ValueError("catalog write failed")
 
     monkeypatch.setattr("docie_bench.serving.catalog.ModelCatalog", _FailingCatalog)
 
@@ -128,8 +135,9 @@ async def test_run_seed_ollama_compensation_failure_does_not_mask_original(
     monkeypatch.setattr(ModelStore, "remove_entry", _boom)
 
     data = {"reference": "m:latest", "name": "seeded", "family": "openai_chat"}
-    # The ORIGINAL catalog error propagates, not the compensation's RuntimeError.
-    with pytest.raises(CatalogUnavailableError):
+    # The ORIGINAL catalog error (ValueError) propagates, NOT the compensation's
+    # RuntimeError — a failed rollback must never mask the real failure.
+    with pytest.raises(ValueError, match="catalog write failed"):
         await functions._run_seed_ollama(data)
 
 
