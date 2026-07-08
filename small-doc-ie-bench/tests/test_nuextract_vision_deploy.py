@@ -16,6 +16,7 @@ Ollama store is a fake on-disk manifest. They prove the contract PR-2 owns:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import cast
@@ -179,12 +180,19 @@ def _fake_ollama_home(
     home = tmp_path / "ollama"
     blobs = home / "blobs"
     blobs.mkdir(parents=True)
-    model_digest = "sha256:" + "a" * 64
-    (blobs / model_digest.replace(":", "-")).write_bytes(b"GGUF-model-weights")
+
+    def _blob(content: bytes) -> str:
+        # Ollama blobs are content-addressed by their real sha256; the store now
+        # verifies transferred blobs against the manifest digest, so the fixture
+        # must use the true content hash (not a placeholder) to pass that check.
+        digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        (blobs / digest.replace(":", "-")).write_bytes(content)
+        return digest
+
+    model_digest = _blob(b"GGUF-model-weights")
     layers = [{"mediaType": "application/vnd.ollama.image.model", "digest": model_digest}]
     if with_projector:
-        proj_digest = "sha256:" + "b" * 64
-        (blobs / proj_digest.replace(":", "-")).write_bytes(b"MANIFEST-mmproj")
+        proj_digest = _blob(b"MANIFEST-mmproj")
         layers.append(
             {"mediaType": "application/vnd.ollama.image.projector", "digest": proj_digest}
         )

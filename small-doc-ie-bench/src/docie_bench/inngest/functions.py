@@ -438,8 +438,12 @@ def _serving_home() -> Path:
 
 async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     """Seed a GGUF from the host's Ollama into the store + record it in the catalog."""
-    from docie_bench.serving.catalog import ModelCatalog
-    from docie_bench.serving.model_store import ModelStore
+    from docie_bench.serving.catalog import (
+        CatalogUnavailableError,
+        ModelCatalog,
+        available_backends,
+    )
+    from docie_bench.serving.model_store import FAMILIES, ModelStore
 
     reference = data.get("reference")
     name = data.get("name")
@@ -451,12 +455,71 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("seed event must include 'reference' and 'name'")
 
     store = ModelStore(_serving_home() / "models")
-    # Blocking file I/O (hard-link or copy of multi-GB blobs) -> off the loop.
+    # Blocking file I/O (hard-link or copy of multi-GB blobs, plus a one-time
+    # full-file rehash to verify integrity) -> off the loop. The rehash adds one
+    # multi-GB read per seed; acceptable as a one-time, threaded cost.
     entry = await asyncio.to_thread(
         store.seed_from_ollama, reference, name=name, family=family, mmproj_source=mmproj
     )
     size = entry.model_path.stat().st_size if entry.model_path.exists() else None
-    return ModelCatalog().upsert(entry, size_bytes=size)
+    # Catalog registration has two distinct failure modes and they must NOT be
+    # conflated:
+    #   * NO catalog configured (dev/local: DATABASE_URL unset) -> the catalog is
+    #     genuinely unavailable. The on-disk store entry is a complete, usable
+    #     seed; it is simply not registered in the Postgres catalog (Studio won't
+    #     list it). Degrade gracefully: keep the on-disk entry, warn, succeed.
+    #   * A catalog that IS configured but whose WRITE fails -> a real, half-done
+    #     seed (on-disk entry with no catalog row). That is fatal: compensate by
+    #     rolling back the on-disk entry so the seed is all-or-nothing.
+    # CatalogUnavailableError is a subclass of Exception, so it MUST be caught
+    # first — otherwise the generic handler would wrongly compensate the no-DB
+    # case (the local/dev regression this fix removes).
+    try:
+        return ModelCatalog().upsert(entry, size_bytes=size)
+    except CatalogUnavailableError:
+        contract = FAMILIES.get(entry.family)
+        logger.warning(
+            "no catalog configured (no DATABASE_URL): seed %r written to the store but "
+            "NOT catalog-registered (store-only; Studio will not list it until a catalog "
+            "is configured)",
+            name,
+        )
+        return {
+            "name": entry.name,
+            "family": entry.family,
+            "vision": bool(contract and contract.vision),
+            "available_backends": available_backends(entry.family),
+            "has_mmproj": entry.mmproj_path is not None,
+            "source": entry.source,
+            "size_bytes": size,
+            "placement": None,
+            "created_at": None,
+            "updated_at": None,
+            "catalog_registered": False,
+        }
+    except Exception:  # noqa: BLE001 - configured catalog write FAILED: compensate then re-raise
+        # Roll back the just-written on-disk entry so the seed is all-or-nothing:
+        # both index.json + catalog row, or neither. The compensation itself must
+        # never mask the original failure (the bug this PR exists to kill).
+        try:
+            await asyncio.to_thread(store.remove_entry, name)
+        except Exception:  # noqa: BLE001 - log; never shadow the original error
+            logger.exception("seed compensation remove_entry failed for %r", name)
+        raise
+
+
+async def _publish_error_safely(channel: str, message: str) -> None:
+    """Publish an error-topic message without ever masking the caller's error.
+
+    ``publish`` is already best-effort, but if a misconfigured realtime backend
+    makes it raise, that exception must not replace the original job failure on
+    the way out of an ``except``. Swallow-and-log here so the caller can re-raise
+    the ORIGINAL exception.
+    """
+    try:
+        await publish(channel, TOPIC_ERROR, {"message": message})
+    except Exception:  # noqa: BLE001 - a failed error-publish must not mask the original
+        logger.exception("failed to publish error to channel %s", channel)
 
 
 @inngest_client.create_function(
@@ -470,15 +533,34 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
     ``family`` (default "openai_chat"), ``channel``.
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "seeding", "reference": data.get("reference")})
     try:
         result = await ctx.step.run("seed-ollama", lambda: _run_seed_ollama(data))
-    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
-        await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - log traceback, surface error, re-raise
+        # logger.exception BEFORE publish so a full traceback lands in worker logs
+        # even when realtime is unconfigured (empty logs were how seed failures
+        # went invisible). _publish_error_safely guards against a publish that
+        # itself raises masking the original. Same pattern belongs on the
+        # extract/deploy jobs (follow-up); scoped here to the seed job.
+        logger.exception(
+            "seed_ollama_job failed (reference=%s name=%s)",
+            data.get("reference"),
+            data.get("name"),
+        )
+        await _publish_error_safely(channel, str(exc))
         raise
-    await publish(channel, TOPIC_RESULT, result)
+    # The seed already SUCCEEDED (blob transferred, index + catalog written) and
+    # is durable. A post-success realtime publish sits OUTSIDE the try/except, so
+    # if this publish raised it would mark the whole run failed even though the
+    # work is done — and Inngest would then RETRY a completed seed. Guard it: a
+    # result-publish failure is logged, never fatal (the UI still recovers the
+    # result via /runs polling).
+    try:
+        await publish(channel, TOPIC_RESULT, result)
+    except Exception:  # noqa: BLE001 - result is durable; a failed publish must not fail the run
+        logger.exception("failed to publish seed result to channel %s", channel)
     return result
 
 

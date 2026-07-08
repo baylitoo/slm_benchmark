@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,24 +15,48 @@ from docie_bench.serving.model_store import (
 )
 
 
+def _write_blob(blobs: Path, content: bytes) -> str:
+    """Write a content-addressed Ollama blob; return its canonical ``sha256:`` digest.
+
+    Ollama names blobs ``blobs/sha256-<hex>`` by the sha256 of their content, and
+    the manifest layer digest is that same canonical hash. The store now verifies
+    transferred blobs against this digest, so a faithful fixture MUST use the real
+    content hash (not a placeholder) for the transfer to pass.
+    """
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    (blobs / digest.replace(":", "-")).write_bytes(content)
+    return digest
+
+
 def _fake_ollama_home(
     tmp_path: Path,
     reference_parts: tuple[str, ...],
     tag: str,
     *,
     with_projector: bool = True,
+    model_content: bytes = b"GGUF-model-weights",
+    model_digest_override: str | None = None,
 ) -> Path:
-    """Build a minimal Ollama models dir: one manifest + content-addressed blobs."""
+    """Build a minimal Ollama models dir: one manifest + content-addressed blobs.
+
+    ``model_digest_override`` writes a manifest digest that does NOT match the
+    blob content, simulating a corrupt/mislabeled source blob so the store's
+    integrity check has something to reject.
+    """
     home = tmp_path / "ollama"
     blobs = home / "blobs"
     blobs.mkdir(parents=True)
 
-    model_digest = "sha256:" + "a" * 64
-    (blobs / model_digest.replace(":", "-")).write_bytes(b"GGUF-model-weights")
+    if model_digest_override is not None:
+        # Blob EXISTS at the manifest-referenced path but its content does not
+        # hash to that digest — a corrupt/mislabeled source blob.
+        model_digest = model_digest_override
+        (blobs / model_digest.replace(":", "-")).write_bytes(model_content)
+    else:
+        model_digest = _write_blob(blobs, model_content)
     layers = [{"mediaType": "application/vnd.ollama.image.model", "digest": model_digest}]
     if with_projector:
-        proj_digest = "sha256:" + "b" * 64
-        (blobs / proj_digest.replace(":", "-")).write_bytes(b"GGUF-mmproj")
+        proj_digest = _write_blob(blobs, b"GGUF-mmproj")
         layers.append(
             {"mediaType": "application/vnd.ollama.image.projector", "digest": proj_digest}
         )
@@ -202,3 +227,84 @@ def test_library_reference_resolves_to_registry_ollama_ai(tmp_path: Path) -> Non
     )
     assert entry.model_path.is_file()
     assert entry.mmproj_path is None
+
+
+def test_seed_blob_mismatching_manifest_digest_fails_loud_no_partial_state(
+    tmp_path: Path,
+) -> None:
+    """(a) Blob bytes != manifest digest -> ModelStoreError, zero partial state.
+
+    Simulates a corrupt/mislabeled source blob: the manifest advertises a digest
+    that is NOT the sha256 of the blob content. The seed must fail loud and leave
+    NO model.gguf and NO index.json entry.
+    """
+    wrong_digest = "sha256:" + "c" * 64  # not the hash of b"GGUF-model-weights"
+    home = _fake_ollama_home(
+        tmp_path,
+        ("registry.ollama.ai", "library", "m"),
+        "latest",
+        with_projector=False,
+        model_digest_override=wrong_digest,
+    )
+    store = ModelStore(tmp_path / "models")
+    with pytest.raises(ModelStoreError, match="integrity check failed"):
+        store.seed_from_ollama("m:latest", name="corrupt", family="openai_chat", ollama_home=home)
+
+    assert not (tmp_path / "models" / "corrupt").exists()  # no model.gguf, no dir
+    assert store.list() == []  # no index entry
+    with pytest.raises(ModelStoreError, match="Unknown model"):
+        store.entry("corrupt")
+
+
+def test_seed_write_entry_crash_leaves_no_index_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(b) Crash between the verified transfer and _write_entry -> no index entry.
+
+    The canonical model.gguf is written+verified via a tmp->rename, so the blob
+    may exist, but the entry is only visible once the index is written. A failure
+    before that must leave the store un-indexed (never a half-registered entry).
+    """
+    home = _fake_ollama_home(
+        tmp_path, ("registry.ollama.ai", "library", "m"), "latest", with_projector=False
+    )
+    store = ModelStore(tmp_path / "models")
+
+    def _boom(_entry: object) -> None:
+        raise RuntimeError("index write crashed")
+
+    monkeypatch.setattr(store, "_write_entry", _boom)
+    with pytest.raises(RuntimeError, match="index write crashed"):
+        store.seed_from_ollama("m:latest", name="half", family="openai_chat", ollama_home=home)
+
+    assert store.list() == []  # no index entry despite the transfer having run
+    with pytest.raises(ModelStoreError, match="Unknown model"):
+        store.entry("half")
+
+
+def test_remove_entry_drops_index_key_and_dir_only_for_that_name(tmp_path: Path) -> None:
+    """Compensation removes only ``root/name`` + its index key, never a sibling."""
+    home = _fake_ollama_home(
+        tmp_path, ("registry.ollama.ai", "library", "m"), "latest", with_projector=False
+    )
+    store = ModelStore(tmp_path / "models")
+    store.seed_from_ollama("m:latest", name="keep", family="openai_chat", ollama_home=home)
+    store.seed_from_ollama("m:latest", name="drop", family="openai_chat", ollama_home=home)
+
+    store.remove_entry("drop")
+
+    assert not (tmp_path / "models" / "drop").exists()
+    assert [e.name for e in store.list()] == ["keep"]
+    assert (tmp_path / "models" / "keep").is_dir()
+
+
+def test_add_gguf_copy_is_verified_and_faithful(tmp_path: Path) -> None:
+    """add_gguf routes through the verified transfer (copy-fidelity, link=False)."""
+    gguf = tmp_path / "src.gguf"
+    gguf.write_bytes(b"weights-abc")
+    store = ModelStore(tmp_path / "models")
+    entry = store.add_gguf(
+        name="local", family="nuextract_v1", model_gguf=gguf, link=False
+    )
+    assert entry.model_path.read_bytes() == b"weights-abc"
+    assert not entry.model_path.with_name("model.gguf.tmp").exists()
