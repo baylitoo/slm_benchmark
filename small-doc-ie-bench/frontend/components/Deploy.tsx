@@ -158,9 +158,20 @@ function SlideOverPanel({
   children: React.ReactNode;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const wasOpen = useRef(open);
 
   useEffect(() => {
-    if (open) closeRef.current?.focus();
+    if (open && !wasOpen.current) {
+      // Opening: remember the trigger, move focus into the panel.
+      openerRef.current = document.activeElement as HTMLElement | null;
+      closeRef.current?.focus();
+    } else if (!open && wasOpen.current) {
+      // Closing: return focus to the trigger that opened it, not <body>.
+      openerRef.current?.focus();
+      openerRef.current = null;
+    }
+    wasOpen.current = open;
   }, [open]);
 
   return (
