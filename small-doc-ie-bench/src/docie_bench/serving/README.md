@@ -41,6 +41,17 @@ A `FamilyContract` records how to serve and prompt a family:
 | `nuextract3` | `chat_template_kwargs` | `--jinja` (+`--mmproj`, vision) | **no** (Ollama drops the kwargs) |
 | `nuextract_v1` | baked into the prompt | – | yes |
 | `openai_chat` | OpenAI `response_format` | – | yes |
+| `lfm2` | OpenAI `response_format` | `--jinja` | yes (embedded template) |
+| `lfm2_vl` | OpenAI `response_format` | `--jinja` (+`--mmproj`, vision) | yes* (serve via llama-server) |
+
+\* LFM2.5's custom `<|startoftext|>`+ChatML template renders faithfully only via
+the GGUF's embedded jinja template, so both LFM2.5 families launch with `--jinja`
+(a GBNF grammar compiled from the json_schema still constrains the sampler and
+forces valid JSON). `lfm2_vl` is template-faithful, but the **tested** VL runtime
+path is `llama-server` — Ollama's `mmproj`-via-`ADAPTER` support for `lfm2-vl` is
+unverified. The MoE `LFM2.5-8B-A1B` (`lfm2moe` arch) is a distinct architecture
+and is **deferred pending a llama.cpp arch-support probe** — no family/profile
+ships for it yet.
 
 `ollama_modelfile()` **refuses** families that Ollama can't serve faithfully, so
 you can't accidentally deploy a NuExtract3 that ignores its template.
@@ -162,6 +173,43 @@ store.add_gguf(
     name="nuextract3", family="nuextract3",
     model_gguf="NuExtract3-Q4_K_M.gguf", mmproj="mmproj-NuExtract3-BF16.gguf",
 )
+```
+
+### LFM2.5 (LiquidAI) — text + vision
+
+The LFM2.5 profiles (`lfm25_230m` / `lfm25_350m` / `lfm25_1_2b`, family `lfm2`;
+`lfm25_vl_1_6b`, family `lfm2_vl`) are served by `llama-server` from the same
+canonical store. Download a GGUF from Hugging Face and register it; the family
+contract supplies `--jinja` (and `--mmproj` for VL) at launch.
+
+```bash
+# text (1.2B primary extractor)
+huggingface-cli download LiquidAI/LFM2.5-1.2B-Instruct-GGUF \
+  LFM2.5-1.2B-Instruct-Q4_K_M.gguf --local-dir ./dl
+python -c "from docie_bench.serving.model_store import ModelStore; \
+ModelStore('~/.local/share/docie-bench/serving/models').add_gguf( \
+name='lfm25_1_2b', family='lfm2', model_gguf='dl/LFM2.5-1.2B-Instruct-Q4_K_M.gguf', \
+source='hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF')"
+docie up lfm25_1_2b            # llama-server --jinja on :8088
+
+# vision (1.6B VL) — model + projector; --mmproj is wired by the family contract
+huggingface-cli download LiquidAI/LFM2.5-VL-1.6B-GGUF \
+  LFM2.5-VL-1.6B-Q8_0.gguf mmproj-LFM2.5-VL-1.6b-Q8_0.gguf --local-dir ./dl
+python -c "from docie_bench.serving.model_store import ModelStore; \
+ModelStore('~/.local/share/docie-bench/serving/models').add_gguf( \
+name='lfm25_vl_1_6b', family='lfm2_vl', model_gguf='dl/LFM2.5-VL-1.6B-Q8_0.gguf', \
+mmproj='dl/mmproj-LFM2.5-VL-1.6b-Q8_0.gguf', source='hf:LiquidAI/LFM2.5-VL-1.6B-GGUF')"
+# store.llama_server_command('lfm25_vl_1_6b') -> …--jinja --mmproj …/mmproj.gguf
+```
+
+Before trusting VL output, confirm the *bundled* llama-server renders the custom
+template (predates-`lfm2`-template builds fall back to generic ChatML):
+
+```bash
+llama-server -m model.gguf --jinja --verbose-prompt --port 8088 &
+curl -s localhost:8088/v1/chat/completions \
+  -d '{"model":"m","messages":[{"role":"user","content":"hi"}]}'
+# expect <|startoftext|> and <|im_start|> in the rendered prompt
 ```
 
 ## Serving an Ollama-faithful family via Ollama
