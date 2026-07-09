@@ -60,7 +60,30 @@ export function Observability({ view = "dashboards" }: { view?: string }) {
           </div>
         </Card>
       ) : (
-        <Card
+        <div className="space-y-4">
+          {/* Quick links surfaced on the default view so a fresh landing still
+              exposes Inngest/Prometheus (the dedicated "links" sub-view stays). */}
+          <div className="grid gap-3 sm:grid-cols-3">
+            <LinkTile
+              title="Grafana"
+              href={GRAFANA_URL}
+              desc="Dashboards & charts"
+              icon={<BarChart3 className="h-5 w-5" />}
+            />
+            <LinkTile
+              title="Inngest"
+              href={INNGEST_URL}
+              desc="Runs, events & functions"
+              icon={<Workflow className="h-5 w-5" />}
+            />
+            <LinkTile
+              title="Prometheus metrics"
+              href={METRICS_URL}
+              desc="Raw /metrics endpoint"
+              icon={<Gauge className="h-5 w-5" />}
+            />
+          </div>
+          <Card
           title="Grafana"
           subtitle={GRAFANA_URL}
           actions={
@@ -88,7 +111,8 @@ export function Observability({ view = "dashboards" }: { view?: string }) {
             <code className="rounded bg-muted px-1">allow_embedding = true</code> (and an anonymous
             org/viewer) in Grafana, or open it directly via the link above.
           </p>
-        </Card>
+          </Card>
+        </div>
       )}
     </div>
   );

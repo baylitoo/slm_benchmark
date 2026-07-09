@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Rocket,
   Server,
@@ -140,6 +140,13 @@ export function Deploy({
 /**
  * Right-hand slide-over. Persistently mounted; slides off-screen when closed so
  * its children (a form + any in-flight ResultPanel) keep their state.
+ *
+ * A11y: while closed the panel is off-screen but still in the DOM, so without
+ * `inert` its buttons/inputs would stay in the tab order and reachable by
+ * screen readers. `inert={!open}` makes the whole subtree non-focusable and
+ * a11y-hidden when closed while preserving the translate-x slide animation and
+ * the persistent mount (form state / in-flight ResultPanel survive). On open we
+ * move focus into the panel (standard dialog behavior).
  */
 function SlideOverPanel({
   open,
@@ -150,8 +157,15 @@ function SlideOverPanel({
   onClose: () => void;
   children: React.ReactNode;
 }) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (open) closeRef.current?.focus();
+  }, [open]);
+
   return (
     <aside
+      inert={!open}
       aria-hidden={!open}
       className={cn(
         "fixed inset-y-0 right-0 z-50 flex w-full max-w-xl flex-col bg-background shadow-elevated transition-transform duration-200",
@@ -160,6 +174,7 @@ function SlideOverPanel({
     >
       <div className="flex items-center justify-end border-b border-border px-3 py-2">
         <button
+          ref={closeRef}
           type="button"
           onClick={onClose}
           aria-label="Close panel"
