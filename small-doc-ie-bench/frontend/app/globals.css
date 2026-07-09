@@ -9,16 +9,17 @@
  */
 @layer base {
   :root {
-    --background: 248 250 252; /* slate-50 */
-    --foreground: 15 23 42; /* slate-900 */
-    --card: 255 255 255;
+    /* LIGHT — the primary target. White surfaces, gray hairlines, one indigo. */
+    --background: 250 250 251; /* near-white app bg */
+    --foreground: 24 27 34; /* near-black ink */
+    --card: 255 255 255; /* surfaces */
     --elevated: 255 255 255;
-    --border: 226 232 240; /* slate-200 */
-    --input: 226 232 240;
-    --ring: 37 99 235; /* blue-600 */
-    --muted: 241 245 249; /* slate-100 */
-    --muted-foreground: 100 116 139; /* slate-500 */
-    --accent: 37 99 235; /* blue-600 */
+    --border: 233 235 239; /* hairline gray */
+    --input: 233 235 239;
+    --ring: 109 90 237; /* #6d5aed indigo */
+    --muted: 247 248 250; /* zebra / header fill */
+    --muted-foreground: 113 118 128; /* gray micro-labels */
+    --accent: 109 90 237; /* #6d5aed — the ONE indigo */
     --accent-foreground: 255 255 255;
 
     color-scheme: light;
@@ -31,11 +32,11 @@
     --elevated: 22 27 38;
     --border: 30 37 51;
     --input: 30 37 51;
-    --ring: 96 145 255;
+    --ring: 124 108 246; /* retinted indigo for dark contrast */
     --muted: 22 27 38;
     --muted-foreground: 148 163 184; /* slate-400 */
-    --accent: 96 145 255; /* bright blue */
-    --accent-foreground: 9 13 22;
+    --accent: 124 108 246; /* indigo, brightened for dark */
+    --accent-foreground: 255 255 255;
 
     color-scheme: dark;
   }

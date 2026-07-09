@@ -30,7 +30,7 @@ export function Card({
   return (
     <section
       className={cn(
-        "rounded-2xl border border-border bg-card shadow-card",
+        "rounded-lg border border-border bg-card shadow-card",
         className,
       )}
     >
@@ -69,13 +69,13 @@ type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 type ButtonSize = "sm" | "md";
 
 const BTN_BASE =
-  "inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-lg font-medium transition focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50";
+  "inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-md font-medium transition focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50";
 
 const BTN_VARIANTS: Record<ButtonVariant, string> = {
   primary:
-    "bg-accent text-accent-foreground shadow-sm hover:brightness-110 active:brightness-95",
+    "bg-accent text-accent-foreground shadow-sm hover:bg-accent/90 active:bg-accent",
   secondary:
-    "border border-border bg-muted text-foreground hover:bg-border/60",
+    "border border-border bg-card text-foreground hover:bg-muted",
   ghost: "text-muted-foreground hover:bg-muted hover:text-foreground",
   danger:
     "bg-rose-500 text-white shadow-sm hover:bg-rose-500/90 dark:bg-rose-600 dark:hover:bg-rose-600/90",
@@ -122,7 +122,7 @@ export function IconButton({
       aria-label={label}
       title={label}
       className={cn(
-        "grid h-9 w-9 place-items-center rounded-lg border border-border bg-muted text-muted-foreground transition hover:text-foreground disabled:opacity-50",
+        "grid h-9 w-9 place-items-center rounded-md border border-border bg-card text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-50",
         className,
       )}
       {...props}
@@ -167,7 +167,7 @@ export function Field({
 }
 
 const INPUT_BASE =
-  "w-full rounded-lg border border-input bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground/70 transition focus:border-accent focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-0 disabled:opacity-50";
+  "w-full rounded-md border border-input bg-card px-3 text-sm text-foreground placeholder:text-muted-foreground/70 transition focus:border-accent focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-0 disabled:opacity-50";
 
 export const TextInput = forwardRef<
   HTMLInputElement,
@@ -307,7 +307,7 @@ export function EmptyState({
   icon?: React.ReactNode;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-muted/30 px-6 py-10 text-center">
+    <div className="flex flex-col items-center justify-center rounded-md border border-dashed border-border bg-muted/20 px-6 py-12 text-center">
       <span className="mb-3 grid h-11 w-11 place-items-center rounded-full border border-border bg-card text-muted-foreground">
         {icon ?? <Inbox className="h-5 w-5" />}
       </span>

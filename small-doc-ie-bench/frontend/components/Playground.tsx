@@ -18,6 +18,7 @@ import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
 import { Button, Card, Field, Select, TextArea, TextInput, Badge } from "./ui";
 import { ResultPanel } from "./ResultPanel";
+import { PageHeader } from "./patterns/PageHeader";
 
 type InputMode = "text" | "file";
 
@@ -110,7 +111,12 @@ export function Playground({ active = true }: { active?: boolean }) {
   }
 
   return (
-    <div className="grid gap-6 lg:grid-cols-2">
+    <div>
+      <PageHeader
+        title="Playground"
+        subtitle="Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
+      />
+      <div className="grid gap-6 lg:grid-cols-2">
       <Card
         icon={<Sparkles className="h-5 w-5" />}
         title="Extract"
@@ -227,6 +233,7 @@ export function Playground({ active = true }: { active?: boolean }) {
           </p>
         )}
       </Card>
+      </div>
     </div>
   );
 }
