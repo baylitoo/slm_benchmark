@@ -42,16 +42,22 @@ A `FamilyContract` records how to serve and prompt a family:
 | `nuextract_v1` | baked into the prompt | – | yes |
 | `openai_chat` | OpenAI `response_format` | – | yes |
 | `lfm2` | OpenAI `response_format` | `--jinja` | yes (embedded template) |
-| `lfm2_vl` | OpenAI `response_format` | `--jinja` (+`--mmproj`, vision) | yes* (serve via llama-server) |
+| `lfm2_vl` | OpenAI `response_format` | `--jinja` (+`--mmproj`, vision) | no* (llama-server only) |
 
 \* LFM2.5's custom `<|startoftext|>`+ChatML template renders faithfully only via
 the GGUF's embedded jinja template, so both LFM2.5 families launch with `--jinja`
 (a GBNF grammar compiled from the json_schema still constrains the sampler and
-forces valid JSON). `lfm2_vl` is template-faithful, but the **tested** VL runtime
-path is `llama-server` — Ollama's `mmproj`-via-`ADAPTER` support for `lfm2-vl` is
-unverified. The MoE `LFM2.5-8B-A1B` (`lfm2moe` arch) is a distinct architecture
-and is **deferred pending a llama.cpp arch-support probe** — no family/profile
-ships for it yet.
+forces valid JSON). `lfm2_vl` is `ollama_faithful=False` — the tested VL runtime
+path is `llama-server` only; Ollama's `mmproj`-via-`ADAPTER` support for `lfm2-vl`
+is unverified, so an Ollama Modelfile is refused. The MoE `LFM2.5-8B-A1B`
+(`lfm2moe` arch) is a distinct architecture and is **deferred pending a llama.cpp
+arch-support probe** — no family/profile ships for it yet.
+
+**LFM2.5 GGUF refs** (HuggingFace — seed via `add_gguf` or `huggingface-cli download`):
+`LiquidAI/LFM2.5-230M-GGUF` → profile `lfm25_230m` (family `lfm2`),
+`LFM2.5-350M-GGUF` → `lfm25_350m`, `LFM2.5-1.2B-Instruct-GGUF` → `lfm25_1_2b`,
+and `LFM2.5-VL-1.6B-GGUF` + its `mmproj-LFM2.5-VL-1.6b-*.gguf` projector →
+`lfm25_vl_1_6b` (family `lfm2_vl`).
 
 `ollama_modelfile()` **refuses** families that Ollama can't serve faithfully, so
 you can't accidentally deploy a NuExtract3 that ignores its template.

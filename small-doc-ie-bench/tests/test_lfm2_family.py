@@ -16,7 +16,12 @@ from pathlib import Path
 import pytest
 
 from docie_bench.llm.model_profiles import load_model_profiles
-from docie_bench.serving.model_store import FAMILIES, ModelStore, TemplateDelivery
+from docie_bench.serving.model_store import (
+    FAMILIES,
+    ModelStore,
+    ModelStoreError,
+    TemplateDelivery,
+)
 from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
 from docie_bench.serving.supervisor import DeploymentRecord, DeploymentSpec
@@ -54,6 +59,8 @@ def test_lfm2_vl_contract() -> None:
     assert "--jinja" in contract.llama_server_args
     assert contract.default_max_tokens == 4096
     assert contract.default_timeout_seconds == pytest.approx(600.0)
+    # Ollama mmproj/ADAPTER for lfm2-vl is unverified → llama-server only.
+    assert contract.ollama_faithful is False
 
 
 # ── models.yaml profile load ────────────────────────────────────────────────────
@@ -135,9 +142,10 @@ def test_llama_server_command_vl_includes_jinja_and_mmproj(tmp_path: Path) -> No
     assert "lfm25_vl_1_6b" in command
 
 
-def test_lfm2_vl_is_ollama_faithful_but_served_via_llama_server(tmp_path: Path) -> None:
-    # lfm2_vl is template-faithful (ollama_faithful=True), so a Modelfile is
-    # emitted (unlike nuextract3 which raises) — the ADAPTER carries the projector.
+def test_lfm2_vl_not_ollama_faithful_served_via_llama_server(tmp_path: Path) -> None:
+    # Ollama mmproj/ADAPTER support for lfm2-vl is unverified, so lfm2_vl is
+    # ollama_faithful=False and refuses a Modelfile (like nuextract3) — the VL
+    # path is llama-server only.
     store = ModelStore(tmp_path / "models")
     store.add_gguf(
         name="vl",
@@ -146,8 +154,8 @@ def test_lfm2_vl_is_ollama_faithful_but_served_via_llama_server(tmp_path: Path) 
         mmproj=_fake_gguf(tmp_path, "mmproj.gguf"),
         link=False,
     )
-    modelfile = store.ollama_modelfile("vl")
-    assert "ADAPTER" in modelfile
+    with pytest.raises(ModelStoreError):
+        store.ollama_modelfile("vl")
 
 
 # ── resolver: VL store deploy inherits vision=True end-to-end ────────────────────

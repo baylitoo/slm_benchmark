@@ -153,7 +153,9 @@ FAMILIES: dict[str, FamilyContract] = {
         default_temperature=0.1,  # slight temp helps VL; matches Liquid VL guidance
         default_max_tokens=4096,
         default_timeout_seconds=600.0,  # vision on CPU is slow (nuextract3 precedent)
-        ollama_faithful=True,  # template-faithful; but serve via llama-server (tested path)
+        # Ollama mmproj/ADAPTER support for lfm2-vl is unverified; serve VL via
+        # llama-server only (mirrors nuextract3 — refuses an Ollama Modelfile).
+        ollama_faithful=False,
     ),
 }
 
