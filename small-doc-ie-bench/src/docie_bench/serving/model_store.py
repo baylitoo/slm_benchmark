@@ -115,6 +115,48 @@ FAMILIES: dict[str, FamilyContract] = {
         default_temperature=0.0,
         ollama_faithful=True,
     ),
+    # LiquidAI LFM2.5 text (230M/350M/1.2B). A *standard* instruct model, so the
+    # schema rides OpenAI `response_format` (openai_json_schema) — unlike
+    # nuextract3 it needs NO chat_template_kwargs/extra_body. The one wrinkle: its
+    # template is custom (`<|startoftext|>` + ChatML), which only renders
+    # faithfully via the GGUF's embedded jinja template, hence `--jinja`. That
+    # `--jinja` is the whole reason this is a distinct family from `openai_chat`.
+    # A GBNF grammar (compiled from the json_schema) constrains the sampler, which
+    # overrides LFM2.5's default Pythonic tool-call output and forces valid JSON.
+    "lfm2": FamilyContract(
+        name="lfm2",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja",),
+        needs_mmproj=False,
+        vision=False,
+        default_temperature=0.0,  # extraction-deterministic (Liquid's 0.1 is a chat rec)
+        default_max_tokens=900,
+        default_timeout_seconds=180.0,
+        ollama_faithful=True,  # standard template; Ollama auto-extracts the embedded one
+    ),
+    # LiquidAI LFM2.5-VL (1.6B). SigLIP2 encoder + connector on the LFM2 backbone;
+    # ships a projector, so `needs_mmproj=True` (family_launch_args appends
+    # `--mmproj <path>` automatically -> ("--jinja", "--mmproj", <path>)). KEY diff
+    # vs nuextract3: schema still rides `response_format` (openai_json_schema), so
+    # it stays Ollama-faithful in template terms — but the TESTED VL runtime path is
+    # llama-server (Ollama mmproj-via-ADAPTER support for lfm2-vl is unverified).
+    "lfm2_vl": FamilyContract(
+        name="lfm2_vl",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja",),  # --mmproj appended by family_launch_args
+        needs_mmproj=True,
+        vision=True,
+        default_temperature=0.1,  # slight temp helps VL; matches Liquid VL guidance
+        default_max_tokens=4096,
+        default_timeout_seconds=600.0,  # vision on CPU is slow (nuextract3 precedent)
+        # Ollama mmproj/ADAPTER support for lfm2-vl is unverified; serve VL via
+        # llama-server only (mirrors nuextract3 — refuses an Ollama Modelfile).
+        ollama_faithful=False,
+    ),
 }
 
 

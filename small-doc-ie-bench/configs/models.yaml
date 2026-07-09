@@ -275,3 +275,58 @@ profiles:
     vision: true
     vision_max_pages: 8
     vision_pdf_dpi: 150
+
+  # --- LiquidAI LFM2.5 (served by llama-server from the canonical models/ store) ---
+  # A standard instruct/VL family: schema rides OpenAI `response_format`
+  # (openai_json_schema), so — unlike nuextract3 — there is NO chat_template_kwargs.
+  # The custom `<|startoftext|>`+ChatML template renders faithfully only via the
+  # GGUF's embedded jinja template, so the `lfm2`/`lfm2_vl` family contracts launch
+  # llama-server with `--jinja` (family_launch_args). `model` == the `--alias`
+  # (served id). Seed+serve setup is in src/docie_bench/serving/README.md.
+  # These store/llama-server profiles are distinct from the Ollama-runtime
+  # `ollama_lfm25_350m` above (which stays as-is).
+  lfm25_230m:
+    model: lfm25_230m
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    max_tokens: 900
+    timeout_seconds: 180
+    prompt_profile: strict_extraction_v1
+
+  lfm25_350m:
+    model: lfm25_350m
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    max_tokens: 900
+    timeout_seconds: 180
+    prompt_profile: strict_extraction_v1
+
+  lfm25_1_2b:
+    model: lfm25_1_2b
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    max_tokens: 1024
+    timeout_seconds: 240
+    prompt_profile: strict_extraction_v1
+
+  # Vision. mmproj is wired by the `lfm2_vl` family contract at launch
+  # (family_launch_args appends `--mmproj <path>`); PDFs are rasterized upstream.
+  # Deployed and served via llama-server (the tested VL path — see serving/README).
+  lfm25_vl_1_6b:
+    model: lfm25_vl_1_6b
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.1
+    max_tokens: 4096
+    timeout_seconds: 600
+    prompt_profile: strict_extraction_v1
+    vision: true
+    vision_max_pages: 8
+    vision_pdf_dpi: 150
