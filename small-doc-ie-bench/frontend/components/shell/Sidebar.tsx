@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Layers, ChevronDown, ChevronsLeft, X } from "lucide-react";
 import { API_BASE } from "@/lib/env";
 import type { Health } from "@/lib/useBackendHealth";
@@ -55,8 +55,28 @@ export function Sidebar({
 
   const meta = HEALTH_META[health];
 
+  // Below lg the sidebar is an off-canvas drawer (fixed + -translate-x-full when
+  // closed). Off-screen but still in the DOM, its nav links stay tabbable and
+  // SR-reachable — so make it inert/aria-hidden ONLY while mobile AND closed.
+  // Desktop (lg:static) must never be inert.
+  const asideRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const el = asideRef.current;
+    if (!el) return;
+    const mq = window.matchMedia("(max-width: 1023.98px)");
+    const apply = () => {
+      const offscreen = mq.matches && !mobileOpen;
+      el.inert = offscreen;
+      el.setAttribute("aria-hidden", offscreen ? "true" : "false");
+    };
+    apply();
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
+  }, [mobileOpen]);
+
   return (
     <aside
+      ref={asideRef}
       className={cn(
         "fixed inset-y-0 left-0 z-40 flex flex-col border-r border-border bg-card transition-all lg:static lg:translate-x-0",
         collapsed ? "w-14" : "w-60",
