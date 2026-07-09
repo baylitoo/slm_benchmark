@@ -3,12 +3,12 @@
 import { ThemeProvider } from "next-themes";
 import { ToastProvider } from "./Toast";
 
-/** Client-side app providers: theme (dark by default) + toasts. */
+/** Client-side app providers: theme (light by default) + toasts. */
 export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <ThemeProvider
       attribute="class"
-      defaultTheme="dark"
+      defaultTheme="light"
       enableSystem={false}
       disableTransitionOnChange
     >

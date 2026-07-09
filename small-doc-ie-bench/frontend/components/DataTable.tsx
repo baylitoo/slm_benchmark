@@ -45,9 +45,9 @@ export function DataTable({
   const columns = Array.from(new Set(objs.flatMap((r) => Object.keys(r))));
 
   return (
-    <div className="scroll-thin overflow-auto rounded-xl border border-border">
+    <div className="scroll-thin overflow-x-auto rounded-md border border-border">
       <table className="w-full text-left text-sm">
-        <thead className="bg-muted/60 text-xs uppercase tracking-wide text-muted-foreground">
+        <thead className="bg-muted/60 text-[11px] uppercase tracking-wide text-muted-foreground">
           <tr>
             {columns.map((c) => (
               <th key={c} className="whitespace-nowrap px-3 py-2.5 font-medium">

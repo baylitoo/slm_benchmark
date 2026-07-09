@@ -8,10 +8,12 @@ import {
   Cpu,
   Boxes,
   Plus,
+  Network,
   ChevronDown,
   ChevronRight,
   AlertCircle,
   PackagePlus,
+  X,
 } from "lucide-react";
 import {
   getStore,
@@ -25,7 +27,8 @@ import {
   ApiUnavailable,
   type StoreEntry,
   type ModelFamily,
-  type PortsView,
+  type PortsView as PortsViewData,
+  type DeploymentRecord,
   type TriggerResponse,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
@@ -34,6 +37,7 @@ import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
 import {
   Badge,
+  type BadgeTone,
   Button,
   Card,
   EmptyState,
@@ -46,48 +50,600 @@ import {
 import { DataTable } from "./DataTable";
 import { LiveIndicator } from "./LiveIndicator";
 import { ResultPanel } from "./ResultPanel";
+import { PageHeader } from "./patterns/PageHeader";
+import { Toolbar } from "./patterns/Toolbar";
+import { ResultLine } from "./patterns/ResultLine";
+import { Pager } from "./patterns/Pager";
+import { Table, type Column } from "./patterns/Table";
 
 const POLL_MS = 4000;
+const PAGE_SIZE = 10;
 
-export function Deploy({ active = true }: { active?: boolean }) {
+type SlideOver = null | "deploy" | "seed";
+
+/**
+ * Deploy = a table-first serving console with three nav-driven sub-views
+ * ("models" / "deployments" / "ports"). The Deploy + Seed forms live in
+ * persistently-mounted slide-overs (visibility toggled, never unmounted) so an
+ * in-flight deploy/seed and its ResultPanel survive closing the panel or
+ * switching views. All pollers, handlers, and API calls are unchanged.
+ */
+export function Deploy({
+  active = true,
+  view = "deployments",
+}: {
+  active?: boolean;
+  view?: string;
+}) {
   // Auto-refreshing lists — paused when the tab is hidden OR Deploy isn't the
-  // active section (every section stays mounted in the shell).
+  // active section (every section stays mounted in the shell). Held at the top
+  // level so switching sub-views never remounts a poller.
   const store = usePolling<StoreEntry[]>(getStore, POLL_MS, active);
-  const deployments = usePolling(getDeployments, POLL_MS, active);
+  const deployments = usePolling<DeploymentRecord[]>(getDeployments, POLL_MS, active);
   const families = useAsync(getFamilies, []); // static-ish; one-shot fetch
 
-  return (
-    <div className="space-y-6">
-      <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
-        <DeployForm
-          store={store}
-          active={active}
-          onDeployed={() => deployments.refresh()}
-        />
-        <SeedForm families={families.data} onSeeded={() => store.refresh()} />
-      </div>
+  const [slideOver, setSlideOver] = useState<SlideOver>(null);
 
-      <Card
-        icon={<Server className="h-5 w-5" />}
-        title="Deployments"
-        subtitle="GET /v1/serving/deployments"
+  const heading =
+    view === "models"
+      ? { title: "Models", subtitle: "GET /v1/serving/store — the GGUF catalog you can deploy." }
+      : view === "ports"
+        ? { title: "Ports", subtitle: "Live port allocation across running deployments." }
+        : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
+
+  return (
+    <div>
+      <PageHeader
+        title={heading.title}
+        subtitle={heading.subtitle}
         actions={
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setSlideOver("seed")}>
+              <PackagePlus className="h-4 w-4" />
+              Add model
+            </Button>
+            <Button size="sm" onClick={() => setSlideOver("deploy")}>
+              <Rocket className="h-4 w-4" />
+              Deploy model
+            </Button>
+          </>
+        }
+      />
+
+      {view === "models" ? (
+        <ModelsView store={store} onDeploy={() => setSlideOver("deploy")} />
+      ) : view === "ports" ? (
+        <PortsView deployments={deployments} />
+      ) : (
+        <DeploymentsView deployments={deployments} />
+      )}
+
+      {/* Slide-overs: both forms stay mounted; only visibility toggles. */}
+      <div
+        className={cn(
+          "fixed inset-0 z-40 bg-black/40 transition-opacity duration-200",
+          slideOver ? "opacity-100" : "pointer-events-none opacity-0",
+        )}
+        onClick={() => setSlideOver(null)}
+        aria-hidden
+      />
+      <SlideOverPanel open={slideOver === "deploy"} onClose={() => setSlideOver(null)}>
+        <DeployForm store={store} active={active} onDeployed={() => deployments.refresh()} />
+      </SlideOverPanel>
+      <SlideOverPanel open={slideOver === "seed"} onClose={() => setSlideOver(null)}>
+        <SeedForm families={families.data} onSeeded={() => store.refresh()} />
+      </SlideOverPanel>
+    </div>
+  );
+}
+
+/**
+ * Right-hand slide-over. Persistently mounted; slides off-screen when closed so
+ * its children (a form + any in-flight ResultPanel) keep their state.
+ */
+function SlideOverPanel({
+  open,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <aside
+      aria-hidden={!open}
+      className={cn(
+        "fixed inset-y-0 right-0 z-50 flex w-full max-w-xl flex-col bg-background shadow-elevated transition-transform duration-200",
+        open ? "translate-x-0" : "translate-x-full",
+      )}
+    >
+      <div className="flex items-center justify-end border-b border-border px-3 py-2">
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close panel"
+          className="grid h-8 w-8 place-items-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="scroll-thin flex-1 overflow-y-auto p-4">{children}</div>
+    </aside>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Deployment lifecycle → badge tone.
+// ---------------------------------------------------------------------------
+
+function stateTone(state?: string | null): BadgeTone {
+  switch ((state ?? "").toLowerCase()) {
+    case "ready":
+    case "running":
+    case "serving":
+      return "ok";
+    case "failed":
+    case "error":
+      return "err";
+    case "starting":
+    case "downloading":
+    case "degraded":
+      return "warn";
+    default:
+      return "neutral";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Deployments view — explicit-column table over DeploymentRecord[].
+// ---------------------------------------------------------------------------
+
+function DeploymentsView({
+  deployments,
+}: {
+  deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
+}) {
+  const [filter, setFilter] = useState("");
+  const [page, setPage] = useState(1);
+
+  const all = deployments.data ?? [];
+  const total = all.length;
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return all;
+    return all.filter((r) => {
+      const hay = [r.spec?.name, r.spec?.launch?.model, r.spec?.launch?.runtime, r.state]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(q);
+    });
+  }, [all, filter]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const clampedPage = Math.min(page, pageCount);
+  const paged = useMemo(
+    () => filtered.slice((clampedPage - 1) * PAGE_SIZE, clampedPage * PAGE_SIZE),
+    [filtered, clampedPage],
+  );
+
+  const columns: Column<DeploymentRecord>[] = [
+    {
+      key: "name",
+      header: "Name",
+      sortAccessor: (r) => r.spec?.name ?? "",
+      render: (r) => <span className="font-medium text-foreground">{r.spec?.name ?? "—"}</span>,
+    },
+    {
+      key: "model",
+      header: "Model",
+      sortAccessor: (r) => r.spec?.launch?.model ?? "",
+      render: (r) => (
+        <span className="font-mono text-xs text-foreground/90">{r.spec?.launch?.model ?? "—"}</span>
+      ),
+    },
+    {
+      key: "runtime",
+      header: "Runtime",
+      render: (r) =>
+        r.spec?.launch?.runtime ? (
+          <Badge tone="neutral">{r.spec.launch.runtime}</Badge>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+    {
+      key: "port",
+      header: "Port",
+      sortAccessor: (r) => r.spec?.launch?.port ?? 0,
+      render: (r) => (
+        <span className="font-mono tabular-nums text-xs">{r.spec?.launch?.port ?? "—"}</span>
+      ),
+    },
+    {
+      key: "state",
+      header: "State",
+      sortAccessor: (r) => r.state ?? "",
+      render: (r) => (
+        <span
+          title={
+            [
+              r.last_error ? `error: ${r.last_error}` : null,
+              r.restart_count ? `restarts: ${r.restart_count}` : null,
+            ]
+              .filter(Boolean)
+              .join(" · ") || undefined
+          }
+        >
+          <Badge tone={stateTone(r.state)}>{r.state ?? "unknown"}</Badge>
+        </span>
+      ),
+    },
+    {
+      key: "endpoint",
+      header: "Endpoint",
+      className: "max-w-[18rem]",
+      render: (r) =>
+        r.endpoint ? (
+          <span className="block truncate font-mono text-xs text-muted-foreground" title={r.endpoint}>
+            {r.endpoint}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+  ];
+
+  return (
+    <div>
+      <Toolbar
+        onReset={() => {
+          setFilter("");
+          setPage(1);
+        }}
+        resetDisabled={filter === ""}
+      >
+        <TextInput
+          value={filter}
+          onChange={(e) => {
+            setFilter(e.target.value);
+            setPage(1);
+          }}
+          placeholder="Filter by name, model, runtime…"
+          className="h-8 w-64 text-xs"
+        />
+        <div className="ml-auto">
           <LiveIndicator
             live={deployments.live}
             refreshing={deployments.refreshing}
             lastUpdated={deployments.lastUpdated}
             onRefresh={deployments.refresh}
           />
+        </div>
+      </Toolbar>
+
+      <ResultLine
+        shown={paged.length}
+        total={total}
+        noun="deployments"
+        onFetch={deployments.refresh}
+        fetching={deployments.refreshing}
+        pager={
+          <Pager
+            page={clampedPage}
+            pageCount={pageCount}
+            onPrev={() => setPage((p) => Math.max(1, p - 1))}
+            onNext={() => setPage((p) => Math.min(pageCount, p + 1))}
+          />
         }
+      />
+
+      <Table<DeploymentRecord>
+        columns={columns}
+        rows={deployments.data ? paged : null}
+        getRowKey={(r, i) => r.spec?.name ?? `dep-${i}`}
+        loading={deployments.loading}
+        error={deployments.error}
+        emptyIcon={<Server className="h-5 w-5" />}
+        emptyLabel="No deployments found"
+        emptyDescription="Deploy a model with the button above — it'll appear here on the next refresh."
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Models view — the deployable store catalog.
+// ---------------------------------------------------------------------------
+
+function ModelsView({
+  store,
+  onDeploy,
+}: {
+  store: ReturnType<typeof usePolling<StoreEntry[]>>;
+  onDeploy: () => void;
+}) {
+  const [filter, setFilter] = useState("");
+  const [page, setPage] = useState(1);
+
+  const all = store.data ?? [];
+  const total = all.length;
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return all;
+    return all.filter((m) =>
+      [m.name, m.family, ...(m.available_backends ?? [])]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(q),
+    );
+  }, [all, filter]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const clampedPage = Math.min(page, pageCount);
+  const paged = useMemo(
+    () => filtered.slice((clampedPage - 1) * PAGE_SIZE, clampedPage * PAGE_SIZE),
+    [filtered, clampedPage],
+  );
+
+  const columns: Column<StoreEntry>[] = [
+    {
+      key: "name",
+      header: "Name",
+      sortAccessor: (m) => m.name,
+      render: (m) => <span className="font-mono text-xs text-foreground">{m.name}</span>,
+    },
+    {
+      key: "family",
+      header: "Family",
+      sortAccessor: (m) => m.family ?? "",
+      render: (m) =>
+        m.family ? (
+          <Badge tone="neutral">
+            <Cpu className="h-3 w-3" /> {m.family}
+          </Badge>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+    {
+      key: "vision",
+      header: "Vision",
+      render: (m) =>
+        m.vision ? (
+          <Badge tone="info">
+            <Eye className="h-3 w-3" /> vision
+          </Badge>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+    {
+      key: "size",
+      header: "Size",
+      sortAccessor: (m) => m.size_bytes ?? 0,
+      render: (m) => <span className="font-mono tabular-nums text-xs">{formatBytes(m.size_bytes)}</span>,
+    },
+    {
+      key: "backends",
+      header: "Backends",
+      render: (m) => (
+        <span className="text-xs text-muted-foreground">
+          {(m.available_backends ?? []).join(", ") || "—"}
+        </span>
+      ),
+    },
+    {
+      key: "action",
+      header: "",
+      className: "text-right",
+      render: () => (
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDeploy();
+          }}
+        >
+          <Rocket className="h-3.5 w-3.5" />
+          Deploy
+        </Button>
+      ),
+    },
+  ];
+
+  return (
+    <div>
+      <Toolbar
+        onReset={() => {
+          setFilter("");
+          setPage(1);
+        }}
+        resetDisabled={filter === ""}
       >
-        <DataTable
-          rows={deployments.data}
-          loading={deployments.loading}
-          error={deployments.error}
-          emptyLabel="No active deployments"
-          emptyDescription="Deploy a model above — it'll appear here on the next refresh."
+        <TextInput
+          value={filter}
+          onChange={(e) => {
+            setFilter(e.target.value);
+            setPage(1);
+          }}
+          placeholder="Filter by name, family, backend…"
+          className="h-8 w-64 text-xs"
         />
-      </Card>
+        <div className="ml-auto">
+          <LiveIndicator
+            live={store.live}
+            refreshing={store.refreshing}
+            lastUpdated={store.lastUpdated}
+            onRefresh={store.refresh}
+          />
+        </div>
+      </Toolbar>
+
+      <ResultLine
+        shown={paged.length}
+        total={total}
+        noun="models"
+        onFetch={store.refresh}
+        fetching={store.refreshing}
+        pager={
+          <Pager
+            page={clampedPage}
+            pageCount={pageCount}
+            onPrev={() => setPage((p) => Math.max(1, p - 1))}
+            onNext={() => setPage((p) => Math.min(pageCount, p + 1))}
+          />
+        }
+      />
+
+      <Table<StoreEntry>
+        columns={columns}
+        rows={store.data ? paged : null}
+        getRowKey={(m) => m.name}
+        loading={store.loading}
+        error={store.error}
+        emptyIcon={<Boxes className="h-5 w-5" />}
+        emptyLabel="No models found"
+        emptyDescription="Seed one from a local Ollama / HF reference via Add model — it'll show up here automatically."
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Ports view — pure projection over the deployments already in memory.
+// ---------------------------------------------------------------------------
+
+function PortsView({
+  deployments,
+}: {
+  deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
+}) {
+  const [filter, setFilter] = useState("");
+  const [page, setPage] = useState(1);
+
+  const all = deployments.data ?? [];
+  const total = all.length;
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return all;
+    return all.filter((r) =>
+      [r.spec?.name, r.spec?.launch?.port, r.state]
+        .filter((x) => x != null)
+        .join(" ")
+        .toLowerCase()
+        .includes(q),
+    );
+  }, [all, filter]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const clampedPage = Math.min(page, pageCount);
+  const paged = useMemo(
+    () => filtered.slice((clampedPage - 1) * PAGE_SIZE, clampedPage * PAGE_SIZE),
+    [filtered, clampedPage],
+  );
+
+  const columns: Column<DeploymentRecord>[] = [
+    {
+      key: "port",
+      header: "Port",
+      sortAccessor: (r) => r.spec?.launch?.port ?? 0,
+      render: (r) => (
+        <span className="font-mono tabular-nums text-xs text-foreground">
+          {r.spec?.launch?.port ?? "—"}
+        </span>
+      ),
+    },
+    {
+      key: "pid",
+      header: "PID",
+      sortAccessor: (r) => r.pid ?? 0,
+      render: (r) => <span className="font-mono tabular-nums text-xs">{r.pid ?? "—"}</span>,
+    },
+    {
+      key: "process",
+      header: "Process",
+      sortAccessor: (r) => r.spec?.name ?? "",
+      render: (r) => <span className="text-foreground">{r.spec?.name ?? "—"}</span>,
+    },
+    {
+      key: "state",
+      header: "State",
+      sortAccessor: (r) => r.state ?? "",
+      render: (r) => <Badge tone={stateTone(r.state)}>{r.state ?? "unknown"}</Badge>,
+    },
+    {
+      key: "endpoint",
+      header: "Endpoint",
+      className: "max-w-[18rem]",
+      render: (r) =>
+        r.endpoint ? (
+          <span className="block truncate font-mono text-xs text-muted-foreground" title={r.endpoint}>
+            {r.endpoint}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+  ];
+
+  return (
+    <div>
+      <Toolbar
+        onReset={() => {
+          setFilter("");
+          setPage(1);
+        }}
+        resetDisabled={filter === ""}
+      >
+        <TextInput
+          value={filter}
+          onChange={(e) => {
+            setFilter(e.target.value);
+            setPage(1);
+          }}
+          placeholder="Filter by process, port, state…"
+          className="h-8 w-64 text-xs"
+        />
+        <div className="ml-auto">
+          <LiveIndicator
+            live={deployments.live}
+            refreshing={deployments.refreshing}
+            lastUpdated={deployments.lastUpdated}
+            onRefresh={deployments.refresh}
+          />
+        </div>
+      </Toolbar>
+
+      <ResultLine
+        shown={paged.length}
+        total={total}
+        noun="ports"
+        onFetch={deployments.refresh}
+        fetching={deployments.refreshing}
+        pager={
+          <Pager
+            page={clampedPage}
+            pageCount={pageCount}
+            onPrev={() => setPage((p) => Math.max(1, p - 1))}
+            onNext={() => setPage((p) => Math.min(pageCount, p + 1))}
+          />
+        }
+      />
+
+      <Table<DeploymentRecord>
+        columns={columns}
+        rows={deployments.data ? paged : null}
+        getRowKey={(r, i) => `${r.spec?.launch?.port ?? "port"}-${r.spec?.name ?? i}`}
+        loading={deployments.loading}
+        error={deployments.error}
+        emptyIcon={<Network className="h-5 w-5" />}
+        emptyLabel="No ports in use"
+        emptyDescription="Deploy a model — its port appears here on the next refresh."
+      />
     </div>
   );
 }
@@ -124,7 +680,7 @@ function DeployForm({
 
   // Live port view — only polled while the Advanced panel is open (and Deploy is
   // the active, visible section), so a collapsed panel costs nothing.
-  const ports = usePolling<PortsView>(getPorts, POLL_MS, active && showAdvanced);
+  const ports = usePolling<PortsViewData>(getPorts, POLL_MS, active && showAdvanced);
   const portsData = ports.data;
 
   // Prefill the field from the recommended port until the operator types — never
@@ -324,7 +880,7 @@ function DeployForm({
         </div>
 
         {error && (
-          <p className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
             {error}
           </p>
@@ -345,13 +901,13 @@ function DeployForm({
   );
 }
 
-function PortsAdmin({ ports }: { ports: ReturnType<typeof usePolling<PortsView>> }) {
+function PortsAdmin({ ports }: { ports: ReturnType<typeof usePolling<PortsViewData>> }) {
   const data = ports.data;
   const range = data?.range;
   const recommended = data?.recommended_next;
 
   return (
-    <div className="rounded-xl border border-border bg-muted/20 p-3">
+    <div className="rounded-md border border-border bg-muted/20 p-3">
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="text-xs font-medium text-foreground">
           Port allocation
@@ -441,7 +997,7 @@ function ModelPicker({
             aria-checked={isSel}
             onClick={() => onSelect(m.name)}
             className={cn(
-              "flex w-full items-start justify-between gap-3 rounded-xl border p-3 text-left transition",
+              "flex w-full items-start justify-between gap-3 rounded-md border p-3 text-left transition",
               isSel
                 ? "border-accent bg-accent/5 ring-1 ring-accent/40"
                 : "border-border bg-background hover:border-accent/40 hover:bg-muted/40",
@@ -501,7 +1057,7 @@ function RuntimeChip({
       aria-checked={checked}
       onClick={onClick}
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm transition",
+        "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm transition",
         checked
           ? "border-accent bg-accent/10 text-accent"
           : "border-border bg-background text-muted-foreground hover:text-foreground",
@@ -634,7 +1190,7 @@ function SeedForm({
         )}
 
         {error && (
-          <p className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
             {error}
           </p>
