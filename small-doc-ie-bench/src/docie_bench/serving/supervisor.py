@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
@@ -21,6 +22,34 @@ from docie_bench.serving.runtime import (
 class DesiredState(StrEnum):
     RUNNING = "running"
     STOPPED = "stopped"
+
+
+class Activation(StrEnum):
+    """Who put a STOPPED deployment in that state (lifecycle-control metadata).
+
+    ``MANUAL``  — a user pressed Stop: stays cold, never auto-reloaded.
+    ``MANAGED`` — the autoloader evicted it for memory (PR-4): a request may
+    auto-reload it. Lives in ``deployments.json`` (NOT Postgres) by design so
+    the DB-optional routing contract survives (design doc §1, fix #5).
+    """
+
+    MANUAL = "manual"
+    MANAGED = "managed"
+
+
+def _default_create_time(pid: int) -> float | None:
+    """psutil ``create_time`` for ``pid``, or None when unknowable.
+
+    ``NoSuchProcess`` (pid already gone) and any access error map to None —
+    "cannot prove it is our process" — rather than bubbling out of a reconcile
+    (design doc fix #8).
+    """
+    try:
+        import psutil
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:  # noqa: BLE001 - NoSuchProcess/AccessDenied/etc => unknowable
+        return None
 
 
 class RestartPolicy(StrEnum):
@@ -64,6 +93,20 @@ class DeploymentRecord:
     consecutive_health_failures: int = 0
     last_error: str | None = None
     updated_at: float = field(default_factory=time.time)
+    # psutil create_time() captured at spawn: the PID-reuse guard. A later
+    # observer compares the live process's create_time against this — mismatch
+    # (or NoSuchProcess) means "not our process => dead", so a recycled pid can
+    # never keep a stale record alive (design doc §1 step 1). None => never
+    # captured (pre-PR-1 records, or psutil could not see the fresh process).
+    pid_create_time: float | None = None
+    # Lifecycle-control metadata (PR-1 adds the fields; PR-4 drives them).
+    # Persisted in deployments.json — deliberately NOT in Postgres (fix #5).
+    activation: Activation = Activation.MANUAL
+    pinned: bool = False
+    # Unix timestamp of the last request served through this deployment, folded
+    # in from the per-deployment recency sidecars by the reconciler (monotonic
+    # max — last-write-wins is correct semantics). None => never served.
+    last_served: float | None = None
     # True once a runtime process was observed to start and then exit on its own
     # (crash / bind collision) — as opposed to a launch that never spawned (a
     # missing binary raises before start). The reallocation caller uses this to
@@ -85,7 +128,19 @@ class DeploymentRecord:
 
 
 class PersistentSupervisor:
-    """Small single-node desired-state reconciler with durable JSON state."""
+    """Small single-node desired-state reconciler with durable JSON state.
+
+    Thread-safety (PR-1): every public mutator takes ``self.lock`` (a
+    reentrant thread lock). In the single-replica ``serving`` service the
+    background reconciler and the Inngest lifecycle handlers share ONE
+    supervisor instance — one ``_records`` dict, one ``deployments.json`` —
+    and interleaved read-modify-``_save()`` cycles would lose writes (design
+    doc fix #4). The reconciler additionally holds the same lock across a
+    whole observation cycle (it runs off the event loop via
+    ``asyncio.to_thread``, hence a *thread* lock, not an asyncio one).
+    ``await_ready`` deliberately locks per ``reconcile()`` call, not around
+    its whole sleep loop, so a slow model load never starves the handlers.
+    """
 
     def __init__(
         self,
@@ -94,15 +149,24 @@ class PersistentSupervisor:
         adapters: Mapping[RuntimeKind, RuntimeAdapter] | None = None,
         clock: Callable[[], float] = time.time,
         logs_dir: str | Path | None = None,
+        create_time: Callable[[int], float | None] = _default_create_time,
     ) -> None:
         self.state_path = Path(state_path)
         self.logs_dir = Path(logs_dir) if logs_dir is not None else self.state_path.parent / "logs"
         self.adapters = dict(adapters or default_runtime_adapters())
         self._clock = clock
+        self._create_time = create_time
+        self._lock = threading.RLock()
         self._records = self._load()
 
+    @property
+    def lock(self) -> threading.RLock:
+        """The lock serializing ALL supervisor mutations (see class docstring)."""
+        return self._lock
+
     def list(self) -> tuple[DeploymentRecord, ...]:
-        return tuple(replace(self._records[name]) for name in sorted(self._records))
+        with self._lock:
+            return tuple(replace(self._records[name]) for name in sorted(self._records))
 
     def get(self, name: str) -> DeploymentRecord:
         try:
@@ -110,46 +174,150 @@ class PersistentSupervisor:
         except KeyError as exc:
             raise KeyError(f"Unknown deployment {name!r}") from exc
 
+    def records(self) -> dict[str, DeploymentRecord]:
+        """The LIVE records dict — callers MUST hold ``self.lock``.
+
+        Reconciler seam: the reconciler needs the real records (not the
+        defensive copies ``list()`` returns) to read transient fields and
+        decide per-record actions, all under one lock for the whole cycle.
+        """
+        return self._records
+
     def deploy(self, spec: DeploymentSpec) -> DeploymentRecord:
-        current = self._records.get(spec.name)
-        if current is not None and current.spec.launch != spec.launch:
-            if current.pid is not None:
-                self.adapters[current.spec.launch.runtime].shutdown(current.pid)
-            current = None
-        self._records[spec.name] = DeploymentRecord(
-            spec=spec,
-            state=current.state if current else LifecycleState.STOPPED,
-            pid=current.pid if current else None,
-            endpoint=current.endpoint if current else None,
-            restart_count=current.restart_count if current else 0,
-            consecutive_health_failures=current.consecutive_health_failures if current else 0,
-            last_error=current.last_error if current else None,
-            updated_at=self._clock(),
-        )
-        self._save()
-        return self.reconcile(spec.name)
+        with self._lock:
+            current = self._records.get(spec.name)
+            if current is not None and current.spec.launch != spec.launch:
+                if current.pid is not None:
+                    self.adapters[current.spec.launch.runtime].shutdown(current.pid)
+                current = None
+            self._records[spec.name] = DeploymentRecord(
+                spec=spec,
+                state=current.state if current else LifecycleState.STOPPED,
+                pid=current.pid if current else None,
+                endpoint=current.endpoint if current else None,
+                restart_count=current.restart_count if current else 0,
+                consecutive_health_failures=(
+                    current.consecutive_health_failures if current else 0
+                ),
+                last_error=current.last_error if current else None,
+                updated_at=self._clock(),
+                pid_create_time=current.pid_create_time if current else None,
+                activation=current.activation if current else Activation.MANUAL,
+                pinned=current.pinned if current else False,
+                last_served=current.last_served if current else None,
+            )
+            self._save()
+            return self.reconcile(spec.name)
 
     def stop(self, name: str) -> DeploymentRecord:
-        record = self.get(name)
-        record.spec = replace(record.spec, desired_state=DesiredState.STOPPED)
-        return self.reconcile(name)
+        with self._lock:
+            record = self.get(name)
+            record.spec = replace(record.spec, desired_state=DesiredState.STOPPED)
+            # A user Stop is always MANUAL: it stays cold and is never
+            # auto-reloaded. The managed/evicted flavor is set by the PR-4
+            # unload path, never here.
+            record.activation = Activation.MANUAL
+            return self.reconcile(name)
 
     def remove(self, name: str) -> None:
-        record = self.get(name)
-        if record.pid is not None:
-            self.adapters[record.spec.launch.runtime].shutdown(record.pid)
-        del self._records[name]
-        self._save()
+        with self._lock:
+            record = self.get(name)
+            if record.pid is not None:
+                self.adapters[record.spec.launch.runtime].shutdown(record.pid)
+            del self._records[name]
+            self._save()
+
+    def mark_failed(
+        self, name: str, error: str | None, *, shutdown: bool = False
+    ) -> DeploymentRecord:
+        """Declare a deployment dead WITHOUT respawning it (reconciler seam).
+
+        ``reconcile()`` conflates "observe dead" with "repair by respawn"; the
+        background reconciler must be able to declare death when the restart
+        gate (budget / fit-check) says no. ``shutdown=False`` is the default
+        because the usual caller has already established the process is gone —
+        and for a PID-REUSE mismatch a shutdown would SIGTERM an unrelated
+        process. Pass ``shutdown=True`` only for a hung-but-alive process the
+        caller wants torn down (fast-death of an unresponsive READY runtime).
+        """
+        with self._lock:
+            record = self.get(name)
+            if shutdown and record.pid is not None:
+                self.adapters[record.spec.launch.runtime].shutdown(record.pid)
+            if error is None and record.pid is not None:
+                log_path = self.logs_dir / f"{record.spec.name}.log"
+                error = self._log_tail(log_path, record.log_offset) or "runtime process exited"
+            record.pid = None
+            record.pid_create_time = None
+            record.state = LifecycleState.FAILED
+            record.last_error = error or record.last_error or "runtime process exited"
+            record.updated_at = self._clock()
+            self._save()
+            return record
+
+    def observe_health(
+        self, name: str, *, healthy: bool, detail: str | None = None
+    ) -> DeploymentRecord:
+        """Record one health observation without spawn/kill side effects.
+
+        The reconciler probes health itself (so it can apply its own fast/slow
+        thresholds) and writes the outcome through this narrow seam instead of
+        ``reconcile()`` (which would re-probe AND auto-respawn). A pass makes
+        the record READY and clears the failure streak; a miss increments the
+        streak and records the reason but does NOT change ``state`` — state
+        transitions on misses are the caller's policy (fast-death via
+        ``mark_failed``), so a transient blip never flips READY off and stops
+        routing by itself.
+        """
+        with self._lock:
+            record = self.get(name)
+            if healthy:
+                record.state = LifecycleState.READY
+                record.consecutive_health_failures = 0
+                record.last_error = None
+            else:
+                record.consecutive_health_failures += 1
+                record.last_error = detail or "health check failed"
+            record.updated_at = self._clock()
+            self._save()
+            return record
+
+    def fold_recency(self, timestamps: Mapping[str, float]) -> bool:
+        """Fold per-deployment recency sidecars into ``last_served`` (max-wins).
+
+        ``last_served`` is a monotonic max-timestamp: the scaled workers stamp
+        sidecars (they must never write deployments.json — single-writer, P1)
+        and the reconciler folds them here each cycle. Returns True when
+        anything changed (and was saved).
+        """
+        with self._lock:
+            changed = False
+            for name, timestamp in timestamps.items():
+                record = self._records.get(name)
+                if record is None:
+                    continue
+                if record.last_served is None or timestamp > record.last_served:
+                    record.last_served = timestamp
+                    changed = True
+            if changed:
+                self._save()
+            return changed
 
     def reconcile_all(self) -> tuple[DeploymentRecord, ...]:
-        return tuple(self.reconcile(name) for name in sorted(self._records))
+        with self._lock:
+            return tuple(self.reconcile(name) for name in sorted(self._records))
 
     def reconcile(self, name: str) -> DeploymentRecord:
+        with self._lock:
+            return self._reconcile_locked(name)
+
+    def _reconcile_locked(self, name: str) -> DeploymentRecord:
         record = self.get(name)
         adapter = self.adapters[record.spec.launch.runtime]
         if record.spec.desired_state == DesiredState.STOPPED:
             adapter.shutdown(record.pid)
             record.pid = None
+            record.pid_create_time = None
             record.endpoint = None
             record.state = LifecycleState.STOPPED
             record.consecutive_health_failures = 0
@@ -167,6 +335,7 @@ class PersistentSupervisor:
                 # via the pre-spawn offset) instead of a bare, undiagnosable string,
                 # and flag it so the deploy caller can reallocate off a bad port.
                 record.pid = None
+                record.pid_create_time = None
                 record.state = LifecycleState.FAILED
                 record.exited_after_start = True
                 record.last_error = self._log_tail(log_path, record.log_offset) or (
@@ -196,6 +365,12 @@ class PersistentSupervisor:
                 self._save()
                 return record
             record.pid = process.pid
+            # Capture create_time AT SPAWN so later observers can prove the pid
+            # still names this process (PID-reuse guard). None when the process
+            # exited before psutil saw it, or has no pid (REMOTE).
+            record.pid_create_time = (
+                self._create_time(process.pid) if process.pid is not None else None
+            )
             record.endpoint = process.endpoint
             record.state = LifecycleState.STARTING
             record.last_error = None
@@ -221,6 +396,7 @@ class PersistentSupervisor:
                 if record.pid is not None and self._may_restart(record):
                     adapter.shutdown(record.pid)
                     record.pid = None
+                    record.pid_create_time = None
             else:
                 record.state = LifecycleState.STARTING
         record.updated_at = self._clock()
@@ -239,12 +415,15 @@ class PersistentSupervisor:
 
         The deploy path spawns the runtime and probes health ONCE immediately —
         but the model takes seconds to load, so that first probe sees
-        "Connection refused" and the record freezes at STARTING forever (there
-        is no background reconcile, and the API cannot reach the worker-local
-        endpoint). reconcile() performs the health check here in the worker,
-        where 127.0.0.1 IS reachable, so this bounded loop re-probes until the
-        process is actually serving. Returns whatever state is reached — an
-        honest final record, never a busy-wait past ``timeout_s``.
+        "Connection refused" and the record freezes at STARTING (the API
+        cannot reach a container-local endpoint, and before PR-1's reconciler
+        nothing re-probed periodically). reconcile() performs the health check
+        here in the deploying service, where the ADVERTISE endpoint
+        (``DOCIE_SERVING_ADVERTISE_HOST:port``, via ``reachable_launch``)
+        resolves back to this same single-replica container, so this bounded
+        loop re-probes until the process is actually serving. Returns whatever
+        state is reached — an honest final record, never a busy-wait past
+        ``timeout_s``.
 
         A *terminally* FAILED record (exited/never-spawned with no restarts left)
         short-circuits immediately: reconcile keeps respawning while restarts
@@ -342,6 +521,7 @@ class PersistentSupervisor:
 def _record_to_dict(record: DeploymentRecord) -> dict[str, Any]:
     value = asdict(record)
     value["state"] = record.state.value
+    value["activation"] = record.activation.value
     value["spec"]["desired_state"] = record.spec.desired_state.value
     value["spec"]["restart_policy"] = record.spec.restart_policy.value
     value["spec"]["launch"]["runtime"] = record.spec.launch.runtime.value
@@ -368,6 +548,8 @@ def _record_from_dict(value: dict[str, Any]) -> DeploymentRecord:
         restart_policy=RestartPolicy(spec_value.pop("restart_policy")),
         **spec_value,
     )
+    raw_create_time = value.get("pid_create_time")
+    raw_last_served = value.get("last_served")
     return DeploymentRecord(
         spec=spec,
         state=LifecycleState(value["state"]),
@@ -377,4 +559,9 @@ def _record_from_dict(value: dict[str, Any]) -> DeploymentRecord:
         consecutive_health_failures=int(value.get("consecutive_health_failures", 0)),
         last_error=value.get("last_error"),
         updated_at=float(value.get("updated_at", 0)),
+        # New PR-1 fields default safely for records written by older code.
+        pid_create_time=float(raw_create_time) if raw_create_time is not None else None,
+        activation=Activation(value.get("activation", Activation.MANUAL.value)),
+        pinned=bool(value.get("pinned", False)),
+        last_served=float(raw_last_served) if raw_last_served is not None else None,
     )

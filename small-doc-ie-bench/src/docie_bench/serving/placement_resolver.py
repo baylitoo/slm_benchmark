@@ -116,6 +116,14 @@ def resolve_store_profile(name: str, *, catalog: ModelCatalog | None = None) -> 
             f"store model {name!r} placement is {state!r}, not ready — "
             f"wait for the deploy to finish or redeploy."
         )
+    # PR-1 contract: a non-live row stores endpoint "" (the column is NOT
+    # NULL), and EVERY reader must treat "" as "no live endpoint" — never
+    # route into it, whatever the state column momentarily says.
+    if not str(placement.get("endpoint") or "").strip():
+        raise PlacementNotReadyError(
+            f"store model {name!r} placement advertises no live endpoint — "
+            f"wait for the deploy/reload to finish or redeploy."
+        )
     contract = FAMILIES.get(str(entry.get("family") or ""))
     engine = str(placement.get("engine") or "")
     return ModelProfile(
