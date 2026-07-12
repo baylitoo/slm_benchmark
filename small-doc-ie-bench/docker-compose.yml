@@ -103,13 +103,19 @@ services:
   # belt-and-suspenders. No published `ports:` — that would expose the unauth
   # runtime on 0.0.0.0.
   #
-  # PR-2 note: set an explicit mem_limit here so cgroup-v2 numbers become the
-  # authoritative sizing denominator (Docker Desktop's VM total is elastic).
+  # Memory (PR-2): the explicit mem_limit makes cgroup-v2 numbers
+  # (memory.max/memory.current) the AUTHORITATIVE sizing denominator for the
+  # resource tracker — without it memory.max reads the "max" sentinel and the
+  # tracker degrades to the elastic Docker Desktop/WSL2 VM view (published
+  # with source=vm and badged as soft). Size DOCIE_SERVING_MEM_LIMIT to the
+  # RAM you actually grant the GGUF runtimes (weights + KV cache + ~0.5 GB
+  # slab per deployment).
   serving:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
+    mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-16g}
     environment:
       # Registers ONLY the lifecycle functions (deploy/seed/delete) under the
       # dedicated docie-serving Inngest app + runs the reconciler, so a

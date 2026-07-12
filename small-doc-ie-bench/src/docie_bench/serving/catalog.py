@@ -25,6 +25,7 @@ from sqlalchemy import (
     Float,
     Integer,
     String,
+    Table,
     Text,
     select,
 )
@@ -32,6 +33,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Mapped, Session, mapped_column
+from sqlalchemy.schema import CreateTable
 from sqlalchemy.types import TypeEngine
 
 from docie_bench.serving.model_store import FAMILIES, StoreEntry
@@ -119,6 +121,65 @@ class ModelPlacement(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+# Fixed primary key of the ONE serving_node row (single-node topology, P1).
+SERVING_NODE_ROW_ID = "node"
+
+
+class ServingNode(Base):
+    """Single-row node resource snapshot (PR-2, design doc §1 "Resources").
+
+    Written ONLY by the serving-service reconciler each cycle (measured inside
+    the serving container — the one whose cgroup actually bounds the
+    runtimes); read by the api's ``/v1/serving/resources`` and later the
+    sizing engine. Exactly one row (fixed PK ``SERVING_NODE_ROW_ID``): the
+    control plane is single-node by design, and the publish is an upsert of
+    that row, never an append. ``source`` says whether the numbers came from
+    an authoritative cgroup-v2 limit (``cgroup``) or the soft VM fallback
+    (``vm``) so the UI can badge soft measurements honestly.
+    """
+
+    __tablename__ = "serving_node"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=SERVING_NODE_ROW_ID)
+    total_bytes: Mapped[int] = mapped_column(BigInteger)
+    free_bytes: Mapped[int] = mapped_column(BigInteger)
+    source: Mapped[str] = mapped_column(String(16))  # "cgroup" | "vm"
+    sum_rss_bytes: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+# Arbitrary-but-stable advisory-lock key for the serving_node table creation
+# ("docie placement v2"). Distinct from the placement-columns key so the two
+# migrations never serialize against each other needlessly.
+_SERVING_NODE_LOCK_KEY = 0x0D0C1E02
+
+
+def ensure_serving_node_table(engine: Engine) -> bool:
+    """Race-safe forward migration: create ``serving_node`` if missing (PR-2).
+
+    Mirrors the PR-1 observed-columns pattern: ``create_all`` DOES create new
+    tables, but concurrently starting processes (api, serving, N workers) each
+    run inspect-then-CREATE and can race each other into a duplicate-table
+    abort. Here the DDL is ``CREATE TABLE IF NOT EXISTS`` (supported by both
+    PostgreSQL and the sqlite used in tests), taken under
+    ``pg_advisory_xact_lock`` on PostgreSQL so concurrent migrators serialize
+    and a raced CREATE degrades to a no-op. Returns True when this call
+    created the table.
+    """
+    inspector = sa_inspect(engine)
+    existed = inspector.has_table("serving_node")
+    node_table = ServingNode.__table__
+    assert isinstance(node_table, Table)  # narrow FromClause for the compiler
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _SERVING_NODE_LOCK_KEY},
+            )
+        connection.execute(CreateTable(node_table, if_not_exists=True))
+    return not existed
 
 
 # The observed columns added by PR-1 (see ModelPlacement docstring). Kept as a
@@ -239,6 +300,16 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "last_probe_at": row.last_probe_at.isoformat() if row.last_probe_at else None,
         "last_error": row.last_error,
         "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _node_view(row: ServingNode) -> dict[str, Any]:
+    return {
+        "total_bytes": row.total_bytes,
+        "free_bytes": row.free_bytes,
+        "source": row.source,
+        "sum_rss_bytes": row.sum_rss_bytes,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
 
@@ -422,6 +493,45 @@ class ModelCatalog:
             session.flush()
             return _placement_view(row)
 
+    # ----------------------------------------------------------- node snapshot
+    def publish_node_snapshot(
+        self,
+        *,
+        total_bytes: int,
+        free_bytes: int,
+        source: str,
+        sum_rss_bytes: int,
+    ) -> dict[str, Any]:
+        """Upsert THE ``serving_node`` row (the reconciler is the sole caller).
+
+        Single-row semantics: always the fixed ``SERVING_NODE_ROW_ID`` key, so
+        repeated publishes UPDATE in place and the table never grows.
+        ``updated_at`` is stamped explicitly (not left to ``onupdate``) so an
+        unchanged reading still proves the reconciler is alive.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ServingNode, SERVING_NODE_ROW_ID)
+            if row is None:
+                row = ServingNode(id=SERVING_NODE_ROW_ID)
+                session.add(row)
+            row.total_bytes = total_bytes
+            row.free_bytes = free_bytes
+            row.source = source
+            row.sum_rss_bytes = sum_rss_bytes
+            row.updated_at = _utcnow()
+            session.flush()
+            return _node_view(row)
+
+    def get_node_snapshot(self) -> dict[str, Any] | None:
+        """The published node snapshot, or None when never published."""
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ServingNode, SERVING_NODE_ROW_ID)
+            return _node_view(row) if row is not None else None
+
     def mark_placement_stopped(self, name: str, *, phase: str = "cold") -> bool:
         """UPDATE a stopped deployment's row instead of deleting it (fix #3).
 
@@ -496,6 +606,9 @@ __all__ = [
     "ModelPlacement",
     "ModelCatalog",
     "CatalogUnavailableError",
+    "SERVING_NODE_ROW_ID",
+    "ServingNode",
     "available_backends",
     "ensure_placement_observed_columns",
+    "ensure_serving_node_table",
 ]

@@ -157,9 +157,19 @@ def init_engine(database_url: str | None = None) -> None:
     # UndefinedColumn (the documented size_bytes hazard, handled explicitly for
     # the placement table instead of trusted to create_all). No-op on fresh
     # databases (create_all then creates the table complete).
-    from docie_bench.serving.catalog import ensure_placement_observed_columns
+    from docie_bench.serving.catalog import (
+        ensure_placement_observed_columns,
+        ensure_serving_node_table,
+    )
 
     ensure_placement_observed_columns(_engine)
+    # serving_node is a NEW table, which create_all would create — but the
+    # api, serving service, and N workers all run init_engine concurrently at
+    # stack-up, and create_all's inspect-then-CREATE can race into a
+    # duplicate-table abort. The explicit CREATE TABLE IF NOT EXISTS (advisory
+    # lock on PostgreSQL) makes the creation race-safe (PR-2, mirroring the
+    # PR-1 observed-columns pattern above).
+    ensure_serving_node_table(_engine)
     Base.metadata.create_all(bind=_engine)
 
 

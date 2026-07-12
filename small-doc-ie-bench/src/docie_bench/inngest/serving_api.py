@@ -96,6 +96,56 @@ async def list_deployments() -> Any:
     return records
 
 
+@router.get("/resources")
+async def serving_resources() -> dict[str, Any]:
+    """Node RAM snapshot + per-deployment RSS (PR-2, read-only observed surface).
+
+    Serves the single ``serving_node`` row the in-``serving`` reconciler
+    publishes every cycle — measured inside the serving container
+    (cgroup-v2-first; ``source: "cgroup" | "vm"`` flags a soft VM fallback so
+    the UI can badge it). The api NEVER measures here: a psutil call in this
+    process would describe the api container's cgroup, not the serving node's
+    (design doc §2).
+
+    Honest degradation: ``observed_available: false`` + a ``detail`` reason
+    when the database is unreachable OR the reconciler has never published a
+    snapshot — never a stale or locally-measured number. Auth matches the
+    sibling serving reads (unauthenticated ops view; mutations stay evented).
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    node: dict[str, Any] | None = None
+    deployments: list[dict[str, Any]] = []
+    detail: str | None = None
+    try:
+        catalog = ModelCatalog()
+        node = catalog.get_node_snapshot()
+        if node is None:
+            detail = (
+                "no node snapshot published yet — is the serving service's "
+                "reconciler running?"
+            )
+        deployments = [
+            {
+                "name": placement["name"],
+                "rss_bytes": placement["rss_bytes"],
+                "phase": placement["phase"],
+            }
+            for placement in catalog.list_placements()
+        ]
+    except CatalogUnavailableError:
+        detail = "observed state unavailable: DATABASE_URL is not configured"
+    except Exception:  # noqa: BLE001 - a DB hiccup must not 500 the Board
+        detail = "observed state unavailable: database error"
+    return {
+        "observed_available": node is not None,
+        "source": node["source"] if node is not None else None,
+        "node": node,
+        "deployments": deployments,
+        "detail": detail,
+    }
+
+
 @router.get("/ports")
 async def serving_ports() -> dict[str, Any]:
     """Record-derived view of the serving port window for the Deploy admin table.
