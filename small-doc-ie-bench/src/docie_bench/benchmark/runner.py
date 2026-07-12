@@ -47,6 +47,7 @@ from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_profiles import ModelProfile, load_judge_profile, load_model_profiles
 from docie_bench.ocr.factory import get_ocr_backend
 from docie_bench.ocr.service import processor_from_settings
+from docie_bench.serving import recency
 from docie_bench.settings import get_settings
 
 try:
@@ -398,6 +399,17 @@ async def run_benchmark(
                 else:
                     service = ExtractionService(profile)
                     response = await service.extract_from_file(**extract_kwargs)
+                # PR-4 recency (review fix): a benchmark drives sustained load
+                # through a deployment — that IS served traffic, so stamp the
+                # recency sidecar or a >15min run's deployment reads as idle
+                # forever and gets idle-TTL-unloaded mid-benchmark. Best-effort
+                # no-op for plain models.yaml profiles (not deployments); under
+                # routing the response's own model_profile names the stage
+                # profile that actually served.
+                recency.stamp_served_profile(
+                    getattr(response, "model_profile", None)
+                    or (None if routing_active else profile.name)
+                )
                 row = {
                     "task_id": task.task_id,
                     "task_state": "completed",

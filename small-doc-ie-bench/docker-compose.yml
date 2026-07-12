@@ -32,6 +32,18 @@ services:
   # Self-hosted Inngest server: dashboard + event API (8288) and the Connect
   # WebSocket gateway (8289). Reuses the project Postgres (separate `inngest` DB,
   # created by infra/postgres/init.sql) and a dedicated Redis for run state.
+  #
+  # Step-budget contract (PR-4 review fix): this server's per-step execution /
+  # Connect lease ceiling is NOT pinned here (the OSS binary exposes no
+  # documented knob for it), so no worker-side step is allowed to DEPEND on
+  # it. The worker awaits cold model loads in bounded ~60s chunks
+  # (_AUTOLOAD_STEP_BUDGET_S, inngest/functions.py) even though the total
+  # size-aware budget can reach 1800s, and the serving-side `load` step is
+  # idempotent-convergent under the per-deployment load lock: an attempt
+  # killed at any server limit leaves the load running in-process, and the
+  # retry blocks on the lock then no-ops once the spawn completes (see
+  # load_deployment_job). Raising server limits is an optimization, never a
+  # correctness requirement.
   inngest:
     image: inngest/inngest
     command: ["inngest", "start"]

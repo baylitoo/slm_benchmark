@@ -625,7 +625,14 @@ def test_role_partition_is_disjoint_and_complete() -> None:
 
     serving_ids = ids(fn.serving_functions)
     worker_ids = ids(fn.worker_functions)
-    assert serving_ids == {"serving-deploy", "serving-seed-ollama", "serving-delete"}
+    assert serving_ids == {
+        "serving-deploy",
+        "serving-seed-ollama",
+        "serving-delete",
+        "serving-load",
+        "serving-unload",
+        "serving-pin",
+    }
     assert worker_ids == {"doc-extract", "benchmark-run", "studio-runs-gc"}
     assert serving_ids.isdisjoint(worker_ids)
     assert ids(fn.functions) == serving_ids | worker_ids

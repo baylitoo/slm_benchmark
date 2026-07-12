@@ -13,6 +13,10 @@ import {
   ChevronRight,
   AlertCircle,
   PackagePlus,
+  Pin,
+  PinOff,
+  Play,
+  Square,
   X,
 } from "lucide-react";
 import {
@@ -22,6 +26,9 @@ import {
   getPorts,
   deployModel,
   seedOllama,
+  loadDeployment,
+  unloadDeployment,
+  pinDeployment,
   formatBytes,
   ApiError,
   ApiUnavailable,
@@ -231,16 +238,126 @@ function stateTone(state?: string | null): BadgeTone {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle phase (PR-4) — reconciler-observed when available, else derived
+// from the record's own lifecycle state + activation.
+// ---------------------------------------------------------------------------
+
+function derivePhase(r: DeploymentRecord): string {
+  const observed = r.observed?.phase;
+  if (observed) return observed;
+  switch ((r.state ?? "").toLowerCase()) {
+    case "ready":
+      return "hot";
+    case "starting":
+    case "degraded":
+      return "loading";
+    case "failed":
+      return "failed";
+    case "stopped":
+      return r.activation === "managed" ? "evicted" : "cold";
+    default:
+      return "unknown";
+  }
+}
+
+const PHASE_STYLES: Record<string, { dot: string; text: string; pulse?: boolean }> = {
+  hot: {
+    dot: "bg-emerald-500",
+    text: "text-emerald-600 dark:text-emerald-400",
+    pulse: true,
+  },
+  loading: {
+    dot: "bg-amber-500",
+    text: "text-amber-600 dark:text-amber-400",
+    pulse: true,
+  },
+  cold: { dot: "bg-slate-400", text: "text-muted-foreground" },
+  evicted: { dot: "bg-sky-400", text: "text-sky-600 dark:text-sky-400" },
+  failed: { dot: "bg-rose-500", text: "text-rose-600 dark:text-rose-400" },
+  unknown: { dot: "bg-slate-300", text: "text-muted-foreground" },
+};
+
+/** Phase chip with a live dot (pulsing while hot/loading) + pin marker. */
+function PhaseChip({ record }: { record: DeploymentRecord }) {
+  const phase = derivePhase(record);
+  const style = PHASE_STYLES[phase] ?? PHASE_STYLES.unknown;
+  const hint = [
+    record.pinned ? "pinned — never evicted" : null,
+    record.observed?.last_error ? `error: ${record.observed.last_error}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <span
+      className={cn("inline-flex items-center gap-1.5 text-xs font-medium", style.text)}
+      title={hint || phase}
+    >
+      <span className="relative flex h-2 w-2">
+        {style.pulse && (
+          <span
+            className={cn(
+              "absolute inline-flex h-full w-full animate-ping rounded-full opacity-60",
+              style.dot,
+            )}
+          />
+        )}
+        <span className={cn("relative inline-flex h-2 w-2 rounded-full", style.dot)} />
+      </span>
+      {phase}
+      {record.pinned && <Pin className="h-3 w-3" />}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Deployments view — explicit-column table over DeploymentRecord[].
 // ---------------------------------------------------------------------------
+
+type LifecycleAction = "load" | "unload" | "pin" | "unpin";
 
 function DeploymentsView({
   deployments,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
 }) {
+  const { toast } = useToast();
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
+  // One in-flight lifecycle action at a time, keyed "name:action" so exactly
+  // the pressed button shows its spinner.
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function act(name: string, action: LifecycleAction) {
+    setBusy(`${name}:${action}`);
+    try {
+      if (action === "load") await loadDeployment(name);
+      else if (action === "unload") await unloadDeployment(name);
+      else await pinDeployment(name, action === "pin");
+      toast({
+        title:
+          action === "load"
+            ? "Load requested"
+            : action === "unload"
+              ? "Unload requested"
+              : action === "pin"
+                ? "Pinned"
+                : "Unpinned",
+        description: name,
+        tone: "success",
+      });
+      deployments.refresh();
+    } catch (err) {
+      const msg =
+        err instanceof ApiUnavailable
+          ? "The lifecycle endpoints aren't available yet on this backend."
+          : err instanceof Error
+            ? err.message
+            : `${action} failed.`;
+      toast({ title: `${action} failed`, description: msg, tone: "error" });
+    } finally {
+      setBusy(null);
+    }
+  }
 
   const all = deployments.data ?? [];
   const total = all.length;
@@ -316,6 +433,25 @@ function DeploymentsView({
       ),
     },
     {
+      key: "phase",
+      header: "Phase",
+      sortAccessor: (r) => derivePhase(r),
+      render: (r) => <PhaseChip record={r} />,
+    },
+    {
+      key: "rss",
+      header: "RSS",
+      sortAccessor: (r) => r.observed?.rss_bytes ?? 0,
+      render: (r) =>
+        r.observed?.rss_bytes ? (
+          <span className="font-mono tabular-nums text-xs">
+            {formatBytes(r.observed.rss_bytes)}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+    {
       key: "endpoint",
       header: "Endpoint",
       className: "max-w-[18rem]",
@@ -327,6 +463,63 @@ function DeploymentsView({
         ) : (
           <span className="text-muted-foreground">—</span>
         ),
+    },
+    {
+      key: "actions",
+      header: "",
+      className: "text-right",
+      render: (r) => {
+        const name = r.spec?.name;
+        if (!name) return null;
+        const phase = derivePhase(r);
+        const running = phase === "hot" || phase === "loading";
+        return (
+          <div
+            className="flex items-center justify-end gap-1"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {running ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={busy === `${name}:unload`}
+                disabled={busy !== null}
+                title="Unload: free the RAM, keep the record + port (auto-reloads on the next request)"
+                onClick={() => act(name, "unload")}
+              >
+                <Square className="h-3.5 w-3.5" />
+                Unload
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={busy === `${name}:load`}
+                disabled={busy !== null}
+                title="Load: spawn the runtime and wait until it serves"
+                onClick={() => act(name, "load")}
+              >
+                <Play className="h-3.5 w-3.5" />
+                Load
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={busy === `${name}:pin` || busy === `${name}:unpin`}
+              disabled={busy !== null}
+              title={
+                r.pinned
+                  ? "Unpin: allow idle unload / eviction again"
+                  : "Pin: never idle-unloaded or evicted"
+              }
+              onClick={() => act(name, r.pinned ? "unpin" : "pin")}
+            >
+              {r.pinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
+            </Button>
+          </div>
+        );
+      },
     },
   ];
 

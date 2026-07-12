@@ -6,6 +6,7 @@ import {
   triggerExtract,
   getDeployments,
   selectableDeployments,
+  isLiveDeployment,
   fileToBase64,
   ApiError,
   ApiUnavailable,
@@ -38,29 +39,32 @@ export function Playground({ active = true }: { active?: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
 
-  // Live deployments, sourced from the same endpoint the Deploy tab uses
-  // (GET /v1/serving/deployments). Polling is paused while the tab is hidden.
+  // Routable deployments, sourced from the same endpoint the Deploy tab uses
+  // (GET /v1/serving/deployments): live ones PLUS evicted `managed` ones — a
+  // request to an evicted deployment auto-reloads it (PR-4 cold-start-on-
+  // demand), so it must stay selectable here or the flagship flow would be
+  // unreachable from the UI. Polling is paused while the tab is hidden.
   const deployments = usePolling<DeploymentRecord[]>(getDeployments, DEPLOY_POLL_MS, active);
-  const ready = useMemo(
+  const selectable = useMemo(
     () => selectableDeployments(deployments.data ?? []),
     [deployments.data],
   );
-  const readyNames = useMemo(
-    () => ready.map((d) => d.spec?.name ?? "").filter(Boolean),
-    [ready],
+  const selectableNames = useMemo(
+    () => selectable.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [selectable],
   );
 
-  // Pre-select the first ready deployment so an explicit `deployment` is always
-  // sent when one exists; resync if the current pick disappears from the list.
+  // Pre-select the first selectable deployment so an explicit `deployment` is
+  // always sent when one exists; resync if the current pick disappears.
   useEffect(() => {
-    if (readyNames.length === 0) {
+    if (selectableNames.length === 0) {
       if (selectedDeployment !== "") setSelectedDeployment("");
       return;
     }
-    if (!readyNames.includes(selectedDeployment)) {
-      setSelectedDeployment(readyNames[0]);
+    if (!selectableNames.includes(selectedDeployment)) {
+      setSelectedDeployment(selectableNames[0]);
     }
-  }, [readyNames, selectedDeployment]);
+  }, [selectableNames, selectedDeployment]);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -181,10 +185,13 @@ export function Playground({ active = true }: { active?: boolean }) {
                 placeholder="invoice"
               />
             </Field>
-            <Field label="Deployment" hint="Live runtime to route this extraction to.">
+            <Field
+              label="Deployment"
+              hint="Runtime to route this extraction to. Evicted deployments reload on request (first request waits for the model load)."
+            >
               <DeploymentSelect
                 deployments={deployments}
-                ready={ready}
+                selectable={selectable}
                 value={selectedDeployment}
                 onChange={setSelectedDeployment}
               />
@@ -239,18 +246,19 @@ export function Playground({ active = true }: { active?: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
-// Deployment selector — a dropdown of live (ready) deployments. Falls back to
-// clear, non-crashing states for loading / unavailable / empty.
+// Deployment selector — a dropdown of routable deployments: live ones plus
+// evicted/loading `managed` ones (a request auto-reloads those; PR-4). Falls
+// back to clear, non-crashing states for loading / unavailable / empty.
 // ---------------------------------------------------------------------------
 
 function DeploymentSelect({
   deployments,
-  ready,
+  selectable,
   value,
   onChange,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
-  ready: DeploymentRecord[];
+  selectable: DeploymentRecord[];
   value: string;
   onChange: (name: string) => void;
 }) {
@@ -276,24 +284,29 @@ function DeploymentSelect({
     );
   }
 
-  if (ready.length === 0) {
+  if (selectable.length === 0) {
     return (
       <p className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        No live deployments — deploy one in the Deploy tab. The server default
-        will be used.
+        No routable deployments — deploy one in the Deploy tab. The server
+        default will be used.
       </p>
     );
   }
 
   return (
     <Select value={value} onChange={(e) => onChange(e.target.value)}>
-      {ready.map((d) => {
+      {selectable.map((d) => {
         const name = d.spec?.name ?? "";
         const model = d.spec?.launch?.model ?? "?";
         const runtime = d.spec?.launch?.runtime ?? "?";
+        const suffix = isLiveDeployment(d)
+          ? ""
+          : d.state === "stopped"
+            ? " · evicted — loads on request"
+            : " · loading";
         return (
           <option key={name} value={name}>
-            {`${name} · ${model} (${runtime})`}
+            {`${name} · ${model} (${runtime})${suffix}`}
           </option>
         );
       })}

@@ -60,17 +60,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from docie_bench.serving import recency
+from docie_bench.serving.lifecycle import assess_fit
 from docie_bench.serving.resources import (
     FootprintStore,
     NodeSnapshot,
     ResourceTracker,
-    footprint_bytes,
-    predicted_footprint_for_model,
     process_rss,
     publish_snapshot_via_catalog,
     read_node_memory,
 )
-from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
+from docie_bench.serving.runtime import LifecycleState, RuntimeKind
 from docie_bench.serving.supervisor import (
     Activation,
     DeploymentRecord,
@@ -192,31 +191,6 @@ class ObservedDeployment:
     model: str = ""
 
 
-def _mmproj_bytes_from_launch(launch: RuntimeLaunchSpec) -> int:
-    """Size of the vision projector a launch will load (0 when none/unreadable).
-
-    ``needs_mmproj`` families launch with ``--mmproj <path>`` in
-    ``extra_args`` (wired by ``ModelStore.family_launch_args``); llama-server
-    loads that projector fully resident, so the fit gate must price it —
-    ``predicted_footprint_for_model`` already takes ``mmproj_bytes``, this
-    recovers the number from the record. Unreadable/missing degrades to 0
-    (fail-open, like every other unknowable in the gate).
-    """
-    arguments = list(launch.extra_args)
-    for index, argument in enumerate(arguments):
-        path: str | None = None
-        if argument == "--mmproj" and index + 1 < len(arguments):
-            path = arguments[index + 1]
-        elif argument.startswith("--mmproj="):
-            path = argument.partition("=")[2]
-        if path:
-            try:
-                return Path(path).stat().st_size
-            except OSError:
-                return 0
-    return 0
-
-
 def default_fit_check(
     record: DeploymentRecord,
     *,
@@ -252,39 +226,20 @@ def default_fit_check(
     ``FootprintStore`` on the serving volume is consulted, so calibration is
     never silently ignored. ``margin_fraction=None`` reads the settings knob;
     pass an explicit fraction to override (tests, custom gates).
-    """
-    from docie_bench.serving.sizing import safety_margin_bytes
-    from docie_bench.settings import get_settings
 
-    launch = record.spec.launch
-    predicted = predicted_footprint_for_model(
-        size_bytes=None,
-        model_path=launch.model,
-        context_length=launch.context_length,
-        mmproj_bytes=_mmproj_bytes_from_launch(launch),
+    PR-4 factored the shared policy into ``lifecycle.assess_fit`` so the
+    load-on-demand path and this restart gate can never drift apart; this
+    wrapper keeps the reconciler's ``(fits, reason)`` seam unchanged.
+    """
+    decision = assess_fit(
+        record,
+        footprints=tracker.footprints if tracker is not None else None,
+        margin_fraction=margin_fraction,
+        # Module-global on purpose: tests monkeypatch THIS module's
+        # read_node_memory to script node RAM, and the delegation must honor it.
+        memory_reader=read_node_memory,
     )
-    if predicted is None:
-        return True, ""
-    footprints = tracker.footprints if tracker is not None else FootprintStore()
-    needed = footprint_bytes(predicted, footprints.get(launch.model))
-    try:
-        memory = read_node_memory()
-    except Exception:  # noqa: BLE001 - unmeasurable => fail-open
-        return True, ""
-    fraction = (
-        margin_fraction
-        if margin_fraction is not None
-        else get_settings().serving_sizing_margin_fraction
-    )
-    margin = safety_margin_bytes(memory.total_bytes, fraction)
-    if memory.free_bytes - margin < needed:
-        return False, (
-            f"needs ~{needed} bytes (max of calibrated steady-state RSS and "
-            f"predicted weights + kv-cache + overhead + mmproj) "
-            f"but only {memory.free_bytes} free minus the {margin}-byte safety "
-            f"margin leaves {memory.free_bytes - margin} available"
-        )
-    return True, ""
+    return decision.fits, decision.reason
 
 
 def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
@@ -332,6 +287,9 @@ class ServingReconciler:
         lease: ReconcilerLease | None = None,
         tracker: ResourceTracker | None = None,
         snapshot_publisher: Callable[[NodeSnapshot], None] = publish_snapshot_via_catalog,
+        idle_ttl_s: float = 0.0,
+        min_hot_s: float = 0.0,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -339,10 +297,22 @@ class ServingReconciler:
             raise ValueError("ready_miss_threshold must be positive")
         if healthy_reset_threshold < 1:
             raise ValueError("healthy_reset_threshold must be positive")
+        if idle_ttl_s < 0:
+            raise ValueError("idle_ttl_s must be non-negative (0 disables idle unload)")
+        if min_hot_s < 0:
+            raise ValueError("min_hot_s must be non-negative")
         self.supervisor = supervisor
         self.interval_s = interval_s
         self.ready_miss_threshold = ready_miss_threshold
         self.healthy_reset_threshold = healthy_reset_threshold
+        # PR-4 idle-TTL unload: a hot, unpinned deployment idle for longer than
+        # idle_ttl_s is unloaded (record + port KEPT, activation=managed =>
+        # phase=evicted, auto-reloadable). 0 disables. min_hot_s guards a
+        # just-loaded deployment from immediate re-eviction; the clock is
+        # injectable so tests can script time.
+        self.idle_ttl_s = idle_ttl_s
+        self.min_hot_s = min_hot_s
+        self._clock = clock
         self._rss_reader = rss_reader
         self._create_time = create_time
         self._publisher = publisher
@@ -496,6 +466,16 @@ class ServingReconciler:
         )
         if health.healthy:
             record = self.supervisor.observe_health(name, healthy=True)
+            if self._idle_unload_due(record):
+                logger.info(
+                    "deployment %s idle for > %.0fs: unloading (record + port kept, "
+                    "activation=managed => auto-reloadable)",
+                    name,
+                    self.idle_ttl_s,
+                )
+                record = self.supervisor.unload(name)
+                self._forget(name)
+                return self._observation(name, record, phase="evicted", health_ok=False)
             self._was_ready.add(name)
             self._misses[name] = 0
             record = self._credit_healthy_cycle(name, record)
@@ -568,6 +548,30 @@ class ServingReconciler:
         )
 
     # -------------------------------------------------------------- plumbing
+    def _idle_unload_due(self, record: DeploymentRecord) -> bool:
+        """True when a healthy deployment crossed the idle TTL (PR-4, §4).
+
+        Guards, in order: the feature is on (``idle_ttl_s > 0``); the
+        deployment is not pinned (pinned = never evicted, idle included); the
+        min-hot-time has elapsed since the last spawn (a just-loaded model is
+        never immediately re-evicted); and the freshest recency signal —
+        ``max(last_served, loaded_at)``, the sidecar fold having already run
+        this cycle — is older than the TTL. A record with NEITHER stamp (a
+        pre-PR-4 deployment that never respawned) is left alone: with no
+        honest age there is no honest idle verdict.
+        """
+        if self.idle_ttl_s <= 0 or record.pinned:
+            return False
+        now = self._clock()
+        if record.loaded_at is not None and now - record.loaded_at < self.min_hot_s:
+            return False
+        stamps = [
+            stamp for stamp in (record.last_served, record.loaded_at) if stamp is not None
+        ]
+        if not stamps:
+            return False
+        return now - max(stamps) > self.idle_ttl_s
+
     def _was_previously_ready(self, name: str, record: DeploymentRecord) -> bool:
         """Was this deployment ever READY? Survives a serving-service restart.
 

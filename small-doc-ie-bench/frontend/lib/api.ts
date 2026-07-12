@@ -119,6 +119,17 @@ export interface RuntimeCapability {
   [k: string]: unknown;
 }
 
+/** The reconciler's per-cycle observed overlay on a deployment (PR-1/PR-4). */
+export interface ObservedPlacement {
+  phase?: string | null; // hot | loading | cold | evicted | failed
+  rss_bytes?: number | null;
+  health_ok?: boolean | null;
+  endpoint?: string | null;
+  last_error?: string | null;
+  last_probe_at?: string | null;
+  [k: string]: unknown;
+}
+
 /** A deployment record (GET /v1/serving/deployments). */
 export interface DeploymentRecord {
   spec?: {
@@ -141,6 +152,24 @@ export interface DeploymentRecord {
   restart_count?: number;
   last_error?: string | null;
   updated_at?: number;
+  /** Lifecycle-control metadata (PR-4): who stopped it — "manual" stays cold,
+   * "managed" (evicted) auto-reloads on the next request. */
+  activation?: string;
+  /** Pinned deployments are never chosen for idle unload / eviction. */
+  pinned?: boolean;
+  last_served?: number | null;
+  /** Reconciler-published observed state; null until first published,
+   * observed_available=false when the database is unreachable. */
+  observed?: ObservedPlacement | null;
+  observed_available?: boolean;
+  [k: string]: unknown;
+}
+
+/** Response of the lifecycle action endpoints (load/unload/pin/delete). */
+export interface LifecycleActionResponse {
+  event_ids: string[];
+  channel: string;
+  name: string;
   [k: string]: unknown;
 }
 
@@ -435,6 +464,46 @@ export function deployModel(payload: DeployRequest): Promise<TriggerResponse> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Deployment lifecycle actions (PR-4). Each fires a serving/* event at the
+// single-replica serving service and returns the event ids to poll.
+// ---------------------------------------------------------------------------
+
+/** Cold-start a deployment (idempotent server-side; may evict LRU victims). */
+export function loadDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/load`,
+    { method: "POST" },
+  );
+}
+
+/** Evict a deployment: process killed, record + port + row kept (phase=evicted). */
+export function unloadDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/unload`,
+    { method: "POST" },
+  );
+}
+
+/** Set/clear the eviction shield. */
+export function pinDeployment(
+  name: string,
+  pinned: boolean,
+): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/pin`,
+    { method: "POST", body: JSON.stringify({ pinned }) },
+  );
+}
+
+/** Real teardown: kills the process, frees the port, deletes the row. */
+export function deleteDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+}
+
 /** Benchmark returns the same trigger shape as extract. */
 export function triggerBenchmark(payload: BenchmarkRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/benchmark", {
@@ -500,14 +569,35 @@ export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse>
 // ---------------------------------------------------------------------------
 
 /**
- * Deployments that can actually serve an extraction: lifecycle `ready` AND a
- * concrete `endpoint` AND a `spec.name` (the token the backend resolver keys
- * on). starting/degraded/failed/stopped are excluded. Mirrors the resolver's
- * "live/selectable" definition (PR-a).
+ * A deployment that is live RIGHT NOW: lifecycle `ready` AND a concrete
+ * `endpoint`. Mirrors the backend resolver's `_is_live` gate.
+ */
+export function isLiveDeployment(r: DeploymentRecord): boolean {
+  return r.state === "ready" && !!r.endpoint;
+}
+
+/**
+ * A deployment a request would AUTO-RELOAD (PR-4 cold-start-on-demand):
+ * evicted by the autoloader (`activation === "managed"`) or with a load
+ * already in flight (`desired_state === "running"`, still starting). Mirrors
+ * the worker's `_autoload_target` gate. Manually stopped deployments stay
+ * cold and are deliberately NOT selectable.
+ */
+export function isAutoReloadable(r: DeploymentRecord): boolean {
+  if (isLiveDeployment(r)) return false;
+  return r.activation === "managed" || r.spec?.desired_state === "running";
+}
+
+/**
+ * Deployments the Playground may route an extraction to: live ones, PLUS
+ * evicted/loading `managed` ones — sending a request to those triggers the
+ * worker's autoload (TTFT = model load time, by design). Requires a
+ * `spec.name` (the token the backend resolver keys on). Manually stopped /
+ * terminally failed deployments are excluded.
  */
 export function selectableDeployments(records: DeploymentRecord[]): DeploymentRecord[] {
   return records.filter(
-    (r) => r.state === "ready" && !!r.endpoint && !!r.spec?.name,
+    (r) => !!r.spec?.name && (isLiveDeployment(r) || isAutoReloadable(r)),
   );
 }
 

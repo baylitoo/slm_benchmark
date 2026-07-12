@@ -107,6 +107,12 @@ class DeploymentRecord:
     # in from the per-deployment recency sidecars by the reconciler (monotonic
     # max — last-write-wins is correct semantics). None => never served.
     last_served: float | None = None
+    # Unix timestamp of the most recent process SPAWN (PR-4). The min-hot-time
+    # guard for idle unload / eviction keys on this — updated_at churns on every
+    # reconcile so it cannot say "how long has this been hot", and a
+    # reconciler-local memory would forget across serving restarts. Persisted;
+    # None => never spawned (or a pre-PR-4 record).
+    loaded_at: float | None = None
     # True once a runtime process was observed to start and then exit on its own
     # (crash / bind collision) — as opposed to a launch that never spawned (a
     # missing binary raises before start). The reallocation caller uses this to
@@ -205,6 +211,7 @@ class PersistentSupervisor:
                 activation=current.activation if current else Activation.MANUAL,
                 pinned=current.pinned if current else False,
                 last_served=current.last_served if current else None,
+                loaded_at=current.loaded_at if current else None,
             )
             self._save()
             return self.reconcile(spec.name)
@@ -218,6 +225,35 @@ class PersistentSupervisor:
             # unload path, never here.
             record.activation = Activation.MANUAL
             return self.reconcile(name)
+
+    def unload(self, name: str) -> DeploymentRecord:
+        """Evict a deployment: kill the process, KEEP the record + port (PR-4).
+
+        The distinct path design fix #3 demands — NOT ``stop()``: an unload is
+        the autoloader freeing memory, so ``activation=MANAGED`` marks the
+        deployment auto-reloadable (a later request to it fires a load instead
+        of failing), where a user Stop stays ``MANUAL``/cold forever. The
+        record and its port reservation survive; only ``remove()`` frees them.
+        """
+        with self._lock:
+            record = self.get(name)
+            record.spec = replace(record.spec, desired_state=DesiredState.STOPPED)
+            record.activation = Activation.MANAGED
+            return self.reconcile(name)
+
+    def pin(self, name: str, *, pinned: bool) -> DeploymentRecord:
+        """Set the eviction shield: a pinned deployment is never chosen as an
+        idle-unload or memory-pressure victim (PR-4). Lives in
+        ``deployments.json`` (not Postgres) with the rest of the
+        lifecycle-control metadata (design fix #5)."""
+        with self._lock:
+            record = self.get(name)
+            if record.pinned == pinned:
+                return record
+            record.pinned = pinned
+            record.updated_at = self._clock()
+            self._save()
+            return record
 
     def remove(self, name: str) -> None:
         with self._lock:
@@ -392,6 +428,8 @@ class PersistentSupervisor:
             record.pid_create_time = (
                 self._create_time(process.pid) if process.pid is not None else None
             )
+            # Spawn stamp for the PR-4 min-hot-time guard (see field docstring).
+            record.loaded_at = self._clock()
             record.endpoint = process.endpoint
             record.state = LifecycleState.STARTING
             record.last_error = None
@@ -571,6 +609,7 @@ def _record_from_dict(value: dict[str, Any]) -> DeploymentRecord:
     )
     raw_create_time = value.get("pid_create_time")
     raw_last_served = value.get("last_served")
+    raw_loaded_at = value.get("loaded_at")
     return DeploymentRecord(
         spec=spec,
         state=LifecycleState(value["state"]),
@@ -585,4 +624,5 @@ def _record_from_dict(value: dict[str, Any]) -> DeploymentRecord:
         activation=Activation(value.get("activation", Activation.MANUAL.value)),
         pinned=bool(value.get("pinned", False)),
         last_served=float(raw_last_served) if raw_last_served is not None else None,
+        loaded_at=float(raw_loaded_at) if raw_loaded_at is not None else None,
     )

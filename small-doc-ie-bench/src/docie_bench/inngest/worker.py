@@ -140,7 +140,15 @@ def _build_reconciler(instance_id: str) -> Any:
         # timeouts) never lets a second replica steal a live lease.
         stale_after_s=max(6 * interval, 60.0),
     )
-    return ServingReconciler(supervisor, interval_s=interval, lease=lease)
+    settings = get_settings()
+    return ServingReconciler(
+        supervisor,
+        interval_s=interval,
+        lease=lease,
+        # PR-4 idle-TTL unload knobs (0 disables; see settings.py).
+        idle_ttl_s=settings.serving_idle_ttl_seconds,
+        min_hot_s=settings.serving_min_hot_seconds,
+    )
 
 
 def _start_reconciler(instance_id: str) -> asyncio.Task[None] | None:
