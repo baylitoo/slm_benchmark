@@ -1,9 +1,21 @@
 """Sizing engine for the serving control plane (PR-3, design doc §3).
 
 Answers one question per store model: **"how many MORE instances fit right
-now?"** — and prices hypothetical deployment mixes (what-if) with exactly the
-same math, so the number the UI shows is the number the deploy path's fit gate
-would enforce.
+now?"** — and prices hypothetical deployment mixes (what-if) with the same
+math, so the fit table and the what-if verdict can never disagree with each
+other.
+
+Relationship to the deploy path's fit gate (``reconciler.default_fit_check``),
+stated honestly: both price a candidate with the SAME footprint formula
+(``max(calibrated steady RSS, predicted weights + KV + overhead + mmproj)``)
+and hold back the SAME explicit safety margin. They differ in when and where
+the free number is read: the gate runs inside the serving container and
+re-measures node memory LIVE at decision time; this engine prices against the
+snapshot that same reader published last cycle. The gate also stats the launch
+GGUF for weights (record-driven, DB-optional) where this engine prefers the
+store's ``size_bytes`` — the recorded size of the same file. So sizing is the
+gate's math against a reading up to one reconcile interval older, never a
+different policy.
 
 Inputs are the observed surfaces the reconciler publishes (design doc §3): the
 store models (``ModelCatalog.list``), the live observed placements, and the
@@ -19,24 +31,38 @@ footprint::
 
 with weights from ``ModelStoreEntry.size_bytes`` (or an on-disk stat) and the
 calibration read from the ``FootprintStore`` sidecars on the shared serving
-volume — never the registry (design doc fix #6).
+volume — never the registry (design doc fix #6). ``ctx`` defaults to
+``DEFAULT_DEPLOY_CONTEXT_LENGTH`` — the same default every deploy path uses —
+so an uncalibrated model is priced at the KV budget a default deploy actually
+consumes.
 
 **The double-count trap, and the guard (design doc §3).** The snapshot's
 ``free_bytes`` is a *measured* number (cgroup working-set or psutil
-``available``): the RSS of every RUNNING llama-server is **already inside
-"used"**. Subtracting predicted footprints of running deployments from that
-free number would price them twice, halving the apparent capacity. So this
-engine prices **prospective instances only** against the measured free —
-observed placements are consumed for display (running-instance counts) and are
+``available``): the RSS of every steady RUNNING llama-server is **already
+inside "used"**. Subtracting predicted footprints of running deployments from
+that free number would price them twice, halving the apparent capacity. So
+this engine prices **prospective instances only** against the measured free —
+``hot`` placements are consumed for display (running-instance counts) and are
 deliberately NEVER re-subtracted. That choice is stated here once and asserted
 by tests; the UI states it too.
 
+**The one deliberate exception: ``loading`` placements.** llama.cpp mmaps the
+GGUF, so a mid-load runtime's RSS — and therefore the snapshot's "used" —
+only reflects the pages faulted in so far; the rest of its footprint is still
+coming and the measured free overstates capacity by exactly that remainder
+for the minutes a multi-GB load takes. Each loading placement therefore
+reserves ``max(footprint(model) - observed_rss, 0)`` out of the budget. This
+composes with the guard rather than violating it: the paged-in part is inside
+"used" already, only the not-yet-resident remainder is subtracted, and a
+placement that goes ``hot`` reserves nothing.
+
 Fit for a candidate model X (design doc §3)::
 
-    fits_now(X) = floor( (free - safety_margin) / footprint(X) )
+    fits_now(X) = floor( (free - safety_margin - loading_reserved) / footprint(X) )
 
 ``safety_margin`` is explicit and configurable (default ~10% of total),
 surfaced in every payload — an honest buffer, never a hidden fudge factor.
+``loading_reserved`` is likewise surfaced, never silently folded in.
 
 Honesty rules:
 * no node snapshot (reconciler never ran / DB empty) => footprints are still
@@ -54,7 +80,7 @@ from pathlib import Path
 from typing import Any
 
 from docie_bench.serving.resources import (
-    DEFAULT_CONTEXT_LENGTH,
+    DEFAULT_DEPLOY_CONTEXT_LENGTH,
     FootprintStore,
     footprint_bytes,
     predicted_footprint_for_model,
@@ -64,7 +90,9 @@ from docie_bench.serving.resources import (
 # 10-15%; take the low end — the margin is visible, not padding on padding).
 DEFAULT_MARGIN_FRACTION = 0.10
 
-# Phases whose process is resident right now (RSS already inside "used").
+# Phases with a live process right now. "hot" RSS is fully inside the
+# snapshot's "used"; "loading" RSS is only partially there (mmap ramp) and its
+# remainder is reserved separately (see _loading_reservation).
 LIVE_PHASES = frozenset({"hot", "loading"})
 
 
@@ -112,7 +140,11 @@ class SizingReport:
     free_bytes: int | None
     source: str | None  # "cgroup" | "vm" — the soft-number badge input
     safety_margin_bytes: int | None
-    free_effective_bytes: int | None  # free - margin (may be negative: honest)
+    # RAM still owed to mid-load (mmap-ramp) placements: not yet inside the
+    # snapshot's "used", reserved out of the budget below (module docstring).
+    loading_reserved_bytes: int
+    # free - margin - loading_reserved (may be negative: honest).
+    free_effective_bytes: int | None
     margin_fraction: float
     context_length: int
     n_parallel: int
@@ -127,6 +159,7 @@ class SizingReport:
             "free_bytes": self.free_bytes,
             "source": self.source,
             "safety_margin_bytes": self.safety_margin_bytes,
+            "loading_reserved_bytes": self.loading_reserved_bytes,
             "free_effective_bytes": self.free_effective_bytes,
             "assumptions": {
                 "context_length": self.context_length,
@@ -167,6 +200,7 @@ class WhatIfReport:
     total_predicted_bytes: int
     free_effective_bytes: int | None
     safety_margin_bytes: int | None
+    loading_reserved_bytes: int  # mmap-ramp reservation (module docstring)
     remaining_bytes: int | None  # free_effective - total_predicted
     ok: bool | None  # None = no snapshot to judge against (honest, not False)
     deficit_bytes: int | None  # >0 iff ok is False; how much RAM is missing
@@ -181,6 +215,7 @@ class WhatIfReport:
             "total_predicted_bytes": self.total_predicted_bytes,
             "free_effective_bytes": self.free_effective_bytes,
             "safety_margin_bytes": self.safety_margin_bytes,
+            "loading_reserved_bytes": self.loading_reserved_bytes,
             "remaining_bytes": self.remaining_bytes,
             "ok": self.ok,
             "deficit_bytes": self.deficit_bytes,
@@ -250,9 +285,10 @@ def _running_instances(
 ) -> dict[str, int]:
     """Live (hot/loading) instance count per store model — DISPLAY only.
 
-    The double-count guard in one function: these placements' RSS is already
-    inside the snapshot's "used", so the counts inform the operator but are
-    never subtracted from free again.
+    The double-count guard in one function: a hot placement's steady RSS is
+    already inside the snapshot's "used", so these counts inform the operator
+    but are never subtracted from free again. (Loading placements' NOT-yet-
+    resident remainder is handled separately by :func:`_loading_reservation`.)
     """
     counts: dict[str, int] = {}
     for placement in placements:
@@ -260,6 +296,43 @@ def _running_instances(
         if model_name and placement.get("phase") in LIVE_PHASES:
             counts[model_name] = counts.get(model_name, 0) + 1
     return counts
+
+
+def _loading_reservation(
+    models_by_name: Mapping[str, Mapping[str, Any]],
+    placements: Sequence[Mapping[str, Any]],
+    *,
+    footprints: FootprintStore,
+    context_length: int,
+    n_parallel: int,
+) -> int:
+    """RAM still owed to placements mid-load: ``Σ max(footprint - rss, 0)``.
+
+    A ``loading`` runtime's RSS is only PARTIALLY inside the snapshot's "used"
+    (llama.cpp mmap ramp — pages fault in over minutes for a multi-GB GGUF),
+    so the measured free overstates capacity by (footprint - current RSS) per
+    loading placement until it goes hot. Reserving exactly that remainder
+    composes with the double-count guard: the paged-in part is already inside
+    "used"; only the not-yet-resident remainder is subtracted. ``hot``
+    placements reserve nothing (steady RSS fully measured); a placement whose
+    model is unknown or unpriceable reserves nothing (fail-open, the same rule
+    as every other unknowable in the fit gate).
+    """
+    reserved = 0
+    for placement in placements:
+        if placement.get("phase") != "loading":
+            continue
+        row = models_by_name.get(str(placement.get("model_name") or ""))
+        if row is None:
+            continue
+        _, _, working = price_model(
+            row, footprints=footprints, context_length=context_length, n_parallel=n_parallel
+        )
+        if working is None:
+            continue
+        rss = int(placement.get("rss_bytes") or 0)
+        reserved += max(working - rss, 0)
+    return reserved
 
 
 def _check_margin(margin_fraction: float) -> None:
@@ -305,12 +378,26 @@ def compute_sizing(
     (``ModelCatalog.list`` / ``list_placements`` / ``get_node_snapshot``) so
     sizing reads the same observed surface the Board does. ``snapshot=None``
     degrades honestly: footprints still price, ``fits_now`` stays ``None``.
+    ``context_length`` defaults to the deploy paths' default (8192), never
+    llama-server's bare 4096 fallback — the fit table prices what a default
+    deploy will actually consume.
     """
     _check_margin(margin_fraction)
     store = footprints if footprints is not None else FootprintStore()
-    context = context_length if context_length is not None else DEFAULT_CONTEXT_LENGTH
+    context = (
+        context_length if context_length is not None else DEFAULT_DEPLOY_CONTEXT_LENGTH
+    )
     total, free, margin, free_effective, source = _free_budget(snapshot, margin_fraction)
     running = _running_instances(placements)
+    loading_reserved = _loading_reservation(
+        {str(row["name"]): row for row in models},
+        placements,
+        footprints=store,
+        context_length=context,
+        n_parallel=n_parallel,
+    )
+    if free_effective is not None:
+        free_effective -= loading_reserved
 
     fits_rows: list[ModelFit] = []
     for row in models:
@@ -349,6 +436,7 @@ def compute_sizing(
         free_bytes=free,
         source=source,
         safety_margin_bytes=margin,
+        loading_reserved_bytes=loading_reserved,
         free_effective_bytes=free_effective,
         margin_fraction=margin_fraction,
         context_length=context,
@@ -362,6 +450,7 @@ def compute_whatif(
     models: Sequence[Mapping[str, Any]],
     snapshot: Mapping[str, Any] | None,
     plan: Sequence[Mapping[str, Any]],
+    placements: Sequence[Mapping[str, Any]] = (),
     *,
     footprints: FootprintStore | None = None,
     margin_fraction: float = DEFAULT_MARGIN_FRACTION,
@@ -370,9 +459,9 @@ def compute_whatif(
     """Price a hypothetical deployment mix against the live free budget.
 
     ``plan`` items: ``{"model": <store name>, "instances": N,
-    "context_length": ctx | None}``. Same footprint math as the fit table
-    (max(calibrated, predicted), mmproj-aware) so the what-if answer matches
-    what the deploy path's fit gate would decide. Raises
+    "context_length": ctx | None}`` (``None`` => the deploy default, 8192).
+    Same footprint math, same margin and same loading-placement reservation as
+    the fit table, so the two surfaces can never disagree. Raises
     :class:`UnknownModelError` for a model not in the store and
     :class:`UnpriceableModelError` when an item cannot be priced — a plan sum
     with silent zero-priced lines would be a lie, not an estimate.
@@ -381,6 +470,15 @@ def compute_whatif(
     store = footprints if footprints is not None else FootprintStore()
     by_name = {str(row["name"]): row for row in models}
     _, _, margin, free_effective, _ = _free_budget(snapshot, margin_fraction)
+    loading_reserved = _loading_reservation(
+        by_name,
+        placements,
+        footprints=store,
+        context_length=DEFAULT_DEPLOY_CONTEXT_LENGTH,
+        n_parallel=n_parallel,
+    )
+    if free_effective is not None:
+        free_effective -= loading_reserved
 
     items: list[WhatIfItem] = []
     for entry in plan:
@@ -392,7 +490,7 @@ def compute_whatif(
         if instances < 1:
             raise ValueError(f"instances must be >= 1 (got {instances} for {model!r})")
         raw_context = entry.get("context_length")
-        context = int(raw_context) if raw_context else DEFAULT_CONTEXT_LENGTH
+        context = int(raw_context) if raw_context else DEFAULT_DEPLOY_CONTEXT_LENGTH
         _, calibrated, working = price_model(
             row, footprints=store, context_length=context, n_parallel=n_parallel
         )
@@ -425,6 +523,7 @@ def compute_whatif(
         total_predicted_bytes=total_predicted,
         free_effective_bytes=free_effective,
         safety_margin_bytes=margin,
+        loading_reserved_bytes=loading_reserved,
         remaining_bytes=remaining,
         ok=ok,
         deficit_bytes=deficit,

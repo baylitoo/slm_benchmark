@@ -33,6 +33,7 @@ from docie_bench.inngest.realtime import (
 )
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.profile_resolver import resolve_extraction_profile
+from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 
@@ -432,7 +433,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
         record = await cp.up(
             model,
             port=int(raw_port) if raw_port is not None else None,
-            context_length=int(data.get("context_length", 8192)),
+            context_length=int(data.get("context_length", DEFAULT_DEPLOY_CONTEXT_LENGTH)),
         )
     return record
 

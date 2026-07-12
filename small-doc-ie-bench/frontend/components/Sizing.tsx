@@ -35,8 +35,11 @@ const POLL_MS = 5000;
  * right now?" Everything rendered here is the OBSERVED surface the serving
  * reconciler publishes — the capacity bar and fit table come straight from
  * GET /v1/serving/sizing, and the what-if selector round-trips through
- * POST /v1/serving/sizing/whatif so its math matches the deploy path's fit
- * gate exactly (never re-derived client-side).
+ * POST /v1/serving/sizing/whatif so the verdict is always the server's,
+ * never re-derived client-side. The server applies the deploy path's fit-gate
+ * policy — same footprint formula, same safety margin — priced against the
+ * reconciler's last published snapshot (the gate itself re-measures live at
+ * decision time; see serving.sizing for the honest delta).
  */
 export function Sizing({ active = true }: { active?: boolean }) {
   const sizing = usePolling<SizingView>(getSizing, POLL_MS, active);
@@ -80,21 +83,27 @@ function CapacityBar({ data }: { data: SizingView | null }) {
   const total = node?.total_bytes ?? null;
   const free = node?.free_bytes ?? null;
   const margin = data?.safety_margin_bytes ?? null;
+  const loadingReserved = data?.loading_reserved_bytes ?? 0;
   const freeEffective = data?.free_effective_bytes ?? null;
   const soft = (data?.source ?? node?.source) === "vm";
+  const measuredAgo = agoLabel(node?.updated_at);
 
   // Segment widths in % of total; clamped so a weird reading never overflows.
   const segments = useMemo(() => {
     if (total == null || free == null || margin == null || total <= 0) return null;
     const used = Math.max(total - free, 0);
     const pct = (n: number) => Math.max(0, Math.min(100, (n / total) * 100));
+    const afterMargin = Math.max(free - margin, 0);
+    const reserved = Math.min(Math.max(loadingReserved, 0), afterMargin);
     return {
       used,
       usedPct: pct(used),
       marginPct: pct(Math.min(margin, Math.max(free, 0))),
-      freePct: pct(Math.max(free - margin, 0)),
+      reserved,
+      reservedPct: pct(reserved),
+      freePct: pct(Math.max(afterMargin - reserved, 0)),
     };
-  }, [total, free, margin]);
+  }, [total, free, margin, loadingReserved]);
 
   return (
     <Card
@@ -134,6 +143,13 @@ function CapacityBar({ data }: { data: SizingView | null }) {
               style={{ width: `${segments.marginPct}%` }}
               title={`Safety margin: ${formatBytes(margin)}`}
             />
+            {segments.reserved > 0 && (
+              <div
+                className="h-full bg-sky-400/60"
+                style={{ width: `${segments.reservedPct}%` }}
+                title={`Reserved for loading models (pages not yet resident): ${formatBytes(segments.reserved)}`}
+              />
+            )}
             <div
               className="h-full bg-emerald-500/40"
               style={{ width: `${segments.freePct}%` }}
@@ -147,6 +163,13 @@ function CapacityBar({ data }: { data: SizingView | null }) {
               label="margin"
               value={formatBytes(margin)}
             />
+            {segments.reserved > 0 && (
+              <LegendChip
+                className="bg-sky-400/60"
+                label="loading"
+                value={formatBytes(segments.reserved)}
+              />
+            )}
             <LegendChip
               className="bg-emerald-500/40"
               label="deployable"
@@ -158,6 +181,7 @@ function CapacityBar({ data }: { data: SizingView | null }) {
               <span className="font-medium text-foreground">
                 {formatBytes(node?.sum_rss_bytes)}
               </span>
+              {measuredAgo && <>{" · "}measured {measuredAgo}</>}
             </span>
           </div>
           {freeEffective != null && freeEffective < 0 && (
@@ -168,15 +192,26 @@ function CapacityBar({ data }: { data: SizingView | null }) {
             </p>
           )}
           <p className="mt-2 text-xs text-muted-foreground">
-            Free is the measured number (running deployments&apos; RSS is already inside
-            &quot;used&quot; — never double-counted). Margin is an explicit{" "}
+            Free is the measured number (hot deployments&apos; RSS is already inside
+            &quot;used&quot; — never double-counted; models still loading reserve only
+            their not-yet-resident remainder). Margin is an explicit{" "}
             {Math.round((data?.assumptions?.margin_fraction ?? 0) * 100)}% of total held
-            back before pricing anything new.
+            back before pricing anything new — the same margin the deploy path&apos;s
+            fit gate enforces.
           </p>
         </div>
       )}
     </Card>
   );
+}
+
+/** "12s ago" / "3m ago" from an ISO stamp (null when absent/unparseable). */
+function agoLabel(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const stamp = Date.parse(iso);
+  if (Number.isNaN(stamp)) return null;
+  const seconds = Math.max(0, Math.round((Date.now() - stamp) / 1000));
+  return seconds < 120 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`;
 }
 
 function LegendChip({
@@ -202,6 +237,9 @@ function LegendChip({
 
 function FitTable({ sizing }: { sizing: ReturnType<typeof usePolling<SizingView>> }) {
   const rows = sizing.data?.per_model ?? null;
+  // Surface the pricing assumption: uncalibrated KV is priced at THIS context
+  // (the deploy default), so the operator knows what the table assumed.
+  const ctx = sizing.data?.assumptions?.context_length;
 
   const columns: Column<SizingModelFit>[] = [
     {
@@ -277,7 +315,9 @@ function FitTable({ sizing }: { sizing: ReturnType<typeof usePolling<SizingView>
     <Card
       icon={<Boxes className="h-5 w-5" />}
       title="Per-model fit"
-      subtitle="footprint = max(calibrated steady RSS, predicted weights + KV + overhead + mmproj); fits = floor((free − margin) / footprint)."
+      subtitle={`footprint = max(calibrated steady RSS, predicted weights + KV${
+        ctx != null ? ` @ ${ctx.toLocaleString()}-token ctx (the deploy default)` : ""
+      } + overhead + mmproj); fits = floor((free − margin − loading reserve) / footprint).`}
     >
       <Table<SizingModelFit>
         columns={columns}
@@ -375,7 +415,7 @@ function WhatIf({ data }: { data: SizingView | null }) {
     <Card
       icon={<Scale className="h-5 w-5" />}
       title="What if…"
-      subtitle="Stage a deployment mix — the server prices it with the exact fit-gate math."
+      subtitle="Stage a deployment mix — the server prices it with the fit gate's footprint math and margin."
     >
       <div className="space-y-3">
         {staged.length === 0 && (
@@ -411,8 +451,12 @@ function WhatIf({ data }: { data: SizingView | null }) {
               min={1}
               value={row.contextLength}
               onChange={(e) => updateRow(index, { contextLength: e.target.value })}
-              placeholder="ctx (default)"
-              className="h-8 w-32 text-xs"
+              placeholder={
+                data?.assumptions?.context_length != null
+                  ? `ctx (default ${data.assumptions.context_length.toLocaleString()})`
+                  : "ctx (deploy default)"
+              }
+              className="h-8 w-36 text-xs"
               aria-label="Context length"
             />
             <button

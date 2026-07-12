@@ -35,6 +35,7 @@ from docie_bench.inngest.realtime import (
     subscription_token,
 )
 from docie_bench.security import TenantDependency
+from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 from docie_bench.studio.store import RunStoreUnavailableError, default_run_store
 
 router = APIRouter(prefix="/v1/studio", tags=["studio"])
@@ -151,7 +152,10 @@ class DeployRequest(BaseModel):
     # UI sends no port unless the operator explicitly overrides it. model_dump(
     # exclude_none=True) at trigger time drops a None so the worker sees no port.
     port: int | None = None
-    context_length: int = 8192
+    # The shared deploy-default context (resources.DEFAULT_DEPLOY_CONTEXT_LENGTH)
+    # — the SAME constant the sizing engine prices uncalibrated fits at, so the
+    # fit table and a default deploy consume the same KV budget.
+    context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH
     replicas: int = 1
 
 

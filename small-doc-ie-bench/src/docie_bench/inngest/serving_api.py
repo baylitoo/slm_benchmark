@@ -16,8 +16,11 @@ when the database is down.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+import os
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 import inngest
@@ -32,6 +35,72 @@ from docie_bench.settings import get_settings
 router = APIRouter(prefix="/v1/serving", tags=["serving"])
 
 DELETE_EVENT = "serving/delete.requested"
+
+# Snapshot-staleness gate: a published node snapshot is only trusted while it
+# is at most this many reconcile intervals old. If the serving reconciler dies,
+# its last snapshot must NOT keep backing "observed_available: true" sizing
+# forever — /resources promises "never a stale number", and that promise has to
+# cover the reconciler-died case, not just the never-published one.
+SNAPSHOT_STALE_INTERVALS = 3.0
+# Floor so a very short dev interval (e.g. 1s) does not flap the gate on one
+# slow DB round-trip.
+SNAPSHOT_STALE_FLOOR_S = 30.0
+
+
+def _reconcile_interval_s() -> float:
+    """The reconciler's cycle interval — same env knob worker.py reads."""
+    try:
+        interval = float(os.getenv("DOCIE_SERVING_RECONCILE_INTERVAL", "10"))
+    except ValueError:
+        return 10.0
+    return interval if interval > 0 else 10.0
+
+
+def snapshot_stale_after_s() -> float:
+    return max(SNAPSHOT_STALE_INTERVALS * _reconcile_interval_s(), SNAPSHOT_STALE_FLOOR_S)
+
+
+def _snapshot_age_s(snapshot: Mapping[str, Any], *, now: dt.datetime | None = None) -> float | None:
+    """Seconds since the snapshot's ``updated_at`` (None when unparseable)."""
+    raw = snapshot.get("updated_at")
+    if not raw:
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        # sqlite round-trips the reconciler's UTC stamp as a naive datetime.
+        stamp = stamp.replace(tzinfo=dt.UTC)
+    current = now if now is not None else dt.datetime.now(dt.UTC)
+    return (current - stamp).total_seconds()
+
+
+def _gate_snapshot_staleness(
+    snapshot: dict[str, Any] | None, *, now: dt.datetime | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
+    """(snapshot or None, staleness detail): drop a snapshot too old to trust.
+
+    A snapshot older than ``snapshot_stale_after_s()`` (default 3x the
+    reconcile interval, floored at 30s) means the serving reconciler stopped
+    publishing — the number describes a dead past, so it degrades to the SAME
+    honest "observed unavailable" state as never-published, with a detail
+    saying how old the last measurement is. An unparseable/missing
+    ``updated_at`` fails open (treated as fresh): the stamp is always written
+    by ``publish_node_snapshot``, and refusing to serve over a formatting
+    quirk would be a false outage.
+    """
+    if snapshot is None:
+        return None, None
+    age = _snapshot_age_s(snapshot, now=now)
+    threshold = snapshot_stale_after_s()
+    if age is not None and age > threshold:
+        return None, (
+            f"node snapshot is stale: last published {age:.0f}s ago "
+            f"(> {threshold:.0f}s = {SNAPSHOT_STALE_INTERVALS:g}x the reconcile "
+            f"interval) — is the serving service's reconciler still running?"
+        )
+    return snapshot, None
 
 
 def _control_plane() -> ControlPlane:
@@ -109,9 +178,11 @@ async def serving_resources() -> dict[str, Any]:
     (design doc §2).
 
     Honest degradation: ``observed_available: false`` + a ``detail`` reason
-    when the database is unreachable OR the reconciler has never published a
-    snapshot — never a stale or locally-measured number. Auth matches the
-    sibling serving reads (unauthenticated ops view; mutations stay evented).
+    when the database is unreachable, the reconciler has never published a
+    snapshot, OR the last snapshot is older than the staleness gate allows
+    (the reconciler died and its final number describes a dead past) — never
+    a stale or locally-measured number. Auth matches the sibling serving
+    reads (unauthenticated ops view; mutations stay evented).
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
@@ -126,6 +197,8 @@ async def serving_resources() -> dict[str, Any]:
                 "no node snapshot published yet — is the serving service's "
                 "reconciler running?"
             )
+        else:
+            node, detail = _gate_snapshot_staleness(node)
         deployments = [
             {
                 "name": placement["name"],
@@ -166,8 +239,10 @@ def _sizing_inputs() -> tuple[
 
     All three inputs come from the observed Postgres surface the reconciler
     publishes (design doc §3) — the api never measures locally. A missing
-    database degrades to empty inputs + a reason; a missing snapshot keeps the
-    store list (footprints still price) and lets the engine mark fits unknown.
+    database degrades to empty inputs + a reason; a missing OR stale snapshot
+    (staleness gate above) keeps the store list (footprints still price) and
+    lets the engine mark fits unknown — never a fit computed against a dead
+    reconciler's last number.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
@@ -180,11 +255,14 @@ def _sizing_inputs() -> tuple[
         return [], None, [], "observed state unavailable: DATABASE_URL is not configured"
     except Exception:  # noqa: BLE001 - a DB hiccup must not 500 the Sizing tab
         return [], None, [], "observed state unavailable: database error"
-    detail = None
     if snapshot is None:
-        detail = (
-            "no node snapshot published yet — is the serving service's reconciler running?"
+        return (
+            models,
+            None,
+            placements,
+            "no node snapshot published yet — is the serving service's reconciler running?",
         )
+    snapshot, detail = _gate_snapshot_staleness(snapshot)
     return models, snapshot, placements, detail
 
 
@@ -194,16 +272,22 @@ async def serving_sizing() -> dict[str, Any]:
 
     Pure read over the observed surface: footprint per candidate instance is
     the PR-2 tracker's ``max(calibrated steady RSS, predicted)`` (mmproj-aware,
-    calibration sidecars on the shared serving volume), free RAM is the
-    reconciler-published node snapshot VERBATIM (running deployments' RSS is
-    already inside "used" — the engine never subtracts them again; see the
-    double-count guard in ``serving.sizing``), and the safety margin is the
-    explicit, configurable ``serving_sizing_margin_fraction`` slice of total.
+    calibration sidecars on the shared serving volume, KV priced at the deploy
+    default context), free RAM is the reconciler-published node snapshot
+    (hot deployments' RSS is already inside "used" — the engine never
+    subtracts them again; loading deployments reserve only their not-yet-
+    resident remainder; see the double-count guard in ``serving.sizing``),
+    and the safety margin is the explicit, configurable
+    ``serving_sizing_margin_fraction`` slice of total — the same margin the
+    deploy path's restart fit gate holds back (the gate re-measures free RAM
+    live at decision time; this table prices against the snapshot that same
+    reader published last cycle).
 
     Honest degradation mirrors ``/resources``: ``observed_available: false`` +
-    a ``detail`` reason when the database is down or the snapshot was never
-    published — footprints still price, ``fits_now`` stays null. Auth parity
-    with the sibling serving reads (unauthenticated ops view).
+    a ``detail`` reason when the database is down, the snapshot was never
+    published, or the snapshot is stale (reconciler died) — footprints still
+    price, ``fits_now`` stays null. Auth parity with the sibling serving
+    reads (unauthenticated ops view).
     """
     from docie_bench.serving.resources import FootprintStore
     from docie_bench.serving.sizing import compute_sizing
@@ -227,13 +311,18 @@ async def serving_sizing() -> dict[str, Any]:
 async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
     """Price a hypothetical deployment mix → fits or an explicit deficit (§3).
 
-    Same engine and same footprint math as ``/sizing`` — the what-if readout
-    matches what the deploy path's fit gate would decide, by construction. A
-    pure computation (nothing deploys, nothing mutates), so auth parity is
-    with the sibling reads, not the evented mutations. 404 for a model not in
-    the store; 422 when a staged model cannot be priced at all. With no node
-    snapshot the plan still prices (``total_predicted_bytes``) but ``ok`` /
-    ``remaining_bytes`` stay null — never a verdict against a made-up number.
+    Same engine, same footprint math, same margin and same loading-placement
+    reservation as ``/sizing`` — the two surfaces can never disagree (and the
+    policy is the deploy path's fit gate's, priced against the last published
+    snapshot; see ``serving.sizing``). A pure computation (nothing deploys,
+    nothing mutates), so auth parity is with the sibling reads, not the
+    evented mutations. 422 for a model not in the store or a staged model
+    that cannot be priced — NEVER 404: the frontend's global convention maps
+    404 to "endpoint doesn't exist yet" (``api.ts isUnavailableStatus``), and
+    a store-removal racing the UI poll must surface the server's detail, not
+    a bogus "endpoint unavailable". With no node snapshot the plan still
+    prices (``total_predicted_bytes``) but ``ok`` / ``remaining_bytes`` stay
+    null — never a verdict against a made-up number.
     """
     from docie_bench.serving.resources import FootprintStore
     from docie_bench.serving.sizing import (
@@ -243,7 +332,6 @@ async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
     )
 
     models, snapshot, placements, detail = _sizing_inputs()
-    del placements  # the plan prices prospective instances only
     if not models:
         # No store to resolve plan models against: the DB-down degrade path.
         raise HTTPException(
@@ -255,12 +343,11 @@ async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
             models,
             snapshot,
             [item.model_dump() for item in request.plan],
+            placements,
             footprints=FootprintStore(),
             margin_fraction=get_settings().serving_sizing_margin_fraction,
         )
-    except UnknownModelError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except UnpriceableModelError as exc:
+    except (UnknownModelError, UnpriceableModelError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     payload = report.as_dict()
     if detail is not None:
@@ -361,13 +448,21 @@ async def list_store() -> Any:
     """The local GGUF model store (queryable Postgres catalog the Studio reads).
 
     Each entry includes its family and the backends that can serve it faithfully.
+    ``model_path``/``mmproj_path`` (container filesystem paths) are STRIPPED
+    here: they are server-side sizing inputs (calibration key + projector
+    pricing), and this is an unauthenticated surface — the browser never needs
+    them, so it never sees them.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
     try:
-        return ModelCatalog().list()
+        entries = ModelCatalog().list()
     except CatalogUnavailableError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
+    for entry in entries:
+        entry.pop("model_path", None)
+        entry.pop("mmproj_path", None)
+    return entries
 
 
 @router.get("/families")

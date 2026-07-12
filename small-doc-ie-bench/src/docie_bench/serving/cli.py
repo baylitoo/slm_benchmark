@@ -14,6 +14,7 @@ from pathlib import Path
 import typer
 
 from docie_bench.serving.control_plane import ControlPlane, to_data
+from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
 
 @dataclass
@@ -152,7 +153,9 @@ def create_app(
             help="Bind port. Omit to auto-allocate the first free port in "
             "DOCIE_SERVING_PORT_RANGE_* (8088-8188 by default).",
         ),
-        ctx_size: int = typer.Option(8192, "--ctx-size", min=1, help="llama.cpp context size."),
+        ctx_size: int = typer.Option(
+            DEFAULT_DEPLOY_CONTEXT_LENGTH, "--ctx-size", min=1, help="llama.cpp context size."
+        ),
     ) -> None:
         """Serve a store model in the background with its family's llama-server flags."""
         _execute(

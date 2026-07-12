@@ -200,7 +200,9 @@ export interface SizingView {
   free_bytes?: number | null;
   source?: string | null;
   safety_margin_bytes?: number | null;
-  /** free - margin; may be negative (honest red number). */
+  /** RAM reserved for mid-load (mmap-ramp) deployments not yet fully resident. */
+  loading_reserved_bytes?: number | null;
+  /** free - margin - loading reserve; may be negative (honest red number). */
   free_effective_bytes?: number | null;
   assumptions?: {
     context_length?: number;
@@ -235,6 +237,8 @@ export interface WhatIfView {
   total_predicted_bytes: number;
   free_effective_bytes?: number | null;
   safety_margin_bytes?: number | null;
+  /** RAM reserved for mid-load (mmap-ramp) deployments not yet fully resident. */
+  loading_reserved_bytes?: number | null;
   remaining_bytes?: number | null;
   /** true fits · false deficit · null = no snapshot to judge against. */
   ok?: boolean | null;

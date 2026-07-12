@@ -70,8 +70,19 @@ KV_CACHE_BYTES_PER_TOKEN = 65_536
 # design doc §2 brackets it 0.3-0.5 GB — take the conservative top end).
 RUNTIME_OVERHEAD_BYTES = 512 * 1024 * 1024
 
-# llama-server's default --ctx-size when a deployment specifies none.
+# llama-server's default --ctx-size when a deployment specifies none. This is
+# the RUNTIME's own fallback — only correct for pricing a launch record that
+# genuinely carries no context_length. Prospective sizing must NOT use it (see
+# DEFAULT_DEPLOY_CONTEXT_LENGTH below).
 DEFAULT_CONTEXT_LENGTH = 4096
+
+# The context every DEPLOY path defaults to when the operator specifies none:
+# studio_api.DeployRequest, functions.deploy handler, ControlPlane.up /
+# serve_store_model and the docie CLI all import THIS constant, so the sizing
+# engine pricing a prospective instance at DEFAULT_DEPLOY_CONTEXT_LENGTH is
+# the same KV budget a default deploy will actually consume (65536 bytes/token
+# x 4096 extra tokens = 256 MiB per instance would otherwise go unpriced).
+DEFAULT_DEPLOY_CONTEXT_LENGTH = 8192
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -331,6 +342,14 @@ def footprint_key(model: str) -> str:
 
 # ------------------------------------------------------ persisted footprints
 
+# Directories whose legacy (pre-v2) sidecars were already purged this process.
+# The purge is a one-time migration sweep per directory, not an invariant to
+# re-establish on every construction: the api builds a FootprintStore per
+# sizing request (every UI poll), and re-listing the directory each time is
+# pure waste — nothing writes pre-v2 keys anymore. A lost race between two
+# threads is harmless (the purge is idempotent).
+_PURGED_FOOTPRINT_DIRS: set[Path] = set()
+
 
 class FootprintStore:
     """Per-model observed steady-state RSS, persisted on the serving volume.
@@ -352,7 +371,11 @@ class FootprintStore:
 
     def __init__(self, home: Path | None = None) -> None:
         self._directory = (home if home is not None else _serving_home()) / "footprints"
-        self._purge_legacy_keys()
+        # One migration sweep per directory per process (see _PURGED_FOOTPRINT_DIRS):
+        # per-request constructions must not re-scan the directory every poll.
+        if self._directory not in _PURGED_FOOTPRINT_DIRS:
+            self._purge_legacy_keys()
+            _PURGED_FOOTPRINT_DIRS.add(self._directory)
 
     @property
     def directory(self) -> Path:
@@ -553,6 +576,7 @@ def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
 __all__ = [
     "CGROUP_V2_ROOT",
     "DEFAULT_CONTEXT_LENGTH",
+    "DEFAULT_DEPLOY_CONTEXT_LENGTH",
     "KV_CACHE_BYTES_PER_TOKEN",
     "RUNTIME_OVERHEAD_BYTES",
     "FootprintStore",
