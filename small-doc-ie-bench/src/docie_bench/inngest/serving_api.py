@@ -22,6 +22,7 @@ from typing import Any
 
 import inngest
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from docie_bench.inngest.client import inngest_client
 from docie_bench.security import TenantDependency
@@ -144,6 +145,127 @@ async def serving_resources() -> dict[str, Any]:
         "deployments": deployments,
         "detail": detail,
     }
+
+
+class WhatIfPlanItem(BaseModel):
+    """One staged line of a hypothetical deployment mix."""
+
+    model: str
+    instances: int = Field(default=1, ge=1, le=1000)
+    context_length: int | None = Field(default=None, ge=1, le=1_048_576)
+
+
+class WhatIfRequest(BaseModel):
+    plan: list[WhatIfPlanItem] = Field(min_length=1, max_length=100)
+
+
+def _sizing_inputs() -> tuple[
+    list[dict[str, Any]], dict[str, Any] | None, list[dict[str, Any]], str | None
+]:
+    """(models, snapshot, placements, degradation detail) for the sizing engine.
+
+    All three inputs come from the observed Postgres surface the reconciler
+    publishes (design doc §3) — the api never measures locally. A missing
+    database degrades to empty inputs + a reason; a missing snapshot keeps the
+    store list (footprints still price) and lets the engine mark fits unknown.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        catalog = ModelCatalog()
+        models = catalog.list()
+        snapshot = catalog.get_node_snapshot()
+        placements = list(catalog.list_placements())
+    except CatalogUnavailableError:
+        return [], None, [], "observed state unavailable: DATABASE_URL is not configured"
+    except Exception:  # noqa: BLE001 - a DB hiccup must not 500 the Sizing tab
+        return [], None, [], "observed state unavailable: database error"
+    detail = None
+    if snapshot is None:
+        detail = (
+            "no node snapshot published yet — is the serving service's reconciler running?"
+        )
+    return models, snapshot, placements, detail
+
+
+@router.get("/sizing")
+async def serving_sizing() -> dict[str, Any]:
+    """Per-model fit table: how many MORE instances fit right now (PR-3, §3).
+
+    Pure read over the observed surface: footprint per candidate instance is
+    the PR-2 tracker's ``max(calibrated steady RSS, predicted)`` (mmproj-aware,
+    calibration sidecars on the shared serving volume), free RAM is the
+    reconciler-published node snapshot VERBATIM (running deployments' RSS is
+    already inside "used" — the engine never subtracts them again; see the
+    double-count guard in ``serving.sizing``), and the safety margin is the
+    explicit, configurable ``serving_sizing_margin_fraction`` slice of total.
+
+    Honest degradation mirrors ``/resources``: ``observed_available: false`` +
+    a ``detail`` reason when the database is down or the snapshot was never
+    published — footprints still price, ``fits_now`` stays null. Auth parity
+    with the sibling serving reads (unauthenticated ops view).
+    """
+    from docie_bench.serving.resources import FootprintStore
+    from docie_bench.serving.sizing import compute_sizing
+
+    models, snapshot, placements, detail = _sizing_inputs()
+    report = compute_sizing(
+        models,
+        snapshot,
+        placements,
+        footprints=FootprintStore(),
+        margin_fraction=get_settings().serving_sizing_margin_fraction,
+    )
+    payload = report.as_dict()
+    payload["node"] = snapshot  # full snapshot view: capacity bar input
+    if detail is not None:
+        payload["detail"] = detail
+    return payload
+
+
+@router.post("/sizing/whatif")
+async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
+    """Price a hypothetical deployment mix → fits or an explicit deficit (§3).
+
+    Same engine and same footprint math as ``/sizing`` — the what-if readout
+    matches what the deploy path's fit gate would decide, by construction. A
+    pure computation (nothing deploys, nothing mutates), so auth parity is
+    with the sibling reads, not the evented mutations. 404 for a model not in
+    the store; 422 when a staged model cannot be priced at all. With no node
+    snapshot the plan still prices (``total_predicted_bytes``) but ``ok`` /
+    ``remaining_bytes`` stay null — never a verdict against a made-up number.
+    """
+    from docie_bench.serving.resources import FootprintStore
+    from docie_bench.serving.sizing import (
+        UnknownModelError,
+        UnpriceableModelError,
+        compute_whatif,
+    )
+
+    models, snapshot, placements, detail = _sizing_inputs()
+    del placements  # the plan prices prospective instances only
+    if not models:
+        # No store to resolve plan models against: the DB-down degrade path.
+        raise HTTPException(
+            status_code=503,
+            detail=detail or "model store unavailable: cannot resolve plan models",
+        )
+    try:
+        report = compute_whatif(
+            models,
+            snapshot,
+            [item.model_dump() for item in request.plan],
+            footprints=FootprintStore(),
+            margin_fraction=get_settings().serving_sizing_margin_fraction,
+        )
+    except UnknownModelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnpriceableModelError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    payload = report.as_dict()
+    if detail is not None:
+        payload["detail"] = detail
+    return payload
 
 
 @router.get("/ports")

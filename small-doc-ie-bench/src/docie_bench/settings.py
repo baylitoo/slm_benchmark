@@ -138,6 +138,20 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Sizing safety margin (PR-3): the slice of node TOTAL RAM the fit table
+    # holds back before pricing prospective instances — explicit and surfaced
+    # in the API/UI, never a hidden fudge factor. Design doc §3 brackets it at
+    # 10-15%; default the low end. DOCIE_-prefixed alias mirrors the other
+    # serving knobs.
+    serving_sizing_margin_fraction: float = Field(
+        default=0.10,
+        ge=0.0,
+        lt=1.0,
+        validation_alias=AliasChoices(
+            "DOCIE_SIZING_MARGIN_FRACTION", "serving_sizing_margin_fraction"
+        ),
+    )
+
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
     openai_compat_model: str = "local-model"
