@@ -35,6 +35,9 @@ from docie_bench.settings import get_settings
 router = APIRouter(prefix="/v1/serving", tags=["serving"])
 
 DELETE_EVENT = "serving/delete.requested"
+LOAD_EVENT = "serving/load.requested"
+UNLOAD_EVENT = "serving/unload.requested"
+PIN_EVENT = "serving/pin.requested"
 
 # Snapshot-staleness gate: a published node snapshot is only trusted while it
 # is at most this many reconcile intervals old. If the serving reconciler dies,
@@ -420,27 +423,86 @@ async def deployment_status(name: str) -> Any:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.delete("/deployments/{name}")
-async def delete_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
-    """Fire the real-teardown event (PR-1): a delete that actually deletes.
+async def _fire_lifecycle_event(
+    name: str,
+    *,
+    event: str,
+    prefix: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """404-gate ``name`` then fire one ``serving/*`` lifecycle event.
 
-    The api cannot kill the runtime itself (different PID namespace), so this
-    fires ``serving/delete.requested`` at the single-replica ``serving``
-    service — the only process holding the Popen handle — which kills the
-    process, drops the record (freeing its port), and DELETEs the placement
-    row. Returns the event id(s) to poll; 404 for an unknown deployment so a
-    typo does not queue a no-op job.
+    Shared shape for delete/load/unload/pin: the api can neither spawn nor
+    kill a runtime (different PID namespace, and only the serving service may
+    write ``deployments.json``), so every mutation is an event handled on the
+    single-replica ``serving`` service. Returns the event id(s) + channel to
+    poll; 404 for an unknown deployment so a typo never queues a no-op job.
     """
-    del tenant  # authenticated principal required; no per-tenant scoping (ops surface)
     try:
         await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    channel = f"delete:{uuid.uuid4().hex}"
-    ids = await inngest_client.send(
-        inngest.Event(name=DELETE_EVENT, data={"name": name, "channel": channel})
-    )
+    channel = f"{prefix}:{uuid.uuid4().hex}"
+    data: dict[str, Any] = {"name": name, "channel": channel, **(extra or {})}
+    ids = await inngest_client.send(inngest.Event(name=event, data=data))
     return {"event_ids": list(ids), "channel": channel, "name": name}
+
+
+@router.delete("/deployments/{name}")
+async def delete_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
+    """Fire the real-teardown event (PR-1): a delete that actually deletes.
+
+    Handled on ``serving`` (the only process holding the Popen handle), which
+    kills the process, drops the record (freeing its port), and DELETEs the
+    placement row — the ONLY path that deletes a row.
+    """
+    del tenant  # authenticated principal required; no per-tenant scoping (ops surface)
+    return await _fire_lifecycle_event(name, event=DELETE_EVENT, prefix="delete")
+
+
+@router.post("/deployments/{name}/load")
+async def load_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
+    """Cold-start a deployment (PR-4): fire ``serving/load.requested``.
+
+    The serving-side handler is idempotent (per-deployment load lock — an
+    already-hot deployment is a no-op) and may evict LRU unpinned victims
+    when that makes the load fit. Works on manual-cold deployments too: the
+    Load button IS the explicit Start.
+    """
+    del tenant
+    return await _fire_lifecycle_event(name, event=LOAD_EVENT, prefix="load")
+
+
+@router.post("/deployments/{name}/unload")
+async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
+    """Evict a deployment (PR-4): fire ``serving/unload.requested``.
+
+    DISTINCT from stop/delete (design fix #3): the record, its port
+    reservation and its placement row all SURVIVE — the row is UPDATEd to
+    ``phase=evicted`` / ``activation=managed``, so the next request to it
+    auto-reloads instead of failing.
+    """
+    del tenant
+    return await _fire_lifecycle_event(name, event=UNLOAD_EVENT, prefix="unload")
+
+
+class PinRequest(BaseModel):
+    """Body of POST /deployments/{name}/pin."""
+
+    pinned: bool = True
+
+
+@router.post("/deployments/{name}/pin")
+async def pin_deployment(
+    name: str, request: PinRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    """Set/clear a deployment's eviction shield (PR-4): never evicted while
+    pinned. An event (not an in-place write) because ``pinned`` lives in
+    ``deployments.json`` and only the serving service writes that file."""
+    del tenant
+    return await _fire_lifecycle_event(
+        name, event=PIN_EVENT, prefix="pin", extra={"pinned": request.pinned}
+    )
 
 
 @router.get("/store")

@@ -152,6 +152,41 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Dynamic lifecycle knobs (PR-4, design doc §4). All DOCIE_-prefixed like
+    # the other serving knobs.
+    #
+    # Idle-TTL unload: a hot, unpinned deployment that served nothing for this
+    # long is unloaded by the reconciler (record + port kept, phase=evicted,
+    # auto-reloadable on the next request). 0 disables idle unload entirely.
+    serving_idle_ttl_seconds: float = Field(
+        default=900.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "DOCIE_SERVING_IDLE_TTL_SECONDS", "serving_idle_ttl_seconds"
+        ),
+    )
+    # Minimum hot time before a deployment may be idle-unloaded or chosen as an
+    # eviction victim — the anti-thrash guard: a just-loaded model must not be
+    # immediately re-evicted by the load that follows it.
+    serving_min_hot_seconds: float = Field(
+        default=120.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "DOCIE_SERVING_MIN_HOT_SECONDS", "serving_min_hot_seconds"
+        ),
+    )
+    # Eviction rate limit (storm guard): at most this many victims per load
+    # attempt / reconcile cycle. If the allowed victims cannot make the
+    # candidate fit, NOTHING is evicted (never evict-to-not-fit).
+    serving_max_evictions_per_cycle: int = Field(
+        default=2,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "DOCIE_SERVING_MAX_EVICTIONS_PER_CYCLE", "serving_max_evictions_per_cycle"
+        ),
+    )
+
     openai_compat_base_url: str = "http://llm-llamacpp:8000/v1"
     openai_compat_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
     openai_compat_model: str = "local-model"

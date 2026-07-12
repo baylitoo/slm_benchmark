@@ -119,6 +119,17 @@ export interface RuntimeCapability {
   [k: string]: unknown;
 }
 
+/** The reconciler's per-cycle observed overlay on a deployment (PR-1/PR-4). */
+export interface ObservedPlacement {
+  phase?: string | null; // hot | loading | cold | evicted | failed
+  rss_bytes?: number | null;
+  health_ok?: boolean | null;
+  endpoint?: string | null;
+  last_error?: string | null;
+  last_probe_at?: string | null;
+  [k: string]: unknown;
+}
+
 /** A deployment record (GET /v1/serving/deployments). */
 export interface DeploymentRecord {
   spec?: {
@@ -141,6 +152,24 @@ export interface DeploymentRecord {
   restart_count?: number;
   last_error?: string | null;
   updated_at?: number;
+  /** Lifecycle-control metadata (PR-4): who stopped it — "manual" stays cold,
+   * "managed" (evicted) auto-reloads on the next request. */
+  activation?: string;
+  /** Pinned deployments are never chosen for idle unload / eviction. */
+  pinned?: boolean;
+  last_served?: number | null;
+  /** Reconciler-published observed state; null until first published,
+   * observed_available=false when the database is unreachable. */
+  observed?: ObservedPlacement | null;
+  observed_available?: boolean;
+  [k: string]: unknown;
+}
+
+/** Response of the lifecycle action endpoints (load/unload/pin/delete). */
+export interface LifecycleActionResponse {
+  event_ids: string[];
+  channel: string;
+  name: string;
   [k: string]: unknown;
 }
 
@@ -433,6 +462,46 @@ export function deployModel(payload: DeployRequest): Promise<TriggerResponse> {
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Deployment lifecycle actions (PR-4). Each fires a serving/* event at the
+// single-replica serving service and returns the event ids to poll.
+// ---------------------------------------------------------------------------
+
+/** Cold-start a deployment (idempotent server-side; may evict LRU victims). */
+export function loadDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/load`,
+    { method: "POST" },
+  );
+}
+
+/** Evict a deployment: process killed, record + port + row kept (phase=evicted). */
+export function unloadDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/unload`,
+    { method: "POST" },
+  );
+}
+
+/** Set/clear the eviction shield. */
+export function pinDeployment(
+  name: string,
+  pinned: boolean,
+): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/pin`,
+    { method: "POST", body: JSON.stringify({ pinned }) },
+  );
+}
+
+/** Real teardown: kills the process, frees the port, deletes the row. */
+export function deleteDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
 }
 
 /** Benchmark returns the same trigger shape as extract. */

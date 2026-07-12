@@ -41,6 +41,17 @@ logger = logging.getLogger("docie_bench.inngest.functions")
 
 MODELS_CONFIG_PATH = Path("configs/models.yaml")
 
+# Lifecycle event names (PR-4). Fired by the api endpoints and the worker's
+# cold-start-on-demand path; handled ONLY on the single-replica serving app.
+LOAD_EVENT = "serving/load.requested"
+UNLOAD_EVENT = "serving/unload.requested"
+PIN_EVENT = "serving/pin.requested"
+
+# Poll cadence for the worker-side await of a serving-side load (the worker
+# reads the shared deployments.json fresh; the serving reconciler/load handler
+# is what actually flips it READY).
+_AUTOLOAD_POLL_INTERVAL_S = 2.0
+
 
 def _resolve_profile(
     *, model_profile: str | None = None, deployment: str | None = None
@@ -75,12 +86,12 @@ def _record_observability(response: Any, tenant_id: str | None) -> None:
         logger.warning("record_extraction failed for a Studio extraction", exc_info=True)
 
 
-def _known_deployment(name: str) -> bool:
-    """True iff ``name`` is a deployment record in the shared deployments.json.
+def _read_deployment(name: str) -> dict[str, Any] | None:
+    """The raw deployment record dict from the shared deployments.json, or None.
 
     Cheap direct read (no supervisor construction, no mkdir side effects);
-    best-effort — any hiccup reads as "not a deployment" so recency stamping
-    can never fail an extraction.
+    best-effort — any hiccup reads as "no such deployment" so the callers
+    (recency stamping, autoload detection) can never fail an extraction.
     """
     import json
 
@@ -88,9 +99,87 @@ def _known_deployment(name: str) -> bool:
         payload = json.loads(
             (_serving_home() / "deployments.json").read_text(encoding="utf-8")
         )
-        return name in (payload.get("deployments") or {})
+        record = (payload.get("deployments") or {}).get(name)
+        return record if isinstance(record, dict) else None
     except (OSError, ValueError):
-        return False
+        return None
+
+
+def _known_deployment(name: str) -> bool:
+    """True iff ``name`` is a deployment record in the shared deployments.json."""
+    return _read_deployment(name) is not None
+
+
+def _deployment_is_live(record: dict[str, Any]) -> bool:
+    """Mirror of the resolver's ``_is_live`` gate over the raw record dict."""
+    return record.get("state") == "ready" and bool(record.get("endpoint"))
+
+
+def _autoload_target(data: dict[str, Any]) -> tuple[str, float] | None:
+    """(deployment name, size-aware wait budget) when a load must precede the
+    extraction — else None (PR-4 cold-start-on-demand, design §4).
+
+    The target is the explicit ``deployment`` selector, or a ``model_profile``
+    that names a deployment record. A load is warranted when the record is
+    not live AND either
+
+    * ``desired_state == running`` — a load/deploy is already in flight
+      (still STARTING); the request waits instead of 502ing, or
+    * ``activation == managed`` — the autoloader evicted it; a request may
+      auto-reload it.
+
+    ``activation == manual`` (user pressed Stop) NEVER auto-loads: the
+    resolver then raises its honest "not a live deployment" error downstream.
+    The resolver itself stays pure — this is the only side-effectful seam,
+    and it lives in the worker path, not in ``resolve_extraction_profile``.
+    """
+    from docie_bench.serving.lifecycle import load_timeout_s
+
+    explicit = data.get("deployment")
+    candidate = explicit or data.get("model_profile")
+    if not candidate:
+        return None
+    name = str(candidate)
+    record = _read_deployment(name)
+    if record is None or _deployment_is_live(record):
+        return None
+    spec = record.get("spec") or {}
+    desired = str(spec.get("desired_state") or "")
+    activation = str(record.get("activation") or "")
+    if desired != "running" and activation != "managed":
+        return None  # manual cold (or unknown): stays cold until explicit Start
+    launch = spec.get("launch") or {}
+    model_path = launch.get("model")
+    timeout = load_timeout_s(str(model_path) if model_path else None)
+    return name, timeout
+
+
+async def _await_deployment_live(
+    name: str,
+    *,
+    timeout_s: float,
+    interval_s: float = _AUTOLOAD_POLL_INTERVAL_S,
+) -> dict[str, Any]:
+    """Wait (bounded, size-aware) until ``name`` is READY with an endpoint.
+
+    The worker cannot observe the serving container's processes; it polls the
+    shared ``deployments.json`` that the serving service ``_save()``s as the
+    load progresses. Fails honestly ONLY after the generous size-aware budget
+    (design fix #7) — never a fast 502 on a cold managed deployment.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while True:
+        record = _read_deployment(name)
+        if record is not None and _deployment_is_live(record):
+            return {"deployment": name, "state": "ready", "endpoint": record.get("endpoint")}
+        if asyncio.get_running_loop().time() >= deadline:
+            detail = (record or {}).get("last_error")
+            raise TimeoutError(
+                f"deployment {name!r} did not become ready within the "
+                f"{timeout_s:.0f}s size-aware load budget"
+                + (f" (last_error: {detail})" if detail else "")
+            )
+        await asyncio.sleep(interval_s)
 
 
 def _stamp_deployment_recency(*, explicit: str | None, profile_name: str) -> None:
@@ -188,12 +277,36 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
       - ``ocr_backend`` (str?)    -- OCR backend for ``content_b64``
       - ``language`` (str?)
       - ``channel`` (str?)        -- realtime channel to publish to
+
+    Cold-start-on-demand (PR-4, design §4): when the request targets a
+    cold/evicted MANAGED deployment (or one whose load is already in flight),
+    this worker fires ``serving/load.requested`` at the single-replica serving
+    service and WAITS — as its own durable steps, so a step retry re-fires an
+    IDEMPOTENT load (the serving-side per-deployment lock makes N concurrent
+    requests one spawn) instead of double-spawning. The request never 502s on
+    a cold managed deployment; it fails honestly only after the generous
+    size-aware budget. TTFT for that first request = model load time —
+    explicitly accepted. A MANUALLY stopped deployment is never auto-loaded.
     """
     data = dict(ctx.event.data or {})
     channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "schema": data.get("schema_name")})
     try:
+        autoload = _autoload_target(data)
+        if autoload is not None:
+            target, budget_s = autoload
+            await publish(
+                channel, TOPIC_STATUS, {"state": "loading", "deployment": target}
+            )
+            await ctx.step.send_event(
+                "request-load",
+                inngest.Event(name=LOAD_EVENT, data={"name": target}),
+            )
+            await ctx.step.run(
+                "await-deployment-ready",
+                lambda: _await_deployment_live(target, timeout_s=budget_s),
+            )
         result = await ctx.step.run("extract", lambda: _run_extraction(data))
     except Exception as exc:  # noqa: BLE001 - surface error to the channel then re-raise
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
@@ -513,6 +626,119 @@ async def delete_deployment_job(ctx: inngest.Context) -> Any:
     return result
 
 
+def _required_name(data: dict[str, Any], action: str) -> str:
+    name = data.get("name")
+    if not name:
+        raise ValueError(f"{action} event must include 'name'")
+    return str(name)
+
+
+async def _run_load(data: dict[str, Any]) -> Any:
+    """Bring a deployment hot via the shared control plane (serving-side).
+
+    Idempotent by construction: the ControlPlane routes through the
+    per-deployment LoadCoordinator lock, so a re-delivered/retried event (or N
+    concurrent requests from scaled workers) can never double-spawn — the
+    design fix #7 precondition for running the load as its own durable step.
+    May evict LRU unpinned victims when that (and only that) makes the load
+    fit (design §4 eviction policy).
+    """
+    cp = _serving_control_plane()
+    return await cp.load(_required_name(data, "load"))
+
+
+@serving_client.create_function(
+    fn_id="serving-load",
+    trigger=inngest.TriggerEvent(event=LOAD_EVENT),
+)
+async def load_deployment_job(ctx: inngest.Context) -> Any:
+    """Cold-start a deployment on the single-replica serving service (PR-4).
+
+    Event ``data``: ``name`` (required), ``channel``. Runs ONLY on ``serving``
+    (the sole holder of the Popen handles). Blocks through a size-aware
+    ``await_ready`` inside a worker thread; publishes the final record.
+    """
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(channel, TOPIC_STATUS, {"state": "loading", "name": data.get("name")})
+    try:
+        result = await ctx.step.run("load", lambda: _run_load(data))
+    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
+        logger.exception("load_deployment_job failed (name=%s)", data.get("name"))
+        await _publish_error_safely(channel, str(exc))
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result
+
+
+async def _run_unload(data: dict[str, Any]) -> Any:
+    """The DISTINCT unload path (design fix #3): evict, never clear."""
+    cp = _serving_control_plane()
+    return await cp.unload(_required_name(data, "unload"))
+
+
+@serving_client.create_function(
+    fn_id="serving-unload",
+    trigger=inngest.TriggerEvent(event=UNLOAD_EVENT),
+)
+async def unload_deployment_job(ctx: inngest.Context) -> Any:
+    """Evict a deployment: kill the process, KEEP the record + port + row.
+
+    Event ``data``: ``name`` (required), ``channel``. Distinct from a user
+    Stop: the record flips ``activation=managed`` (phase=evicted), so the
+    next request to it auto-reloads instead of failing — where Stop stays
+    ``manual``/cold until an explicit Start.
+    """
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(channel, TOPIC_STATUS, {"state": "unloading", "name": data.get("name")})
+    try:
+        result = await ctx.step.run("unload", lambda: _run_unload(data))
+    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
+        logger.exception("unload_deployment_job failed (name=%s)", data.get("name"))
+        await _publish_error_safely(channel, str(exc))
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result
+
+
+async def _run_pin(data: dict[str, Any]) -> Any:
+    cp = _serving_control_plane()
+    return await cp.pin(_required_name(data, "pin"), pinned=bool(data.get("pinned", True)))
+
+
+@serving_client.create_function(
+    fn_id="serving-pin",
+    trigger=inngest.TriggerEvent(event=PIN_EVENT),
+)
+async def pin_deployment_job(ctx: inngest.Context) -> Any:
+    """Set/clear a deployment's eviction shield (PR-4).
+
+    Event ``data``: ``name`` (required), ``pinned`` (bool, default true),
+    ``channel``. Handled on ``serving`` because ``pinned`` lives in
+    ``deployments.json`` and only the serving service may write that file
+    (single-writer, P1) — the api must never flip it in place.
+    """
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(
+        channel,
+        TOPIC_STATUS,
+        {"state": "pinning", "name": data.get("name"), "pinned": data.get("pinned", True)},
+    )
+    try:
+        result = await ctx.step.run("pin", lambda: _run_pin(data))
+    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
+        logger.exception("pin_deployment_job failed (name=%s)", data.get("name"))
+        await _publish_error_safely(channel, str(exc))
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result
+
+
 def _serving_home() -> Path:
     return Path(
         os.environ.get(
@@ -717,6 +943,9 @@ serving_functions = [
     deploy_model_job,
     seed_ollama_job,
     delete_deployment_job,
+    load_deployment_job,
+    unload_deployment_job,
+    pin_deployment_job,
 ]
 
 # Single-process default (local dev without the compose split): everything.
@@ -772,6 +1001,12 @@ __all__ = [
     "deploy_model_job",
     "seed_ollama_job",
     "delete_deployment_job",
+    "load_deployment_job",
+    "unload_deployment_job",
+    "pin_deployment_job",
     "gc_studio_runs_job",
     "benchmark_idempotency_key",
+    "LOAD_EVENT",
+    "UNLOAD_EVENT",
+    "PIN_EVENT",
 ]

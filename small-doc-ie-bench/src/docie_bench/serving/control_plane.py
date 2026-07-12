@@ -229,6 +229,12 @@ class Supervisor(Protocol):
 
     def remove(self, name: str) -> Result: ...
 
+    def load(self, name: str) -> Result: ...
+
+    def unload(self, name: str) -> Result: ...
+
+    def pin(self, name: str, *, pinned: bool) -> Result: ...
+
 
 class Planner(Protocol):
     def plan(self, model: str, *, runtime: str | None, replicas: int) -> Result: ...
@@ -395,6 +401,35 @@ class ControlPlane:
         terminate/kill timeouts and must not stall the Connect heartbeats.
         """
         result = await asyncio.to_thread(self.supervisor.remove, _required(name, "deployment"))
+        return to_data(await _resolve(result))
+
+    async def load(self, name: str) -> object:
+        """Bring a cold/evicted deployment hot (PR-4, §4 cold-start-on-demand).
+
+        Idempotent under the serving-side per-deployment load lock: N
+        concurrent loads (scaled workers, api button, step retries) funnel to
+        ONE spawn, an already-hot deployment is a no-op. Blocks through a
+        size-aware ``await_ready`` — threaded so a multi-minute GGUF load
+        never stalls the Connect heartbeats.
+        """
+        result = await asyncio.to_thread(self.supervisor.load, _required(name, "deployment"))
+        return to_data(await _resolve(result))
+
+    async def unload(self, name: str) -> object:
+        """Evict a deployment: kill the process, KEEP record + port + row.
+
+        The DISTINCT path from ``stop`` (design fix #3): activation flips to
+        ``managed`` so the next request auto-reloads it, and the placement row
+        is UPDATEd to ``phase=evicted`` — never cleared.
+        """
+        result = await asyncio.to_thread(self.supervisor.unload, _required(name, "deployment"))
+        return to_data(await _resolve(result))
+
+    async def pin(self, name: str, *, pinned: bool = True) -> object:
+        """Set/clear the eviction shield on a deployment (PR-4)."""
+        result = await asyncio.to_thread(
+            lambda: self.supervisor.pin(_required(name, "deployment"), pinned=pinned)
+        )
         return to_data(await _resolve(result))
 
     async def plan(
@@ -567,6 +602,10 @@ class _DefaultSupervisor:
         # and a fake prober so they never touch real sockets.
         self._port_range = port_range
         self._port_probe = port_probe
+        # PR-4 load coordinator (per-deployment load locks + fit/eviction),
+        # built lazily on first load() so read-only constructions (the api's
+        # per-request ControlPlane) never touch the footprints sidecars.
+        self._load_coordinator: Any = None
 
     def _reachability_hosts(self) -> tuple[str, str]:
         """Return ``(bind_host, advertise_host)`` for a deploy on this node."""
@@ -862,6 +901,38 @@ class _DefaultSupervisor:
         _clear_placement(name)
         return result if result is not None else {"name": name, "removed": True}
 
+    # ------------------------------------------------------- lifecycle (PR-4)
+    def _coordinator(self) -> Any:
+        """The shared LoadCoordinator (lazy; one per supervisor => one lock map).
+
+        Its eviction executor is THIS wrapper's ``unload`` so every victim
+        goes through the placement-row UPDATE, exactly like a direct unload.
+        """
+        if self._load_coordinator is None:
+            from docie_bench.serving.lifecycle import LoadCoordinator
+
+            self._load_coordinator = LoadCoordinator(self.backend, unload=self.unload)
+        return self._load_coordinator
+
+    def load(self, name: str) -> object:
+        """Cold-start a deployment (idempotent; may evict LRU victims, §4)."""
+        record = self._coordinator().load(name)
+        # Refresh the existing placement row so store:<name> resolution sees
+        # the live endpoint immediately instead of one reconcile cycle later
+        # (the row itself was RETAINED by unload — that is the whole point).
+        _mark_placement_ready(name, endpoint=str(record.endpoint or ""))
+        return record
+
+    def unload(self, name: str) -> object:
+        """The DISTINCT unload path (design fix #3): UPDATE to evicted, never
+        clear. Record and port reservation are retained by the backend."""
+        result = self.backend.unload(name)
+        _mark_placement_stopped(name, phase="evicted")
+        return result
+
+    def pin(self, name: str, *, pinned: bool) -> object:
+        return self.backend.pin(name, pinned=pinned)
+
 
 def _record_placement(model_name: str, record: object) -> None:
     """Upsert the catalog placement of a deployed store model (best-effort).
@@ -896,22 +967,42 @@ def _record_placement(model_name: str, record: object) -> None:
         logger.warning("could not record catalog placement for %r", model_name, exc_info=True)
 
 
-def _mark_placement_stopped(name: str) -> None:
-    """UPDATE the placement of a stopped deployment to cold/"" (best-effort).
+def _mark_placement_stopped(name: str, *, phase: str = "cold") -> None:
+    """UPDATE the placement of a stopped deployment to ``phase``/"" (best-effort).
 
-    The stop-side sibling of ``_record_placement``: keeps the row (deletion is
-    ``remove``'s job only, design fix #3) while making it non-routable
-    (``endpoint=""``). Best-effort: no DATABASE_URL / a DB hiccup must never
-    block stopping a local process.
+    The stop/unload-side sibling of ``_record_placement``: keeps the row
+    (deletion is ``remove``'s job only, design fix #3) while making it
+    non-routable (``endpoint=""``). ``phase="cold"`` for a user Stop,
+    ``"evicted"`` for the PR-4 unload path. Best-effort: no DATABASE_URL / a
+    DB hiccup must never block stopping a local process.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
     try:
-        ModelCatalog().mark_placement_stopped(name, phase="cold")
+        ModelCatalog().mark_placement_stopped(name, phase=phase)
     except CatalogUnavailableError:
         pass  # no DATABASE_URL -> nothing was ever recorded; nothing to update
     except Exception:  # noqa: BLE001 - staleness cleanup must not fail the stop
         logger.warning("could not mark catalog placement stopped for %r", name, exc_info=True)
+
+
+def _mark_placement_ready(name: str, *, endpoint: str) -> None:
+    """UPDATE an existing placement row to ready/hot after a load (best-effort).
+
+    The load-side sibling of ``_mark_placement_stopped``: closes the
+    up-to-one-cycle window where a just-reloaded store model's row still says
+    ``evicted``/``endpoint=""`` and ``store:<name>`` refuses to route. Never
+    creates a row (the reconciler owns creation); no DATABASE_URL / a DB
+    hiccup must never fail a load that already succeeded.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        ModelCatalog().mark_placement_ready(name, endpoint=endpoint)
+    except CatalogUnavailableError:
+        pass  # no DATABASE_URL -> nothing was ever recorded; nothing to update
+    except Exception:  # noqa: BLE001 - discoverability must not fail the load
+        logger.warning("could not mark catalog placement ready for %r", name, exc_info=True)
 
 
 def _clear_placement(name: str) -> None:

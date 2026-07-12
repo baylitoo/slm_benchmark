@@ -630,6 +630,29 @@ class ModelCatalog:
             row = session.get(ServingNode, SERVING_NODE_ROW_ID)
             return _node_view(row) if row is not None else None
 
+    def mark_placement_ready(self, name: str, *, endpoint: str) -> bool:
+        """UPDATE an existing row to ready/hot after a load (PR-4, no create).
+
+        The load-side sibling of ``mark_placement_stopped``: an evicted row
+        holds ``endpoint=""`` and would keep ``store:<name>`` refusing to
+        route for up to one reconcile cycle after the model is actually hot —
+        this closes that window. Deliberately never CREATEs a row: the
+        reconciler owns row creation for never-recorded deployments (its
+        ``publish_observed`` fills engine/model_name properly). Returns False
+        when no row exists.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ModelPlacement, name)
+            if row is None:
+                return False
+            row.state = "ready"
+            row.endpoint = endpoint
+            row.phase = "hot"
+            row.health_ok = True
+            return True
+
     def mark_placement_stopped(self, name: str, *, phase: str = "cold") -> bool:
         """UPDATE a stopped deployment's row instead of deleting it (fix #3).
 
