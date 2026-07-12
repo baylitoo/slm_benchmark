@@ -1,8 +1,11 @@
 """Deployment placements: the catalog binding that makes deploys discoverable.
 
-The deploy job records *where* a model is served (``ModelPlacement``); stopping
-the deployment clears it. Without this table an extraction has no way to find
-the endpoint a deploy just created — the deploy/extraction disconnect.
+The deploy job records *where* a model is served (``ModelPlacement``). PR-1
+row lifecycle (design fix #3): stopping a deployment RETAINS the row and
+UPDATEs it non-routable (``state=stopped``, ``endpoint=""``, ``phase=cold``)
+so display/auto-reload metadata survive; only ``remove`` DELETEs it. Without
+this table an extraction has no way to find the endpoint a deploy just
+created — the deploy/extraction disconnect.
 """
 
 from __future__ import annotations
@@ -198,7 +201,8 @@ def test_cli_stop_lazily_initializes_engine(tmp_path: Path, monkeypatch) -> None
     catalog seam lazily initializes it from DATABASE_URL, otherwise the
     staleness cleanup silently no-ops and store:<name> keeps resolving to a
     dead endpoint after every stop — the exact staleness the stop/remove hooks
-    exist to prevent."""
+    exist to prevent. PR-1: the cleanup is now an UPDATE (endpoint="") that
+    retains the row, not a delete."""
     from docie_bench.settings import get_settings
 
     db.dispose_engine()
@@ -209,7 +213,10 @@ def test_cli_stop_lazily_initializes_engine(tmp_path: Path, monkeypatch) -> None
         supervisor = _DefaultSupervisor(_FakeSupervisorBackend(), planner=None)
 
         supervisor.stop("invoice-extractor")
-        assert ModelCatalog().get_placement("invoice-extractor") is None
+        placement = ModelCatalog().get_placement("invoice-extractor")
+        assert placement is not None  # retained (delete is remove()'s job only)
+        assert placement["endpoint"] == ""  # but no longer routable
+        assert placement["state"] == "stopped"
     finally:
         get_settings.cache_clear()
         db.dispose_engine()
@@ -228,13 +235,21 @@ class _FakeSupervisorBackend:
         self.removed.append(name)
 
 
-def test_stop_clears_placement(_sqlite_catalog: None) -> None:
+def test_stop_updates_placement_instead_of_clearing(_sqlite_catalog: None) -> None:
+    """PR-1 (design fix #3): stop UPDATEs the row cold/non-routable; only
+    remove() deletes. An evicted/stopped deployment must keep its row so the
+    Board (and PR-4's auto-reload) still see it."""
     catalog = ModelCatalog()
     _record(catalog)
     supervisor = _DefaultSupervisor(_FakeSupervisorBackend(), planner=None)
 
     supervisor.stop("invoice-extractor")
-    assert catalog.get_placement("invoice-extractor") is None
+    placement = catalog.get_placement("invoice-extractor")
+    assert placement is not None
+    assert placement["state"] == "stopped"
+    assert placement["endpoint"] == ""  # readers treat "" as "no live endpoint"
+    assert placement["phase"] == "cold"
+    assert placement["health_ok"] is False
 
 
 def test_remove_clears_placement(_sqlite_catalog: None) -> None:

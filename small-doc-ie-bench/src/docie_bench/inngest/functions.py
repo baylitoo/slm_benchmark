@@ -24,7 +24,7 @@ from typing import Any
 import inngest
 
 from docie_bench.extract.service import ExtractionService, hash_bytes
-from docie_bench.inngest.client import inngest_client
+from docie_bench.inngest.client import inngest_client, serving_client
 from docie_bench.inngest.realtime import (
     TOPIC_ERROR,
     TOPIC_RESULT,
@@ -74,6 +74,45 @@ def _record_observability(response: Any, tenant_id: str | None) -> None:
         logger.warning("record_extraction failed for a Studio extraction", exc_info=True)
 
 
+def _known_deployment(name: str) -> bool:
+    """True iff ``name`` is a deployment record in the shared deployments.json.
+
+    Cheap direct read (no supervisor construction, no mkdir side effects);
+    best-effort — any hiccup reads as "not a deployment" so recency stamping
+    can never fail an extraction.
+    """
+    import json
+
+    try:
+        payload = json.loads(
+            (_serving_home() / "deployments.json").read_text(encoding="utf-8")
+        )
+        return name in (payload.get("deployments") or {})
+    except (OSError, ValueError):
+        return False
+
+
+def _stamp_deployment_recency(*, explicit: str | None, profile_name: str) -> None:
+    """Stamp the per-deployment recency sidecar after a served extraction (PR-1).
+
+    ``last_served`` is the PR-4 LRU/idle input; it must be written by the code
+    path that actually serves traffic — this scaled worker — but workers must
+    NEVER write ``deployments.json`` (single-writer, design §0.1/P1). So the
+    stamp goes to ``serving-state/recency/<name>`` (atomic single-key sidecar,
+    monotonic max semantics) and the serving-side reconciler folds it into the
+    record. Stamps the explicit ``deployment`` selector when given, else the
+    resolved profile name iff it names a deployment record (a plain
+    models.yaml profile is not a deployment and gets no sidecar).
+    """
+    from docie_bench.serving import recency
+
+    target = explicit
+    if target is None and _known_deployment(profile_name):
+        target = profile_name
+    if target:
+        recency.stamp(str(target))
+
+
 async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     """Run one extraction from event data; returns a JSON-serializable result."""
     schema_name = data.get("schema_name", "invoice")
@@ -95,6 +134,9 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
             metadata={"source": "inngest"},
         )
         _record_observability(response, tenant_id)
+        _stamp_deployment_recency(
+            explicit=data.get("deployment"), profile_name=profile.name
+        )
         return response.model_dump(mode="json")
 
     content_b64 = data.get("content_b64")
@@ -122,6 +164,7 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     finally:
         tmp_path.unlink(missing_ok=True)
     _record_observability(response, tenant_id)
+    _stamp_deployment_recency(explicit=data.get("deployment"), profile_name=profile.name)
     return response.model_dump(mode="json")
 
 
@@ -146,7 +189,7 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
       - ``channel`` (str?)        -- realtime channel to publish to
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "schema": data.get("schema_name")})
     try:
@@ -292,7 +335,7 @@ async def run_benchmark_job(ctx: inngest.Context) -> dict[str, Any]:
     ``tenant_id`` (bound at trigger time), ``idempotency_key`` (optional).
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
     event_id = ctx.event.id
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "dataset": data.get("dataset")})
@@ -394,7 +437,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     return record
 
 
-@inngest_client.create_function(
+@serving_client.create_function(
     fn_id="serving-deploy",
     trigger=inngest.TriggerEvent(event="serving/deploy.requested"),
 )
@@ -406,28 +449,64 @@ async def deploy_model_job(ctx: inngest.Context) -> Any:
 
     Reachability (PR-1): the runtime now binds ``DOCIE_SERVING_BIND_HOST``
     (0.0.0.0) and the DeploymentRecord advertises ``DOCIE_SERVING_ADVERTISE_HOST``
-    (the compose service name, e.g. ``worker``), so the api container resolves a
-    cross-container-reachable endpoint instead of a worker-local loopback.
+    — the single-replica ``serving`` compose service's own name (pinned in
+    docker-compose.yml, independent of any legacy .env value) — so the api
+    container resolves a cross-container-reachable endpoint that always names
+    the one node that ran the deploy.
 
-    NOTE: still requires worker ``scale=1``. The advertised service name
-    round-robins under ``--scale worker>1`` and may resolve to a replica that
-    never ran the deploy (deterministic scale>1 needs a dedicated single-replica
-    serving service; deferred). This is no longer a silent, intermittent failure:
-    the control plane now FAILS FAST at deploy time when the advertise host
-    resolves to more than one address (see
+    Belt-and-suspenders: the control plane still FAILS FAST at deploy time when
+    the advertise host resolves to more than one address (see
     ``_DefaultSupervisor._guard_deterministic_advertise``), surfacing a clear
-    error on the ``error`` topic instead of recording a flaky endpoint. Also needs
-    the ``llama-server`` binary on PATH + a seeded model store; without them
-    deploys fail cleanly on the ``error`` topic.
+    error on the ``error`` topic instead of recording a flaky endpoint. Also
+    needs the ``llama-server`` binary on PATH + a seeded model store; without
+    them deploys fail cleanly on the ``error`` topic.
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "model": data.get("model")})
     try:
         result = await ctx.step.run("deploy", lambda: _run_deploy(data))
     except Exception as exc:  # noqa: BLE001 - surface error then re-raise
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result
+
+
+async def _run_delete(data: dict[str, Any]) -> Any:
+    """Tear a deployment down for real: process, record, port, placement row."""
+    name = data.get("name")
+    if not name:
+        raise ValueError("delete event must include 'name'")
+    cp = _serving_control_plane()
+    return await cp.remove(str(name))
+
+
+@serving_client.create_function(
+    fn_id="serving-delete",
+    trigger=inngest.TriggerEvent(event="serving/delete.requested"),
+)
+async def delete_deployment_job(ctx: inngest.Context) -> Any:
+    """Real teardown (PR-1): the only path that DELETEs a placement row.
+
+    Event ``data``: ``name`` (required, the deployment record name), ``channel``.
+
+    Runs on the single-replica ``serving`` service (it holds the Popen handle
+    to kill). Kills the runtime process, deletes the deployment record (which
+    frees its port reservation — ``_reserved_ports`` scans records), and
+    DELETEs the ``model_placement`` row. An unknown name surfaces a KeyError
+    on the error topic.
+    """
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(channel, TOPIC_STATUS, {"state": "deleting", "name": data.get("name")})
+    try:
+        result = await ctx.step.run("delete", lambda: _run_delete(data))
+    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
+        logger.exception("delete_deployment_job failed (name=%s)", data.get("name"))
+        await _publish_error_safely(str(channel), str(exc))
         raise
     await publish(channel, TOPIC_RESULT, result)
     return result
@@ -527,7 +606,7 @@ async def _publish_error_safely(channel: str, message: str) -> None:
         logger.exception("failed to publish error to channel %s", channel)
 
 
-@inngest_client.create_function(
+@serving_client.create_function(
     fn_id="serving-seed-ollama",
     trigger=inngest.TriggerEvent(event="serving/seed.requested"),
 )
@@ -607,20 +686,91 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
     return await ctx.step.run("gc-studio-runs", _gc_studio_runs)
 
 
-functions = [
+# --------------------------------------------------------------------- roles
+# P1 (design doc §0.1): the compose topology splits the old `worker` into a
+# dedicated single-replica `serving` service (owns every function that spawns
+# or kills a runtime process, plus the background reconciler) and a freely
+# scaled `worker` service (extraction/benchmark/GC — replica-safe, never
+# spawns a runtime). Routing is load-bearing, and per the Inngest Connect
+# contract it requires TWO app ids, not one app with per-role subsets: every
+# worker sync (Connect handshake) registers its function list as the app's
+# authoritative set, so two fleets syncing DISJOINT sets under one app id
+# would overwrite each other's registration on every (re)connect — functions
+# flap between registered and archived, and a `serving/*` event may fire
+# while its function is deregistered. Hence:
+#   * `worker_functions`  are created on `inngest_client`  (app `docie-studio`)
+#   * `serving_functions` are created on `serving_client`  (app `docie-serving`)
+# Events still reach their handlers: event delivery routes by event NAME
+# within the environment, not by app, so `serving/*` events fired from the
+# api or a worker land on the serving app's functions unchanged.
+# Seed lives on `serving` too: it writes multi-GB blobs into the store the
+# serving service deploys from, and keeping every store/lifecycle writer on
+# the single replica keeps the write topology trivial.
+worker_functions = [
     extract_document,
     run_benchmark_job,
-    deploy_model_job,
-    seed_ollama_job,
     gc_studio_runs_job,
 ]
 
+serving_functions = [
+    deploy_model_job,
+    seed_ollama_job,
+    delete_deployment_job,
+]
+
+# Single-process default (local dev without the compose split): everything.
+functions = [*worker_functions, *serving_functions]
+
+
+def functions_for_role(role: str | None) -> list[Any]:
+    """The function set for a ``DOCIE_WORKER_ROLE`` (see worker.py)."""
+    normalized = (role or "all").strip().lower()
+    if normalized == "serving":
+        return list(serving_functions)
+    if normalized == "worker":
+        return list(worker_functions)
+    if normalized in {"all", ""}:
+        return list(functions)
+    raise ValueError(
+        f"unknown DOCIE_WORKER_ROLE {role!r}: expected 'serving', 'worker', or 'all'"
+    )
+
+
+def apps_for_role(role: str | None) -> list[tuple[Any, list[Any]]]:
+    """The ``(client, functions)`` app registrations for a role.
+
+    This is what ``connect()`` consumes. Each app id always carries its FULL
+    function set (never a subset), so no two processes can ever sync different
+    function lists for the same app — the flapping-registration failure mode
+    the two-app split exists to prevent. The ``all`` dev role registers BOTH
+    apps over the one connection (the SDK's `connect` is multi-app by design).
+    """
+    normalized = (role or "all").strip().lower()
+    if normalized == "serving":
+        return [(serving_client, list(serving_functions))]
+    if normalized == "worker":
+        return [(inngest_client, list(worker_functions))]
+    if normalized in {"all", ""}:
+        return [
+            (inngest_client, list(worker_functions)),
+            (serving_client, list(serving_functions)),
+        ]
+    raise ValueError(
+        f"unknown DOCIE_WORKER_ROLE {role!r}: expected 'serving', 'worker', or 'all'"
+    )
+
+
 __all__ = [
     "functions",
+    "worker_functions",
+    "serving_functions",
+    "functions_for_role",
+    "apps_for_role",
     "extract_document",
     "run_benchmark_job",
     "deploy_model_job",
     "seed_ollama_job",
+    "delete_deployment_job",
     "gc_studio_runs_job",
     "benchmark_idempotency_key",
 ]

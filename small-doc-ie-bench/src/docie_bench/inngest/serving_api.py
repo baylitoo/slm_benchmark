@@ -1,28 +1,36 @@
-"""Read-only serving endpoints for the DocIE Studio Deploy tab.
+"""Serving endpoints for the DocIE Studio Deploy tab.
 
 Thin wrappers over ``ControlPlane`` (the same facade the ``docie`` CLI drives),
 reading the shared serving home (``DOCIE_SERVING_HOME``, a named volume mounted
-on both ``api`` and ``worker``). Quick reads live here as plain HTTP; the
-long-running *deploy* action is an Inngest function (see ``functions.py`` /
-``studio_api.py``).
+on ``api``, ``serving`` and ``worker``). Quick reads live here as plain HTTP;
+mutations are Inngest events handled by the single-replica ``serving`` service
+(*deploy* via ``studio_api.py``; *delete* via ``DELETE /deployments/{name}``
+below, which fires ``serving/delete.requested``).
 
-Caveat: ``deployment_status`` checks process liveness in the *calling* process's
-namespace. The runtime is spawned in the ``worker`` container, so liveness read
-from the ``api`` container is approximate; static lists (models/runtimes/
-deployments) are exact since they come from the shared on-disk state.
+Liveness (PR-1): the api process still cannot see the serving container's PID
+namespace, but it no longer needs to — ``/deployments`` overlays the OBSERVED
+state (phase/rss/health) the in-``serving`` reconciler publishes to Postgres
+every cycle, degrading to the (reconciler-refreshed) ``deployments.json`` view
+when the database is down.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
+import inngest
 from fastapi import APIRouter, HTTPException
 
+from docie_bench.inngest.client import inngest_client
+from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
 from docie_bench.settings import get_settings
 
 router = APIRouter(prefix="/v1/serving", tags=["serving"])
+
+DELETE_EVENT = "serving/delete.requested"
 
 
 def _control_plane() -> ControlPlane:
@@ -46,9 +54,46 @@ async def list_runtimes() -> Any:
     return await _control_plane().list_runtimes()
 
 
+def _observed_placements() -> dict[str, dict[str, Any]] | None:
+    """The reconciler-published observed rows, keyed by name (None = DB down).
+
+    Best-effort: with no DATABASE_URL (or a DB hiccup) the Board degrades to
+    the fresh-but-lean ``deployments.json`` view — which the reconciler also
+    keeps de-staled via its per-cycle ``_save()`` — so Postgres is NOT required
+    to kill liveness staleness (design doc fix #8), only for RSS/phase.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        return {row["name"]: row for row in ModelCatalog().list_placements()}
+    except CatalogUnavailableError:
+        return None
+    except Exception:  # noqa: BLE001 - a DB hiccup must not 500 the Board
+        return None
+
+
 @router.get("/deployments")
 async def list_deployments() -> Any:
-    return await _control_plane().list_deployments()
+    """Deployment records overlaid with the reconciler's OBSERVED state (PR-1).
+
+    Each record gains an ``observed`` object (phase / pid / rss_bytes /
+    health_ok / last_probe_at / last_error / endpoint, from the Postgres
+    surface the reconciler UPDATEs every cycle) — ``None`` per record when the
+    reconciler has not published it, and ``observed_available: false`` on all
+    records when the database is unreachable (worker-local desired state only).
+    """
+    records = await _control_plane().list_deployments()
+    observed = _observed_placements()
+    if not isinstance(records, list):
+        return records
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        spec = record.get("spec") or {}
+        name = spec.get("name")
+        record["observed_available"] = observed is not None
+        record["observed"] = observed.get(name) if observed and name else None
+    return records
 
 
 @router.get("/ports")
@@ -114,6 +159,29 @@ async def deployment_status(name: str) -> Any:
         return await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/deployments/{name}")
+async def delete_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
+    """Fire the real-teardown event (PR-1): a delete that actually deletes.
+
+    The api cannot kill the runtime itself (different PID namespace), so this
+    fires ``serving/delete.requested`` at the single-replica ``serving``
+    service — the only process holding the Popen handle — which kills the
+    process, drops the record (freeing its port), and DELETEs the placement
+    row. Returns the event id(s) to poll; 404 for an unknown deployment so a
+    typo does not queue a no-op job.
+    """
+    del tenant  # authenticated principal required; no per-tenant scoping (ops surface)
+    try:
+        await _control_plane().deployment_status(name)
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    channel = f"delete:{uuid.uuid4().hex}"
+    ids = await inngest_client.send(
+        inngest.Event(name=DELETE_EVENT, data={"name": name, "channel": channel})
+    )
+    return {"event_ids": list(ids), "channel": channel, "name": name}
 
 
 @router.get("/store")

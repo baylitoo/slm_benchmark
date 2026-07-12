@@ -151,6 +151,15 @@ def init_engine(database_url: str | None = None) -> None:
 
     _engine = create_engine(resolved_url, pool_pre_ping=True)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
+    # Explicit forward migration BEFORE create_all: create_all never ALTERs an
+    # existing table, so a model_placement that predates the PR-1 observed
+    # columns must gain them here or the reconciler's first publish throws
+    # UndefinedColumn (the documented size_bytes hazard, handled explicitly for
+    # the placement table instead of trusted to create_all). No-op on fresh
+    # databases (create_all then creates the table complete).
+    from docie_bench.serving.catalog import ensure_placement_observed_columns
+
+    ensure_placement_observed_columns(_engine)
     Base.metadata.create_all(bind=_engine)
 
 

@@ -225,6 +225,8 @@ class Supervisor(Protocol):
 
     def stop(self, name: str) -> Result: ...
 
+    def remove(self, name: str) -> Result: ...
+
 
 class Planner(Protocol):
     def plan(self, model: str, *, runtime: str | None, replicas: int) -> Result: ...
@@ -331,16 +333,21 @@ class ControlPlane:
         runtime: str | None = None,
         replicas: int = 1,
     ) -> object:
-        return to_data(
-            await _resolve(
-                self.supervisor.serve(
-                    _required(model, "model"),
-                    name=_optional(name),
-                    runtime=_optional(runtime),
-                    replicas=_replicas(replicas),
-                )
-            )
+        # Threaded like up(): the runtime-specified deploy path blocks in
+        # deploy + await_ready (a bounded time.sleep poll while the model
+        # loads) plus a DNS resolve in the advertise guard. Running that on
+        # the event loop would stall the Inngest Connect heartbeats for the
+        # whole load (design doc fix #4). Argument validation stays eager so
+        # bad input raises before a thread is spawned; _resolve keeps the
+        # awaitable-backend contract for async test fakes.
+        result = await asyncio.to_thread(
+            self.supervisor.serve,
+            _required(model, "model"),
+            name=_optional(name),
+            runtime=_optional(runtime),
+            replicas=_replicas(replicas),
         )
+        return to_data(await _resolve(result))
 
     async def up(
         self,
@@ -364,10 +371,29 @@ class ControlPlane:
         )
 
     async def start(self, name: str) -> object:
-        return to_data(await _resolve(self.supervisor.start(_required(name, "deployment"))))
+        # Threaded: start() re-deploys (spawn + immediate health probe), which
+        # blocks on process spawn and the probe timeout — same rationale as
+        # serve()/stop() below.
+        result = await asyncio.to_thread(self.supervisor.start, _required(name, "deployment"))
+        return to_data(await _resolve(result))
 
     async def stop(self, name: str) -> object:
-        return to_data(await _resolve(self.supervisor.stop(_required(name, "deployment"))))
+        # Threaded: stop() reconciles to STOPPED, which blocks in the
+        # adapter's terminate/kill shutdown timeouts (up to ~10s per process)
+        # and the placement UPDATE. Must not stall Connect heartbeats.
+        result = await asyncio.to_thread(self.supervisor.stop, _required(name, "deployment"))
+        return to_data(await _resolve(result))
+
+    async def remove(self, name: str) -> object:
+        """Real teardown (PR-1): kill the process, drop the record, free the
+        port, DELETE the placement row — the previously-unreachable
+        ``_DefaultSupervisor.remove``, now on the facade so the
+        ``serving/delete.requested`` job and the API can actually delete.
+        Threaded like ``up()``: the shutdown can block up to the adapter's
+        terminate/kill timeouts and must not stall the Connect heartbeats.
+        """
+        result = await asyncio.to_thread(self.supervisor.remove, _required(name, "deployment"))
+        return to_data(await _resolve(result))
 
     async def plan(
         self,
@@ -817,13 +843,18 @@ class _DefaultSupervisor:
 
     def stop(self, name: str) -> object:
         result = self.backend.stop(name)
-        _clear_placement(name)
+        # PR-1 (design fix #3): a stop RETAINS the placement row and UPDATEs it
+        # (state=stopped, endpoint="", phase=cold) so display + future
+        # auto-reload metadata survive; endpoint "" stops routing immediately.
+        # Deleting the row is remove()'s job ONLY.
+        _mark_placement_stopped(name)
         return result
 
     def remove(self, name: str) -> object:
+        """The one true delete: kill process, drop record + port, DELETE row."""
         result = self.backend.remove(name)
         _clear_placement(name)
-        return result
+        return result if result is not None else {"name": name, "removed": True}
 
 
 def _record_placement(model_name: str, record: object) -> None:
@@ -859,12 +890,31 @@ def _record_placement(model_name: str, record: object) -> None:
         logger.warning("could not record catalog placement for %r", model_name, exc_info=True)
 
 
-def _clear_placement(name: str) -> None:
-    """Drop the catalog placement of a stopped/removed deployment (best-effort).
+def _mark_placement_stopped(name: str) -> None:
+    """UPDATE the placement of a stopped deployment to cold/"" (best-effort).
 
-    Without this, ``store:<model>`` would keep resolving to a dead endpoint
-    after ``docie stop``. Best-effort by design: a missing DATABASE_URL or a DB
-    hiccup must never block stopping a local process.
+    The stop-side sibling of ``_record_placement``: keeps the row (deletion is
+    ``remove``'s job only, design fix #3) while making it non-routable
+    (``endpoint=""``). Best-effort: no DATABASE_URL / a DB hiccup must never
+    block stopping a local process.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        ModelCatalog().mark_placement_stopped(name, phase="cold")
+    except CatalogUnavailableError:
+        pass  # no DATABASE_URL -> nothing was ever recorded; nothing to update
+    except Exception:  # noqa: BLE001 - staleness cleanup must not fail the stop
+        logger.warning("could not mark catalog placement stopped for %r", name, exc_info=True)
+
+
+def _clear_placement(name: str) -> None:
+    """DELETE the catalog placement of a REMOVED deployment (best-effort).
+
+    PR-1: this is the only path that deletes a placement row — ``stop`` now
+    UPDATEs via ``_mark_placement_stopped`` instead (design fix #3).
+    Best-effort by design: a missing DATABASE_URL or a DB hiccup must never
+    block tearing down a local process.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
