@@ -39,6 +39,7 @@ once there is one, stay conservative about the ramp.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -91,11 +92,38 @@ def _serving_home() -> Path:
 
 @dataclass(frozen=True)
 class NodeMemory:
-    """One node RAM reading, honest about where the numbers came from."""
+    """One node RAM reading, honest about where the numbers came from.
+
+    ``reclaimable_bytes`` flags the page-cache adjustment applied to
+    ``free_bytes`` (cgroup readings only; see :func:`read_cgroup_memory`): a
+    non-zero value says "free was computed against the WORKING SET, not raw
+    ``memory.current``" — 0 means no adjustment was applicable/measurable.
+    """
 
     total_bytes: int
     free_bytes: int
     source: str  # "cgroup" (authoritative limit) | "vm" (soft: VM/host view)
+    reclaimable_bytes: int = 0  # inactive_file page cache excluded from "used"
+
+
+def _read_inactive_file_bytes(root: Path) -> int:
+    """``inactive_file`` from ``memory.stat`` (0 when missing/corrupt).
+
+    Best-effort by design: an authoritative ``memory.max`` limit must never be
+    discarded because the reclaim adjustment could not be measured.
+    """
+    try:
+        text = (root / "memory.stat").read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return 0
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "inactive_file":
+            try:
+                return max(int(parts[1]), 0)
+            except ValueError:
+                return 0
+    return 0
 
 
 def read_cgroup_memory(root: Path = CGROUP_V2_ROOT) -> NodeMemory | None:
@@ -106,6 +134,22 @@ def read_cgroup_memory(root: Path = CGROUP_V2_ROOT) -> NodeMemory | None:
     limit configured => the cgroup ceiling is not a sizing denominator).
     ``memory.current`` is best-effort: missing/corrupt reads as 0 used rather
     than discarding an authoritative limit.
+
+    Reclaimable page cache (PR-2 review fix): ``memory.current`` INCLUDES page
+    cache, and llama.cpp mmaps multi-GB GGUFs — those file pages linger as
+    cache long after an unload, so ``limit - current`` would keep reporting
+    the node nearly full and wreck sizing. Standard cgroup-v2 working-set
+    accounting subtracts the reclaimable file cache::
+
+        working_set = memory.current - memory.stat:inactive_file
+        free        = memory.max - working_set
+
+    We deliberately subtract only ``inactive_file`` (not all of ``file``):
+    ``active_file`` pages are recently referenced — e.g. the resident weights
+    of a HOT model — and pricing them as free would over-commit the node;
+    ``inactive_file`` is what the kernel reclaims first under pressure. The
+    adjustment is flagged in the reading (``reclaimable_bytes``) so the
+    published snapshot can say the number is reclaim-adjusted.
     """
     try:
         raw_limit = (root / "memory.max").read_text(encoding="ascii").strip()
@@ -123,15 +167,23 @@ def read_cgroup_memory(root: Path = CGROUP_V2_ROOT) -> NodeMemory | None:
         current = int((root / "memory.current").read_text(encoding="ascii").strip())
     except (OSError, ValueError, UnicodeDecodeError):
         current = 0
+    # Never subtract more than what is actually accounted as used.
+    reclaimable = min(_read_inactive_file_bytes(root), max(current, 0))
+    working_set = max(current - reclaimable, 0)
     return NodeMemory(
         total_bytes=total,
-        free_bytes=max(total - current, 0),
+        free_bytes=max(total - working_set, 0),
         source="cgroup",
+        reclaimable_bytes=reclaimable,
     )
 
 
 def read_vm_memory() -> NodeMemory:
-    """psutil view of the VM/host — the soft fallback, flagged ``source=vm``."""
+    """psutil view of the VM/host — the soft fallback, flagged ``source=vm``.
+
+    ``psutil.virtual_memory().available`` already accounts for reclaimable
+    cache, so no explicit adjustment applies (``reclaimable_bytes=0``).
+    """
     import psutil
 
     virtual = psutil.virtual_memory()
@@ -249,17 +301,32 @@ def footprint_bytes(predicted: int, observed_steady_rss: int | None) -> int:
     return max(predicted, observed_steady_rss or 0)
 
 
+# Calibration-key scheme version. v1 keyed on the file BASENAME — but the
+# canonical store names EVERY model's weights ``model.gguf``
+# (<root>/<name>/model.gguf), so v1 collapsed all store models into ONE shared
+# calibration entry and poisoned sizing across models. The prefix versions the
+# scheme so pre-v2 sidecars can never be read again (FootprintStore purges
+# them on sight).
+_FOOTPRINT_KEY_PREFIX = "v2-"
+
+
 def footprint_key(model: str) -> str:
     """Stable per-MODEL calibration key from a launch model reference.
 
-    Uses the file name (two deployments serving the same GGUF share one
-    calibration), digesting anything filesystem-unsafe so a hostile name can
-    never traverse out of the footprints directory.
+    Keyed by the FULL reference (path), never the bare basename: uniqueness
+    comes from a digest of the whole string, so ``<root>/a/model.gguf`` and
+    ``<root>/b/model.gguf`` — distinct store models with identical basenames —
+    calibrate independently. Two deployments launching the SAME path still
+    share one calibration. The basename is kept in the key (when
+    filesystem-safe) purely so sidecar files stay human-readable; a hostile
+    name degrades to digest-only and can never traverse out of the footprints
+    directory.
     """
-    name = Path(model).name if model else model
+    digest = hashlib.sha256(model.encode("utf-8")).hexdigest()[:16]
+    name = Path(model).name if model else ""
     if name and _SAFE_NAME.match(name):
-        return name
-    return "sha256-" + hashlib.sha256(model.encode("utf-8")).hexdigest()
+        return f"{_FOOTPRINT_KEY_PREFIX}{name}-{digest}"
+    return f"{_FOOTPRINT_KEY_PREFIX}sha256-{digest}"
 
 
 # ------------------------------------------------------ persisted footprints
@@ -275,18 +342,25 @@ class FootprintStore:
     keeps the MAX of steady-state samples: successive steady readings can
     still creep up as stragglers page in, and sizing must stay conservative.
     Everything is best-effort — a disk hiccup must never fail a reconcile.
+
+    Methods take the raw MODEL REFERENCE (launch model path) and derive the
+    sidecar name via :func:`footprint_key` exactly once. Pre-v2 sidecars
+    (basename-keyed — one shared ``model.gguf`` entry for every store model,
+    i.e. cross-model-poisoned data) are purged on construction so they can
+    never leak into sizing again.
     """
 
     def __init__(self, home: Path | None = None) -> None:
         self._directory = (home if home is not None else _serving_home()) / "footprints"
+        self._purge_legacy_keys()
 
     @property
     def directory(self) -> Path:
         return self._directory
 
-    def get(self, key: str) -> int | None:
-        """Last calibrated steady-state RSS for ``key`` (None = never observed)."""
-        path = self._directory / footprint_key(key)
+    def get(self, model: str) -> int | None:
+        """Last calibrated steady-state RSS for ``model`` (None = never observed)."""
+        path = self._directory / footprint_key(model)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             rss = int(payload["rss_bytes"])
@@ -294,16 +368,16 @@ class FootprintStore:
             return None
         return rss if rss > 0 else None
 
-    def record_steady(self, key: str, rss_bytes: int) -> None:
+    def record_steady(self, model: str, rss_bytes: int) -> None:
         """Persist one steady-state sample (monotonic max; best-effort)."""
         if rss_bytes <= 0:
             return
-        current = self.get(key)
+        current = self.get(model)
         if current is not None and current >= rss_bytes:
             return
         try:
             self._directory.mkdir(parents=True, exist_ok=True)
-            target = self._directory / footprint_key(key)
+            target = self._directory / footprint_key(model)
             temporary = self._directory / f".{target.name}.tmp"
             temporary.write_text(
                 json.dumps(
@@ -313,7 +387,24 @@ class FootprintStore:
             )
             os.replace(temporary, target)
         except OSError:  # pragma: no cover - disk hiccup must not fail a cycle
-            logger.warning("could not persist footprint for %r", key, exc_info=True)
+            logger.warning("could not persist footprint for %r", model, exc_info=True)
+
+    def _purge_legacy_keys(self) -> None:
+        """Delete every pre-v2 sidecar (and stray tmp) — best-effort.
+
+        v1 keys were file basenames, which the canonical store collapses to a
+        single shared ``model.gguf`` entry across ALL models: that data is
+        cross-model poisoned by construction, so it is invalidated (deleted),
+        never migrated — there is no way to know which model wrote it.
+        """
+        try:
+            entries = list(self._directory.iterdir())
+        except OSError:  # missing directory: nothing to purge
+            return
+        for entry in entries:
+            if not entry.name.startswith(_FOOTPRINT_KEY_PREFIX):
+                with contextlib.suppress(OSError):
+                    entry.unlink()
 
 
 # --------------------------------------------------------------- the tracker
@@ -344,6 +435,10 @@ class NodeSnapshot:
     free_bytes: int
     source: str  # "cgroup" | "vm" — the UI's soft-number badge input
     sum_rss_bytes: int  # sum of live (hot/loading) runtime RSS this cycle
+    # Reclaimable page cache excluded from "used" when computing free_bytes
+    # (cgroup working-set accounting; 0 = no adjustment applied). Published so
+    # readers know the free number is reclaim-adjusted, not raw memory.current.
+    reclaimable_bytes: int = 0
 
 
 class ResourceTracker:
@@ -395,11 +490,12 @@ class ResourceTracker:
             free_bytes=memory.free_bytes,
             source=memory.source,
             sum_rss_bytes=sum_rss,
+            reclaimable_bytes=memory.reclaimable_bytes,
         )
 
     def footprint_for(self, model: str, predicted: int) -> int:
         """Calibrated working footprint: ``max(observed_steady, predicted)``."""
-        return footprint_bytes(predicted, self.footprints.get(footprint_key(model)))
+        return footprint_bytes(predicted, self.footprints.get(model))
 
     def _calibrate(self, observations: Iterable[Observation]) -> None:
         seen: set[str] = set()
@@ -419,7 +515,7 @@ class ResourceTracker:
                 continue  # not enough consecutive hot samples to call it steady
             if abs(observed.rss_bytes - previous) > self.stability_fraction * previous:
                 continue  # still climbing: pages are faulting in
-            self.footprints.record_steady(footprint_key(observed.model), observed.rss_bytes)
+            self.footprints.record_steady(observed.model, observed.rss_bytes)
         # Forget deployments that no longer exist.
         for stale in set(self._hot_streak) - seen:
             del self._hot_streak[stale]
@@ -446,6 +542,7 @@ def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
             free_bytes=snapshot.free_bytes,
             source=snapshot.source,
             sum_rss_bytes=snapshot.sum_rss_bytes,
+            reclaimable_bytes=snapshot.reclaimable_bytes,
         )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: node snapshot not published this cycle")

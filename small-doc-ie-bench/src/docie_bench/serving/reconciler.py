@@ -61,14 +61,16 @@ from pathlib import Path
 
 from docie_bench.serving import recency
 from docie_bench.serving.resources import (
+    FootprintStore,
     NodeSnapshot,
     ResourceTracker,
+    footprint_bytes,
     predicted_footprint_for_model,
     process_rss,
     publish_snapshot_via_catalog,
     read_node_memory,
 )
-from docie_bench.serving.runtime import LifecycleState, RuntimeKind
+from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
 from docie_bench.serving.supervisor import (
     Activation,
     DeploymentRecord,
@@ -190,32 +192,72 @@ class ObservedDeployment:
     model: str = ""
 
 
-def default_fit_check(record: DeploymentRecord) -> tuple[bool, str]:
-    """Restart fit gate, priced by the PR-2 resource tracker's formula.
+def _mmproj_bytes_from_launch(launch: RuntimeLaunchSpec) -> int:
+    """Size of the vision projector a launch will load (0 when none/unreadable).
+
+    ``needs_mmproj`` families launch with ``--mmproj <path>`` in
+    ``extra_args`` (wired by ``ModelStore.family_launch_args``); llama-server
+    loads that projector fully resident, so the fit gate must price it —
+    ``predicted_footprint_for_model`` already takes ``mmproj_bytes``, this
+    recovers the number from the record. Unreadable/missing degrades to 0
+    (fail-open, like every other unknowable in the gate).
+    """
+    arguments = list(launch.extra_args)
+    for index, argument in enumerate(arguments):
+        path: str | None = None
+        if argument == "--mmproj" and index + 1 < len(arguments):
+            path = arguments[index + 1]
+        elif argument.startswith("--mmproj="):
+            path = argument.partition("=")[2]
+        if path:
+            try:
+                return Path(path).stat().st_size
+            except OSError:
+                return 0
+    return 0
+
+
+def default_fit_check(
+    record: DeploymentRecord, *, tracker: ResourceTracker | None = None
+) -> tuple[bool, str]:
+    """Restart fit gate, priced by the PR-2 resource tracker's numbers.
 
     ``predicted_footprint_for_model`` (on-disk weights + KV(ctx) + runtime
-    overhead) against the cgroup-aware node free RAM — the same numbers the
-    published snapshot reports, replacing PR-1's psutil-only heuristic (which
-    read the elastic WSL2 VM total inside a container). Fail-open on anything
-    unknowable (no model file, unmeasurable node): the gate exists to stop
-    crash->OOM->respawn storms, not to block legitimate repairs on
-    measurement hiccups.
+    overhead + mmproj for vision launches), lifted to the CALIBRATED working
+    footprint ``max(observed_steady_rss, predicted)`` — the whole point of
+    steady-state calibration is that a model measured to need more than its
+    formula must be priced at the measurement, or the gate re-approves the
+    exact OOM the budget exists to stop. Checked against the cgroup-aware node
+    free RAM — the same numbers the published snapshot reports, replacing
+    PR-1's psutil-only heuristic (which read the elastic WSL2 VM total inside
+    a container). Fail-open on anything unknowable (no model file,
+    unmeasurable node): the gate exists to stop crash->OOM->respawn storms,
+    not to block legitimate repairs on measurement hiccups.
+
+    ``tracker`` supplies the calibration sidecars; the reconciler binds its
+    own tracker here. Without one (direct/standalone calls) the default
+    ``FootprintStore`` on the serving volume is consulted, so calibration is
+    never silently ignored.
     """
     launch = record.spec.launch
     predicted = predicted_footprint_for_model(
         size_bytes=None,
         model_path=launch.model,
         context_length=launch.context_length,
+        mmproj_bytes=_mmproj_bytes_from_launch(launch),
     )
     if predicted is None:
         return True, ""
+    footprints = tracker.footprints if tracker is not None else FootprintStore()
+    needed = footprint_bytes(predicted, footprints.get(launch.model))
     try:
         free = read_node_memory().free_bytes
     except Exception:  # noqa: BLE001 - unmeasurable => fail-open
         return True, ""
-    if free < predicted:
+    if free < needed:
         return False, (
-            f"needs ~{predicted} bytes (weights + kv-cache + overhead) "
+            f"needs ~{needed} bytes (max of calibrated steady-state RSS and "
+            f"predicted weights + kv-cache + overhead + mmproj) "
             f"but only {free} available"
         )
     return True, ""
@@ -277,7 +319,6 @@ class ServingReconciler:
         self.interval_s = interval_s
         self.ready_miss_threshold = ready_miss_threshold
         self.healthy_reset_threshold = healthy_reset_threshold
-        self._fit_check = fit_check
         self._rss_reader = rss_reader
         self._create_time = create_time
         self._publisher = publisher
@@ -288,10 +329,18 @@ class ServingReconciler:
         # under the same serving home the recency fold reads, so tests that
         # redirect recency_home never write calibration into the real home.
         if tracker is None:
-            from docie_bench.serving.resources import FootprintStore
-
             tracker = ResourceTracker(footprints=FootprintStore(home=recency_home))
         self._tracker = tracker
+        # The default fit gate must consume THIS reconciler's calibration
+        # sidecars (max(calibrated, predicted)), not price restarts from the
+        # raw prediction — bind the tracker in. An injected fit_check is used
+        # verbatim (tests / custom gates).
+        if fit_check is default_fit_check:
+            self._fit_check: Callable[[DeploymentRecord], tuple[bool, str]] = (
+                lambda record: default_fit_check(record, tracker=self._tracker)
+            )
+        else:
+            self._fit_check = fit_check
         self._snapshot_publisher = snapshot_publisher
         # Reconciler-local memory: which deployments were observed READY (so a
         # later miss is a fast-death candidate, not a slow cold-load) and how
@@ -362,7 +411,14 @@ class ServingReconciler:
         except Exception:  # noqa: BLE001 - unmeasurable node != broken cycle
             logger.warning("resource snapshot failed this cycle", exc_info=True)
         else:
-            self._snapshot_publisher(snapshot)
+            # The publisher gets the same containment as the measurement: an
+            # injected publisher that raises (or a non-CatalogUnavailable DB
+            # driver surprise) must not abort the cycle tail — the lease
+            # heartbeat below is what keeps a second replica refusing.
+            try:
+                self._snapshot_publisher(snapshot)
+            except Exception:  # noqa: BLE001 - publish hiccup != broken cycle
+                logger.warning("node snapshot publish failed this cycle", exc_info=True)
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:

@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import text as sa_text
 
 import docie_bench.storage.db as db
 from docie_bench.serving import resources
@@ -45,11 +47,15 @@ from docie_bench.serving.resources import (
 GIB = 1024**3
 
 
-def _write_cgroup(root: Path, *, limit: str | None, current: str | None) -> None:
+def _write_cgroup(
+    root: Path, *, limit: str | None, current: str | None, stat: str | None = None
+) -> None:
     if limit is not None:
         (root / "memory.max").write_text(limit, encoding="ascii")
     if current is not None:
         (root / "memory.current").write_text(current, encoding="ascii")
+    if stat is not None:
+        (root / "memory.stat").write_text(stat, encoding="ascii")
 
 
 def _vm_reader() -> NodeMemory:
@@ -104,6 +110,44 @@ def test_cgroup_missing_current_still_authoritative(tmp_path: Path) -> None:
 
     assert reading.source == "cgroup"
     assert reading.total_bytes == reading.free_bytes == 8 * GIB
+
+
+def test_cgroup_free_subtracts_reclaimable_page_cache(tmp_path: Path) -> None:
+    """memory.current INCLUDES page cache, and mmap'd GGUF pages linger there
+    long after an unload — 'used' must be the working set (current -
+    inactive_file, cgroup-v2 accounting practice), or free stays deflated and
+    sizing refuses models the node could actually hold. The adjustment is
+    flagged in the reading."""
+    stat = f"anon {3 * GIB}\nfile {3 * GIB}\ninactive_file {2 * GIB}\nactive_file {GIB}\n"
+    _write_cgroup(tmp_path, limit=str(8 * GIB), current=str(6 * GIB), stat=stat)
+
+    reading = read_node_memory(cgroup_root=tmp_path, vm_reader=_vm_reader)
+
+    assert reading.source == "cgroup"
+    assert reading.total_bytes == 8 * GIB
+    # used = 6 GiB current - 2 GiB reclaimable inactive_file => free = 4 GiB
+    # (raw limit-current would have said 2 GiB).
+    assert reading.free_bytes == 4 * GIB
+    assert reading.reclaimable_bytes == 2 * GIB
+
+
+def test_cgroup_reclaim_adjustment_is_best_effort(tmp_path: Path) -> None:
+    # No memory.stat at all: no adjustment, free = limit - current, flagged 0.
+    _write_cgroup(tmp_path, limit=str(8 * GIB), current=str(6 * GIB))
+    reading = read_node_memory(cgroup_root=tmp_path, vm_reader=_vm_reader)
+    assert (reading.free_bytes, reading.reclaimable_bytes) == (2 * GIB, 0)
+
+    # Corrupt inactive_file value: same degradation, never a crash.
+    _write_cgroup(tmp_path, limit=None, current=None, stat="inactive_file banana\n")
+    reading = read_node_memory(cgroup_root=tmp_path, vm_reader=_vm_reader)
+    assert (reading.free_bytes, reading.reclaimable_bytes) == (2 * GIB, 0)
+
+    # inactive_file larger than current (torn/racy reads): clamped to current,
+    # so used never goes negative and free never exceeds the limit.
+    _write_cgroup(tmp_path, limit=None, current=str(GIB), stat=f"inactive_file {5 * GIB}\n")
+    reading = read_node_memory(cgroup_root=tmp_path, vm_reader=_vm_reader)
+    assert reading.free_bytes == 8 * GIB
+    assert reading.reclaimable_bytes == GIB
 
 
 # ---------------------------------------------------------- predicted footprint
@@ -195,16 +239,61 @@ def test_footprint_store_persists_max_of_steady_samples(tmp_path: Path) -> None:
     assert FootprintStore(home=tmp_path).get("model.gguf") == 3 * GIB
 
 
-def test_footprint_key_is_per_model_file_and_traversal_safe(tmp_path: Path) -> None:
-    # Two deployments of the same GGUF share one calibration key.
-    assert footprint_key("/models/invoice.gguf") == footprint_key("/other/dir/invoice.gguf")
+def test_footprint_key_is_per_model_path_and_traversal_safe(tmp_path: Path) -> None:
+    # Two deployments launching the SAME path share one calibration key.
+    assert footprint_key("/models/invoice/model.gguf") == footprint_key(
+        "/models/invoice/model.gguf"
+    )
+    # DIFFERENT paths never collide on the basename: the canonical store names
+    # EVERY model's weights model.gguf, so a basename key would fold all store
+    # models into one poisoned entry.
+    assert footprint_key("/models/invoice/model.gguf") != footprint_key(
+        "/models/receipt/model.gguf"
+    )
     # Unsafe names map to a digest that stays inside the footprints dir.
     hostile = footprint_key("..\\..\\escape:me")
-    assert hostile.startswith("sha256-")
+    assert hostile.startswith("v2-sha256-")
     store = FootprintStore(home=tmp_path)
     store.record_steady("..\\..\\escape:me", GIB)
     assert store.get("..\\..\\escape:me") == GIB
     assert all(p.parent == store.directory for p in store.directory.iterdir())
+
+
+def test_two_store_models_calibrate_independently(tmp_path: Path) -> None:
+    """THE cross-model poisoning regression (PR-2 review blocker): the store
+    lays out <root>/<name>/model.gguf, so every model's weights file is
+    literally named model.gguf — a small model's steady RSS must never
+    become (or cap) a big model's calibration."""
+    store = FootprintStore(home=tmp_path)
+    small = "/store/tiny-lfm2/model.gguf"
+    big = "/store/nuextract3/model.gguf"
+
+    store.record_steady(small, GIB)
+    store.record_steady(big, 5 * GIB)
+
+    assert store.get(small) == GIB  # not maxed up by the big model
+    assert store.get(big) == 5 * GIB  # not seeded/capped by the small one
+    assert FootprintStore(home=tmp_path).get(small) == GIB  # survives restart
+
+
+def test_footprint_store_invalidates_legacy_basename_sidecars(tmp_path: Path) -> None:
+    """Pre-v2 sidecars were keyed by basename — one shared model.gguf entry for
+    every store model, poisoned by construction. They must be purged, never
+    read (there is no way to know which model wrote them)."""
+    directory = tmp_path / "footprints"
+    directory.mkdir(parents=True)
+    (directory / "model.gguf").write_text('{"rss_bytes": 9999999999}', encoding="utf-8")
+    (directory / ".model.gguf.tmp").write_text("{}", encoding="utf-8")
+
+    store = FootprintStore(home=tmp_path)
+
+    assert store.get("/store/anything/model.gguf") is None  # never read
+    leftovers = [p.name for p in directory.iterdir()]
+    assert leftovers == []  # invalidated on sight
+
+    # v2 sidecars survive a re-open untouched.
+    store.record_steady("/store/anything/model.gguf", GIB)
+    assert FootprintStore(home=tmp_path).get("/store/anything/model.gguf") == GIB
 
 
 # ------------------------------------------------------------------ calibration
@@ -233,7 +322,7 @@ def test_calibration_ignores_loading_phase_samples(tmp_path: Path) -> None:
     tracker = _tracker(tmp_path)
     for rss in (GIB, 2 * GIB, 3 * GIB, 3 * GIB, 3 * GIB, 3 * GIB):
         tracker.observe_cycle([_Obs("invoice", "loading", rss)])
-    assert tracker.footprints.get("invoice.gguf") is None
+    assert tracker.footprints.get("/models/invoice.gguf") is None
 
 
 def test_calibration_waits_for_steady_state_hot_rss(tmp_path: Path) -> None:
@@ -244,25 +333,26 @@ def test_calibration_waits_for_steady_state_hot_rss(tmp_path: Path) -> None:
     ramp = [1 * GIB, int(1.5 * GIB), 2 * GIB]  # deltas >2%: still faulting in
     for rss in ramp:
         tracker.observe_cycle([_Obs("invoice", "hot", rss)])
-    assert tracker.footprints.get("invoice.gguf") is None  # streak long enough, not stable
+    # streak long enough, not stable
+    assert tracker.footprints.get("/models/invoice.gguf") is None
 
     steady = 2 * GIB + 1024  # <2% delta vs previous: steady state
     tracker.observe_cycle([_Obs("invoice", "hot", steady)])
-    assert tracker.footprints.get("invoice.gguf") == steady
+    assert tracker.footprints.get("/models/invoice.gguf") == steady
 
     # A phase interruption (crash/unload) resets the streak: the next hot
     # sample alone is not trusted again.
     tracker.observe_cycle([_Obs("invoice", "cold", 0)])
     tracker.observe_cycle([_Obs("invoice", "hot", 3 * GIB)])
     tracker.observe_cycle([_Obs("invoice", "hot", 3 * GIB)])
-    assert tracker.footprints.get("invoice.gguf") == steady  # streak of 2 < 3
+    assert tracker.footprints.get("/models/invoice.gguf") == steady  # streak of 2 < 3
 
 
 def test_tracker_footprint_for_applies_the_max_rule(tmp_path: Path) -> None:
     tracker = _tracker(tmp_path)
     predicted = predict_footprint_bytes(2 * GIB, context_length=4096)
     assert tracker.footprint_for("/models/invoice.gguf", predicted) == predicted
-    tracker.footprints.record_steady(footprint_key("/models/invoice.gguf"), 5 * GIB)
+    tracker.footprints.record_steady("/models/invoice.gguf", 5 * GIB)
     assert tracker.footprint_for("/models/invoice.gguf", predicted) == 5 * GIB
 
 
@@ -279,6 +369,18 @@ def test_snapshot_sums_only_live_rss(tmp_path: Path) -> None:
     assert snapshot == NodeSnapshot(
         total_bytes=8 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=3 * GIB
     )
+
+
+def test_snapshot_carries_the_reclaim_adjustment_flag(tmp_path: Path) -> None:
+    """A reclaim-adjusted node reading must say so in the published snapshot —
+    readers need to know free is working-set based, not raw memory.current."""
+    tracker = ResourceTracker(
+        memory_reader=lambda: NodeMemory(8 * GIB, 4 * GIB, "cgroup", reclaimable_bytes=2 * GIB),
+        footprints=FootprintStore(home=tmp_path),
+    )
+    snapshot = tracker.observe_cycle([])
+    assert snapshot.free_bytes == 4 * GIB
+    assert snapshot.reclaimable_bytes == 2 * GIB
 
 
 # --------------------------------------------------------------------- database
@@ -343,6 +445,82 @@ def test_ensure_serving_node_table_is_race_safe_and_idempotent(tmp_path: Path) -
         dialect=postgresql.dialect()
     ))
     assert "CREATE TABLE IF NOT EXISTS serving_node" in ddl
+
+
+def test_ensure_serving_node_table_inspects_under_the_migration_lock() -> None:
+    """The `existed` inspection must run INSIDE the locked transaction
+    (mirroring the placement migration): a pre-lock snapshot can race a
+    concurrent creator and misreport who created the table. Structural guard,
+    same style as the no-registry-import check above."""
+    import inspect as py_inspect
+
+    import docie_bench.serving.catalog as catalog_module
+
+    source = py_inspect.getsource(catalog_module.ensure_serving_node_table)
+    function = ast.parse(source).body[0]
+    assert isinstance(function, ast.FunctionDef)
+
+    def _has_table_calls(node: ast.AST) -> list[ast.Call]:
+        return [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "has_table"
+        ]
+
+    with_blocks = [node for node in ast.walk(function) if isinstance(node, ast.With)]
+    assert _has_table_calls(function), "expected a has_table inspection"
+    inside = [call for block in with_blocks for call in _has_table_calls(block)]
+    assert _has_table_calls(function) == inside, (
+        "has_table must be called inside the engine.begin() transaction "
+        "(after the advisory lock), never before it"
+    )
+
+
+def test_ensure_serving_node_table_adds_late_columns_to_legacy_table(tmp_path: Path) -> None:
+    """A serving_node created before reclaimable_bytes shipped (create_all
+    never ALTERs) must gain the column instead of failing the first publish."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            sa_text(
+                "CREATE TABLE serving_node ("
+                "id VARCHAR(32) PRIMARY KEY, total_bytes BIGINT, free_bytes BIGINT, "
+                "source VARCHAR(16), sum_rss_bytes BIGINT, updated_at TIMESTAMP)"
+            )
+        )
+
+    assert ensure_serving_node_table(engine) is False  # pre-existing, migrated in place
+    columns = {column["name"] for column in sa_inspect(engine).get_columns("serving_node")}
+    assert "reclaimable_bytes" in columns
+
+
+@pytest.mark.parametrize("dialect_name", ["postgresql", "sqlite"])
+def test_publish_node_snapshot_is_a_native_on_conflict_upsert(dialect_name: str) -> None:
+    """The single-row publish must be a REAL upsert: get-then-INSERT lets two
+    racing first publishes both see 'no row' and the loser abort on the
+    duplicate key. Verified at statement-shape level for both the production
+    dialect and the test dialect."""
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from docie_bench.serving.catalog import _node_snapshot_upsert
+
+    values = {
+        "total_bytes": 8 * GIB,
+        "free_bytes": 6 * GIB,
+        "source": "cgroup",
+        "sum_rss_bytes": GIB,
+        "reclaimable_bytes": 0,
+    }
+    statement = _node_snapshot_upsert(dialect_name, dict(values))
+    assert statement is not None
+    dialect = postgresql.dialect() if dialect_name == "postgresql" else sqlite.dialect()
+    sql = str(statement.compile(dialect=dialect))
+    assert "INSERT INTO serving_node" in sql
+    assert "ON CONFLICT (id) DO UPDATE" in sql
+    for name in values:
+        assert f"{name} = excluded.{name}" in sql
 
 
 # -------------------------------------------------------- reconciler integration

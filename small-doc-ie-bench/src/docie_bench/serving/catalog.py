@@ -31,9 +31,10 @@ from sqlalchemy import (
 )
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text as sa_text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Mapped, Session, mapped_column
 from sqlalchemy.schema import CreateTable
+from sqlalchemy.sql.dml import Insert
 from sqlalchemy.types import TypeEngine
 
 from docie_bench.serving.model_store import FAMILIES, StoreEntry
@@ -147,6 +148,10 @@ class ServingNode(Base):
     free_bytes: Mapped[int] = mapped_column(BigInteger)
     source: Mapped[str] = mapped_column(String(16))  # "cgroup" | "vm"
     sum_rss_bytes: Mapped[int] = mapped_column(BigInteger)
+    # Reclaimable page cache excluded from "used" when free_bytes was computed
+    # (cgroup working-set accounting, see resources.read_cgroup_memory); 0
+    # means no adjustment applied (vm source / nothing reclaimable).
+    reclaimable_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -154,6 +159,40 @@ class ServingNode(Base):
 # ("docie placement v2"). Distinct from the placement-columns key so the two
 # migrations never serialize against each other needlessly.
 _SERVING_NODE_LOCK_KEY = 0x0D0C1E02
+
+# serving_node columns added AFTER the table first shipped on the PR-2 branch
+# (create_all never ALTERs an existing table — the documented size_bytes
+# hazard). Module-level tuple so the migration and tests agree on one list.
+_SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
+    ("reclaimable_bytes", BigInteger()),
+)
+
+
+def _ensure_serving_node_columns(connection: Connection, engine: Engine) -> None:
+    """Add late serving_node columns to a pre-existing table (under the lock).
+
+    PostgreSQL: ``ADD COLUMN IF NOT EXISTS .. NOT NULL DEFAULT 0`` — race-safe
+    under the caller's advisory lock. Other dialects (sqlite tests):
+    inspect-then-ALTER, safe there because sqlite is single-process dev/test.
+    """
+    if engine.dialect.name == "postgresql":
+        for name, column_type in _SERVING_NODE_ADDED_COLUMNS:
+            compiled = column_type.compile(dialect=engine.dialect)
+            connection.execute(
+                sa_text(
+                    f"ALTER TABLE serving_node ADD COLUMN IF NOT EXISTS "
+                    f"{name} {compiled} NOT NULL DEFAULT 0"
+                )
+            )
+        return
+    existing = {column["name"] for column in sa_inspect(connection).get_columns("serving_node")}
+    for name, column_type in _SERVING_NODE_ADDED_COLUMNS:
+        if name in existing:
+            continue
+        compiled = column_type.compile(dialect=engine.dialect)
+        connection.execute(
+            sa_text(f"ALTER TABLE serving_node ADD COLUMN {name} {compiled} NOT NULL DEFAULT 0")
+        )
 
 
 def ensure_serving_node_table(engine: Engine) -> bool:
@@ -165,11 +204,13 @@ def ensure_serving_node_table(engine: Engine) -> bool:
     abort. Here the DDL is ``CREATE TABLE IF NOT EXISTS`` (supported by both
     PostgreSQL and the sqlite used in tests), taken under
     ``pg_advisory_xact_lock`` on PostgreSQL so concurrent migrators serialize
-    and a raced CREATE degrades to a no-op. Returns True when this call
-    created the table.
+    and a raced CREATE degrades to a no-op. The ``existed`` inspection ALSO
+    happens under that lock (mirroring the placement migration): a pre-lock
+    snapshot could race a concurrent creator and misreport who created the
+    table. Returns True when this call created the table; when it already
+    existed, late-added columns are ensured (see
+    ``_ensure_serving_node_columns``).
     """
-    inspector = sa_inspect(engine)
-    existed = inspector.has_table("serving_node")
     node_table = ServingNode.__table__
     assert isinstance(node_table, Table)  # narrow FromClause for the compiler
     with engine.begin() as connection:
@@ -178,7 +219,10 @@ def ensure_serving_node_table(engine: Engine) -> bool:
                 sa_text("SELECT pg_advisory_xact_lock(:key)"),
                 {"key": _SERVING_NODE_LOCK_KEY},
             )
+        existed = sa_inspect(connection).has_table("serving_node")
         connection.execute(CreateTable(node_table, if_not_exists=True))
+        if existed:
+            _ensure_serving_node_columns(connection, engine)
     return not existed
 
 
@@ -310,8 +354,38 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         "free_bytes": row.free_bytes,
         "source": row.source,
         "sum_rss_bytes": row.sum_rss_bytes,
+        "reclaimable_bytes": row.reclaimable_bytes,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
+
+
+def _node_snapshot_upsert(dialect_name: str, values: dict[str, Any]) -> Insert | None:
+    """One-statement ``INSERT .. ON CONFLICT (id) DO UPDATE`` for serving_node.
+
+    The single-row publish must be a REAL upsert: get-then-INSERT lets two
+    racing first publishes both observe "no row" and the loser abort on the
+    duplicate key. Both production PostgreSQL and the sqlite used in tests
+    support ``ON CONFLICT DO UPDATE`` natively; any other dialect returns
+    ``None`` and the caller falls back to get-then-INSERT (single-writer
+    semantics only).
+    """
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        pg_statement = pg_insert(ServingNode).values(id=SERVING_NODE_ROW_ID, **values)
+        return pg_statement.on_conflict_do_update(
+            index_elements=[ServingNode.id],
+            set_={name: pg_statement.excluded[name] for name in values},
+        )
+    if dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        sqlite_statement = sqlite_insert(ServingNode).values(id=SERVING_NODE_ROW_ID, **values)
+        return sqlite_statement.on_conflict_do_update(
+            index_elements=[ServingNode.id],
+            set_={name: sqlite_statement.excluded[name] for name in values},
+        )
+    return None
 
 
 def _to_view(row: ModelStoreEntry, placement: ModelPlacement | None = None) -> dict[str, Any]:
@@ -501,28 +575,45 @@ class ModelCatalog:
         free_bytes: int,
         source: str,
         sum_rss_bytes: int,
+        reclaimable_bytes: int = 0,
     ) -> dict[str, Any]:
         """Upsert THE ``serving_node`` row (the reconciler is the sole caller).
 
         Single-row semantics: always the fixed ``SERVING_NODE_ROW_ID`` key, so
-        repeated publishes UPDATE in place and the table never grows.
+        repeated publishes UPDATE in place and the table never grows. A REAL
+        upsert (``INSERT .. ON CONFLICT (id) DO UPDATE``) — never
+        get-then-INSERT, whose two racing first publishes (e.g. a replaced
+        serving container overlapping the old one within the lease staleness
+        window) both see "no row" and the loser aborts on the duplicate key.
         ``updated_at`` is stamped explicitly (not left to ``onupdate``) so an
         unchanged reading still proves the reconciler is alive.
         """
+        stamped = _utcnow()
+        values: dict[str, Any] = {
+            "total_bytes": total_bytes,
+            "free_bytes": free_bytes,
+            "source": source,
+            "sum_rss_bytes": sum_rss_bytes,
+            "reclaimable_bytes": reclaimable_bytes,
+            "updated_at": stamped,
+        }
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")
-            row = session.get(ServingNode, SERVING_NODE_ROW_ID)
-            if row is None:
-                row = ServingNode(id=SERVING_NODE_ROW_ID)
-                session.add(row)
-            row.total_bytes = total_bytes
-            row.free_bytes = free_bytes
-            row.source = source
-            row.sum_rss_bytes = sum_rss_bytes
-            row.updated_at = _utcnow()
-            session.flush()
-            return _node_view(row)
+            statement = _node_snapshot_upsert(session.get_bind().dialect.name, values)
+            if statement is not None:
+                session.execute(statement)
+            else:  # pragma: no cover - no third dialect is in use
+                # Fallback for dialects without ON CONFLICT support: the old
+                # get-then-INSERT (single-writer semantics only).
+                row = session.get(ServingNode, SERVING_NODE_ROW_ID)
+                if row is None:
+                    row = ServingNode(id=SERVING_NODE_ROW_ID)
+                    session.add(row)
+                for name, value in values.items():
+                    setattr(row, name, value)
+                session.flush()
+            return {**values, "updated_at": stamped.isoformat()}
 
     def get_node_snapshot(self) -> dict[str, Any] | None:
         """The published node snapshot, or None when never published."""

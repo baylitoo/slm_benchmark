@@ -110,12 +110,20 @@ services:
   # with source=vm and badged as soft). Size DOCIE_SERVING_MEM_LIMIT to the
   # RAM you actually grant the GGUF runtimes (weights + KV cache + ~0.5 GB
   # slab per deployment).
+  #
+  # The 8g DEFAULT is deliberately conservative: on Docker Desktop the WSL2 VM
+  # defaults to 50% of host RAM (often 8g), and a mem_limit LARGER than the VM
+  # never actually binds — the tracker would publish an authoritative-looking
+  # cgroup ceiling the node cannot deliver, and runtimes sized to it get
+  # VM-OOM-killed instead of fit-checked. Raise DOCIE_SERVING_MEM_LIMIT only
+  # after granting the VM at least that much via %UserProfile%\.wslconfig
+  # ([wsl2] memory=24GB, then `wsl --shutdown`).
   serving:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
-    mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-16g}
+    mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
       # Registers ONLY the lifecycle functions (deploy/seed/delete) under the
       # dedicated docie-serving Inngest app + runs the reconciler, so a
