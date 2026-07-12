@@ -40,6 +40,11 @@ What a cycle does per record (design doc §1):
   ``endpoint=""`` whenever not live) best-effort: with no DATABASE_URL the
   cycle still repairs and ``_save()``s ``deployments.json`` (which the api
   reads fresh per request), it just skips the Postgres publish.
+* Publishes the ``serving_node`` resource snapshot (PR-2): the
+  ``ResourceTracker`` folds this cycle's observations (steady-state footprint
+  calibration, live-RSS sum) and reads node total/free RAM cgroup-v2-first,
+  then the snapshot is upserted as the single ``serving_node`` row — same
+  best-effort no-DB degradation as the observed rows.
 """
 
 from __future__ import annotations
@@ -55,7 +60,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from docie_bench.serving import recency
-from docie_bench.serving.runtime import LifecycleState, RuntimeKind
+from docie_bench.serving.resources import (
+    FootprintStore,
+    NodeSnapshot,
+    ResourceTracker,
+    footprint_bytes,
+    predicted_footprint_for_model,
+    process_rss,
+    publish_snapshot_via_catalog,
+    read_node_memory,
+)
+from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
 from docie_bench.serving.supervisor import (
     Activation,
     DeploymentRecord,
@@ -66,11 +81,6 @@ from docie_bench.serving.supervisor import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Fixed runtime slab assumed on top of the model weights when fit-checking a
-# restart (llama-server arena, KV cache floor). PR-2 replaces this heuristic
-# with the calibrated resource tracker; PR-1 only needs a storm brake.
-_RESTART_OVERHEAD_BYTES = 512 * 1024 * 1024
 
 # create_time is stable for the lifetime of a process; allow a small slack for
 # float rounding across psutil reads.
@@ -177,43 +187,80 @@ class ObservedDeployment:
     rss_bytes: int
     health_ok: bool
     last_error: str | None
+    # Launch model reference (GGUF path) — the resource tracker's calibration
+    # key, so a per-model footprint survives redeploys under new names.
+    model: str = ""
 
 
-def default_fit_check(record: DeploymentRecord) -> tuple[bool, str]:
-    """Cheap PR-1 fit gate: on-disk weights + fixed overhead vs available RAM.
+def _mmproj_bytes_from_launch(launch: RuntimeLaunchSpec) -> int:
+    """Size of the vision projector a launch will load (0 when none/unreadable).
 
-    Fail-open on anything unknowable (no model file, psutil failure): the gate
-    exists to stop crash->OOM->respawn storms, not to block legitimate repairs
-    on measurement hiccups. PR-2's resource tracker replaces this.
+    ``needs_mmproj`` families launch with ``--mmproj <path>`` in
+    ``extra_args`` (wired by ``ModelStore.family_launch_args``); llama-server
+    loads that projector fully resident, so the fit gate must price it —
+    ``predicted_footprint_for_model`` already takes ``mmproj_bytes``, this
+    recovers the number from the record. Unreadable/missing degrades to 0
+    (fail-open, like every other unknowable in the gate).
     """
-    try:
-        weights = Path(record.spec.launch.model).stat().st_size
-    except OSError:
-        return True, ""
-    if weights <= 0:
-        return True, ""
-    try:
-        import psutil
+    arguments = list(launch.extra_args)
+    for index, argument in enumerate(arguments):
+        path: str | None = None
+        if argument == "--mmproj" and index + 1 < len(arguments):
+            path = arguments[index + 1]
+        elif argument.startswith("--mmproj="):
+            path = argument.partition("=")[2]
+        if path:
+            try:
+                return Path(path).stat().st_size
+            except OSError:
+                return 0
+    return 0
 
-        available = int(psutil.virtual_memory().available)
+
+def default_fit_check(
+    record: DeploymentRecord, *, tracker: ResourceTracker | None = None
+) -> tuple[bool, str]:
+    """Restart fit gate, priced by the PR-2 resource tracker's numbers.
+
+    ``predicted_footprint_for_model`` (on-disk weights + KV(ctx) + runtime
+    overhead + mmproj for vision launches), lifted to the CALIBRATED working
+    footprint ``max(observed_steady_rss, predicted)`` — the whole point of
+    steady-state calibration is that a model measured to need more than its
+    formula must be priced at the measurement, or the gate re-approves the
+    exact OOM the budget exists to stop. Checked against the cgroup-aware node
+    free RAM — the same numbers the published snapshot reports, replacing
+    PR-1's psutil-only heuristic (which read the elastic WSL2 VM total inside
+    a container). Fail-open on anything unknowable (no model file,
+    unmeasurable node): the gate exists to stop crash->OOM->respawn storms,
+    not to block legitimate repairs on measurement hiccups.
+
+    ``tracker`` supplies the calibration sidecars; the reconciler binds its
+    own tracker here. Without one (direct/standalone calls) the default
+    ``FootprintStore`` on the serving volume is consulted, so calibration is
+    never silently ignored.
+    """
+    launch = record.spec.launch
+    predicted = predicted_footprint_for_model(
+        size_bytes=None,
+        model_path=launch.model,
+        context_length=launch.context_length,
+        mmproj_bytes=_mmproj_bytes_from_launch(launch),
+    )
+    if predicted is None:
+        return True, ""
+    footprints = tracker.footprints if tracker is not None else FootprintStore()
+    needed = footprint_bytes(predicted, footprints.get(launch.model))
+    try:
+        free = read_node_memory().free_bytes
     except Exception:  # noqa: BLE001 - unmeasurable => fail-open
         return True, ""
-    needed = weights + _RESTART_OVERHEAD_BYTES
-    if available < needed:
+    if free < needed:
         return False, (
-            f"needs ~{needed} bytes (weights {weights} + overhead) "
-            f"but only {available} available"
+            f"needs ~{needed} bytes (max of calibrated steady-state RSS and "
+            f"predicted weights + kv-cache + overhead + mmproj) "
+            f"but only {free} available"
         )
     return True, ""
-
-
-def _default_rss(pid: int) -> int:
-    try:
-        import psutil
-
-        return int(psutil.Process(pid).memory_info().rss)
-    except Exception:  # noqa: BLE001 - a vanished process reads as 0
-        return 0
 
 
 def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
@@ -253,12 +300,14 @@ class ServingReconciler:
         interval_s: float = 10.0,
         ready_miss_threshold: int = 3,
         fit_check: Callable[[DeploymentRecord], tuple[bool, str]] = default_fit_check,
-        rss_reader: Callable[[int], int] = _default_rss,
+        rss_reader: Callable[[int], int] = process_rss,
         create_time: Callable[[int], float | None] = _default_create_time,
         publisher: Callable[[list[ObservedDeployment]], None] = _publish_via_catalog,
         recency_home: Path | None = None,
         healthy_reset_threshold: int = 30,
         lease: ReconcilerLease | None = None,
+        tracker: ResourceTracker | None = None,
+        snapshot_publisher: Callable[[NodeSnapshot], None] = publish_snapshot_via_catalog,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -270,12 +319,29 @@ class ServingReconciler:
         self.interval_s = interval_s
         self.ready_miss_threshold = ready_miss_threshold
         self.healthy_reset_threshold = healthy_reset_threshold
-        self._fit_check = fit_check
         self._rss_reader = rss_reader
         self._create_time = create_time
         self._publisher = publisher
         self._recency_home = recency_home
         self._lease = lease
+        # PR-2 resource tracker: node RAM snapshot + steady-state footprint
+        # calibration each cycle. The default persists footprint sidecars
+        # under the same serving home the recency fold reads, so tests that
+        # redirect recency_home never write calibration into the real home.
+        if tracker is None:
+            tracker = ResourceTracker(footprints=FootprintStore(home=recency_home))
+        self._tracker = tracker
+        # The default fit gate must consume THIS reconciler's calibration
+        # sidecars (max(calibrated, predicted)), not price restarts from the
+        # raw prediction — bind the tracker in. An injected fit_check is used
+        # verbatim (tests / custom gates).
+        if fit_check is default_fit_check:
+            self._fit_check: Callable[[DeploymentRecord], tuple[bool, str]] = (
+                lambda record: default_fit_check(record, tracker=self._tracker)
+            )
+        else:
+            self._fit_check = fit_check
+        self._snapshot_publisher = snapshot_publisher
         # Reconciler-local memory: which deployments were observed READY (so a
         # later miss is a fast-death candidate, not a slow cold-load) and how
         # many consecutive misses each has accrued since. _was_ready is a CACHE,
@@ -337,6 +403,22 @@ class ServingReconciler:
         # Publish OUTSIDE the lock: observations are immutable snapshots and a
         # slow database must not block the lifecycle handlers.
         self._publisher(observations)
+        # Resource snapshot (PR-2), also outside the lock: pure measurement
+        # (cgroup/psutil reads + footprint sidecar writes). Best-effort — a
+        # measurement hiccup must never mark the repair cycle failed.
+        try:
+            snapshot = self._tracker.observe_cycle(observations)
+        except Exception:  # noqa: BLE001 - unmeasurable node != broken cycle
+            logger.warning("resource snapshot failed this cycle", exc_info=True)
+        else:
+            # The publisher gets the same containment as the measurement: an
+            # injected publisher that raises (or a non-CatalogUnavailable DB
+            # driver surprise) must not abort the cycle tail — the lease
+            # heartbeat below is what keeps a second replica refusing.
+            try:
+                self._snapshot_publisher(snapshot)
+            except Exception:  # noqa: BLE001 - publish hiccup != broken cycle
+                logger.warning("node snapshot publish failed this cycle", exc_info=True)
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
@@ -558,6 +640,7 @@ class ServingReconciler:
             rss_bytes=rss,
             health_ok=health_ok,
             last_error=last_error if last_error is not None else record.last_error,
+            model=record.spec.launch.model,
         )
 
 

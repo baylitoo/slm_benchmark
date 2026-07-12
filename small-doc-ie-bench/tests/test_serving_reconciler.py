@@ -906,3 +906,196 @@ def test_reconciler_enabled_only_for_the_serving_role(monkeypatch: pytest.Monkey
 
     monkeypatch.setenv("DOCIE_SERVING_RECONCILE", "0")
     assert _reconciler_enabled("serving") is False  # explicit kill switch
+
+
+# ---------------------------------------------- PR-2 fit gate (review fixes)
+
+
+def _record_for(model_path: Path, *, extra_args: tuple[str, ...] = ()) -> Any:
+    from docie_bench.serving.supervisor import DeploymentRecord
+
+    return DeploymentRecord(
+        spec=_spec(
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.LLAMACPP,
+                model=str(model_path),
+                alias="invoice",
+                port=8090,
+                extra_args=extra_args,
+            )
+        )
+    )
+
+
+def test_default_fit_check_prices_the_calibrated_footprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fit gate must consume calibration (max(calibrated, predicted)), not
+    the raw prediction: a model MEASURED to need more than its formula would
+    otherwise be re-approved into the exact OOM the gate exists to stop."""
+    from docie_bench.serving import reconciler as reconciler_module
+    from docie_bench.serving.reconciler import default_fit_check
+    from docie_bench.serving.resources import (
+        FootprintStore,
+        NodeMemory,
+        ResourceTracker,
+        predicted_footprint_for_model,
+    )
+
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"g" * 1024)
+    predicted = predicted_footprint_for_model(size_bytes=None, model_path=str(gguf))
+    assert predicted is not None
+    free = predicted + 1024**3  # plenty for the prediction alone
+    monkeypatch.setattr(
+        reconciler_module,
+        "read_node_memory",
+        lambda: NodeMemory(total_bytes=8 * 1024**3, free_bytes=free, source="cgroup"),
+    )
+    tracker = ResourceTracker(footprints=FootprintStore(home=tmp_path))
+    record = _record_for(gguf)
+
+    fits, _ = default_fit_check(record, tracker=tracker)
+    assert fits is True  # never calibrated: prediction governs
+
+    tracker.footprints.record_steady(str(gguf), free + 1)  # measured bigger than free
+    fits, reason = default_fit_check(record, tracker=tracker)
+    assert fits is False
+    assert "calibrated" in reason
+
+
+def test_default_fit_check_prices_the_mmproj_for_vision_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """needs_mmproj deployments launch with --mmproj <path> in extra_args and
+    llama-server loads the projector fully resident — the gate must include
+    it (predicted_footprint_for_model already supports mmproj_bytes)."""
+    from docie_bench.serving import reconciler as reconciler_module
+    from docie_bench.serving.reconciler import default_fit_check
+    from docie_bench.serving.resources import (
+        FootprintStore,
+        NodeMemory,
+        ResourceTracker,
+        predicted_footprint_for_model,
+    )
+
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"g" * 1024)
+    mmproj = tmp_path / "mmproj.gguf"
+    mmproj.write_bytes(b"p" * 4096)
+    base = predicted_footprint_for_model(size_bytes=None, model_path=str(gguf))
+    assert base is not None
+    free = base + 2000  # enough without the projector, NOT enough with it
+    monkeypatch.setattr(
+        reconciler_module,
+        "read_node_memory",
+        lambda: NodeMemory(total_bytes=8 * 1024**3, free_bytes=free, source="cgroup"),
+    )
+    tracker = ResourceTracker(footprints=FootprintStore(home=tmp_path))
+
+    text_only = _record_for(gguf)
+    fits, _ = default_fit_check(text_only, tracker=tracker)
+    assert fits is True
+
+    vision = _record_for(gguf, extra_args=("--jinja", "--mmproj", str(mmproj)))
+    fits, _ = default_fit_check(vision, tracker=tracker)
+    assert fits is False  # projector priced: base + 4096 > free
+
+    # --mmproj=<path> form is priced identically.
+    vision_eq = _record_for(gguf, extra_args=(f"--mmproj={mmproj}",))
+    fits, _ = default_fit_check(vision_eq, tracker=tracker)
+    assert fits is False
+
+
+def test_reconciler_default_fit_gate_consumes_its_trackers_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the repair loop: a reconciler built WITHOUT an
+    injected fit_check must price gated restarts from ITS tracker's
+    calibration sidecars, so a measured-too-big model stays down."""
+    from docie_bench.serving import reconciler as reconciler_module
+    from docie_bench.serving.resources import (
+        FootprintStore,
+        NodeMemory,
+        ResourceTracker,
+        predicted_footprint_for_model,
+    )
+
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"g" * 1024)
+    predicted = predicted_footprint_for_model(size_bytes=None, model_path=str(gguf))
+    assert predicted is not None
+    free = predicted + 1024**3
+    monkeypatch.setattr(
+        reconciler_module,
+        "read_node_memory",
+        lambda: NodeMemory(total_bytes=8 * 1024**3, free_bytes=free, source="cgroup"),
+    )
+    adapter = ScriptedAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json",
+        adapters={RuntimeKind.LLAMACPP: adapter},
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+    )
+    tracker = ResourceTracker(footprints=FootprintStore(home=tmp_path))
+    tracker.footprints.record_steady(str(gguf), free + 1)  # calibrated: does not fit
+    reconciler = ServingReconciler(
+        supervisor,
+        rss_reader=lambda pid: 0,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+        tracker=tracker,
+        snapshot_publisher=lambda snapshot: None,
+    )
+    record = supervisor.deploy(_spec(launch=RuntimeLaunchSpec(
+        runtime=RuntimeKind.LLAMACPP, model=str(gguf), alias="invoice", port=8090
+    )))
+    adapter.crash(record.pid)
+
+    observations = reconciler.run_cycle()
+
+    observed = _only(observations, "invoice")
+    assert observed.phase == "failed"  # restart withheld, NOT respawned
+    assert observed.last_error is not None
+    assert "fit-check failed" in observed.last_error
+    assert adapter.starts == 1  # the original deploy only
+
+
+def test_raising_snapshot_publisher_does_not_abort_the_cycle_tail(tmp_path: Path) -> None:
+    """A publisher that raises (injected, or a DB driver surprise outside
+    CatalogUnavailableError) must not abort the cycle: observations are still
+    returned and the singleton lease still heartbeats."""
+    import json as json_lib
+
+    from docie_bench.serving.reconciler import ReconcilerLease
+
+    def exploding_publisher(snapshot: object) -> None:
+        raise RuntimeError("snapshot publisher blew up")
+
+    lease_path = tmp_path / "reconciler-lease.json"
+    now = [700.0]
+    lease = ReconcilerLease(lease_path, "replica-a", stale_after_s=60.0, clock=lambda: now[0])
+    adapter = ScriptedAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json",
+        adapters={RuntimeKind.LLAMACPP: adapter},
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+    )
+    reconciler = ServingReconciler(
+        supervisor,
+        fit_check=lambda record: (True, ""),
+        rss_reader=lambda pid: 123,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+        lease=lease,
+        snapshot_publisher=exploding_publisher,
+    )
+    supervisor.deploy(_spec())
+
+    observations = reconciler.run_cycle()  # must not raise
+
+    assert [obs.phase for obs in observations] == ["hot"]
+    payload = json_lib.loads(lease_path.read_text(encoding="utf-8"))
+    assert payload["timestamp"] == 700.0  # lease heartbeat still ran
