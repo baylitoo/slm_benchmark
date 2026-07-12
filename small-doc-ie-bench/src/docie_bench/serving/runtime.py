@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -284,9 +284,20 @@ class RuntimeAdapter:
         process = self._processes.get(pid)
         if process is not None:
             return process.poll() is None
-        return psutil.pid_exists(pid)
+        return bool(psutil.pid_exists(pid))
 
     def shutdown(self, pid: int | None, *, timeout: float = 10) -> None:
+        """Terminate the runtime process and WAIT until it is actually gone.
+
+        Both branches block until the process exits (or the escalation
+        timeout elapses): the owned-Popen branch always did, and the
+        recovered-pid branch (a serving-container restart emptied
+        ``_processes``) now does too instead of a fire-and-forget SIGTERM.
+        The wait is load-bearing for the fit-before-evict gate: eviction
+        frees a multi-GB victim precisely so a following ``assess_fit`` can
+        observe the freed RAM — returning while the victim is still dying
+        would let the gate approve an overcommit that OOMs.
+        """
         if pid is None:
             return
         process = self._processes.pop(pid, None)
@@ -298,8 +309,24 @@ class RuntimeAdapter:
                 process.kill()
                 process.wait(timeout=timeout)
             return
-        if self.is_running(pid):
-            os.kill(pid, signal.SIGTERM)
+        if not self.is_running(pid):
+            return
+        # Recovered pid (no Popen handle): terminate via psutil so we can WAIT
+        # on a non-child process, escalating to kill() exactly like the owned
+        # branch. NoSuchProcess at any point means "already gone" — done.
+        try:
+            external = psutil.Process(pid)
+            external.terminate()
+            try:
+                external.wait(timeout=timeout)
+            except psutil.TimeoutExpired:
+                external.kill()
+                # A second timeout means unkillable (e.g. uninterruptible
+                # I/O); nothing more can be done.
+                with contextlib.suppress(psutil.TimeoutExpired):
+                    external.wait(timeout=timeout)
+        except psutil.NoSuchProcess:
+            return
 
     def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> HealthResult:
         headers: dict[str, str] = {}

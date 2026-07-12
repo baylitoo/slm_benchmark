@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +55,7 @@ from docie_bench.security import (
     redact_fields,
     tenant_guard,
 )
+from docie_bench.serving import recency
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
     PlacementNotFoundError,
@@ -118,7 +120,9 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def enforce_request_content_length(request: Request, call_next):
+async def enforce_request_content_length(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -152,24 +156,27 @@ def resolve_profile(profile_name: str | None) -> ModelProfile:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProfileResolutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if profile_name and profile_name.startswith(STORE_PROFILE_PREFIX):
-        if endpoint_is_loopback(profile.base_url):
-            # The deploy runtime records its endpoint from the WORKER's point of
-            # view; in the documented api/worker compose topology a loopback
-            # endpoint is unreachable from this process. Fail fast (worker-only
-            # for now) instead of burning timeout_seconds x retries on doomed
-            # connects. Deployments recorded with an advertised (non-loopback)
-            # endpoint pass this guard untouched.
-            raise HTTPException(
-                status_code=501,
-                detail=(
-                    f"{profile_name} resolved to {profile.base_url}, which is "
-                    "loopback on the worker that deployed it and not reachable "
-                    "from the API. Run the extraction through the worker "
-                    "(POST /v1/studio/extract) or record a non-loopback "
-                    "advertised endpoint at deploy time."
-                ),
-            )
+    if (
+        profile_name
+        and profile_name.startswith(STORE_PROFILE_PREFIX)
+        and endpoint_is_loopback(profile.base_url)
+    ):
+        # The deploy runtime records its endpoint from the WORKER's point of
+        # view; in the documented api/worker compose topology a loopback
+        # endpoint is unreachable from this process. Fail fast (worker-only
+        # for now) instead of burning timeout_seconds x retries on doomed
+        # connects. Deployments recorded with an advertised (non-loopback)
+        # endpoint pass this guard untouched.
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"{profile_name} resolved to {profile.base_url}, which is "
+                "loopback on the worker that deployed it and not reachable "
+                "from the API. Run the extraction through the worker "
+                "(POST /v1/studio/extract) or record a non-loopback "
+                "advertised endpoint at deploy time."
+            ),
+        )
     return profile
 
 
@@ -193,6 +200,14 @@ def validate_text_request(payload: ExtractTextRequest) -> None:
 
 def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> ExtractionResponse:
     record_extraction(response, tenant_id=tenant_id)
+    # PR-4 recency (review fix): the direct API extract endpoints serve
+    # traffic too, so they must stamp last_served like the worker path — or a
+    # deployment driven only through this surface reads as idle forever and
+    # becomes the first idle-TTL/LRU eviction victim mid-use. Best-effort,
+    # sidecar-only (never deployments.json); the api mounts the shared
+    # serving-state volume. `model_profile` is the resolved profile's honest
+    # name (a deployment name, or `store:<name>` — the helper strips it).
+    recency.stamp_served_profile(response.model_profile)
     if not settings.response_redaction_fields:
         return response
     return response.model_copy(
@@ -231,7 +246,7 @@ def list_schemas(_tenant: TenantDependency) -> dict[str, list[str]]:
 
 
 @app.get("/v1/schemas/{schema_name}")
-def get_schema(schema_name: str, _tenant: TenantDependency) -> dict:
+def get_schema(schema_name: str, _tenant: TenantDependency) -> dict[str, Any]:
     try:
         return schema_json(schema_name)
     except ValueError as exc:

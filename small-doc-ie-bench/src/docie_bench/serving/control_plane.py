@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import socket
+import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -604,8 +605,13 @@ class _DefaultSupervisor:
         self._port_probe = port_probe
         # PR-4 load coordinator (per-deployment load locks + fit/eviction),
         # built lazily on first load() so read-only constructions (the api's
-        # per-request ControlPlane) never touch the footprints sidecars.
+        # per-request ControlPlane) never touch the footprints sidecars. The
+        # lazy init is guarded by _coordinator_lock: two concurrent first
+        # loads (cold-start pileup — exactly when the coordinator's locks
+        # matter) must never each construct a coordinator with its own lock
+        # map, which would void the single-spawn/single-admission guarantee.
         self._load_coordinator: Any = None
+        self._coordinator_lock = threading.Lock()
 
     def _reachability_hosts(self) -> tuple[str, str]:
         """Return ``(bind_host, advertise_host)`` for a deploy on this node."""
@@ -907,11 +913,19 @@ class _DefaultSupervisor:
 
         Its eviction executor is THIS wrapper's ``unload`` so every victim
         goes through the placement-row UPDATE, exactly like a direct unload.
+        Double-checked under ``_coordinator_lock``: the un-synchronized
+        check-then-set was a classic race — two concurrent FIRST loads (the
+        cold-start pileup the coordinator exists for) could each build a
+        coordinator with its own per-deployment lock map.
         """
         if self._load_coordinator is None:
-            from docie_bench.serving.lifecycle import LoadCoordinator
+            with self._coordinator_lock:
+                if self._load_coordinator is None:
+                    from docie_bench.serving.lifecycle import LoadCoordinator
 
-            self._load_coordinator = LoadCoordinator(self.backend, unload=self.unload)
+                    self._load_coordinator = LoadCoordinator(
+                        self.backend, unload=self.unload
+                    )
         return self._load_coordinator
 
     def load(self, name: str) -> object:

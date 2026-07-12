@@ -32,6 +32,7 @@ from docie_bench.inngest.realtime import (
     publish,
 )
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.serving.placement_resolver import STORE_PROFILE_PREFIX
 from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 from docie_bench.settings import get_settings
@@ -51,6 +52,20 @@ PIN_EVENT = "serving/pin.requested"
 # reads the shared deployments.json fresh; the serving reconciler/load handler
 # is what actually flips it READY).
 _AUTOLOAD_POLL_INTERVAL_S = 2.0
+
+# Per-step ceiling for the worker-side await of a serving-side load (review
+# fix, design fix #7 follow-through). The size-aware budget can legitimately
+# reach LOAD_TIMEOUT_CEILING_S (1800s), but the self-hosted Inngest server's
+# per-step execution / Connect lease limits are NOT pinned by this repo — a
+# single step blocking for the whole budget would be killed at whatever the
+# server's limit is, on every attempt, and the retries would exhaust before a
+# large-GGUF load that was actually succeeding finished. So the worker awaits
+# in bounded chunks: each `await-deployment-ready:{i}` step blocks at most
+# this long (comfortably under any plausible lease/step limit) and the durable
+# step graph carries the total budget across chunks. The serving-side `load`
+# step remains long-running by nature (it owns the spawn); its safety story is
+# different and documented on `load_deployment_job`.
+_AUTOLOAD_STEP_BUDGET_S = 60.0
 
 
 def _resolve_profile(
@@ -105,11 +120,6 @@ def _read_deployment(name: str) -> dict[str, Any] | None:
         return None
 
 
-def _known_deployment(name: str) -> bool:
-    """True iff ``name`` is a deployment record in the shared deployments.json."""
-    return _read_deployment(name) is not None
-
-
 def _deployment_is_live(record: dict[str, Any]) -> bool:
     """Mirror of the resolver's ``_is_live`` gate over the raw record dict."""
     return record.get("state") == "ready" and bool(record.get("endpoint"))
@@ -132,6 +142,13 @@ def _autoload_target(data: dict[str, Any]) -> tuple[str, float] | None:
     resolver then raises its honest "not a live deployment" error downstream.
     The resolver itself stays pure — this is the only side-effectful seam,
     and it lives in the worker path, not in ``resolve_extraction_profile``.
+
+    A ``store:<name>`` selector routes via the placement of the deployment
+    record ``<name>`` (``serve_store_model`` names the record after the store
+    entry), so the prefix is STRIPPED before the record lookup — otherwise a
+    store-routed deployment evicted by the idle TTL would never auto-reload
+    and every subsequent ``store:`` extraction would hard-fail (review
+    blocker).
     """
     from docie_bench.serving.lifecycle import load_timeout_s
 
@@ -140,6 +157,8 @@ def _autoload_target(data: dict[str, Any]) -> tuple[str, float] | None:
     if not candidate:
         return None
     name = str(candidate)
+    if name.startswith(STORE_PROFILE_PREFIX):
+        name = name[len(STORE_PROFILE_PREFIX) :]
     record = _read_deployment(name)
     if record is None or _deployment_is_live(record):
         return None
@@ -154,6 +173,41 @@ def _autoload_target(data: dict[str, Any]) -> tuple[str, float] | None:
     return name, timeout
 
 
+async def _poll_deployment_live(
+    name: str,
+    *,
+    timeout_s: float,
+    interval_s: float = _AUTOLOAD_POLL_INTERVAL_S,
+) -> dict[str, Any]:
+    """One BOUNDED await chunk: poll until live or ``timeout_s`` elapses.
+
+    Returns ``{"ready": bool, ...}`` instead of raising, so the durable step
+    loop in ``_ensure_deployment_live`` can chain chunks without burning a
+    step retry on an honest not-yet-ready. The worker cannot observe the
+    serving container's processes; it polls the shared ``deployments.json``
+    that the serving service ``_save()``s as the load progresses.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        record = _read_deployment(name)
+        if record is not None and _deployment_is_live(record):
+            return {
+                "ready": True,
+                "deployment": name,
+                "state": "ready",
+                "endpoint": record.get("endpoint"),
+            }
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return {
+                "ready": False,
+                "deployment": name,
+                "last_error": (record or {}).get("last_error"),
+            }
+        await asyncio.sleep(min(interval_s, remaining))
+
+
 async def _await_deployment_live(
     name: str,
     *,
@@ -162,24 +216,77 @@ async def _await_deployment_live(
 ) -> dict[str, Any]:
     """Wait (bounded, size-aware) until ``name`` is READY with an endpoint.
 
-    The worker cannot observe the serving container's processes; it polls the
-    shared ``deployments.json`` that the serving service ``_save()``s as the
-    load progresses. Fails honestly ONLY after the generous size-aware budget
-    (design fix #7) — never a fast 502 on a cold managed deployment.
+    Fails honestly ONLY after the generous size-aware budget (design fix #7)
+    — never a fast 502 on a cold managed deployment. Direct-await flavour of
+    :func:`_poll_deployment_live` for callers outside a durable step graph.
     """
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    while True:
-        record = _read_deployment(name)
-        if record is not None and _deployment_is_live(record):
-            return {"deployment": name, "state": "ready", "endpoint": record.get("endpoint")}
-        if asyncio.get_running_loop().time() >= deadline:
-            detail = (record or {}).get("last_error")
-            raise TimeoutError(
-                f"deployment {name!r} did not become ready within the "
-                f"{timeout_s:.0f}s size-aware load budget"
-                + (f" (last_error: {detail})" if detail else "")
-            )
-        await asyncio.sleep(interval_s)
+    outcome = await _poll_deployment_live(name, timeout_s=timeout_s, interval_s=interval_s)
+    if outcome.get("ready"):
+        return outcome
+    detail = outcome.get("last_error")
+    raise TimeoutError(
+        f"deployment {name!r} did not become ready within the "
+        f"{timeout_s:.0f}s size-aware load budget"
+        + (f" (last_error: {detail})" if detail else "")
+    )
+
+
+async def _ensure_deployment_live(
+    step: Any,
+    data: dict[str, Any],
+    channel: str,
+    *,
+    step_budget_s: float = _AUTOLOAD_STEP_BUDGET_S,
+    poll_interval_s: float = _AUTOLOAD_POLL_INTERVAL_S,
+) -> str | None:
+    """Durable cold-start-on-demand orchestration for ``extract_document``.
+
+    Returns the target deployment name once live (or ``None`` when no
+    autoload was needed). Two review fixes are load-bearing here:
+
+    * **The plan is itself a durable step** (``plan-autoload``): evaluated
+      outside a step, a function-level retry would re-read
+      ``deployments.json``, possibly see the deployment live NOW, and replay
+      a DIFFERENT step sequence than the memoized attempt — a
+      non-deterministic step graph. Memoizing the decision keeps the graph
+      identical across retries.
+    * **The wait is chunked** (``await-deployment-ready:{i}``): each chunk
+      blocks at most ``step_budget_s`` (see ``_AUTOLOAD_STEP_BUDGET_S``), so
+      no single step depends on the Inngest server's unpinned step/lease
+      ceiling while the durable graph still carries the full size-aware
+      budget. Raises ``TimeoutError`` only after the whole budget.
+    """
+    plan = await step.run("plan-autoload", lambda: _autoload_target(data))
+    if plan is None:
+        return None
+    # step.run memoization JSON-round-trips the tuple into a list.
+    target, budget_s = str(plan[0]), float(plan[1])
+    await publish(channel, TOPIC_STATUS, {"state": "loading", "deployment": target})
+    await step.send_event(
+        "request-load",
+        inngest.Event(name=LOAD_EVENT, data={"name": target}),
+    )
+    remaining = budget_s
+    index = 0
+    last: dict[str, Any] | None = None
+    while remaining > 0:
+        chunk = min(step_budget_s, remaining)
+        last = await step.run(
+            f"await-deployment-ready:{index}",
+            lambda chunk=chunk: _poll_deployment_live(
+                target, timeout_s=chunk, interval_s=poll_interval_s
+            ),
+        )
+        if last is not None and last.get("ready"):
+            return target
+        remaining -= chunk
+        index += 1
+    detail = (last or {}).get("last_error")
+    raise TimeoutError(
+        f"deployment {target!r} did not become ready within the "
+        f"{budget_s:.0f}s size-aware load budget"
+        + (f" (last_error: {detail})" if detail else "")
+    )
 
 
 def _stamp_deployment_recency(*, explicit: str | None, profile_name: str) -> None:
@@ -190,17 +297,17 @@ def _stamp_deployment_recency(*, explicit: str | None, profile_name: str) -> Non
     NEVER write ``deployments.json`` (single-writer, design §0.1/P1). So the
     stamp goes to ``serving-state/recency/<name>`` (atomic single-key sidecar,
     monotonic max semantics) and the serving-side reconciler folds it into the
-    record. Stamps the explicit ``deployment`` selector when given, else the
-    resolved profile name iff it names a deployment record (a plain
-    models.yaml profile is not a deployment and gets no sidecar).
+    record. Delegates to the shared :func:`recency.stamp_served_profile` (the
+    same seam the direct API endpoints and the benchmark runner use), which
+    stamps the explicit ``deployment`` selector when given, else the resolved
+    profile name iff it names a deployment record — including ``store:<name>``
+    profiles, whose prefix is stripped to the record name (review blocker: an
+    unstamped store-routed deployment read as idle forever and was evicted
+    mid-use).
     """
     from docie_bench.serving import recency
 
-    target = explicit
-    if target is None and _known_deployment(profile_name):
-        target = profile_name
-    if target:
-        recency.stamp(str(target))
+    recency.stamp_served_profile(profile_name, deployment=explicit)
 
 
 async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
@@ -278,35 +385,27 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
       - ``language`` (str?)
       - ``channel`` (str?)        -- realtime channel to publish to
 
-    Cold-start-on-demand (PR-4, design §4): when the request targets a
-    cold/evicted MANAGED deployment (or one whose load is already in flight),
-    this worker fires ``serving/load.requested`` at the single-replica serving
-    service and WAITS — as its own durable steps, so a step retry re-fires an
-    IDEMPOTENT load (the serving-side per-deployment lock makes N concurrent
-    requests one spawn) instead of double-spawning. The request never 502s on
-    a cold managed deployment; it fails honestly only after the generous
-    size-aware budget. TTFT for that first request = model load time —
-    explicitly accepted. A MANUALLY stopped deployment is never auto-loaded.
+    Cold-start-on-demand (PR-4, design §4 + review fixes): when the request
+    targets a cold/evicted MANAGED deployment (or one whose load is already
+    in flight — including via a ``store:<name>`` selector), this worker fires
+    ``serving/load.requested`` at the single-replica serving service and
+    WAITS. The whole orchestration is durable steps (see
+    ``_ensure_deployment_live``): the autoload DECISION is memoized as its
+    own step so a function-level retry replays the identical step graph, and
+    the wait is chunked so no single step outruns the Inngest server's
+    step/lease limits. A step retry re-fires an IDEMPOTENT load (the
+    serving-side per-deployment lock makes N concurrent requests one spawn)
+    instead of double-spawning. The request never 502s on a cold managed
+    deployment; it fails honestly only after the generous size-aware budget.
+    TTFT for that first request = model load time — explicitly accepted. A
+    MANUALLY stopped deployment is never auto-loaded.
     """
     data = dict(ctx.event.data or {})
     channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "schema": data.get("schema_name")})
     try:
-        autoload = _autoload_target(data)
-        if autoload is not None:
-            target, budget_s = autoload
-            await publish(
-                channel, TOPIC_STATUS, {"state": "loading", "deployment": target}
-            )
-            await ctx.step.send_event(
-                "request-load",
-                inngest.Event(name=LOAD_EVENT, data={"name": target}),
-            )
-            await ctx.step.run(
-                "await-deployment-ready",
-                lambda: _await_deployment_live(target, timeout_s=budget_s),
-            )
+        await _ensure_deployment_live(ctx.step, data, channel)
         result = await ctx.step.run("extract", lambda: _run_extraction(data))
     except Exception as exc:  # noqa: BLE001 - surface error to the channel then re-raise
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
@@ -657,6 +756,20 @@ async def load_deployment_job(ctx: inngest.Context) -> Any:
     Event ``data``: ``name`` (required), ``channel``. Runs ONLY on ``serving``
     (the sole holder of the Popen handles). Blocks through a size-aware
     ``await_ready`` inside a worker thread; publishes the final record.
+
+    Step-budget contract (review fix): this ``load`` step is long-running by
+    nature — it owns the spawn and can legitimately block up to
+    ``LOAD_TIMEOUT_CEILING_S`` (1800s), and the self-hosted Inngest server's
+    per-step execution / lease ceiling is NOT pinned by this repo. Safety
+    does not depend on it: if the server kills an attempt at its limit, the
+    underlying ``asyncio.to_thread`` worker thread keeps loading in-process
+    (threads are not cancelled), and the RETRY blocks on the coordinator's
+    per-deployment load lock until that original spawn finishes, then
+    returns the hot record as an idempotent no-op. Attempts therefore
+    CONVERGE — the tolerated wall-clock load time is roughly (retries + 1) x
+    the server's per-attempt limit, and no attempt can ever double-spawn.
+    The worker-side wait never relies on this at all: it awaits in bounded
+    ``_AUTOLOAD_STEP_BUDGET_S`` chunks (see ``_ensure_deployment_live``).
     """
     data = dict(ctx.event.data or {})
     channel = str(data.get("channel") or f"run:{ctx.event.id}")

@@ -569,14 +569,35 @@ export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse>
 // ---------------------------------------------------------------------------
 
 /**
- * Deployments that can actually serve an extraction: lifecycle `ready` AND a
- * concrete `endpoint` AND a `spec.name` (the token the backend resolver keys
- * on). starting/degraded/failed/stopped are excluded. Mirrors the resolver's
- * "live/selectable" definition (PR-a).
+ * A deployment that is live RIGHT NOW: lifecycle `ready` AND a concrete
+ * `endpoint`. Mirrors the backend resolver's `_is_live` gate.
+ */
+export function isLiveDeployment(r: DeploymentRecord): boolean {
+  return r.state === "ready" && !!r.endpoint;
+}
+
+/**
+ * A deployment a request would AUTO-RELOAD (PR-4 cold-start-on-demand):
+ * evicted by the autoloader (`activation === "managed"`) or with a load
+ * already in flight (`desired_state === "running"`, still starting). Mirrors
+ * the worker's `_autoload_target` gate. Manually stopped deployments stay
+ * cold and are deliberately NOT selectable.
+ */
+export function isAutoReloadable(r: DeploymentRecord): boolean {
+  if (isLiveDeployment(r)) return false;
+  return r.activation === "managed" || r.spec?.desired_state === "running";
+}
+
+/**
+ * Deployments the Playground may route an extraction to: live ones, PLUS
+ * evicted/loading `managed` ones — sending a request to those triggers the
+ * worker's autoload (TTFT = model load time, by design). Requires a
+ * `spec.name` (the token the backend resolver keys on). Manually stopped /
+ * terminally failed deployments are excluded.
  */
 export function selectableDeployments(records: DeploymentRecord[]): DeploymentRecord[] {
   return records.filter(
-    (r) => r.state === "ready" && !!r.endpoint && !!r.spec?.name,
+    (r) => !!r.spec?.name && (isLiveDeployment(r) || isAutoReloadable(r)),
   );
 }
 

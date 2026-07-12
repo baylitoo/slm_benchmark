@@ -25,6 +25,10 @@ the one process holding the runtime Popen handles (P1). The pieces:
   N concurrent requests (from any number of scaled workers, the api, or a
   step retry) trigger exactly ONE spawn; an already-hot deployment is an
   idempotent no-op, which is what makes a re-fired load event harmless.
+  Admission (fit gate + eviction) additionally runs under ONE
+  coordinator-wide lock with in-flight reservations, so two concurrent loads
+  of DIFFERENT deployments can never both price themselves against the same
+  ``free_bytes`` and jointly overcommit the node.
 
 Unload itself lives on ``PersistentSupervisor.unload`` (the record mutation)
 and ``control_plane._DefaultSupervisor.unload`` (the placement-row UPDATE) —
@@ -285,6 +289,19 @@ class LoadCoordinator:
     route it through the placement-row UPDATE); ``assess`` is the fit gate
     (injected in tests). ``min_hot_s``/``max_evictions`` default from
     settings at call time so env knobs act without a restart.
+
+    Concurrent-load admission (review fix): the per-deployment locks
+    serialize loads of the SAME name only, so two threads loading DIFFERENT
+    deployments would each run ``assess_fit`` against the same measured
+    ``free_bytes`` — free RAM does not drop until the freshly spawned model
+    faults its pages in, so both gates could pass and jointly OOM the node.
+    Admission therefore runs under one ``_admission_lock`` and every admitted
+    load holds an in-flight reservation of its priced ``needed_bytes`` until
+    it reaches READY (or fails); a later admission subtracts the outstanding
+    reservations from the measured free RAM before deciding. Eviction is
+    symmetric: ``RuntimeAdapter.shutdown`` WAITS for the victim process to
+    exit (owned Popen and recovered-pid alike), so the freed RAM is
+    observable before the admitted load spawns.
     """
 
     def __init__(
@@ -317,6 +334,12 @@ class LoadCoordinator:
         self._timeout_for = timeout_for
         self._locks: dict[str, threading.Lock] = {}
         self._registry_lock = threading.Lock()
+        # One admission at a time + outstanding reservations (name -> priced
+        # needed_bytes) for loads admitted but not yet READY/failed. See the
+        # class docstring: this is what stops two concurrent loads of
+        # different deployments from double-spending the same free_bytes.
+        self._admission_lock = threading.Lock()
+        self._inflight: dict[str, int] = {}
 
     # ------------------------------------------------------------------ knobs
     def _eviction_knobs(self) -> tuple[float, int]:
@@ -358,37 +381,61 @@ class LoadCoordinator:
                     logger.debug("load %r: already hot — idempotent no-op", name)
                     return replace(record)
                 snapshot = replace(record)
-            self._make_room(snapshot)
-            with self.supervisor.lock:
-                record = self.supervisor.get(name)
-                spec = replace(record.spec, desired_state=DesiredState.RUNNING)
-                record = self.supervisor.deploy(spec)
-            if record.state == LifecycleState.READY:
-                return record
-            timeout = self._timeout_for(spec.launch.model)
-            record = self.supervisor.await_ready(
-                name, timeout_s=timeout, sleep=self._sleep
-            )
-            if record.state != LifecycleState.READY:
-                raise LoadError(
-                    f"deployment {name!r} did not become ready within the "
-                    f"{timeout:.0f}s size-aware load budget "
-                    f"(state={record.state.value}, last_error={record.last_error!r})"
+            # Admission is globally serialized and leaves a reservation (see
+            # class docstring); the reservation is released only once the load
+            # reaches READY (RSS then backs the memory) or fails.
+            with self._admission_lock:
+                decision = self._make_room(snapshot)
+                self._inflight[name] = max(decision.needed_bytes or 0, 0)
+            try:
+                with self.supervisor.lock:
+                    record = self.supervisor.get(name)
+                    spec = replace(record.spec, desired_state=DesiredState.RUNNING)
+                    record = self.supervisor.deploy(spec)
+                if record.state == LifecycleState.READY:
+                    return record
+                timeout = self._timeout_for(spec.launch.model)
+                record = self.supervisor.await_ready(
+                    name, timeout_s=timeout, sleep=self._sleep
                 )
-            return record
+                if record.state != LifecycleState.READY:
+                    raise LoadError(
+                        f"deployment {name!r} did not become ready within the "
+                        f"{timeout:.0f}s size-aware load budget "
+                        f"(state={record.state.value}, last_error={record.last_error!r})"
+                    )
+                return record
+            finally:
+                with self._admission_lock:
+                    self._inflight.pop(name, None)
 
     # --------------------------------------------------------------- eviction
-    def _make_room(self, record: DeploymentRecord) -> None:
-        """Fit-gate ``record``; evict LRU victims iff that makes it fit (§4)."""
+    def _make_room(self, record: DeploymentRecord) -> FitDecision:
+        """Fit-gate ``record``; evict LRU victims iff that makes it fit (§4).
+
+        Callers hold ``_admission_lock``. Outstanding in-flight reservations
+        (other admitted-but-not-yet-READY loads) are subtracted from the
+        measured free RAM before deciding, so concurrent loads of different
+        deployments cannot both spend the same bytes. Returns the decision so
+        the caller can reserve ``needed_bytes`` for this load.
+        """
         decision = self._assess(record)
-        if decision.fits:
-            return
         name = record.spec.name
+        reserved = sum(
+            bytes_ for other, bytes_ in self._inflight.items() if other != name
+        )
         if decision.needed_bytes is None or decision.free_bytes is None:
+            if decision.fits:
+                # Fail-open decision (unpriceable model or unmeasurable node):
+                # nothing to reserve, nothing to evict for.
+                return decision
             # A non-fitting decision always carries numbers (fail-open paths
             # return fits=True); guard against a custom gate that does not.
             raise LoadError(f"deployment {name!r} does not fit: {decision.reason}")
-        deficit = decision.needed_bytes + decision.margin_bytes - decision.free_bytes
+        effective_free = decision.free_bytes - reserved
+        if effective_free - decision.margin_bytes >= decision.needed_bytes:
+            return decision
+        deficit = decision.needed_bytes + decision.margin_bytes - effective_free
         min_hot_s, max_evictions = self._eviction_knobs()
         with self.supervisor.lock:
             candidates = [
@@ -405,16 +452,25 @@ class LoadCoordinator:
             price=lambda victim: releasable_bytes(victim, self._footprints),
         )
         if victims is None:
+            detail = decision.reason or (
+                f"needs ~{decision.needed_bytes} bytes but only {effective_free} "
+                f"effectively free ({decision.free_bytes} measured minus "
+                f"{reserved} reserved by in-flight loads) minus the "
+                f"{decision.margin_bytes}-byte safety margin"
+            )
             raise LoadError(
                 f"deployment {name!r} does not fit and eviction cannot make it "
                 f"fit (pinned/min-hot/rate-limit guards; never evict-to-not-fit): "
-                f"{decision.reason}"
+                f"{detail}"
             )
         for victim in victims:
             logger.info(
                 "evicting %r (LRU victim) to make room for loading %r", victim, name
             )
+            # The unload path waits for the victim process to exit (adapter
+            # shutdown blocks), so the freed RAM is real by the time we return.
             self._unload(victim)
+        return decision
 
 
 __all__ = [
