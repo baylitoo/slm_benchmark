@@ -955,11 +955,13 @@ def test_default_fit_check_prices_the_calibrated_footprint(
     tracker = ResourceTracker(footprints=FootprintStore(home=tmp_path))
     record = _record_for(gguf)
 
-    fits, _ = default_fit_check(record, tracker=tracker)
+    # margin_fraction=0.0 isolates the calibration behaviour under test from
+    # the safety-margin subtraction (covered by its own test below).
+    fits, _ = default_fit_check(record, tracker=tracker, margin_fraction=0.0)
     assert fits is True  # never calibrated: prediction governs
 
     tracker.footprints.record_steady(str(gguf), free + 1)  # measured bigger than free
-    fits, reason = default_fit_check(record, tracker=tracker)
+    fits, reason = default_fit_check(record, tracker=tracker, margin_fraction=0.0)
     assert fits is False
     assert "calibrated" in reason
 
@@ -993,18 +995,68 @@ def test_default_fit_check_prices_the_mmproj_for_vision_launches(
     )
     tracker = ResourceTracker(footprints=FootprintStore(home=tmp_path))
 
+    # margin_fraction=0.0: this test isolates mmproj pricing (free is only
+    # 2000 bytes above base, so any margin would fail even the text launch).
     text_only = _record_for(gguf)
-    fits, _ = default_fit_check(text_only, tracker=tracker)
+    fits, _ = default_fit_check(text_only, tracker=tracker, margin_fraction=0.0)
     assert fits is True
 
     vision = _record_for(gguf, extra_args=("--jinja", "--mmproj", str(mmproj)))
-    fits, _ = default_fit_check(vision, tracker=tracker)
+    fits, _ = default_fit_check(vision, tracker=tracker, margin_fraction=0.0)
     assert fits is False  # projector priced: base + 4096 > free
 
     # --mmproj=<path> form is priced identically.
     vision_eq = _record_for(gguf, extra_args=(f"--mmproj={mmproj}",))
-    fits, _ = default_fit_check(vision_eq, tracker=tracker)
+    fits, _ = default_fit_check(vision_eq, tracker=tracker, margin_fraction=0.0)
     assert fits is False
+
+
+def test_default_fit_check_holds_back_the_sizing_safety_margin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate must enforce the SAME explicit safety margin the Sizing tab
+    surfaces (serving_sizing_margin_fraction of total): raw `free >= needed`
+    would re-approve loads right up to 100% of the node while the fit table
+    honestly reports 'does not fit' — the two must be one policy."""
+    from docie_bench.serving import reconciler as reconciler_module
+    from docie_bench.serving.reconciler import default_fit_check
+    from docie_bench.serving.resources import (
+        FootprintStore,
+        NodeMemory,
+        ResourceTracker,
+        predicted_footprint_for_model,
+    )
+    from docie_bench.serving.sizing import safety_margin_bytes
+
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"g" * 1024)
+    predicted = predicted_footprint_for_model(size_bytes=None, model_path=str(gguf))
+    assert predicted is not None
+    total = 8 * 1024**3
+    margin = safety_margin_bytes(total, 0.10)
+    # Fits the raw free, does NOT fit once the margin is held back.
+    free = predicted + margin // 2
+    monkeypatch.setattr(
+        reconciler_module,
+        "read_node_memory",
+        lambda: NodeMemory(total_bytes=total, free_bytes=free, source="cgroup"),
+    )
+    tracker = ResourceTracker(footprints=FootprintStore(home=tmp_path))
+    record = _record_for(gguf)
+
+    fits, reason = default_fit_check(record, tracker=tracker, margin_fraction=0.10)
+    assert fits is False
+    assert "margin" in reason
+
+    # No margin override => the settings knob (default 0.10) governs: same
+    # refusal through the path the reconciler binds.
+    fits, reason = default_fit_check(record, tracker=tracker)
+    assert fits is False
+    assert "margin" in reason
+
+    # An explicit zero margin restores the raw-free comparison.
+    fits, _ = default_fit_check(record, tracker=tracker, margin_fraction=0.0)
+    assert fits is True
 
 
 def test_reconciler_default_fit_gate_consumes_its_trackers_calibration(

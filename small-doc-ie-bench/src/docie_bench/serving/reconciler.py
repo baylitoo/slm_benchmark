@@ -218,7 +218,10 @@ def _mmproj_bytes_from_launch(launch: RuntimeLaunchSpec) -> int:
 
 
 def default_fit_check(
-    record: DeploymentRecord, *, tracker: ResourceTracker | None = None
+    record: DeploymentRecord,
+    *,
+    tracker: ResourceTracker | None = None,
+    margin_fraction: float | None = None,
 ) -> tuple[bool, str]:
     """Restart fit gate, priced by the PR-2 resource tracker's numbers.
 
@@ -228,17 +231,31 @@ def default_fit_check(
     steady-state calibration is that a model measured to need more than its
     formula must be priced at the measurement, or the gate re-approves the
     exact OOM the budget exists to stop. Checked against the cgroup-aware node
-    free RAM — the same numbers the published snapshot reports, replacing
-    PR-1's psutil-only heuristic (which read the elastic WSL2 VM total inside
-    a container). Fail-open on anything unknowable (no model file,
-    unmeasurable node): the gate exists to stop crash->OOM->respawn storms,
-    not to block legitimate repairs on measurement hiccups.
+    free RAM minus the SAME explicit safety margin the Sizing tab holds back
+    (``serving_sizing_margin_fraction`` of total, default 10%) — without the
+    margin the gate would re-approve loads right up to 100% of the node while
+    the fit table honestly says "does not fit". Fail-open on anything
+    unknowable (no model file, unmeasurable node): the gate exists to stop
+    crash->OOM->respawn storms, not to block legitimate repairs on
+    measurement hiccups.
+
+    Same policy as the sizing engine, two honest mechanical differences
+    (documented in ``serving.sizing``): this gate re-measures node memory LIVE
+    at decision time — ``read_node_memory`` is the same reader the published
+    snapshot comes from, so sizing sees this number one reconcile cycle later
+    — and it stats the launch GGUF for weights (record-driven, DB-optional)
+    where sizing prefers the store's recorded ``size_bytes`` of that same
+    file.
 
     ``tracker`` supplies the calibration sidecars; the reconciler binds its
     own tracker here. Without one (direct/standalone calls) the default
     ``FootprintStore`` on the serving volume is consulted, so calibration is
-    never silently ignored.
+    never silently ignored. ``margin_fraction=None`` reads the settings knob;
+    pass an explicit fraction to override (tests, custom gates).
     """
+    from docie_bench.serving.sizing import safety_margin_bytes
+    from docie_bench.settings import get_settings
+
     launch = record.spec.launch
     predicted = predicted_footprint_for_model(
         size_bytes=None,
@@ -251,14 +268,21 @@ def default_fit_check(
     footprints = tracker.footprints if tracker is not None else FootprintStore()
     needed = footprint_bytes(predicted, footprints.get(launch.model))
     try:
-        free = read_node_memory().free_bytes
+        memory = read_node_memory()
     except Exception:  # noqa: BLE001 - unmeasurable => fail-open
         return True, ""
-    if free < needed:
+    fraction = (
+        margin_fraction
+        if margin_fraction is not None
+        else get_settings().serving_sizing_margin_fraction
+    )
+    margin = safety_margin_bytes(memory.total_bytes, fraction)
+    if memory.free_bytes - margin < needed:
         return False, (
             f"needs ~{needed} bytes (max of calibrated steady-state RSS and "
             f"predicted weights + kv-cache + overhead + mmproj) "
-            f"but only {free} available"
+            f"but only {memory.free_bytes} free minus the {margin}-byte safety "
+            f"margin leaves {memory.free_bytes - margin} available"
         )
     return True, ""
 

@@ -20,6 +20,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
+from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
 if TYPE_CHECKING:
     from docie_bench.serving.runtime import RuntimeLaunchSpec
 
@@ -354,7 +356,7 @@ class ControlPlane:
         name: str,
         *,
         port: int | None = None,
-        context_length: int = 8192,
+        context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -773,7 +775,11 @@ class _DefaultSupervisor:
         )
 
     def serve_store_model(
-        self, name: str, *, port: int | None = None, context_length: int = 8192
+        self,
+        name: str,
+        *,
+        port: int | None = None,
+        context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
     ) -> object:
         from docie_bench.serving.model_store import ModelStore, ModelStoreError
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec

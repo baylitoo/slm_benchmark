@@ -36,6 +36,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
 
 class TemplateDelivery(StrEnum):
     """How a model family receives the extraction template/schema."""
@@ -463,7 +465,7 @@ class ModelStore:
         executable: str = "llama-server",
         host: str = "127.0.0.1",
         port: int = 8088,
-        context_length: int = 8192,
+        context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
     ) -> tuple[str, ...]:
         """Build the llama-server command that serves ``name`` per its family contract.
 

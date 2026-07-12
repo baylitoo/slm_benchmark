@@ -396,6 +396,13 @@ def _to_view(row: ModelStoreEntry, placement: ModelPlacement | None = None) -> d
         "vision": bool(contract and contract.vision),
         "available_backends": available_backends(row.family),
         "has_mmproj": row.mmproj_path is not None,
+        # Launch paths (PR-3 sizing inputs): model_path keys the per-model
+        # calibration sidecar and is the stat fallback for weights; mmproj_path
+        # lets the fit table price the resident vision projector. SERVER-SIDE
+        # inputs only: the unauthenticated /v1/serving/store endpoint strips
+        # both before echoing entries to the browser (serving_api.list_store).
+        "model_path": row.model_path,
+        "mmproj_path": row.mmproj_path,
         "source": row.source,
         "size_bytes": row.size_bytes,
         "placement": _placement_view(placement) if placement is not None else None,

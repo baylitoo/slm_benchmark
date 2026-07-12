@@ -17,6 +17,7 @@ import {
   Boxes,
   Server,
   Network,
+  Gauge,
   Play,
   History,
   BarChart3,
@@ -48,6 +49,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { id: "deploy", label: "Models", icon: Boxes, view: "models" },
       { id: "deploy", label: "Deployments", icon: Server, view: "deployments" },
       { id: "deploy", label: "Ports", icon: Network, view: "ports" },
+      { id: "deploy", label: "Sizing", icon: Gauge, view: "sizing" },
     ],
   },
   {

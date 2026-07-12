@@ -49,6 +49,7 @@ import {
 } from "./ui";
 import { DataTable } from "./DataTable";
 import { LiveIndicator } from "./LiveIndicator";
+import { Sizing } from "./Sizing";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
@@ -89,7 +90,13 @@ export function Deploy({
       ? { title: "Models", subtitle: "GET /v1/serving/store — the GGUF catalog you can deploy." }
       : view === "ports"
         ? { title: "Ports", subtitle: "Live port allocation across running deployments." }
-        : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
+        : view === "sizing"
+          ? {
+              title: "Sizing",
+              subtitle:
+                "GET /v1/serving/sizing — how many more instances fit in RAM right now.",
+            }
+          : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
 
   return (
     <div>
@@ -114,6 +121,8 @@ export function Deploy({
         <ModelsView store={store} onDeploy={() => setSlideOver("deploy")} />
       ) : view === "ports" ? (
         <PortsView deployments={deployments} />
+      ) : view === "sizing" ? (
+        <Sizing active={active && view === "sizing"} />
       ) : (
         <DeploymentsView deployments={deployments} />
       )}
