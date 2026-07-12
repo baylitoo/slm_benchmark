@@ -31,7 +31,7 @@ from sqlalchemy import (
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, Session, mapped_column
 from sqlalchemy.types import TypeEngine
 
 from docie_bench.serving.model_store import FAMILIES, StoreEntry
@@ -134,28 +134,77 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
 )
 
 
+# Arbitrary-but-stable advisory-lock key for the model_placement observed-columns
+# migration ("docie placement v1"). Any concurrent migrator serializes on it.
+_PLACEMENT_MIGRATION_LOCK_KEY = 0x0D0C1E01
+
+
+def _postgres_add_column_ddl(name: str, column_type: TypeEngine[Any], dialect: Any) -> str:
+    """The race-safe PostgreSQL form of one observed-column ADD (design §0.1/P2)."""
+    compiled = column_type.compile(dialect=dialect)
+    return f"ALTER TABLE model_placement ADD COLUMN IF NOT EXISTS {name} {compiled}"
+
+
 def ensure_placement_observed_columns(engine: Engine) -> list[str]:
     """Forward migration: add the PR-1 observed columns to an existing table.
 
     ``create_all`` never alters an existing table (the ``size_bytes`` caveat),
     so a database that predates the observed columns would make the
-    reconciler's first publish throw ``UndefinedColumn``. This adds exactly the
-    missing columns (all nullable, so no table rewrite / no lock pain) and is
-    idempotent — a fresh database created by ``create_all`` already has them
-    and this is a no-op. Returns the column names actually added.
+    reconciler's first publish throw ``UndefinedColumn``. Adds exactly the
+    missing columns (all nullable, so no table rewrite / no lock pain).
+    Returns the column names actually added.
+
+    Concurrency/idempotence: every process that calls ``init_engine`` (api,
+    serving, N scaled workers) runs this at startup, possibly simultaneously.
+    On PostgreSQL each column is added with ``ADD COLUMN IF NOT EXISTS`` (the
+    design doc's §0.1/P2 SQL) inside one transaction that first takes
+    ``pg_advisory_xact_lock`` — so concurrent migrators serialize and a raced
+    duplicate ADD degrades to a no-op instead of a DuplicateColumn abort. On
+    other dialects (sqlite in tests — no IF NOT EXISTS support for ADD
+    COLUMN) it falls back to inspect-then-ALTER, which is safe there because
+    the sqlite path is single-process dev/test only. A fresh database created
+    by ``create_all`` already has the columns and this is a no-op either way.
     """
     inspector = sa_inspect(engine)
     if not inspector.has_table("model_placement"):
         return []  # create_all will create it complete
-    existing = {column["name"] for column in inspector.get_columns("model_placement")}
     added: list[str] = []
     with engine.begin() as connection:
-        for name, column_type in _OBSERVED_COLUMNS:
-            if name in existing:
-                continue
-            compiled = column_type.compile(dialect=engine.dialect)
-            connection.execute(sa_text(f"ALTER TABLE model_placement ADD COLUMN {name} {compiled}"))
-            added.append(name)
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _PLACEMENT_MIGRATION_LOCK_KEY},
+            )
+            existing = {
+                row[0]
+                for row in connection.execute(
+                    sa_text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'model_placement'"
+                    )
+                )
+            }
+            for name, column_type in _OBSERVED_COLUMNS:
+                # IF NOT EXISTS even for columns the snapshot says are missing:
+                # the snapshot + lock make `added` accurate, the SQL guard makes
+                # the ALTER itself unconditionally race-safe.
+                connection.execute(
+                    sa_text(_postgres_add_column_ddl(name, column_type, engine.dialect))
+                )
+                if name not in existing:
+                    added.append(name)
+        else:
+            existing = {
+                column["name"] for column in inspector.get_columns("model_placement")
+            }
+            for name, column_type in _OBSERVED_COLUMNS:
+                if name in existing:
+                    continue
+                compiled = column_type.compile(dialect=engine.dialect)
+                connection.execute(
+                    sa_text(f"ALTER TABLE model_placement ADD COLUMN {name} {compiled}")
+                )
+                added.append(name)
     if added:
         logger.info("model_placement migration: added observed columns %s", added)
     return added
@@ -257,6 +306,9 @@ class ModelCatalog:
                     .where(ModelPlacement.model_name.is_not(None))
                     .order_by(ModelPlacement.updated_at)
                 )
+                # The WHERE clause already excludes NULLs; the guard just
+                # narrows str | None for the type checker.
+                if placement.model_name is not None
             }
             return [_to_view(row, placements.get(row.name)) for row in rows]
 
@@ -431,7 +483,7 @@ class ModelCatalog:
             return _placement_view(row) if row is not None else None
 
     @staticmethod
-    def _placement_row_for_model(session: Any, model_name: str) -> ModelPlacement | None:
+    def _placement_row_for_model(session: Session, model_name: str) -> ModelPlacement | None:
         return session.scalars(
             select(ModelPlacement)
             .where(ModelPlacement.model_name == model_name)

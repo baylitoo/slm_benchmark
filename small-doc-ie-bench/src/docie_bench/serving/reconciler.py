@@ -46,9 +46,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from docie_bench.serving import recency
@@ -80,6 +83,84 @@ _ENGINE_BY_RUNTIME: dict[RuntimeKind, str] = {
     RuntimeKind.VLLM: "vllm",
     RuntimeKind.REMOTE: "remote",
 }
+
+
+class ReconcilerSingletonError(RuntimeError):
+    """Another live serving replica already holds the reconciler lease."""
+
+
+@dataclass
+class ReconcilerLease:
+    """Advisory single-reconciler lease on the shared serving-state volume.
+
+    ``deploy.replicas: 1`` in compose is advisory — ``--scale serving=2`` (or a
+    copy-pasted override file) silently bypasses it, and N reconcilers on the
+    shared volume are exactly the multi-writer clobber P1 designed out. This
+    lease turns that misconfiguration into a loud refusal: every reconciler
+    heartbeats ``<serving-home>/reconciler-lease.json`` (atomic single-key
+    write, same pattern as the recency sidecars) each cycle, and a starting
+    reconciler REFUSES to run when a fresh lease from a DIFFERENT instance
+    exists. Advisory, not a distributed lock: a perfectly simultaneous double
+    start can still race the first claim — the guard exists to catch the
+    realistic "second replica joins an already-running fleet" case, not to be
+    Paxos. ``--scale serving=N`` for N>1 remains forbidden regardless.
+    """
+
+    path: Path
+    instance_id: str
+    stale_after_s: float = 60.0
+    clock: Callable[[], float] = field(default=time.time)
+
+    def claim(self) -> None:
+        """Take the lease or raise ``ReconcilerSingletonError`` if held live.
+
+        A stale lease (older than ``stale_after_s`` — e.g. this same container
+        restarted, or a crashed replica) is overwritten. A fresh lease from
+        this same ``instance_id`` is simply re-claimed (idempotent restart).
+        """
+        holder = self._read()
+        if holder is not None:
+            other_instance, stamped_at = holder
+            age = self.clock() - stamped_at
+            if other_instance != self.instance_id and 0 <= age < self.stale_after_s:
+                raise ReconcilerSingletonError(
+                    f"another serving replica ({other_instance!r}) heartbeated the "
+                    f"reconciler lease {age:.1f}s ago (< {self.stale_after_s:.0f}s): "
+                    f"refusing to start a second reconciler. The serving service is "
+                    f"single-replica by design — never `--scale serving=2`; scale "
+                    f"back to 1 (or remove the stale replica) and restart."
+                )
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Heartbeat the lease (best-effort, atomic; called every cycle)."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(f".{self.path.name}.tmp")
+            temporary.write_text(
+                json.dumps(
+                    {"instance": self.instance_id, "timestamp": self.clock()},
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.path)
+        except OSError:  # pragma: no cover - disk hiccup must not kill the loop
+            logger.warning("could not heartbeat reconciler lease %s", self.path, exc_info=True)
+
+    def release(self) -> None:
+        """Drop the lease on clean shutdown iff it is still ours (best-effort)."""
+        holder = self._read()
+        if holder is not None and holder[0] == self.instance_id:
+            with contextlib.suppress(OSError):
+                self.path.unlink()
+
+    def _read(self) -> tuple[str, float] | None:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return str(payload["instance"]), float(payload["timestamp"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None  # missing/corrupt lease reads as "unheld"
 
 
 @dataclass(frozen=True)
@@ -176,24 +257,49 @@ class ServingReconciler:
         create_time: Callable[[int], float | None] = _default_create_time,
         publisher: Callable[[list[ObservedDeployment]], None] = _publish_via_catalog,
         recency_home: Path | None = None,
+        healthy_reset_threshold: int = 30,
+        lease: ReconcilerLease | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
         if ready_miss_threshold < 1:
             raise ValueError("ready_miss_threshold must be positive")
+        if healthy_reset_threshold < 1:
+            raise ValueError("healthy_reset_threshold must be positive")
         self.supervisor = supervisor
         self.interval_s = interval_s
         self.ready_miss_threshold = ready_miss_threshold
+        self.healthy_reset_threshold = healthy_reset_threshold
         self._fit_check = fit_check
         self._rss_reader = rss_reader
         self._create_time = create_time
         self._publisher = publisher
         self._recency_home = recency_home
+        self._lease = lease
         # Reconciler-local memory: which deployments were observed READY (so a
         # later miss is a fast-death candidate, not a slow cold-load) and how
-        # many consecutive misses each has accrued since.
+        # many consecutive misses each has accrued since. _was_ready is a CACHE,
+        # not the authority: was-readiness is also derived from the persisted
+        # record state (READY survives deployments.json reloads), so a serving
+        # restart never resets death-detection for a hung runtime back to the
+        # ~10-minute slow-load tolerance (see _was_previously_ready).
         self._was_ready: set[str] = set()
         self._misses: dict[str, int] = {}
+        # Consecutive healthy cycles per deployment: after
+        # ``healthy_reset_threshold`` of them the restart budget is forgiven
+        # (reset to 0), so the budget bounds crash STORMS without becoming a
+        # lifetime cap. Any miss or death zeroes the streak.
+        self._healthy_streak: dict[str, int] = {}
+
+    def claim_singleton(self) -> None:
+        """Claim the singleton lease before starting the loop.
+
+        Raises ``ReconcilerSingletonError`` when another live serving replica
+        holds it (the caller must then NOT start this reconciler). No-op when
+        no lease was configured (tests / embedded use).
+        """
+        if self._lease is not None:
+            self._lease.claim()
 
     # ------------------------------------------------------------------ loop
     async def run_forever(self, *, stop_event: asyncio.Event | None = None) -> None:
@@ -203,18 +309,25 @@ class ServingReconciler:
             self.interval_s,
             self.ready_miss_threshold,
         )
-        while stop_event is None or not stop_event.is_set():
-            try:
-                # The cycle blocks (health probes + fsync) while holding the
-                # supervisor lock -> a worker thread, never the event loop.
-                await asyncio.to_thread(self.run_cycle)
-            except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
-                logger.exception("serving reconcile cycle failed")
-            if stop_event is None:
-                await asyncio.sleep(self.interval_s)
-            else:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stop_event.wait(), self.interval_s)
+        try:
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    # The cycle blocks (health probes + fsync) while holding the
+                    # supervisor lock -> a worker thread, never the event loop.
+                    await asyncio.to_thread(self.run_cycle)
+                except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
+                    logger.exception("serving reconcile cycle failed")
+                if stop_event is None:
+                    await asyncio.sleep(self.interval_s)
+                else:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(stop_event.wait(), self.interval_s)
+        finally:
+            # Clean shutdown drops the singleton lease so a replacement replica
+            # does not have to wait out stale_after_s (a crash leaves the lease
+            # to expire naturally — that is the point of the staleness window).
+            if self._lease is not None:
+                self._lease.release()
 
     # ----------------------------------------------------------------- cycle
     def run_cycle(self) -> list[ObservedDeployment]:
@@ -224,6 +337,10 @@ class ServingReconciler:
         # Publish OUTSIDE the lock: observations are immutable snapshots and a
         # slow database must not block the lifecycle handlers.
         self._publisher(observations)
+        # Heartbeat the singleton lease each completed cycle so a second
+        # serving replica joining later sees a live holder and refuses.
+        if self._lease is not None:
+            self._lease.refresh()
         return observations
 
     def _observe_locked(self) -> list[ObservedDeployment]:
@@ -244,6 +361,8 @@ class ServingReconciler:
         self._was_ready.intersection_update(records)
         for stale in set(self._misses) - set(records):
             del self._misses[stale]
+        for stale in set(self._healthy_streak) - set(records):
+            del self._healthy_streak[stale]
         return observations
 
     def _observe_one(self, name: str, record: DeploymentRecord) -> ObservedDeployment:
@@ -273,10 +392,12 @@ class ServingReconciler:
             record = self.supervisor.observe_health(name, healthy=True)
             self._was_ready.add(name)
             self._misses[name] = 0
+            record = self._credit_healthy_cycle(name, record)
             return self._observation(name, record, phase="hot", health_ok=True)
 
+        self._healthy_streak.pop(name, None)  # any miss restarts the streak
         detail = health.detail or f"health check returned status {health.status_code}"
-        if name in self._was_ready:
+        if self._was_previously_ready(name, record):
             # Previously READY and now unreachable: the FAST path. Do not wait
             # out the deploy-time health_failure_threshold=60 (~10 min).
             misses = self._misses.get(name, 0) + 1
@@ -341,6 +462,44 @@ class ServingReconciler:
         )
 
     # -------------------------------------------------------------- plumbing
+    def _was_previously_ready(self, name: str, record: DeploymentRecord) -> bool:
+        """Was this deployment ever READY? Survives a serving-service restart.
+
+        The in-memory ``_was_ready`` set is process-local; if it were the only
+        signal, restarting the serving container would re-enter the generous
+        slow-load tolerance for a HUNG (alive-but-unreachable) runtime and take
+        ~10 minutes to re-declare it dead. The persisted record state closes
+        that hole: ``observe_health(healthy=False)`` deliberately never flips
+        READY off (state transitions on misses are this loop's policy), so a
+        record that reached READY still says READY in ``deployments.json``
+        after a reload — derived was-readiness, no extra persistence needed.
+        """
+        return name in self._was_ready or record.state == LifecycleState.READY
+
+    def _credit_healthy_cycle(self, name: str, record: DeploymentRecord) -> DeploymentRecord:
+        """Count a healthy cycle; forgive the restart budget after a streak.
+
+        ``restart_count`` otherwise only ratchets up, so ``max_restarts=5``
+        would be a LIFETIME cap: five crashes spread over weeks of healthy
+        uptime would leave the deployment permanently unrepairable. After
+        ``healthy_reset_threshold`` consecutive healthy cycles (default 30 —
+        five minutes at the 10s interval) the budget resets to zero. A crash
+        storm never earns the reset: every miss or death zeroes the streak.
+        """
+        streak = self._healthy_streak.get(name, 0) + 1
+        self._healthy_streak[name] = streak
+        if streak >= self.healthy_reset_threshold and record.restart_count > 0:
+            logger.info(
+                "deployment %s healthy for %d consecutive cycles: "
+                "resetting restart budget (was %d/%d)",
+                name,
+                streak,
+                record.restart_count,
+                record.spec.max_restarts,
+            )
+            record = self.supervisor.reset_restart_budget(name)
+        return record
+
     def _process_alive(self, record: DeploymentRecord) -> tuple[bool, str | None]:
         """(alive, reuse_error): health-independent process liveness + reuse guard."""
         adapter = self.supervisor.adapters[record.spec.launch.runtime]
@@ -371,6 +530,7 @@ class ServingReconciler:
     def _forget(self, name: str) -> None:
         self._was_ready.discard(name)
         self._misses.pop(name, None)
+        self._healthy_streak.pop(name, None)
 
     def _observation(
         self,
@@ -401,4 +561,10 @@ class ServingReconciler:
         )
 
 
-__all__ = ["ServingReconciler", "ObservedDeployment", "default_fit_check"]
+__all__ = [
+    "ServingReconciler",
+    "ObservedDeployment",
+    "ReconcilerLease",
+    "ReconcilerSingletonError",
+    "default_fit_check",
+]

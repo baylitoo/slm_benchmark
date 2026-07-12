@@ -78,7 +78,21 @@ services:
   # the sole holder of the llama-server Popen handles and the sole writer of
   # deployments.json; scaling it would reintroduce the multi-writer clobber
   # and round-robin-advertise failure the split exists to prevent.
-  # NEVER run `--scale serving=N` (deploy.replicas pins it to 1).
+  #
+  # NEVER run `--scale serving=N`. `deploy.replicas: 1` below is ADVISORY for
+  # plain `docker compose` (it is only enforced by Swarm) and an explicit
+  # `--scale serving=2` overrides it silently. Defense in depth: each replica
+  # heartbeats a reconciler lease on the shared serving-state volume, and a
+  # second replica that sees a live lease from another instance REFUSES to
+  # start its reconciler (loud CRITICAL log). That guard contains the worst
+  # damage (N reconcilers clobbering deployments.json) but a second replica
+  # still registers duplicate lifecycle handlers — scale>1 stays forbidden.
+  #
+  # Inngest app: this service registers its OWN app id (docie-serving, see
+  # INNGEST_SERVING_APP_ID) with only the lifecycle functions. Per the Inngest
+  # Connect contract an app's function set is re-synced on every connect, so
+  # serving and worker MUST NOT share one app id with disjoint function lists
+  # (registrations would overwrite each other and flap).
   #
   # Reachability: the in-container runtime BINDS 0.0.0.0
   # (DOCIE_SERVING_BIND_HOST) and ADVERTISES this service's name
@@ -97,11 +111,20 @@ services:
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
     environment:
-      # Registers ONLY the lifecycle functions (deploy/seed/delete) + runs the
-      # reconciler. Disjoint from the worker's set, so a serving/* event can
-      # only land on this replica.
+      # Registers ONLY the lifecycle functions (deploy/seed/delete) under the
+      # dedicated docie-serving Inngest app + runs the reconciler, so a
+      # serving/* event can only land on this replica.
       DOCIE_WORKER_ROLE: serving
-      DOCIE_SERVING_ADVERTISE_HOST: ${DOCIE_SERVING_ADVERTISE_HOST:-serving}
+      # Deliberately NOT `${DOCIE_SERVING_ADVERTISE_HOST:-serving}`: a .env
+      # written before the PR-1 service split carries
+      # DOCIE_SERVING_ADVERTISE_HOST=worker, and interpolating the legacy
+      # variable here would make every deploy advertise the SCALED worker
+      # service name (round-robin endpoint — the exact failure the split
+      # removed). The service pins its own name; to rename it, set the new
+      # DOCIE_SERVING_ADVERTISE_HOST_OVERRIDE (the legacy variable is ignored
+      # by this service and the worker warns at startup if it names a scaled
+      # service).
+      DOCIE_SERVING_ADVERTISE_HOST: ${DOCIE_SERVING_ADVERTISE_HOST_OVERRIDE:-serving}
       # Opt INTO an all-interfaces bind so sibling containers (api/worker) can
       # reach the runtime over the compose network. The code default is the
       # safe loopback 127.0.0.1 (so a local `docie up`/`docie serve` never

@@ -24,7 +24,7 @@ from typing import Any
 import inngest
 
 from docie_bench.extract.service import ExtractionService, hash_bytes
-from docie_bench.inngest.client import inngest_client
+from docie_bench.inngest.client import inngest_client, serving_client
 from docie_bench.inngest.realtime import (
     TOPIC_ERROR,
     TOPIC_RESULT,
@@ -189,7 +189,7 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
       - ``channel`` (str?)        -- realtime channel to publish to
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "schema": data.get("schema_name")})
     try:
@@ -335,7 +335,7 @@ async def run_benchmark_job(ctx: inngest.Context) -> dict[str, Any]:
     ``tenant_id`` (bound at trigger time), ``idempotency_key`` (optional).
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
     event_id = ctx.event.id
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "dataset": data.get("dataset")})
@@ -437,7 +437,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     return record
 
 
-@inngest_client.create_function(
+@serving_client.create_function(
     fn_id="serving-deploy",
     trigger=inngest.TriggerEvent(event="serving/deploy.requested"),
 )
@@ -449,22 +449,20 @@ async def deploy_model_job(ctx: inngest.Context) -> Any:
 
     Reachability (PR-1): the runtime now binds ``DOCIE_SERVING_BIND_HOST``
     (0.0.0.0) and the DeploymentRecord advertises ``DOCIE_SERVING_ADVERTISE_HOST``
-    (the compose service name, e.g. ``worker``), so the api container resolves a
-    cross-container-reachable endpoint instead of a worker-local loopback.
+    — the single-replica ``serving`` compose service's own name (pinned in
+    docker-compose.yml, independent of any legacy .env value) — so the api
+    container resolves a cross-container-reachable endpoint that always names
+    the one node that ran the deploy.
 
-    NOTE: still requires worker ``scale=1``. The advertised service name
-    round-robins under ``--scale worker>1`` and may resolve to a replica that
-    never ran the deploy (deterministic scale>1 needs a dedicated single-replica
-    serving service; deferred). This is no longer a silent, intermittent failure:
-    the control plane now FAILS FAST at deploy time when the advertise host
-    resolves to more than one address (see
+    Belt-and-suspenders: the control plane still FAILS FAST at deploy time when
+    the advertise host resolves to more than one address (see
     ``_DefaultSupervisor._guard_deterministic_advertise``), surfacing a clear
-    error on the ``error`` topic instead of recording a flaky endpoint. Also needs
-    the ``llama-server`` binary on PATH + a seeded model store; without them
-    deploys fail cleanly on the ``error`` topic.
+    error on the ``error`` topic instead of recording a flaky endpoint. Also
+    needs the ``llama-server`` binary on PATH + a seeded model store; without
+    them deploys fail cleanly on the ``error`` topic.
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "model": data.get("model")})
     try:
@@ -485,7 +483,7 @@ async def _run_delete(data: dict[str, Any]) -> Any:
     return await cp.remove(str(name))
 
 
-@inngest_client.create_function(
+@serving_client.create_function(
     fn_id="serving-delete",
     trigger=inngest.TriggerEvent(event="serving/delete.requested"),
 )
@@ -501,7 +499,7 @@ async def delete_deployment_job(ctx: inngest.Context) -> Any:
     on the error topic.
     """
     data = dict(ctx.event.data or {})
-    channel = data.get("channel") or f"run:{ctx.event.id}"
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
 
     await publish(channel, TOPIC_STATUS, {"state": "deleting", "name": data.get("name")})
     try:
@@ -608,7 +606,7 @@ async def _publish_error_safely(channel: str, message: str) -> None:
         logger.exception("failed to publish error to channel %s", channel)
 
 
-@inngest_client.create_function(
+@serving_client.create_function(
     fn_id="serving-seed-ollama",
     trigger=inngest.TriggerEvent(event="serving/seed.requested"),
 )
@@ -693,9 +691,18 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
 # dedicated single-replica `serving` service (owns every function that spawns
 # or kills a runtime process, plus the background reconciler) and a freely
 # scaled `worker` service (extraction/benchmark/GC — replica-safe, never
-# spawns a runtime). Routing is load-bearing: each service registers a
-# DISJOINT function list with the same Inngest app, so a `serving/*` lifecycle
-# event can only ever land on the one replica that holds the Popen handles.
+# spawns a runtime). Routing is load-bearing, and per the Inngest Connect
+# contract it requires TWO app ids, not one app with per-role subsets: every
+# worker sync (Connect handshake) registers its function list as the app's
+# authoritative set, so two fleets syncing DISJOINT sets under one app id
+# would overwrite each other's registration on every (re)connect — functions
+# flap between registered and archived, and a `serving/*` event may fire
+# while its function is deregistered. Hence:
+#   * `worker_functions`  are created on `inngest_client`  (app `docie-studio`)
+#   * `serving_functions` are created on `serving_client`  (app `docie-serving`)
+# Events still reach their handlers: event delivery routes by event NAME
+# within the environment, not by app, so `serving/*` events fired from the
+# api or a worker land on the serving app's functions unchanged.
 # Seed lives on `serving` too: it writes multi-GB blobs into the store the
 # serving service deploys from, and keeping every store/lifecycle writer on
 # the single replica keeps the write topology trivial.
@@ -729,11 +736,36 @@ def functions_for_role(role: str | None) -> list[Any]:
     )
 
 
+def apps_for_role(role: str | None) -> list[tuple[Any, list[Any]]]:
+    """The ``(client, functions)`` app registrations for a role.
+
+    This is what ``connect()`` consumes. Each app id always carries its FULL
+    function set (never a subset), so no two processes can ever sync different
+    function lists for the same app — the flapping-registration failure mode
+    the two-app split exists to prevent. The ``all`` dev role registers BOTH
+    apps over the one connection (the SDK's `connect` is multi-app by design).
+    """
+    normalized = (role or "all").strip().lower()
+    if normalized == "serving":
+        return [(serving_client, list(serving_functions))]
+    if normalized == "worker":
+        return [(inngest_client, list(worker_functions))]
+    if normalized in {"all", ""}:
+        return [
+            (inngest_client, list(worker_functions)),
+            (serving_client, list(serving_functions)),
+        ]
+    raise ValueError(
+        f"unknown DOCIE_WORKER_ROLE {role!r}: expected 'serving', 'worker', or 'all'"
+    )
+
+
 __all__ = [
     "functions",
     "worker_functions",
     "serving_functions",
     "functions_for_role",
+    "apps_for_role",
     "extract_document",
     "run_benchmark_job",
     "deploy_model_job",

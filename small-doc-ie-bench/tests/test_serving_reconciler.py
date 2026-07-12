@@ -478,6 +478,23 @@ def test_publish_observed_updates_and_creates_rows() -> None:
     assert len(catalog.list_placements()) == 1  # updated, not duplicated
 
 
+def test_postgres_migration_uses_race_safe_add_column_if_not_exists() -> None:
+    """On PostgreSQL every ADD uses the design's `ADD COLUMN IF NOT EXISTS`
+    form (race-safe under concurrent api/serving/worker startups), not the
+    inspect-then-plain-ALTER pattern (which aborts with DuplicateColumn when
+    two processes race the inspector snapshot)."""
+    from sqlalchemy.dialects import postgresql
+
+    from docie_bench.serving.catalog import _OBSERVED_COLUMNS, _postgres_add_column_ddl
+
+    dialect = postgresql.dialect()
+    for name, column_type in _OBSERVED_COLUMNS:
+        ddl = _postgres_add_column_ddl(name, column_type, dialect)
+        assert ddl.startswith(
+            f"ALTER TABLE model_placement ADD COLUMN IF NOT EXISTS {name} "
+        )
+
+
 def test_migration_adds_observed_columns_to_a_legacy_table(tmp_path: Path) -> None:
     """A model_placement created BEFORE PR-1 (no observed columns) gains
     exactly the missing columns via the explicit ALTER TABLE migration —
@@ -592,11 +609,19 @@ def test_role_partition_is_disjoint_and_complete() -> None:
     """P1 routing is load-bearing: lifecycle functions register ONLY on the
     serving service, extraction/benchmark ONLY on workers, no overlap."""
     from docie_bench.inngest import functions as fn
-    from docie_bench.inngest.client import APP_ID
+    from docie_bench.inngest.client import APP_ID, SERVING_APP_ID
 
     def ids(items: list[Any]) -> set[str]:
-        # Function.id is app-prefixed ("{APP_ID}-{fn_id}"); compare local ids.
-        return {f.id.removeprefix(f"{APP_ID}-") for f in items}
+        # Function.id is app-prefixed ("{app_id}-{fn_id}"); compare local ids.
+        result = set()
+        for f in items:
+            local = f.id
+            for prefix in (f"{SERVING_APP_ID}-", f"{APP_ID}-"):
+                if local.startswith(prefix):
+                    local = local.removeprefix(prefix)
+                    break
+            result.add(local)
+        return result
 
     serving_ids = ids(fn.serving_functions)
     worker_ids = ids(fn.worker_functions)
@@ -610,6 +635,261 @@ def test_role_partition_is_disjoint_and_complete() -> None:
     assert ids(fn.functions_for_role(None)) == serving_ids | worker_ids
     with pytest.raises(ValueError, match="DOCIE_WORKER_ROLE"):
         fn.functions_for_role("both")
+
+
+def test_roles_register_separate_inngest_apps() -> None:
+    """The Inngest Connect app-id contract: a worker sync registers its function
+    list as the app's AUTHORITATIVE set, so serving and worker fleets MUST NOT
+    share one app id with disjoint function subsets (their registrations would
+    overwrite each other on every reconnect). Each role registers its own app,
+    each app id always carries its full function set, and the dev `all` role
+    registers both apps over the one (multi-app) connection."""
+    from docie_bench.inngest import functions as fn
+    from docie_bench.inngest.client import (
+        APP_ID,
+        SERVING_APP_ID,
+        inngest_client,
+        serving_client,
+    )
+
+    # Two distinct apps, two distinct clients.
+    assert APP_ID != SERVING_APP_ID
+    assert inngest_client.app_id == APP_ID
+    assert serving_client.app_id == SERVING_APP_ID
+
+    # Every function is bound to exactly its role's app (Function.id is
+    # "{app_id}-{fn_id}", stamped by the client that created it).
+    assert all(f.id.startswith(f"{SERVING_APP_ID}-") for f in fn.serving_functions)
+    assert all(f.id.startswith(f"{APP_ID}-") for f in fn.worker_functions)
+
+    # apps_for_role: the (client, functions) registrations connect() consumes.
+    serving_apps = fn.apps_for_role("serving")
+    worker_apps = fn.apps_for_role("worker")
+    all_apps = fn.apps_for_role("all")
+    assert [(c.app_id, [f.id for f in fns]) for c, fns in serving_apps] == [
+        (SERVING_APP_ID, [f.id for f in fn.serving_functions])
+    ]
+    assert [(c.app_id, [f.id for f in fns]) for c, fns in worker_apps] == [
+        (APP_ID, [f.id for f in fn.worker_functions])
+    ]
+    # `all` registers BOTH apps, each with its FULL set — never a subset of
+    # either app (a subset sync is exactly the flapping failure mode).
+    assert {c.app_id for c, _ in all_apps} == {APP_ID, SERVING_APP_ID}
+    by_app = {c.app_id: [f.id for f in fns] for c, fns in all_apps}
+    assert by_app[APP_ID] == [f.id for f in fn.worker_functions]
+    assert by_app[SERVING_APP_ID] == [f.id for f in fn.serving_functions]
+    with pytest.raises(ValueError, match="DOCIE_WORKER_ROLE"):
+        fn.apps_for_role("both")
+
+
+def test_serving_role_warns_when_advertise_host_names_a_scaled_service(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Upgrade-trap guard: a pre-split .env carries
+    DOCIE_SERVING_ADVERTISE_HOST=worker; the serving role warns loudly at
+    startup instead of silently recording round-robin endpoints."""
+    import logging
+
+    import docie_bench.inngest.worker as worker_mod
+
+    class _Settings:
+        serving_advertise_host = "worker"
+
+    monkeypatch.setattr(worker_mod, "get_settings", lambda: _Settings())
+    with caplog.at_level(logging.WARNING, logger="docie_bench.inngest.worker"):
+        worker_mod._warn_legacy_advertise_host("serving")
+    assert any("SCALED compose service" in record.getMessage() for record in caplog.records)
+
+    # The correct single-replica name stays silent; the worker role never warns.
+    caplog.clear()
+    _Settings.serving_advertise_host = "serving"
+    with caplog.at_level(logging.WARNING, logger="docie_bench.inngest.worker"):
+        worker_mod._warn_legacy_advertise_host("serving")
+    _Settings.serving_advertise_host = "worker"
+    with caplog.at_level(logging.WARNING, logger="docie_bench.inngest.worker"):
+        worker_mod._warn_legacy_advertise_host("worker")
+    assert caplog.records == []
+
+
+# -------------------------------------------------- restart-budget forgiveness
+
+
+def test_restart_budget_resets_after_sustained_healthy_streak(tmp_path: Path) -> None:
+    """The budget bounds crash STORMS, not lifetime crashes: after
+    healthy_reset_threshold consecutive healthy cycles restart_count returns
+    to 0, so a deployment that crashed twice over weeks of healthy uptime is
+    still repairable. Pre-fix, restart_count only ever ratcheted up."""
+    adapter = ScriptedAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json",
+        adapters={RuntimeKind.LLAMACPP: adapter},
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+    )
+    reconciler = ServingReconciler(
+        supervisor,
+        ready_miss_threshold=2,
+        healthy_reset_threshold=3,
+        fit_check=lambda record: (True, ""),
+        rss_reader=lambda pid: 0,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+    )
+    record = supervisor.deploy(_spec(max_restarts=2))
+
+    # Two crash->respawn rounds: budget nearly exhausted.
+    for expected in (1, 2):
+        adapter.crash(supervisor.get("invoice").pid)
+        reconciler.run_cycle()
+        assert supervisor.get("invoice").restart_count == expected
+
+    # A sustained healthy streak forgives the budget...
+    for _ in range(3):
+        reconciler.run_cycle()
+    assert supervisor.get("invoice").restart_count == 0
+    # ...and the reset survives the JSON roundtrip (it is _save()d).
+    reloaded = PersistentSupervisor(
+        tmp_path / "deployments.json", adapters={RuntimeKind.LLAMACPP: adapter}
+    )
+    assert reloaded.get("invoice").restart_count == 0
+
+    # So a LATER crash is repairable again instead of stuck at the cap.
+    adapter.crash(supervisor.get("invoice").pid)
+    observations = reconciler.run_cycle()
+    assert _only(observations, "invoice").phase == "hot"
+    assert supervisor.get("invoice").restart_count == 1
+    del record
+
+
+def test_crash_storm_never_earns_the_budget_reset(tmp_path: Path) -> None:
+    """Every miss/death zeroes the healthy streak, so rapid crash->respawn
+    loops still exhaust the budget exactly as before."""
+    adapter = ScriptedAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json",
+        adapters={RuntimeKind.LLAMACPP: adapter},
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+    )
+    reconciler = ServingReconciler(
+        supervisor,
+        healthy_reset_threshold=2,
+        fit_check=lambda record: (True, ""),
+        rss_reader=lambda pid: 0,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+    )
+    supervisor.deploy(_spec(max_restarts=2))
+
+    # crash / one-healthy-cycle / crash / ... — the single healthy cycle
+    # between crashes never reaches the 2-cycle streak, so no forgiveness.
+    for _ in range(2):
+        adapter.crash(supervisor.get("invoice").pid)
+        reconciler.run_cycle()  # respawn (healthy streak restarts at 1)
+    adapter.crash(supervisor.get("invoice").pid)
+    observations = reconciler.run_cycle()
+    assert _only(observations, "invoice").phase == "failed"
+    assert "restart budget exhausted" in (_only(observations, "invoice").last_error or "")
+
+
+# ------------------------------------------- fast-death survives a restart
+
+
+def test_fast_death_memory_survives_a_serving_restart(tmp_path: Path) -> None:
+    """Finding: _was_ready was process-local, so restarting the serving
+    service reset death-detection for a HUNG (alive-but-unreachable) runtime
+    back to the ~10-minute slow-load tolerance. Was-readiness is now derived
+    from the PERSISTED record state (READY survives the deployments.json
+    roundtrip), so a FRESH reconciler still fast-deaths within threshold."""
+    supervisor, adapter, reconciler, _ = _build(tmp_path, ready_miss_threshold=2)
+    record = supervisor.deploy(_spec())
+    spawned_pid = record.pid
+    reconciler.run_cycle()  # observed hot; record.state persisted as READY
+
+    adapter.healthy["invoice"] = False  # runtime hangs: alive but unreachable
+
+    # Simulate a serving-service restart: reload the supervisor from disk and
+    # build a BRAND-NEW reconciler with empty in-memory _was_ready/_misses.
+    restarted_supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json",
+        adapters={RuntimeKind.LLAMACPP: adapter},
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+    )
+    fresh = ServingReconciler(
+        restarted_supervisor,
+        ready_miss_threshold=2,
+        fit_check=lambda rec: (False, "hold"),
+        rss_reader=lambda pid: 0,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+    )
+
+    first = fresh.run_cycle()
+    assert _only(first, "invoice").phase == "loading"  # miss 1 of 2
+    second = fresh.run_cycle()
+    observed = _only(second, "invoice")
+    assert observed.phase == "failed"  # fast death, NOT slow-load tolerance
+    assert adapter.stops == [spawned_pid]  # hung process torn down
+    assert "unresponsive after READY" in (
+        restarted_supervisor.get("invoice").last_error or ""
+    )
+
+
+# ------------------------------------------------------------ singleton lease
+
+
+def test_reconciler_lease_refuses_a_second_live_instance(tmp_path: Path) -> None:
+    """--scale serving=2 containment: replica B sees A's fresh heartbeat on the
+    shared volume and refuses to start its reconciler."""
+    from docie_bench.serving.reconciler import ReconcilerLease, ReconcilerSingletonError
+
+    lease_path = tmp_path / "reconciler-lease.json"
+    now = [1000.0]
+    lease_a = ReconcilerLease(lease_path, "replica-a", stale_after_s=60.0, clock=lambda: now[0])
+    lease_b = ReconcilerLease(lease_path, "replica-b", stale_after_s=60.0, clock=lambda: now[0])
+
+    lease_a.claim()
+    now[0] += 10.0  # A heartbeated 10s ago: live
+    with pytest.raises(ReconcilerSingletonError, match="replica-a"):
+        lease_b.claim()
+
+    # A stale lease (crashed replica) is claimable...
+    now[0] += 120.0
+    lease_b.claim()
+    # ...and re-claiming one's own fresh lease is an idempotent restart.
+    lease_b.claim()
+
+    # Release drops the file only when it is still ours.
+    lease_a.release()  # not the holder: no-op
+    assert lease_path.exists()
+    lease_b.release()
+    assert not lease_path.exists()
+
+
+def test_reconciler_cycle_heartbeats_the_lease(tmp_path: Path) -> None:
+    import json as json_lib
+
+    from docie_bench.serving.reconciler import ReconcilerLease
+
+    lease_path = tmp_path / "reconciler-lease.json"
+    now = [500.0]
+    lease = ReconcilerLease(lease_path, "replica-a", stale_after_s=60.0, clock=lambda: now[0])
+    supervisor, _, _, _ = _build(tmp_path)
+    reconciler = ServingReconciler(
+        supervisor,
+        fit_check=lambda record: (True, ""),
+        rss_reader=lambda pid: 0,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+        lease=lease,
+    )
+    reconciler.claim_singleton()
+    now[0] = 555.0
+    reconciler.run_cycle()
+    payload = json_lib.loads(lease_path.read_text(encoding="utf-8"))
+    assert payload == {"instance": "replica-a", "timestamp": 555.0}
 
 
 def test_reconciler_enabled_only_for_the_serving_role(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -282,6 +282,27 @@ class PersistentSupervisor:
             self._save()
             return record
 
+    def reset_restart_budget(self, name: str) -> DeploymentRecord:
+        """Zero ``restart_count`` after a sustained healthy streak (reconciler seam).
+
+        Without this the budget only ever ratchets up: a deployment that
+        crashed ``max_restarts`` times over WEEKS of otherwise-healthy uptime
+        would be permanently unrepairable, because nothing ever forgives old
+        restarts. The reconciler calls this once a deployment has stayed
+        healthy for ``healthy_reset_threshold`` consecutive cycles, so the
+        budget bounds crash *storms* (rapid crash->respawn loops never get a
+        healthy streak) without becoming a lifetime cap. No-op when the count
+        is already zero (no churn, no _save).
+        """
+        with self._lock:
+            record = self.get(name)
+            if record.restart_count == 0:
+                return record
+            record.restart_count = 0
+            record.updated_at = self._clock()
+            self._save()
+            return record
+
     def fold_recency(self, timestamps: Mapping[str, float]) -> bool:
         """Fold per-deployment recency sidecars into ``last_served`` (max-wins).
 

@@ -333,16 +333,21 @@ class ControlPlane:
         runtime: str | None = None,
         replicas: int = 1,
     ) -> object:
-        return to_data(
-            await _resolve(
-                self.supervisor.serve(
-                    _required(model, "model"),
-                    name=_optional(name),
-                    runtime=_optional(runtime),
-                    replicas=_replicas(replicas),
-                )
-            )
+        # Threaded like up(): the runtime-specified deploy path blocks in
+        # deploy + await_ready (a bounded time.sleep poll while the model
+        # loads) plus a DNS resolve in the advertise guard. Running that on
+        # the event loop would stall the Inngest Connect heartbeats for the
+        # whole load (design doc fix #4). Argument validation stays eager so
+        # bad input raises before a thread is spawned; _resolve keeps the
+        # awaitable-backend contract for async test fakes.
+        result = await asyncio.to_thread(
+            self.supervisor.serve,
+            _required(model, "model"),
+            name=_optional(name),
+            runtime=_optional(runtime),
+            replicas=_replicas(replicas),
         )
+        return to_data(await _resolve(result))
 
     async def up(
         self,
@@ -366,10 +371,18 @@ class ControlPlane:
         )
 
     async def start(self, name: str) -> object:
-        return to_data(await _resolve(self.supervisor.start(_required(name, "deployment"))))
+        # Threaded: start() re-deploys (spawn + immediate health probe), which
+        # blocks on process spawn and the probe timeout — same rationale as
+        # serve()/stop() below.
+        result = await asyncio.to_thread(self.supervisor.start, _required(name, "deployment"))
+        return to_data(await _resolve(result))
 
     async def stop(self, name: str) -> object:
-        return to_data(await _resolve(self.supervisor.stop(_required(name, "deployment"))))
+        # Threaded: stop() reconciles to STOPPED, which blocks in the
+        # adapter's terminate/kill shutdown timeouts (up to ~10s per process)
+        # and the placement UPDATE. Must not stall Connect heartbeats.
+        result = await asyncio.to_thread(self.supervisor.stop, _required(name, "deployment"))
+        return to_data(await _resolve(result))
 
     async def remove(self, name: str) -> object:
         """Real teardown (PR-1): kill the process, drop the record, free the

@@ -547,3 +547,73 @@ def test_to_data_sorts_mapping_keys_and_hides_private_attributes() -> None:
 
     assert to_data(Result()) == {"a": "ready", "z": 1}
     assert to_data(frozenset({"vision", "batching"})) == ["batching", "vision"]
+
+
+# ----------------------------------------------------- event-loop discipline
+
+
+def test_serve_stop_and_start_run_off_the_event_loop() -> None:
+    """PR-1 review finding: ControlPlane.serve/stop ran the blocking backend
+    (deploy + await_ready time.sleep loops / shutdown timeouts) directly ON
+    the event loop, stalling the Inngest Connect heartbeats for the whole
+    model load. They must go through asyncio.to_thread like up() does.
+
+    Mechanism: the fake backend blocks on a threading.Event that ONLY a
+    coroutine on the same loop can set. If the facade ran the backend on the
+    loop, the release coroutine could never run and the backend's bounded
+    wait would expire (pre-fix failure); threaded, the loop stays free and
+    releases it immediately.
+    """
+    import threading
+
+    class BlockingSupervisor:
+        def __init__(self) -> None:
+            self.release = threading.Event()
+
+        def _block(self) -> None:
+            assert self.release.wait(timeout=10.0), (
+                "the event loop was blocked while the backend ran: "
+                "serve/stop/start must run via asyncio.to_thread"
+            )
+
+        def serve(
+            self,
+            model: str,
+            *,
+            name: str | None,
+            runtime: str | None,
+            replicas: int,
+        ) -> dict[str, object]:
+            self._block()
+            return {"name": name, "state": "ready"}
+
+        def stop(self, name: str) -> dict[str, str]:
+            self._block()
+            return {"name": name, "state": "stopped"}
+
+        def start(self, name: str) -> dict[str, str]:
+            self._block()
+            return {"name": name, "state": "running"}
+
+    async def scenario() -> None:
+        supervisor = BlockingSupervisor()
+        plane = ControlPlane(None, None, supervisor, None)  # type: ignore[arg-type]
+
+        async def run_released(coroutine: object) -> object:
+            supervisor.release.clear()
+            task = asyncio.ensure_future(coroutine)  # type: ignore[arg-type]
+            # Runs ONLY while the loop is free — i.e. the backend is off-loop.
+            await asyncio.sleep(0.05)
+            supervisor.release.set()
+            return await asyncio.wait_for(task, timeout=10.0)
+
+        served = await run_released(
+            plane.serve("org/model", name="dep", runtime="llamacpp", replicas=1)
+        )
+        assert served == {"name": "dep", "state": "ready"}
+        stopped = await run_released(plane.stop("dep"))
+        assert stopped == {"name": "dep", "state": "stopped"}
+        started = await run_released(plane.start("dep"))
+        assert started == {"name": "dep", "state": "running"}
+
+    asyncio.run(scenario())
