@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useBackendHealth } from "@/lib/useBackendHealth";
 import { Playground } from "./Playground";
 import { Deploy } from "./Deploy";
+import { Agents } from "./Agents";
 import { Benchmark } from "./Benchmark";
 import { Observability } from "./Observability";
 import { Sidebar } from "./shell/Sidebar";
@@ -57,7 +58,7 @@ export function AppShell() {
 
         <main className="flex-1 overflow-y-auto bg-background">
           <div className="px-6 py-5">
-            {/* All FOUR sections stay mounted; only the active one is shown so a
+            {/* All FIVE sections stay mounted; only the active one is shown so a
                 running extraction / deploy / benchmark survives nav changes.
                 Iterates the de-duped SECTIONS list — never the grouped nav —
                 so each section (and its pollers) mounts exactly once. */}
@@ -69,6 +70,7 @@ export function AppShell() {
               >
                 {id === "playground" && <Playground active={active === "playground"} />}
                 {id === "deploy" && <Deploy active={active === "deploy"} view={view} />}
+                {id === "agents" && <Agents view={view} />}
                 {id === "benchmark" && <Benchmark view={view} />}
                 {id === "observability" && <Observability view={view} />}
               </div>

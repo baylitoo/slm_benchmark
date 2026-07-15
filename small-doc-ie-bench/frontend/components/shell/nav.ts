@@ -22,10 +22,18 @@ import {
   History,
   BarChart3,
   ExternalLink,
+  Bot,
+  LayoutGrid,
+  PlusCircle,
   type LucideIcon,
 } from "lucide-react";
 
-export type SectionId = "playground" | "deploy" | "benchmark" | "observability";
+export type SectionId =
+  | "playground"
+  | "deploy"
+  | "agents"
+  | "benchmark"
+  | "observability";
 
 export interface NavItem {
   id: SectionId;
@@ -53,6 +61,14 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
+    heading: "Agents",
+    items: [
+      { id: "agents", label: "Catalog", icon: LayoutGrid, view: "catalog" },
+      { id: "agents", label: "My Agents", icon: Bot, view: "instances" },
+      { id: "agents", label: "Create", icon: PlusCircle, view: "create" },
+    ],
+  },
+  {
     heading: "Benchmark",
     items: [
       { id: "benchmark", label: "Run", icon: Play, view: "run" },
@@ -68,10 +84,11 @@ export const NAV_GROUPS: NavGroup[] = [
   },
 ];
 
-/** The FOUR unique sections — the single source of truth for the mount loop. */
+/** The FIVE unique sections — the single source of truth for the mount loop. */
 export const SECTIONS: SectionId[] = [
   "playground",
   "deploy",
+  "agents",
   "benchmark",
   "observability",
 ];
@@ -80,6 +97,7 @@ export const SECTIONS: SectionId[] = [
 export const DEFAULT_VIEW: Record<SectionId, string> = {
   playground: "",
   deploy: "deployments",
+  agents: "catalog",
   benchmark: "run",
   observability: "dashboards",
 };

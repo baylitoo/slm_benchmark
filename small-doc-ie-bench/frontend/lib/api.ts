@@ -565,6 +565,96 @@ export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse>
 }
 
 // ---------------------------------------------------------------------------
+// Agents (GET/POST /v1/agents — preconfigured agents over OpenAI endpoints)
+// ---------------------------------------------------------------------------
+
+export type AgentKind = "proxy_security" | "ocr" | "custom";
+
+/** A catalog template (GET /v1/agents/templates). */
+export interface AgentTemplate {
+  id: string;
+  kind: AgentKind;
+  display_name: string;
+  description: string;
+  /** Prefill for the create form: { system_prompt, options }. */
+  defaults?: { system_prompt?: string | null; options?: Record<string, unknown> };
+}
+
+/** A configured agent (GET /v1/agents). */
+export interface AgentView {
+  name: string;
+  kind: AgentKind;
+  display_name?: string;
+  description?: string;
+  /** Backing SLM selector: profile name, live deployment name, or store:<name>. */
+  model_profile?: string | null;
+  system_prompt?: string | null;
+  options?: Record<string, unknown>;
+  enabled?: boolean;
+  created_at?: string;
+  updated_at?: string;
+  /** API-relative OpenAI-compatible base path, e.g. "/v1/agents/pii-proxy". */
+  endpoint?: string;
+  [k: string]: unknown;
+}
+
+export interface CreateAgentRequest {
+  name: string;
+  template?: string;
+  kind?: AgentKind;
+  display_name?: string;
+  description?: string;
+  model_profile?: string | null;
+  system_prompt?: string | null;
+  options?: Record<string, unknown>;
+  enabled?: boolean;
+}
+
+export interface UpdateAgentRequest {
+  display_name?: string;
+  description?: string;
+  model_profile?: string | null;
+  system_prompt?: string | null;
+  options?: Record<string, unknown>;
+  enabled?: boolean;
+}
+
+export function getAgents(): Promise<AgentView[]> {
+  return request<AgentView[]>("/v1/agents");
+}
+
+export function getAgentTemplates(): Promise<AgentTemplate[]> {
+  return request<AgentTemplate[]>("/v1/agents/templates");
+}
+
+export function createAgent(payload: CreateAgentRequest): Promise<AgentView> {
+  return request<AgentView>("/v1/agents", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateAgent(name: string, patch: UpdateAgentRequest): Promise<AgentView> {
+  return request<AgentView>(`/v1/agents/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function deleteAgent(name: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(`/v1/agents/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Absolute OpenAI-compatible base_url for one agent (or the whole platform). */
+export function agentBaseUrl(name?: string): string {
+  return name
+    ? `${API_BASE}/v1/agents/${encodeURIComponent(name)}`
+    : `${API_BASE}/v1/agents`;
+}
+
+// ---------------------------------------------------------------------------
 // Derived helpers
 // ---------------------------------------------------------------------------
 
