@@ -9,11 +9,17 @@ deployment being unloaded and reloaded on another port.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
 from docie_bench.agents import pii
+from docie_bench.agents.guard import (
+    GuardAnalysisError,
+    guard_analyze,
+    labels_from_entities,
+)
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.profile_resolver import (
@@ -130,13 +136,9 @@ async def _complete_proxy(
             status_code=500,
             error_type="invalid_agent_config",
         )
-    if options.get("guard_model"):
-        raise AgentError(
-            "options.guard_model (encoder-family analyzer) is not implemented yet; "
-            "unset it to use the built-in analyzer",
-            status_code=501,
-            error_type="not_implemented",
-        )
+    analyze_fn, analyzer_label, guard_state = _build_analyzer(
+        spec, options, entities, http_client=http_client
+    )
 
     messages = body.get("messages") or []
     placeholders: dict[str, str] = {}
@@ -144,7 +146,7 @@ async def _complete_proxy(
     masked_messages: list[dict[str, Any]] = []
     for message in messages:
         masked_messages.append(
-            _mask_message(message, entities, placeholders, detected_types)
+            await _mask_message(message, analyze_fn, placeholders, detected_types)
         )
 
     if mode == "block" and placeholders:
@@ -163,20 +165,96 @@ async def _complete_proxy(
     if options.get("restore_pii") and placeholders:
         _restore_completion(completion, placeholders)
 
+    pii_report: dict[str, Any] = {
+        "mode": mode,
+        "analyzer": analyzer_label,
+        "detected": sum(detected_types.values()),
+        # Types + placeholders only — raw values never leave the process.
+        "entities": [
+            {"type": t, "count": n} for t, n in sorted(detected_types.items())
+        ],
+        "placeholders": sorted(placeholders) if mode == "placeholder" else [],
+    }
+    if guard_state.get("degraded"):
+        # The guard failed mid-request and options.guard_fallback kicked in —
+        # callers must be able to see the analysis ran at regex recall.
+        pii_report["degraded_to_regex"] = True
     completion["docie_agent"] = {
         "agent": spec.name,
         "kind": spec.kind,
-        "pii": {
-            "mode": mode,
-            "detected": sum(detected_types.values()),
-            # Types + placeholders only — raw values never leave the process.
-            "entities": [
-                {"type": t, "count": n} for t, n in sorted(detected_types.items())
-            ],
-            "placeholders": sorted(placeholders) if mode == "placeholder" else [],
-        },
+        "pii": pii_report,
     }
     return completion
+
+
+AnalyzeFn = Callable[[str], Awaitable[list[pii.PiiEntity]]]
+
+
+def _build_analyzer(
+    spec: AgentSpec,
+    options: dict[str, Any],
+    entities: list[str] | None,
+    *,
+    http_client: httpx.AsyncClient,
+) -> tuple[AnalyzeFn, str, dict[str, bool]]:
+    """The proxy's analyzer: the guard encoder when configured, else regex.
+
+    Fail-closed by design: a configured guard that errors ABORTS the request
+    (502 ``guard_unavailable``) — a security proxy must never silently forward
+    unmasked text because its analyzer died. ``guard_fallback: "regex"`` opts
+    into degraded regex analysis instead, flagged in the response report.
+    """
+    guard_state: dict[str, bool] = {"degraded": False}
+    guard_selector = options.get("guard_model")
+    if not guard_selector:
+
+        async def regex_analyze(text: str) -> list[pii.PiiEntity]:
+            return pii.analyze(text, entities)
+
+        return regex_analyze, "regex", guard_state
+
+    guard_profile = _resolve_backing(str(guard_selector))
+    labels_raw = options.get("guard_labels")
+    if labels_raw is not None and not isinstance(labels_raw, list):
+        raise AgentError(
+            f"agent {spec.name!r} has invalid options.guard_labels (expected a list)",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    labels = (
+        [str(label) for label in labels_raw]
+        if labels_raw
+        else labels_from_entities(entities)
+    )
+    threshold_raw = options.get("guard_threshold")
+    try:
+        threshold = float(threshold_raw) if threshold_raw is not None else None
+    except (TypeError, ValueError):
+        raise AgentError(
+            f"agent {spec.name!r} has invalid options.guard_threshold (expected a number)",
+            status_code=500,
+            error_type="invalid_agent_config",
+        ) from None
+    fallback_to_regex = options.get("guard_fallback") == "regex"
+
+    async def analyze(text: str) -> list[pii.PiiEntity]:
+        try:
+            return await guard_analyze(
+                text,
+                guard=guard_profile,
+                http_client=http_client,
+                labels=labels,
+                threshold=threshold,
+            )
+        except GuardAnalysisError as exc:
+            if fallback_to_regex:
+                guard_state["degraded"] = True
+                return pii.analyze(text, entities)
+            raise AgentError(
+                exc.message, status_code=502, error_type="guard_unavailable"
+            ) from exc
+
+    return analyze, f"guard:{guard_profile.name}", guard_state
 
 
 async def _complete_custom(
@@ -258,40 +336,37 @@ async def _forward_chat(
 # ---------------------------------------------------------------------------
 
 
-def _mask_text(
+async def _mask_text(
     text: str,
-    entities: list[str] | None,
+    analyze_fn: AnalyzeFn,
     placeholders: dict[str, str],
     detected_types: dict[str, int],
 ) -> str:
-    found = pii.analyze(text, entities)
+    found = await analyze_fn(text)
     for entity in found:
         detected_types[entity.type] = detected_types.get(entity.type, 0) + 1
     masked, _ = pii.anonymize(text, found, placeholders=placeholders)
     return masked
 
 
-def _mask_message(
+async def _mask_message(
     message: dict[str, Any],
-    entities: list[str] | None,
+    analyze_fn: AnalyzeFn,
     placeholders: dict[str, str],
     detected_types: dict[str, int],
 ) -> dict[str, Any]:
     content = message.get("content")
     if isinstance(content, str):
-        return {**message, "content": _mask_text(content, entities, placeholders, detected_types)}
+        masked = await _mask_text(content, analyze_fn, placeholders, detected_types)
+        return {**message, "content": masked}
     if isinstance(content, list):
         parts: list[Any] = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(
-                    {
-                        **part,
-                        "text": _mask_text(
-                            str(part.get("text", "")), entities, placeholders, detected_types
-                        ),
-                    }
+                masked = await _mask_text(
+                    str(part.get("text", "")), analyze_fn, placeholders, detected_types
                 )
+                parts.append({**part, "text": masked})
             else:
                 parts.append(part)
         return {**message, "content": parts}

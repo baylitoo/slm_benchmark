@@ -215,6 +215,33 @@ def create_app(
         )
         uvicorn.run(create_gateway_app(models_config), host=host, port=port)
 
+    @app.command()
+    def encoder(
+        host: str = typer.Option("127.0.0.1", help="Bind address."),
+        port: int = typer.Option(8090, min=1, max=65535, help="Port for the encoder endpoint."),
+        model: str = typer.Option(
+            "urchade/gliner_multi_pii-v1",
+            help="Encoder model id (GLiNER-compatible; zero-shot labels).",
+        ),
+        threshold: float = typer.Option(0.5, min=0.0, max=1.0, help="Default min confidence."),
+    ) -> None:
+        """Serve an encoder (PII/NER token classifier) behind the OpenAI surface.
+
+        Text in as a user message, detected entities out as the assistant's
+        JSON content — the analyzer contract the security proxy agent's
+        `guard_model` consumes. Requires the `encoders` extra (GLiNER).
+        """
+        import uvicorn
+
+        from docie_bench.encoders.server import create_encoder_app
+
+        typer.echo(f"docie encoder [{model}] -> http://{host}:{port}/v1")
+        uvicorn.run(
+            create_encoder_app(model_id=model, default_threshold=threshold),
+            host=host,
+            port=port,
+        )
+
     return app
 
 

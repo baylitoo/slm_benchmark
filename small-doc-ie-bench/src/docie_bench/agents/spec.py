@@ -27,7 +27,10 @@ class AgentSpec(BaseModel):
 
     * ``proxy_security`` — ``entities`` (subset of :data:`~docie_bench.agents.pii.PII_TYPES`),
       ``mode`` (``placeholder`` | ``block`` | ``detect``), ``restore_pii`` (bool),
-      ``guard_model`` (reserved: encoder-family analyzer profile).
+      ``guard_model`` (encoder-family analyzer endpoint selector; replaces the
+      regex analyzer), ``guard_labels`` (zero-shot labels), ``guard_threshold``
+      (min confidence), ``guard_fallback`` (``"regex"`` = degrade instead of
+      failing closed when the guard is down).
     * ``ocr`` — ``backend`` (tesseract | paddleocr | pdf_text), ``language``,
       ``extractor`` (optional passthrough profile name -> OCR→SLM pipeline).
     """

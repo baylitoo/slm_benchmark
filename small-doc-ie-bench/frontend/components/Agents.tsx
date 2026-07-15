@@ -386,6 +386,8 @@ function CreateView({
   const [mode, setMode] = useState("placeholder");
   const [entities, setEntities] = useState<string[]>(PII_ENTITIES);
   const [restorePii, setRestorePii] = useState(false);
+  const [guardModel, setGuardModel] = useState("");
+  const [guardFallback, setGuardFallback] = useState(false);
   const [ocrBackend, setOcrBackend] = useState("tesseract");
   const [ocrLanguage, setOcrLanguage] = useState("");
   const [ocrExtractor, setOcrExtractor] = useState("");
@@ -415,7 +417,13 @@ function CreateView({
     try {
       const options: Record<string, unknown> =
         kind === "proxy_security"
-          ? { mode, entities, restore_pii: restorePii }
+          ? {
+              mode,
+              entities,
+              restore_pii: restorePii,
+              guard_model: guardModel.trim() || null,
+              guard_fallback: guardModel.trim() && guardFallback ? "regex" : null,
+            }
           : kind === "ocr"
             ? {
                 backend: ocrBackend,
@@ -555,10 +563,31 @@ function CreateView({
                   />
                   Restore original values in the response
                 </label>
-                <p className="text-xs text-muted-foreground">
-                  Built-in regex analyzer today; a specialized encoder model
-                  (guard model) can plug in later for higher recall.
-                </p>
+                <Field
+                  label="Guard model"
+                  htmlFor="agent-guard-model"
+                  hint="Encoder analyzer endpoint (e.g. a `docie encoder` GLiNER deployment) — replaces the built-in regex analyzer for higher recall. Empty = regex."
+                >
+                  <TextInput
+                    id="agent-guard-model"
+                    value={guardModel}
+                    onChange={(e) => setGuardModel(e.target.value)}
+                    placeholder="gliner-pii"
+                    list="agent-deployments"
+                  />
+                </Field>
+                {guardModel.trim() && (
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90">
+                    <input
+                      type="checkbox"
+                      checked={guardFallback}
+                      onChange={(e) => setGuardFallback(e.target.checked)}
+                      className="h-3.5 w-3.5"
+                    />
+                    Degrade to regex analysis if the guard is unreachable
+                    (default: fail closed)
+                  </label>
+                )}
               </div>
             </Card>
           )}

@@ -29,9 +29,15 @@ AGENT_TEMPLATES: list[dict[str, Any]] = [
                 "entities": list(PII_TYPES),
                 "mode": "placeholder",
                 "restore_pii": False,
-                # Reserved: a specialized encoder (PII/NER) analyzer profile.
-                # When set, it replaces the built-in regex analyzer.
+                # Encoder-family analyzer (e.g. a `docie encoder` GLiNER
+                # deployment). When set it replaces the regex analyzer;
+                # guard_labels/guard_threshold tune it, guard_fallback: "regex"
+                # opts into degraded analysis when the guard is down
+                # (fail-closed otherwise).
                 "guard_model": None,
+                "guard_labels": None,
+                "guard_threshold": None,
+                "guard_fallback": None,
             },
         },
     },
