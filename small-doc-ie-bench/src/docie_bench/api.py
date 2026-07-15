@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from docie_bench.agents.api import router as agents_router
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.serving_api import router as serving_router
 from docie_bench.inngest.studio_api import router as studio_router
@@ -89,6 +90,10 @@ app = FastAPI(
 app.include_router(orchestrator_router, dependencies=[Depends(tenant_guard)])
 app.include_router(studio_router, dependencies=[Depends(tenant_guard)])
 app.include_router(serving_router, dependencies=[Depends(tenant_guard)])
+# The agents router carries its own guard (agents_tenant_guard): same manager,
+# but the OpenAI surface also accepts `Authorization: Bearer` so stock OpenAI
+# SDK clients can consume agents without custom headers.
+app.include_router(agents_router)
 
 # Allow the DocIE Studio frontend (separate origin) to call the API from the
 # browser. Defaults to the local Studio UI origins; override via
