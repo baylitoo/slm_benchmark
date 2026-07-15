@@ -575,6 +575,7 @@ def _serving_control_plane() -> Any:
 _ENGINE_BY_RUNTIME: dict[str, str] = {
     "llamacpp": "llama-server",
     "ollama": "ollama",
+    "encoder": "encoder",
 }
 
 

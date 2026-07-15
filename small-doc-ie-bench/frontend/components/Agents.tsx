@@ -14,6 +14,7 @@ import {
   Copy,
   Plug,
   PlusCircle,
+  Rocket,
   ScanText,
   ShieldCheck,
   Trash2,
@@ -24,6 +25,7 @@ import {
   agentBaseUrl,
   createAgent,
   deleteAgent,
+  deployModel,
   getAgents,
   getAgentTemplates,
   getDeployments,
@@ -388,6 +390,33 @@ function CreateView({
   const [restorePii, setRestorePii] = useState(false);
   const [guardModel, setGuardModel] = useState("");
   const [guardFallback, setGuardFallback] = useState(false);
+  const [deployingGuard, setDeployingGuard] = useState(false);
+
+  // One-click guard bootstrap: deploy the GLiNER encoder as a managed
+  // deployment (runtime: "encoder") and point the form at it. The deploy is
+  // async (Inngest) — watch it under Deployments; the serving node needs the
+  // `encoders` extra or the deploy fails there with the actionable reason.
+  async function deployGuardEncoder() {
+    setDeployingGuard(true);
+    try {
+      await deployModel({
+        model: "urchade/gliner_multi_pii-v1",
+        runtime: "encoder",
+        name: "gliner-pii",
+      });
+      setGuardModel("gliner-pii");
+      toast({
+        title: "Encoder deploy started",
+        description:
+          "gliner-pii — follow progress under Deployments. Requires the 'encoders' extra on the serving node.",
+        tone: "success",
+      });
+    } catch (err) {
+      toast({ title: "Encoder deploy failed", description: errMessage(err), tone: "error" });
+    } finally {
+      setDeployingGuard(false);
+    }
+  }
   const [ocrBackend, setOcrBackend] = useState("tesseract");
   const [ocrLanguage, setOcrLanguage] = useState("");
   const [ocrExtractor, setOcrExtractor] = useState("");
@@ -568,13 +597,26 @@ function CreateView({
                   htmlFor="agent-guard-model"
                   hint="Encoder analyzer endpoint (e.g. a `docie encoder` GLiNER deployment) — replaces the built-in regex analyzer for higher recall. Empty = regex."
                 >
-                  <TextInput
-                    id="agent-guard-model"
-                    value={guardModel}
-                    onChange={(e) => setGuardModel(e.target.value)}
-                    placeholder="gliner-pii"
-                    list="agent-deployments"
-                  />
+                  <div className="flex items-center gap-2">
+                    <TextInput
+                      id="agent-guard-model"
+                      value={guardModel}
+                      onChange={(e) => setGuardModel(e.target.value)}
+                      placeholder="gliner-pii"
+                      list="agent-deployments"
+                    />
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      loading={deployingGuard}
+                      onClick={() => void deployGuardEncoder()}
+                      title="Deploy the GLiNER PII encoder as a managed deployment (runtime: encoder)"
+                    >
+                      <Rocket className="h-3.5 w-3.5" />
+                      Deploy
+                    </Button>
+                  </div>
                 </Field>
                 {guardModel.trim() && (
                   <label className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90">

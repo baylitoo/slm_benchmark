@@ -91,6 +91,7 @@ _ENGINE_BY_RUNTIME: dict[RuntimeKind, str] = {
     RuntimeKind.OLLAMA: "ollama",
     RuntimeKind.VLLM: "vllm",
     RuntimeKind.REMOTE: "remote",
+    RuntimeKind.ENCODER: "encoder",
 }
 
 

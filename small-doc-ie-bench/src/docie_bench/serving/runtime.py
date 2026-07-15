@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.metadata
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -10,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
@@ -23,6 +25,7 @@ class RuntimeKind(StrEnum):
     LLAMACPP = "llamacpp"
     OLLAMA = "ollama"
     REMOTE = "remote"
+    ENCODER = "encoder"
 
 
 class LifecycleState(StrEnum):
@@ -527,12 +530,77 @@ class RemoteRuntime(RuntimeAdapter):
         return self._health_get(f"{self.endpoint(spec)}/models", timeout, headers)
 
 
+class EncoderRuntime(RuntimeAdapter):
+    """Launch ``docie encoder`` — the OpenAI-compatible shim over a
+    token-classification model (see ``docie_bench.encoders.server``).
+
+    ``spec.model`` is the encoder model id (e.g. a GLiNER HF id), not a GGUF
+    path, so this deploys through the explicit-runtime ``serve`` path
+    (``runtime="encoder"``), never the store path. Everything else — port
+    allocation, deployment record, health probing (``/healthz``), reconciler
+    overlay, load/unload/delete lifecycle — is inherited unchanged.
+    """
+
+    kind = RuntimeKind.ENCODER
+    executable_names = ("docie", "docie-serving")
+    health_path = "/healthz"
+    features = frozenset()
+
+    def resolve_executable(self, spec: RuntimeLaunchSpec) -> str | None:
+        # The console script may be off PATH inside a container; the current
+        # interpreter can always launch the CLI module instead (see
+        # build_command), so the encoder never reads as "not installed".
+        return super().resolve_executable(spec) or sys.executable
+
+    def detect_version(self, executable: str) -> str | None:
+        # The meaningful version is the analyzer library's, not the CLI's.
+        try:
+            return f"gliner {importlib.metadata.version('gliner')}"
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    def probe(self, spec: RuntimeLaunchSpec) -> RuntimeCapabilities:
+        capabilities = super().probe(spec)
+        if importlib.util.find_spec("gliner") is None:
+            # Fail the deploy at probe time with the actionable reason, not
+            # after a spawn whose child process dies on the same ImportError.
+            return replace(
+                capabilities,
+                compatible=False,
+                reasons=(
+                    *capabilities.reasons,
+                    "the 'encoders' extra is not installed on the serving node "
+                    "(pip install 'small-doc-ie-bench[encoders]')",
+                ),
+            )
+        return capabilities
+
+    def build_command(self, spec: RuntimeLaunchSpec) -> tuple[str, ...]:
+        self.validate(spec)
+        # Base lookup (no interpreter fallback): a found console script runs
+        # directly; otherwise launch the CLI module with this interpreter.
+        found = RuntimeAdapter.resolve_executable(self, spec)
+        base = (found,) if found else (sys.executable, "-m", "docie_bench.serving.cli")
+        return (
+            *base,
+            "encoder",
+            "--model",
+            spec.model,
+            "--host",
+            spec.host,
+            "--port",
+            str(spec.port),
+            *spec.extra_args,
+        )
+
+
 def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
     return {
         RuntimeKind.VLLM: VLLMRuntime(),
         RuntimeKind.LLAMACPP: LlamaCppRuntime(),
         RuntimeKind.OLLAMA: OllamaRuntime(),
         RuntimeKind.REMOTE: RemoteRuntime(),
+        RuntimeKind.ENCODER: EncoderRuntime(),
     }
 
 

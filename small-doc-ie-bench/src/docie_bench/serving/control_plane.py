@@ -275,8 +275,13 @@ class ControlPlane:
                 cpu_cores=psutil.cpu_count(logical=True) or 1,
                 memory_gb=round(psutil.virtual_memory().available / (1024**3), 4),
                 disk_gb=round(shutil.disk_usage(home.parent).free / (1024**3), 4),
+                # Only the planner-scorable chat runtimes: non-chat kinds (the
+                # encoder shim) are deploy-explicit (`runtime="encoder"`) and
+                # must never be auto-recommended for a chat model.
                 available_runtimes=frozenset(
-                    RuntimeName(name) for name in runtimes.available_names()
+                    RuntimeName(name)
+                    for name in runtimes.available_names()
+                    if name in {member.value for member in RuntimeName}
                 ),
             ),
         )
