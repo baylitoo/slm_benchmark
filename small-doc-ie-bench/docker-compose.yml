@@ -134,6 +134,11 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
+      args:
+        # Encoder deployments (runtime: "encoder", e.g. the GLiNER PII guard)
+        # spawn inside THIS container — it needs the analyzer library. Other
+        # services keep the light "ocr" default.
+        PIP_EXTRAS: "ocr,encoders"
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
@@ -178,6 +183,9 @@ services:
       # blobs into the store without re-downloading. Set OLLAMA_MODELS_HOST in
       # .env to your host path (e.g. C:/Users/<you>/.ollama/models).
       - ${OLLAMA_MODELS_HOST:-/root/.ollama/models}:/root/.ollama/models:ro
+      # Encoder (HF) weights cache: the first GLiNER deploy downloads ~1GB;
+      # persist it so container rebuilds/restarts don't re-download.
+      - hf-cache:/root/.cache/huggingface
     command: ["docie-worker"]
 
   # The Connect worker: extraction / benchmark / GC functions only (PR-1 split
@@ -338,3 +346,4 @@ volumes:
   redis-data:
   serving-state:
   artifact-store:
+  hf-cache:

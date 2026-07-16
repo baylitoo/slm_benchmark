@@ -47,7 +47,12 @@ COPY --from=llama-builder /src/build/bin/llama-server /usr/local/bin/llama-serve
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY scripts ./scripts
-RUN pip install --upgrade pip && pip install -e ".[ocr]"
+# PIP_EXTRAS lets one service opt into heavier optional groups without
+# bloating every image built from this file: the `serving` service passes
+# "ocr,encoders" (torch + gliner for encoder deployments), everything else
+# keeps the light default.
+ARG PIP_EXTRAS=ocr
+RUN pip install --upgrade pip && pip install -e ".[${PIP_EXTRAS}]"
 
 COPY configs ./configs
 
