@@ -654,6 +654,53 @@ export function agentBaseUrl(name?: string): string {
     : `${API_BASE}/v1/agents`;
 }
 
+/** The proxy's per-request analysis report (docie_agent extension key). */
+export interface AgentPiiReport {
+  mode?: string;
+  analyzer?: string;
+  detected?: number;
+  entities?: { type: string; count: number }[];
+  placeholders?: string[];
+  degraded_to_regex?: boolean;
+}
+
+export interface AgentChatResponse {
+  model?: string;
+  choices?: { message?: { role?: string; content?: string } }[];
+  docie_agent?: { agent?: string; kind?: string; pii?: AgentPiiReport };
+  [k: string]: unknown;
+}
+
+/**
+ * One synchronous chat completion against an agent's OpenAI endpoint (the Try
+ * panel). Unlike `request()`, errors here arrive OpenAI-shaped
+ * (`{"error": {"message", "type"}}`), so surface that message directly —
+ * e.g. `guard_unavailable` when the encoder deployment is unloaded.
+ */
+export async function agentChat(
+  name: string,
+  messages: { role: string; content: unknown }[],
+): Promise<AgentChatResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${agentBaseUrl(name)}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ model: name, messages }),
+    });
+  } catch (e) {
+    throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
+  }
+  const body = await readBody(res);
+  if (res.ok) return body as AgentChatResponse;
+  const err =
+    body && typeof body === "object" && "error" in body
+      ? (body as { error?: { message?: string; type?: string } }).error
+      : undefined;
+  const detail = err?.message ?? detailOf(body, `Request failed (HTTP ${res.status})`);
+  throw new ApiError(res.status, err?.type ? `${err.type}: ${detail}` : detail);
+}
+
 // ---------------------------------------------------------------------------
 // Derived helpers
 // ---------------------------------------------------------------------------

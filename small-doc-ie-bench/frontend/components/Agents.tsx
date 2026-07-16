@@ -12,6 +12,7 @@ import {
   Bot,
   Check,
   Copy,
+  Play,
   Plug,
   PlusCircle,
   Rocket,
@@ -23,14 +24,17 @@ import {
 import {
   ApiError,
   agentBaseUrl,
+  agentChat,
   createAgent,
   deleteAgent,
   deployModel,
+  fileToBase64,
   getAgents,
   getAgentTemplates,
   getDeployments,
   selectableDeployments,
   updateAgent,
+  type AgentChatResponse,
   type AgentKind,
   type AgentTemplate,
   type AgentView,
@@ -316,6 +320,137 @@ function InstancesView({
   );
 }
 
+// Prefilled sample so one click demonstrates masking (name, email, FR phone, IBAN).
+const SAMPLE_PII_TEXT =
+  "Report prepared by Jean Dupont. Contact: jean.dupont@acme.fr or " +
+  "+33 6 12 34 56 78. Refund to IBAN DE89 3704 0044 0532 0130 00.";
+
+function TryPanel({ agent }: { agent: AgentView }) {
+  const isOcr = agent.kind === "ocr";
+  const [text, setText] = useState(SAMPLE_PII_TEXT);
+  const [file, setFile] = useState<File | null>(null);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<AgentChatResponse | null>(null);
+
+  async function run() {
+    setError(null);
+    setResult(null);
+    let messages: { role: string; content: unknown }[];
+    if (isOcr) {
+      if (!file) {
+        setError("Choose a document image or PDF first.");
+        return;
+      }
+      const b64 = await fileToBase64(file);
+      messages = [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "OCR this document." },
+            {
+              type: "image_url",
+              image_url: { url: `data:${file.type || "image/png"};base64,${b64}` },
+            },
+          ],
+        },
+      ];
+    } else {
+      if (!text.trim()) {
+        setError("Type some text first.");
+        return;
+      }
+      messages = [{ role: "user", content: text }];
+    }
+    setRunning(true);
+    try {
+      setResult(await agentChat(agent.name, messages));
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  const pii = result?.docie_agent?.pii;
+  const content = result?.choices?.[0]?.message?.content;
+
+  return (
+    <div className="rounded-md border border-border bg-card p-3">
+      <p className="mb-2 text-xs font-medium text-foreground">Try it</p>
+      <div className="space-y-2">
+        {isOcr ? (
+          <input
+            type="file"
+            accept=".pdf,image/*"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            className="block w-full text-xs text-muted-foreground file:mr-3 file:rounded-md file:border file:border-border file:bg-muted file:px-3 file:py-1.5 file:text-xs file:text-foreground"
+          />
+        ) : (
+          <TextArea rows={3} value={text} onChange={(e) => setText(e.target.value)} />
+        )}
+        <div className="flex items-center gap-2">
+          <Button type="button" size="sm" loading={running} onClick={() => void run()}>
+            <Play className="h-3.5 w-3.5" />
+            Run
+          </Button>
+          {running && (
+            <span className="text-xs text-muted-foreground">
+              An evicted backing deployment auto-reloads on first request — that
+              wait is the model load.
+            </span>
+          )}
+        </div>
+
+        {error && (
+          <p className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-400">
+            {error}
+          </p>
+        )}
+
+        {result && (
+          <div className="space-y-2">
+            {pii && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge tone="info">analyzer: {pii.analyzer ?? "?"}</Badge>
+                <Badge>mode: {pii.mode ?? "?"}</Badge>
+                {(pii.entities ?? []).map((e) => (
+                  <Badge key={e.type} tone={e.count > 0 ? "warn" : "neutral"}>
+                    {e.type} ×{e.count}
+                  </Badge>
+                ))}
+                {(pii.detected ?? 0) === 0 && <Badge tone="ok">no PII found</Badge>}
+                {pii.degraded_to_regex && (
+                  <Badge tone="err">guard down — degraded to regex</Badge>
+                )}
+              </div>
+            )}
+            {(pii?.placeholders?.length ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Sent upstream as: {pii?.placeholders?.join(" ")}
+              </p>
+            )}
+            <div>
+              <p className="mb-1 text-xs font-medium text-muted-foreground">Response</p>
+              <pre className="scroll-thin max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed text-foreground/90">
+                {typeof content === "string" ? content : JSON.stringify(result, null, 2)}
+              </pre>
+            </div>
+            <details>
+              <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
+                Raw completion JSON
+              </summary>
+              <pre className="scroll-thin mt-1 max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs text-foreground/90">
+                {JSON.stringify(result, null, 2)}
+              </pre>
+            </details>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AgentDetails({ agent }: { agent: AgentView }) {
   const curl = [
     `curl ${agentBaseUrl(agent.name)}/chat/completions \\`,
@@ -326,9 +461,10 @@ function AgentDetails({ agent }: { agent: AgentView }) {
   return (
     <div className="space-y-3">
       <CopyLine label="base_url" value={agentBaseUrl(agent.name)} />
+      <TryPanel agent={agent} />
       <div>
         <div className="mb-1 flex items-center justify-between">
-          <p className="text-xs font-medium text-muted-foreground">Try it</p>
+          <p className="text-xs font-medium text-muted-foreground">From your platform</p>
           <CopyButton value={curl} label="Copy curl" />
         </div>
         <pre className="scroll-thin overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed text-foreground/90">
