@@ -245,3 +245,26 @@ PY
 
 See [docs/serving-factory.md](../../../docs/serving-factory.md) for the broader
 control-plane (`runtime`/`registry`/`planner`/`supervisor`) architecture.
+
+## mesh-llm (private pooled capacity)
+
+[mesh-llm](https://github.com/Mesh-LLM/mesh-llm) pools machines behind one
+OpenAI-compatible `/v1` that routes by the `model` field — the same contract
+this framework keys on, so the integration is a *selector*, not a runtime:
+
+```
+DOCIE_MESH_BASE_URL=http://mesh-host:9337/v1   # your PRIVATE mesh only
+```
+
+- `mesh:<model>` works anywhere a `model_profile` is accepted (agents'
+  backing model, Playground, benchmark) — synthesized passthrough profile,
+  no models.yaml edit.
+- `GET /v1/serving/mesh` reports reachability + the served model list; the
+  Agents create form surfaces them in the backing-model datalist.
+- The mesh manages its own nodes; it is deliberately NOT a supervised
+  deployment here (no record/port/reconciler row).
+
+Security: point only at a private (invite-token) mesh you operate — never a
+publicly discovered one. Prompts routed there leave this node; pair the mesh
+with a `proxy_security` agent whose LOCAL guard encoder masks PII first, so
+only placeholder-anonymized text reaches pooled capacity.

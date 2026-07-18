@@ -505,6 +505,19 @@ async def pin_deployment(
     )
 
 
+@router.get("/mesh")
+async def mesh_status() -> dict[str, Any]:
+    """Live mesh-llm status: configured endpoint, reachability, served models.
+
+    Backs the Studio's mesh surfacing (Agents backing-model datalist and any
+    future Deploy card). Never 500s on an unreachable mesh — that is a normal
+    ``healthy: false`` answer with a ``detail``.
+    """
+    from docie_bench.serving.mesh import mesh_view
+
+    return await mesh_view()
+
+
 @router.get("/store")
 async def list_store() -> Any:
     """The local GGUF model store (queryable Postgres catalog the Studio reads).

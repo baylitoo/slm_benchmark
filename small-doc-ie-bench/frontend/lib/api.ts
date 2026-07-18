@@ -556,6 +556,20 @@ export function whatifSizing(plan: WhatIfPlanEntry[]): Promise<WhatIfView> {
   });
 }
 
+/** mesh-llm status (GET /v1/serving/mesh): private pooled capacity, if configured. */
+export interface MeshView {
+  configured: boolean;
+  endpoint: string | null;
+  healthy: boolean;
+  /** Model ids the mesh currently serves — routable as `mesh:<id>`. */
+  models: string[];
+  detail?: string | null;
+}
+
+export function getMesh(): Promise<MeshView> {
+  return request<MeshView>("/v1/serving/mesh");
+}
+
 /** Seed the store from a local Ollama/HF reference. Returns a trigger to stream. */
 export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/seed-ollama", {

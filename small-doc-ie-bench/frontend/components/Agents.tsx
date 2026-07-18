@@ -32,6 +32,7 @@ import {
   getAgents,
   getAgentTemplates,
   getDeployments,
+  getMesh,
   selectableDeployments,
   updateAgent,
   type AgentChatResponse,
@@ -506,12 +507,23 @@ function CreateView({
 }) {
   const { toast } = useToast();
   const deployments = useAsync(getDeployments, []);
+  // Private mesh-llm capacity (if configured): its models route as `mesh:<id>`.
+  // getMesh never throws on an unconfigured/unreachable mesh; a missing route
+  // (older backend) surfaces as ApiUnavailable, which useAsync just holds.
+  const mesh = useAsync(getMesh, []);
   const deploymentNames = useMemo(
     () =>
       selectableDeployments(deployments.data ?? [])
         .map((d) => d.spec?.name)
         .filter((n): n is string => !!n),
     [deployments.data],
+  );
+  const meshSelectors = useMemo(
+    () =>
+      mesh.data?.configured && mesh.data.healthy
+        ? mesh.data.models.map((m) => `mesh:${m}`)
+        : [],
+    [mesh.data],
   );
 
   const [templateId, setTemplateId] = useState(prefill?.id ?? "custom");
@@ -653,7 +665,7 @@ function CreateView({
               <Field
                 label="Backing model"
                 htmlFor="agent-model"
-                hint="A live deployment, models.yaml profile, or store:<name>. Empty = studio default."
+                hint="A live deployment, models.yaml profile, store:<name>, or mesh:<model> (private pooled capacity). Empty = studio default."
                 className="sm:col-span-2"
               >
                 <TextInput
@@ -667,7 +679,17 @@ function CreateView({
                   {deploymentNames.map((n) => (
                     <option key={n} value={n} />
                   ))}
+                  {meshSelectors.map((n) => (
+                    <option key={n} value={n} />
+                  ))}
                 </datalist>
+                {mesh.data?.configured && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {mesh.data.healthy
+                      ? `Mesh connected (${mesh.data.endpoint}) — ${mesh.data.models.length} pooled model(s) routable as mesh:<id>. Pair with a local guard model so only anonymized text leaves this node.`
+                      : `Mesh configured but unreachable: ${mesh.data.detail ?? "no detail"}`}
+                  </p>
+                )}
               </Field>
             )}
             {kind !== "ocr" && (

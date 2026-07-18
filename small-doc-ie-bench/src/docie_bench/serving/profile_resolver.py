@@ -40,6 +40,11 @@ from pathlib import Path
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.serving.gateway import GatewayRoutingError
 from docie_bench.serving.gateway import resolve_profile as gateway_resolve_profile
+from docie_bench.serving.mesh import (
+    MESH_PROFILE_PREFIX,
+    MeshNotConfiguredError,
+    resolve_mesh_profile,
+)
 from docie_bench.serving.model_store import FAMILIES
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
@@ -330,6 +335,16 @@ def resolve_extraction_profile(
     # explicit store: ref must never fall through to the yaml/env table.
     if model_profile and model_profile.startswith(STORE_PROFILE_PREFIX):
         return resolve_store_profile(model_profile[len(STORE_PROFILE_PREFIX) :])
+
+    # (1c) "mesh:<model>" -> the configured private mesh-llm endpoint (its own
+    # router owns placement, so this is pure synthesis — no table lookup, no
+    # network). Sibling of store:; an explicit mesh: ref must never fall
+    # through to the yaml/env table, so not-configured is a refusal.
+    if model_profile and model_profile.startswith(MESH_PROFILE_PREFIX):
+        try:
+            return resolve_mesh_profile(model_profile[len(MESH_PROFILE_PREFIX) :])
+        except MeshNotConfiguredError as exc:
+            raise ProfileResolutionError(str(exc)) from exc
 
     table = build_profile_table(yaml_profiles, live)
 

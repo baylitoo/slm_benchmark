@@ -193,6 +193,19 @@ class Settings(BaseSettings):
     openai_compat_timeout_seconds: float = 180.0
     openai_compat_response_format_style: str = "openai_json_schema"
 
+    # mesh-llm integration (opt-in): the OpenAI-compatible endpoint of a
+    # PRIVATE mesh (https://github.com/Mesh-LLM/mesh-llm). Empty = disabled —
+    # `mesh:<model>` selectors refuse with a clear error and /v1/serving/mesh
+    # reports "not configured". Point ONLY at a private/invite-token mesh you
+    # operate: prompts routed there leave this node (the security proxy's
+    # placeholder masking is what makes that acceptable — see agents docs).
+    mesh_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("DOCIE_MESH_BASE_URL", "mesh_base_url"),
+    )
+    mesh_api_key: SecretStr = Field(default=SecretStr("local-not-used"))
+    mesh_timeout_seconds: float = 180.0
+
     prometheus_multiproc_dir: str | None = None
 
     @property
