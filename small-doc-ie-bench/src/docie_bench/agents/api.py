@@ -17,6 +17,7 @@ the former by default, so an external platform needs no header customization.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
@@ -35,6 +36,7 @@ from docie_bench.agents.runtime import AgentError, complete_agent
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.agents.templates import AGENT_TEMPLATES, template_by_id
 from docie_bench.security import TenantContext, get_quota_manager
+from docie_bench.telemetry import AGENT_LATENCY, AGENT_PII_DETECTED, AGENT_REQUESTS
 
 
 async def agents_tenant_guard(
@@ -225,13 +227,34 @@ async def _serve_completion(spec: AgentSpec, request: Request) -> Any:
             error_type="invalid_request_error",
         )
     wants_stream = bool(body.get("stream"))
+    started = time.monotonic()
     try:
         completion = await complete_agent(spec, body, http_client=_client())
     except AgentError as exc:
+        # The error_type IS the outcome taxonomy (pii_blocked, guard_unavailable,
+        # upstream_error, ...) — the Observability dashboard groups on it.
+        AGENT_REQUESTS.labels(spec.name, spec.kind, exc.error_type).inc()
+        AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
         return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
+    AGENT_REQUESTS.labels(spec.name, spec.kind, "ok").inc()
+    AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
+    _record_pii_metrics(spec.name, completion)
     if wants_stream:
         return _single_chunk_sse(completion)
     return JSONResponse(completion)
+
+
+def _record_pii_metrics(agent_name: str, completion: dict[str, Any]) -> None:
+    """Count detected entities from the proxy's report (types+counts only)."""
+    report = completion.get("docie_agent")
+    pii = report.get("pii") if isinstance(report, dict) else None
+    if not isinstance(pii, dict):
+        return
+    for entry in pii.get("entities") or []:
+        if isinstance(entry, dict) and entry.get("type"):
+            AGENT_PII_DETECTED.labels(agent_name, str(entry["type"])).inc(
+                int(entry.get("count", 0) or 0)
+            )
 
 
 @router.post("/chat/completions")

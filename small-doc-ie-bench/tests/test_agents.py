@@ -320,3 +320,34 @@ def test_per_agent_models_advertises_single_id(api) -> None:
     _create_proxy(client)
     data = client.get("/v1/agents/pii-proxy/models").json()
     assert [m["id"] for m in data["data"]] == ["pii-proxy"]
+
+
+def test_agent_requests_and_pii_metrics_recorded(api) -> None:
+    from prometheus_client import REGISTRY
+
+    def sample(name: str, labels: dict[str, str]) -> float:
+        return REGISTRY.get_sample_value(name, labels) or 0.0
+
+    client, _ = api
+    _create_proxy(client)
+    ok_labels = {"agent": "pii-proxy", "kind": "proxy_security", "outcome": "ok"}
+    email_labels = {"agent": "pii-proxy", "entity_type": "EMAIL"}
+    ok_before = sample("docie_agent_requests_total", ok_labels)
+    email_before = sample("docie_agent_pii_detected_total", email_labels)
+
+    client.post(
+        "/v1/agents/pii-proxy/chat/completions",
+        json={"messages": [{"role": "user", "content": "mail jean@acme.fr"}]},
+    )
+    assert sample("docie_agent_requests_total", ok_labels) == ok_before + 1
+    assert sample("docie_agent_pii_detected_total", email_labels) == email_before + 1
+
+    # A gate refusal lands under its own outcome, never "ok".
+    _create_proxy(client, name="gate", options={"mode": "block"})
+    blocked_labels = {"agent": "gate", "kind": "proxy_security", "outcome": "pii_blocked"}
+    blocked_before = sample("docie_agent_requests_total", blocked_labels)
+    client.post(
+        "/v1/agents/gate/chat/completions",
+        json={"messages": [{"role": "user", "content": "card 4111 1111 1111 1111"}]},
+    )
+    assert sample("docie_agent_requests_total", blocked_labels) == blocked_before + 1

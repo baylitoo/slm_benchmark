@@ -1,7 +1,135 @@
 {
   "title": "Small Document IE Benchmark",
   "schemaVersion": 39,
-  "version": 1,
-  "panels": [],
-  "time": {"from": "now-6h", "to": "now"}
+  "version": 2,
+  "refresh": "10s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Agent requests by outcome (req/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "sum by (agent, outcome) (rate(docie_agent_requests_total[5m]))",
+          "legendFormat": "{{agent}} · {{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "PII detected by type (5m increase)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "sum by (entity_type) (increase(docie_agent_pii_detected_total[5m]))",
+          "legendFormat": "{{entity_type}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Agent latency p95 (s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, agent) (rate(docie_agent_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{agent}} p95"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Blocked by security gate (1h)",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(docie_agent_requests_total{outcome=\"pii_blocked\"}[1h]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "PII entities caught (1h)",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 8},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "targets": [
+        {"expr": "sum(increase(docie_agent_pii_detected_total[1h]))"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Guard failures (1h)",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 12},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(docie_agent_requests_total{outcome=\"guard_unavailable\"}[1h]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Agent requests OK (1h)",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "sum(increase(docie_agent_requests_total{outcome=\"ok\"}[1h]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Extraction requests (req/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "sum by (model_profile, valid) (rate(docie_extraction_requests_total[5m]))",
+          "legendFormat": "{{model_profile}} · valid={{valid}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Model gateway outcomes (req/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "sum by (model_profile, outcome) (rate(docie_model_gateway_requests_total[5m]))",
+          "legendFormat": "{{model_profile}} · {{outcome}}"
+        }
+      ]
+    }
+  ]
 }

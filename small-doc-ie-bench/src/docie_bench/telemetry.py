@@ -59,6 +59,26 @@ MODEL_GATEWAY_CIRCUIT_OPEN = Gauge(
     ["model_profile", "model"],
 )
 
+AGENT_REQUESTS = Counter(
+    "docie_agent_requests_total",
+    "Agent chat-completion requests by outcome (ok / pii_blocked / "
+    "guard_unavailable / upstream errors / ...)",
+    ["agent", "kind", "outcome"],
+)
+
+AGENT_LATENCY = Histogram(
+    "docie_agent_latency_seconds",
+    "End-to-end agent request latency (analysis + backing model)",
+    ["agent", "kind"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120),
+)
+
+AGENT_PII_DETECTED = Counter(
+    "docie_agent_pii_detected_total",
+    "PII entities detected by security-proxy agents, by placeholder type",
+    ["agent", "entity_type"],
+)
+
 REVIEW_ACTIONS = Counter(
     "docie_review_actions_total",
     "Total human review actions",
