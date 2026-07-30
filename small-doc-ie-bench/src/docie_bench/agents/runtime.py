@@ -19,6 +19,7 @@ from docie_bench.agents.guard import (
     GuardAnalysisError,
     guard_analyze,
     labels_from_entities,
+    moderation_flags,
 )
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.llm.model_profiles import ModelProfile
@@ -149,6 +150,16 @@ async def _complete_proxy(
             await _mask_message(message, analyze_fn, placeholders, detected_types)
         )
 
+    # Moderation verdicts (GLiNER2 guardrail tasks) block BEFORE PII does: an
+    # unsafe/jailbreak prompt must never reach the model even fully anonymized.
+    unsafe = moderation_flags(guard_state.get("moderation") or {})
+    if mode == "block" and unsafe:
+        raise AgentError(
+            f"request blocked by agent {spec.name!r}: flagged by moderation "
+            f"({', '.join(unsafe)})",
+            status_code=400,
+            error_type="unsafe_blocked",
+        )
     if mode == "block" and placeholders:
         summary = ", ".join(f"{t}×{n}" for t, n in sorted(detected_types.items()))
         raise AgentError(
@@ -179,15 +190,33 @@ async def _complete_proxy(
         # The guard failed mid-request and options.guard_fallback kicked in —
         # callers must be able to see the analysis ran at regex recall.
         pii_report["degraded_to_regex"] = True
-    completion["docie_agent"] = {
+    report: dict[str, Any] = {
         "agent": spec.name,
         "kind": spec.kind,
         "pii": pii_report,
     }
+    moderation = guard_state.get("moderation")
+    if moderation:
+        report["moderation"] = {"verdicts": moderation, "flags": unsafe}
+    completion["docie_agent"] = report
     return completion
 
 
 AnalyzeFn = Callable[[str], Awaitable[list[pii.PiiEntity]]]
+
+
+def _merge_moderation(state: dict[str, Any], verdicts: dict[str, Any]) -> None:
+    """Fold one message's verdicts into the request-level state (worst wins)."""
+    merged: dict[str, Any] = state.setdefault("moderation", {})
+    for task, verdict in verdicts.items():
+        current = merged.get(task)
+        if isinstance(verdict, list):
+            existing = current if isinstance(current, list) else []
+            merged[task] = sorted({*map(str, existing), *map(str, verdict)})
+        elif isinstance(verdict, str):
+            if str(current).strip().lower() == "unsafe":
+                continue  # an earlier message already flagged this task
+            merged[task] = verdict
 
 
 def _build_analyzer(
@@ -196,15 +225,17 @@ def _build_analyzer(
     entities: list[str] | None,
     *,
     http_client: httpx.AsyncClient,
-) -> tuple[AnalyzeFn, str, dict[str, bool]]:
+) -> tuple[AnalyzeFn, str, dict[str, Any]]:
     """The proxy's analyzer: the guard encoder when configured, else regex.
 
     Fail-closed by design: a configured guard that errors ABORTS the request
     (502 ``guard_unavailable``) — a security proxy must never silently forward
     unmasked text because its analyzer died. ``guard_fallback: "regex"`` opts
     into degraded regex analysis instead, flagged in the response report.
+    ``guard_tasks`` (GLiNER2 guardrail checkpoints) adds moderation verdicts,
+    accumulated across the request's messages into the returned state.
     """
-    guard_state: dict[str, bool] = {"degraded": False}
+    guard_state: dict[str, Any] = {"degraded": False}
     guard_selector = options.get("guard_model")
     if not guard_selector:
 
@@ -235,16 +266,25 @@ def _build_analyzer(
             status_code=500,
             error_type="invalid_agent_config",
         ) from None
+    tasks_raw = options.get("guard_tasks")
+    if tasks_raw is not None and not isinstance(tasks_raw, list):
+        raise AgentError(
+            f"agent {spec.name!r} has invalid options.guard_tasks (expected a list)",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    tasks = [str(task) for task in tasks_raw] if tasks_raw else None
     fallback_to_regex = options.get("guard_fallback") == "regex"
 
     async def analyze(text: str) -> list[pii.PiiEntity]:
         try:
-            return await guard_analyze(
+            result = await guard_analyze(
                 text,
                 guard=guard_profile,
                 http_client=http_client,
                 labels=labels,
                 threshold=threshold,
+                tasks=tasks,
             )
         except GuardAnalysisError as exc:
             if fallback_to_regex:
@@ -253,6 +293,9 @@ def _build_analyzer(
             raise AgentError(
                 exc.message, status_code=502, error_type="guard_unavailable"
             ) from exc
+        if result.moderation:
+            _merge_moderation(guard_state, result.moderation)
+        return result.entities
 
     return analyze, f"guard:{guard_profile.name}", guard_state
 

@@ -561,9 +561,13 @@ class EncoderRuntime(RuntimeAdapter):
 
     def probe(self, spec: RuntimeLaunchSpec) -> RuntimeCapabilities:
         capabilities = super().probe(spec)
-        if importlib.util.find_spec("gliner") is None:
-            # Fail the deploy at probe time with the actionable reason, not
-            # after a spawn whose child process dies on the same ImportError.
+        # Either analyzer library will do (the server auto-picks gliner2 for
+        # GLiNER2 model ids). Fail the deploy at probe time with the
+        # actionable reason, not after a spawn whose child dies on ImportError.
+        if (
+            importlib.util.find_spec("gliner") is None
+            and importlib.util.find_spec("gliner2") is None
+        ):
             return replace(
                 capabilities,
                 compatible=False,

@@ -13,12 +13,41 @@ to it.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 from docie_bench.agents.pii import PiiEntity
 from docie_bench.llm.model_profiles import ModelProfile
+
+
+@dataclass(frozen=True)
+class GuardResult:
+    """One guard round-trip: PII spans + (optional) moderation verdicts."""
+
+    entities: list[PiiEntity]
+    moderation: dict[str, Any] = field(default_factory=dict)
+
+
+def moderation_flags(moderation: dict[str, Any]) -> list[str]:
+    """The non-benign verdicts of a moderation result, as ``task:label`` flags.
+
+    Single-label tasks flag on ``unsafe``; multi-label tasks flag every label
+    except ``benign``. Empty list = clean.
+    """
+    flags: list[str] = []
+    for task, verdict in moderation.items():
+        if isinstance(verdict, str):
+            if verdict.strip().lower() == "unsafe":
+                flags.append(f"{task}:{verdict}")
+        elif isinstance(verdict, list):
+            flags.extend(
+                f"{task}:{label}"
+                for label in verdict
+                if str(label).strip().lower() != "benign"
+            )
+    return flags
 
 
 class GuardAnalysisError(Exception):
@@ -99,8 +128,14 @@ async def guard_analyze(
     http_client: httpx.AsyncClient,
     labels: list[str] | None = None,
     threshold: float | None = None,
-) -> list[PiiEntity]:
-    """Analyze one text through the guard encoder endpoint."""
+    tasks: list[str] | None = None,
+) -> GuardResult:
+    """Analyze one text through the guard encoder endpoint.
+
+    ``tasks`` (moderation preset names, GLiNER2 guardrail checkpoints) rides
+    along in the same single-pass request; verdicts come back in
+    :attr:`GuardResult.moderation`.
+    """
     body: dict[str, Any] = {
         "model": guard.model,
         "messages": [{"role": "user", "content": text}],
@@ -109,6 +144,8 @@ async def guard_analyze(
         body["labels"] = labels
     if threshold is not None:
         body["threshold"] = threshold
+    if tasks:
+        body["tasks"] = tasks
     url = f"{guard.base_url}/chat/completions"
     headers = {
         "Authorization": f"Bearer {guard.api_key}",
@@ -148,4 +185,8 @@ async def guard_analyze(
             ) from exc
     if not isinstance(payload, dict):
         raise GuardAnalysisError("guard encoder entities payload is not a JSON object")
-    return _parse_entities(payload, text)
+    moderation = payload.get("moderation")
+    return GuardResult(
+        entities=_parse_entities(payload, text),
+        moderation=moderation if isinstance(moderation, dict) else {},
+    )

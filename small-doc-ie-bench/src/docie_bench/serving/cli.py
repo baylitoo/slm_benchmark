@@ -221,7 +221,11 @@ def create_app(
         port: int = typer.Option(8090, min=1, max=65535, help="Port for the encoder endpoint."),
         model: str = typer.Option(
             "urchade/gliner_multi_pii-v1",
-            help="Encoder model id (GLiNER-compatible; zero-shot labels).",
+            help="Encoder model id (GLiNER or GLiNER2 checkpoint; zero-shot labels).",
+        ),
+        backend: str = typer.Option(
+            "auto",
+            help="auto | gliner | gliner2 (auto picks GLiNER2 for GLiNER2 model ids).",
         ),
         threshold: float = typer.Option(0.5, min=0.0, max=1.0, help="Default min confidence."),
     ) -> None:
@@ -237,7 +241,9 @@ def create_app(
 
         typer.echo(f"docie encoder [{model}] -> http://{host}:{port}/v1")
         uvicorn.run(
-            create_encoder_app(model_id=model, default_threshold=threshold),
+            create_encoder_app(
+                model_id=model, backend_kind=backend, default_threshold=threshold
+            ),
             host=host,
             port=port,
         )

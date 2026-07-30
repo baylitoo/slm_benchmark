@@ -38,6 +38,11 @@ AGENT_TEMPLATES: list[dict[str, Any]] = [
                 "guard_labels": None,
                 "guard_threshold": None,
                 "guard_fallback": None,
+                # Moderation presets for GLiNER2 guardrail checkpoints (e.g.
+                # fastino/GLiNER2-Guardrails-PII-Multi): prompt_safety,
+                # prompt_toxicity, jailbreak_detection. In block mode a
+                # non-benign verdict refuses the request (unsafe_blocked).
+                "guard_tasks": None,
             },
         },
     },

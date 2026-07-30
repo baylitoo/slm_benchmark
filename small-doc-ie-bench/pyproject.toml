@@ -45,7 +45,8 @@ paddle = [
   "paddleocr>=2.8.0"
 ]
 encoders = [
-  "gliner>=0.2.13"
+  "gliner>=0.2.13",
+  "gliner2[local]"
 ]
 dev = [
   "pytest>=8.3.2",

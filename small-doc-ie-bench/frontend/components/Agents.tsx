@@ -55,6 +55,11 @@ const PII_ENTITIES = [
   "IP_ADDRESS",
 ];
 
+// Moderation presets served by GLiNER2 guardrail checkpoints
+// (fastino/GLiNER2-Guardrails-PII-Multi). Names mirror the encoder server's
+// MODERATION_TASKS registry.
+const GUARD_TASKS = ["prompt_safety", "prompt_toxicity", "jailbreak_detection"];
+
 const KIND_META: Record<AgentKind, { label: string; icon: React.ReactNode }> = {
   proxy_security: { label: "Security proxy", icon: <ShieldCheck className="h-5 w-5" /> },
   ocr: { label: "OCR", icon: <ScanText className="h-5 w-5" /> },
@@ -526,6 +531,7 @@ function CreateView({
   const [restorePii, setRestorePii] = useState(false);
   const [guardModel, setGuardModel] = useState("");
   const [guardFallback, setGuardFallback] = useState(false);
+  const [guardTasks, setGuardTasks] = useState<string[]>([]);
   const [deployingGuard, setDeployingGuard] = useState(false);
 
   // One-click guard bootstrap: deploy the GLiNER encoder as a managed
@@ -588,6 +594,8 @@ function CreateView({
               restore_pii: restorePii,
               guard_model: guardModel.trim() || null,
               guard_fallback: guardModel.trim() && guardFallback ? "regex" : null,
+              guard_tasks:
+                guardModel.trim() && guardTasks.length > 0 ? guardTasks : null,
             }
           : kind === "ocr"
             ? {
@@ -755,16 +763,51 @@ function CreateView({
                   </div>
                 </Field>
                 {guardModel.trim() && (
-                  <label className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90">
-                    <input
-                      type="checkbox"
-                      checked={guardFallback}
-                      onChange={(e) => setGuardFallback(e.target.checked)}
-                      className="h-3.5 w-3.5"
-                    />
-                    Degrade to regex analysis if the guard is unreachable
-                    (default: fail closed)
-                  </label>
+                  <>
+                    <div>
+                      <p className="mb-1.5 text-xs font-medium text-foreground">
+                        Moderation tasks
+                      </p>
+                      <div className="grid gap-1.5">
+                        {GUARD_TASKS.map((task) => (
+                          <label
+                            key={task}
+                            className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={guardTasks.includes(task)}
+                              onChange={() =>
+                                setGuardTasks((prev) =>
+                                  prev.includes(task)
+                                    ? prev.filter((t) => t !== task)
+                                    : [...prev, task],
+                                )
+                              }
+                              className="h-3.5 w-3.5"
+                            />
+                            {task.replaceAll("_", " ")}
+                          </label>
+                        ))}
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Needs a GLiNER2 guardrails checkpoint (e.g.
+                        fastino/GLiNER2-Guardrails-PII-Multi). In Block mode a
+                        non-benign verdict refuses the request before any PII
+                        check.
+                      </p>
+                    </div>
+                    <label className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90">
+                      <input
+                        type="checkbox"
+                        checked={guardFallback}
+                        onChange={(e) => setGuardFallback(e.target.checked)}
+                        className="h-3.5 w-3.5"
+                      />
+                      Degrade to regex analysis if the guard is unreachable
+                      (default: fail closed)
+                    </label>
+                  </>
                 )}
               </div>
             </Card>
