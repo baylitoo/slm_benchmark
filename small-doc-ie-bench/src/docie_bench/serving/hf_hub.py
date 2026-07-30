@@ -108,8 +108,12 @@ async def list_repo_ggufs(repo: str, *, client: httpx.AsyncClient) -> list[HfGgu
     if response.status_code == 404:
         raise HfHubError(f"repo {repo!r} does not exist on the Hugging Face Hub")
     if response.status_code in (401, 403):
+        # The Hub answers 401 for a NONEXISTENT repo when unauthenticated (it
+        # won't leak existence), so this is ambiguous by design — say so.
         raise HfHubError(
-            f"repo {repo!r} is gated/private — set HF_TOKEN on the serving service"
+            f"repo {repo!r} was refused by the Hub: either the id has a typo "
+            "(check the exact repo name), or it is gated/private — in that "
+            "case set HF_TOKEN on the api and serving services"
         )
     if response.status_code >= 400:
         raise HfHubError(f"Hub returned HTTP {response.status_code} for {repo!r}")

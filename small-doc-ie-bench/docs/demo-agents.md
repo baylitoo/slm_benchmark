@@ -9,7 +9,7 @@ initial `docker compose up`.
 
 | Role | Model / engine | Where it comes from |
 |---|---|---|
-| Chat SLM (agent backing) | `LiquidAI/LFM2.5-350M-Instruct-GGUF` (LFM2.5 family) | downloaded straight from the HF Hub, in-UI |
+| Chat SLM (agent backing) | `LiquidAI/LFM2.5-350M-GGUF` (LFM2.5 family) | downloaded straight from the HF Hub, in-UI |
 | Guard encoder (PII analyzer) | `urchade/gliner_multi_pii-v1` | one click in the Agents form |
 | OCR engine | tesseract (eng+fra, in the image) | nothing to fetch |
 | Optional OCR extractor | a NuExtract3 deployment | if already in your store |
@@ -32,15 +32,15 @@ straight from the Hugging Face Hub.
 ## Act 1 — Model → family → deployment (Deploy section)
 
 1. **Models → Add model → Hugging Face tab**: repo
-   `LiquidAI/LFM2.5-350M-Instruct-GGUF` → **Inspect** (lists every quant with
-   its size) → pick `Q4_K_M`, store name prefilled `lfm2.5-350m-instruct`,
+   `LiquidAI/LFM2.5-350M-GGUF` → **Inspect** (lists every quant with
+   its size) → pick `Q4_K_M`, store name prefilled `lfm2.5-350m`,
    **Family: `lfm2`** — this is the "integrate into a family" step: the family
    contract carries the template style, generation defaults and launch args
    the deploy will inherit. **Download & seed** → a live progress bar streams
    the download (percent + bytes) over the same realtime backbone as every
    other job. *(The "Collection" tab seeds a provider's whole curated
    collection at once; "Ollama (legacy)" keeps the old path.)*
-2. **Deployments → Deploy a model**: pick `lfm2.5-350m-instruct`, runtime
+2. **Deployments → Deploy a model**: pick `lfm2.5-350m`, runtime
    Auto, deploy.
    Watch the row: phase `loading` → `hot`, PID, endpoint, observed RSS filled
    by the reconciler (~10s cadence).
@@ -57,7 +57,7 @@ agent becomes an OCR→SLM structured-extraction pipeline.)*
 
 ### 2b. Security gate (filtering / blocking proxy)
 Catalog → **Security Proxy Agent** → Use template → name `gate`:
-- Backing model: `lfm25-350m` (datalist offers the live deployment)
+- Backing model: `lfm2.5-350m` (datalist offers the live deployment)
 - **Mode: Block — refuse requests containing PII**
 - Guard model: click **Deploy** (spawns the `gliner-pii` managed deployment —
   show it appear under Deployments, phase `loading` → `hot` like any SLM),
@@ -66,7 +66,7 @@ Catalog → **Security Proxy Agent** → Use template → name `gate`:
 
 ### 2c. Anonymizer
 Same template → name `anonymizer`:
-- Backing model `lfm25-350m`, guard `gliner-pii`
+- Backing model `lfm2.5-350m`, guard `gliner-pii`
 - **Mode: Placeholder — anonymize before forwarding** (leave "restore" off so
   the masking stays visible in the response)
 - Create.
