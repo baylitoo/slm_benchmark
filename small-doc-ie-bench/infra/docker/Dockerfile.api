@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Build a portable, statically-linked llama-server (CPU) once. This stage has no
 # dependency on the app source, so it caches across code changes and only
 # rebuilds if these lines change. GGML_NATIVE=OFF keeps the binary portable
@@ -23,9 +24,11 @@ RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /src \
 
 FROM python:3.11-slim-bookworm
 
+# NOTE: no PIP_NO_CACHE_DIR — the dependency layer below uses a BuildKit cache
+# mount for /root/.cache/pip, so wheels (torch is ~200MB even CPU-only) are
+# downloaded once and reused across rebuilds without growing the image.
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
@@ -44,15 +47,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # worker; harmless in the api image.
 COPY --from=llama-builder /src/build/bin/llama-server /usr/local/bin/llama-server
 
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY scripts ./scripts
 # PIP_EXTRAS lets one service opt into heavier optional groups without
 # bloating every image built from this file: the `serving` service passes
 # "ocr,encoders" (torch + gliner for encoder deployments), everything else
 # keeps the light default.
 ARG PIP_EXTRAS=ocr
-RUN pip install --upgrade pip && pip install -e ".[${PIP_EXTRAS}]"
+
+# ── Dependency layer ─────────────────────────────────────────────────────────
+# Installed from pyproject BEFORE the source copy, so editing code never
+# re-resolves (or re-downloads) the dependency world. Two deliberate moves:
+#   * CPU-only torch is pinned FIRST when the encoders extra is requested —
+#     otherwise gliner/gliner2 pull the default CUDA build and its multi-GB
+#     nvidia-cudnn/cublas wheels, which this CPU-only stack never executes.
+#   * the pip download cache is a BuildKit cache mount: even when this layer
+#     is invalidated (dependency bump), wheels come from the local cache
+#     instead of the network.
+COPY pyproject.toml README.md ./
+COPY scripts/print_requirements.py ./scripts/print_requirements.py
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip \
+ && case ",${PIP_EXTRAS}," in \
+      *,encoders,*) pip install --index-url https://download.pytorch.org/whl/cpu torch ;; \
+    esac \
+ && python scripts/print_requirements.py "${PIP_EXTRAS}" > /tmp/requirements.txt \
+ && pip install -r /tmp/requirements.txt
+
+# ── Source layer ─────────────────────────────────────────────────────────────
+# Code-only changes rebuild from here: --no-deps because everything third-party
+# is already satisfied above (seconds, no network).
+COPY src ./src
+COPY scripts ./scripts
+RUN pip install --no-deps -e .
 
 COPY configs ./configs
 
