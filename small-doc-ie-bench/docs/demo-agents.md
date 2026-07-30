@@ -10,7 +10,7 @@ initial `docker compose up`.
 | Role | Model / engine | Where it comes from |
 |---|---|---|
 | Chat SLM (agent backing) | `LiquidAI/LFM2.5-350M-GGUF` (LFM2.5 family) | downloaded straight from the HF Hub, in-UI |
-| Guard encoder (PII analyzer) | `urchade/gliner_multi_pii-v1` | one click in the Agents form |
+| Guard encoder (PII analyzer) | `fastino/GLiNER2-Guardrails-PII-Multi` | one click in the Agents form |
 | OCR engine | tesseract (eng+fra, in the image) | nothing to fetch |
 | Optional OCR extractor | a NuExtract3 deployment | if already in your store |
 
@@ -59,14 +59,14 @@ agent becomes an OCR→SLM structured-extraction pipeline.)*
 Catalog → **Security Proxy Agent** → Use template → name `gate`:
 - Backing model: `lfm2.5-350m` (datalist offers the live deployment)
 - **Mode: Block — refuse requests containing PII**
-- Guard model: click **Deploy** (spawns the `gliner-pii` managed deployment —
+- Guard model: click **Deploy** (spawns the `guardrails-pii` managed deployment —
   show it appear under Deployments, phase `loading` → `hot` like any SLM),
-  field is prefilled with `gliner-pii`.
+  field is prefilled with `guardrails-pii`.
 - Create.
 
 ### 2c. Anonymizer
 Same template → name `anonymizer`:
-- Backing model `lfm2.5-350m`, guard `gliner-pii`
+- Backing model `lfm2.5-350m`, guard `guardrails-pii`
 - **Mode: Placeholder — anonymize before forwarding** (leave "restore" off so
   the masking stays visible in the response)
 - Create.
@@ -79,7 +79,7 @@ the platform-wide endpoint card in Catalog).
 
 1. **`anonymizer`** → expand → Try. Replace the sample with the full text of
    `invoice-001.txt`, prepend *"Repeat this text exactly:"* → Run.
-   Show: entity badges (`analyzer: guard:gliner-pii`, `IBAN ×1`, `PERSON …`),
+   Show: entity badges (`analyzer: guard:guardrails-pii`, `IBAN ×1`, `PERSON …`),
    the placeholder list that went upstream, and the model's reply containing
    `[IBAN_1]`-style tokens instead of real values. Raw JSON collapsible for
    the `docie_agent` report.
@@ -90,7 +90,7 @@ the platform-wide endpoint card in Catalog).
 4. **`ocr-reader`** → upload an invoice image → Run → OCR text back (with an
    extractor configured: structured JSON instead).
 5. **Fail-closed** (the security money-shot): Deployments → Unload
-   `gliner-pii` → Try `anonymizer` → `guard_unavailable` 502, request refused.
+   `guardrails-pii` → Try `anonymizer` → `guard_unavailable` 502, request refused.
    Load it back → works again. (Optional: an agent with
    `guard_fallback: "regex"` degrades instead and its report shows
    `degraded to regex`.)

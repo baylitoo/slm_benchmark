@@ -534,23 +534,24 @@ function CreateView({
   const [guardTasks, setGuardTasks] = useState<string[]>([]);
   const [deployingGuard, setDeployingGuard] = useState(false);
 
-  // One-click guard bootstrap: deploy the GLiNER encoder as a managed
-  // deployment (runtime: "encoder") and point the form at it. The deploy is
-  // async (Inngest) — watch it under Deployments; the serving node needs the
+  // One-click guard bootstrap: deploy the GLiNER2 guardrails encoder (PII +
+  // safety moderation in one checkpoint) as a managed deployment
+  // (runtime: "encoder") and point the form at it. The deploy is async
+  // (Inngest) — watch it under Deployments; the serving node needs the
   // `encoders` extra or the deploy fails there with the actionable reason.
   async function deployGuardEncoder() {
     setDeployingGuard(true);
     try {
       await deployModel({
-        model: "urchade/gliner_multi_pii-v1",
+        model: "fastino/GLiNER2-Guardrails-PII-Multi",
         runtime: "encoder",
-        name: "gliner-pii",
+        name: "guardrails-pii",
       });
-      setGuardModel("gliner-pii");
+      setGuardModel("guardrails-pii");
       toast({
         title: "Encoder deploy started",
         description:
-          "gliner-pii — follow progress under Deployments. Requires the 'encoders' extra on the serving node.",
+          "guardrails-pii — follow progress under Deployments. Requires the 'encoders' extra on the serving node.",
         tone: "success",
       });
     } catch (err) {
@@ -746,7 +747,7 @@ function CreateView({
                       id="agent-guard-model"
                       value={guardModel}
                       onChange={(e) => setGuardModel(e.target.value)}
-                      placeholder="gliner-pii"
+                      placeholder="guardrails-pii"
                       list="agent-deployments"
                     />
                     <Button
@@ -755,7 +756,7 @@ function CreateView({
                       size="sm"
                       loading={deployingGuard}
                       onClick={() => void deployGuardEncoder()}
-                      title="Deploy the GLiNER PII encoder as a managed deployment (runtime: encoder)"
+                      title="Deploy the GLiNER2 guardrails encoder (PII + safety moderation) as a managed deployment"
                     >
                       <Rocket className="h-3.5 w-3.5" />
                       Deploy
