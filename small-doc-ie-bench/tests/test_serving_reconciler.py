@@ -628,6 +628,7 @@ def test_role_partition_is_disjoint_and_complete() -> None:
     assert serving_ids == {
         "serving-deploy",
         "serving-seed-ollama",
+        "serving-seed-hf",
         "serving-delete",
         "serving-load",
         "serving-unload",

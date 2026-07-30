@@ -173,6 +173,67 @@ async def trigger_deploy(payload: DeployRequest, tenant: TenantDependency) -> Tr
     return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
 
 
+class SeedHfRequest(BaseModel):
+    """Seed a GGUF DIRECTLY from the Hugging Face Hub (preferred path)."""
+
+    repo: str  # e.g. "LiquidAI/LFM2.5-350M-Instruct-GGUF"
+    quant: str | None = None  # e.g. "Q4_K_M"; None = best available default
+    name: str | None = None  # store name; None = derived from the repo
+    family: str = "openai_chat"
+
+
+@router.post("/seed-hf", response_model=TriggerResponse)
+async def trigger_seed_hf(payload: SeedHfRequest, tenant: TenantDependency) -> TriggerResponse:
+    channel = f"seed:{uuid.uuid4().hex}"
+    data: dict[str, Any] = payload.model_dump(exclude_none=True)
+    data["channel"] = channel
+    ids = await inngest_client.send(inngest.Event(name="serving/seed-hf.requested", data=data))
+    _record_event_owners(list(ids), tenant.tenant_id)
+    return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
+
+
+@router.get("/hf/repo")
+async def hf_repo_ggufs(repo: Annotated[str, Query(min_length=3)]) -> dict[str, Any]:
+    """Live GGUF listing of a Hub repo — backs the Studio's quant picker.
+
+    Proxied server-side so the browser needs no HF credentials (HF_TOKEN on the
+    api service covers gated repos) and no CORS exceptions.
+    """
+    from docie_bench.serving.hf_hub import HfHubError, default_store_name, list_repo_ggufs
+
+    try:
+        async with httpx.AsyncClient() as client:
+            files = await list_repo_ggufs(repo, client=client)
+    except HfHubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "repo": repo,
+        "suggested_name": default_store_name(repo),
+        "ggufs": [
+            {
+                "filename": f.filename,
+                "size_bytes": f.size_bytes,
+                "quant": f.quant,
+                "is_mmproj": f.is_mmproj,
+                "is_multipart": f.is_multipart,
+            }
+            for f in files
+        ],
+    }
+
+
+@router.get("/hf/collection")
+async def hf_collection(slug: Annotated[str, Query(min_length=3)]) -> dict[str, Any]:
+    """A provider-curated HF collection's model repos (seed-a-collection picker)."""
+    from docie_bench.serving.hf_hub import HfHubError, list_collection
+
+    try:
+        async with httpx.AsyncClient() as client:
+            return await list_collection(slug, client=client)
+    except HfHubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 class SeedOllamaRequest(BaseModel):
     reference: str  # e.g. "qwen2.5:1.5b" or "hf.co/numind/NuExtract3-GGUF:Q4_K_M"
     name: str  # store entry name

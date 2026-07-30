@@ -16,17 +16,21 @@ import base64
 import binascii
 import logging
 import os
+import shutil
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import httpx
 import inngest
 
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.client import inngest_client, serving_client
 from docie_bench.inngest.realtime import (
     TOPIC_ERROR,
+    TOPIC_PROGRESS,
     TOPIC_RESULT,
     TOPIC_STATUS,
     publish,
@@ -989,6 +993,215 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
+def _register_seed_in_catalog(store: Any, entry: Any, name: str) -> dict[str, Any]:
+    """Catalog-register a freshly seeded entry (shared by ollama + HF seeds).
+
+    Same two failure modes as documented on the Ollama path: no catalog
+    configured -> store-only success with a warning; a configured catalog whose
+    write FAILS -> compensate (remove the on-disk entry) and re-raise so the
+    seed stays all-or-nothing.
+    """
+    from docie_bench.serving.catalog import (
+        CatalogUnavailableError,
+        ModelCatalog,
+        available_backends,
+    )
+    from docie_bench.serving.model_store import FAMILIES
+
+    size = entry.model_path.stat().st_size if entry.model_path.exists() else None
+    try:
+        return ModelCatalog().upsert(entry, size_bytes=size)
+    except CatalogUnavailableError:
+        contract = FAMILIES.get(entry.family)
+        logger.warning(
+            "no catalog configured (no DATABASE_URL): seed %r written to the store but "
+            "NOT catalog-registered (store-only; Studio will not list it until a catalog "
+            "is configured)",
+            name,
+        )
+        return {
+            "name": entry.name,
+            "family": entry.family,
+            "vision": bool(contract and contract.vision),
+            "available_backends": available_backends(entry.family),
+            "has_mmproj": entry.mmproj_path is not None,
+            "source": entry.source,
+            "size_bytes": size,
+            "placement": None,
+            "created_at": None,
+            "updated_at": None,
+            "catalog_registered": False,
+        }
+    except Exception:  # noqa: BLE001 - configured catalog write FAILED: compensate then re-raise
+        try:
+            store.remove_entry(name)
+        except Exception:  # noqa: BLE001 - log; never shadow the original error
+            logger.exception("seed compensation remove_entry failed for %r", name)
+        raise
+
+
+async def _run_seed_hf(
+    data: dict[str, Any],
+    channel: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """Download a GGUF straight from the Hugging Face Hub into the store.
+
+    Streams download progress to the run channel's ``progress`` topic
+    (throttled), then registers the entry exactly like the Ollama seed
+    (store + catalog, all-or-nothing). ``needs_mmproj`` families auto-download
+    the repo's vision projector when it ships one, and refuse loudly when it
+    doesn't.
+    """
+    from docie_bench.serving.hf_hub import (
+        default_store_name,
+        download_file,
+        list_repo_ggufs,
+        pick_gguf,
+        pick_mmproj,
+    )
+    from docie_bench.serving.model_store import ModelStore, get_family
+
+    repo = data.get("repo")
+    if not repo:
+        raise ValueError("seed-hf event must include 'repo'")
+    repo = str(repo)
+    quant = str(data.get("quant") or "") or None
+    family = str(data.get("family") or "openai_chat")
+    name = str(data.get("name") or "") or default_store_name(repo)
+    contract = get_family(family)  # fail fast on an unknown family
+
+    store = ModelStore(_serving_home() / "models")
+    tmp_dir = store.root / ".hf-downloads" / name
+
+    throttle = {"at": 0.0, "percent": -100.0}
+
+    def _progress_reporter(stage: str, filename: str):
+        async def report(received: int, total: int | None) -> None:
+            percent = (received / total * 100.0) if total else None
+            now = time.monotonic()
+            done = percent is not None and percent >= 100.0
+            if not done:
+                if percent is None and now - throttle["at"] < 3.0:
+                    return
+                if (
+                    percent is not None
+                    and percent - throttle["percent"] < 3.0
+                    and now - throttle["at"] < 2.0
+                ):
+                    return
+            throttle["at"] = now
+            throttle["percent"] = percent if percent is not None else throttle["percent"]
+            await publish(
+                channel,
+                TOPIC_PROGRESS,
+                {
+                    "stage": stage,
+                    "file": filename,
+                    "received_bytes": received,
+                    "total_bytes": total,
+                    "percent": round(percent, 1) if percent is not None else None,
+                },
+            )
+
+        return report
+
+    try:
+        async with httpx.AsyncClient(transport=transport) as client:
+            files = await list_repo_ggufs(repo, client=client)
+            chosen = pick_gguf(files, quant)
+            mmproj_file = pick_mmproj(files)
+            if contract.needs_mmproj and mmproj_file is None:
+                raise ValueError(
+                    f"family {family!r} requires a vision projector but {repo!r} ships "
+                    "no mmproj GGUF — pick a repo that includes one"
+                )
+
+            await publish(
+                channel,
+                TOPIC_STATUS,
+                {
+                    "state": "downloading",
+                    "repo": repo,
+                    "file": chosen.filename,
+                    "quant": chosen.quant,
+                    "size_bytes": chosen.size_bytes,
+                },
+            )
+            model_tmp = tmp_dir / "model.gguf"
+            await download_file(
+                repo,
+                chosen.filename,
+                model_tmp,
+                client=client,
+                progress=_progress_reporter("download", chosen.filename),
+            )
+            mmproj_tmp: Path | None = None
+            if contract.needs_mmproj and mmproj_file is not None:
+                await publish(
+                    channel,
+                    TOPIC_STATUS,
+                    {"state": "downloading-mmproj", "file": mmproj_file.filename},
+                )
+                mmproj_tmp = tmp_dir / "mmproj.gguf"
+                await download_file(
+                    repo,
+                    mmproj_file.filename,
+                    mmproj_tmp,
+                    client=client,
+                    progress=_progress_reporter("download-mmproj", mmproj_file.filename),
+                )
+
+        await publish(channel, TOPIC_STATUS, {"state": "registering", "name": name})
+        # Hard-link into the canonical entry (same volume, instant), verify, index.
+        entry = await asyncio.to_thread(
+            store.add_gguf,
+            name=name,
+            family=family,
+            model_gguf=model_tmp,
+            mmproj=mmproj_tmp,
+            source=f"hf:{repo}:{chosen.quant or chosen.filename}",
+            link=True,
+        )
+        return await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
+    finally:
+        # The canonical entry holds hard links to this data; removing the
+        # download dir never touches the registered blobs.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@serving_client.create_function(
+    fn_id="serving-seed-hf",
+    trigger=inngest.TriggerEvent(event="serving/seed-hf.requested"),
+)
+async def seed_hf_job(ctx: inngest.Context) -> dict[str, Any]:
+    """Seed a model DIRECTLY from the Hugging Face Hub (no Ollama in the path).
+
+    Event ``data``: ``repo`` (e.g. "LiquidAI/LFM2.5-350M-Instruct-GGUF"),
+    ``quant`` (e.g. "Q4_K_M"; empty = best available default), ``name``
+    (store name; empty = derived from the repo), ``family``, ``channel``.
+    Download progress streams on the channel's ``progress`` topic.
+    """
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(channel, TOPIC_STATUS, {"state": "seeding", "repo": data.get("repo")})
+    try:
+        result = await ctx.step.run("seed-hf", lambda: _run_seed_hf(data, channel))
+    except Exception as exc:  # noqa: BLE001 - log traceback, surface error, re-raise
+        logger.exception(
+            "seed_hf_job failed (repo=%s name=%s)", data.get("repo"), data.get("name")
+        )
+        await _publish_error_safely(channel, str(exc))
+        raise
+    try:
+        await publish(channel, TOPIC_RESULT, result)
+    except Exception:  # noqa: BLE001 - result is durable; a failed publish must not fail the run
+        logger.exception("failed to publish seed result to channel %s", channel)
+    return result
+
+
 def _gc_studio_runs_sync() -> dict[str, int]:
     """Apply the retention policy to the durable Studio run index (blocking)."""
     from docie_bench.studio.store import default_run_store
@@ -1056,6 +1269,7 @@ worker_functions = [
 serving_functions = [
     deploy_model_job,
     seed_ollama_job,
+    seed_hf_job,
     delete_deployment_job,
     load_deployment_job,
     unload_deployment_job,
@@ -1114,6 +1328,7 @@ __all__ = [
     "run_benchmark_job",
     "deploy_model_job",
     "seed_ollama_job",
+    "seed_hf_job",
     "delete_deployment_job",
     "load_deployment_job",
     "unload_deployment_job",

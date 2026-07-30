@@ -565,6 +565,59 @@ export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse>
 }
 
 // ---------------------------------------------------------------------------
+// Hugging Face direct seeding (preferred path — no Ollama dependency)
+// ---------------------------------------------------------------------------
+
+/** One GGUF file of a Hub repo (GET /v1/studio/hf/repo). */
+export interface HfGgufFileView {
+  filename: string;
+  size_bytes?: number | null;
+  quant?: string | null;
+  is_mmproj?: boolean;
+  is_multipart?: boolean;
+}
+
+export interface HfRepoView {
+  repo: string;
+  suggested_name: string;
+  ggufs: HfGgufFileView[];
+}
+
+/** A provider-curated collection (GET /v1/studio/hf/collection). */
+export interface HfCollectionView {
+  slug: string;
+  title: string;
+  models: string[];
+}
+
+export interface SeedHfRequest {
+  repo: string;
+  quant?: string | null;
+  name?: string | null;
+  family?: string;
+}
+
+/** Live GGUF/quant listing of a Hub repo (server-side proxy, HF_TOKEN aware). */
+export function getHfRepo(repo: string): Promise<HfRepoView> {
+  return request<HfRepoView>(`/v1/studio/hf/repo?repo=${encodeURIComponent(repo)}`);
+}
+
+/** The model repos of a HF collection (owner/slug-hash or its full URL). */
+export function getHfCollection(slug: string): Promise<HfCollectionView> {
+  return request<HfCollectionView>(
+    `/v1/studio/hf/collection?slug=${encodeURIComponent(slug)}`,
+  );
+}
+
+/** Download a GGUF straight from the Hub into the store; progress streams live. */
+export function seedHf(payload: SeedHfRequest): Promise<TriggerResponse> {
+  return request<TriggerResponse>("/v1/studio/seed-hf", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Agents (GET/POST /v1/agents — preconfigured agents over OpenAI endpoints)
 // ---------------------------------------------------------------------------
 

@@ -9,7 +9,7 @@ initial `docker compose up`.
 
 | Role | Model / engine | Where it comes from |
 |---|---|---|
-| Chat SLM (agent backing) | `lfm2.5:350m` (LFM2.5 family) | seeded from host Ollama |
+| Chat SLM (agent backing) | `LiquidAI/LFM2.5-350M-Instruct-GGUF` (LFM2.5 family) | downloaded straight from the HF Hub, in-UI |
 | Guard encoder (PII analyzer) | `urchade/gliner_multi_pii-v1` | one click in the Agents form |
 | OCR engine | tesseract (eng+fra, in the image) | nothing to fetch |
 | Optional OCR extractor | a NuExtract3 deployment | if already in your store |
@@ -23,19 +23,25 @@ initial `docker compose up`.
 - Any invoice JPG/PNG/PDF on your machine for the OCR agent (the Try panel
   uploads it straight from the browser).
 
-Prerequisite once: `ollama pull lfm2.5:350m` on the host, `OLLAMA_MODELS_HOST`
-set in `.env`, then `docker compose up -d api serving worker web`
-(+ `--profile observability` for Grafana).
+Prerequisite once: `docker compose up -d api serving worker web`
+(+ `--profile observability` for Grafana). No Ollama needed — models come
+straight from the Hugging Face Hub.
 
 ---
 
 ## Act 1 — Model → family → deployment (Deploy section)
 
-1. **Models → Add model**: reference `lfm2.5:350m`, store name `lfm25-350m`,
+1. **Models → Add model → Hugging Face tab**: repo
+   `LiquidAI/LFM2.5-350M-Instruct-GGUF` → **Inspect** (lists every quant with
+   its size) → pick `Q4_K_M`, store name prefilled `lfm2.5-350m-instruct`,
    **Family: `lfm2`** — this is the "integrate into a family" step: the family
-   contract carries the template style, generation defaults and launch args the
-   deploy will inherit. Seed streams live (Inngest realtime).
-2. **Deployments → Deploy a model**: pick `lfm25-350m`, runtime Auto, deploy.
+   contract carries the template style, generation defaults and launch args
+   the deploy will inherit. **Download & seed** → a live progress bar streams
+   the download (percent + bytes) over the same realtime backbone as every
+   other job. *(The "Collection" tab seeds a provider's whole curated
+   collection at once; "Ollama (legacy)" keeps the old path.)*
+2. **Deployments → Deploy a model**: pick `lfm2.5-350m-instruct`, runtime
+   Auto, deploy.
    Watch the row: phase `loading` → `hot`, PID, endpoint, observed RSS filled
    by the reconciler (~10s cadence).
 3. **Sizing tab**: the new process is counted in the node bar; point at the
