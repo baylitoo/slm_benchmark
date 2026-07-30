@@ -39,6 +39,11 @@ def _hub_transport() -> httpx.MockTransport:
         path = request.url.path
         if path == f"/api/models/{REPO}":
             return httpx.Response(200, json={"siblings": SIBLINGS})
+        if path == "/api/models/fastino/GLiNER2-Guardrails-PII-Multi":
+            return httpx.Response(
+                200,
+                json={"siblings": [{"rfilename": "model.safetensors"}, {"rfilename": "config.json"}]},
+            )
         if path == "/api/models/ghost/nope":
             return httpx.Response(404)
         if path == "/api/collections/LiquidAI/lfm25-abc123":
@@ -95,6 +100,13 @@ async def test_multipart_only_repo_is_refused() -> None:
     multiparts = [f for f in files if f.is_multipart or f.is_mmproj]
     with pytest.raises(HfHubError, match="multi-part"):
         pick_gguf(multiparts, None)
+
+
+async def test_safetensors_repo_routes_to_encoder_runtime() -> None:
+    """An encoder checkpoint must point at the encoder path, not a GGUF hunt."""
+    async with httpx.AsyncClient(transport=_hub_transport()) as client:
+        with pytest.raises(HfHubError, match="encoder runtime"):
+            await list_repo_ggufs("fastino/GLiNER2-Guardrails-PII-Multi", client=client)
 
 
 async def test_unknown_repo_is_a_clear_error() -> None:

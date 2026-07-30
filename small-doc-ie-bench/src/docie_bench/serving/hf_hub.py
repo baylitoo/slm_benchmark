@@ -118,12 +118,26 @@ async def list_repo_ggufs(repo: str, *, client: httpx.AsyncClient) -> list[HfGgu
     if response.status_code >= 400:
         raise HfHubError(f"Hub returned HTTP {response.status_code} for {repo!r}")
     payload = response.json()
+    siblings = [s for s in payload.get("siblings", []) if isinstance(s, dict)]
     files = [
-        gguf
-        for sibling in payload.get("siblings", [])
-        if isinstance(sibling, dict) and (gguf := _gguf_from_sibling(sibling)) is not None
+        gguf for sibling in siblings if (gguf := _gguf_from_sibling(sibling)) is not None
     ]
     if not files:
+        # A safetensors checkpoint is usually an ENCODER (GLiNER/GLiNER2,
+        # classifiers) — those are not llama.cpp-servable at all and belong to
+        # the encoder runtime, not the GGUF store. Route the user there
+        # instead of sending them hunting for a -GGUF repo that can't exist.
+        has_safetensors = any(
+            str(s.get("rfilename", "")).endswith(".safetensors") for s in siblings
+        )
+        if has_safetensors:
+            raise HfHubError(
+                f"repo {repo!r} is a transformers/encoder checkpoint (safetensors), "
+                "not a GGUF model — it is not served from the GGUF store. If it is "
+                "a GLiNER/GLiNER2 analyzer, deploy it with the encoder runtime "
+                "(Agents → Security options → the Deploy button next to Guard "
+                "model, or a deploy with runtime=\"encoder\")."
+            )
         raise HfHubError(
             f"repo {repo!r} ships no GGUF files — pick that model's -GGUF conversion repo"
         )
