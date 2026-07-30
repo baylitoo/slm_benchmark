@@ -638,12 +638,12 @@ function CreateView({
               label="Name"
               htmlFor="agent-name"
               required
-              hint="Lowercase slug — becomes the OpenAI model id."
+              hint="Becomes the OpenAI model id — typed input is normalized to a lowercase slug."
             >
               <TextInput
                 id="agent-name"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => setName(slugifyAgentName(e.target.value))}
                 placeholder="pii-proxy"
                 pattern="[a-z0-9][a-z0-9._-]*"
                 required
@@ -833,6 +833,18 @@ function CreateView({
 function errMessage(e: unknown): string {
   if (e instanceof ApiError || e instanceof Error) return e.message;
   return String(e);
+}
+
+/** Agent names are OpenAI model ids: normalize typing into the slug the
+ * backend accepts ("DLPProtection" -> "dlpprotection") instead of letting a
+ * raw pydantic pattern error surface after submit. */
+function slugifyAgentName(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9._-]+/g, "")
+    .replace(/^[^a-z0-9]+/, "")
+    .slice(0, 63);
 }
 
 function CopyButton({ value, label }: { value: string; label: string }) {
