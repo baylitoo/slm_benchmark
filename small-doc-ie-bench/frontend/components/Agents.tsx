@@ -856,7 +856,9 @@ function CreateView({
           <Card title="Endpoint" subtitle="Created agents are addressable immediately.">
             <CopyLine
               label="base_url"
-              value={`${agentBaseUrl(name.trim() || "<name>")}`}
+              value={
+                name.trim() ? agentBaseUrl(name.trim()) : `${agentBaseUrl()}/{name}`
+              }
             />
           </Card>
 
