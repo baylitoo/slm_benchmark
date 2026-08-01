@@ -1,9 +1,19 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { FileText, Play, Sparkles, Upload, AlertCircle } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  FileText,
+  MessageSquare,
+  Play,
+  Send,
+  Sparkles,
+  Trash2,
+  Upload,
+  AlertCircle,
+} from "lucide-react";
 import {
   triggerExtract,
+  chatCompletion,
   getDeployments,
   selectableDeployments,
   isLiveDeployment,
@@ -17,16 +27,18 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
-import { Button, Card, Field, Select, TextArea, TextInput, Badge } from "./ui";
+import { Button, Card, Field, Select, TextArea, TextInput, Badge, Spinner } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 
 type InputMode = "text" | "file";
+type PlaygroundMode = "extract" | "chat";
 
 const DEPLOY_POLL_MS = 4000;
 
 export function Playground({ active = true }: { active?: boolean }) {
   const { toast } = useToast();
+  const [mode, setMode] = useState<PlaygroundMode>("extract");
   const [inputMode, setInputMode] = useState<InputMode>("text");
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -118,9 +130,49 @@ export function Playground({ active = true }: { active?: boolean }) {
     <div>
       <PageHeader
         title="Playground"
-        subtitle="Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
+        subtitle={
+          mode === "chat"
+            ? "Classic queries: chat directly with any live deployment."
+            : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
+        }
+        actions={
+          <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
+            {(
+              [
+                ["extract", "Extract", Sparkles],
+                ["chat", "Chat", MessageSquare],
+              ] as [PlaygroundMode, string, typeof Sparkles][]
+            ).map(([m, label, Icon]) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setMode(m)}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 transition",
+                  mode === m
+                    ? "bg-card text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <Icon className="h-4 w-4" />
+                {label}
+              </button>
+            ))}
+          </div>
+        }
       />
-      <div className="grid gap-6 lg:grid-cols-2">
+
+      {/* Both modes stay mounted (hidden, never unmounted) so an in-flight
+          extraction stream or a chat history survives switching modes. */}
+      <div hidden={mode !== "chat"}>
+        <ChatPanel
+          deployments={deployments}
+          selectable={selectable}
+          selectedDeployment={selectedDeployment}
+          onSelectDeployment={setSelectedDeployment}
+        />
+      </div>
+      <div hidden={mode !== "extract"} className="grid gap-6 lg:grid-cols-2">
       <Card
         icon={<Sparkles className="h-5 w-5" />}
         title="Extract"
@@ -242,6 +294,171 @@ export function Playground({ active = true }: { active?: boolean }) {
       </Card>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Chat mode — classic free-form queries against a live deployment, through
+// the generic OpenAI surface (POST /v1/chat/completions, model = deployment).
+// ---------------------------------------------------------------------------
+
+interface ChatMsg {
+  role: "user" | "assistant";
+  content: string;
+}
+
+function ChatPanel({
+  deployments,
+  selectable,
+  selectedDeployment,
+  onSelectDeployment,
+}: {
+  deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
+  selectable: DeploymentRecord[];
+  selectedDeployment: string;
+  onSelectDeployment: (name: string) => void;
+}) {
+  const [system, setSystem] = useState("");
+  const [input, setInput] = useState("");
+  const [msgs, setMsgs] = useState<ChatMsg[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [msgs, busy]);
+
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    if (!selectedDeployment) {
+      setError("No live deployment selected — deploy a model in the Deploy tab first.");
+      return;
+    }
+    setError(null);
+    const next: ChatMsg[] = [...msgs, { role: "user", content: text }];
+    setMsgs(next);
+    setInput("");
+    setBusy(true);
+    try {
+      const payload = [
+        ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
+        ...next,
+      ];
+      const res = await chatCompletion(selectedDeployment, payload);
+      const content = res.choices?.[0]?.message?.content ?? "(empty response)";
+      setMsgs([...next, { role: "assistant", content }]);
+    } catch (e) {
+      const msg =
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Chat request failed.";
+      setError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card
+      icon={<MessageSquare className="h-5 w-5" />}
+      title="Chat"
+      subtitle="Free-form conversation with the selected deployment (multi-turn, history kept locally)."
+    >
+      <div className="space-y-4">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field
+            label="Deployment"
+            hint="Live deployments only — evicted ones need a Load from the Deploy tab first."
+          >
+            <DeploymentSelect
+              deployments={deployments}
+              selectable={selectable.filter(isLiveDeployment)}
+              value={selectedDeployment}
+              onChange={onSelectDeployment}
+            />
+          </Field>
+          <Field label="System prompt" hint="Optional — applied to the whole conversation.">
+            <TextInput
+              value={system}
+              onChange={(e) => setSystem(e.target.value)}
+              placeholder="You are…"
+            />
+          </Field>
+        </div>
+
+        <div className="scroll-thin max-h-[50vh] min-h-40 space-y-3 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
+          {msgs.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              Ask anything — the request goes straight to the deployment through
+              the OpenAI-compatible surface.
+            </p>
+          )}
+          {msgs.map((m, i) => (
+            <div
+              key={i}
+              className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}
+            >
+              <div
+                className={cn(
+                  "max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",
+                  m.role === "user"
+                    ? "bg-accent text-accent-foreground"
+                    : "border border-border bg-card text-foreground",
+                )}
+              >
+                {m.content}
+              </div>
+            </div>
+          ))}
+          {busy && (
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Spinner /> Waiting for the model…
+            </p>
+          )}
+          <div ref={bottomRef} />
+        </div>
+
+        {error && (
+          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            {error}
+          </p>
+        )}
+
+        <div className="flex items-end gap-2">
+          <TextArea
+            rows={2}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            placeholder="Type a message (Enter to send, Shift+Enter for a new line)…"
+          />
+          <Button type="button" loading={busy} onClick={() => void send()}>
+            <Send className="h-4 w-4" />
+            Send
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={msgs.length === 0 || busy}
+            onClick={() => {
+              setMsgs([]);
+              setError(null);
+            }}
+            title="Clear the conversation"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    </Card>
   );
 }
 

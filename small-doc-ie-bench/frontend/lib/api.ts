@@ -724,22 +724,14 @@ export interface AgentChatResponse {
   [k: string]: unknown;
 }
 
-/**
- * One synchronous chat completion against an agent's OpenAI endpoint (the Try
- * panel). Unlike `request()`, errors here arrive OpenAI-shaped
- * (`{"error": {"message", "type"}}`), so surface that message directly —
- * e.g. `guard_unavailable` when the encoder deployment is unloaded.
- */
-export async function agentChat(
-  name: string,
-  messages: { role: string; content: unknown }[],
-): Promise<AgentChatResponse> {
+/** POST an OpenAI-shaped chat body and surface OpenAI-shaped errors readably. */
+async function openaiPost(url: string, payload: unknown): Promise<AgentChatResponse> {
   let res: Response;
   try {
-    res = await fetch(`${agentBaseUrl(name)}/chat/completions`, {
+    res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ model: name, messages }),
+      body: JSON.stringify(payload),
     });
   } catch (e) {
     throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
@@ -752,6 +744,33 @@ export async function agentChat(
       : undefined;
   const detail = err?.message ?? detailOf(body, `Request failed (HTTP ${res.status})`);
   throw new ApiError(res.status, err?.type ? `${err.type}: ${detail}` : detail);
+}
+
+/**
+ * One synchronous chat completion against an agent's OpenAI endpoint (the Try
+ * panel). Errors arrive OpenAI-shaped — e.g. `guard_unavailable` when the
+ * encoder deployment is unloaded.
+ */
+export function agentChat(
+  name: string,
+  messages: { role: string; content: unknown }[],
+): Promise<AgentChatResponse> {
+  return openaiPost(`${agentBaseUrl(name)}/chat/completions`, {
+    model: name,
+    messages,
+  });
+}
+
+/**
+ * Generic chat against the serving stack (POST /v1/chat/completions): `model`
+ * is a live deployment name, a models.yaml profile, or store:<name>. Backs
+ * the Playground's Chat mode.
+ */
+export function chatCompletion(
+  model: string,
+  messages: { role: string; content: unknown }[],
+): Promise<AgentChatResponse> {
+  return openaiPost(`${API_BASE}/v1/chat/completions`, { model, messages });
 }
 
 // ---------------------------------------------------------------------------

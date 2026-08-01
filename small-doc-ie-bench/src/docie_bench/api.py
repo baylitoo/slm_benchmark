@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from docie_bench.agents.api import router as agents_router
+from docie_bench.chat_api import router as chat_router
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.serving_api import router as serving_router
 from docie_bench.inngest.studio_api import router as studio_router
@@ -94,6 +95,9 @@ app.include_router(serving_router, dependencies=[Depends(tenant_guard)])
 # but the OpenAI surface also accepts `Authorization: Bearer` so stock OpenAI
 # SDK clients can consume agents without custom headers.
 app.include_router(agents_router)
+# Generic OpenAI chat over the serving stack (Playground "Chat" + platform
+# surface): POST /v1/chat/completions with model = deployment/profile.
+app.include_router(chat_router)
 
 # Allow the DocIE Studio frontend (separate origin) to call the API from the
 # browser. Defaults to the local Studio UI origins; override via
