@@ -548,6 +548,7 @@ function CreateView({
   const [guardModel, setGuardModel] = useState("");
   const [guardFallback, setGuardFallback] = useState(false);
   const [guardTasks, setGuardTasks] = useState<string[]>([]);
+  const [guardLabels, setGuardLabels] = useState("");
   const [deployingGuard, setDeployingGuard] = useState(false);
 
   // One-click guard bootstrap: deploy the GLiNER2 guardrails encoder (PII +
@@ -613,6 +614,10 @@ function CreateView({
               guard_fallback: guardModel.trim() && guardFallback ? "regex" : null,
               guard_tasks:
                 guardModel.trim() && guardTasks.length > 0 ? guardTasks : null,
+              guard_labels:
+                guardModel.trim() && guardLabels.trim()
+                  ? guardLabels.split(",").map((l) => l.trim()).filter(Boolean)
+                  : null,
             }
           : kind === "ocr"
             ? {
@@ -816,6 +821,18 @@ function CreateView({
                 </Field>
                 {guardModel.trim() && (
                   <>
+                    <Field
+                      label="Guard labels (advanced)"
+                      htmlFor="agent-guard-labels"
+                      hint="Comma-separated zero-shot labels sent to the encoder. Empty = derived from the entity checkboxes. GLiNER2 covers 42 types — e.g. person, address, date_of_birth, password, api_key, secret."
+                    >
+                      <TextInput
+                        id="agent-guard-labels"
+                        value={guardLabels}
+                        onChange={(e) => setGuardLabels(e.target.value)}
+                        placeholder="person, email, phone_number, iban, payment_card, address, date_of_birth, password, api_key"
+                      />
+                    </Field>
                     <div>
                       <p className="mb-1.5 text-xs font-medium text-foreground">
                         Moderation tasks
