@@ -57,8 +57,14 @@ export function Playground({ active = true }: { active?: boolean }) {
   // demand), so it must stay selectable here or the flagship flow would be
   // unreachable from the UI. Polling is paused while the tab is hidden.
   const deployments = usePolling<DeploymentRecord[]>(getDeployments, DEPLOY_POLL_MS, active);
+  // Encoders (PII/guardrail analyzers) are excluded: they answer the encoder
+  // convention, not extraction prompts or chat — offering them here only
+  // produces confusing 4xx/garbage responses.
   const selectable = useMemo(
-    () => selectableDeployments(deployments.data ?? []),
+    () =>
+      selectableDeployments(deployments.data ?? []).filter(
+        (d) => d.spec?.launch?.runtime !== "encoder",
+      ),
     [deployments.data],
   );
   const selectableNames = useMemo(
@@ -165,12 +171,7 @@ export function Playground({ active = true }: { active?: boolean }) {
       {/* Both modes stay mounted (hidden, never unmounted) so an in-flight
           extraction stream or a chat history survives switching modes. */}
       <div hidden={mode !== "chat"}>
-        <ChatPanel
-          deployments={deployments}
-          selectable={selectable}
-          selectedDeployment={selectedDeployment}
-          onSelectDeployment={setSelectedDeployment}
-        />
+        <ChatPanel deployments={deployments} selectable={selectable} />
       </div>
       <div hidden={mode !== "extract"} className="grid gap-6 lg:grid-cols-2">
       <Card
@@ -310,14 +311,28 @@ interface ChatMsg {
 function ChatPanel({
   deployments,
   selectable,
-  selectedDeployment,
-  onSelectDeployment,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   selectable: DeploymentRecord[];
-  selectedDeployment: string;
-  onSelectDeployment: (name: string) => void;
 }) {
+  // Chat owns its OWN selection: it only offers LIVE deployments, so sharing
+  // the Extract-side selection (which legitimately includes evicted
+  // auto-reload targets) would let the select DISPLAY one model while the
+  // request carries another — the exact mismatch this state split fixes.
+  const [model, setModel] = useState("");
+  const liveOnly = useMemo(() => selectable.filter(isLiveDeployment), [selectable]);
+  const liveNames = useMemo(
+    () => liveOnly.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [liveOnly],
+  );
+  useEffect(() => {
+    if (liveNames.length === 0) {
+      if (model !== "") setModel("");
+      return;
+    }
+    if (!liveNames.includes(model)) setModel(liveNames[0]);
+  }, [liveNames, model]);
+
   const [system, setSystem] = useState("");
   const [input, setInput] = useState("");
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
@@ -332,7 +347,7 @@ function ChatPanel({
   async function send() {
     const text = input.trim();
     if (!text || busy) return;
-    if (!selectedDeployment) {
+    if (!model) {
       setError("No live deployment selected — deploy a model in the Deploy tab first.");
       return;
     }
@@ -346,7 +361,7 @@ function ChatPanel({
         ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
         ...next,
       ];
-      const res = await chatCompletion(selectedDeployment, payload);
+      const res = await chatCompletion(model, payload);
       const content = res.choices?.[0]?.message?.content ?? "(empty response)";
       setMsgs([...next, { role: "assistant", content }]);
     } catch (e) {
@@ -374,9 +389,9 @@ function ChatPanel({
           >
             <DeploymentSelect
               deployments={deployments}
-              selectable={selectable.filter(isLiveDeployment)}
-              value={selectedDeployment}
-              onChange={onSelectDeployment}
+              selectable={liveOnly}
+              value={model}
+              onChange={setModel}
             />
           </Field>
           <Field label="System prompt" hint="Optional — applied to the whole conversation.">
