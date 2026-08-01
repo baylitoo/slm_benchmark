@@ -1560,6 +1560,47 @@ function EncoderDeployForm() {
   );
 }
 
+// Short human blurb per known family; unknown families fall back to a flag-
+// derived tag so a new family still reads sensibly.
+const FAMILY_BLURBS: Record<string, string> = {
+  openai_chat: "chat / extraction (OpenAI schema)",
+  lfm2: "LFM2.5 text — chat / extraction",
+  lfm2_vl: "LFM2.5-VL — vision extraction",
+  nuextract3: "NuExtract3 — vision extraction",
+  nuextract_v1: "NuExtract v1 — text extraction",
+  embedding: "embedding — vectors for RAG (/v1/embeddings)",
+};
+
+function familyTypeTag(f: ModelFamily): string {
+  if (f.embedding) return "embedding";
+  if (f.vision || f.needs_mmproj) return "vision";
+  return "chat";
+}
+
+function familyOptionLabel(f: ModelFamily): string {
+  return FAMILY_BLURBS[f.name] ?? `${f.name} — ${familyTypeTag(f)} model`;
+}
+
+/** Family <option> list from the families API, with descriptive labels. */
+function FamilyOptions({ families }: { families: ModelFamily[] | null }) {
+  if (!families || families.length === 0) {
+    return <option value="openai_chat">openai_chat — chat / extraction</option>;
+  }
+  return (
+    <>
+      {families.map((f) => (
+        <option key={f.name} value={f.name}>
+          {f.name} · {familyOptionLabel(f)}
+        </option>
+      ))}
+    </>
+  );
+}
+
+function isEmbeddingFamily(families: ModelFamily[] | null, name: string): boolean {
+  return (families ?? []).some((f) => f.name === name && f.embedding);
+}
+
 function familyOptionsOf(families: ModelFamily[] | null): string[] {
   return families && families.length > 0 ? families.map((f) => f.name) : ["openai_chat"];
 }
@@ -1706,13 +1747,16 @@ function HfSeedForm({
               <Field label="Store name" required>
                 <TextInput value={name} onChange={(e) => setName(e.target.value)} />
               </Field>
-              <Field label="Family">
+              <Field
+                label="Family"
+                hint={
+                  isEmbeddingFamily(families, family)
+                    ? "Embedding model — served with --embedding, used via /v1/embeddings (Playground → Embed)."
+                    : "How the model is launched and prompted. Pick 'embedding' for a vector model."
+                }
+              >
                 <Select value={family} onChange={(e) => setFamily(e.target.value)}>
-                  {familyOptionsOf(families).map((f) => (
-                    <option key={f} value={f}>
-                      {f}
-                    </option>
-                  ))}
+                  <FamilyOptions families={families} />
                 </Select>
               </Field>
             </div>
@@ -1872,11 +1916,7 @@ function HfCollectionSeed({
               </Field>
               <Field label="Family" hint="One family for the whole batch.">
                 <Select value={family} onChange={(e) => setFamily(e.target.value)}>
-                  {familyOptionsOf(families).map((f) => (
-                    <option key={f} value={f}>
-                      {f}
-                    </option>
-                  ))}
+                  <FamilyOptions families={families} />
                 </Select>
               </Field>
             </div>
@@ -2021,11 +2061,7 @@ function SeedForm({
         </Field>
         <Field label="Family">
           <Select value={family} onChange={(e) => setFamily(e.target.value)}>
-            {familyOptions.map((f) => (
-              <option key={f} value={f}>
-                {f}
-              </option>
-            ))}
+            <FamilyOptions families={families} />
           </Select>
         </Field>
 
