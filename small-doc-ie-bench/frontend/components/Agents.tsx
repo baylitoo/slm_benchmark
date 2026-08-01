@@ -12,6 +12,7 @@ import {
   Bot,
   Check,
   Copy,
+  Pencil,
   Play,
   Plug,
   PlusCircle,
@@ -77,9 +78,17 @@ export function Agents({ view = "catalog" }: { view?: string }) {
   const templates = useAsync(getAgentTemplates, []);
   const agents = useAsync(getAgents, []);
   const [prefill, setPrefill] = useState<AgentTemplate | null>(null);
+  const [editAgent, setEditAgent] = useState<AgentView | null>(null);
 
   function useTemplate(template: AgentTemplate) {
+    setEditAgent(null);
     setPrefill(template);
+    setTab("create");
+  }
+
+  function editExisting(agent: AgentView) {
+    setPrefill(null);
+    setEditAgent(agent);
     setTab("create");
   }
 
@@ -87,7 +96,9 @@ export function Agents({ view = "catalog" }: { view?: string }) {
     tab === "instances"
       ? "Configured agents and their OpenAI-compatible endpoints."
       : tab === "create"
-        ? "Instantiate a template or build your own agent over a served model."
+        ? editAgent
+          ? `Editing ${editAgent.name} — toggle behaviors and save.`
+          : "Instantiate a template or build your own agent over a served model."
         : "Preconfigured agents over the served SLMs — pick one to instantiate.";
 
   return (
@@ -96,7 +107,14 @@ export function Agents({ view = "catalog" }: { view?: string }) {
         title="Agents"
         subtitle={subtitle}
         actions={
-          <Button size="sm" onClick={() => setTab("create")}>
+          <Button
+            size="sm"
+            onClick={() => {
+              setEditAgent(null);
+              setPrefill(null);
+              setTab("create");
+            }}
+          >
             <PlusCircle className="h-4 w-4" />
             New agent
           </Button>
@@ -104,14 +122,16 @@ export function Agents({ view = "catalog" }: { view?: string }) {
       />
 
       {tab === "instances" ? (
-        <InstancesView agents={agents} />
+        <InstancesView agents={agents} onEdit={editExisting} />
       ) : tab === "create" ? (
         <CreateView
           templates={templates.data ?? []}
           prefill={prefill}
+          editAgent={editAgent}
           onCreated={() => {
             agents.reload();
             setPrefill(null);
+            setEditAgent(null);
             setTab("instances");
           }}
         />
@@ -199,8 +219,10 @@ function CatalogView({
 
 function InstancesView({
   agents,
+  onEdit,
 }: {
   agents: { data: AgentView[] | null; error: unknown; loading: boolean; reload: () => void };
+  onEdit: (agent: AgentView) => void;
 }) {
   const { toast } = useToast();
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -281,6 +303,19 @@ function InstancesView({
       className: "text-right",
       render: (a) => (
         <div className="flex items-center justify-end gap-1.5">
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={busy === a.name}
+            title="Edit this agent's behavior"
+            onClick={(e) => {
+              e.stopPropagation();
+              onEdit(a);
+            }}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+            Edit
+          </Button>
           <Button
             variant="secondary"
             size="sm"
@@ -505,12 +540,15 @@ function AgentDetails({ agent }: { agent: AgentView }) {
 function CreateView({
   templates,
   prefill,
+  editAgent,
   onCreated,
 }: {
   templates: AgentTemplate[];
   prefill: AgentTemplate | null;
+  editAgent: AgentView | null;
   onCreated: () => void;
 }) {
+  const editing = editAgent !== null;
   const { toast } = useToast();
   const deployments = useAsync(getDeployments, []);
   // Managed deployments, segmented by semantic type — every model an agent
@@ -594,6 +632,33 @@ function CreateView({
     if (typeof options.backend === "string") setOcrBackend(options.backend);
   }, [prefill]);
 
+  // Load an existing agent's full config for editing (name + template locked).
+  useEffect(() => {
+    if (!editAgent) return;
+    const templateForKind: Record<AgentKind, string> = {
+      proxy_security: "proxy-security",
+      ocr: "ocr-agent",
+      custom: "custom",
+    };
+    setTemplateId(templateForKind[editAgent.kind] ?? "custom");
+    setName(editAgent.name);
+    setSystemPrompt(editAgent.system_prompt ?? "");
+    const backing = editAgent.model_profile ?? "";
+    setModelProfile(backing);
+    const o = editAgent.options ?? {};
+    if (Array.isArray(o.entities)) setEntities((o.entities as unknown[]).map(String));
+    if (typeof o.mode === "string") setMode(o.mode);
+    setRestorePii(o.restore_pii === true);
+    setGuardModel(typeof o.guard_model === "string" ? o.guard_model : "");
+    setGuardFallback(o.guard_fallback === "regex");
+    setGuardTasks(Array.isArray(o.guard_tasks) ? (o.guard_tasks as unknown[]).map(String) : []);
+    setGuardLabels(Array.isArray(o.guard_labels) ? (o.guard_labels as unknown[]).join(", ") : "");
+    if (typeof o.backend === "string") setOcrBackend(o.backend);
+    setOcrLanguage(typeof o.language === "string" ? o.language : "");
+    setOcrExtractor(typeof o.extractor === "string" ? o.extractor : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editAgent]);
+
   function toggleEntity(entity: string) {
     setEntities((prev) =>
       prev.includes(entity) ? prev.filter((e) => e !== entity) : [...prev, entity],
@@ -626,21 +691,34 @@ function CreateView({
                 extractor: ocrExtractor || null,
               }
             : {};
-      const created = await createAgent({
-        name: name.trim(),
-        template: templateId,
-        model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
-        system_prompt: systemPrompt.trim() || null,
-        options,
-      });
-      toast({
-        title: `Agent ${created.name} created`,
-        description: `OpenAI endpoint: ${agentBaseUrl(created.name)}`,
-        tone: "success",
-      });
+      if (editing && editAgent) {
+        await updateAgent(editAgent.name, {
+          model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
+          system_prompt: systemPrompt.trim() || null,
+          options,
+        });
+        toast({ title: `Agent ${editAgent.name} updated`, tone: "success" });
+      } else {
+        const created = await createAgent({
+          name: name.trim(),
+          template: templateId,
+          model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
+          system_prompt: systemPrompt.trim() || null,
+          options,
+        });
+        toast({
+          title: `Agent ${created.name} created`,
+          description: `OpenAI endpoint: ${agentBaseUrl(created.name)}`,
+          tone: "success",
+        });
+      }
       onCreated();
     } catch (err) {
-      toast({ title: "Create failed", description: errMessage(err), tone: "error" });
+      toast({
+        title: editing ? "Update failed" : "Create failed",
+        description: errMessage(err),
+        tone: "error",
+      });
     } finally {
       setSubmitting(false);
     }
@@ -656,6 +734,7 @@ function CreateView({
                 id="agent-template"
                 value={templateId}
                 onChange={(e) => setTemplateId(e.target.value)}
+                disabled={editing}
               >
                 {templates.map((t) => (
                   <option key={t.id} value={t.id}>
@@ -668,7 +747,11 @@ function CreateView({
               label="Name"
               htmlFor="agent-name"
               required
-              hint="Becomes the OpenAI model id — typed input is normalized to a lowercase slug."
+              hint={
+                editing
+                  ? "The agent id is immutable — edit its behavior, not its name."
+                  : "Becomes the OpenAI model id — typed input is normalized to a lowercase slug."
+              }
             >
               <TextInput
                 id="agent-name"
@@ -677,6 +760,7 @@ function CreateView({
                 placeholder="pii-proxy"
                 pattern="[a-z0-9][a-z0-9._-]*"
                 required
+                disabled={editing}
               />
             </Field>
             {kind !== "ocr" && (
@@ -937,7 +1021,7 @@ function CreateView({
 
           <Button type="submit" className="w-full" loading={submitting} disabled={!name.trim()}>
             <PlusCircle className="h-4 w-4" />
-            Create agent
+            {editing ? "Save changes" : "Create agent"}
           </Button>
         </div>
       </div>
