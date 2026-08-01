@@ -17,6 +17,7 @@ import {
   PinOff,
   Play,
   Square,
+  Trash2,
   X,
 } from "lucide-react";
 import {
@@ -32,6 +33,7 @@ import {
   loadDeployment,
   unloadDeployment,
   pinDeployment,
+  deleteDeployment,
   formatBytes,
   ApiError,
   ApiUnavailable,
@@ -317,7 +319,7 @@ function PhaseChip({ record }: { record: DeploymentRecord }) {
 // Deployments view — explicit-column table over DeploymentRecord[].
 // ---------------------------------------------------------------------------
 
-type LifecycleAction = "load" | "unload" | "pin" | "unpin";
+type LifecycleAction = "load" | "unload" | "pin" | "unpin" | "delete";
 
 function DeploymentsView({
   deployments,
@@ -332,10 +334,19 @@ function DeploymentsView({
   const [busy, setBusy] = useState<string | null>(null);
 
   async function act(name: string, action: LifecycleAction) {
+    if (
+      action === "delete" &&
+      !window.confirm(
+        `Delete deployment "${name}"? Kills the process, frees the port, removes the record.`,
+      )
+    ) {
+      return;
+    }
     setBusy(`${name}:${action}`);
     try {
       if (action === "load") await loadDeployment(name);
       else if (action === "unload") await unloadDeployment(name);
+      else if (action === "delete") await deleteDeployment(name);
       else await pinDeployment(name, action === "pin");
       toast({
         title:
@@ -343,9 +354,11 @@ function DeploymentsView({
             ? "Load requested"
             : action === "unload"
               ? "Unload requested"
-              : action === "pin"
-                ? "Pinned"
-                : "Unpinned",
+              : action === "delete"
+                ? "Delete requested"
+                : action === "pin"
+                  ? "Pinned"
+                  : "Unpinned",
         description: name,
         tone: "success",
       });
@@ -520,6 +533,16 @@ function DeploymentsView({
               onClick={() => act(name, r.pinned ? "unpin" : "pin")}
             >
               {r.pinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
+            </Button>
+            <Button
+              size="sm"
+              variant="danger"
+              loading={busy === `${name}:delete`}
+              disabled={busy !== null}
+              title="Delete: kill the process, free the port, remove the record (the real teardown)"
+              onClick={() => act(name, "delete")}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
             </Button>
           </div>
         );
