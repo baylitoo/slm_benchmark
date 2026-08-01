@@ -15,8 +15,6 @@ import {
   PackagePlus,
   Pin,
   PinOff,
-  Play,
-  Square,
   Trash2,
   X,
 } from "lucide-react";
@@ -285,6 +283,46 @@ const PHASE_STYLES: Record<string, { dot: string; text: string; pulse?: boolean 
 };
 
 /** Phase chip with a live dot (pulsing while hot/loading) + pin marker. */
+/** Hot ⇄ Offloaded switch. `on` = loaded; toggling calls load/unload. */
+function LoadToggle({
+  on,
+  busy,
+  disabled,
+  onToggle,
+}: {
+  on: boolean;
+  busy: boolean;
+  disabled: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      disabled={disabled || busy}
+      onClick={onToggle}
+      title={
+        on
+          ? "Offload: free the RAM now (record + port kept; auto-reloads on the next request)"
+          : "Load: spawn the runtime and wait until it serves"
+      }
+      className={cn(
+        "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50",
+        on ? "bg-emerald-500" : "bg-muted-foreground/40",
+      )}
+    >
+      <span
+        className={cn(
+          "inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform",
+          on ? "translate-x-4" : "translate-x-0.5",
+          busy && "animate-pulse",
+        )}
+      />
+    </button>
+  );
+}
+
 function PhaseChip({ record }: { record: DeploymentRecord }) {
   const phase = derivePhase(record);
   const style = PHASE_STYLES[phase] ?? PHASE_STYLES.unknown;
@@ -505,36 +543,23 @@ function DeploymentsView({
         if (!name) return null;
         const phase = derivePhase(r);
         const running = phase === "hot" || phase === "loading";
+        const transitioning =
+          phase === "loading" || busy === `${name}:load` || busy === `${name}:unload`;
         return (
           <div
-            className="flex items-center justify-end gap-1"
+            className="flex items-center justify-end gap-2"
             onClick={(e) => e.stopPropagation()}
           >
-            {running ? (
-              <Button
-                size="sm"
-                variant="secondary"
-                loading={busy === `${name}:unload`}
-                disabled={busy !== null}
-                title="Unload: free the RAM, keep the record + port (auto-reloads on the next request)"
-                onClick={() => act(name, "unload")}
-              >
-                <Square className="h-3.5 w-3.5" />
-                Unload
-              </Button>
-            ) : (
-              <Button
-                size="sm"
-                variant="secondary"
-                loading={busy === `${name}:load`}
-                disabled={busy !== null}
-                title="Load: spawn the runtime and wait until it serves"
-                onClick={() => act(name, "load")}
-              >
-                <Play className="h-3.5 w-3.5" />
-                Load
-              </Button>
-            )}
+            {/* Hot ⇄ Offloaded toggle: on = loaded (hot/loading), flipping it
+                off unloads (frees RAM, keeps record+port), flipping it on
+                loads. Disabled mid-transition so a half-loaded model isn't
+                double-toggled. */}
+            <LoadToggle
+              on={running}
+              busy={transitioning}
+              disabled={busy !== null && !transitioning}
+              onToggle={() => act(name, running ? "unload" : "load")}
+            />
             <Button
               size="sm"
               variant="ghost"
