@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FileText,
+  Fingerprint,
   MessageSquare,
   Play,
   Send,
@@ -14,7 +15,11 @@ import {
 import {
   triggerExtract,
   chatCompletion,
+  embed,
+  embeddingDeploymentNames,
   getDeployments,
+  getStore,
+  getFamilies,
   selectableDeployments,
   isLiveDeployment,
   fileToBase64,
@@ -23,8 +28,11 @@ import {
   type TriggerResponse,
   type ExtractRequest,
   type DeploymentRecord,
+  type StoreEntry,
+  type ModelFamily,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
+import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
 import { Button, Card, Field, Select, TextArea, TextInput, Badge, Spinner } from "./ui";
@@ -32,7 +40,7 @@ import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 
 type InputMode = "text" | "file";
-type PlaygroundMode = "extract" | "chat";
+type PlaygroundMode = "extract" | "chat" | "embed";
 
 const DEPLOY_POLL_MS = 4000;
 
@@ -57,15 +65,23 @@ export function Playground({ active = true }: { active?: boolean }) {
   // demand), so it must stay selectable here or the flagship flow would be
   // unreachable from the UI. Polling is paused while the tab is hidden.
   const deployments = usePolling<DeploymentRecord[]>(getDeployments, DEPLOY_POLL_MS, active);
-  // Encoders (PII/guardrail analyzers) are excluded: they answer the encoder
-  // convention, not extraction prompts or chat — offering them here only
-  // produces confusing 4xx/garbage responses.
+  const store = useAsync<StoreEntry[]>(getStore, []);
+  const families = useAsync<ModelFamily[]>(getFamilies, []);
+  const embeddingNames = useMemo(
+    () => embeddingDeploymentNames(store.data, families.data),
+    [store.data, families.data],
+  );
+  // Encoders (analyzers) AND embedding models are excluded from extract/chat:
+  // they don't answer chat/extraction prompts. Embedding models live in the
+  // Embed mode instead.
   const selectable = useMemo(
     () =>
       selectableDeployments(deployments.data ?? []).filter(
-        (d) => d.spec?.launch?.runtime !== "encoder",
+        (d) =>
+          d.spec?.launch?.runtime !== "encoder" &&
+          !(d.spec?.name && embeddingNames.has(d.spec.name)),
       ),
-    [deployments.data],
+    [deployments.data, embeddingNames],
   );
   const selectableNames = useMemo(
     () => selectable.map((d) => d.spec?.name ?? "").filter(Boolean),
@@ -139,7 +155,9 @@ export function Playground({ active = true }: { active?: boolean }) {
         subtitle={
           mode === "chat"
             ? "Classic queries: chat directly with any live deployment."
-            : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
+            : mode === "embed"
+              ? "Embeddings computed locally — vectors never leave the infra (RAG-ready)."
+              : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
         }
         actions={
           <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
@@ -147,6 +165,7 @@ export function Playground({ active = true }: { active?: boolean }) {
               [
                 ["extract", "Extract", Sparkles],
                 ["chat", "Chat", MessageSquare],
+                ["embed", "Embed", Fingerprint],
               ] as [PlaygroundMode, string, typeof Sparkles][]
             ).map(([m, label, Icon]) => (
               <button
@@ -172,6 +191,12 @@ export function Playground({ active = true }: { active?: boolean }) {
           extraction stream or a chat history survives switching modes. */}
       <div hidden={mode !== "chat"}>
         <ChatPanel deployments={deployments} selectable={selectable} />
+      </div>
+      <div hidden={mode !== "embed"}>
+        <EmbedPanel
+          deployments={deployments.data ?? []}
+          embeddingNames={embeddingNames}
+        />
       </div>
       <div hidden={mode !== "extract"} className="grid gap-6 lg:grid-cols-2">
       <Card
@@ -472,6 +497,156 @@ function ChatPanel({
             <Trash2 className="h-4 w-4" />
           </Button>
         </div>
+      </div>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Embed mode — local embeddings + cosine similarity (RAG demo). Vectors are
+// computed on this node; nothing leaves the infra.
+// ---------------------------------------------------------------------------
+
+function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+}
+
+function EmbedPanel({
+  deployments,
+  embeddingNames,
+}: {
+  deployments: DeploymentRecord[];
+  embeddingNames: Set<string>;
+}) {
+  const embedDeployments = useMemo(
+    () =>
+      deployments.filter(
+        (d) => d.spec?.name && embeddingNames.has(d.spec.name) && isLiveDeployment(d),
+      ),
+    [deployments, embeddingNames],
+  );
+  const names = useMemo(
+    () => embedDeployments.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [embedDeployments],
+  );
+
+  const [model, setModel] = useState("");
+  const [textA, setTextA] = useState("Facture 5 400 € TTC, échéance 30 jours.");
+  const [textB, setTextB] = useState("Invoice total 5400 EUR, net 30 payment terms.");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{ dims: number; sim: number; a: number[] } | null>(null);
+
+  useEffect(() => {
+    if (names.length === 0) {
+      if (model !== "") setModel("");
+      return;
+    }
+    if (!names.includes(model)) setModel(names[0]);
+  }, [names, model]);
+
+  async function run() {
+    if (!model) {
+      setError("No live embedding deployment — deploy an embedding model (family: embedding).");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await embed(model, [textA, textB]);
+      const a = res.data?.[0]?.embedding ?? [];
+      const b = res.data?.[1]?.embedding ?? [];
+      setResult({ dims: a.length, sim: cosine(a, b), a });
+    } catch (e) {
+      setError(
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Embedding request failed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card
+      icon={<Fingerprint className="h-5 w-5" />}
+      title="Embeddings"
+      subtitle="Two texts in, cosine similarity out — the retrieval primitive, computed on-node."
+    >
+      <div className="space-y-4">
+        <Field
+          label="Embedding deployment"
+          hint="Deploy an embedding GGUF (e.g. LiquidAI/LFM2.5-Embedding-350M-GGUF) with family 'embedding'."
+        >
+          {names.length === 0 ? (
+            <p className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              No live embedding deployment — add one under Serving → Models
+              (family: embedding), then Deploy it.
+            </p>
+          ) : (
+            <Select value={model} onChange={(e) => setModel(e.target.value)}>
+              {names.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Text A">
+            <TextArea rows={3} value={textA} onChange={(e) => setTextA(e.target.value)} />
+          </Field>
+          <Field label="Text B">
+            <TextArea rows={3} value={textB} onChange={(e) => setTextB(e.target.value)} />
+          </Field>
+        </div>
+
+        {error && (
+          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            {error}
+          </p>
+        )}
+
+        <Button type="button" loading={busy} onClick={() => void run()} disabled={!model}>
+          <Fingerprint className="h-4 w-4" />
+          Embed & compare
+        </Button>
+
+        {result && (
+          <div className="space-y-3 rounded-md border border-border bg-muted/20 p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="info">{result.dims} dims</Badge>
+              <Badge tone={result.sim > 0.7 ? "ok" : result.sim > 0.4 ? "warn" : "neutral"}>
+                cosine similarity {result.sim.toFixed(4)}
+              </Badge>
+            </div>
+            <div>
+              <p className="mb-1 text-xs font-medium text-muted-foreground">
+                Text A vector (first 12 dims)
+              </p>
+              <pre className="scroll-thin overflow-x-auto rounded-md border border-border bg-card p-3 text-xs text-foreground/90">
+                [{result.a.slice(0, 12).map((v) => v.toFixed(4)).join(", ")}
+                {result.a.length > 12 ? ", …" : ""}]
+              </pre>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Both vectors were computed by the local deployment — the text
+              never left this node.
+            </p>
+          </div>
+        )}
       </div>
     </Card>
   );

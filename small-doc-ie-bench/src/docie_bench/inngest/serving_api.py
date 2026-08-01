@@ -537,6 +537,7 @@ async def list_families() -> Any:
             "name": fam.name,
             "vision": fam.vision,
             "needs_mmproj": fam.needs_mmproj,
+            "embedding": fam.embedding,
             "ollama_faithful": fam.ollama_faithful,
             "template_delivery": str(fam.template_delivery),
         }

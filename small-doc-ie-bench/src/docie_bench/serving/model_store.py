@@ -69,6 +69,10 @@ class FamilyContract:
     llama_server_args: tuple[str, ...] = ()
     needs_mmproj: bool = False
     vision: bool = False
+    # An embedding model: served with llama-server's --embedding pooling, and
+    # answered on /v1/embeddings — never chat/extraction. Deployments of an
+    # embedding family are typed "embedding" and routed by the embeddings API.
+    embedding: bool = False
     stop_sequences: tuple[str, ...] = ()
     # Generation defaults inherited by a family-synthesized profile (a store deploy
     # whose served id matches no models.yaml profile). These are the single source
@@ -158,6 +162,22 @@ FAMILIES: dict[str, FamilyContract] = {
         # Ollama mmproj/ADAPTER support for lfm2-vl is unverified; serve VL via
         # llama-server only (mirrors nuextract3 — refuses an Ollama Modelfile).
         ollama_faithful=False,
+    ),
+    # Embedding models (LFM2.5-Embedding-350M, or any GGUF embedding model).
+    # llama-server exposes /v1/embeddings when launched with --embedding; mean
+    # pooling is the standard sentence-embedding reduction. No template, no
+    # schema — response_format is irrelevant on the embeddings path. Kept local
+    # so a RAG/retrieval pipeline computes document vectors on THIS node and
+    # they never leave the infra (the same data-boundary guarantee as the
+    # security proxy, applied to indexing).
+    "embedding": FamilyContract(
+        name="embedding",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,  # unused on the embeddings path
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--embedding", "--pooling", "mean"),
+        embedding=True,
+        ollama_faithful=True,
     ),
 }
 

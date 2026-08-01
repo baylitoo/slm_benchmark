@@ -33,6 +33,7 @@ import {
   pinDeployment,
   deleteDeployment,
   deploymentModelType,
+  embeddingDeploymentNames,
   formatBytes,
   ApiError,
   ApiUnavailable,
@@ -97,6 +98,12 @@ export function Deploy({
 
   const [slideOver, setSlideOver] = useState<SlideOver>(null);
 
+  // Deployment names that are embedding models (store family flagged embedding).
+  const embeddingNames = useMemo(
+    () => embeddingDeploymentNames(store.data, families.data),
+    [store.data, families.data],
+  );
+
   const heading =
     view === "models"
       ? { title: "Models", subtitle: "GET /v1/serving/store — the GGUF catalog you can deploy." }
@@ -136,7 +143,7 @@ export function Deploy({
       ) : view === "sizing" ? (
         <Sizing active={active && view === "sizing"} />
       ) : (
-        <DeploymentsView deployments={deployments} />
+        <DeploymentsView deployments={deployments} embeddingNames={embeddingNames} />
       )}
 
       {/* Slide-overs: both forms stay mounted; only visibility toggles. */}
@@ -362,14 +369,18 @@ type LifecycleAction = "load" | "unload" | "pin" | "unpin" | "delete";
 
 function DeploymentsView({
   deployments,
+  embeddingNames,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
+  embeddingNames: Set<string>;
 }) {
   const { toast } = useToast();
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
-  // Segment by semantic model type (chat SLMs vs encoder analyzers).
-  const [typeFilter, setTypeFilter] = useState<"all" | "chat" | "encoder">("all");
+  // Segment by semantic model type (chat SLMs / encoder analyzers / embeddings).
+  const [typeFilter, setTypeFilter] = useState<"all" | "chat" | "encoder" | "embedding">(
+    "all",
+  );
   // One in-flight lifecycle action at a time, keyed "name:action" so exactly
   // the pressed button shows its spinner.
   const [busy, setBusy] = useState<string | null>(null);
@@ -422,7 +433,8 @@ function DeploymentsView({
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return all.filter((r) => {
-      if (typeFilter !== "all" && deploymentModelType(r) !== typeFilter) return false;
+      if (typeFilter !== "all" && deploymentModelType(r, embeddingNames) !== typeFilter)
+        return false;
       if (!q) return true;
       const hay = [r.spec?.name, r.spec?.launch?.model, r.spec?.launch?.runtime, r.state]
         .filter(Boolean)
@@ -457,13 +469,17 @@ function DeploymentsView({
     {
       key: "type",
       header: "Type",
-      sortAccessor: (r) => deploymentModelType(r),
-      render: (r) =>
-        deploymentModelType(r) === "encoder" ? (
+      sortAccessor: (r) => deploymentModelType(r, embeddingNames),
+      render: (r) => {
+        const t = deploymentModelType(r, embeddingNames);
+        return t === "encoder" ? (
           <Badge tone="info">Encoder</Badge>
+        ) : t === "embedding" ? (
+          <Badge tone="warn">Embedding</Badge>
         ) : (
           <Badge tone="neutral">Chat</Badge>
-        ),
+        );
+      },
     },
     {
       key: "runtime",
@@ -615,7 +631,8 @@ function DeploymentsView({
               ["all", "All"],
               ["chat", "Chat"],
               ["encoder", "Encoders"],
-            ] as ["all" | "chat" | "encoder", string][]
+              ["embedding", "Embeddings"],
+            ] as ["all" | "chat" | "encoder" | "embedding", string][]
           ).map(([t, label]) => (
             <button
               key={t}

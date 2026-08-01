@@ -282,6 +282,8 @@ export interface ModelFamily {
   name: string;
   vision?: boolean;
   needs_mmproj?: boolean;
+  /** True for embedding families — served with --embedding, used via /v1/embeddings. */
+  embedding?: boolean;
   ollama_faithful?: boolean;
   template_delivery?: string;
   [k: string]: unknown;
@@ -786,15 +788,58 @@ export function isLiveDeployment(r: DeploymentRecord): boolean {
 }
 
 /**
- * The semantic model type of a deployment — what it can be USED for, derived
- * from the launch runtime. "chat" (generative SLMs: extraction targets, agent
- * backing models, Playground chat) vs "encoder" (analyzers: agent guard
- * models only). One source of truth for every type-filtered picker.
+ * The semantic model type of a deployment — what it can be USED for.
+ * "chat" (generative SLMs: extraction, agent backing, Playground chat),
+ * "encoder" (analyzers: agent guard models), "embedding" (vectors:
+ * /v1/embeddings, RAG). Encoder is derived from the launch runtime; embedding
+ * needs the family, so pass `embeddingNames` (deployment names whose store
+ * family is an embedding family — see embeddingDeploymentNames).
  */
-export type DeployedModelType = "chat" | "encoder";
+export type DeployedModelType = "chat" | "encoder" | "embedding";
 
-export function deploymentModelType(r: DeploymentRecord): DeployedModelType {
-  return r.spec?.launch?.runtime === "encoder" ? "encoder" : "chat";
+export function deploymentModelType(
+  r: DeploymentRecord,
+  embeddingNames?: Set<string>,
+): DeployedModelType {
+  if (r.spec?.launch?.runtime === "encoder") return "encoder";
+  const name = r.spec?.name;
+  if (name && embeddingNames?.has(name)) return "embedding";
+  return "chat";
+}
+
+/**
+ * Deployment names that are embedding models: a store entry whose family is
+ * flagged `embedding`. Cross-references the store catalog and the family
+ * contracts (the deployment record itself carries no family). A store entry's
+ * name equals its store-deployed deployment name.
+ */
+export function embeddingDeploymentNames(
+  store: StoreEntry[] | null | undefined,
+  families: ModelFamily[] | null | undefined,
+): Set<string> {
+  const embeddingFamilies = new Set(
+    (families ?? []).filter((f) => f.embedding).map((f) => f.name),
+  );
+  return new Set(
+    (store ?? [])
+      .filter((e) => e.family && embeddingFamilies.has(e.family))
+      .map((e) => e.name),
+  );
+}
+
+/** One embedding vector from GET-shaped /v1/embeddings response. */
+export interface EmbeddingResponse {
+  data?: { index?: number; embedding?: number[] }[];
+  model?: string;
+  [k: string]: unknown;
+}
+
+/** OpenAI embeddings against an embedding deployment (POST /v1/embeddings). */
+export function embed(model: string, input: string | string[]): Promise<EmbeddingResponse> {
+  return request<EmbeddingResponse>("/v1/embeddings", {
+    method: "POST",
+    body: JSON.stringify({ model, input }),
+  });
 }
 
 /**
