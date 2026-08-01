@@ -28,10 +28,12 @@ import {
   createAgent,
   deleteAgent,
   deployModel,
+  deploymentModelType,
   fileToBase64,
   getAgents,
   getAgentTemplates,
   getDeployments,
+  isLiveDeployment,
   selectableDeployments,
   updateAgent,
   type AgentChatResponse,
@@ -511,17 +513,31 @@ function CreateView({
 }) {
   const { toast } = useToast();
   const deployments = useAsync(getDeployments, []);
-  const deploymentNames = useMemo(
+  // Managed deployments, segmented by semantic type — every model an agent
+  // uses is a deployment the platform orchestrates, picked (not typed).
+  const chatDeployments = useMemo(
     () =>
       selectableDeployments(deployments.data ?? [])
+        .filter((d) => deploymentModelType(d) === "chat")
         .map((d) => d.spec?.name)
         .filter((n): n is string => !!n),
+    [deployments.data],
+  );
+  const encoderDeployments = useMemo(
+    () =>
+      (deployments.data ?? [])
+        .filter((d) => deploymentModelType(d) === "encoder" && !!d.spec?.name)
+        .map((d) => ({
+          name: d.spec?.name as string,
+          live: isLiveDeployment(d),
+        })),
     [deployments.data],
   );
 
   const [templateId, setTemplateId] = useState(prefill?.id ?? "custom");
   const [name, setName] = useState("");
   const [modelProfile, setModelProfile] = useState("");
+  const [backingCustom, setBackingCustom] = useState(false);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -662,21 +678,50 @@ function CreateView({
               <Field
                 label="Backing model"
                 htmlFor="agent-model"
-                hint="A live deployment, models.yaml profile, or store:<name>. Empty = studio default."
+                hint="A managed chat deployment — deploy models under Serving → Deployments. Advanced: a custom reference (profile / store:<name>)."
                 className="sm:col-span-2"
               >
-                <TextInput
+                <Select
                   id="agent-model"
-                  value={modelProfile}
-                  onChange={(e) => setModelProfile(e.target.value)}
-                  placeholder={deploymentNames[0] ?? "e.g. nuextract3"}
-                  list="agent-deployments"
-                />
-                <datalist id="agent-deployments">
-                  {deploymentNames.map((n) => (
-                    <option key={n} value={n} />
+                  value={
+                    backingCustom
+                      ? "__custom__"
+                      : chatDeployments.includes(modelProfile)
+                        ? modelProfile
+                        : ""
+                  }
+                  onChange={(e) => {
+                    if (e.target.value === "__custom__") {
+                      setBackingCustom(true);
+                      setModelProfile("");
+                    } else {
+                      setBackingCustom(false);
+                      setModelProfile(e.target.value);
+                    }
+                  }}
+                >
+                  <option value="">Studio default</option>
+                  {chatDeployments.map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
                   ))}
-                </datalist>
+                  <option value="__custom__">Custom reference…</option>
+                </Select>
+                {backingCustom && (
+                  <TextInput
+                    className="mt-2"
+                    value={modelProfile}
+                    onChange={(e) => setModelProfile(e.target.value)}
+                    placeholder="profile name or store:<name>"
+                  />
+                )}
+                {chatDeployments.length === 0 && (
+                  <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                    No chat deployment is routable yet — deploy one first
+                    (Serving → Models / Deployments).
+                  </p>
+                )}
               </Field>
             )}
             {kind !== "ocr" && (
@@ -740,16 +785,22 @@ function CreateView({
                 <Field
                   label="Guard model"
                   htmlFor="agent-guard-model"
-                  hint="Encoder analyzer endpoint (e.g. a `docie encoder` GLiNER deployment) — replaces the built-in regex analyzer for higher recall. Empty = regex."
+                  hint="A managed ENCODER deployment (analyzer). Empty = built-in regex. No encoder yet? The Deploy button ships the GLiNER2 guardrails checkpoint."
                 >
                   <div className="flex items-center gap-2">
-                    <TextInput
+                    <Select
                       id="agent-guard-model"
                       value={guardModel}
                       onChange={(e) => setGuardModel(e.target.value)}
-                      placeholder="guardrails-pii"
-                      list="agent-deployments"
-                    />
+                    >
+                      <option value="">None — regex analyzer</option>
+                      {encoderDeployments.map((d) => (
+                        <option key={d.name} value={d.name}>
+                          {d.name}
+                          {d.live ? "" : " · not live — Load it in Deployments"}
+                        </option>
+                      ))}
+                    </Select>
                     <Button
                       type="button"
                       variant="secondary"
@@ -839,15 +890,20 @@ function CreateView({
                 <Field
                   label="Extractor"
                   htmlFor="agent-ocr-extractor"
-                  hint="Optional SLM (e.g. a NuExtract deployment) — turns OCR into an OCR→SLM extraction pipeline."
+                  hint="Optional chat deployment (e.g. NuExtract) — turns OCR into an OCR→SLM extraction pipeline."
                 >
-                  <TextInput
+                  <Select
                     id="agent-ocr-extractor"
                     value={ocrExtractor}
                     onChange={(e) => setOcrExtractor(e.target.value)}
-                    placeholder={deploymentNames[0] ?? "nuextract3"}
-                    list="agent-deployments"
-                  />
+                  >
+                    <option value="">None — OCR text only</option>
+                    {chatDeployments.map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </Select>
                 </Field>
               </div>
             </Card>

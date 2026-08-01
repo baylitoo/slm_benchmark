@@ -786,6 +786,18 @@ export function isLiveDeployment(r: DeploymentRecord): boolean {
 }
 
 /**
+ * The semantic model type of a deployment — what it can be USED for, derived
+ * from the launch runtime. "chat" (generative SLMs: extraction targets, agent
+ * backing models, Playground chat) vs "encoder" (analyzers: agent guard
+ * models only). One source of truth for every type-filtered picker.
+ */
+export type DeployedModelType = "chat" | "encoder";
+
+export function deploymentModelType(r: DeploymentRecord): DeployedModelType {
+  return r.spec?.launch?.runtime === "encoder" ? "encoder" : "chat";
+}
+
+/**
  * A deployment a request would AUTO-RELOAD (PR-4 cold-start-on-demand):
  * evicted by the autoloader (`activation === "managed"`) or with a load
  * already in flight (`desired_state === "running"`, still starting). Mirrors

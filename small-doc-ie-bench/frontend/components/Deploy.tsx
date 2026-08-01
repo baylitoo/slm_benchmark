@@ -34,6 +34,7 @@ import {
   unloadDeployment,
   pinDeployment,
   deleteDeployment,
+  deploymentModelType,
   formatBytes,
   ApiError,
   ApiUnavailable,
@@ -329,6 +330,8 @@ function DeploymentsView({
   const { toast } = useToast();
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
+  // Segment by semantic model type (chat SLMs vs encoder analyzers).
+  const [typeFilter, setTypeFilter] = useState<"all" | "chat" | "encoder">("all");
   // One in-flight lifecycle action at a time, keyed "name:action" so exactly
   // the pressed button shows its spinner.
   const [busy, setBusy] = useState<string | null>(null);
@@ -380,15 +383,16 @@ function DeploymentsView({
   const total = all.length;
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    if (!q) return all;
     return all.filter((r) => {
+      if (typeFilter !== "all" && deploymentModelType(r) !== typeFilter) return false;
+      if (!q) return true;
       const hay = [r.spec?.name, r.spec?.launch?.model, r.spec?.launch?.runtime, r.state]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [all, filter]);
+  }, [all, filter, typeFilter]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const clampedPage = Math.min(page, pageCount);
@@ -411,6 +415,17 @@ function DeploymentsView({
       render: (r) => (
         <span className="font-mono text-xs text-foreground/90">{r.spec?.launch?.model ?? "—"}</span>
       ),
+    },
+    {
+      key: "type",
+      header: "Type",
+      sortAccessor: (r) => deploymentModelType(r),
+      render: (r) =>
+        deploymentModelType(r) === "encoder" ? (
+          <Badge tone="info">Encoder</Badge>
+        ) : (
+          <Badge tone="neutral">Chat</Badge>
+        ),
     },
     {
       key: "runtime",
@@ -555,9 +570,10 @@ function DeploymentsView({
       <Toolbar
         onReset={() => {
           setFilter("");
+          setTypeFilter("all");
           setPage(1);
         }}
-        resetDisabled={filter === ""}
+        resetDisabled={filter === "" && typeFilter === "all"}
       >
         <TextInput
           value={filter}
@@ -568,6 +584,32 @@ function DeploymentsView({
           placeholder="Filter by name, model, runtime…"
           className="h-8 w-64 text-xs"
         />
+        <div className="inline-flex rounded-md border border-border bg-card p-0.5 text-xs">
+          {(
+            [
+              ["all", "All"],
+              ["chat", "Chat"],
+              ["encoder", "Encoders"],
+            ] as ["all" | "chat" | "encoder", string][]
+          ).map(([t, label]) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => {
+                setTypeFilter(t);
+                setPage(1);
+              }}
+              className={cn(
+                "rounded px-2.5 py-1 transition",
+                typeFilter === t
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="ml-auto">
           <LiveIndicator
             live={deployments.live}
