@@ -1371,7 +1371,7 @@ function RuntimeChip({
 // legacy local-Ollama seed. One slide-over, three modes.
 // ---------------------------------------------------------------------------
 
-type SeedMode = "hf" | "collection" | "ollama";
+type SeedMode = "hf" | "collection" | "encoder" | "ollama";
 
 function AddModelForm({
   families,
@@ -1388,6 +1388,7 @@ function AddModelForm({
           [
             ["hf", "Hugging Face"],
             ["collection", "Collection"],
+            ["encoder", "Encoder"],
             ["ollama", "Ollama (legacy)"],
           ] as [SeedMode, string][]
         ).map(([m, label]) => (
@@ -1414,10 +1415,106 @@ function AddModelForm({
       <div hidden={mode !== "collection"}>
         <HfCollectionSeed families={families} onSeeded={onSeeded} />
       </div>
+      <div hidden={mode !== "encoder"}>
+        <EncoderDeployForm />
+      </div>
       <div hidden={mode !== "ollama"}>
         <SeedForm families={families} onSeeded={onSeeded} />
       </div>
     </div>
+  );
+}
+
+// Encoders (GLiNER/GLiNER2 analyzers — safetensors, not GGUF) skip the store
+// entirely: the encoder runtime downloads the checkpoint itself at launch.
+// This form fires the managed deploy directly, so "add an encoder" lives in
+// the same place as every other model.
+const DEFAULT_ENCODER_REPO = "fastino/GLiNER2-Guardrails-PII-Multi";
+
+function EncoderDeployForm() {
+  const { toast } = useToast();
+  const [repo, setRepo] = useState(DEFAULT_ENCODER_REPO);
+  const [name, setName] = useState("guardrails-pii");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+
+  async function onDeploy(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setTrigger(null);
+    if (!repo.trim() || !name.trim()) {
+      setError("Repo and deployment name are both required.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await deployModel({
+        model: repo.trim(),
+        runtime: "encoder",
+        name: name.trim(),
+      });
+      setTrigger(res);
+      toast({
+        title: "Encoder deploy started",
+        description: `${name.trim()} — watch it under Deployments (Type: Encoder).`,
+        tone: "success",
+      });
+    } catch (err) {
+      const msg = errText(err, "Encoder deploy failed.");
+      setError(msg);
+      toast({ title: "Encoder deploy failed", description: msg, tone: "error" });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Card
+      icon={<Cpu className="h-5 w-5" />}
+      title="Deploy an encoder"
+      subtitle="Analyzers (GLiNER / GLiNER2 — PII, guardrails): safetensors checkpoints served by the encoder runtime, no GGUF store involved."
+    >
+      <form onSubmit={onDeploy} className="space-y-4">
+        <Field
+          label="Hugging Face repo"
+          required
+          hint="GLiNER-compatible checkpoint. The default combines 42 PII types + safety/jailbreak moderation."
+        >
+          <TextInput value={repo} onChange={(e) => setRepo(e.target.value)} />
+        </Field>
+        <Field
+          label="Deployment name"
+          required
+          hint="How agents select it as their guard model."
+        >
+          <TextInput value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
+
+        {error && (
+          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            {error}
+          </p>
+        )}
+
+        <Button type="submit" loading={submitting}>
+          <Rocket className="h-4 w-4" />
+          Deploy encoder
+        </Button>
+        <p className="text-xs text-muted-foreground">
+          First launch downloads the weights (cached afterwards) — the row sits
+          in phase <code className="rounded bg-muted px-1">loading</code> until
+          the model serves. Requires the encoders extra on the serving node.
+        </p>
+      </form>
+
+      {trigger && (
+        <div className="mt-5 border-t border-border pt-5">
+          <ResultPanel trigger={trigger} noun="deploy" />
+        </div>
+      )}
+    </Card>
   );
 }
 
