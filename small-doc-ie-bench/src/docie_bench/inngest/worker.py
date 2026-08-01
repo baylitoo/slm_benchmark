@@ -151,26 +151,47 @@ def _build_reconciler(instance_id: str) -> Any:
     )
 
 
-def _start_reconciler(instance_id: str) -> asyncio.Task[None] | None:
-    """Claim the singleton lease and start the loop; refuse (None) if held.
+# How often a replica that found the lease HELD retries claiming it. A held
+# lease is usually the OLD container of a `docker compose up -d` recreate,
+# still heartbeating for a few seconds while the new one boots — a permanent
+# boot-time refusal turned that near-certain race into "no reconciler at all
+# until someone manually restarts serving".
+_RECONCILER_RETRY_S = 30.0
 
-    Refusal is deliberately loud but non-fatal: the replica still serves its
-    Inngest functions (so a mis-scaled fleet degrades instead of flapping),
-    but it will not run a second reconciler against the shared volume.
+
+def _start_reconciler(instance_id: str) -> asyncio.Task[None]:
+    """Run the reconciler as soon as the singleton lease can be claimed.
+
+    A held lease is loud (a true `--scale serving=2` misconfiguration stays
+    visible on every retry) but no longer a one-shot verdict: the task keeps
+    retrying, so when the previous container's lease goes stale (recreate
+    race) or the extra replica is removed, THIS replica picks the loop up
+    without a manual restart. The replica serves its Inngest functions either
+    way, so a genuinely mis-scaled fleet degrades instead of flapping.
     """
     from docie_bench.serving.reconciler import ReconcilerSingletonError
 
-    reconciler = _build_reconciler(instance_id)
-    try:
-        reconciler.claim_singleton()
-    except ReconcilerSingletonError as exc:
-        logger.critical(
-            "reconciler DISABLED on this replica: %s (`--scale serving=N>1` is "
-            "forbidden — the serving service is single-replica by design)",
-            exc,
-        )
-        return None
-    return asyncio.create_task(reconciler.run_forever(), name="serving-reconciler")
+    async def claim_then_run() -> None:
+        while True:
+            reconciler = _build_reconciler(instance_id)
+            try:
+                reconciler.claim_singleton()
+            except ReconcilerSingletonError as exc:
+                logger.critical(
+                    "reconciler NOT started on this replica: %s — retrying in %.0fs "
+                    "(a stale lease from a replaced container resolves itself; "
+                    "`--scale serving=N>1` is forbidden — the serving service is "
+                    "single-replica by design)",
+                    exc,
+                    _RECONCILER_RETRY_S,
+                )
+                await asyncio.sleep(_RECONCILER_RETRY_S)
+                continue
+            logger.info("reconciler lease claimed (instance=%s); starting loop", instance_id)
+            await reconciler.run_forever()
+            return
+
+    return asyncio.create_task(claim_then_run(), name="serving-reconciler")
 
 
 async def _serve() -> None:
