@@ -12,10 +12,13 @@ import { JsonView } from "./JsonView";
 import { PollingResult } from "./PollingResult";
 import { Badge, type BadgeTone } from "./ui";
 
-// If the subscription connects but no `result`/`error` topic arrives within this
-// window, the realtime publish was likely dropped (best-effort on the worker) —
-// fall back to polling GET /runs so a completed run's output still surfaces.
-const FALLBACK_AFTER_MS = 8000;
+// If the subscription connects but NO message (status/progress heartbeat or a
+// terminal topic) arrives within this window, the realtime publish was likely
+// dropped — fall back to polling GET /runs. Any incoming message re-arms the
+// timer, so a live stream never trips it; the window is generous so a slow
+// download START (connect + list files before the first progress) doesn't
+// prematurely flip a healthy stream to the coarser polling view.
+const FALLBACK_AFTER_MS = 15000;
 
 // The token is minted by the Python backend, so its TS type can't be inferred
 // here. We cast through `unknown` to the hook's expected token type.

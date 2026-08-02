@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from docie_bench.inngest.serving_api import deployment_logs, serving_ports
+from docie_bench.inngest.serving_api import deployment_logs, list_store, serving_ports
 from docie_bench.serving.control_plane import PortAllocator
 from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
 from docie_bench.serving.supervisor import DeploymentSpec, PersistentSupervisor
@@ -138,3 +138,33 @@ def test_deployment_logs_rejects_path_traversal(serving_home: Path) -> None:
     with pytest.raises(HTTPException) as exc:
         asyncio.run(deployment_logs("../../etc/passwd"))
     assert exc.value.status_code in (400, 404)
+
+
+def test_store_reads_on_disk_without_a_catalog(serving_home: Path) -> None:
+    """A model seeded WITHOUT DATABASE_URL still shows in Models — the store is
+    read from the on-disk index, not only the Postgres catalog (the desync
+    this closes). Covers a GGUF and an encoder snapshot (directory entry)."""
+    import docie_bench.storage.db as db
+    from docie_bench.serving.model_store import ModelStore
+
+    db.dispose_engine()  # no catalog configured
+    models_root = serving_home / "models"
+    store = ModelStore(models_root)
+    gguf = serving_home / "m.gguf"
+    gguf.write_bytes(b"GGUF-weights")
+    store.add_gguf(name="lfm2.5-350m", family="lfm2", model_gguf=gguf)
+    snap = serving_home / "snap"
+    snap.mkdir()
+    (snap / "model.safetensors").write_bytes(b"w")
+    (snap / "config.json").write_text("{}")
+    store.add_snapshot(name="guardrails-pii", family="encoder_gliner2", snapshot_dir=snap)
+
+    view = asyncio.run(list_store())
+
+    by_name = {e["name"]: e for e in view}
+    assert set(by_name) == {"lfm2.5-350m", "guardrails-pii"}
+    assert by_name["guardrails-pii"]["analyzer"] is True
+    assert by_name["guardrails-pii"]["available_backends"] == ["encoder"]
+    assert by_name["guardrails-pii"]["size_bytes"] == len(b"w") + len("{}")
+    assert "model_path" not in by_name["guardrails-pii"]
+    assert by_name["lfm2.5-350m"]["family"] == "lfm2"

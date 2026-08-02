@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
 import uuid
 from collections.abc import Mapping
@@ -32,6 +33,8 @@ from docie_bench.inngest.client import inngest_client
 from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
 from docie_bench.settings import get_settings
+
+logger = logging.getLogger("docie_bench.inngest.serving_api")
 
 router = APIRouter(prefix="/v1/serving", tags=["serving"])
 
@@ -425,20 +428,21 @@ async def deployment_status(name: str) -> Any:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def _serving_logs_dir() -> Path:
-    """The shared log directory the serving supervisor writes to.
-
-    ``<DOCIE_SERVING_HOME>/logs`` on the serving-state volume that api, serving
-    and worker all mount — so the api can tail a runtime's stdout even though
-    it never spawned it.
-    """
-    home = Path(
+def _serving_home() -> Path:
+    """The shared serving home (``DOCIE_SERVING_HOME``) on the serving-state
+    volume that api, serving and worker all mount."""
+    return Path(
         os.environ.get(
             "DOCIE_SERVING_HOME",
             Path.home() / ".local" / "share" / "docie-bench" / "serving",
         )
     )
-    return home / "logs"
+
+
+def _serving_logs_dir() -> Path:
+    """``<serving_home>/logs`` — the runtime stdout files the supervisor writes,
+    readable by the api (it never spawned the process)."""
+    return _serving_home() / "logs"
 
 
 @router.get("/deployments/{name}/logs")
@@ -591,23 +595,77 @@ async def pin_deployment(
     )
 
 
+def _ondisk_store_view() -> list[dict[str, Any]]:
+    """The seeded store read from the ON-DISK index — the authoritative list of
+    what is actually deployable (``serve_store_model`` reads the same index).
+
+    Independent of the Postgres catalog, so a model seeded without DATABASE_URL
+    (or during a catalog hiccup) still shows in Models instead of silently
+    vanishing — the store/catalog desync this closes. Size is measured from
+    disk (a file's size, or a snapshot directory's tree sum).
+    """
+    from docie_bench.serving.catalog import available_backends
+    from docie_bench.serving.model_store import FAMILIES, ModelStore
+
+    store = ModelStore(_serving_home() / "models")
+    view: list[dict[str, Any]] = []
+    for entry in store.list():
+        contract = FAMILIES.get(entry.family)
+        path = entry.model_path
+        try:
+            if path.is_dir():
+                size = sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+            else:
+                size = path.stat().st_size
+        except OSError:
+            size = None
+        view.append(
+            {
+                "name": entry.name,
+                "family": entry.family,
+                "vision": bool(contract and contract.vision),
+                "embedding": bool(contract and contract.embedding),
+                "analyzer": bool(contract and contract.analyzer),
+                "available_backends": available_backends(entry.family),
+                "has_mmproj": entry.mmproj_path is not None,
+                "source": entry.source,
+                "size_bytes": size,
+                "placement": None,
+                "created_at": None,
+                "updated_at": None,
+            }
+        )
+    return view
+
+
 @router.get("/store")
 async def list_store() -> Any:
-    """The local GGUF model store (queryable Postgres catalog the Studio reads).
+    """The local model store the Studio reads — GGUFs AND encoder snapshots.
 
-    Each entry includes its family and the backends that can serve it faithfully.
-    ``model_path``/``mmproj_path`` (container filesystem paths) are STRIPPED
-    here: they are server-side sizing inputs (calibration key + projector
-    pricing), and this is an unauthenticated surface — the browser never needs
-    them, so it never sees them.
+    Sourced from the ON-DISK store index (authoritative: exactly what
+    ``serve_store_model`` can deploy), then enriched with the Postgres catalog's
+    placement/timestamps when a catalog is configured. Reading on-disk first
+    means a model seeded without DATABASE_URL still appears — no store/catalog
+    desync. ``model_path``/``mmproj_path`` (container paths) are never exposed
+    on this unauthenticated surface.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
+    entries = _ondisk_store_view()
+    # Best-effort catalog enrichment (placement + timestamps); never fatal.
     try:
-        entries = ModelCatalog().list()
-    except CatalogUnavailableError as exc:
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
+        catalog = {row["name"]: row for row in ModelCatalog().list()}
+    except CatalogUnavailableError:
+        catalog = {}
+    except Exception:  # noqa: BLE001 - catalog hiccup must not blank the store list
+        logger.warning("store catalog enrichment failed; serving on-disk view", exc_info=True)
+        catalog = {}
     for entry in entries:
+        extra = catalog.get(entry["name"])
+        if extra:
+            entry["placement"] = extra.get("placement")
+            entry["created_at"] = extra.get("created_at")
+            entry["updated_at"] = extra.get("updated_at")
         entry.pop("model_path", None)
         entry.pop("mmproj_path", None)
     return entries
