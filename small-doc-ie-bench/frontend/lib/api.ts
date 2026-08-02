@@ -506,6 +506,19 @@ export function deleteDeployment(name: string): Promise<LifecycleActionResponse>
   );
 }
 
+/** Recover a stuck/failed deployment on a (re)allocated port (no delete+recreate).
+ *  `port` omitted / null = auto-reallocate a free port (steps around an orphan
+ *  still holding the old one); an explicit port is honored verbatim. */
+export function repairDeployment(
+  name: string,
+  port?: number | null,
+): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/repair`,
+    { method: "POST", body: JSON.stringify(port != null ? { port } : {}) },
+  );
+}
+
 /** A deployment's runtime log tail (GET /v1/serving/deployments/{name}/logs). */
 export interface DeploymentLogs {
   name: string;

@@ -38,6 +38,7 @@ router = APIRouter(prefix="/v1/serving", tags=["serving"])
 DELETE_EVENT = "serving/delete.requested"
 LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
+REPAIR_EVENT = "serving/repair.requested"
 PIN_EVENT = "serving/pin.requested"
 
 # Snapshot-staleness gate: a published node snapshot is only trusted while it
@@ -542,6 +543,33 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     """
     del tenant
     return await _fire_lifecycle_event(name, event=UNLOAD_EVENT, prefix="unload")
+
+
+class RepairRequest(BaseModel):
+    """Body of POST /deployments/{name}/repair.
+
+    ``port=None`` (default) auto-reallocates a free port; an explicit port is
+    honored verbatim. Recovery without delete+recreate.
+    """
+
+    port: int | None = None
+
+
+@router.post("/deployments/{name}/repair")
+async def repair_deployment(
+    name: str, request: RepairRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    """Recover a stuck/failed deployment: fire ``serving/repair.requested``.
+
+    Redeploys the SAME launch on a (re)allocated port and resets the restart
+    budget — the fix for a deployment wedged FAILED by an EADDRINUSE bind-loop
+    (an orphan process still holding its old port) without losing the
+    deployment's config. ``port=None`` auto-picks a free port around the
+    orphan; an explicit port is honored.
+    """
+    del tenant
+    extra = {"port": request.port} if request.port is not None else None
+    return await _fire_lifecycle_event(name, event=REPAIR_EVENT, prefix="repair", extra=extra)
 
 
 class PinRequest(BaseModel):

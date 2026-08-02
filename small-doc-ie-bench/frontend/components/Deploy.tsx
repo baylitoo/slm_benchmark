@@ -15,6 +15,7 @@ import {
   PackagePlus,
   Pin,
   PinOff,
+  RefreshCw,
   Trash2,
   X,
 } from "lucide-react";
@@ -32,6 +33,7 @@ import {
   unloadDeployment,
   pinDeployment,
   deleteDeployment,
+  repairDeployment,
   getDeploymentLogs,
   deploymentModelType,
   embeddingDeploymentNames,
@@ -367,7 +369,7 @@ function PhaseChip({ record }: { record: DeploymentRecord }) {
 // Deployments view — explicit-column table over DeploymentRecord[].
 // ---------------------------------------------------------------------------
 
-type LifecycleAction = "load" | "unload" | "pin" | "unpin" | "delete";
+type LifecycleAction = "load" | "unload" | "pin" | "unpin" | "delete" | "repair";
 
 function DeploymentsView({
   deployments,
@@ -389,7 +391,7 @@ function DeploymentsView({
   // the pressed button shows its spinner.
   const [busy, setBusy] = useState<string | null>(null);
 
-  async function act(name: string, action: LifecycleAction) {
+  async function act(name: string, action: LifecycleAction, port?: number | null) {
     if (
       action === "delete" &&
       !window.confirm(
@@ -403,6 +405,7 @@ function DeploymentsView({
       if (action === "load") await loadDeployment(name);
       else if (action === "unload") await unloadDeployment(name);
       else if (action === "delete") await deleteDeployment(name);
+      else if (action === "repair") await repairDeployment(name, port ?? null);
       else await pinDeployment(name, action === "pin");
       toast({
         title:
@@ -412,9 +415,13 @@ function DeploymentsView({
               ? "Unload requested"
               : action === "delete"
                 ? "Delete requested"
-                : action === "pin"
-                  ? "Pinned"
-                  : "Unpinned",
+                : action === "repair"
+                  ? port != null
+                    ? `Repair on port ${port} requested`
+                    : "Repair (auto-reallocate) requested"
+                  : action === "pin"
+                    ? "Pinned"
+                    : "Unpinned",
         description: name,
         tone: "success",
       });
@@ -697,7 +704,14 @@ function DeploymentsView({
           setExpanded((cur) => (cur === n ? null : n));
         }}
         renderExpanded={(r) =>
-          r.spec?.name ? <DeploymentLogsPanel name={r.spec.name} /> : null
+          r.spec?.name ? (
+            <DeploymentLogsPanel
+              name={r.spec.name}
+              phase={derivePhase(r)}
+              busy={busy}
+              onRepair={(port) => act(r.spec!.name!, "repair", port)}
+            />
+          ) : null
         }
       />
     </div>
@@ -707,14 +721,27 @@ function DeploymentsView({
 // Live log tail for a deployment: the WHY behind a failed/loading row. Polls
 // while the row is expanded (paused otherwise), reading the same log file the
 // supervisor captures last_error from — so an operator sees "Connection
-// refused"/"binary not found"/OOM without shell access.
-function DeploymentLogsPanel({ name }: { name: string }) {
+// refused"/"binary not found"/OOM without shell access. A Repair control
+// recovers a stuck row in place (reallocate the port, or set a specific one)
+// instead of delete+recreate.
+function DeploymentLogsPanel({
+  name,
+  phase,
+  busy,
+  onRepair,
+}: {
+  name: string;
+  phase: string;
+  busy: string | null;
+  onRepair: (port?: number | null) => void;
+}) {
   const logs = usePolling<DeploymentLogs>(
     () => getDeploymentLogs(name, 200),
     POLL_MS,
     true,
   );
   const data = logs.data;
+  const repairing = busy === `${name}:repair`;
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
@@ -739,11 +766,102 @@ function DeploymentLogsPanel({ name }: { name: string }) {
             ? (data?.lines ?? []).join("\n")
             : "(no log output yet)"}
       </pre>
-      <p className="text-xs text-muted-foreground">
-        Tail of the runtime process stdout/stderr. A failed row with a stale
-        endpoint or exhausted restart budget won&apos;t recover on Load —
-        Delete it and redeploy.
+      <RepairControls
+        name={name}
+        phase={phase}
+        repairing={repairing}
+        disabled={busy !== null}
+        onRepair={onRepair}
+      />
+    </div>
+  );
+}
+
+// Recover a stuck deployment IN PLACE: reallocate its port (auto — steps
+// around an orphan still holding the old one), or move it to a specific free
+// port. Reuses the Ports view's recommendation + used-port conflict warning so
+// an explicit port is never a blind guess.
+function RepairControls({
+  name,
+  phase,
+  repairing,
+  disabled,
+  onRepair,
+}: {
+  name: string;
+  phase: string;
+  repairing: boolean;
+  disabled: boolean;
+  onRepair: (port?: number | null) => void;
+}) {
+  const ports = useAsync<PortsViewData>(getPorts, []);
+  const [showPort, setShowPort] = useState(false);
+  const [port, setPort] = useState("");
+  const used = ports.data?.used ?? [];
+  const conflict = port.trim() !== "" && used.includes(Number(port));
+  const recommended = ports.data?.recommended_next;
+
+  return (
+    <div className="rounded-md border border-border bg-muted/20 p-3">
+      <p className="mb-2 text-xs font-medium text-foreground">Repair</p>
+      <p className="mb-2 text-xs text-muted-foreground">
+        {phase === "failed"
+          ? "This deployment is stuck. Reallocate its port (recommended — steps around a port an orphan process still holds) or move it to a specific one. No delete/recreate; the config is kept."
+          : "Move this deployment to a new port without recreating it."}
       </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          size="sm"
+          loading={repairing}
+          disabled={disabled}
+          onClick={() => onRepair(null)}
+          title="Redeploy on an automatically-allocated free port (resets the restart budget)"
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+          Reallocate port (auto)
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={disabled}
+          onClick={() => setShowPort((s) => !s)}
+        >
+          Set a specific port…
+        </Button>
+      </div>
+      {showPort && (
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          <Field
+            label="Port"
+            hint={
+              recommended != null
+                ? `Free ports available — e.g. ${recommended}.`
+                : "Pick a free port in the serving range."
+            }
+          >
+            <TextInput
+              value={port}
+              onChange={(e) => setPort(e.target.value)}
+              placeholder={recommended != null ? String(recommended) : "8090"}
+              inputMode="numeric"
+              className="h-8 w-28 text-xs"
+            />
+          </Field>
+          <Button
+            size="sm"
+            loading={repairing}
+            disabled={disabled || port.trim() === "" || conflict}
+            onClick={() => onRepair(Number(port))}
+          >
+            Repair on port {port.trim() || "…"}
+          </Button>
+          {conflict && (
+            <p className="w-full text-xs text-rose-600 dark:text-rose-400">
+              Port {port} is already in use by another deployment — pick a free one.
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }

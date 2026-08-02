@@ -234,6 +234,8 @@ class Supervisor(Protocol):
 
     def unload(self, name: str) -> Result: ...
 
+    def repair(self, name: str, *, port: int | None) -> Result: ...
+
     def pin(self, name: str, *, pinned: bool) -> Result: ...
 
 
@@ -429,6 +431,22 @@ class ControlPlane:
         is UPDATEd to ``phase=evicted`` — never cleared.
         """
         result = await asyncio.to_thread(self.supervisor.unload, _required(name, "deployment"))
+        return to_data(await _resolve(result))
+
+    async def repair(self, name: str, *, port: int | None = None) -> object:
+        """Recover a stuck/failed deployment WITHOUT delete+recreate.
+
+        Rebuilds the SAME launch on a different port and redeploys, resetting
+        the restart budget (the changed launch makes ``deploy`` kill the old
+        pid and zero the failure counters). ``port=None`` auto-reallocates a
+        free port — which side-steps a port still held by an orphan process
+        (the EADDRINUSE bind-loop); an explicit ``port`` is honored verbatim.
+        Threaded like the other spawn paths so it never stalls the Connect
+        heartbeats.
+        """
+        result = await asyncio.to_thread(
+            self.supervisor.repair, _required(name, "deployment"), port=port
+        )
         return to_data(await _resolve(result))
 
     async def pin(self, name: str, *, pinned: bool = True) -> object:
@@ -915,6 +933,53 @@ class _DefaultSupervisor:
 
         record = self.backend.get(name)
         return self.backend.deploy(replace(record.spec, desired_state=DesiredState.RUNNING))
+
+    def repair(self, name: str, *, port: int | None = None) -> object:
+        """Redeploy an existing deployment on a (re)allocated port.
+
+        Recovery without delete+recreate: the SAME launch (runtime, model,
+        extra_args) is rebuilt on a different port and redeployed. Because the
+        launch changes, ``backend.deploy`` kills the old pid and resets the
+        restart budget / failure counters — so a deployment stuck FAILED (e.g.
+        an EADDRINUSE bind-loop against an orphan holding its old port) gets a
+        genuinely fresh chance. ``port=None`` auto-reallocates (the allocator
+        excludes reserved + socket-bound ports, so it steps around the orphan);
+        an explicit ``port`` is honored verbatim, letting the real bind
+        arbitrate.
+        """
+        from docie_bench.serving.runtime import RuntimeKind
+        from docie_bench.serving.supervisor import DeploymentSpec, DesiredState
+
+        record = self.backend.get(name)
+        old_launch = record.spec.launch
+        bind_host, advertise_host = self._reachability_hosts()
+        if old_launch.runtime != RuntimeKind.REMOTE:
+            self._guard_deterministic_advertise(advertise_host)
+
+        def _launch_and_await(chosen: int) -> Any:
+            launch = reachable_launch(
+                replace(old_launch, port=chosen),
+                bind_host=bind_host,
+                advertise_host=advertise_host,
+            )
+            spec = DeploymentSpec(
+                name=record.spec.name,
+                launch=launch,
+                desired_state=DesiredState.RUNNING,
+                health_failure_threshold=60,
+            )
+            self.backend.deploy(spec)
+            return self.backend.await_ready(spec.name)
+
+        result = self._deploy_with_port_reallocation(
+            launch_and_await=_launch_and_await,
+            bind_host=bind_host,
+            exclude_name=name,
+            port_override=port,
+        )
+        # Keep store:<name> resolvable after the port move (endpoint changed).
+        _record_placement(name, result)
+        return result
 
     def stop(self, name: str) -> object:
         result = self.backend.stop(name)

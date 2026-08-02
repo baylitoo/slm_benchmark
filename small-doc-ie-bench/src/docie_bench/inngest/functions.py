@@ -50,6 +50,7 @@ MODELS_CONFIG_PATH = Path("configs/models.yaml")
 # cold-start-on-demand path; handled ONLY on the single-replica serving app.
 LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
+REPAIR_EVENT = "serving/repair.requested"
 PIN_EVENT = "serving/pin.requested"
 
 # Poll cadence for the worker-side await of a serving-side load (the worker
@@ -822,6 +823,41 @@ async def unload_deployment_job(ctx: inngest.Context) -> Any:
     return result
 
 
+async def _run_repair(data: dict[str, Any]) -> Any:
+    """Recover a stuck deployment on a (re)allocated port (no delete+recreate)."""
+    cp = _serving_control_plane()
+    raw_port = data.get("port")
+    port = int(raw_port) if raw_port is not None else None
+    return await cp.repair(_required_name(data, "repair"), port=port)
+
+
+@serving_client.create_function(
+    fn_id="serving-repair",
+    trigger=inngest.TriggerEvent(event=REPAIR_EVENT),
+)
+async def repair_deployment_job(ctx: inngest.Context) -> Any:
+    """Recover a stuck/failed deployment (bind-loop / exhausted budget).
+
+    Event ``data``: ``name`` (required), optional ``port`` (None = auto-
+    reallocate), ``channel``. Runs ONLY on ``serving`` (holds the Popen
+    handles): rebuilds the same launch on a new port, killing the old pid and
+    resetting the restart budget. Blocks through ``await_ready`` in a worker
+    thread; publishes the final record.
+    """
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(channel, TOPIC_STATUS, {"state": "repairing", "name": data.get("name")})
+    try:
+        result = await ctx.step.run("repair", lambda: _run_repair(data))
+    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
+        logger.exception("repair_deployment_job failed (name=%s)", data.get("name"))
+        await _publish_error_safely(channel, str(exc))
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result
+
+
 async def _run_pin(data: dict[str, Any]) -> Any:
     cp = _serving_control_plane()
     return await cp.pin(_required_name(data, "pin"), pinned=bool(data.get("pinned", True)))
@@ -1324,6 +1360,7 @@ serving_functions = [
     delete_deployment_job,
     load_deployment_job,
     unload_deployment_job,
+    repair_deployment_job,
     pin_deployment_job,
 ]
 
@@ -1383,10 +1420,12 @@ __all__ = [
     "delete_deployment_job",
     "load_deployment_job",
     "unload_deployment_job",
+    "repair_deployment_job",
     "pin_deployment_job",
     "gc_studio_runs_job",
     "benchmark_idempotency_key",
     "LOAD_EVENT",
     "UNLOAD_EVENT",
+    "REPAIR_EVENT",
     "PIN_EVENT",
 ]
