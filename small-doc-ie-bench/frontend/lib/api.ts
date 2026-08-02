@@ -284,6 +284,10 @@ export interface ModelFamily {
   needs_mmproj?: boolean;
   /** True for embedding families — served with --embedding, used via /v1/embeddings. */
   embedding?: boolean;
+  /** True for analyzer (encoder) families — served by the encoder runtime. */
+  analyzer?: boolean;
+  /** The analyzer library for an analyzer family (e.g. "gliner" | "gliner2"). */
+  encoder_backend?: string | null;
   ollama_faithful?: boolean;
   template_delivery?: string;
   [k: string]: unknown;

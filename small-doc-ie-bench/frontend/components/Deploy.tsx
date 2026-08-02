@@ -1638,7 +1638,7 @@ function AddModelForm({
         <HfCollectionSeed families={families} onSeeded={onSeeded} />
       </div>
       <div hidden={mode !== "encoder"}>
-        <EncoderSeedForm onSeeded={onSeeded} />
+        <EncoderSeedForm families={families} onSeeded={onSeeded} />
       </div>
       <div hidden={mode !== "ollama"}>
         <SeedForm families={families} onSeeded={onSeeded} />
@@ -1647,21 +1647,34 @@ function AddModelForm({
   );
 }
 
-// Encoders (GLiNER/GLiNER2 analyzers — safetensors, not GGUF) are now SEEDED
-// into the store like any other model: the full checkpoint snapshot is
-// downloaded once (with live progress), then deployed via the normal Deploy
-// flow with zero network at boot. Two backends: gliner (zero-shot NER) and
-// gliner2 (PII + guardrails).
-const DEFAULT_ENCODER_REPO = "fastino/GLiNER2-Guardrails-PII-Multi";
-
-function EncoderSeedForm({ onSeeded }: { onSeeded: () => void }) {
+// Encoders (analyzer families — safetensors, not GGUF) are SEEDED into the
+// store like any other model: the snapshot downloads once (live progress),
+// then deploys via the normal flow with zero network at boot. The family list
+// is data-driven (families where analyzer === true), so a new analyzer family
+// added on the backend shows up here with no UI change.
+function EncoderSeedForm({
+  families,
+  onSeeded,
+}: {
+  families: ModelFamily[] | null;
+  onSeeded: () => void;
+}) {
   const { toast } = useToast();
-  const [repo, setRepo] = useState(DEFAULT_ENCODER_REPO);
-  const [name, setName] = useState("guardrails-pii");
-  const [family, setFamily] = useState("encoder_gliner2");
+  const analyzerFamilies = useMemo(
+    () => (families ?? []).filter((f) => f.analyzer),
+    [families],
+  );
+  const [repo, setRepo] = useState("");
+  const [name, setName] = useState("");
+  const [family, setFamily] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+
+  // Default to the first analyzer family the backend reports.
+  useEffect(() => {
+    if (!family && analyzerFamilies.length > 0) setFamily(analyzerFamilies[0].name);
+  }, [analyzerFamilies, family]);
 
   async function onSeed(e: React.FormEvent) {
     e.preventDefault();
@@ -1693,26 +1706,47 @@ function EncoderSeedForm({ onSeeded }: { onSeeded: () => void }) {
   return (
     <Card
       icon={<Cpu className="h-5 w-5" />}
-      title="Add an encoder"
-      subtitle="Analyzers (GLiNER / GLiNER2 — PII, guardrails): checkpoints downloaded into the store and served by the encoder runtime."
+      title="Add an encoder model"
+      subtitle="Analyzer families (safetensors checkpoints served by the encoder runtime) — e.g. zero-shot NER or PII / guardrails."
     >
       <form onSubmit={onSeed} className="space-y-4">
         <Field
           label="Hugging Face repo"
           required
-          hint="GLiNER-compatible checkpoint. The default combines 42 PII types + safety/jailbreak moderation."
+          hint="Any checkpoint compatible with the selected analyzer family."
         >
-          <TextInput value={repo} onChange={(e) => setRepo(e.target.value)} />
+          <TextInput
+            value={repo}
+            onChange={(e) => setRepo(e.target.value)}
+            placeholder="owner/checkpoint"
+          />
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Store name" required hint="How agents select it as their guard model.">
-            <TextInput value={name} onChange={(e) => setName(e.target.value)} />
+          <Field label="Store name" required hint="How the model is listed and selected.">
+            <TextInput
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="my-analyzer"
+            />
           </Field>
-          <Field label="Backend" hint="gliner2 = PII + guardrails; gliner = zero-shot NER.">
-            <Select value={family} onChange={(e) => setFamily(e.target.value)}>
-              <option value="encoder_gliner2">GLiNER2 (PII + guardrails)</option>
-              <option value="encoder_gliner">GLiNER (zero-shot NER)</option>
-            </Select>
+          <Field
+            label="Analyzer family"
+            hint="The available analyzer families reported by the serving backend."
+          >
+            {analyzerFamilies.length === 0 ? (
+              <p className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                No analyzer family available on this backend.
+              </p>
+            ) : (
+              <Select value={family} onChange={(e) => setFamily(e.target.value)}>
+                {analyzerFamilies.map((f) => (
+                  <option key={f.name} value={f.name}>
+                    {f.name}
+                    {f.encoder_backend ? ` · ${f.encoder_backend}` : ""}
+                  </option>
+                ))}
+              </Select>
+            )}
           </Field>
         </div>
 
@@ -1723,12 +1757,12 @@ function EncoderSeedForm({ onSeeded }: { onSeeded: () => void }) {
           </p>
         )}
 
-        <Button type="submit" loading={submitting}>
+        <Button type="submit" loading={submitting} disabled={!family}>
           <Plus className="h-4 w-4" />
           Download & seed
         </Button>
         <p className="text-xs text-muted-foreground">
-          The snapshot (~1&nbsp;GB) downloads once into the store with live
+          The checkpoint snapshot downloads once into the store with live
           progress; deploying it afterwards is instant (no network at boot).
           Requires the encoders extra on the serving node.
         </p>
@@ -1743,25 +1777,17 @@ function EncoderSeedForm({ onSeeded }: { onSeeded: () => void }) {
   );
 }
 
-// Short human blurb per known family; unknown families fall back to a flag-
-// derived tag so a new family still reads sensibly.
-const FAMILY_BLURBS: Record<string, string> = {
-  openai_chat: "chat / extraction (OpenAI schema)",
-  lfm2: "LFM2.5 text — chat / extraction",
-  lfm2_vl: "LFM2.5-VL — vision extraction",
-  nuextract3: "NuExtract3 — vision extraction",
-  nuextract_v1: "NuExtract v1 — text extraction",
-  embedding: "embedding — vectors for RAG (/v1/embeddings)",
-};
-
+// The generic capability tag for a family, derived purely from its flags — so
+// any family the backend adds reads sensibly with no per-name UI change.
 function familyTypeTag(f: ModelFamily): string {
-  if (f.embedding) return "embedding";
+  if (f.analyzer) return "encoder / analyzer";
+  if (f.embedding) return "embedding · vectors (RAG)";
   if (f.vision || f.needs_mmproj) return "vision";
-  return "chat";
+  return "chat / extraction";
 }
 
 function familyOptionLabel(f: ModelFamily): string {
-  return FAMILY_BLURBS[f.name] ?? `${f.name} — ${familyTypeTag(f)} model`;
+  return `${f.name} — ${familyTypeTag(f)}`;
 }
 
 /** Family <option> list from the families API, with descriptive labels. */
