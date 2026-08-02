@@ -34,6 +34,7 @@ import {
   getAgents,
   getAgentTemplates,
   getDeployments,
+  getStore,
   isLiveDeployment,
   selectableDeployments,
   updateAgent,
@@ -41,6 +42,7 @@ import {
   type AgentKind,
   type AgentTemplate,
   type AgentView,
+  type StoreEntry,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { useToast } from "./Toast";
@@ -571,6 +573,16 @@ function CreateView({
         })),
     [deployments.data],
   );
+  // Analyzer models SEEDED into the store but not yet deployed — offered as
+  // one-click "Deploy" shortcuts (store path, no hardcoded repo, no
+  // download-at-boot). Generic: whatever analyzer entries the store holds.
+  const store = useAsync<StoreEntry[]>(getStore, []);
+  const seededUndeployedEncoders = useMemo(() => {
+    const deployed = new Set(encoderDeployments.map((d) => d.name));
+    return (store.data ?? [])
+      .filter((e) => e.analyzer && !deployed.has(e.name))
+      .map((e) => e.name);
+  }, [store.data, encoderDeployments]);
 
   const [templateId, setTemplateId] = useState(prefill?.id ?? "custom");
   const [name, setName] = useState("");
@@ -589,26 +601,21 @@ function CreateView({
   const [guardLabels, setGuardLabels] = useState("");
   const [deployingGuard, setDeployingGuard] = useState(false);
 
-  // One-click guard bootstrap: deploy the GLiNER2 guardrails encoder (PII +
-  // safety moderation in one checkpoint) as a managed deployment
-  // (runtime: "encoder") and point the form at it. The deploy is async
-  // (Inngest) — watch it under Deployments; the serving node needs the
-  // `encoders` extra or the deploy fails there with the actionable reason.
-  async function deployGuardEncoder() {
+  // Deploy a SEEDED store encoder via the store path (Auto → serve_store_model
+  // → encoder runtime): generic (any analyzer entry), no hardcoded repo, and
+  // no download-at-boot (the snapshot is already in the store). Points the
+  // guard field at it once fired.
+  async function deploySeededEncoder(storeName: string) {
     setDeployingGuard(true);
     try {
-      await deployModel({
-        model: "fastino/GLiNER2-Guardrails-PII-Multi",
-        runtime: "encoder",
-        name: "guardrails-pii",
-      });
-      setGuardModel("guardrails-pii");
+      await deployModel({ model: storeName, name: storeName });
+      setGuardModel(storeName);
       toast({
         title: "Encoder deploy started",
-        description:
-          "guardrails-pii — follow progress under Deployments. Requires the 'encoders' extra on the serving node.",
+        description: `${storeName} — follow progress under Deployments.`,
         tone: "success",
       });
+      deployments.reload();
     } catch (err) {
       toast({ title: "Encoder deploy failed", description: errMessage(err), tone: "error" });
     } finally {
@@ -874,41 +881,59 @@ function CreateView({
                 <Field
                   label="Guard model"
                   htmlFor="agent-guard-model"
-                  hint="A managed ENCODER deployment (analyzer). Empty = built-in regex. No encoder yet? The Deploy button ships the GLiNER2 guardrails checkpoint."
+                  hint="An encoder deployment (analyzer) that runs the checks. Leave empty to use the built-in regex analysis."
                 >
-                  <div className="flex items-center gap-2">
-                    <Select
-                      id="agent-guard-model"
-                      value={guardModel}
-                      onChange={(e) => setGuardModel(e.target.value)}
-                    >
-                      <option value="">None — regex analyzer</option>
-                      {encoderDeployments.map((d) => (
-                        <option key={d.name} value={d.name}>
-                          {d.name}
-                          {d.live ? "" : " · not live — Load it in Deployments"}
-                        </option>
+                  <Select
+                    id="agent-guard-model"
+                    value={guardModel}
+                    onChange={(e) => setGuardModel(e.target.value)}
+                  >
+                    <option value="">None — regex analyzer</option>
+                    {encoderDeployments.map((d) => (
+                      <option key={d.name} value={d.name}>
+                        {d.name}
+                        {d.live ? "" : " · not live — Load it in Deployments"}
+                      </option>
+                    ))}
+                  </Select>
+                  {/* One-click deploy of an analyzer already SEEDED in the store
+                      (generic — no hardcoded model). */}
+                  {seededUndeployedEncoders.length > 0 && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground">
+                        Deploy a seeded encoder:
+                      </span>
+                      {seededUndeployedEncoders.map((n) => (
+                        <Button
+                          key={n}
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          loading={deployingGuard}
+                          onClick={() => void deploySeededEncoder(n)}
+                          title={`Deploy the store analyzer "${n}" as a managed encoder deployment`}
+                        >
+                          <Rocket className="h-3.5 w-3.5" />
+                          {n}
+                        </Button>
                       ))}
-                    </Select>
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      loading={deployingGuard}
-                      onClick={() => void deployGuardEncoder()}
-                      title="Deploy the GLiNER2 guardrails encoder (PII + safety moderation) as a managed deployment"
-                    >
-                      <Rocket className="h-3.5 w-3.5" />
-                      Deploy
-                    </Button>
-                  </div>
+                    </div>
+                  )}
+                  {encoderDeployments.length === 0 &&
+                    seededUndeployedEncoders.length === 0 && (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        No analyzer model available — add one under Serving →
+                        Models → Add model → Encoder, then it appears here to
+                        deploy.
+                      </p>
+                    )}
                 </Field>
                 {guardModel.trim() && (
                   <>
                     <Field
                       label="Guard labels (advanced)"
                       htmlFor="agent-guard-labels"
-                      hint="Comma-separated zero-shot labels sent to the encoder. Empty = derived from the entity checkboxes. GLiNER2 covers 42 types — e.g. person, address, date_of_birth, password, api_key, secret."
+                      hint="Comma-separated zero-shot labels sent to the encoder. Empty = derived from the entity checkboxes. Depends on the encoder — e.g. person, address, date_of_birth, password, api_key, secret."
                     >
                       <TextInput
                         id="agent-guard-labels"

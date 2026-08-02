@@ -178,6 +178,10 @@ export interface StoreEntry {
   name: string;
   family?: string;
   vision?: boolean;
+  /** True for embedding families (served via /v1/embeddings). */
+  embedding?: boolean;
+  /** True for analyzer (encoder) families (served by the encoder runtime). */
+  analyzer?: boolean;
   /** Backends that can serve THIS model faithfully — the runtime picker source. */
   available_backends?: string[];
   has_mmproj?: boolean;
