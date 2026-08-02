@@ -32,9 +32,11 @@ import {
   unloadDeployment,
   pinDeployment,
   deleteDeployment,
+  getDeploymentLogs,
   deploymentModelType,
   embeddingDeploymentNames,
   formatBytes,
+  type DeploymentLogs,
   ApiError,
   ApiUnavailable,
   type StoreEntry,
@@ -381,6 +383,8 @@ function DeploymentsView({
   const [typeFilter, setTypeFilter] = useState<"all" | "chat" | "encoder" | "embedding">(
     "all",
   );
+  // Which row's runtime log is expanded (click a row to see WHY it failed).
+  const [expanded, setExpanded] = useState<string | null>(null);
   // One in-flight lifecycle action at a time, keyed "name:action" so exactly
   // the pressed button shows its spinner.
   const [busy, setBusy] = useState<string | null>(null);
@@ -595,7 +599,7 @@ function DeploymentsView({
               variant="danger"
               loading={busy === `${name}:delete`}
               disabled={busy !== null}
-              title="Delete: kill the process, free the port, remove the record (the real teardown)"
+              title="Delete: stop the process, free the port, and remove the deployment"
               onClick={() => act(name, "delete")}
             >
               <Trash2 className="h-3.5 w-3.5" />
@@ -687,7 +691,59 @@ function DeploymentsView({
         emptyIcon={<Server className="h-5 w-5" />}
         emptyLabel="No deployments found"
         emptyDescription="Deploy a model with the button above — it'll appear here on the next refresh."
+        expandedKey={expanded}
+        onRowClick={(r) => {
+          const n = r.spec?.name ?? null;
+          setExpanded((cur) => (cur === n ? null : n));
+        }}
+        renderExpanded={(r) =>
+          r.spec?.name ? <DeploymentLogsPanel name={r.spec.name} /> : null
+        }
       />
+    </div>
+  );
+}
+
+// Live log tail for a deployment: the WHY behind a failed/loading row. Polls
+// while the row is expanded (paused otherwise), reading the same log file the
+// supervisor captures last_error from — so an operator sees "Connection
+// refused"/"binary not found"/OOM without shell access.
+function DeploymentLogsPanel({ name }: { name: string }) {
+  const logs = usePolling<DeploymentLogs>(
+    () => getDeploymentLogs(name, 200),
+    POLL_MS,
+    true,
+  );
+  const data = logs.data;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-medium text-muted-foreground">Runtime log · {name}</p>
+        <LiveIndicator
+          live={logs.live}
+          refreshing={logs.refreshing}
+          lastUpdated={logs.lastUpdated}
+          onRefresh={logs.refresh}
+        />
+      </div>
+      {data?.last_error && (
+        <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-400">
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="break-words font-mono">{data.last_error}</span>
+        </p>
+      )}
+      <pre className="scroll-thin max-h-72 overflow-auto rounded-md border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground/90">
+        {logs.loading && !data
+          ? "Loading log…"
+          : (data?.lines ?? []).length > 0
+            ? (data?.lines ?? []).join("\n")
+            : "(no log output yet)"}
+      </pre>
+      <p className="text-xs text-muted-foreground">
+        Tail of the runtime process stdout/stderr. A failed row with a stale
+        endpoint or exhausted restart budget won&apos;t recover on Load —
+        Delete it and redeploy.
+      </p>
     </div>
   );
 }
@@ -1083,7 +1139,7 @@ function DeployForm({
     } catch (err) {
       const msg =
         err instanceof ApiUnavailable
-          ? "The deploy endpoint isn't available yet — this UI is ready for when it ships."
+          ? "Deploying isn't available on this server."
           : err instanceof ApiError
             ? err.message
             : err instanceof Error
@@ -1321,7 +1377,7 @@ function ModelPicker({
       <EmptyState
         icon={<Boxes className="h-5 w-5" />}
         title="No models in the store yet"
-        description="Seed one from a local Ollama model using the form on the right — it'll show up here automatically."
+        description="Add one via the Add model button — it'll show up here automatically."
       />
     );
   }
@@ -1437,7 +1493,7 @@ function AddModelForm({
             ["hf", "Hugging Face"],
             ["collection", "Collection"],
             ["encoder", "Encoder"],
-            ["ollama", "Ollama (legacy)"],
+            ["ollama", "Local Ollama"],
           ] as [SeedMode, string][]
         ).map(([m, label]) => (
           <button
@@ -1520,7 +1576,7 @@ function EncoderSeedForm({ onSeeded }: { onSeeded: () => void }) {
     <Card
       icon={<Cpu className="h-5 w-5" />}
       title="Add an encoder"
-      subtitle="Analyzers (GLiNER / GLiNER2 — PII, guardrails): safetensors checkpoints downloaded into the store, served by the encoder runtime (no GGUF)."
+      subtitle="Analyzers (GLiNER / GLiNER2 — PII, guardrails): checkpoints downloaded into the store and served by the encoder runtime."
     >
       <form onSubmit={onSeed} className="space-y-4">
         <Field
@@ -2022,7 +2078,7 @@ function SeedForm({
     } catch (err) {
       const msg =
         err instanceof ApiUnavailable
-          ? "The seed endpoint isn't available yet — this UI is ready for when it ships."
+          ? "Adding models isn't available on this server."
           : err instanceof ApiError
             ? err.message
             : err instanceof Error

@@ -21,6 +21,7 @@ import json
 import os
 import uuid
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import inngest
@@ -421,6 +422,63 @@ async def deployment_status(name: str) -> Any:
         return await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _serving_logs_dir() -> Path:
+    """The shared log directory the serving supervisor writes to.
+
+    ``<DOCIE_SERVING_HOME>/logs`` on the serving-state volume that api, serving
+    and worker all mount — so the api can tail a runtime's stdout even though
+    it never spawned it.
+    """
+    home = Path(
+        os.environ.get(
+            "DOCIE_SERVING_HOME",
+            Path.home() / ".local" / "share" / "docie-bench" / "serving",
+        )
+    )
+    return home / "logs"
+
+
+@router.get("/deployments/{name}/logs")
+async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
+    """Tail a deployment's runtime log (its stdout/stderr) for the Studio.
+
+    Reads ``<serving_home>/logs/<name>.log`` on the shared volume — the same
+    file the supervisor captures ``last_error`` from — so the operator can see
+    WHY a deployment failed (bad endpoint, missing binary, OOM) without shell
+    access. ``last_error`` is the reconciler's one-line summary; ``lines`` is
+    the raw tail (capped). Never 500s on a missing/rotated log — an absent file
+    is an empty tail, not an error.
+    """
+    max_lines = max(1, min(int(lines), 1000))
+    # Path containment: the name is joined into a filesystem path.
+    logs_dir = _serving_logs_dir().resolve()
+    log_path = (logs_dir / f"{name}.log").resolve()
+    if logs_dir not in log_path.parents:
+        raise HTTPException(status_code=400, detail="invalid deployment name")
+
+    last_error: str | None = None
+    try:
+        record = await _control_plane().deployment_status(name)
+        if isinstance(record, dict):
+            last_error = record.get("last_error") or (
+                (record.get("observed") or {}).get("last_error")
+                if isinstance(record.get("observed"), dict)
+                else None
+            )
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    tail: list[str] = []
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            tail = handle.read().splitlines()[-max_lines:]
+    except FileNotFoundError:
+        tail = []
+    except OSError as exc:  # pragma: no cover - unreadable log must not 500
+        tail = [f"(log unreadable: {exc})"]
+    return {"name": name, "last_error": last_error, "lines": tail}
 
 
 async def _fire_lifecycle_event(

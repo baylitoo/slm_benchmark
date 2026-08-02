@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from docie_bench.inngest.serving_api import serving_ports
+from docie_bench.inngest.serving_api import deployment_logs, serving_ports
 from docie_bench.serving.control_plane import PortAllocator
 from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
 from docie_bench.serving.supervisor import DeploymentSpec, PersistentSupervisor
@@ -112,3 +112,29 @@ def test_ports_empty_when_no_deployments(serving_home: Path) -> None:
     assert payload["used"] == []
     assert payload["deployments"] == []
     assert payload["recommended_next"] == 8088  # first pick unchanged for a single deploy
+
+
+def test_deployment_logs_tail(serving_home: Path) -> None:
+    _seed_deployments(serving_home, {"qwen": 8088})
+    logs_dir = serving_home / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "qwen.log").write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+    payload = asyncio.run(deployment_logs("qwen", lines=2))
+
+    assert payload["name"] == "qwen"
+    assert payload["lines"] == ["line2", "line3"]
+
+
+def test_deployment_logs_missing_file_is_empty(serving_home: Path) -> None:
+    _seed_deployments(serving_home, {"qwen": 8088})
+    payload = asyncio.run(deployment_logs("qwen"))
+    assert payload["lines"] == []
+
+
+def test_deployment_logs_rejects_path_traversal(serving_home: Path) -> None:
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(deployment_logs("../../etc/passwd"))
+    assert exc.value.status_code in (400, 404)

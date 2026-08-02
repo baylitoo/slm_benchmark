@@ -398,7 +398,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (res.ok) return body as T;
 
   if (isUnavailableStatus(res.status)) {
-    throw new ApiUnavailable(res.status, detailOf(body, "Endpoint not available yet"));
+    throw new ApiUnavailable(res.status, detailOf(body, "Endpoint not available"));
   }
   throw new ApiError(res.status, detailOf(body, `Request failed (HTTP ${res.status})`));
 }
@@ -503,6 +503,21 @@ export function deleteDeployment(name: string): Promise<LifecycleActionResponse>
   return request<LifecycleActionResponse>(
     `/v1/serving/deployments/${encodeURIComponent(name)}`,
     { method: "DELETE" },
+  );
+}
+
+/** A deployment's runtime log tail (GET /v1/serving/deployments/{name}/logs). */
+export interface DeploymentLogs {
+  name: string;
+  /** Reconciler one-line failure summary, if any. */
+  last_error?: string | null;
+  /** Raw stdout/stderr tail (most recent last). */
+  lines: string[];
+}
+
+export function getDeploymentLogs(name: string, lines = 200): Promise<DeploymentLogs> {
+  return request<DeploymentLogs>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/logs?lines=${lines}`,
   );
 }
 
