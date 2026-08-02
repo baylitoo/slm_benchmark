@@ -133,10 +133,8 @@ async def list_repo_ggufs(repo: str, *, client: httpx.AsyncClient) -> list[HfGgu
         if has_safetensors:
             raise HfHubError(
                 f"repo {repo!r} is a transformers/encoder checkpoint (safetensors), "
-                "not a GGUF model — it is not served from the GGUF store. If it is "
-                "a GLiNER/GLiNER2 analyzer, deploy it with the encoder runtime "
-                "(Agents → Security options → the Deploy button next to Guard "
-                "model, or a deploy with runtime=\"encoder\")."
+                "not a GGUF model. If it is a GLiNER/GLiNER2 analyzer, add it as "
+                "an encoder instead (or deploy with runtime=\"encoder\")."
             )
         raise HfHubError(
             f"repo {repo!r} ships no GGUF files — pick that model's -GGUF conversion repo"
@@ -144,26 +142,37 @@ async def list_repo_ggufs(repo: str, *, client: httpx.AsyncClient) -> list[HfGgu
     return files
 
 
-def pick_gguf(files: list[HfGgufFile], quant: str | None) -> HfGgufFile:
-    """Choose the model GGUF for ``quant`` (or the best default available)."""
+def pick_gguf(files: list[HfGgufFile], quant: str | None, *, prefer: bool = False) -> HfGgufFile:
+    """Choose the model GGUF for ``quant`` (or the best default available).
+
+    ``prefer=False`` (single-repo, explicit pick from the quant chips): an
+    unavailable ``quant`` is a hard error listing what IS there. ``prefer=True``
+    (a batch/collection applying one quant across heterogeneous repos): the
+    ``quant`` is a PREFERENCE — if a repo lacks it, fall back to the default
+    quant ladder / smallest file instead of failing the whole repo.
+    """
     candidates = [f for f in files if not f.is_mmproj and not f.is_multipart]
     multipart_only = [f for f in files if not f.is_mmproj and f.is_multipart]
     if not candidates:
         if multipart_only:
             raise HfHubError(
-                "this repo ships only multi-part GGUFs (…-00001-of-000NN), which the "
-                "store does not assemble yet — pick a single-file quant or another repo"
+                "this repo ships only multi-part GGUFs (…-00001-of-000NN), which are "
+                "not supported — pick a single-file quant or another repo"
             )
-        raise HfHubError("no model GGUF found in this repo (mmproj-only?)")
+        raise HfHubError(
+            "no model GGUF found in this repo — only a vision projector (mmproj) file"
+        )
     if quant:
         wanted = quant.strip().upper()
         for f in candidates:
             if f.quant == wanted:
                 return f
-        available = sorted({f.quant or f.filename for f in candidates})
-        raise HfHubError(
-            f"quant {quant!r} not found; available: {', '.join(available)}"
-        )
+        if not prefer:
+            available = sorted({f.quant or f.filename for f in candidates})
+            raise HfHubError(
+                f"quant {quant!r} not found; available: {', '.join(available)}"
+            )
+        # prefer: fall through to the default ladder below.
     for preferred in DEFAULT_QUANT_PREFERENCE:
         for f in candidates:
             if f.quant == preferred:

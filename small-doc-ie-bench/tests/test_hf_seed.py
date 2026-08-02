@@ -94,6 +94,22 @@ async def test_list_repo_ggufs_and_pick() -> None:
         pick_gguf(files, "Q2_K")
 
 
+def test_pick_gguf_prefer_falls_back_when_quant_absent() -> None:
+    """A collection applies one quant to many repos: a missing quant must fall
+    back (prefer=True), not fail the whole repo (prefer=False raises)."""
+    from docie_bench.serving.hf_hub import HfGgufFile
+
+    files = [
+        HfGgufFile("m-Q5_K_M.gguf", 100, "Q5_K_M", False, False),
+        HfGgufFile("m-Q8_0.gguf", 200, "Q8_0", False, False),
+    ]
+    # prefer=False: explicit pick of an absent quant errors.
+    with pytest.raises(HfHubError, match="not found"):
+        pick_gguf(files, "Q4_K_M", prefer=False)
+    # prefer=True: falls back to the default ladder (Q5_K_M before Q8_0).
+    assert pick_gguf(files, "Q4_K_M", prefer=True).quant == "Q5_K_M"
+
+
 async def test_multipart_only_repo_is_refused() -> None:
     async with httpx.AsyncClient(transport=_hub_transport()) as client:
         files = await list_repo_ggufs(REPO, client=client)

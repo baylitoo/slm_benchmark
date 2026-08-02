@@ -1116,6 +1116,10 @@ async def _run_seed_hf(
         raise ValueError("seed-hf event must include 'repo'")
     repo = str(repo)
     quant = str(data.get("quant") or "") or None
+    # A collection/batch applies one quant across heterogeneous repos → the
+    # quant is a PREFERENCE (fall back to best-available per repo), not a hard
+    # requirement that fails a repo lacking that exact quant.
+    quant_prefer = bool(data.get("quant_prefer", False))
     family = str(data.get("family") or "openai_chat")
     name = str(data.get("name") or "") or default_store_name(repo)
     contract = get_family(family)  # fail fast on an unknown family
@@ -1197,7 +1201,7 @@ async def _run_seed_hf(
     try:
         async with httpx.AsyncClient(transport=transport) as client:
             files = await list_repo_ggufs(repo, client=client)
-            chosen = pick_gguf(files, quant)
+            chosen = pick_gguf(files, quant, prefer=quant_prefer)
             mmproj_file = pick_mmproj(files)
             if contract.needs_mmproj and mmproj_file is None:
                 raise ValueError(

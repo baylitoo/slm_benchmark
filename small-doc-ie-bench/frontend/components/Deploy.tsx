@@ -110,7 +110,7 @@ export function Deploy({
 
   const heading =
     view === "models"
-      ? { title: "Models", subtitle: "GET /v1/serving/store — the GGUF catalog you can deploy." }
+      ? { title: "Models", subtitle: "The model store you can deploy — GGUFs, encoders, embeddings." }
       : view === "ports"
         ? { title: "Ports", subtitle: "Live port allocation across running deployments." }
         : view === "sizing"
@@ -2049,7 +2049,12 @@ function HfCollectionSeed({
     const fired: { repo: string; trigger: TriggerResponse }[] = [];
     try {
       for (const repo of models.filter((m) => selected.has(m))) {
-        const trigger = await seedHf({ repo, quant: quant || null, family });
+        const trigger = await seedHf({
+          repo,
+          quant: quant || null,
+          quant_prefer: true, // batch: quant is a preference, fall back per repo
+          family,
+        });
         fired.push({ repo, trigger });
       }
       setTriggers(fired);

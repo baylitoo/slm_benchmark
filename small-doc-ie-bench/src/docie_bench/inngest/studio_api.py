@@ -178,6 +178,10 @@ class SeedHfRequest(BaseModel):
 
     repo: str  # e.g. "LiquidAI/LFM2.5-350M-Instruct-GGUF"
     quant: str | None = None  # e.g. "Q4_K_M"; None = best available default
+    # True (collection/batch): quant is a PREFERENCE — a repo lacking it falls
+    # back to best-available instead of failing. False: quant is an explicit
+    # pick and an unavailable one errors.
+    quant_prefer: bool = False
     name: str | None = None  # store name; None = derived from the repo
     family: str = "openai_chat"
 

@@ -631,6 +631,8 @@ export interface HfCollectionView {
 export interface SeedHfRequest {
   repo: string;
   quant?: string | null;
+  /** True (batch/collection): quant is a preference — fall back per repo instead of failing. */
+  quant_prefer?: boolean;
   name?: string | null;
   family?: string;
 }
