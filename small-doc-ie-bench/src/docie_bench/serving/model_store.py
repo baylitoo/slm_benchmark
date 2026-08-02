@@ -73,6 +73,13 @@ class FamilyContract:
     # answered on /v1/embeddings — never chat/extraction. Deployments of an
     # embedding family are typed "embedding" and routed by the embeddings API.
     embedding: bool = False
+    # An analyzer (encoder) family: a transformers/safetensors checkpoint served
+    # by the ENCODER runtime (docie encoder), NOT llama.cpp. Stored as a
+    # directory snapshot rather than a single GGUF, and typed "encoder".
+    # ``encoder_backend`` selects the analyzer library (gliner | gliner2); it is
+    # the store-driven replacement for the server's name-based auto-detection.
+    analyzer: bool = False
+    encoder_backend: str | None = None
     stop_sequences: tuple[str, ...] = ()
     # Generation defaults inherited by a family-synthesized profile (a store deploy
     # whose served id matches no models.yaml profile). These are the single source
@@ -178,6 +185,30 @@ FAMILIES: dict[str, FamilyContract] = {
         llama_server_args=("--embedding", "--pooling", "mean"),
         embedding=True,
         ollama_faithful=True,
+    ),
+    # Encoder analyzers (safetensors checkpoints served by the encoder runtime,
+    # never llama.cpp): GLiNER zero-shot NER (urchade/gliner_*) and GLiNER2
+    # guardrails (fastino/GLiNER2-*, PII + safety moderation in one checkpoint).
+    # template_delivery/response_format are irrelevant on the encoder path; the
+    # family exists to type the deployment and to carry the analyzer backend so
+    # a store deploy needs no name-based guessing.
+    "encoder_gliner": FamilyContract(
+        name="encoder_gliner",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        analyzer=True,
+        encoder_backend="gliner",
+        ollama_faithful=False,
+    ),
+    "encoder_gliner2": FamilyContract(
+        name="encoder_gliner2",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        analyzer=True,
+        encoder_backend="gliner2",
+        ollama_faithful=False,
     ),
 }
 
@@ -450,6 +481,64 @@ class ModelStore:
             mmproj_path=mmproj_path,
             source=source,
         )
+        self._write_entry(entry)
+        return entry
+
+    def add_snapshot(
+        self,
+        *,
+        name: str,
+        family: str,
+        snapshot_dir: str | Path,
+        source: str | None = None,
+        link: bool = True,
+    ) -> StoreEntry:
+        """Register a transformers/encoder checkpoint DIRECTORY (safetensors +
+        config + tokenizer) as a store entry.
+
+        Analyzer families (GLiNER/GLiNER2) are multi-file safetensors
+        checkpoints, not single GGUFs, so ``model_path`` points at the snapshot
+        DIRECTORY (``<root>/<name>/snapshot``) served by the encoder runtime
+        via ``from_pretrained(<path>)`` — no network at deploy time. The whole
+        tree is transferred into a ``.tmp`` sibling and renamed atomically, so a
+        half-copied snapshot never appears under the canonical name.
+        """
+        contract = get_family(family)
+        if not contract.analyzer:
+            raise ModelStoreError(
+                f"add_snapshot is for analyzer (encoder) families; {family!r} is not one"
+            )
+        src = Path(snapshot_dir)
+        if not src.is_dir():
+            raise ModelStoreError(f"snapshot directory not found: {src}")
+        if not any(p.suffix == ".safetensors" for p in src.rglob("*") if p.is_file()):
+            raise ModelStoreError(
+                f"snapshot {src} has no .safetensors weights — not an encoder checkpoint"
+            )
+        _assert_within(self.root / name, self.root, label=f"store name {name!r}")
+
+        destination = self.root / name
+        snapshot_path = destination / "snapshot"
+        staging = destination / "snapshot.tmp"
+        try:
+            if staging.exists():
+                shutil.rmtree(staging)
+            for file in sorted(p for p in src.rglob("*") if p.is_file()):
+                target = staging / file.relative_to(src)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _transfer(file, target, link=link)
+            if snapshot_path.exists():
+                shutil.rmtree(snapshot_path)
+            os.replace(staging, snapshot_path)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            # A fresh seed with no prior index entry leaves an orphan dir; the
+            # index write below is what makes it canonical, so drop it on failure.
+            if name not in self._read_index():
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
+
+        entry = StoreEntry(name=name, family=family, model_path=snapshot_path, source=source)
         self._write_entry(entry)
         return entry
 

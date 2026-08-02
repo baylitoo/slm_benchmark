@@ -225,6 +225,108 @@ async def download_file(
         raise
 
 
+# Snapshot download (analyzer/encoder checkpoints — safetensors + configs).
+# Alternate weight formats and hardware-specific exports are skipped: the
+# encoder runtime loads safetensors, so pulling .bin/.onnx/.h5 doubles the
+# download for nothing.
+_SNAPSHOT_SKIP_SUFFIXES = frozenset(
+    {".gguf", ".bin", ".pt", ".pth", ".h5", ".onnx", ".msgpack", ".tflite", ".ot"}
+)
+_SNAPSHOT_SKIP_DIRS = ("onnx/", "openvino/", "coreml/", "tflite/")
+
+
+def _is_snapshot_file(filename: str) -> bool:
+    lower = filename.lower()
+    if any(lower.startswith(prefix) or f"/{prefix}" in lower for prefix in _SNAPSHOT_SKIP_DIRS):
+        return False
+    suffix = filename[filename.rfind(".") :].lower() if "." in filename else ""
+    return suffix not in _SNAPSHOT_SKIP_SUFFIXES
+
+
+async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[HfGgufFile]:
+    """The repo's safetensors-checkpoint files (weights + config + tokenizer).
+
+    Reuses the same ``?blobs=true`` metadata as :func:`list_repo_ggufs` but keeps
+    the transformers snapshot instead of the GGUFs — for analyzer/encoder
+    families served by the encoder runtime. Refuses a repo with no safetensors
+    (that is a GGUF-only or an incompatible repo).
+    """
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        raise HfHubError(f"invalid Hugging Face repo id {repo!r} (expected owner/name)")
+    url = f"{HF_BASE}/api/models/{repo}?blobs=true"
+    try:
+        response = await client.get(url, headers=hf_headers(), timeout=20.0)
+    except httpx.RequestError as exc:
+        raise HfHubError(f"Hugging Face Hub is unreachable: {exc}") from exc
+    if response.status_code == 404:
+        raise HfHubError(f"repo {repo!r} does not exist on the Hugging Face Hub")
+    if response.status_code in (401, 403):
+        raise HfHubError(
+            f"repo {repo!r} was refused by the Hub — check the id or set HF_TOKEN"
+        )
+    if response.status_code >= 400:
+        raise HfHubError(f"Hub returned HTTP {response.status_code} for {repo!r}")
+    payload = response.json()
+    files: list[HfGgufFile] = []
+    has_safetensors = False
+    for sibling in payload.get("siblings", []):
+        if not isinstance(sibling, dict):
+            continue
+        filename = str(sibling.get("rfilename") or "")
+        if not filename or not _is_snapshot_file(filename):
+            continue
+        if filename.lower().endswith(".safetensors"):
+            has_safetensors = True
+        size = sibling.get("size")
+        files.append(
+            HfGgufFile(
+                filename=filename,
+                size_bytes=int(size) if isinstance(size, (int, float)) else None,
+                quant=None,
+                is_mmproj=False,
+                is_multipart=False,
+            )
+        )
+    if not has_safetensors:
+        raise HfHubError(
+            f"repo {repo!r} ships no safetensors weights — not an encoder checkpoint"
+        )
+    return files
+
+
+async def download_snapshot(
+    repo: str,
+    files: list[HfGgufFile],
+    destination: Path,
+    *,
+    client: httpx.AsyncClient,
+    revision: str = "main",
+    progress: ProgressCallback | None = None,
+) -> Path:
+    """Download every snapshot file under ``destination`` (preserving repo paths).
+
+    ``progress(received, total)`` reports CUMULATIVE bytes across all files
+    against the snapshot's known total, so a single bar tracks the whole pull.
+    """
+    total = sum(f.size_bytes or 0 for f in files) or None
+    done_before = 0
+    for file in files:
+        target = destination / file.filename
+        if progress is not None:
+            base = done_before
+
+            async def file_progress(received: int, _t: int | None, _base: int = base) -> None:
+                await progress(_base + received, total)  # type: ignore[misc]
+
+            await download_file(
+                repo, file.filename, target, client=client, revision=revision, progress=file_progress
+            )
+        else:
+            await download_file(repo, file.filename, target, client=client, revision=revision)
+        done_before += file.size_bytes or 0
+    return destination
+
+
 async def list_collection(slug: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
     """A HF collection's model repos (``owner/slug-hash`` or its full URL).
 

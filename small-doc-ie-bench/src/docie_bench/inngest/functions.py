@@ -993,6 +993,16 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
+def _entry_size_bytes(entry: Any) -> int | None:
+    """On-disk size of a store entry — a file's size, or a snapshot dir's tree sum."""
+    path = entry.model_path
+    if not path.exists():
+        return None
+    if path.is_dir():
+        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+    return path.stat().st_size
+
+
 def _register_seed_in_catalog(store: Any, entry: Any, name: str) -> dict[str, Any]:
     """Catalog-register a freshly seeded entry (shared by ollama + HF seeds).
 
@@ -1008,7 +1018,7 @@ def _register_seed_in_catalog(store: Any, entry: Any, name: str) -> dict[str, An
     )
     from docie_bench.serving.model_store import FAMILIES
 
-    size = entry.model_path.stat().st_size if entry.model_path.exists() else None
+    size = _entry_size_bytes(entry)
     try:
         return ModelCatalog().upsert(entry, size_bytes=size)
     except CatalogUnavailableError:
@@ -1057,7 +1067,9 @@ async def _run_seed_hf(
     from docie_bench.serving.hf_hub import (
         default_store_name,
         download_file,
+        download_snapshot,
         list_repo_ggufs,
+        list_snapshot_files,
         pick_gguf,
         pick_mmproj,
     )
@@ -1106,6 +1118,45 @@ async def _run_seed_hf(
             )
 
         return report
+
+    # Analyzer families (encoder checkpoints) are a multi-file safetensors
+    # SNAPSHOT, not a GGUF — download the whole tree and register it as a
+    # directory entry so the encoder runtime loads it locally (no network at
+    # deploy time). Shares the exact same progress/registration machinery.
+    if contract.analyzer:
+        try:
+            async with httpx.AsyncClient(transport=transport) as client:
+                snap_files = await list_snapshot_files(repo, client=client)
+                await publish(
+                    channel,
+                    TOPIC_STATUS,
+                    {
+                        "state": "downloading",
+                        "repo": repo,
+                        "files": len(snap_files),
+                        "size_bytes": sum(f.size_bytes or 0 for f in snap_files) or None,
+                    },
+                )
+                snapshot_tmp = tmp_dir / "snapshot"
+                await download_snapshot(
+                    repo,
+                    snap_files,
+                    snapshot_tmp,
+                    client=client,
+                    progress=_progress_reporter("download-snapshot", repo),
+                )
+            await publish(channel, TOPIC_STATUS, {"state": "registering", "name": name})
+            entry = await asyncio.to_thread(
+                store.add_snapshot,
+                name=name,
+                family=family,
+                snapshot_dir=snapshot_tmp,
+                source=f"hf:{repo}",
+                link=True,
+            )
+            return await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     try:
         async with httpx.AsyncClient(transport=transport) as client:

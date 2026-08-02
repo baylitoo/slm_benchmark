@@ -318,10 +318,13 @@ def ensure_placement_observed_columns(engine: Engine) -> list[str]:
 def available_backends(family: str) -> list[str]:
     """Backends that can serve a model of ``family`` faithfully.
 
-    llama-server can serve every family; Ollama only those whose template it
-    does not silently drop (``ollama_faithful``).
+    Analyzer (encoder) families are served ONLY by the encoder runtime, never
+    llama.cpp/Ollama. For everything else llama-server can serve every family;
+    Ollama only those whose template it does not silently drop.
     """
     contract = FAMILIES.get(family)
+    if contract is not None and contract.analyzer:
+        return ["encoder"]
     backends = ["llama-server"]
     if contract is not None and contract.ollama_faithful:
         backends.append("ollama")
