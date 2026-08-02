@@ -850,15 +850,34 @@ class _DefaultSupervisor:
         # so guard the advertise host unconditionally here.
         self._guard_deterministic_advertise(advertise_host)
 
+        # Analyzer (encoder) entries are a safetensors snapshot served by the
+        # ENCODER runtime — not llama.cpp. The snapshot path goes in as the
+        # model and the family's encoder_backend rides in as --backend (no
+        # name-based guessing), so the checkpoint loads locally with zero
+        # network at boot.
+        from docie_bench.serving.model_store import get_family
+
+        contract = get_family(entry.family)
+        if contract.analyzer:
+            runtime_kind = RuntimeKind.ENCODER
+            launch_extra_args: tuple[str, ...] = (
+                ("--backend", contract.encoder_backend)
+                if contract.encoder_backend
+                else ()
+            )
+        else:
+            runtime_kind = RuntimeKind.LLAMACPP
+            launch_extra_args = store.family_launch_args(name)
+
         def _launch_and_await(chosen: int) -> Any:
             launch = reachable_launch(
                 RuntimeLaunchSpec(
-                    runtime=RuntimeKind.LLAMACPP,
+                    runtime=runtime_kind,
                     model=entry.model_path.as_posix(),
                     alias=entry.name,
                     port=chosen,
                     context_length=context_length,
-                    extra_args=store.family_launch_args(name),
+                    extra_args=launch_extra_args,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -967,12 +986,16 @@ def _record_placement(model_name: str, record: object) -> None:
 
     spec = getattr(record, "spec", None)
     state = getattr(record, "state", None)
+    # Engine follows the launch runtime: llama-server for GGUF, "encoder" for an
+    # analyzer snapshot (serve_store_model now branches by family).
+    launch = getattr(spec, "launch", None)
+    runtime = getattr(launch, "runtime", None)
+    engine = "encoder" if str(getattr(runtime, "value", runtime)) == "encoder" else "llama-server"
     try:
         ModelCatalog().record_placement(
             str(getattr(spec, "name", None) or model_name),
             model_name=model_name,
-            # serve_store_model always launches llama.cpp (RuntimeKind.LLAMACPP).
-            engine="llama-server",
+            engine=engine,
             endpoint=str(getattr(record, "endpoint", None) or ""),
             state=str(getattr(state, "value", state) or "unknown"),
         )
