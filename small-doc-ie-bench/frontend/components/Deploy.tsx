@@ -1039,8 +1039,12 @@ function DeployForm({
     () => models.find((m) => m.name === selected) ?? null,
     [models, selected],
   );
-  // Runtime picker is scoped to the chosen model's faithful backends.
-  const backends = selectedEntry?.available_backends ?? [];
+  // Runtime picker is scoped to the chosen model's faithful backends. "encoder"
+  // is NOT an operator-selectable runtime — it is implied by an analyzer
+  // family and served through the store (Auto) path, so it never appears as a
+  // chip that would wrongly trigger the explicit-runtime serve() route.
+  const backends = (selectedEntry?.available_backends ?? []).filter((b) => b !== "encoder");
+  const isEncoderEntry = (selectedEntry?.available_backends ?? []).includes("encoder");
 
   function pick(modelName: string) {
     setSelected(modelName);
@@ -1144,9 +1148,11 @@ function DeployForm({
               ))}
             </div>
             <p className="mt-1.5 text-xs text-muted-foreground">
-              {backends.length > 0
-                ? "Backends are scoped to this model (from its store entry's available_backends)."
-                : "This model lists no explicit backends — Auto lets the server choose."}
+              {isEncoderEntry
+                ? "Encoder checkpoint — served by the encoder runtime automatically (Auto)."
+                : backends.length > 0
+                  ? "Backends are scoped to this model (from its store entry's available_backends)."
+                  : "This model lists no explicit backends — Auto lets the server choose."}
             </p>
           </div>
         )}
@@ -1458,7 +1464,7 @@ function AddModelForm({
         <HfCollectionSeed families={families} onSeeded={onSeeded} />
       </div>
       <div hidden={mode !== "encoder"}>
-        <EncoderDeployForm />
+        <EncoderSeedForm onSeeded={onSeeded} />
       </div>
       <div hidden={mode !== "ollama"}>
         <SeedForm families={families} onSeeded={onSeeded} />
@@ -1467,45 +1473,44 @@ function AddModelForm({
   );
 }
 
-// Encoders (GLiNER/GLiNER2 analyzers — safetensors, not GGUF) skip the store
-// entirely: the encoder runtime downloads the checkpoint itself at launch.
-// This form fires the managed deploy directly, so "add an encoder" lives in
-// the same place as every other model.
+// Encoders (GLiNER/GLiNER2 analyzers — safetensors, not GGUF) are now SEEDED
+// into the store like any other model: the full checkpoint snapshot is
+// downloaded once (with live progress), then deployed via the normal Deploy
+// flow with zero network at boot. Two backends: gliner (zero-shot NER) and
+// gliner2 (PII + guardrails).
 const DEFAULT_ENCODER_REPO = "fastino/GLiNER2-Guardrails-PII-Multi";
 
-function EncoderDeployForm() {
+function EncoderSeedForm({ onSeeded }: { onSeeded: () => void }) {
   const { toast } = useToast();
   const [repo, setRepo] = useState(DEFAULT_ENCODER_REPO);
   const [name, setName] = useState("guardrails-pii");
+  const [family, setFamily] = useState("encoder_gliner2");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
 
-  async function onDeploy(e: React.FormEvent) {
+  async function onSeed(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setTrigger(null);
     if (!repo.trim() || !name.trim()) {
-      setError("Repo and deployment name are both required.");
+      setError("Repo and store name are both required.");
       return;
     }
     setSubmitting(true);
     try {
-      const res = await deployModel({
-        model: repo.trim(),
-        runtime: "encoder",
-        name: name.trim(),
-      });
+      const res = await seedHf({ repo: repo.trim(), name: name.trim(), family });
       setTrigger(res);
       toast({
-        title: "Encoder deploy started",
-        description: `${name.trim()} — watch it under Deployments (Type: Encoder).`,
+        title: "Encoder download started",
+        description: `${name.trim()} — snapshot into the store, then Deploy it.`,
         tone: "success",
       });
+      onSeeded();
     } catch (err) {
-      const msg = errText(err, "Encoder deploy failed.");
+      const msg = errText(err, "Encoder seed failed.");
       setError(msg);
-      toast({ title: "Encoder deploy failed", description: msg, tone: "error" });
+      toast({ title: "Encoder seed failed", description: msg, tone: "error" });
     } finally {
       setSubmitting(false);
     }
@@ -1514,10 +1519,10 @@ function EncoderDeployForm() {
   return (
     <Card
       icon={<Cpu className="h-5 w-5" />}
-      title="Deploy an encoder"
-      subtitle="Analyzers (GLiNER / GLiNER2 — PII, guardrails): safetensors checkpoints served by the encoder runtime, no GGUF store involved."
+      title="Add an encoder"
+      subtitle="Analyzers (GLiNER / GLiNER2 — PII, guardrails): safetensors checkpoints downloaded into the store, served by the encoder runtime (no GGUF)."
     >
-      <form onSubmit={onDeploy} className="space-y-4">
+      <form onSubmit={onSeed} className="space-y-4">
         <Field
           label="Hugging Face repo"
           required
@@ -1525,13 +1530,17 @@ function EncoderDeployForm() {
         >
           <TextInput value={repo} onChange={(e) => setRepo(e.target.value)} />
         </Field>
-        <Field
-          label="Deployment name"
-          required
-          hint="How agents select it as their guard model."
-        >
-          <TextInput value={name} onChange={(e) => setName(e.target.value)} />
-        </Field>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Store name" required hint="How agents select it as their guard model.">
+            <TextInput value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+          <Field label="Backend" hint="gliner2 = PII + guardrails; gliner = zero-shot NER.">
+            <Select value={family} onChange={(e) => setFamily(e.target.value)}>
+              <option value="encoder_gliner2">GLiNER2 (PII + guardrails)</option>
+              <option value="encoder_gliner">GLiNER (zero-shot NER)</option>
+            </Select>
+          </Field>
+        </div>
 
         {error && (
           <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
@@ -1541,19 +1550,19 @@ function EncoderDeployForm() {
         )}
 
         <Button type="submit" loading={submitting}>
-          <Rocket className="h-4 w-4" />
-          Deploy encoder
+          <Plus className="h-4 w-4" />
+          Download & seed
         </Button>
         <p className="text-xs text-muted-foreground">
-          First launch downloads the weights (cached afterwards) — the row sits
-          in phase <code className="rounded bg-muted px-1">loading</code> until
-          the model serves. Requires the encoders extra on the serving node.
+          The snapshot (~1&nbsp;GB) downloads once into the store with live
+          progress; deploying it afterwards is instant (no network at boot).
+          Requires the encoders extra on the serving node.
         </p>
       </form>
 
       {trigger && (
         <div className="mt-5 border-t border-border pt-5">
-          <ResultPanel trigger={trigger} noun="deploy" />
+          <ResultPanel trigger={trigger} noun="seed" />
         </div>
       )}
     </Card>
