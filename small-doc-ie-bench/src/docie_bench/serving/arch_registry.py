@@ -58,6 +58,24 @@ VISION_ARCHS = frozenset(
     {"qwen2vl", "qwen2_vl", "qwen2.5vl", "lfm2-vl", "lfm2_vl", "deepseek2-ocr"}
 )
 
+# Families that are multimodal — a repo whose family resolves to one of these
+# is already vision, no upgrade needed.
+VISION_FAMILIES = frozenset({"lfm2_vl", "nuextract3", "vision_ocr"})
+
+# When a repo ships an mmproj it is MULTIMODAL regardless of the reported base
+# LM architecture: llama.cpp reports the backbone (e.g. "lfm2" for LFM2-VL,
+# "qwen2" for a Qwen2-VL). The projector is a stronger modality signal than the
+# arch string, so a text-family suggestion is upgraded to a vision family —
+# per-backbone when known, else a sensible default (vision extraction; the user
+# can switch to vision_ocr for OCR).
+TEXT_ARCH_TO_VISION_FAMILY: dict[str, str] = {
+    "lfm2": "lfm2_vl",
+    "qwen2": "lfm2_vl",
+    "qwen3": "lfm2_vl",
+    "llama": "lfm2_vl",
+}
+DEFAULT_VISION_FAMILY = "lfm2_vl"
+
 
 @dataclass(frozen=True)
 class SupportVerdict:
@@ -102,8 +120,18 @@ def resolve_family(
 
     family = ARCH_TO_FAMILY.get(arch)
     if family is not None:
-        # Sanity: a vision family needs a projector; flag the mismatch rather
-        # than deploy something that will fail at load.
+        # A projector means multimodal even when the arch reports a text
+        # backbone (LFM2-VL → "lfm2", Qwen2-VL → "qwen2"): upgrade to a vision
+        # family so the deploy gets --mmproj + the right response contract.
+        if has_mmproj and family not in VISION_FAMILIES:
+            vision_family = TEXT_ARCH_TO_VISION_FAMILY.get(arch, DEFAULT_VISION_FAMILY)
+            return SupportVerdict(
+                "supported",
+                vision_family,
+                f"architecture {architecture!r} with an mmproj projector → "
+                f"{vision_family} (vision) — switch to vision_ocr for OCR",
+            )
+        # Sanity: a vision-arch family with no projector will fail at load.
         if arch in VISION_ARCHS and not has_mmproj:
             return SupportVerdict(
                 "needs_family",
@@ -113,6 +141,15 @@ def resolve_family(
             )
         return SupportVerdict("supported", family, f"architecture {architecture!r} → {family}")
 
+    # Unknown arch but a projector present → still multimodal; suggest a vision
+    # family rather than a blank needs_family.
+    if has_mmproj:
+        return SupportVerdict(
+            "needs_family",
+            DEFAULT_VISION_FAMILY,
+            f"architecture {architecture!r} is unmapped but ships an mmproj — try a "
+            "vision family (or add a contract for this arch)",
+        )
     return SupportVerdict(
         "needs_family",
         None,

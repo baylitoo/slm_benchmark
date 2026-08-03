@@ -31,6 +31,22 @@ def test_resolve_vision_arch_needs_mmproj() -> None:
     assert missing.verdict == "needs_family" and "mmproj" in missing.reason
 
 
+def test_mmproj_upgrades_text_backbone_to_vision_family() -> None:
+    """LFM2-VL/Qwen2-VL GGUFs report the LM backbone arch ("lfm2"/"qwen2") but
+    ship an mmproj — the projector is the modality signal, so the suggestion is
+    upgraded to a vision family (not the text family)."""
+    v = resolve_family("lfm2", has_gguf=True, has_safetensors=False, has_mmproj=True)
+    assert v.verdict == "supported" and v.family == "lfm2_vl"
+    # Without a projector, the same arch stays the text family.
+    t = resolve_family("lfm2", has_gguf=True, has_safetensors=False, has_mmproj=False)
+    assert t.family == "lfm2"
+
+
+def test_unknown_arch_with_mmproj_suggests_vision() -> None:
+    v = resolve_family("mystery-vl", has_gguf=True, has_safetensors=False, has_mmproj=True)
+    assert v.verdict == "needs_family" and v.family == "lfm2_vl"
+
+
 def test_resolve_gliner_marker() -> None:
     v = resolve_family("GLiNER2", has_gguf=False, has_safetensors=True, has_mmproj=False)
     assert v.verdict == "supported" and v.family == "encoder_gliner2"
