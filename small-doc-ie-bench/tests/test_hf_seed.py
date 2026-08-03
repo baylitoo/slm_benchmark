@@ -199,3 +199,41 @@ async def test_run_seed_hf_requires_repo(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
     with pytest.raises(ValueError, match="repo"):
         await _run_seed_hf({}, "seed:test", transport=_hub_transport())
+
+
+def test_vision_ocr_family_contract() -> None:
+    """The OCR vision family shares the mmproj/vision plumbing but emits free
+    text (response_format none), distinct from schema-driven extraction."""
+    from docie_bench.serving.model_store import get_family
+
+    fam = get_family("vision_ocr")
+    assert fam.vision and fam.needs_mmproj
+    assert fam.response_format_style == "none"  # free-text OCR, no JSON grammar
+    assert "--jinja" in fam.llama_server_args
+    assert fam.ollama_faithful is False
+
+
+async def test_seed_vision_ocr_downloads_and_wires_mmproj(tmp_path, monkeypatch) -> None:
+    """A needs_mmproj family auto-downloads the projector and --mmproj is wired,
+    with no model-specific code (Unlimited-OCR ships mmproj-*.gguf like LFM2.5-VL)."""
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+
+    async def fake_publish(channel: str, topic: str, data: dict) -> None:
+        return None
+
+    monkeypatch.setattr("docie_bench.inngest.functions.publish", fake_publish)
+
+    result = await _run_seed_hf(
+        {"repo": REPO, "quant": "Q4_K_M", "family": "vision_ocr", "name": "unlimited-ocr"},
+        "seed:test",
+        transport=_hub_transport(),
+    )
+    assert result["family"] == "vision_ocr"
+    assert result["has_mmproj"] is True
+
+    store = ModelStore(tmp_path / "models")
+    entry = store.entry("unlimited-ocr")
+    assert entry.mmproj_path is not None and entry.mmproj_path.is_file()
+    # --mmproj is appended automatically for the needs_mmproj family.
+    args = store.family_launch_args("unlimited-ocr")
+    assert "--jinja" in args and "--mmproj" in args

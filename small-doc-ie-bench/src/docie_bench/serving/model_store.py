@@ -170,6 +170,28 @@ FAMILIES: dict[str, FamilyContract] = {
         # llama-server only (mirrors nuextract3 — refuses an Ollama Modelfile).
         ollama_faithful=False,
     ),
+    # Vision OCR models: a vision GGUF whose job is FREE-TEXT OCR (image ->
+    # text), not schema-driven extraction — e.g. sahilchachra/Unlimited-OCR-GGUF
+    # (deepseek2-ocr). Shares the vision/mmproj plumbing with lfm2_vl/nuextract3
+    # but with response_format_style="none": OCR output is plain text, and a
+    # JSON grammar would corrupt it. The embedded (often trivial) chat template
+    # is rendered by --jinja. Any vision OCR GGUF that ships an mmproj and emits
+    # free text fits here regardless of base architecture — the contract, not
+    # the arch, defines the family. Runtime support for the arch (e.g.
+    # deepseek2-ocr) is a separate gate: a recent llama-server is required.
+    "vision_ocr": FamilyContract(
+        name="vision_ocr",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,  # unused: no schema sent
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja",),  # --mmproj appended by family_launch_args
+        needs_mmproj=True,
+        vision=True,
+        default_temperature=0.0,
+        default_max_tokens=4096,
+        default_timeout_seconds=600.0,  # vision on CPU is slow
+        ollama_faithful=False,
+    ),
     # Embedding models (LFM2.5-Embedding-350M, or any GGUF embedding model).
     # llama-server exposes /v1/embeddings when launched with --embedding; mean
     # pooling is the standard sentence-embedding reduction. No template, no
