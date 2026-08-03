@@ -21,9 +21,11 @@ const POLL_MS = 1500;
 export function PollingResult({
   eventId,
   noun = "result",
+  onSettled,
 }: {
   eventId: string;
   noun?: string;
+  onSettled?: () => void;
 }) {
   const [runs, setRuns] = useState<InngestRun[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -45,6 +47,7 @@ export function PollingResult({
           list.length > 0 && list.every((r) => statusIs(r, "Completed", "Failed", "Cancelled"));
         if (settled) {
           setDone(true);
+          onSettled?.();
           return;
         }
       } catch (e) {

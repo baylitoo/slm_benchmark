@@ -21,9 +21,12 @@ type Mode =
 export function ResultPanel({
   trigger,
   noun = "result",
+  onSettled,
 }: {
   trigger: TriggerResponse;
   noun?: string;
+  /** Fired once the run reaches a terminal state (result or error). */
+  onSettled?: () => void;
 }) {
   const [mode, setMode] = useState<Mode>({ kind: "connecting" });
 
@@ -61,9 +64,10 @@ export function ResultPanel({
         initialToken={mode.token}
         eventId={trigger.event_ids[0]}
         noun={noun}
+        onSettled={onSettled}
       />
     );
   }
 
-  return <PollingResult eventId={trigger.event_ids[0]} noun={noun} />;
+  return <PollingResult eventId={trigger.event_ids[0]} noun={noun} onSettled={onSettled} />;
 }

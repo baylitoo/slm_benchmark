@@ -42,12 +42,14 @@ export function RealtimeResult({
   initialToken,
   eventId,
   noun = "result",
+  onSettled,
 }: {
   channel: string;
   topics: string[];
   initialToken: RealtimeToken;
   eventId: string;
   noun?: string;
+  onSettled?: () => void;
 }) {
   const refreshToken = useMemo(
     () => async () =>
@@ -80,6 +82,12 @@ export function RealtimeResult({
 
   // A terminal realtime signal means we don't need the polling fallback.
   const hasTerminal = result !== undefined || errTopic !== undefined;
+
+  // Notify the parent once the run settles (result or error), so it can drop
+  // "seeding ongoing" guards without a false positive after completion.
+  useEffect(() => {
+    if (hasTerminal) onSettled?.();
+  }, [hasTerminal, onSettled]);
 
   // Arm a one-shot timer: if no terminal topic arrives in the window, the
   // realtime publish was probably dropped. ANY incoming message (status /

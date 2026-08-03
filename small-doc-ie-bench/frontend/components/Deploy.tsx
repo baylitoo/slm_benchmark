@@ -1686,6 +1686,19 @@ function HfSearchSeed({
   const [quant, setQuant] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+  // A seed is downloading in the background until its run settles. Guards
+  // navigating away from it (picking another model / re-searching) so an
+  // ongoing download is never silently dropped from view.
+  const [seedActive, setSeedActive] = useState(false);
+  const [seedingRepo, setSeedingRepo] = useState<string | null>(null);
+
+  function confirmLeaveSeed(): boolean {
+    if (!seedActive || !seedingRepo) return true;
+    return window.confirm(
+      `A download is still in progress for "${seedingRepo}". It keeps running in ` +
+        "the background (it appears under Models when done). Start on another model?",
+    );
+  }
 
   // A new search is a fresh start: clear any previously-selected/inspected
   // model and its (possibly completed) seed panel, so the results list and the
@@ -1694,6 +1707,8 @@ function HfSearchSeed({
     setSelected(null);
     setInspect(null);
     setTrigger(null);
+    setSeedActive(false);
+    setSeedingRepo(null);
     setName("");
     setFamily("");
     setQuant("");
@@ -1703,6 +1718,7 @@ function HfSearchSeed({
     e.preventDefault();
     setError(null);
     if (!query.trim()) return;
+    if (!confirmLeaveSeed()) return;
     resetSelection();
     setSearching(true);
     try {
@@ -1715,6 +1731,9 @@ function HfSearchSeed({
   }
 
   async function pick(repo: string) {
+    if (repo !== selected && !confirmLeaveSeed()) return;
+    setSeedActive(false);
+    setSeedingRepo(null);
     setSelected(repo);
     setInspect(null);
     setTrigger(null);
@@ -1744,6 +1763,8 @@ function HfSearchSeed({
         family,
       });
       setTrigger(res);
+      setSeedActive(true);
+      setSeedingRepo(selected);
       toast({ title: "Download started", description: selected, tone: "success" });
       onSeeded();
     } catch (err) {
@@ -1896,7 +1917,16 @@ function HfSearchSeed({
 
                 {trigger && (
                   <div className="border-t border-border pt-3">
-                    <ResultPanel trigger={trigger} noun="seed" />
+                    {seedActive && (
+                      <Badge tone="info" className="mb-2">
+                        download in progress · continues in the background
+                      </Badge>
+                    )}
+                    <ResultPanel
+                      trigger={trigger}
+                      noun="seed"
+                      onSettled={() => setSeedActive(false)}
+                    />
                   </div>
                 )}
               </div>
