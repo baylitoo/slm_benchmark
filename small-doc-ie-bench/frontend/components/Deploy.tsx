@@ -1867,6 +1867,12 @@ function HfSearchSeed({
                 {inspect.reason && (
                   <p className="text-xs text-muted-foreground">{inspect.reason}</p>
                 )}
+                {inspect.runtime_note && (
+                  <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                    <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    Runtime: {inspect.runtime_note}
+                  </p>
+                )}
 
                 {!unsupported && (
                   <>

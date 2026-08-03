@@ -654,6 +654,8 @@ export interface HfInspect {
   verdict: string;
   family?: string | null;
   reason?: string;
+  /** A runtime-support caveat (e.g. "needs a recent llama-server"), if any. */
+  runtime_note?: string | null;
   has_gguf?: boolean;
   has_safetensors?: boolean;
   has_mmproj?: boolean;
