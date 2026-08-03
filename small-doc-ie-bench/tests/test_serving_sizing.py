@@ -302,7 +302,7 @@ def test_unpriceable_model_is_honest_not_zero(tmp_path: Path) -> None:
     assert fit.footprint_bytes is None
     assert fit.fits_now is None
     assert fit.detail is not None
-    assert "unpriceable" in fit.detail
+    assert "size unknown" in fit.detail
 
 
 def test_no_snapshot_degrades_honestly(tmp_path: Path) -> None:
@@ -313,7 +313,7 @@ def test_no_snapshot_degrades_honestly(tmp_path: Path) -> None:
     report = compute_sizing(models, None, footprints=_footprints(tmp_path), margin_fraction=0.0)
 
     assert report.observed_available is False
-    assert report.detail == "no node snapshot published"
+    assert report.detail == "no capacity measurement published"
     assert report.free_effective_bytes is None
     fit = report.per_model[0]
     assert fit.footprint_bytes == _fp(2 * GIB)
@@ -484,7 +484,7 @@ def test_sizing_endpoint_honest_when_snapshot_never_published() -> None:
     payload = asyncio.run(serving_sizing())
 
     assert payload["observed_available"] is False
-    assert "no node snapshot published yet" in payload["detail"]
+    assert "no capacity measurement published yet" in payload["detail"]
     assert payload["node"] is None
     (fit,) = payload["per_model"]
     assert fit["footprint_bytes"] == _fp(2 * GIB)  # still priced from the store

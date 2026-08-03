@@ -104,9 +104,8 @@ def _gate_snapshot_staleness(
     threshold = snapshot_stale_after_s()
     if age is not None and age > threshold:
         return None, (
-            f"node snapshot is stale: last published {age:.0f}s ago "
-            f"(> {threshold:.0f}s = {SNAPSHOT_STALE_INTERVALS:g}x the reconcile "
-            f"interval) — is the serving service's reconciler still running?"
+            f"capacity measurement is stale: last published {age:.0f}s ago "
+            f"(threshold {threshold:.0f}s) — is the serving service still running?"
         )
     return snapshot, None
 
@@ -152,13 +151,13 @@ def _observed_placements() -> dict[str, dict[str, Any]] | None:
 
 @router.get("/deployments")
 async def list_deployments() -> Any:
-    """Deployment records overlaid with the reconciler's OBSERVED state (PR-1).
+    """Deployment records with their live observed state.
 
-    Each record gains an ``observed`` object (phase / pid / rss_bytes /
-    health_ok / last_probe_at / last_error / endpoint, from the Postgres
-    surface the reconciler UPDATEs every cycle) — ``None`` per record when the
-    reconciler has not published it, and ``observed_available: false`` on all
-    records when the database is unreachable (worker-local desired state only).
+    Each record carries an ``observed`` object (phase / pid / rss_bytes /
+    health_ok / last_probe_at / last_error / endpoint), refreshed every
+    cycle — ``None`` per record when no observation has been published yet,
+    and ``observed_available: false`` on all records when the observed state
+    is unreachable (desired state only).
     """
     records = await _control_plane().list_deployments()
     observed = _observed_placements()
@@ -174,23 +173,20 @@ async def list_deployments() -> Any:
     return records
 
 
+# The api NEVER measures RAM itself: a psutil call in this process would
+# describe the api container's cgroup, not the serving node's. Numbers come
+# from the ``serving_node`` row the in-``serving`` reconciler publishes every
+# cycle. Auth matches the sibling serving reads (unauthenticated ops view;
+# mutations stay evented).
 @router.get("/resources")
 async def serving_resources() -> dict[str, Any]:
-    """Node RAM snapshot + per-deployment RSS (PR-2, read-only observed surface).
+    """Node RAM snapshot + per-deployment memory usage (read-only).
 
-    Serves the single ``serving_node`` row the in-``serving`` reconciler
-    publishes every cycle — measured inside the serving container
-    (cgroup-v2-first; ``source: "cgroup" | "vm"`` flags a soft VM fallback so
-    the UI can badge it). The api NEVER measures here: a psutil call in this
-    process would describe the api container's cgroup, not the serving node's
-    (design doc §2).
-
-    Honest degradation: ``observed_available: false`` + a ``detail`` reason
-    when the database is unreachable, the reconciler has never published a
-    snapshot, OR the last snapshot is older than the staleness gate allows
-    (the reconciler died and its final number describes a dead past) — never
-    a stale or locally-measured number. Auth matches the sibling serving
-    reads (unauthenticated ops view; mutations stay evented).
+    Serves the last published node measurement, taken inside the serving
+    container (cgroup-v2 first; ``source: "cgroup" | "vm"`` flags a soft VM
+    fallback). Degrades honestly: ``observed_available: false`` plus a
+    ``detail`` reason when the measurement is missing, stale, or the
+    database is unreachable — never a stale or locally-measured number.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
@@ -202,8 +198,8 @@ async def serving_resources() -> dict[str, Any]:
         node = catalog.get_node_snapshot()
         if node is None:
             detail = (
-                "no node snapshot published yet — is the serving service's "
-                "reconciler running?"
+                "no capacity measurement published yet — is the serving "
+                "service running?"
             )
         else:
             node, detail = _gate_snapshot_staleness(node)
@@ -268,7 +264,7 @@ def _sizing_inputs() -> tuple[
             models,
             None,
             placements,
-            "no node snapshot published yet — is the serving service's reconciler running?",
+            "no capacity measurement published yet — is the serving service running?",
         )
     snapshot, detail = _gate_snapshot_staleness(snapshot)
     return models, snapshot, placements, detail
@@ -276,26 +272,20 @@ def _sizing_inputs() -> tuple[
 
 @router.get("/sizing")
 async def serving_sizing() -> dict[str, Any]:
-    """Per-model fit table: how many MORE instances fit right now (PR-3, §3).
+    """Per-model fit table: how many MORE instances fit right now.
 
-    Pure read over the observed surface: footprint per candidate instance is
-    the PR-2 tracker's ``max(calibrated steady RSS, predicted)`` (mmproj-aware,
-    calibration sidecars on the shared serving volume, KV priced at the deploy
-    default context), free RAM is the reconciler-published node snapshot
-    (hot deployments' RSS is already inside "used" — the engine never
-    subtracts them again; loading deployments reserve only their not-yet-
-    resident remainder; see the double-count guard in ``serving.sizing``),
-    and the safety margin is the explicit, configurable
-    ``serving_sizing_margin_fraction`` slice of total — the same margin the
-    deploy path's restart fit gate holds back (the gate re-measures free RAM
-    live at decision time; this table prices against the snapshot that same
-    reader published last cycle).
+    Footprint per candidate instance is ``max(measured steady-state RSS,
+    predicted)`` (mmproj-aware, KV priced at the deploy default context);
+    free RAM is the last published node snapshot (running deployments'
+    memory is already inside "used"; loading deployments reserve only the
+    part not yet in memory); the safety margin is the configurable
+    ``serving_sizing_margin_fraction`` slice of total — the same margin
+    enforced at deploy time.
 
-    Honest degradation mirrors ``/resources``: ``observed_available: false`` +
-    a ``detail`` reason when the database is down, the snapshot was never
-    published, or the snapshot is stale (reconciler died) — footprints still
-    price, ``fits_now`` stays null. Auth parity with the sibling serving
-    reads (unauthenticated ops view).
+    Degrades honestly, mirroring ``/resources``: ``observed_available:
+    false`` plus a ``detail`` reason when the database is down or the
+    snapshot is missing or stale — footprints still price, ``fits_now``
+    stays null.
     """
     from docie_bench.serving.resources import FootprintStore
     from docie_bench.serving.sizing import compute_sizing
@@ -315,22 +305,18 @@ async def serving_sizing() -> dict[str, Any]:
     return payload
 
 
+# Errors here are 422, NEVER 404: the Studio treats 404/501 as "endpoint not
+# available" (api.ts isUnavailableStatus), so a store-removal racing the UI
+# poll must surface the server's detail, not a bogus "endpoint unavailable".
 @router.post("/sizing/whatif")
 async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
-    """Price a hypothetical deployment mix → fits or an explicit deficit (§3).
+    """Price a hypothetical deployment mix → fits or an explicit deficit.
 
-    Same engine, same footprint math, same margin and same loading-placement
-    reservation as ``/sizing`` — the two surfaces can never disagree (and the
-    policy is the deploy path's fit gate's, priced against the last published
-    snapshot; see ``serving.sizing``). A pure computation (nothing deploys,
-    nothing mutates), so auth parity is with the sibling reads, not the
-    evented mutations. 422 for a model not in the store or a staged model
-    that cannot be priced — NEVER 404: the frontend's global convention maps
-    404 to "endpoint doesn't exist yet" (``api.ts isUnavailableStatus``), and
-    a store-removal racing the UI poll must surface the server's detail, not
-    a bogus "endpoint unavailable". With no node snapshot the plan still
-    prices (``total_predicted_bytes``) but ``ok`` / ``remaining_bytes`` stay
-    null — never a verdict against a made-up number.
+    Same engine, footprint math, margin and loading-placement reservation as
+    ``/sizing``, so the two can never disagree. A pure computation — nothing
+    deploys, nothing mutates. 422 for a model not in the store or a staged
+    model that cannot be priced. With no node snapshot the plan still prices
+    (``total_predicted_bytes``) but ``ok`` / ``remaining_bytes`` stay null.
     """
     from docie_bench.serving.resources import FootprintStore
     from docie_bench.serving.sizing import (
@@ -452,7 +438,7 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
     Reads ``<serving_home>/logs/<name>.log`` on the shared volume — the same
     file the supervisor captures ``last_error`` from — so the operator can see
     WHY a deployment failed (bad endpoint, missing binary, OOM) without shell
-    access. ``last_error`` is the reconciler's one-line summary; ``lines`` is
+    access. ``last_error`` is the one-line failure summary; ``lines`` is
     the raw tail (capped). Never 500s on a missing/rotated log — an absent file
     is an empty tail, not an error.
     """
@@ -513,11 +499,10 @@ async def _fire_lifecycle_event(
 
 @router.delete("/deployments/{name}")
 async def delete_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
-    """Fire the real-teardown event (PR-1): a delete that actually deletes.
+    """Delete a deployment: stop its process, free its port, remove the record.
 
-    Handled on ``serving`` (the only process holding the Popen handle), which
-    kills the process, drops the record (freeing its port), and DELETEs the
-    placement row — the ONLY path that deletes a row.
+    Handled on the serving service (the only process that can stop the
+    runtime); also removes the deployment's observed placement row.
     """
     del tenant  # authenticated principal required; no per-tenant scoping (ops surface)
     return await _fire_lifecycle_event(name, event=DELETE_EVENT, prefix="delete")
@@ -525,12 +510,11 @@ async def delete_deployment(name: str, tenant: TenantDependency) -> dict[str, An
 
 @router.post("/deployments/{name}/load")
 async def load_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
-    """Cold-start a deployment (PR-4): fire ``serving/load.requested``.
+    """Load (start) a deployment: fire ``serving/load.requested``.
 
-    The serving-side handler is idempotent (per-deployment load lock — an
-    already-hot deployment is a no-op) and may evict LRU unpinned victims
-    when that makes the load fit. Works on manual-cold deployments too: the
-    Load button IS the explicit Start.
+    Idempotent — loading an already-running deployment is a no-op. May
+    unload least-recently-used unpinned deployments when that makes the
+    load fit. Also starts manually stopped deployments.
     """
     del tenant
     return await _fire_lifecycle_event(name, event=LOAD_EVENT, prefix="load")
@@ -538,12 +522,12 @@ async def load_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]
 
 @router.post("/deployments/{name}/unload")
 async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]:
-    """Evict a deployment (PR-4): fire ``serving/unload.requested``.
+    """Unload a deployment, keeping its configuration.
 
-    DISTINCT from stop/delete (design fix #3): the record, its port
-    reservation and its placement row all SURVIVE — the row is UPDATEd to
-    ``phase=evicted`` / ``activation=managed``, so the next request to it
-    auto-reloads instead of failing.
+    Unlike delete, the record, its port reservation and its placement row
+    all survive — the deployment is marked ``phase=evicted`` /
+    ``activation=managed``, and the next request to it reloads it
+    automatically instead of failing.
     """
     del tenant
     return await _fire_lifecycle_event(name, event=UNLOAD_EVENT, prefix="unload")
@@ -563,13 +547,13 @@ class RepairRequest(BaseModel):
 async def repair_deployment(
     name: str, request: RepairRequest, tenant: TenantDependency
 ) -> dict[str, Any]:
-    """Recover a stuck/failed deployment: fire ``serving/repair.requested``.
+    """Recover a stuck or failed deployment in place.
 
-    Redeploys the SAME launch on a (re)allocated port and resets the restart
-    budget — the fix for a deployment wedged FAILED by an EADDRINUSE bind-loop
-    (an orphan process still holding its old port) without losing the
-    deployment's config. ``port=None`` auto-picks a free port around the
-    orphan; an explicit port is honored.
+    Redeploys the same launch configuration on a (re)allocated port and
+    resets the restart counter — recovery for a deployment stuck failing to
+    bind its port (for example when another process still holds it), without
+    losing the deployment's config. ``port=None`` picks a free port
+    automatically; an explicit port is honored.
     """
     del tenant
     extra = {"port": request.port} if request.port is not None else None
@@ -586,9 +570,9 @@ class PinRequest(BaseModel):
 async def pin_deployment(
     name: str, request: PinRequest, tenant: TenantDependency
 ) -> dict[str, Any]:
-    """Set/clear a deployment's eviction shield (PR-4): never evicted while
-    pinned. An event (not an in-place write) because ``pinned`` lives in
-    ``deployments.json`` and only the serving service writes that file."""
+    # An event (not an in-place write) because ``pinned`` lives in
+    # deployments.json and only the serving service writes that file.
+    """Pin or unpin a deployment — pinned deployments are never auto-unloaded."""
     del tenant
     return await _fire_lifecycle_event(
         name, event=PIN_EVENT, prefix="pin", extra={"pinned": request.pinned}

@@ -321,7 +321,7 @@ def test_concurrent_loads_of_different_deployments_share_one_fit_budget(
             time.sleep(0.005)
         assert "alpha" in coordinator._inflight  # admitted, reservation held
 
-        with pytest.raises(LoadError, match="never evict-to-not-fit"):
+        with pytest.raises(LoadError, match="would not free enough"):
             coordinator.load("beta")
     finally:
         adapter.healthy["alpha"] = True
@@ -488,7 +488,7 @@ async def test_autoload_await_is_chunked_into_bounded_steps(serving_home: Path) 
     # against a 0.02s per-step ceiling => exactly 3 bounded chunks.
     step.memo["plan-autoload"] = ["invoice", 0.06]
 
-    with pytest.raises(TimeoutError, match="size-aware load budget"):
+    with pytest.raises(TimeoutError, match="did not become ready within"):
         await functions_module._ensure_deployment_live(
             step,
             {"deployment": "invoice"},

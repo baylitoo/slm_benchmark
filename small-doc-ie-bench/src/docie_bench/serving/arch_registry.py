@@ -147,12 +147,12 @@ def resolve_family(
         return SupportVerdict(
             "needs_family",
             DEFAULT_VISION_FAMILY,
-            f"architecture {architecture!r} is unmapped but ships an mmproj — try a "
-            "vision family (or add a contract for this arch)",
+            f"architecture {architecture!r} is not recognized but the repo ships an "
+            "mmproj projector — try a vision family",
         )
     return SupportVerdict(
         "needs_family",
         None,
-        f"architecture {architecture!r} has no family contract yet — adding support "
-        "is a small family addition (and the runtime must serve this arch)",
+        f"architecture {architecture!r} is not recognized — pick a family manually "
+        "before deploying",
     )

@@ -409,11 +409,11 @@ def compute_sizing(
         fits_now: int | None = None
         if working is None:
             detail = (
-                "unpriceable: no size_bytes in the store, the GGUF is not "
-                "readable here, and no calibration has been observed"
+                "size unknown: the store lists no size, the model file is not "
+                "readable, and no memory use has been measured yet"
             )
         elif free_effective is None:
-            detail = "no node snapshot: footprint priced, fit unknown"
+            detail = "no capacity measurement: footprint estimated, fit unknown"
         else:
             # floor of an honest (possibly negative) budget, never below 0.
             fits_now = max(free_effective // working, 0)
@@ -442,7 +442,7 @@ def compute_sizing(
         context_length=context,
         n_parallel=n_parallel,
         per_model=tuple(fits_rows),
-        detail=None if snapshot is not None else "no node snapshot published",
+        detail=None if snapshot is not None else "no capacity measurement published",
     )
 
 
@@ -496,8 +496,8 @@ def compute_whatif(
         )
         if working is None:
             raise UnpriceableModelError(
-                f"cannot price {model!r}: no size_bytes in the store, no readable "
-                f"GGUF, and no observed calibration"
+                f"cannot size {model!r}: the store lists no size, the model file "
+                f"is not readable, and no memory use has been measured yet"
             )
         items.append(
             WhatIfItem(
@@ -529,7 +529,7 @@ def compute_whatif(
         deficit_bytes=deficit,
         margin_fraction=margin_fraction,
         per_item=tuple(items),
-        detail=None if snapshot is not None else "no node snapshot published",
+        detail=None if snapshot is not None else "no capacity measurement published",
     )
 
 

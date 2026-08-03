@@ -312,8 +312,7 @@ async def event_runs(event_id: str, tenant: TenantDependency) -> Any:
 
     Benchmark runs have a durable index row (metrics + addressable artifact URIs)
     resolved here, tenant-scoped. Extraction runs have no durable row, so this
-    falls back to proxying the Inngest server's run status (the array shape the
-    Playground polling client expects).
+    falls back to proxying the Inngest server's run status.
     """
     store = default_run_store()
     if store.enabled:

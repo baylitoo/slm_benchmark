@@ -330,7 +330,7 @@ export function ComingSoon({ error }: { error?: unknown }) {
       title={isUnavailable ? "Coming soon" : "Couldn't load"}
       description={
         isUnavailable
-          ? "The backend route for this view isn't available yet. The UI is ready and will light up automatically once it ships."
+          ? "This view isn't available on this server."
           : error instanceof Error
             ? error.message
             : "Not available."

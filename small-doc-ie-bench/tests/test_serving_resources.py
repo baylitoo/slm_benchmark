@@ -652,7 +652,7 @@ def test_resources_endpoint_honest_when_snapshot_never_published() -> None:
     assert payload["observed_available"] is False
     assert payload["node"] is None
     assert payload["source"] is None
-    assert "no node snapshot published yet" in payload["detail"]
+    assert "no capacity measurement published yet" in payload["detail"]
 
 
 def test_resources_endpoint_honest_when_database_down() -> None:

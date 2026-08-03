@@ -161,10 +161,9 @@ def assess_fit(
             memory.free_bytes,
             margin,
             (
-                f"needs ~{needed} bytes (max of calibrated steady-state RSS and "
-                f"predicted weights + kv-cache + overhead + mmproj) "
-                f"but only {memory.free_bytes} free minus the {margin}-byte safety "
-                f"margin leaves {memory.free_bytes - margin} available"
+                f"needs ~{needed} bytes but only {memory.free_bytes} free minus the "
+                f"{margin}-byte safety margin leaves {memory.free_bytes - margin} "
+                f"available"
             ),
         )
     return FitDecision(True, needed, memory.free_bytes, margin, "")
@@ -400,8 +399,8 @@ class LoadCoordinator:
                 )
                 if record.state != LifecycleState.READY:
                     raise LoadError(
-                        f"deployment {name!r} did not become ready within the "
-                        f"{timeout:.0f}s size-aware load budget "
+                        f"deployment {name!r} did not become ready within "
+                        f"{timeout:.0f}s "
                         f"(state={record.state.value}, last_error={record.last_error!r})"
                     )
                 return record
@@ -459,9 +458,8 @@ class LoadCoordinator:
                 f"{decision.margin_bytes}-byte safety margin"
             )
             raise LoadError(
-                f"deployment {name!r} does not fit and eviction cannot make it "
-                f"fit (pinned/min-hot/rate-limit guards; never evict-to-not-fit): "
-                f"{detail}"
+                f"deployment {name!r} does not fit in memory, and unloading other "
+                f"deployments would not free enough: {detail}"
             )
         for victim in victims:
             logger.info(
