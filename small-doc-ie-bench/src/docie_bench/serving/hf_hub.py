@@ -336,6 +336,50 @@ async def download_snapshot(
     return destination
 
 
+async def search_models(
+    query: str, *, client: httpx.AsyncClient, limit: int = 25, gguf_only: bool = True
+) -> list[dict[str, Any]]:
+    """Search the Hub for models (server-side proxy, HF_TOKEN aware).
+
+    ``gguf_only`` filters to GGUF repos (the primary deploy path); drop it to
+    also surface safetensors (encoders). Sorted by downloads. Returns light
+    cards — verdicts are fetched per-repo on demand via :func:`inspect_repo`.
+    """
+    params: dict[str, str] = {
+        "search": query,
+        "limit": str(max(1, min(limit, 50))),
+        "sort": "downloads",
+        "direction": "-1",
+    }
+    if gguf_only:
+        params["filter"] = "gguf"
+    try:
+        response = await client.get(
+            f"{HF_BASE}/api/models", params=params, headers=hf_headers(), timeout=20.0
+        )
+    except httpx.RequestError as exc:
+        raise HfHubError(f"Hugging Face Hub is unreachable: {exc}") from exc
+    if response.status_code >= 400:
+        raise HfHubError(f"Hub search returned HTTP {response.status_code}")
+    payload = response.json()
+    if not isinstance(payload, list):
+        return []
+    cards: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        cards.append(
+            {
+                "id": str(item["id"]),
+                "downloads": item.get("downloads"),
+                "likes": item.get("likes"),
+                "gated": bool(item.get("gated")),
+                "tags": [str(t) for t in (item.get("tags") or []) if isinstance(t, str)][:12],
+            }
+        )
+    return cards
+
+
 async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
     """Pre-flight support detection for a repo — WITHOUT downloading weights.
 

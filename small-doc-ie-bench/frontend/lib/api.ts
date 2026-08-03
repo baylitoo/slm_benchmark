@@ -637,6 +637,42 @@ export interface SeedHfRequest {
   family?: string;
 }
 
+/** A Hub search result card (GET /v1/studio/hf/search). */
+export interface HfSearchCard {
+  id: string;
+  downloads?: number | null;
+  likes?: number | null;
+  gated?: boolean;
+  tags?: string[];
+}
+
+/** Pre-flight support verdict for a repo (GET /v1/studio/hf/inspect). */
+export interface HfInspect {
+  repo: string;
+  architecture?: string | null;
+  /** "supported" | "needs_family" | "unsupported". */
+  verdict: string;
+  family?: string | null;
+  reason?: string;
+  has_gguf?: boolean;
+  has_safetensors?: boolean;
+  has_mmproj?: boolean;
+  quants?: string[];
+  suggested_name?: string;
+}
+
+/** Search the Hub for deployable models (server-side proxy). */
+export function searchHf(query: string, gguf = true): Promise<HfSearchCard[]> {
+  return request<HfSearchCard[]>(
+    `/v1/studio/hf/search?query=${encodeURIComponent(query)}&gguf_only=${gguf}`,
+  );
+}
+
+/** Pre-flight support verdict + suggested family for a repo (no download). */
+export function inspectHf(repo: string): Promise<HfInspect> {
+  return request<HfInspect>(`/v1/studio/hf/inspect?repo=${encodeURIComponent(repo)}`);
+}
+
 /** Live GGUF/quant listing of a Hub repo (server-side proxy, HF_TOKEN aware). */
 export function getHfRepo(repo: string): Promise<HfRepoView> {
   return request<HfRepoView>(`/v1/studio/hf/repo?repo=${encodeURIComponent(repo)}`);

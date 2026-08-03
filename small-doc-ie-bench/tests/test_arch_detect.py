@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from docie_bench.serving.arch_registry import ARCH_TO_FAMILY, resolve_family
-from docie_bench.serving.hf_hub import inspect_repo
+from docie_bench.serving.hf_hub import inspect_repo, search_models
 from docie_bench.serving.model_store import FAMILIES
 
 # ── registry / resolution (pure) ─────────────────────────────────────────────
@@ -98,3 +98,25 @@ async def test_inspect_unknown_arch_is_needs_family() -> None:
         result = await inspect_repo("owner/exotic-GGUF", client=client)
     assert result["verdict"] == "needs_family"
     assert result["family"] is None
+
+
+async def test_search_models_returns_light_cards() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/models"
+        assert request.url.params.get("search") == "lfm2"
+        assert request.url.params.get("filter") == "gguf"
+        return httpx.Response(
+            200,
+            json=[
+                {"id": "LiquidAI/LFM2.5-350M-GGUF", "downloads": 42000, "likes": 85,
+                 "tags": ["gguf", "text-generation"]},
+                {"id": "no-id-here"},  # kept (has id)
+                {"nope": 1},  # dropped (no id)
+            ],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        cards = await search_models("lfm2", client=client, limit=10)
+    ids = [c["id"] for c in cards]
+    assert "LiquidAI/LFM2.5-350M-GGUF" in ids
+    assert cards[0]["downloads"] == 42000 and cards[0]["likes"] == 85

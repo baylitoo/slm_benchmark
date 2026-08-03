@@ -226,6 +226,23 @@ async def hf_repo_ggufs(repo: Annotated[str, Query(min_length=3)]) -> dict[str, 
     }
 
 
+@router.get("/hf/search")
+async def hf_search(
+    query: Annotated[str, Query(min_length=1)],
+    limit: Annotated[int, Query(ge=1, le=50)] = 25,
+    gguf_only: bool = True,
+) -> list[dict[str, Any]]:
+    """Search the Hub for deployable models (server-side proxy). Each card is
+    inspected on demand via /hf/inspect for its support verdict."""
+    from docie_bench.serving.hf_hub import HfHubError, search_models
+
+    try:
+        async with httpx.AsyncClient() as client:
+            return await search_models(query, client=client, limit=limit, gguf_only=gguf_only)
+    except HfHubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @router.get("/hf/inspect")
 async def hf_inspect(repo: Annotated[str, Query(min_length=3)]) -> dict[str, Any]:
     """Pre-flight support verdict for a repo — detects the architecture from the
