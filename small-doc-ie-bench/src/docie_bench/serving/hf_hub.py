@@ -366,11 +366,14 @@ async def search_models(
         return []
     cards: list[dict[str, Any]] = []
     for item in payload:
-        if not isinstance(item, dict) or not item.get("id"):
+        if not isinstance(item, dict):
+            continue
+        repo_id = item.get("id") or item.get("modelId")  # HF uses either
+        if not repo_id:
             continue
         cards.append(
             {
-                "id": str(item["id"]),
+                "id": str(repo_id),
                 "downloads": item.get("downloads"),
                 "likes": item.get("likes"),
                 "gated": bool(item.get("gated")),

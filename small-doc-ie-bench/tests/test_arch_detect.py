@@ -126,7 +126,7 @@ async def test_search_models_returns_light_cards() -> None:
             json=[
                 {"id": "LiquidAI/LFM2.5-350M-GGUF", "downloads": 42000, "likes": 85,
                  "tags": ["gguf", "text-generation"]},
-                {"id": "no-id-here"},  # kept (has id)
+                {"modelId": "owner/via-modelId-GGUF", "downloads": 10},  # id fallback
                 {"nope": 1},  # dropped (no id)
             ],
         )
@@ -135,4 +135,5 @@ async def test_search_models_returns_light_cards() -> None:
         cards = await search_models("lfm2", client=client, limit=10)
     ids = [c["id"] for c in cards]
     assert "LiquidAI/LFM2.5-350M-GGUF" in ids
+    assert "owner/via-modelId-GGUF" in ids  # HF's modelId key handled
     assert cards[0]["downloads"] == 42000 and cards[0]["likes"] == 85

@@ -1687,10 +1687,23 @@ function HfSearchSeed({
   const [submitting, setSubmitting] = useState(false);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
 
+  // A new search is a fresh start: clear any previously-selected/inspected
+  // model and its (possibly completed) seed panel, so the results list and the
+  // detail panel never get stuck on the last deploy.
+  function resetSelection() {
+    setSelected(null);
+    setInspect(null);
+    setTrigger(null);
+    setName("");
+    setFamily("");
+    setQuant("");
+  }
+
   async function runSearch(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     if (!query.trim()) return;
+    resetSelection();
     setSearching(true);
     try {
       setResults(await searchHf(query.trim(), ggufOnly));
