@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FileText,
   Fingerprint,
+  Image as ImageIcon,
   MessageSquare,
   Play,
   Send,
@@ -17,6 +18,7 @@ import {
   chatCompletion,
   embed,
   embeddingDeploymentNames,
+  visionDeploymentNames,
   getDeployments,
   getStore,
   getFamilies,
@@ -40,7 +42,7 @@ import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 
 type InputMode = "text" | "file";
-type PlaygroundMode = "extract" | "chat" | "embed";
+type PlaygroundMode = "extract" | "chat" | "vision" | "embed";
 
 const DEPLOY_POLL_MS = 4000;
 
@@ -71,6 +73,7 @@ export function Playground({ active = true }: { active?: boolean }) {
     () => embeddingDeploymentNames(store.data, families.data),
     [store.data, families.data],
   );
+  const visionNames = useMemo(() => visionDeploymentNames(store.data), [store.data]);
   // Encoders (analyzers) AND embedding models are excluded from extract/chat:
   // they don't answer chat/extraction prompts. Embedding models live in the
   // Embed mode instead.
@@ -155,9 +158,11 @@ export function Playground({ active = true }: { active?: boolean }) {
         subtitle={
           mode === "chat"
             ? "Chat directly with any live deployment."
-            : mode === "embed"
-              ? "Compute embeddings with your deployed models (RAG-ready)."
-              : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
+            : mode === "vision"
+              ? "Send an image to a vision deployment (OCR / description) — free-text answer."
+              : mode === "embed"
+                ? "Compute embeddings with your deployed models (RAG-ready)."
+                : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
         }
         actions={
           <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
@@ -165,6 +170,7 @@ export function Playground({ active = true }: { active?: boolean }) {
               [
                 ["extract", "Extract", Sparkles],
                 ["chat", "Chat", MessageSquare],
+                ["vision", "Vision", ImageIcon],
                 ["embed", "Embed", Fingerprint],
               ] as [PlaygroundMode, string, typeof Sparkles][]
             ).map(([m, label, Icon]) => (
@@ -191,6 +197,12 @@ export function Playground({ active = true }: { active?: boolean }) {
           extraction stream or a chat history survives switching modes. */}
       <div hidden={mode !== "chat"}>
         <ChatPanel deployments={deployments} selectable={selectable} />
+      </div>
+      <div hidden={mode !== "vision"}>
+        <VisionPanel
+          deployments={deployments.data ?? []}
+          visionNames={visionNames}
+        />
       </div>
       <div hidden={mode !== "embed"}>
         <EmbedPanel
@@ -503,6 +515,198 @@ function ChatPanel({
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Vision mode — send an image to a vision deployment (lfm2_vl / nuextract3 /
+// vision_ocr) as an OpenAI multimodal chat request; the answer is free text
+// (OCR, description, caption). Closes the deploy→use loop for vision models.
+// ---------------------------------------------------------------------------
+
+const VISION_PRESETS = [
+  "Extract all the text from this document (OCR).",
+  "Describe this image in detail.",
+  "What is written in this document? Return it verbatim.",
+];
+
+function VisionPanel({
+  deployments,
+  visionNames,
+}: {
+  deployments: DeploymentRecord[];
+  visionNames: Set<string>;
+}) {
+  const liveVision = useMemo(
+    () =>
+      deployments.filter(
+        (d) => d.spec?.name && visionNames.has(d.spec.name) && isLiveDeployment(d),
+      ),
+    [deployments, visionNames],
+  );
+  const names = useMemo(
+    () => liveVision.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [liveVision],
+  );
+
+  const [model, setModel] = useState("");
+  const [prompt, setPrompt] = useState(VISION_PRESETS[0]);
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [answer, setAnswer] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (names.length === 0) {
+      if (model !== "") setModel("");
+      return;
+    }
+    if (!names.includes(model)) setModel(names[0]);
+  }, [names, model]);
+
+  function onFile(f: File | null) {
+    setFile(f);
+    setAnswer(null);
+    if (preview) URL.revokeObjectURL(preview);
+    setPreview(f ? URL.createObjectURL(f) : null);
+  }
+
+  async function run() {
+    if (!model) {
+      setError("No live vision deployment — deploy a vision model (family lfm2_vl / vision_ocr).");
+      return;
+    }
+    if (!file) {
+      setError("Choose an image or PDF first.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    setAnswer(null);
+    try {
+      const b64 = await fileToBase64(file);
+      const dataUri = `data:${file.type || "image/png"};base64,${b64}`;
+      const res = await chatCompletion(model, [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt.trim() || "Describe this image." },
+            { type: "image_url", image_url: { url: dataUri } },
+          ],
+        },
+      ]);
+      setAnswer(res.choices?.[0]?.message?.content ?? "(empty response)");
+    } catch (e) {
+      setError(
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Vision request failed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card
+      icon={<ImageIcon className="h-5 w-5" />}
+      title="Vision"
+      subtitle="Upload an image, ask a question — the vision deployment answers in free text (OCR / description)."
+    >
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="space-y-4">
+          <Field
+            label="Vision deployment"
+            hint="Deploy a vision model (Serving → Models: family lfm2_vl / nuextract3 / vision_ocr)."
+          >
+            {names.length === 0 ? (
+              <p className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                No live vision deployment — add one under Serving → Models, then Deploy it.
+              </p>
+            ) : (
+              <Select value={model} onChange={(e) => setModel(e.target.value)}>
+                {names.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </Select>
+            )}
+          </Field>
+
+          <Field label="Image / document" hint="PNG, JPG or PDF — encoded in your browser.">
+            <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-muted/30 px-4 py-6 text-center transition hover:border-accent hover:bg-muted/50">
+              <Upload className="h-6 w-6 text-muted-foreground" />
+              <span className="text-sm text-foreground">
+                {file ? file.name : "Click to choose an image or PDF"}
+              </span>
+              <input
+                type="file"
+                accept=".pdf,image/*"
+                onChange={(e) => onFile(e.target.files?.[0] ?? null)}
+                className="sr-only"
+              />
+            </label>
+          </Field>
+
+          {preview && (
+            <img
+              src={preview}
+              alt="preview"
+              className="max-h-56 w-full rounded-md border border-border object-contain"
+            />
+          )}
+
+          <Field label="Prompt">
+            <TextArea rows={2} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
+          </Field>
+          <div className="flex flex-wrap gap-1.5">
+            {VISION_PRESETS.map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => setPrompt(p)}
+                className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+              >
+                {p.length > 32 ? `${p.slice(0, 32)}…` : p}
+              </button>
+            ))}
+          </div>
+
+          {error && (
+            <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              {error}
+            </p>
+          )}
+
+          <Button type="button" loading={busy} disabled={!model || !file} onClick={() => void run()}>
+            <Play className="h-4 w-4" />
+            Run
+          </Button>
+        </div>
+
+        <div>
+          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Answer
+          </p>
+          {busy ? (
+            <p className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Spinner /> The vision model is reading the image… (CPU vision is slow)
+            </p>
+          ) : answer != null ? (
+            <pre className="scroll-thin max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-sm leading-relaxed text-foreground/90">
+              {answer}
+            </pre>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Pick a vision deployment, upload an image, and run to see the answer.
+            </p>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 // Embed mode — local embeddings + cosine similarity (RAG demo). Vectors are
 // computed on this node; nothing leaves the infra.
 // ---------------------------------------------------------------------------

@@ -901,6 +901,18 @@ export function embeddingDeploymentNames(
   );
 }
 
+/**
+ * Deployment names that are VISION models: a store entry with vision=true
+ * (lfm2_vl / nuextract3 / vision_ocr families). The deployment record carries
+ * no vision flag, so this cross-references the store catalog. A store entry's
+ * name equals its store-deployed deployment name.
+ */
+export function visionDeploymentNames(
+  store: StoreEntry[] | null | undefined,
+): Set<string> {
+  return new Set((store ?? []).filter((e) => e.vision).map((e) => e.name));
+}
+
 /** One embedding vector from GET-shaped /v1/embeddings response. */
 export interface EmbeddingResponse {
   data?: { index?: number; embedding?: number[] }[];
