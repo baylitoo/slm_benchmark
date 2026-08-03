@@ -226,6 +226,21 @@ async def hf_repo_ggufs(repo: Annotated[str, Query(min_length=3)]) -> dict[str, 
     }
 
 
+@router.get("/hf/inspect")
+async def hf_inspect(repo: Annotated[str, Query(min_length=3)]) -> dict[str, Any]:
+    """Pre-flight support verdict for a repo — detects the architecture from the
+    Hub's metadata (no download) and resolves it to a family + verdict
+    (supported / needs_family / unsupported). Backs a Deploy button that
+    already knows whether the platform can serve the model."""
+    from docie_bench.serving.hf_hub import HfHubError, inspect_repo
+
+    try:
+        async with httpx.AsyncClient() as client:
+            return await inspect_repo(repo, client=client)
+    except HfHubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @router.get("/hf/collection")
 async def hf_collection(slug: Annotated[str, Query(min_length=3)]) -> dict[str, Any]:
     """A provider-curated HF collection's model repos (seed-a-collection picker)."""

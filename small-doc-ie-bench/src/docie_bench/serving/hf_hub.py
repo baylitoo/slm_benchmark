@@ -336,6 +336,110 @@ async def download_snapshot(
     return destination
 
 
+async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
+    """Pre-flight support detection for a repo — WITHOUT downloading weights.
+
+    Reads the architecture from the Hub's parsed metadata (the ``gguf`` block
+    for GGUF repos: ``general.architecture`` + chat template; else the model
+    ``config``'s ``model_type``/``architectures``; else the raw ``config.json``),
+    detects modality signals (GGUF / safetensors / mmproj), and resolves them to
+    a family + a verdict via :mod:`docie_bench.serving.arch_registry`.
+
+    Returns a dict the Studio renders into a Deploy button state:
+    ``{repo, architecture, verdict, family, reason, has_gguf, has_safetensors,
+    has_mmproj, quants, suggested_name}``.
+    """
+    from docie_bench.serving.arch_registry import resolve_family
+
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        raise HfHubError(f"invalid Hugging Face repo id {repo!r} (expected owner/name)")
+    url = f"{HF_BASE}/api/models/{repo}?blobs=true"
+    try:
+        response = await client.get(url, headers=hf_headers(), timeout=20.0)
+    except httpx.RequestError as exc:
+        raise HfHubError(f"Hugging Face Hub is unreachable: {exc}") from exc
+    if response.status_code == 404:
+        raise HfHubError(f"repo {repo!r} does not exist on the Hugging Face Hub")
+    if response.status_code in (401, 403):
+        raise HfHubError(f"repo {repo!r} was refused by the Hub — check the id or set HF_TOKEN")
+    if response.status_code >= 400:
+        raise HfHubError(f"Hub returned HTTP {response.status_code} for {repo!r}")
+    payload = response.json()
+
+    siblings = [s for s in payload.get("siblings", []) if isinstance(s, dict)]
+    ggufs = [g for s in siblings if (g := _gguf_from_sibling(s)) is not None]
+    has_gguf = bool(ggufs)
+    has_safetensors = any(
+        str(s.get("rfilename", "")).endswith(".safetensors") for s in siblings
+    )
+    has_mmproj = any(g.is_mmproj for g in ggufs)
+
+    architecture = _extract_architecture(payload)
+    if architecture is None and has_safetensors:
+        architecture = await _config_architecture(repo, client)
+
+    result = resolve_family(
+        architecture,
+        has_gguf=has_gguf,
+        has_safetensors=has_safetensors,
+        has_mmproj=has_mmproj,
+    )
+    return {
+        "repo": repo,
+        "architecture": architecture,
+        "verdict": result.verdict,
+        "family": result.family,
+        "reason": result.reason,
+        "has_gguf": has_gguf,
+        "has_safetensors": has_safetensors,
+        "has_mmproj": has_mmproj,
+        "quants": sorted(
+            {g.quant for g in ggufs if g.quant and not g.is_mmproj and not g.is_multipart}
+        ),
+        "suggested_name": default_store_name(repo),
+    }
+
+
+def _extract_architecture(payload: dict[str, Any]) -> str | None:
+    """Architecture from the Hub model-info payload (gguf block, then config)."""
+    gguf = payload.get("gguf")
+    if isinstance(gguf, dict) and gguf.get("architecture"):
+        return str(gguf["architecture"])
+    config = payload.get("config")
+    if isinstance(config, dict):
+        if config.get("model_type"):
+            return str(config["model_type"])
+        archs = config.get("architectures")
+        if isinstance(archs, list) and archs:
+            return str(archs[0])
+    return None
+
+
+async def _config_architecture(repo: str, client: httpx.AsyncClient) -> str | None:
+    """Fallback: read model_type/architectures from the raw config.json."""
+    url = f"{HF_BASE}/{repo}/resolve/main/config.json"
+    try:
+        response = await client.get(
+            url, headers=hf_headers(), follow_redirects=True, timeout=15.0
+        )
+    except httpx.RequestError:
+        return None
+    if response.status_code >= 400:
+        return None
+    try:
+        config = response.json()
+    except ValueError:
+        return None
+    if not isinstance(config, dict):
+        return None
+    if config.get("model_type"):
+        return str(config["model_type"])
+    archs = config.get("architectures")
+    if isinstance(archs, list) and archs:
+        return str(archs[0])
+    return None
+
+
 async def list_collection(slug: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
     """A HF collection's model repos (``owner/slug-hash`` or its full URL).
 
