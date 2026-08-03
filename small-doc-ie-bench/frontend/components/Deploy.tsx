@@ -820,7 +820,7 @@ function RepairControls({
           loading={repairing}
           disabled={disabled}
           onClick={() => onRepair(null)}
-          title="Redeploy on an automatically-allocated free port (resets the restart budget)"
+          title="Redeploy on an automatically-allocated free port (resets the restart counter)"
         >
           <RefreshCw className="h-3.5 w-3.5" />
           Reallocate port (auto)
@@ -1330,7 +1330,7 @@ function DeployForm({
               {isEncoderEntry
                 ? "Encoder checkpoint — served by the encoder runtime automatically (Auto)."
                 : backends.length > 0
-                  ? "Backends are scoped to this model (from its store entry's available_backends)."
+                  ? "Backends compatible with this model, from its store entry."
                   : "This model lists no explicit backends — Auto lets the server choose."}
             </p>
           </div>
@@ -1664,6 +1664,10 @@ function verdictTone(verdict: string | undefined): BadgeTone {
   return verdict === "supported" ? "ok" : verdict === "needs_family" ? "warn" : "err";
 }
 
+function verdictLabel(verdict: string | undefined): string {
+  return verdict === "needs_family" ? "needs a family" : (verdict ?? "unknown");
+}
+
 function HfSearchSeed({
   families,
   onSeeded,
@@ -1854,7 +1858,7 @@ function HfSearchSeed({
               <div className="space-y-3">
                 <p className="truncate text-sm font-medium text-foreground">{inspect.repo}</p>
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <Badge tone={verdictTone(inspect.verdict)}>{inspect.verdict}</Badge>
+                  <Badge tone={verdictTone(inspect.verdict)}>{verdictLabel(inspect.verdict)}</Badge>
                   {inspect.architecture && (
                     <Badge tone="neutral">arch: {inspect.architecture}</Badge>
                   )}

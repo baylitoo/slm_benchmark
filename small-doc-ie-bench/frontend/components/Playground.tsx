@@ -154,9 +154,9 @@ export function Playground({ active = true }: { active?: boolean }) {
         title="Playground"
         subtitle={
           mode === "chat"
-            ? "Classic queries: chat directly with any live deployment."
+            ? "Chat directly with any live deployment."
             : mode === "embed"
-              ? "Embeddings computed locally — vectors never leave the infra (RAG-ready)."
+              ? "Compute embeddings with your deployed models (RAG-ready)."
               : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
         }
         actions={
@@ -373,7 +373,7 @@ function ChatPanel({
     const text = input.trim();
     if (!text || busy) return;
     if (!model) {
-      setError("No live deployment selected — deploy a model in the Deploy tab first.");
+      setError("No live deployment selected — deploy a model under Serving → Models first.");
       return;
     }
     setError(null);
@@ -410,7 +410,7 @@ function ChatPanel({
         <div className="grid gap-4 sm:grid-cols-2">
           <Field
             label="Deployment"
-            hint="Live deployments only — evicted ones need a Load from the Deploy tab first."
+            hint="Live deployments only — load evicted ones from Serving → Deployments first."
           >
             <DeploymentSelect
               deployments={deployments}
@@ -642,8 +642,7 @@ function EmbedPanel({
               </pre>
             </div>
             <p className="text-xs text-muted-foreground">
-              Both vectors were computed by the local deployment — the text
-              never left this node.
+              Both vectors were computed by the selected deployment.
             </p>
           </div>
         )}
@@ -694,7 +693,7 @@ function DeploymentSelect({
   if (selectable.length === 0) {
     return (
       <p className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        No routable deployments — deploy one in the Deploy tab. The server
+        No routable deployments — deploy one under Serving → Models. The server
         default will be used.
       </p>
     );

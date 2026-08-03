@@ -64,7 +64,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
     } catch (err) {
       const msg =
         err instanceof ApiUnavailable
-          ? "The benchmark endpoint isn't available yet — this UI is ready for when it ships."
+          ? "Benchmarking isn't available on this server."
           : err instanceof ApiError
             ? err.message
             : err instanceof Error
@@ -319,7 +319,7 @@ function ResultsSummary({
   if (recent.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
-        No runs yet. Start one on the left — it&apos;ll appear here and under Results.
+        No runs yet. Start one with the form — it&apos;ll appear here and under Results.
       </p>
     );
   }

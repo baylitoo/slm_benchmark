@@ -364,7 +364,7 @@ def test_load_fails_honestly_after_the_size_aware_timeout(tmp_path: Path) -> Non
         sleep=lambda seconds: None,
         timeout_for=lambda model: 0.0,  # expire immediately: no real waiting
     )
-    with pytest.raises(LoadError, match="size-aware load budget"):
+    with pytest.raises(LoadError, match="did not become ready within"):
         coordinator.load("invoice")
 
 
@@ -597,7 +597,7 @@ def test_load_that_cannot_fit_evicts_nothing_and_raises(tmp_path: Path) -> None:
         max_evictions=10,
         sleep=lambda seconds: None,
     )
-    with pytest.raises(LoadError, match="never evict-to-not-fit"):
+    with pytest.raises(LoadError, match="would not free enough"):
         coordinator.load("gamma")
 
     assert supervisor.get("alpha").state == LifecycleState.READY  # NOT evicted
@@ -779,7 +779,7 @@ async def test_await_deployment_live_times_out_honestly(serving_home: Path) -> N
     supervisor.deploy(_spec())
     supervisor.unload("invoice")  # nothing will ever load it in this test
 
-    with pytest.raises(TimeoutError, match="size-aware load budget"):
+    with pytest.raises(TimeoutError, match="did not become ready within"):
         await _await_deployment_live("invoice", timeout_s=0.05, interval_s=0.01)
 
 

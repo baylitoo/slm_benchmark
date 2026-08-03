@@ -230,8 +230,7 @@ async def _await_deployment_live(
         return outcome
     detail = outcome.get("last_error")
     raise TimeoutError(
-        f"deployment {name!r} did not become ready within the "
-        f"{timeout_s:.0f}s size-aware load budget"
+        f"deployment {name!r} did not become ready within {timeout_s:.0f}s"
         + (f" (last_error: {detail})" if detail else "")
     )
 
@@ -288,8 +287,7 @@ async def _ensure_deployment_live(
         index += 1
     detail = (last or {}).get("last_error")
     raise TimeoutError(
-        f"deployment {target!r} did not become ready within the "
-        f"{budget_s:.0f}s size-aware load budget"
+        f"deployment {target!r} did not become ready within {budget_s:.0f}s"
         + (f" (last_error: {detail})" if detail else "")
     )
 

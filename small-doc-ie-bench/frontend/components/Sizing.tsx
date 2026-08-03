@@ -109,12 +109,12 @@ function CapacityBar({ data }: { data: SizingView | null }) {
     <Card
       icon={<Gauge className="h-5 w-5" />}
       title="Capacity"
-      subtitle="Node RAM as the serving reconciler measured it last cycle."
+      subtitle="Node RAM as measured on the last refresh cycle."
       actions={
         <div className="flex items-center gap-2">
           {soft && (
             <Badge tone="warn">
-              <AlertTriangle className="h-3 w-3" /> soft numbers (VM view — no cgroup limit)
+              <AlertTriangle className="h-3 w-3" /> approximate (VM-level view)
             </Badge>
           )}
           {node?.reclaimable_bytes != null && node.reclaimable_bytes > 0 && (
@@ -127,8 +127,7 @@ function CapacityBar({ data }: { data: SizingView | null }) {
     >
       {!segments ? (
         <p className="text-sm text-muted-foreground">
-          No node snapshot yet — the capacity bar appears once the serving reconciler
-          publishes one.
+          No capacity reading yet — the bar appears once the server publishes one.
         </p>
       ) : (
         <div>
@@ -192,12 +191,11 @@ function CapacityBar({ data }: { data: SizingView | null }) {
             </p>
           )}
           <p className="mt-2 text-xs text-muted-foreground">
-            Free is the measured number (hot deployments&apos; RSS is already inside
-            &quot;used&quot; — never double-counted; models still loading reserve only
-            their not-yet-resident remainder). Margin is an explicit{" "}
-            {Math.round((data?.assumptions?.margin_fraction ?? 0) * 100)}% of total held
-            back before pricing anything new — the same margin the deploy path&apos;s
-            fit gate enforces.
+            Free is measured directly: running models count toward &quot;used&quot;, and
+            models still loading reserve only the part not yet in memory. Margin is an
+            explicit {Math.round((data?.assumptions?.margin_fraction ?? 0) * 100)}% of
+            total held back before anything new is sized — the same margin enforced at
+            deploy time.
           </p>
         </div>
       )}
@@ -280,9 +278,9 @@ function FitTable({ sizing }: { sizing: ReturnType<typeof usePolling<SizingView>
         ) : (
           <span
             className="text-xs text-muted-foreground"
-            title={m.detail ?? "unpriceable"}
+            title={m.detail ?? "size unknown"}
           >
-            unpriceable
+            size unknown
           </span>
         ),
     },
@@ -415,7 +413,7 @@ function WhatIf({ data }: { data: SizingView | null }) {
     <Card
       icon={<Scale className="h-5 w-5" />}
       title="What if…"
-      subtitle="Stage a deployment mix — the server prices it with the fit gate's footprint math and margin."
+      subtitle="Stage a deployment mix — the server sizes it with the same footprint math and margin used at deploy time."
     >
       <div className="space-y-3">
         {staged.length === 0 && (
