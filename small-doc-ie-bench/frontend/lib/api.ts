@@ -628,6 +628,11 @@ export function scaleStoreModel(name: string, replicas: number): Promise<ScaleRe
   );
 }
 
+/** Extraction schema names available for structured output (GET /v1/schemas). */
+export function listSchemas(): Promise<string[]> {
+  return request<{ schemas: string[] }>("/v1/schemas").then((r) => r.schemas ?? []);
+}
+
 /** Seed the store from a local Ollama/HF reference. Returns a trigger to stream. */
 export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/seed-ollama", {

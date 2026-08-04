@@ -21,6 +21,9 @@ import {
   ShieldCheck,
   Trash2,
   Wand2,
+  Eye,
+  Sparkles,
+  FileText,
 } from "lucide-react";
 import {
   ApiError,
@@ -36,8 +39,10 @@ import {
   getDeployments,
   getStore,
   isLiveDeployment,
+  listSchemas,
   selectableDeployments,
   updateAgent,
+  visionDeploymentNames,
   type AgentChatResponse,
   type AgentKind,
   type AgentTemplate,
@@ -45,10 +50,39 @@ import {
   type StoreEntry,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
+import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
 import { Badge, Button, Card, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
 import { Table, type Column } from "./patterns/Table";
+
+// The three document-extraction stages an "ocr" agent can run. Persisted as
+// options.mode; the UI is a picker over these.
+const STAGE_MODES: {
+  id: "ocr" | "ocr_extract" | "vision";
+  label: string;
+  desc: string;
+  icon: React.ReactNode;
+}[] = [
+  {
+    id: "ocr",
+    label: "Plain OCR",
+    desc: "Image → text. An OCR engine returns the document's text.",
+    icon: <FileText className="h-4 w-4" />,
+  },
+  {
+    id: "ocr_extract",
+    label: "OCR → extract",
+    desc: "OCR the image, then an LLM pulls structured JSON from the text.",
+    icon: <ScanText className="h-4 w-4" />,
+  },
+  {
+    id: "vision",
+    label: "Vision → structured",
+    desc: "Image straight to a vision model that generates JSON — no OCR step.",
+    icon: <Eye className="h-4 w-4" />,
+  },
+];
 
 // Fallback when the templates endpoint hasn't provided the entity list yet.
 const PII_ENTITIES = [
@@ -67,7 +101,7 @@ const GUARD_TASKS = ["prompt_safety", "prompt_toxicity", "jailbreak_detection"];
 
 const KIND_META: Record<AgentKind, { label: string; icon: React.ReactNode }> = {
   proxy_security: { label: "Security proxy", icon: <ShieldCheck className="h-5 w-5" /> },
-  ocr: { label: "OCR", icon: <ScanText className="h-5 w-5" /> },
+  ocr: { label: "Document extraction", icon: <ScanText className="h-5 w-5" /> },
   custom: { label: "Custom", icon: <Wand2 className="h-5 w-5" /> },
 };
 
@@ -625,6 +659,21 @@ function CreateView({
   const [ocrBackend, setOcrBackend] = useState("tesseract");
   const [ocrLanguage, setOcrLanguage] = useState("");
   const [ocrExtractor, setOcrExtractor] = useState("");
+  // Staged document-extraction mode: plain OCR | OCR→LLM | vision→structured.
+  const [ocrMode, setOcrMode] = useState<"ocr" | "ocr_extract" | "vision">("ocr");
+  const [visionModel, setVisionModel] = useState("");
+  const [schemaName, setSchemaName] = useState("");
+
+  // Vision deployments (store family flagged vision) — the model picker for the
+  // vision→structured stage.
+  const visionModels = useMemo(() => {
+    const visionSet = visionDeploymentNames(store.data);
+    return selectableDeployments(deployments.data ?? [])
+      .map((d) => d.spec?.name)
+      .filter((n): n is string => !!n && visionSet.has(n));
+  }, [deployments.data, store.data]);
+  // Extraction schemas available for structured output (GET /v1/schemas).
+  const schemas = useAsync<string[]>(listSchemas, []);
 
   const template = templates.find((t) => t.id === templateId) ?? null;
   const kind: AgentKind = template?.kind ?? "custom";
@@ -663,6 +712,18 @@ function CreateView({
     if (typeof o.backend === "string") setOcrBackend(o.backend);
     setOcrLanguage(typeof o.language === "string" ? o.language : "");
     setOcrExtractor(typeof o.extractor === "string" ? o.extractor : "");
+    setVisionModel(typeof o.vision_model === "string" ? o.vision_model : "");
+    setSchemaName(typeof o.schema === "string" ? o.schema : "");
+    // Back-compat: an agent saved before `mode` derives it — extractor → the
+    // OCR→LLM pipeline, otherwise plain OCR.
+    const savedMode = o.mode;
+    setOcrMode(
+      savedMode === "vision" || savedMode === "ocr_extract" || savedMode === "ocr"
+        ? savedMode
+        : typeof o.extractor === "string" && o.extractor
+          ? "ocr_extract"
+          : "ocr",
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editAgent]);
 
@@ -692,11 +753,25 @@ function CreateView({
                   : null,
             }
           : kind === "ocr"
-            ? {
-                backend: ocrBackend,
-                language: ocrLanguage || null,
-                extractor: ocrExtractor || null,
-              }
+            ? ocrMode === "vision"
+              ? {
+                  mode: "vision",
+                  vision_model: visionModel || null,
+                  schema: schemaName || null,
+                }
+              : ocrMode === "ocr_extract"
+                ? {
+                    mode: "ocr_extract",
+                    backend: ocrBackend,
+                    language: ocrLanguage || null,
+                    extractor: ocrExtractor || null,
+                    schema: schemaName || null,
+                  }
+                : {
+                    mode: "ocr",
+                    backend: ocrBackend,
+                    language: ocrLanguage || null,
+                  }
             : {};
       if (editing && editAgent) {
         await updateAgent(editAgent.name, {
@@ -992,45 +1067,147 @@ function CreateView({
           )}
 
           {kind === "ocr" && (
-            <Card title="OCR options" subtitle="Engine, language, and optional structured extractor.">
+            <Card
+              title="Extraction pipeline"
+              subtitle="Choose how a document becomes output — plain text, OCR→LLM, or vision→structured."
+            >
               <div className="space-y-4">
-                <Field label="OCR backend" htmlFor="agent-ocr-backend">
-                  <Select
-                    id="agent-ocr-backend"
-                    value={ocrBackend}
-                    onChange={(e) => setOcrBackend(e.target.value)}
+                {/* Stage selector */}
+                <div className="grid gap-2 sm:grid-cols-3">
+                  {STAGE_MODES.map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => setOcrMode(m.id)}
+                      className={cn(
+                        "flex flex-col gap-1 rounded-lg border p-3 text-left transition",
+                        ocrMode === m.id
+                          ? "border-accent bg-accent/10 ring-1 ring-accent"
+                          : "border-border hover:bg-muted",
+                      )}
+                    >
+                      <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+                        {m.icon} {m.label}
+                      </span>
+                      <span className="text-xs text-muted-foreground">{m.desc}</span>
+                    </button>
+                  ))}
+                </div>
+
+                {/* OCR engine + language — the OCR-based stages */}
+                {ocrMode !== "vision" && (
+                  <>
+                    <Field label="OCR engine" htmlFor="agent-ocr-backend">
+                      <Select
+                        id="agent-ocr-backend"
+                        value={ocrBackend}
+                        onChange={(e) => setOcrBackend(e.target.value)}
+                      >
+                        <option value="tesseract">tesseract</option>
+                        <option value="pdf_text">pdf_text — embedded PDF text</option>
+                        <option value="paddleocr">paddleocr — needs the paddle extra</option>
+                      </Select>
+                    </Field>
+                    <Field
+                      label="Language"
+                      htmlFor="agent-ocr-language"
+                      hint="Engine-specific, e.g. en / fr. Empty = default."
+                    >
+                      <TextInput
+                        id="agent-ocr-language"
+                        value={ocrLanguage}
+                        onChange={(e) => setOcrLanguage(e.target.value)}
+                        placeholder="en"
+                      />
+                    </Field>
+                  </>
+                )}
+
+                {/* Extractor — the OCR→LLM stage */}
+                {ocrMode === "ocr_extract" && (
+                  <Field
+                    label="Extractor model"
+                    htmlFor="agent-ocr-extractor"
+                    hint="A chat deployment (e.g. NuExtract) that turns the OCR text into JSON."
                   >
-                    <option value="tesseract">tesseract</option>
-                    <option value="paddleocr">paddleocr</option>
-                    <option value="pdf_text">pdf_text</option>
-                  </Select>
-                </Field>
-                <Field label="Language" htmlFor="agent-ocr-language" hint="Backend-specific, e.g. en / fr. Empty = default.">
-                  <TextInput
-                    id="agent-ocr-language"
-                    value={ocrLanguage}
-                    onChange={(e) => setOcrLanguage(e.target.value)}
-                    placeholder="en"
-                  />
-                </Field>
-                <Field
-                  label="Extractor"
-                  htmlFor="agent-ocr-extractor"
-                  hint="Optional chat deployment (e.g. NuExtract) — turns OCR into an OCR→SLM extraction pipeline."
-                >
-                  <Select
-                    id="agent-ocr-extractor"
-                    value={ocrExtractor}
-                    onChange={(e) => setOcrExtractor(e.target.value)}
+                    <Select
+                      id="agent-ocr-extractor"
+                      value={ocrExtractor}
+                      onChange={(e) => setOcrExtractor(e.target.value)}
+                    >
+                      <option value="">Select a chat model…</option>
+                      {chatDeployments.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                )}
+
+                {/* Vision model — the direct vision→structured stage */}
+                {ocrMode === "vision" && (
+                  <Field
+                    label="Vision model"
+                    htmlFor="agent-vision-model"
+                    hint="A deployed vision model (NuExtract, Gemma, LFM2-VL…). The image goes straight to it."
                   >
-                    <option value="">None — OCR text only</option>
-                    {chatDeployments.map((n) => (
-                      <option key={n} value={n}>
-                        {n}
+                    <Select
+                      id="agent-vision-model"
+                      value={visionModel}
+                      onChange={(e) => setVisionModel(e.target.value)}
+                    >
+                      <option value="">Select a vision model…</option>
+                      {visionModels.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </Select>
+                    {visionModels.length === 0 && (
+                      <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                        No vision model deployed — deploy one from Models first.
+                      </p>
+                    )}
+                  </Field>
+                )}
+
+                {/* Output schema — structured stages */}
+                {ocrMode !== "ocr" && (
+                  <Field
+                    label="Output schema"
+                    htmlFor="agent-schema"
+                    hint={
+                      ocrMode === "vision"
+                        ? "Grammar-constrains the JSON (llama.cpp GBNF)."
+                        : "Optional — constrains the LLM to this schema."
+                    }
+                  >
+                    <Select
+                      id="agent-schema"
+                      value={schemaName}
+                      onChange={(e) => setSchemaName(e.target.value)}
+                    >
+                      <option value="">
+                        {ocrMode === "vision" ? "Free text (no schema)" : "None — model decides"}
                       </option>
-                    ))}
-                  </Select>
-                </Field>
+                      {(schemas.data ?? []).map((s) => (
+                        <option key={s} value={s}>
+                          {s}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                )}
+
+                {ocrMode === "vision" && (
+                  <p className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                    <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    Structured output needs a model whose runtime enforces a schema
+                    (llama.cpp GBNF / vLLM). A NuExtract model here runs via generic
+                    grammar, not its bespoke chat-template path.
+                  </p>
+                )}
               </div>
             </Card>
           )}
