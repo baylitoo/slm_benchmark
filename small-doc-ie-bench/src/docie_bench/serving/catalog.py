@@ -720,6 +720,21 @@ class ModelCatalog:
             row = self._placement_row_for_model(session, model_name)
             return _placement_view(row) if row is not None else None
 
+    def list_placements_for_model(self, model_name: str) -> list[dict[str, Any]]:
+        """ALL placements serving store model ``model_name`` (its scaled
+        replicas), freshest first. The load-balancing resolver picks one live
+        replica per request; a single-instance model returns one row exactly as
+        before."""
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            rows = session.scalars(
+                select(ModelPlacement)
+                .where(ModelPlacement.model_name == model_name)
+                .order_by(ModelPlacement.updated_at.desc())
+            ).all()
+            return [_placement_view(row) for row in rows]
+
     @staticmethod
     def _placement_row_for_model(session: Session, model_name: str) -> ModelPlacement | None:
         return session.scalars(

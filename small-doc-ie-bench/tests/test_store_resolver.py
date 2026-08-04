@@ -157,6 +157,87 @@ def test_api_resolve_profile_store_maps_error_to_http(_sqlite_catalog: None) -> 
     assert not_ready.value.status_code == 409
 
 
+# ── PR-C: load-balancing across scaled replicas ─────────────────────────────
+
+
+def _place_replica(
+    record_name: str,
+    model_name: str,
+    *,
+    endpoint: str,
+    state: str = "ready",
+    engine: str = "llama-server",
+) -> None:
+    """A placement row whose RECORD name differs from its MODEL name — i.e. a
+    scaled replica (control_plane names replicas <base>-2/-3 but keeps
+    model_name=<base>)."""
+    ModelCatalog().record_placement(
+        record_name,
+        model_name=model_name,
+        engine=engine,
+        endpoint=endpoint,
+        state=state,
+    )
+
+
+def test_resolve_load_balances_across_ready_replicas(_sqlite_catalog: None) -> None:
+    _seed("qwen", family="openai_chat")
+    _place_replica("qwen", "qwen", endpoint="http://worker:8091/v1")
+    _place_replica("qwen-2", "qwen", endpoint="http://worker:8092/v1")
+    _place_replica("qwen-3", "qwen", endpoint="http://worker:8093/v1")
+
+    # A deterministic chooser (sorted by name) reaches every replica across the
+    # three indices — proving all live replicas are candidates.
+    seen = set()
+    for idx in (0, 1, 2):
+        profile = resolve_store_profile(
+            "qwen",
+            chooser=lambda xs, _i=idx: sorted(xs, key=lambda p: p["name"])[_i],
+        )
+        # Every replica answers to the same routable model id (the base alias).
+        assert profile.model == "qwen"
+        seen.add(profile.base_url)
+    assert seen == {
+        "http://worker:8091/v1",
+        "http://worker:8092/v1",
+        "http://worker:8093/v1",
+    }
+
+
+def test_resolve_only_balances_over_ready_replicas(_sqlite_catalog: None) -> None:
+    _seed("qwen", family="openai_chat")
+    _place_replica("qwen", "qwen", endpoint="http://worker:8091/v1", state="starting")
+    _place_replica("qwen-2", "qwen", endpoint="http://worker:8092/v1", state="ready")
+
+    def chooser(candidates):  # the chooser must only ever see the ready replica
+        assert [p["name"] for p in candidates] == ["qwen-2"]
+        return candidates[0]
+
+    profile = resolve_store_profile("qwen", chooser=chooser)
+    assert profile.base_url == "http://worker:8092/v1"
+
+
+def test_resolve_single_replica_is_unchanged(_sqlite_catalog: None) -> None:
+    _seed("qwen", family="openai_chat")
+    _place_replica("qwen", "qwen", endpoint="http://worker:8091/v1")
+
+    # One live replica: the chooser is never consulted (would raise if it were).
+    def boom(_candidates):
+        raise AssertionError("chooser must not run for a single replica")
+
+    profile = resolve_store_profile("qwen", chooser=boom)
+    assert profile.base_url == "http://worker:8091/v1"
+
+
+def test_resolve_all_replicas_not_ready_raises(_sqlite_catalog: None) -> None:
+    _seed("qwen", family="openai_chat")
+    _place_replica("qwen", "qwen", endpoint="http://worker:8091/v1", state="starting")
+    _place_replica("qwen-2", "qwen", endpoint="http://worker:8092/v1", state="loading")
+
+    with pytest.raises(PlacementNotReadyError):
+        resolve_store_profile("qwen")
+
+
 @pytest.mark.parametrize(
     ("url", "loopback"),
     [
