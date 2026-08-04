@@ -45,6 +45,15 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "qwen2.5vl": "lfm2_vl",
     "lfm2-vl": "lfm2_vl",
     "lfm2_vl": "lfm2_vl",
+    # NuExtract3's GGUF reports the "qwen35" backbone (numind/NuExtract3-GGUF).
+    # NuExtract3 is the canonical qwen35-vl model in this project, so map it to
+    # the nuextract3 CONTRACT (chat_template_kwargs schema extraction) rather
+    # than the generic vision family — a generic Qwen3.5-VL would otherwise
+    # need a manual override, but defaulting the flagship to a json_schema
+    # family (lfm2_vl) would silently drop its template (the exact trap the
+    # family contract exists to prevent). Override to lfm2_vl/vision_ocr for a
+    # non-NuExtract qwen35 repo.
+    "qwen35": "nuextract3",
     # OCR vision. Unlimited-OCR IS the DeepSeek-OCR architecture (SAM-ViT-B +
     # CLIP-L/14 vision tower → projector → DeepSeek-V2 MoE decoder). Its GGUF
     # `general.architecture` is "unlimited-ocr" (llama.cpp mtmd support merged
@@ -67,6 +76,7 @@ VISION_ARCHS = frozenset(
         "qwen2vl",
         "qwen2_vl",
         "qwen2.5vl",
+        "qwen35",
         "lfm2-vl",
         "lfm2_vl",
         "unlimited-ocr",
