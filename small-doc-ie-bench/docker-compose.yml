@@ -139,6 +139,11 @@ services:
         # spawn inside THIS container — it needs the analyzer library. Other
         # services keep the light "ocr" default.
         PIP_EXTRAS: "ocr,encoders"
+        # llama.cpp pin: the serving container holds the llama-server that
+        # actually serves deployed models. Set LLAMA_REF in .env to a commit/
+        # tag to rebuild llama.cpp at that pin (reproducible + picks up new
+        # arch support, e.g. Unlimited-OCR). Empty = latest HEAD (cached).
+        LLAMA_REF: ${LLAMA_REF:-}
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
