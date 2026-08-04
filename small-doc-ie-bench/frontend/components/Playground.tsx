@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Boxes,
   FileText,
   Fingerprint,
   Image as ImageIcon,
@@ -44,9 +45,20 @@ import { PageHeader } from "./patterns/PageHeader";
 type InputMode = "text" | "file";
 type PlaygroundMode = "extract" | "chat" | "vision" | "embed";
 
+// Deep-link callback threaded from AppShell so first-run empty states can send
+// the user straight to Models to deploy a model. Optional everywhere: when it
+// is absent the empty states degrade to instructive text only.
+type NavigateToDeploy = (id: "deploy", view?: string) => void;
+
 const DEPLOY_POLL_MS = 4000;
 
-export function Playground({ active = true }: { active?: boolean }) {
+export function Playground({
+  active = true,
+  onNavigate,
+}: {
+  active?: boolean;
+  onNavigate?: NavigateToDeploy;
+}) {
   const { toast } = useToast();
   const [mode, setMode] = useState<PlaygroundMode>("extract");
   const [inputMode, setInputMode] = useState<InputMode>("text");
@@ -151,6 +163,12 @@ export function Playground({ active = true }: { active?: boolean }) {
     }
   }
 
+  // Genuine first-run empty: deployments loaded cleanly but none can serve an
+  // extraction. Kept distinct from loading / endpoint-error (those legitimately
+  // fall back to the server default and must NOT disable Run).
+  const extractNoModel =
+    !deployments.loading && !deployments.error && selectable.length === 0;
+
   return (
     <div>
       <PageHeader
@@ -196,18 +214,20 @@ export function Playground({ active = true }: { active?: boolean }) {
       {/* Both modes stay mounted (hidden, never unmounted) so an in-flight
           extraction stream or a chat history survives switching modes. */}
       <div hidden={mode !== "chat"}>
-        <ChatPanel deployments={deployments} selectable={selectable} />
+        <ChatPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
       </div>
       <div hidden={mode !== "vision"}>
         <VisionPanel
           deployments={deployments.data ?? []}
           visionNames={visionNames}
+          onNavigate={onNavigate}
         />
       </div>
       <div hidden={mode !== "embed"}>
         <EmbedPanel
           deployments={deployments.data ?? []}
           embeddingNames={embeddingNames}
+          onNavigate={onNavigate}
         />
       </div>
       <div hidden={mode !== "extract"} className="grid gap-6 lg:grid-cols-2">
@@ -284,6 +304,8 @@ export function Playground({ active = true }: { active?: boolean }) {
                 selectable={selectable}
                 value={selectedDeployment}
                 onChange={setSelectedDeployment}
+                emptyNoun="chat"
+                onNavigate={onNavigate}
               />
             </Field>
             <Field label="OCR backend" hint="Optional — for file uploads.">
@@ -309,10 +331,17 @@ export function Playground({ active = true }: { active?: boolean }) {
             </p>
           )}
 
-          <Button type="submit" loading={submitting}>
-            <Play className="h-4 w-4" />
-            {submitting ? "Submitting…" : "Run extraction"}
-          </Button>
+          <div className="space-y-1.5">
+            <Button type="submit" loading={submitting} disabled={extractNoModel}>
+              <Play className="h-4 w-4" />
+              {submitting ? "Submitting…" : "Run extraction"}
+            </Button>
+            {extractNoModel && (
+              <p className="text-xs text-muted-foreground">
+                Deploy a chat model before running an extraction.
+              </p>
+            )}
+          </div>
         </form>
       </Card>
 
@@ -348,9 +377,11 @@ interface ChatMsg {
 function ChatPanel({
   deployments,
   selectable,
+  onNavigate,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   selectable: DeploymentRecord[];
+  onNavigate?: NavigateToDeploy;
 }) {
   // Chat owns its OWN selection: it only offers LIVE deployments, so sharing
   // the Extract-side selection (which legitimately includes evicted
@@ -429,6 +460,8 @@ function ChatPanel({
               selectable={liveOnly}
               value={model}
               onChange={setModel}
+              emptyNoun="chat"
+              onNavigate={onNavigate}
             />
           </Field>
           <Field label="System prompt" hint="Optional — applied to the whole conversation.">
@@ -492,7 +525,12 @@ function ChatPanel({
             }}
             placeholder="Type a message (Enter to send, Shift+Enter for a new line)…"
           />
-          <Button type="button" loading={busy} onClick={() => void send()}>
+          <Button
+            type="button"
+            loading={busy}
+            disabled={liveNames.length === 0}
+            onClick={() => void send()}
+          >
             <Send className="h-4 w-4" />
             Send
           </Button>
@@ -530,9 +568,11 @@ const VISION_PRESETS = [
 function VisionPanel({
   deployments,
   visionNames,
+  onNavigate,
 }: {
   deployments: DeploymentRecord[];
   visionNames: Set<string>;
+  onNavigate?: NavigateToDeploy;
 }) {
   const liveVision = useMemo(
     () =>
@@ -618,9 +658,7 @@ function VisionPanel({
             hint="Deploy a vision model (Serving → Models: family lfm2_vl / nuextract3 / vision_ocr)."
           >
             {names.length === 0 ? (
-              <p className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                No live vision deployment — add one under Serving → Models, then Deploy it.
-              </p>
+              <EmptyModelState noun="vision" onNavigate={onNavigate} />
             ) : (
               <Select value={model} onChange={(e) => setModel(e.target.value)}>
                 {names.map((n) => (
@@ -726,9 +764,11 @@ function cosine(a: number[], b: number[]): number {
 function EmbedPanel({
   deployments,
   embeddingNames,
+  onNavigate,
 }: {
   deployments: DeploymentRecord[];
   embeddingNames: Set<string>;
+  onNavigate?: NavigateToDeploy;
 }) {
   const embedDeployments = useMemo(
     () =>
@@ -792,10 +832,7 @@ function EmbedPanel({
           hint="Deploy an embedding GGUF (e.g. LiquidAI/LFM2.5-Embedding-350M-GGUF) with family 'embedding'."
         >
           {names.length === 0 ? (
-            <p className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              No live embedding deployment — add one under Serving → Models
-              (family: embedding), then Deploy it.
-            </p>
+            <EmptyModelState noun="embedding" onNavigate={onNavigate} />
           ) : (
             <Select value={model} onChange={(e) => setModel(e.target.value)}>
               {names.map((n) => (
@@ -861,16 +898,57 @@ function EmbedPanel({
 // back to clear, non-crashing states for loading / unavailable / empty.
 // ---------------------------------------------------------------------------
 
+// First-run empty state: no usable model deployed for the current mode. Names
+// the mode, points at Models → Search Hugging Face, and (when a nav callback is
+// threaded in) offers a one-click jump to deploy one. Degrades to text-only
+// when `onNavigate` is absent.
+function EmptyModelState({
+  noun,
+  onNavigate,
+}: {
+  noun: "chat" | "vision" | "embedding";
+  onNavigate?: NavigateToDeploy;
+}) {
+  return (
+    <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-amber-700 dark:text-amber-400">
+      <div className="flex items-start gap-2">
+        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+        <div>
+          <p className="text-sm font-medium">No {noun} model deployed yet.</p>
+          <p className="mt-0.5 text-xs text-amber-700/90 dark:text-amber-400/90">
+            Deploy one from Models → Search Hugging Face.
+          </p>
+        </div>
+      </div>
+      {onNavigate && (
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          onClick={() => onNavigate("deploy", "models")}
+        >
+          <Boxes className="h-4 w-4" />
+          Deploy a model
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function DeploymentSelect({
   deployments,
   selectable,
   value,
   onChange,
+  emptyNoun = "chat",
+  onNavigate,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   selectable: DeploymentRecord[];
   value: string;
   onChange: (name: string) => void;
+  emptyNoun?: "chat" | "vision" | "embedding";
+  onNavigate?: NavigateToDeploy;
 }) {
   // First load, nothing cached yet.
   if (deployments.loading && !deployments.data) {
@@ -895,12 +973,7 @@ function DeploymentSelect({
   }
 
   if (selectable.length === 0) {
-    return (
-      <p className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        No routable deployments — deploy one under Serving → Models. The server
-        default will be used.
-      </p>
-    );
+    return <EmptyModelState noun={emptyNoun} onNavigate={onNavigate} />;
   }
 
   return (
