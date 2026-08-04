@@ -130,6 +130,60 @@ async def test_inspect_unknown_arch_is_needs_family() -> None:
     assert result["family"] is None
 
 
+async def test_inspect_safetensors_only_falls_to_transformers() -> None:
+    # A plain safetensors model with no GGUF → the transformers last resort,
+    # with the memory disclaimer on runtime_note and no custom-code flag.
+    payload = {"siblings": [{"rfilename": "model.safetensors", "size": 5_000_000_000}]}
+    config = {"model_type": "some-new-lm"}
+    async with httpx.AsyncClient(transport=_transport(payload, config=config)) as client:
+        result = await inspect_repo("owner/new-lm", client=client)
+    assert result["verdict"] == "supported"
+    assert result["family"] == "transformers"
+    assert result["has_gguf"] is False
+    assert result["has_safetensors"] is True
+    assert result["runtime_note"]
+    assert "2-3x" in result["runtime_note"]
+    assert result["needs_trust_remote_code"] is False
+
+
+async def test_inspect_auto_map_flags_trust_remote_code() -> None:
+    # A custom-code checkpoint (config.json auto_map) → the trust flag is set so
+    # the Studio surfaces the security note + trust family.
+    payload = {"siblings": [{"rfilename": "model.safetensors", "size": 3_000_000_000}]}
+    config = {
+        "model_type": "unlimited_ocr",
+        "auto_map": {"AutoModel": "modeling_unlimited_ocr.UnlimitedOCRForCausalLM"},
+    }
+    async with httpx.AsyncClient(transport=_transport(payload, config=config)) as client:
+        result = await inspect_repo("sahilchachra/Unlimited-OCR", client=client)
+    assert result["family"] == "transformers"
+    assert result["needs_trust_remote_code"] is True
+
+
+async def test_inspect_gguf_never_flags_trust() -> None:
+    # A GGUF is served by llama.cpp (no repo code) — never flag trust even if a
+    # config with auto_map is also present in the repo.
+    payload = {
+        "gguf": {"architecture": "llama"},
+        "siblings": [{"rfilename": "m-Q4_K_M.gguf", "size": 1}],
+    }
+    config = {"model_type": "llama", "auto_map": {"AutoModel": "x.Y"}}
+    async with httpx.AsyncClient(transport=_transport(payload, config=config)) as client:
+        result = await inspect_repo("owner/llama-GGUF", client=client)
+    assert result["needs_trust_remote_code"] is False
+
+
+async def test_search_non_gguf_drops_filter() -> None:
+    # gguf_only=False must NOT send filter=gguf, so safetensors repos surface.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("filter") is None
+        return httpx.Response(200, json=[{"id": "owner/some-safetensors"}])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        cards = await search_models("ocr", client=client, gguf_only=False)
+    assert cards[0]["id"] == "owner/some-safetensors"
+
+
 async def test_search_models_returns_light_cards() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/models"

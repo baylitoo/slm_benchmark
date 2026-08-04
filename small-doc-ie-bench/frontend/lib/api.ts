@@ -663,6 +663,9 @@ export interface HfInspect {
   has_gguf?: boolean;
   has_safetensors?: boolean;
   has_mmproj?: boolean;
+  /** Transformers last resort only: the checkpoint runs custom repo code on the
+   * node (config auto_map) — deploy via the transformers_trust_remote_code family. */
+  needs_trust_remote_code?: boolean;
   quants?: string[];
   suggested_name?: string;
 }

@@ -12,6 +12,7 @@ import {
   ChevronDown,
   ChevronRight,
   AlertCircle,
+  ShieldAlert,
   PackagePlus,
   Pin,
   PinOff,
@@ -1804,7 +1805,7 @@ function HfSearchSeed({
             onChange={(e) => setGgufOnly(e.target.checked)}
             className="h-3.5 w-3.5"
           />
-          GGUF only (uncheck to include encoder / safetensors checkpoints)
+          GGUF only (uncheck to include encoder / transformers safetensors checkpoints)
         </label>
       </form>
 
@@ -1871,6 +1872,17 @@ function HfSearchSeed({
                   <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                     <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     Runtime: {inspect.runtime_note}
+                  </p>
+                )}
+                {inspect.needs_trust_remote_code && (
+                  <p className="flex items-start gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-400">
+                    <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      <strong>Runs custom code.</strong> This checkpoint executes the
+                      repo&apos;s own Python on the serving node. To load it, select the{" "}
+                      <code>transformers_trust_remote_code</code> family below — a
+                      deliberate choice, never the default. Only deploy code you trust.
+                    </span>
                   </p>
                 )}
 
