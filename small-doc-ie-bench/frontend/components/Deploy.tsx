@@ -8,6 +8,8 @@ import {
   Cpu,
   Boxes,
   Plus,
+  Minus,
+  Layers,
   Network,
   ChevronDown,
   ChevronRight,
@@ -36,6 +38,7 @@ import {
   unloadDeployment,
   pinDeployment,
   deleteDeployment,
+  scaleStoreModel,
   repairDeployment,
   getDeploymentLogs,
   deploymentModelType,
@@ -153,7 +156,11 @@ export function Deploy({
       ) : view === "sizing" ? (
         <Sizing active={active && view === "sizing"} />
       ) : (
-        <DeploymentsView deployments={deployments} embeddingNames={embeddingNames} />
+        <DeploymentsView
+          deployments={deployments}
+          embeddingNames={embeddingNames}
+          store={store}
+        />
       )}
 
       {/* Slide-overs: both forms stay mounted; only visibility toggles. */}
@@ -377,12 +384,159 @@ function PhaseChip({ record }: { record: DeploymentRecord }) {
 
 type LifecycleAction = "load" | "unload" | "pin" | "unpin" | "delete" | "repair";
 
+interface ScalableGroup {
+  base: string;
+  records: DeploymentRecord[];
+  total: number;
+  running: number;
+}
+
+// The replica to remove when scaling a model down: the highest numeric suffix
+// (`base-3` before `base-2` before the bare `base`), so scale-down peels off
+// the last instance added and keeps the base while replicas remain.
+function highestReplicaName(records: DeploymentRecord[]): string | null {
+  const names = records
+    .map((r) => r.spec?.name)
+    .filter((n): n is string => Boolean(n));
+  if (names.length === 0) return null;
+  const suffix = (n: string) => {
+    const m = n.match(/-(\d+)$/);
+    return m ? parseInt(m[1], 10) : 1;
+  };
+  return [...names].sort((a, b) => suffix(b) - suffix(a))[0];
+}
+
+// The scale panel: one row per store model that has live deployments — deploy
+// or remove an instance in place, without hunting the flat table below. Reuses
+// the same endpoints the rest of the tab uses (scaleStoreModel / delete). Scale
+// up is best-effort against RAM; the Sizing tab is the fit-aware surface and the
+// reconciler is the runtime backstop.
+function ScaledModelsPanel({
+  groups,
+  onChanged,
+}: {
+  groups: ScalableGroup[];
+  onChanged: () => void;
+}) {
+  return (
+    <Card
+      icon={<Layers className="h-5 w-5" />}
+      title="Scaled models"
+      subtitle="Run several instances of a store model — each addressable, and load-balanced behind its model id."
+      className="mb-4"
+    >
+      <div className="divide-y divide-border">
+        {groups.map((g) => (
+          <ScaleRow key={g.base} group={g} onChanged={onChanged} />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function ScaleRow({
+  group,
+  onChanged,
+}: {
+  group: ScalableGroup;
+  onChanged: () => void;
+}) {
+  const { toast } = useToast();
+  const [busy, setBusy] = useState<"up" | "down" | null>(null);
+
+  async function scaleUp() {
+    setBusy("up");
+    try {
+      const res = await scaleStoreModel(group.base, group.total + 1);
+      toast({
+        title:
+          res.adding.length > 0
+            ? `Deploying 1 more of ${group.base}`
+            : "Already at target",
+        description: group.base,
+        tone: "success",
+      });
+      onChanged();
+    } catch (err) {
+      toast({
+        title: "Scale up failed",
+        description: errText(err, "Scale failed."),
+        tone: "error",
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function scaleDown() {
+    const victim = highestReplicaName(group.records);
+    if (!victim) return;
+    if (!window.confirm(`Remove one instance of "${group.base}" (delete "${victim}")?`))
+      return;
+    setBusy("down");
+    try {
+      await deleteDeployment(victim);
+      toast({ title: "Removing 1 instance", description: victim, tone: "success" });
+      onChanged();
+    } catch (err) {
+      toast({
+        title: "Scale down failed",
+        description: errText(err, "Delete failed."),
+        tone: "error",
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-3 py-2 first:pt-0 last:pb-0">
+      <span
+        className="min-w-0 flex-1 truncate font-mono text-xs text-foreground"
+        title={group.base}
+      >
+        {group.base}
+      </span>
+      <Badge tone={group.running === group.total ? "ok" : "warn"}>
+        {group.running}/{group.total} running
+      </Badge>
+      <div className="flex items-center gap-1">
+        <Button
+          size="sm"
+          variant="ghost"
+          loading={busy === "down"}
+          disabled={busy !== null || group.total <= 1}
+          title="Remove one instance"
+          onClick={() => void scaleDown()}
+        >
+          <Minus className="h-3.5 w-3.5" />
+        </Button>
+        <span className="w-6 text-center font-mono tabular-nums text-xs text-foreground">
+          {group.total}
+        </span>
+        <Button
+          size="sm"
+          variant="ghost"
+          loading={busy === "up"}
+          disabled={busy !== null}
+          title="Deploy one more instance"
+          onClick={() => void scaleUp()}
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function DeploymentsView({
   deployments,
   embeddingNames,
+  store,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   embeddingNames: Set<string>;
+  store: ReturnType<typeof usePolling<StoreEntry[]>>;
 }) {
   const { toast } = useToast();
   const [filter, setFilter] = useState("");
@@ -467,6 +621,36 @@ function DeploymentsView({
     () => filtered.slice((clampedPage - 1) * PAGE_SIZE, clampedPage * PAGE_SIZE),
     [filtered, clampedPage],
   );
+
+  // Group deployments into their base store model to drive the scale panel.
+  // A scaled model's replicas all share the launch --alias (= the base store
+  // name), so alias is the grouping key; only STORE-backed groups can scale
+  // (scaleStoreModel needs a store entry), so gate on the store index.
+  const storeNames = useMemo(
+    () => new Set((store.data ?? []).map((e) => e.name)),
+    [store.data],
+  );
+  const scalableGroups = useMemo<ScalableGroup[]>(() => {
+    const map = new Map<string, DeploymentRecord[]>();
+    for (const r of all) {
+      const base = r.spec?.launch?.alias || r.spec?.name;
+      if (!base || !storeNames.has(base)) continue;
+      const arr = map.get(base);
+      if (arr) arr.push(r);
+      else map.set(base, [r]);
+    }
+    return [...map.entries()]
+      .map(([base, records]) => ({
+        base,
+        records,
+        total: records.length,
+        running: records.filter((r) => {
+          const p = derivePhase(r);
+          return p === "hot" || p === "loading";
+        }).length,
+      }))
+      .sort((a, b) => a.base.localeCompare(b.base));
+  }, [all, storeNames]);
 
   const columns: Column<DeploymentRecord>[] = [
     {
@@ -625,6 +809,10 @@ function DeploymentsView({
 
   return (
     <div>
+      {scalableGroups.length > 0 && (
+        <ScaledModelsPanel groups={scalableGroups} onChanged={deployments.refresh} />
+      )}
+
       <Toolbar
         onReset={() => {
           setFilter("");
