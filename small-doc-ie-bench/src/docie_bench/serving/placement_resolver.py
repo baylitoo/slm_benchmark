@@ -23,7 +23,10 @@ Style precedence (the load-bearing rule):
 from __future__ import annotations
 
 import ipaddress
+import random
 import urllib.parse
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.catalog import ModelCatalog
@@ -94,12 +97,34 @@ def endpoint_is_loopback(url: str) -> bool:
     return address.is_loopback or address.is_unspecified
 
 
-def resolve_store_profile(name: str, *, catalog: ModelCatalog | None = None) -> ModelProfile:
-    """Build the ModelProfile that extracts against the live placement of ``name``.
+def _placement_is_live(placement: dict[str, Any]) -> bool:
+    # PR-1 contract: a non-live row stores endpoint "" (the column is NOT NULL),
+    # and EVERY reader must treat "" as "no live endpoint" — never route into it,
+    # whatever the state column momentarily says.
+    return (
+        str(placement.get("state") or "") == "ready"
+        and bool(str(placement.get("endpoint") or "").strip())
+    )
+
+
+def resolve_store_profile(
+    name: str,
+    *,
+    catalog: ModelCatalog | None = None,
+    chooser: Callable[[Sequence[dict[str, Any]]], dict[str, Any]] = random.choice,
+) -> ModelProfile:
+    """Build the ModelProfile that extracts against a live placement of ``name``.
+
+    LOAD BALANCING (PR-C): a scaled model has several placement rows (one per
+    replica, all sharing ``model_name``); this picks ONE live replica per call.
+    ``chooser`` defaults to ``random.choice`` — stateless, so it distributes
+    evenly across replicas even from many concurrent workers with no shared
+    counter; tests inject a deterministic chooser. A single-instance model has
+    exactly one live row, so the pick is a no-op and behaviour is unchanged.
 
     Raises :class:`PlacementNotFoundError` when the model is not in the catalog
-    or has no live placement, and :class:`PlacementNotReadyError` when the
-    deployment exists but is not serving yet. May raise
+    or has no placement at all, and :class:`PlacementNotReadyError` when
+    deployments exist but none is serving yet. May raise
     ``CatalogUnavailableError`` when DATABASE_URL is not configured.
     """
     catalog = catalog if catalog is not None else ModelCatalog()
@@ -108,32 +133,38 @@ def resolve_store_profile(name: str, *, catalog: ModelCatalog | None = None) -> 
         raise PlacementNotFoundError(
             f"store model {name!r} is not in the catalog; seed it first"
         )
-    placement = catalog.get_placement_for_model(name)
-    if placement is None:
+    placements = catalog.list_placements_for_model(name)
+    if not placements:
         raise PlacementNotFoundError(
             f"No live placement for store model {name!r}. Deploy it first "
             f"(POST /v1/serving/deploy or `docie up {name}`), then retry."
         )
-    state = str(placement.get("state") or "")
-    if state != "ready":
-        raise PlacementNotReadyError(
-            f"store model {name!r} placement is {state!r}, not ready — "
-            f"wait for the deploy to finish or redeploy."
-        )
-    # PR-1 contract: a non-live row stores endpoint "" (the column is NOT
-    # NULL), and EVERY reader must treat "" as "no live endpoint" — never
-    # route into it, whatever the state column momentarily says.
-    if not str(placement.get("endpoint") or "").strip():
+    live = [p for p in placements if _placement_is_live(p)]
+    if not live:
+        # No replica is servable — give an honest reason from the freshest row
+        # (list_placements_for_model returns freshest-first).
+        freshest = placements[0]
+        state = str(freshest.get("state") or "")
+        if state != "ready":
+            raise PlacementNotReadyError(
+                f"store model {name!r} placement is {state!r}, not ready — "
+                f"wait for the deploy to finish or redeploy."
+            )
         raise PlacementNotReadyError(
             f"store model {name!r} placement advertises no live endpoint — "
             f"wait for the deploy/reload to finish or redeploy."
         )
+    placement = live[0] if len(live) == 1 else chooser(live)
     contract = FAMILIES.get(str(entry.get("family") or ""))
     engine = str(placement.get("engine") or "")
     return ModelProfile(
         name=f"{STORE_PROFILE_PREFIX}{name}",
-        # The deployment name is the llama-server --alias / Ollama model name.
-        model=str(placement["name"]),
+        # The model id sent upstream is the llama-server --alias, which is the
+        # BASE store name (model_name) — NOT the record name. They are equal for
+        # a single deploy, but a scaled replica's record is `<base>-2` while its
+        # alias stays `<base>`, so routing to it with the record name would ask
+        # for a model the server does not answer to.
+        model=str(placement.get("model_name") or placement["name"]),
         base_url=str(placement.get("endpoint") or "").rstrip("/"),
         api_key="local-not-used",
         response_format_style=_resolve_style(placement, contract, engine),
