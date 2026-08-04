@@ -422,8 +422,21 @@ async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any
     has_mmproj = any(g.is_mmproj for g in ggufs)
 
     architecture = _extract_architecture(payload)
-    if architecture is None and has_safetensors:
-        architecture = await _config_architecture(repo, client)
+    # Custom-code detection: a safetensors checkpoint with an `auto_map` (or an
+    # explicit `trust_remote_code`) in its config executes the repo's own Python
+    # on the serving node. Only relevant to the transformers last resort (a GGUF
+    # is served by llama.cpp, which never runs repo code), so we read the config
+    # only for safetensors-only repos — reusing the same fetch as the arch
+    # fallback to avoid a second round-trip.
+    needs_trust_remote_code = False
+    if has_safetensors and (architecture is None or not has_gguf):
+        config_arch, cfg_trust = await _config_details(repo, client)
+        if architecture is None:
+            architecture = config_arch
+        # Trust only matters for the transformers path (no GGUF); a GGUF is
+        # served by llama.cpp, which never imports repo code.
+        if not has_gguf:
+            needs_trust_remote_code = cfg_trust
 
     result = resolve_family(
         architecture,
@@ -441,6 +454,10 @@ async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any
         "has_gguf": has_gguf,
         "has_safetensors": has_safetensors,
         "has_mmproj": has_mmproj,
+        # True only for the transformers last resort when the checkpoint runs
+        # custom repo code — the Studio surfaces a security note and the
+        # transformers_trust_remote_code family.
+        "needs_trust_remote_code": needs_trust_remote_code,
         "quants": sorted(
             {g.quant for g in ggufs if g.quant and not g.is_mmproj and not g.is_multipart}
         ),
@@ -463,29 +480,40 @@ def _extract_architecture(payload: dict[str, Any]) -> str | None:
     return None
 
 
-async def _config_architecture(repo: str, client: httpx.AsyncClient) -> str | None:
-    """Fallback: read model_type/architectures from the raw config.json."""
+async def _config_details(repo: str, client: httpx.AsyncClient) -> tuple[str | None, bool]:
+    """Read ``(architecture, needs_trust_remote_code)`` from the raw config.json.
+
+    ``architecture`` falls back to ``model_type``/``architectures[0]``.
+    ``needs_trust_remote_code`` is True when the config carries an ``auto_map``
+    (custom modeling code the loader must import) or an explicit
+    ``trust_remote_code`` flag — either means loading executes the repo's own
+    Python on the serving node. Best-effort: any fetch/parse failure returns
+    ``(None, False)``.
+    """
     url = f"{HF_BASE}/{repo}/resolve/main/config.json"
     try:
         response = await client.get(
             url, headers=hf_headers(), follow_redirects=True, timeout=15.0
         )
     except httpx.RequestError:
-        return None
+        return None, False
     if response.status_code >= 400:
-        return None
+        return None, False
     try:
         config = response.json()
     except ValueError:
-        return None
+        return None, False
     if not isinstance(config, dict):
-        return None
+        return None, False
+    architecture: str | None = None
     if config.get("model_type"):
-        return str(config["model_type"])
-    archs = config.get("architectures")
-    if isinstance(archs, list) and archs:
-        return str(archs[0])
-    return None
+        architecture = str(config["model_type"])
+    else:
+        archs = config.get("architectures")
+        if isinstance(archs, list) and archs:
+            architecture = str(archs[0])
+    needs_trust = bool(config.get("auto_map")) or bool(config.get("trust_remote_code"))
+    return architecture, needs_trust
 
 
 async def list_collection(slug: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
