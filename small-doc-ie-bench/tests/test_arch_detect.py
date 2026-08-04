@@ -22,6 +22,20 @@ def test_resolve_chat_arch_supported() -> None:
     assert v.verdict == "supported" and v.family == "openai_chat"
 
 
+def test_resolve_unlimited_ocr_arch() -> None:
+    # Unlimited-OCR's GGUF arch is "unlimited-ocr" (DeepSeek-OCR lineage).
+    for arch in ("unlimited-ocr", "deepseek-ocr", "deepseek2-ocr"):
+        v = resolve_family(arch, has_gguf=True, has_safetensors=False, has_mmproj=True)
+        assert v.verdict == "supported" and v.family == "vision_ocr", arch
+        # Honest about the separate runtime gate (recent llama-server needed).
+        assert v.runtime_note and "llama-server" in v.runtime_note, arch
+
+
+def test_common_arch_has_no_runtime_note() -> None:
+    v = resolve_family("qwen2", has_gguf=True, has_safetensors=False, has_mmproj=False)
+    assert v.runtime_note is None
+
+
 def test_resolve_vision_arch_needs_mmproj() -> None:
     ok = resolve_family("deepseek2-ocr", has_gguf=True, has_safetensors=False, has_mmproj=True)
     assert ok.verdict == "supported" and ok.family == "vision_ocr"

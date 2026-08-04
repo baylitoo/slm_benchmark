@@ -45,6 +45,14 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "qwen2.5vl": "lfm2_vl",
     "lfm2-vl": "lfm2_vl",
     "lfm2_vl": "lfm2_vl",
+    # OCR vision. Unlimited-OCR IS the DeepSeek-OCR architecture (SAM-ViT-B +
+    # CLIP-L/14 vision tower → projector → DeepSeek-V2 MoE decoder). Its GGUF
+    # `general.architecture` is "unlimited-ocr" (llama.cpp mtmd support merged
+    # in ggml-org/llama.cpp#24969, 2026-06-24 — needs a llama-server built
+    # after that). The deepseek-ocr lineage may report "deepseek-ocr" /
+    # "deepseek2-ocr"; all map to the free-text OCR family.
+    "unlimited-ocr": "vision_ocr",
+    "deepseek-ocr": "vision_ocr",
     "deepseek2-ocr": "vision_ocr",
     # embeddings
     "bert": "embedding",
@@ -55,7 +63,16 @@ ARCH_TO_FAMILY: dict[str, str] = {
 
 # Non-exhaustive vision archs (used only to sanity-flag a vision/mmproj mismatch).
 VISION_ARCHS = frozenset(
-    {"qwen2vl", "qwen2_vl", "qwen2.5vl", "lfm2-vl", "lfm2_vl", "deepseek2-ocr"}
+    {
+        "qwen2vl",
+        "qwen2_vl",
+        "qwen2.5vl",
+        "lfm2-vl",
+        "lfm2_vl",
+        "unlimited-ocr",
+        "deepseek-ocr",
+        "deepseek2-ocr",
+    }
 )
 
 # Families that are multimodal — a repo whose family resolves to one of these
@@ -76,6 +93,26 @@ TEXT_ARCH_TO_VISION_FAMILY: dict[str, str] = {
 }
 DEFAULT_VISION_FAMILY = "lfm2_vl"
 
+# Archs whose SERVING support landed in llama.cpp only recently: the family
+# contract exists, but the node's llama-server must be new enough to load the
+# arch. This is a SEPARATE gate from "we have a family" — surfaced as a note so
+# a "supported" verdict is honest ("rebuild the serving image if it won't
+# load"). Keyed by arch → the note shown to the operator.
+RUNTIME_NOTES: dict[str, str] = {
+    "unlimited-ocr": (
+        "serving needs a llama-server built after ggml-org/llama.cpp#24969 "
+        "(2026-06-24) — rebuild the serving image if the deploy fails to load"
+    ),
+    "deepseek-ocr": (
+        "serving needs a recent llama-server (deepseek-ocr mtmd support) — "
+        "rebuild the serving image if the deploy fails to load"
+    ),
+    "deepseek2-ocr": (
+        "serving needs a recent llama-server (deepseek-ocr mtmd support) — "
+        "rebuild the serving image if the deploy fails to load"
+    ),
+}
+
 
 @dataclass(frozen=True)
 class SupportVerdict:
@@ -84,6 +121,9 @@ class SupportVerdict:
     verdict: str  # "supported" | "needs_family" | "unsupported"
     family: str | None
     reason: str
+    # A caveat about RUNTIME (not family) support — e.g. "needs a recent
+    # llama-server". None when the runtime support is long-standing.
+    runtime_note: str | None = None
 
 
 def resolve_family(
@@ -111,6 +151,7 @@ def resolve_family(
         )
 
     arch = architecture.strip().lower()
+    runtime_note = RUNTIME_NOTES.get(arch)
 
     # Encoder analyzers are detected by the gliner marker, not a base arch
     # (GLiNER2's base is mdeberta but that is NOT what we serve it as).
@@ -130,6 +171,7 @@ def resolve_family(
                 vision_family,
                 f"architecture {architecture!r} with an mmproj projector → "
                 f"{vision_family} (vision) — switch to vision_ocr for OCR",
+                runtime_note=runtime_note,
             )
         # Sanity: a vision-arch family with no projector will fail at load.
         if arch in VISION_ARCHS and not has_mmproj:
@@ -138,8 +180,14 @@ def resolve_family(
                 family,
                 f"vision architecture {architecture!r} but the repo ships no mmproj "
                 "projector — pick a repo that includes one",
+                runtime_note=runtime_note,
             )
-        return SupportVerdict("supported", family, f"architecture {architecture!r} → {family}")
+        return SupportVerdict(
+            "supported",
+            family,
+            f"architecture {architecture!r} → {family}",
+            runtime_note=runtime_note,
+        )
 
     # Unknown arch but a projector present → still multimodal; suggest a vision
     # family rather than a blank needs_family.

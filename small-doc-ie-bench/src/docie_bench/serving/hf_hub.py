@@ -437,6 +437,7 @@ async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any
         "verdict": result.verdict,
         "family": result.family,
         "reason": result.reason,
+        "runtime_note": result.runtime_note,
         "has_gguf": has_gguf,
         "has_safetensors": has_safetensors,
         "has_mmproj": has_mmproj,
