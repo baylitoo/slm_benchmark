@@ -7,9 +7,10 @@ import {
 } from "@inngest/realtime/hooks";
 import type { Realtime } from "@inngest/realtime";
 import { Radio } from "lucide-react";
-import { formatBytes, getRealtimeToken, type RealtimeToken } from "@/lib/api";
+import { getRealtimeToken, type RealtimeToken } from "@/lib/api";
 import { JsonView } from "./JsonView";
 import { PollingResult } from "./PollingResult";
+import { ProgressView } from "./ProgressBar";
 import { Badge, type BadgeTone } from "./ui";
 
 // If the subscription connects but NO message (status/progress heartbeat or a
@@ -150,48 +151,11 @@ export function RealtimeResult({
         {result !== undefined ? (
           <JsonView value={result} />
         ) : fallbackActive ? (
-          <PollingResult eventId={eventId} noun={noun} />
+          <PollingResult eventId={eventId} channel={channel} noun={noun} />
         ) : (
           <p className="text-sm text-muted-foreground">Waiting for the {noun}…</p>
         )}
       </Section>
-    </div>
-  );
-}
-
-/** Structured download progress renders as a bar; anything else as JSON. */
-function ProgressView({ value }: { value: unknown }) {
-  const p = value as {
-    percent?: number | null;
-    received_bytes?: number;
-    total_bytes?: number | null;
-    stage?: string;
-    file?: string;
-  } | null;
-  if (!p || typeof p !== "object" || typeof p.percent !== "number") {
-    return <JsonView value={value} maxHeight="8rem" />;
-  }
-  const pct = Math.max(0, Math.min(100, p.percent));
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
-        <span className="truncate">
-          {p.stage === "download-mmproj" ? "Vision projector" : "Model"}
-          {p.file ? ` · ${p.file}` : ""}
-        </span>
-        <span className="shrink-0 pl-2 font-medium text-foreground">
-          {pct.toFixed(0)}%
-          {p.received_bytes != null && p.total_bytes != null
-            ? ` · ${formatBytes(p.received_bytes)} / ${formatBytes(p.total_bytes)}`
-            : ""}
-        </span>
-      </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-        <div
-          className="h-full rounded-full bg-accent transition-all duration-300"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
     </div>
   );
 }

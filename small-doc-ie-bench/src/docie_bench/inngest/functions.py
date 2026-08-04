@@ -39,6 +39,7 @@ from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.placement_resolver import STORE_PROFILE_PREFIX
 from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+from docie_bench.serving.seed_progress import clear_progress, write_progress
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 
@@ -1147,17 +1148,17 @@ async def _run_seed_hf(
                     return
             throttle["at"] = now
             throttle["percent"] = percent if percent is not None else throttle["percent"]
-            await publish(
-                channel,
-                TOPIC_PROGRESS,
-                {
-                    "stage": stage,
-                    "file": filename,
-                    "received_bytes": received,
-                    "total_bytes": total,
-                    "percent": round(percent, 1) if percent is not None else None,
-                },
-            )
+            payload = {
+                "stage": stage,
+                "file": filename,
+                "received_bytes": received,
+                "total_bytes": total,
+                "percent": round(percent, 1) if percent is not None else None,
+            }
+            await publish(channel, TOPIC_PROGRESS, payload)
+            # Also persist it so the polling fallback (realtime down) shows the
+            # same percentage — the realtime publish above is best-effort only.
+            await asyncio.to_thread(write_progress, channel, payload)
 
         return report
 
@@ -1288,7 +1289,11 @@ async def seed_hf_job(ctx: inngest.Context) -> dict[str, Any]:
             "seed_hf_job failed (repo=%s name=%s)", data.get("repo"), data.get("name")
         )
         await _publish_error_safely(channel, str(exc))
+        await asyncio.to_thread(clear_progress, channel)
         raise
+    # The download is done — drop the pollable progress sidecar so a later poll
+    # sees the result, not a stale 100%.
+    await asyncio.to_thread(clear_progress, channel)
     try:
         await publish(channel, TOPIC_RESULT, result)
     except Exception:  # noqa: BLE001 - result is durable; a failed publish must not fail the run

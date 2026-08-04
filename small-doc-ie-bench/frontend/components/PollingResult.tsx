@@ -2,8 +2,15 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Clock3, Loader2 } from "lucide-react";
-import { getRuns, statusIs, type InngestRun } from "@/lib/api";
+import {
+  getRuns,
+  getSeedProgress,
+  statusIs,
+  type InngestRun,
+  type SeedProgress,
+} from "@/lib/api";
 import { JsonView } from "./JsonView";
+import { ProgressView } from "./ProgressBar";
 import { Badge } from "./ui";
 
 /** Best-effort human error out of an Inngest run's output/error shape. */
@@ -20,14 +27,18 @@ const POLL_MS = 1500;
 
 export function PollingResult({
   eventId,
+  channel,
   noun = "result",
   onSettled,
 }: {
   eventId: string;
+  /** The run channel — enables the pollable download-progress bar (seed jobs). */
+  channel?: string;
   noun?: string;
   onSettled?: () => void;
 }) {
   const [runs, setRuns] = useState<InngestRun[] | null>(null);
+  const [progress, setProgress] = useState<SeedProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -35,6 +46,7 @@ export function PollingResult({
   useEffect(() => {
     let cancelled = false;
     setRuns(null);
+    setProgress(null);
     setError(null);
     setDone(false);
 
@@ -43,6 +55,17 @@ export function PollingResult({
         const list = await getRuns(eventId);
         if (cancelled) return;
         setRuns(list);
+        // Poll the pollable progress sidecar too — this is what gives the
+        // polling fallback the same percentage bar realtime shows. Best-effort:
+        // a missing endpoint / null progress just leaves the bar hidden.
+        if (channel) {
+          try {
+            const p = await getSeedProgress(channel);
+            if (!cancelled) setProgress(p);
+          } catch {
+            /* no progress endpoint / not a seed — ignore */
+          }
+        }
         const settled =
           list.length > 0 && list.every((r) => statusIs(r, "Completed", "Failed", "Cancelled"));
         if (settled) {
@@ -63,7 +86,7 @@ export function PollingResult({
       cancelled = true;
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [eventId]);
+  }, [eventId, channel]);
 
   const primary = runs?.[0];
   const completed = primary && statusIs(primary, "Completed");
@@ -101,6 +124,15 @@ export function PollingResult({
           <p className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
             The {noun} failed{failMsg ? `: ${failMsg}` : "."}
           </p>
+        ) : progress && typeof progress.percent === "number" ? (
+          // Realtime is down, but the pollable sidecar gives us the live
+          // percentage — render the same bar the realtime stream would.
+          <div className="space-y-2">
+            <ProgressView value={progress} />
+            <p className="text-xs text-muted-foreground">
+              Downloading — continues in the background if you navigate away.
+            </p>
+          </div>
         ) : (
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />

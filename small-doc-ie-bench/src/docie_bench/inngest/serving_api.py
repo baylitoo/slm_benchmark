@@ -475,6 +475,19 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
     return {"name": name, "last_error": last_error, "lines": tail}
 
 
+@router.get("/seed-progress")
+async def seed_progress(channel: str) -> dict[str, Any]:
+    """The latest download progress for a seed run's ``channel`` (realtime-free).
+
+    The seed job persists its percentage to a sidecar on the shared volume; the
+    Studio's polling fallback reads it here to render the same bar realtime would.
+    ``progress`` is null when nothing has been written yet (or the download is
+    done — the sidecar is cleared on settle)."""
+    from docie_bench.serving.seed_progress import read_progress
+
+    return {"channel": channel, "progress": read_progress(channel)}
+
+
 async def _fire_lifecycle_event(
     name: str,
     *,
