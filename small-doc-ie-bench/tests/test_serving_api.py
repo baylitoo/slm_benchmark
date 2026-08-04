@@ -114,6 +114,63 @@ def test_ports_empty_when_no_deployments(serving_home: Path) -> None:
     assert payload["recommended_next"] == 8088  # first pick unchanged for a single deploy
 
 
+# ── scale endpoint: fan-out to deploy events ────────────────────────────────
+
+
+def _scale(name: str, replicas: int):
+    from docie_bench.inngest.serving_api import ScaleRequest, scale_store_model
+
+    return asyncio.run(scale_store_model(name, ScaleRequest(replicas=replicas), tenant=None))
+
+
+def test_scale_fans_out_one_deploy_event_per_new_replica(
+    serving_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.inngest import serving_api
+
+    _seed_deployments(serving_home, {"qwen": 8088, "qwen-2": 8089})  # already 2 replicas
+    sent: list[object] = []
+
+    async def fake_send(event: object) -> list[str]:
+        sent.append(event)
+        return [f"evt-{event.data['deployment_name']}"]  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(serving_api.inngest_client, "send", fake_send)
+
+    result = _scale("qwen", 3)  # 2 → 3 adds exactly one: qwen-3
+
+    assert result["current"] == 2
+    assert result["adding"] == ["qwen-3"]
+    assert result["channel"] is not None
+    assert result["channel"].startswith("scale:")
+    # One deploy event, carrying the replica name + the base model.
+    assert [e.data["deployment_name"] for e in sent] == ["qwen-3"]  # type: ignore[attr-defined]
+    assert all(e.name == "serving/deploy.requested" for e in sent)  # type: ignore[attr-defined]
+    assert all(e.data["model"] == "qwen" for e in sent)  # type: ignore[attr-defined]
+
+
+def test_scale_is_idempotent_no_events_when_already_at_target(
+    serving_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.inngest import serving_api
+
+    _seed_deployments(serving_home, {"qwen": 8088, "qwen-2": 8089})
+    sent: list[object] = []
+
+    async def fake_send(event: object) -> list[str]:
+        sent.append(event)
+        return ["evt"]
+
+    monkeypatch.setattr(serving_api.inngest_client, "send", fake_send)
+
+    result = _scale("qwen", 2)  # already 2 → no-op
+
+    assert result["adding"] == []
+    assert result["event_ids"] == []
+    assert result["channel"] is None
+    assert sent == []
+
+
 def test_deployment_logs_tail(serving_home: Path) -> None:
     _seed_deployments(serving_home, {"qwen": 8088})
     logs_dir = serving_home / "logs"
