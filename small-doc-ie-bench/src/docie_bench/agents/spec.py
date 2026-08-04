@@ -31,8 +31,20 @@ class AgentSpec(BaseModel):
       regex analyzer), ``guard_labels`` (zero-shot labels), ``guard_threshold``
       (min confidence), ``guard_fallback`` (``"regex"`` = degrade instead of
       failing closed when the guard is down).
-    * ``ocr`` — ``backend`` (tesseract | paddleocr | pdf_text), ``language``,
-      ``extractor`` (optional passthrough profile name -> OCR→SLM pipeline).
+    * ``ocr`` — a document-extraction agent with a staged ``mode``:
+        - ``mode="ocr"`` (plain OCR): ``backend`` (tesseract | paddleocr |
+          pdf_text), ``language`` → returns the document's OCR text.
+        - ``mode="ocr_extract"`` (OCR → LLM): the above plus ``extractor`` (a
+          passthrough LLM profile) and an optional ``schema`` (a name in the
+          extraction SCHEMA_REGISTRY) → OCR the image, then the LLM extracts
+          structured JSON (grammar-constrained when ``schema`` is set).
+        - ``mode="vision"`` (vision → structured): ``vision_model`` (a vision
+          deployment selector) and ``schema`` → the image goes straight to the
+          vision model, which grammar-generates JSON via ``response_format``
+          (llama.cpp GBNF; no OCR step). NOTE: a NuExtract deployment here runs
+          via generic GBNF, not its bespoke chat_template_kwargs path.
+      Back-compat: an agent saved before ``mode`` existed derives it — an
+      ``extractor`` present means ``ocr_extract``, otherwise ``ocr``.
     """
 
     name: str = Field(pattern=_NAME_RE, max_length=63)

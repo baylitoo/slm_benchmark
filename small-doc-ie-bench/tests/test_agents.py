@@ -166,6 +166,75 @@ def _create_proxy(client: TestClient, **overrides: object) -> dict:
     return response.json()
 
 
+def test_resolve_ocr_mode_derives_and_honors_explicit() -> None:
+    from docie_bench.agents.runtime import _resolve_ocr_mode
+
+    assert _resolve_ocr_mode({}) == "ocr"  # nothing → plain OCR
+    assert _resolve_ocr_mode({"extractor": "slm"}) == "ocr_extract"  # legacy pipeline
+    assert _resolve_ocr_mode({"mode": "vision"}) == "vision"  # explicit wins
+    assert _resolve_ocr_mode({"mode": "bogus"}) == "ocr"  # unknown → derive
+
+
+def test_inject_response_format_unknown_schema_raises() -> None:
+    from docie_bench.agents.runtime import AgentError, _inject_response_format
+
+    with pytest.raises(AgentError):
+        _inject_response_format({}, "not-a-real-schema")
+
+
+def test_inject_response_format_builds_json_schema() -> None:
+    from docie_bench.agents.runtime import _inject_response_format
+
+    body: dict = {}
+    _inject_response_format(body, "invoice")
+    rf = body["response_format"]
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["name"] == "invoice"
+    assert rf["json_schema"]["strict"] is True
+    assert isinstance(rf["json_schema"]["schema"], dict)
+
+
+def test_ocr_agent_vision_mode_forwards_image_with_schema(api) -> None:
+    client, captured = api
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "doc-vision",
+            "kind": "ocr",
+            "options": {"mode": "vision", "vision_model": "gemma-vl", "schema": "invoice"},
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/v1/agents/chat/completions",
+        json={
+            "model": "doc-vision",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "extract the invoice"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    ],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    sent = json.loads(captured[-1].content)
+    # Forwarded to the VISION deployment, not the agent name.
+    assert sent["model"] == "gemma-vl"
+    # Schema injected as response_format (GBNF structuring).
+    assert sent["response_format"]["json_schema"]["name"] == "invoice"
+    # The image reaches the model untouched (no OCR step).
+    assert any(
+        isinstance(p, dict) and p.get("type") == "image_url"
+        for p in sent["messages"][-1]["content"]
+    )
+    assert resp.json()["docie_agent"]["mode"] == "vision"
+
+
 def test_templates_listed(api) -> None:
     client, _ = api
     ids = {t["id"] for t in client.get("/v1/agents/templates").json()}

@@ -71,26 +71,93 @@ async def complete_agent(
 # ---------------------------------------------------------------------------
 
 
+OCR_MODES = ("ocr", "ocr_extract", "vision")
+
+
+def _resolve_ocr_mode(options: dict[str, Any]) -> str:
+    """The staged mode, deriving it for agents saved before ``mode`` existed:
+    an ``extractor`` present means the OCR→LLM pipeline, otherwise plain OCR."""
+    mode = options.get("mode")
+    if mode in OCR_MODES:
+        return str(mode)
+    return "ocr_extract" if options.get("extractor") else "ocr"
+
+
+def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
+    """Constrain the completion to the named extraction schema via OpenAI
+    ``response_format`` (llama.cpp compiles it to a GBNF grammar). Shared by the
+    OCR→LLM (over OCR text) and vision (over the image) paths."""
+    from docie_bench.schemas.extraction import schema_json
+
+    try:
+        json_schema = schema_json(schema_name)
+    except ValueError as exc:
+        raise AgentError(
+            str(exc), status_code=400, error_type="invalid_request_error"
+        ) from exc
+    body["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {"name": schema_name, "schema": json_schema, "strict": True},
+    }
+
+
 async def _complete_ocr(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
     options = dict(spec.options)
-    extractor_name = options.get("extractor")
+    mode = _resolve_ocr_mode(options)
+
+    # Vision → structured: the image goes straight to a vision deployment, which
+    # grammar-generates JSON. No OCR, no solution adapter — just a schema-injected
+    # forward (llama.cpp GBNF does the structuring).
+    if mode == "vision":
+        vision_selector = options.get("vision_model")
+        if not vision_selector:
+            raise AgentError(
+                f"agent {spec.name!r} is in vision mode but has no options.vision_model",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        upstream = _resolve_backing(str(vision_selector))
+        forward = dict(body)
+        if spec.system_prompt:
+            forward["messages"] = [
+                {"role": "system", "content": spec.system_prompt},
+                *(forward.get("messages") or []),
+            ]
+        schema_name = options.get("schema")
+        if schema_name:
+            _inject_response_format(forward, str(schema_name))
+        completion = await _post_chat(upstream, forward, http_client=http_client)
+        completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind, "mode": mode}
+        return completion
+
+    # OCR (A) or OCR→LLM (B): reuse the gateway's solution adapters.
     profiles: dict[str, ModelProfile] = {}
-    if extractor_name:
-        # OCR→SLM pipeline: the extractor selector goes through the same
-        # resolver as everything else, then is handed to PipelineSolution.
+    if mode == "ocr_extract":
+        extractor_name = options.get("extractor")
+        if not extractor_name:
+            raise AgentError(
+                f"agent {spec.name!r} is in ocr_extract mode but has no options.extractor",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
         extractor = _resolve_backing(str(extractor_name))
         profiles[extractor.name] = extractor
         kind = "pipeline"
-        options = {
+        solution_options: dict[str, Any] = {
             "ocr_backend": options.get("backend", "tesseract"),
             "language": options.get("language"),
             "extractor": extractor.name,
         }
+        # An optional schema makes the OCR→LLM extraction reliably structured —
+        # the same grammar constraint the vision path uses, over OCR text.
+        schema_name = options.get("schema")
+        if schema_name:
+            _inject_response_format(body, str(schema_name))
     else:
         kind = "ocr"
-        options = {
+        solution_options = {
             "backend": options.get("backend", "tesseract"),
             "language": options.get("language"),
         }
@@ -100,7 +167,7 @@ async def _complete_ocr(
         base_url="",
         api_key="local-not-used",
         kind=kind,
-        options=options,
+        options=solution_options,
     )
     try:
         solution = build_solution(profile, profiles=profiles, http_client=http_client)
@@ -109,7 +176,7 @@ async def _complete_ocr(
         raise AgentError(
             exc.message, status_code=exc.status_code, error_type=exc.error_type
         ) from exc
-    completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind}
+    completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind, "mode": mode}
     return completion
 
 
@@ -332,6 +399,15 @@ async def _forward_chat(
             {"role": "system", "content": spec.system_prompt},
             *(body.get("messages") or []),
         ]
+    return await _post_chat(upstream, body, http_client=http_client)
+
+
+async def _post_chat(
+    upstream: ModelProfile, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> dict[str, Any]:
+    """POST an OpenAI chat request to a resolved passthrough upstream. The
+    caller owns message/system-prompt/response_format shaping; this just sets
+    the model id, forces a non-streaming call, posts, and normalizes errors."""
     body["model"] = upstream.model
     # The API layer re-emits the final completion as a single SSE chunk for
     # streaming clients; upstream is always asked for a plain completion.
