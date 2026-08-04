@@ -14,6 +14,7 @@ import {
 import {
   getSizing,
   whatifSizing,
+  scaleStoreModel,
   formatBytes,
   ApiError,
   ApiUnavailable,
@@ -26,6 +27,7 @@ import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
 import { Badge, Button, Card, Select, TextInput } from "./ui";
 import { LiveIndicator } from "./LiveIndicator";
+import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
 
 const POLL_MS = 5000;
@@ -307,6 +309,16 @@ function FitTable({ sizing }: { sizing: ReturnType<typeof usePolling<SizingView>
           </Badge>
         ),
     },
+    {
+      key: "scale",
+      header: "Deploy more",
+      // Only offer scaling where the fit gate says at least one more fits; a
+      // 0 (does not fit) or null (unpriceable) row shows nothing here.
+      render: (m) =>
+        m.fits_now != null && m.fits_now > 0 ? (
+          <DeployMoreCell model={m} refresh={sizing.refresh} />
+        ) : null,
+    },
   ];
 
   return (
@@ -328,6 +340,87 @@ function FitTable({ sizing }: { sizing: ReturnType<typeof usePolling<SizingView>
         emptyDescription="Seed a model on the Models view — it gets a fit estimate here."
       />
     </Card>
+  );
+}
+
+/**
+ * Per-row "Deploy more" control — scale a model straight from the fit table.
+ * State is local to the row so only the clicked row goes busy; the number is
+ * clamped to `fits_now` on submit, so the UI never asks for more than the
+ * server's own fit gate says will fit right now.
+ */
+function DeployMoreCell({
+  model,
+  refresh,
+}: {
+  model: SizingModelFit;
+  refresh: () => void;
+}) {
+  const { toast } = useToast();
+  const [count, setCount] = useState("1");
+  const [busy, setBusy] = useState(false);
+  const max = model.fits_now ?? 0;
+
+  async function deploy() {
+    const n = Number(count);
+    if (!Number.isInteger(n) || n < 1) {
+      toast({ title: "Enter a whole number ≥ 1", tone: "error" });
+      return;
+    }
+    // Never request beyond what the fit table says fits.
+    const add = Math.min(n, max);
+    const target = (model.running_instances ?? 0) + add;
+    setBusy(true);
+    try {
+      const result = await scaleStoreModel(model.name, target);
+      if (result.adding.length === 0) {
+        toast({
+          title: `${model.name} already at target`,
+          description: `${result.current} already running (target ${result.target}).`,
+          tone: "info",
+        });
+      } else {
+        toast({
+          title: `Deploying ${result.adding.length} more of ${model.name}`,
+          description: result.adding.join(", "),
+          tone: "success",
+        });
+      }
+      refresh(); // pick up the new Running / Fits-now counts
+    } catch (err) {
+      toast({
+        title: "Scale failed",
+        description:
+          err instanceof ApiUnavailable
+            ? "The scale endpoint isn't available on this backend."
+            : err instanceof ApiError
+              ? err.message
+              : err instanceof Error
+                ? err.message
+                : "Scale failed.",
+        tone: "error",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <TextInput
+        type="number"
+        min={1}
+        max={max}
+        value={count}
+        onChange={(e) => setCount(e.target.value)}
+        disabled={busy}
+        className="h-8 w-16 text-xs tabular-nums"
+        aria-label={`Instances of ${model.name} to deploy`}
+      />
+      <Button size="sm" onClick={deploy} loading={busy} disabled={busy}>
+        <Plus className="h-4 w-4" /> Deploy
+      </Button>
+    </div>
   );
 }
 
