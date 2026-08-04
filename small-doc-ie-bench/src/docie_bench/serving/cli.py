@@ -248,6 +248,43 @@ def create_app(
             port=port,
         )
 
+    @app.command()
+    def transformers(
+        host: str = typer.Option("127.0.0.1", help="Bind address."),
+        port: int = typer.Option(
+            8091, min=1, max=65535, help="Port for the transformers endpoint."
+        ),
+        model: str = typer.Option(
+            ...,
+            help="Model snapshot dir or HF id served via AutoModel (last resort).",
+        ),
+        trust_remote_code: bool = typer.Option(
+            False,
+            "--trust-remote-code",
+            help="Execute the repo's custom Python (needed for custom-code "
+            "checkpoints). SECURITY: arbitrary code on the serving node — off by default.",
+        ),
+    ) -> None:
+        """Serve a Hugging Face model behind the OpenAI surface via transformers.
+
+        The LAST-RESORT path: unquantized AutoModel weights use ~2-3x the RAM of
+        a GGUF Q4 and CPU inference is slower — prefer a GGUF repo whenever one
+        exists. Chat + vision (image_url data URIs). Requires torch + transformers
+        (the `ocr`/`encoders` extras).
+        """
+        import uvicorn
+
+        from docie_bench.transformers_server.server import create_transformers_app
+
+        typer.echo(f"docie transformers [{model}] -> http://{host}:{port}/v1")
+        uvicorn.run(
+            create_transformers_app(
+                model_id=model, trust_remote_code=trust_remote_code
+            ),
+            host=host,
+            port=port,
+        )
+
     return app
 
 

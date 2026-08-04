@@ -668,6 +668,8 @@ async def list_families() -> Any:
             "embedding": fam.embedding,
             "analyzer": fam.analyzer,
             "encoder_backend": fam.encoder_backend,
+            "transformers_runtime": fam.transformers_runtime,
+            "trust_remote_code": fam.trust_remote_code,
             "ollama_faithful": fam.ollama_faithful,
             "template_delivery": str(fam.template_delivery),
         }

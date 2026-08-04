@@ -40,6 +40,10 @@ ENGINE_DEFAULT_STYLE: dict[str, str] = {
     # Ollama's json_schema path returns empty content on several models, so
     # json_object is the safe universal default (see llm.model_catalog).
     "ollama": "json_object",
+    # The transformers shim free-generates (it ignores response_format), so it
+    # cannot enforce a grammar — rely on the prompt for JSON, never advertise a
+    # constraint the server drops. (Last-resort path; best-effort extraction.)
+    "transformers": "none",
 }
 
 _FALLBACK_STYLE = "openai_json_schema"

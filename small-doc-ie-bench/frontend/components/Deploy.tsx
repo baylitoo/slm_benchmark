@@ -2083,6 +2083,12 @@ function EncoderSeedForm({
 function familyTypeTag(f: ModelFamily): string {
   if (f.analyzer) return "encoder / analyzer";
   if (f.embedding) return "embedding · vectors (RAG)";
+  // Transformers/AutoModel is the last-resort path (no GGUF) — label it as such
+  // before the generic vision/chat tags so a manual pick reads honestly.
+  if (f.transformers_runtime)
+    return f.trust_remote_code
+      ? "transformers · last resort · trusts remote code"
+      : "transformers · last resort (~2-3x RAM)";
   if (f.vision || f.needs_mmproj) return "vision";
   return "chat / extraction";
 }

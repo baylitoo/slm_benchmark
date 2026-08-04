@@ -80,6 +80,14 @@ class FamilyContract:
     # the store-driven replacement for the server's name-based auto-detection.
     analyzer: bool = False
     encoder_backend: str | None = None
+    # A transformers/AutoModel family: a safetensors snapshot served by the
+    # TRANSFORMERS runtime (docie transformers), NOT llama.cpp. The LAST-RESORT
+    # path for a model with no GGUF / an arch llama.cpp cannot serve — stored as
+    # a directory snapshot like an analyzer, and typed "transformers".
+    # ``trust_remote_code`` opts a custom-code checkpoint into executing the
+    # repo's Python on the serving node (SECURITY: off by default).
+    transformers_runtime: bool = False
+    trust_remote_code: bool = False
     stop_sequences: tuple[str, ...] = ()
     # Generation defaults inherited by a family-synthesized profile (a store deploy
     # whose served id matches no models.yaml profile). These are the single source
@@ -230,6 +238,45 @@ FAMILIES: dict[str, FamilyContract] = {
         prompt_profile="strict_extraction_v1",
         analyzer=True,
         encoder_backend="gliner2",
+        ollama_faithful=False,
+    ),
+    # Transformers / AutoModel LAST-RESORT family. A safetensors snapshot served
+    # by the TRANSFORMERS runtime when no GGUF exists (or llama.cpp can't load
+    # the arch). Chat + vision are handled generically by the repo's own chat
+    # template — no per-model contract — at the cost of ~2-3x a GGUF's RAM and
+    # slower CPU inference (surfaced as a memory warning at inspect/deploy).
+    # template_delivery/response_format ride the standard OpenAI chat surface
+    # the shim exposes; a schema (when sent) goes via response_format.
+    "transformers": FamilyContract(
+        name="transformers",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        # The shim free-generates (ignores response_format); rely on the prompt
+        # for JSON. See ENGINE_DEFAULT_STYLE["transformers"] = "none".
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        transformers_runtime=True,
+        trust_remote_code=False,
+        vision=True,  # the shim auto-detects vision; the surface allows images
+        default_max_tokens=1024,
+        default_timeout_seconds=600.0,  # unquantized CPU inference is slow
+        ollama_faithful=False,
+    ),
+    # Same runtime, opted into executing the repo's custom Python — required for
+    # custom-code checkpoints (config.json auto_map, e.g. UnlimitedOCR/DeepSeek-
+    # OCR). SECURITY: arbitrary code on the serving node, hence a DISTINCT family
+    # so the trust is an explicit, auditable choice at deploy, never a default.
+    "transformers_trust_remote_code": FamilyContract(
+        name="transformers_trust_remote_code",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        # The shim free-generates (ignores response_format); rely on the prompt
+        # for JSON. See ENGINE_DEFAULT_STYLE["transformers"] = "none".
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        transformers_runtime=True,
+        trust_remote_code=True,
+        vision=True,
+        default_max_tokens=1024,
+        default_timeout_seconds=600.0,
         ollama_faithful=False,
     ),
 }
@@ -515,27 +562,30 @@ class ModelStore:
         source: str | None = None,
         link: bool = True,
     ) -> StoreEntry:
-        """Register a transformers/encoder checkpoint DIRECTORY (safetensors +
-        config + tokenizer) as a store entry.
+        """Register a safetensors checkpoint DIRECTORY (weights + config +
+        tokenizer/processor) as a store entry.
 
-        Analyzer families (GLiNER/GLiNER2) are multi-file safetensors
-        checkpoints, not single GGUFs, so ``model_path`` points at the snapshot
-        DIRECTORY (``<root>/<name>/snapshot``) served by the encoder runtime
-        via ``from_pretrained(<path>)`` — no network at deploy time. The whole
-        tree is transferred into a ``.tmp`` sibling and renamed atomically, so a
-        half-copied snapshot never appears under the canonical name.
+        Two snapshot families share this path: analyzer (GLiNER/GLiNER2)
+        checkpoints served by the encoder runtime, and the LAST-RESORT
+        transformers/AutoModel path. Both are multi-file safetensors, not single
+        GGUFs, so ``model_path`` points at the snapshot DIRECTORY
+        (``<root>/<name>/snapshot``) loaded via ``from_pretrained(<path>)`` — no
+        network at deploy time. The whole tree is transferred into a ``.tmp``
+        sibling and renamed atomically, so a half-copied snapshot never appears
+        under the canonical name.
         """
         contract = get_family(family)
-        if not contract.analyzer:
+        if not (contract.analyzer or contract.transformers_runtime):
             raise ModelStoreError(
-                f"add_snapshot is for analyzer (encoder) families; {family!r} is not one"
+                f"add_snapshot is for snapshot families (analyzer / transformers); "
+                f"{family!r} is not one"
             )
         src = Path(snapshot_dir)
         if not src.is_dir():
             raise ModelStoreError(f"snapshot directory not found: {src}")
         if not any(p.suffix == ".safetensors" for p in src.rglob("*") if p.is_file()):
             raise ModelStoreError(
-                f"snapshot {src} has no .safetensors weights — not an encoder checkpoint"
+                f"snapshot {src} has no .safetensors weights — not a servable checkpoint"
             )
         _assert_within(self.root / name, self.root, label=f"store name {name!r}")
 

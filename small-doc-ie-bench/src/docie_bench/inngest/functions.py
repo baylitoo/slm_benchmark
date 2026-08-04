@@ -1157,11 +1157,12 @@ async def _run_seed_hf(
 
         return report
 
-    # Analyzer families (encoder checkpoints) are a multi-file safetensors
-    # SNAPSHOT, not a GGUF — download the whole tree and register it as a
-    # directory entry so the encoder runtime loads it locally (no network at
-    # deploy time). Shares the exact same progress/registration machinery.
-    if contract.analyzer:
+    # Snapshot families are a multi-file safetensors SNAPSHOT, not a GGUF —
+    # download the whole tree and register it as a directory entry so the
+    # runtime loads it locally (no network at deploy time). Two kinds share the
+    # exact same progress/registration machinery: analyzer (encoder) checkpoints
+    # and the LAST-RESORT transformers/AutoModel path (no GGUF for this model).
+    if contract.analyzer or contract.transformers_runtime:
         try:
             async with httpx.AsyncClient(transport=transport) as client:
                 snap_files = await list_snapshot_files(repo, client=client)

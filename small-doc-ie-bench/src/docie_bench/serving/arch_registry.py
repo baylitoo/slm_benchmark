@@ -114,6 +114,23 @@ RUNTIME_NOTES: dict[str, str] = {
 }
 
 
+# The LAST-RESORT transformers/AutoModel families (arch-agnostic: served from
+# the repo's own chat template, no per-model contract). `transformers` is the
+# safe default; `transformers_trust_remote_code` is the opt-in for custom-code
+# checkpoints (config.json auto_map) that execute repo Python on the node.
+TRANSFORMERS_FAMILY = "transformers"
+
+# The memory disclaimer surfaced on any transformers verdict — carried on the
+# verdict's ``runtime_note`` so the UI renders it in the SAME amber caveat as a
+# runtime gate. States the preferred path plainly (the whole point of making
+# this a last resort).
+TRANSFORMERS_MEMORY_NOTE = (
+    "served via transformers (AutoModel) — unquantized weights use ~2-3x the "
+    "RAM of a GGUF Q4 and CPU inference is slower. Prefer a GGUF repo of this "
+    "model if one exists; deploy here only as a last resort."
+)
+
+
 @dataclass(frozen=True)
 class SupportVerdict:
     """The outcome of resolving an architecture to a family."""
@@ -133,7 +150,22 @@ def resolve_family(
     has_safetensors: bool,
     has_mmproj: bool,
 ) -> SupportVerdict:
-    """Map a detected architecture (+ repo shape) to a family and a verdict."""
+    """Map a detected architecture (+ repo shape) to a family and a verdict.
+
+    The GGUF/llama.cpp path is always preferred. Only when the repo ships NO
+    servable GGUF (safetensors-only) does the LAST-RESORT transformers family
+    apply — the "no servable GGUF" hard gate (see ``_transformers_verdict``).
+    """
+    arch = architecture.strip().lower() if architecture else ""
+    runtime_note = RUNTIME_NOTES.get(arch)
+
+    # Encoder analyzers are detected by the gliner marker, not a base arch
+    # (GLiNER2's base is mdeberta but that is NOT what we serve it as). These
+    # ARE safetensors-only, so this must precede the transformers gate below.
+    if "gliner" in arch:
+        family = "encoder_gliner2" if "2" in arch else "encoder_gliner"
+        return SupportVerdict("supported", family, f"analyzer architecture {architecture!r}")
+
     if not architecture:
         if has_gguf:
             # A GGUF with no readable arch is still deployable as a plain chat
@@ -144,20 +176,29 @@ def resolve_family(
                 "no architecture metadata found; defaulting to a plain chat family — "
                 "confirm the family before deploying",
             )
+        if has_safetensors:
+            # No GGUF, no arch, but weights present — the transformers last
+            # resort can still serve it from the repo's own chat template.
+            return _transformers_verdict(architecture=None, has_mmproj=has_mmproj)
         return SupportVerdict(
             "unsupported",
             None,
             "no GGUF and no readable architecture — not a servable repo",
         )
 
-    arch = architecture.strip().lower()
-    runtime_note = RUNTIME_NOTES.get(arch)
-
-    # Encoder analyzers are detected by the gliner marker, not a base arch
-    # (GLiNER2's base is mdeberta but that is NOT what we serve it as).
-    if "gliner" in arch:
-        family = "encoder_gliner2" if "2" in arch else "encoder_gliner"
-        return SupportVerdict("supported", family, f"analyzer architecture {architecture!r}")
+    # No servable GGUF in THIS repo: even a llama.cpp-supported arch cannot be
+    # served here via llama-server (it needs a .gguf file). If weights are
+    # present, redirect to the transformers last resort (with the memory note
+    # nudging the operator to a GGUF repo); otherwise it is not servable here.
+    if not has_gguf:
+        if has_safetensors:
+            return _transformers_verdict(architecture=arch, has_mmproj=has_mmproj)
+        return SupportVerdict(
+            "unsupported",
+            None,
+            f"architecture {architecture!r} detected but the repo ships neither a "
+            "GGUF nor safetensors weights — nothing servable here",
+        )
 
     family = ARCH_TO_FAMILY.get(arch)
     if family is not None:
@@ -203,4 +244,22 @@ def resolve_family(
         None,
         f"architecture {architecture!r} is not recognized — pick a family manually "
         "before deploying",
+    )
+
+
+def _transformers_verdict(*, architecture: str | None, has_mmproj: bool) -> SupportVerdict:
+    """The last-resort transformers verdict for a safetensors-only repo.
+
+    ``supported`` — we CAN serve it — but the memory disclaimer rides
+    ``runtime_note`` so the preferred (GGUF) path is stated loudly at the
+    decision point. Custom-code detection (config.json ``auto_map``) is a
+    deploy-time concern; the operator picks ``transformers_trust_remote_code``
+    explicitly when the load needs it.
+    """
+    arch_label = f"architecture {architecture!r}" if architecture else "no readable architecture"
+    return SupportVerdict(
+        "supported",
+        TRANSFORMERS_FAMILY,
+        f"{arch_label}: no GGUF in this repo — {TRANSFORMERS_FAMILY} (last resort)",
+        runtime_note=TRANSFORMERS_MEMORY_NOTE,
     )
