@@ -633,6 +633,24 @@ export function listSchemas(): Promise<string[]> {
   return request<{ schemas: string[] }>("/v1/schemas").then((r) => r.schemas ?? []);
 }
 
+/** A seed download's latest progress — emitted on the realtime `progress` topic
+ * AND persisted to a pollable sidecar so the polling fallback shows the same bar. */
+export interface SeedProgress {
+  percent?: number | null;
+  received_bytes?: number;
+  total_bytes?: number | null;
+  stage?: string;
+  file?: string;
+}
+
+/** Poll a seed run's latest download progress by channel (realtime-free). Returns
+ * null progress until the first chunk lands (or once the download settles). */
+export function getSeedProgress(channel: string): Promise<SeedProgress | null> {
+  return request<{ channel: string; progress: SeedProgress | null }>(
+    `/v1/serving/seed-progress?channel=${encodeURIComponent(channel)}`,
+  ).then((r) => r.progress ?? null);
+}
+
 /** Seed the store from a local Ollama/HF reference. Returns a trigger to stream. */
 export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/seed-ollama", {

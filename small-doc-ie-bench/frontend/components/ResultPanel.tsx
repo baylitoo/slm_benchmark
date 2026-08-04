@@ -69,5 +69,12 @@ export function ResultPanel({
     );
   }
 
-  return <PollingResult eventId={trigger.event_ids[0]} noun={noun} onSettled={onSettled} />;
+  return (
+    <PollingResult
+      eventId={trigger.event_ids[0]}
+      channel={trigger.channel}
+      noun={noun}
+      onSettled={onSettled}
+    />
+  );
 }
