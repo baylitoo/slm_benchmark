@@ -11,10 +11,31 @@ FROM python:3.11-slim-bookworm AS llama-builder
 # on a stock Docker Desktop). Override on a roomier machine for speed:
 #   docker compose build --build-arg LLAMA_BUILD_JOBS=8 worker
 ARG LLAMA_BUILD_JOBS=2
+# Pin llama.cpp to a commit/tag for REPRODUCIBLE builds AND to force a rebuild
+# of this (Docker-cached) layer when a needed upstream feature lands. Empty
+# (default) keeps the old behavior — the latest master HEAD, cached forever
+# once built. IMPORTANT: because the clone-and-build below is one RUN whose
+# text never changes, a plain `docker compose build` REUSES the cached
+# llama-server even after upstream HEAD moves. To pick up a new arch (e.g.
+# Unlimited-OCR / deepseek-ocr, ggml-org/llama.cpp#24969, merged 2026-06-24),
+# set LLAMA_REF to a commit/tag AFTER that merge — the changed ARG busts this
+# layer's cache and rebuilds llama.cpp at the pin:
+#   docker compose build --build-arg LLAMA_REF=<commit-or-tag> serving
+# (or `docker compose build --no-cache serving`, but that rebuilds everything).
+ARG LLAMA_REF=
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git build-essential cmake ca-certificates \
   && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /src \
+# A pinned ref is shallow-fetched (only that commit — GitHub allows any-SHA
+# fetch), so pinning stays as cheap as the --depth 1 clone.
+RUN if [ -n "${LLAMA_REF}" ]; then \
+      git init /src \
+      && git -C /src remote add origin https://github.com/ggml-org/llama.cpp \
+      && git -C /src fetch --depth 1 origin "${LLAMA_REF}" \
+      && git -C /src checkout FETCH_HEAD; \
+    else \
+      git clone --depth 1 https://github.com/ggml-org/llama.cpp /src; \
+    fi \
  && cmake -S /src -B /src/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_SHARED_LIBS=OFF \
