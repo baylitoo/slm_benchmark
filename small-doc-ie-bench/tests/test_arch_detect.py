@@ -61,6 +61,19 @@ def test_unknown_arch_with_mmproj_suggests_vision() -> None:
     assert v.verdict == "needs_family" and v.family == "lfm2_vl"
 
 
+def test_resolve_qwen35_is_nuextract3() -> None:
+    # NuExtract3's GGUF backbone arch "qwen35" + mmproj → the nuextract3 schema
+    # contract (not the generic json_schema vision family that would drop it).
+    v = resolve_family("qwen35", has_gguf=True, has_safetensors=False, has_mmproj=True)
+    assert v.verdict == "supported"
+    assert v.family == "nuextract3"
+    # Same arch without a projector fails the vision sanity check, not a silent
+    # text mis-serve.
+    t = resolve_family("qwen35", has_gguf=True, has_safetensors=False, has_mmproj=False)
+    assert t.verdict == "needs_family"
+    assert "mmproj" in t.reason
+
+
 def test_resolve_gliner_marker() -> None:
     v = resolve_family("GLiNER2", has_gguf=False, has_safetensors=True, has_mmproj=False)
     assert v.verdict == "supported" and v.family == "encoder_gliner2"
