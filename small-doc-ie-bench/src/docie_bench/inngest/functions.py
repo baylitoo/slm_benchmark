@@ -646,10 +646,14 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
         # port is honored verbatim. Drop the old 8088 fallback: pinning it here
         # made auto-allocation dead code and collided every concurrent deploy.
         raw_port = data.get("port")
+        raw_dep_name = data.get("deployment_name")
         record = await cp.up(
             model,
             port=int(raw_port) if raw_port is not None else None,
             context_length=int(data.get("context_length", DEFAULT_DEPLOY_CONTEXT_LENGTH)),
+            # Scale: a distinct record name for another replica of `model`
+            # (control_plane.serve_store_model looks the weights up by `model`).
+            deployment_name=str(raw_dep_name) if raw_dep_name else None,
         )
     return record
 

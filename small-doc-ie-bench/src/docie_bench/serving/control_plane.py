@@ -11,11 +11,12 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import shutil
 import socket
 import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence, Set
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -371,18 +372,22 @@ class ControlPlane:
         *,
         port: int | None = None,
         context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
+        deployment_name: str | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
         # so it does not stall the worker's asyncio loop — the Inngest Connect
         # heartbeats and any concurrent realtime/extraction steps must keep
         # flowing on the scale-1 worker while a large GGUF loads.
+        # ``deployment_name`` (scale) names the record while ``name`` stays the
+        # store-entry lookup — see serve_store_model.
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
                 _required(name, "model"),
                 port=port,
                 context_length=context_length,
+                deployment_name=deployment_name,
             )
         )
 
@@ -848,7 +853,15 @@ class _DefaultSupervisor:
         *,
         port: int | None = None,
         context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
+        deployment_name: str | None = None,
     ) -> object:
+        """Deploy a store model. ``deployment_name`` overrides the record name so
+        the SAME store model can run as several deployments (scale): the weights
+        + family are looked up by ``name`` (the store entry), but the record —
+        and its port — are keyed on ``deployment_name or name``. The llama-server
+        ``--alias`` stays the base store ``name`` so every replica answers to the
+        same model id (the placement row records ``model_name=name``), which is
+        what a future load-balancer routes ``store:<name>`` across."""
         from docie_bench.serving.model_store import ModelStore, ModelStoreError
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -863,6 +876,7 @@ class _DefaultSupervisor:
                 f"{exc} Seed it first (ModelStore.seed_from_ollama / add_gguf — "
                 f"see serving/README.md), then re-run `docie up {name}`."
             ) from exc
+        record_name = deployment_name or entry.name
         bind_host, advertise_host = self._reachability_hosts()
         # Store models always run the in-worker LLAMACPP subprocess (never REMOTE),
         # so guard the advertise host unconditionally here.
@@ -901,6 +915,9 @@ class _DefaultSupervisor:
                 RuntimeLaunchSpec(
                     runtime=runtime_kind,
                     model=entry.model_path.as_posix(),
+                    # --alias stays the BASE store name so every replica answers
+                    # to the same model id (load-balancing key); the RECORD name
+                    # is what makes the deployment individually addressable.
                     alias=entry.name,
                     port=chosen,
                     context_length=context_length,
@@ -910,7 +927,7 @@ class _DefaultSupervisor:
                 advertise_host=advertise_host,
             )
             spec = DeploymentSpec(
-                name=entry.name,
+                name=record_name,
                 launch=launch,
                 # A large GGUF can take a while to load; keep the readiness poll from
                 # tripping reconcile's degrade-and-kill while the model is still
@@ -928,12 +945,14 @@ class _DefaultSupervisor:
         record = self._deploy_with_port_reallocation(
             launch_and_await=_launch_and_await,
             bind_host=bind_host,
-            exclude_name=entry.name,
+            exclude_name=record_name,
             port_override=port,
         )
         # Record the placement at the same seam stop()/remove() clear it, so
         # every deploy surface — host-native `docie up` and the worker's Inngest
         # job alike — makes store:<name> resolvable, not just the worker path.
+        # ``name`` (the base store name) is the placement's model_name, so all
+        # replicas share one routable model id.
         _record_placement(name, record)
         return record
 
@@ -1044,6 +1063,47 @@ class _DefaultSupervisor:
 
     def pin(self, name: str, *, pinned: bool) -> object:
         return self.backend.pin(name, pinned=pinned)
+
+
+def replica_deployment_name(base: str, index: int) -> str:
+    """The deployment (record) name for the ``index``-th replica of ``base``.
+
+    The first instance (index 1) IS the bare store name so a single deploy is
+    unchanged; subsequent replicas get a ``-2``/``-3``/… suffix. This is the
+    naming convention scaling and ``count_replica_deployments`` both key on."""
+    return base if index <= 1 else f"{base}-{index}"
+
+
+def _replica_re(base: str) -> re.Pattern[str]:
+    return re.compile(rf"^{re.escape(base)}(?:-(\d+))?$")
+
+
+def count_replica_deployments(base: str, existing_names: Iterable[str]) -> int:
+    """How many live deployments are replicas of ``base`` (``base`` or ``base-N``)."""
+    pattern = _replica_re(base)
+    return sum(1 for n in existing_names if pattern.match(n))
+
+
+def replica_names_to_add(
+    base: str, existing_names: Iterable[str], target_total: int
+) -> list[str]:
+    """The deployment names to CREATE to bring ``base`` up to ``target_total``
+    replicas, skipping any name already taken (replica of ``base`` or not).
+
+    Returns fewer than the delta only if the search is exhausted (bounded). An
+    already-satisfied target returns ``[]`` — scaling is idempotent."""
+    existing = set(existing_names)
+    current = count_replica_deployments(base, existing)
+    delta = max(0, target_total - current)
+    names: list[str] = []
+    index = 1
+    while len(names) < delta and index <= 10_000:
+        candidate = replica_deployment_name(base, index)
+        if candidate not in existing:
+            names.append(candidate)
+            existing.add(candidate)
+        index += 1
+    return names
 
 
 def _record_placement(model_name: str, record: object) -> None:

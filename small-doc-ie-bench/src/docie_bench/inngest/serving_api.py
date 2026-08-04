@@ -43,6 +43,9 @@ LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
 REPAIR_EVENT = "serving/repair.requested"
 PIN_EVENT = "serving/pin.requested"
+# Scaling reuses the ordinary single-deploy job (deploy_model_job) — the scale
+# endpoint just fans out one deploy event per new replica name.
+DEPLOY_EVENT = "serving/deploy.requested"
 
 # Snapshot-staleness gate: a published node snapshot is only trusted while it
 # is at most this many reconcile intervals old. If the serving reconciler dies,
@@ -531,6 +534,76 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     """
     del tenant
     return await _fire_lifecycle_event(name, event=UNLOAD_EVENT, prefix="unload")
+
+
+class ScaleRequest(BaseModel):
+    """Body of POST /store/{name}/scale — the TARGET total replica count."""
+
+    replicas: int = Field(ge=1, le=16)
+    context_length: int | None = None
+
+
+@router.post("/store/{name}/scale")
+async def scale_store_model(
+    name: str, request: ScaleRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    """Scale a store model to ``replicas`` total addressable deployments.
+
+    Deploying the SAME store model several times means several records — the
+    first is the bare store name, the rest are ``<name>-2``/``-3``/… on their
+    own auto-allocated ports (control_plane.replica_names_to_add). Idempotent:
+    if already at/above the target, nothing is spawned. This fans out one
+    ordinary ``serving/deploy.requested`` per new replica (each carrying
+    ``deployment_name``), so every deploy reuses the proven single-deploy job —
+    timeouts, port reallocation, placement recording — with no long-running
+    scale job. The fit check lives in the Sizing surface the UI drives; the
+    reconciler is the runtime backstop.
+    """
+    del tenant  # authenticated principal required; ops surface, no per-tenant scoping
+    from docie_bench.serving.control_plane import (
+        count_replica_deployments,
+        replica_names_to_add,
+    )
+    from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
+    records = await _control_plane().list_deployments()
+    existing = [
+        str(spec_name)
+        for record in (records if isinstance(records, list) else [])
+        if isinstance(record, dict)
+        and (spec_name := (record.get("spec") or {}).get("name"))
+    ]
+    to_add = replica_names_to_add(name, existing, request.replicas)
+    current = count_replica_deployments(name, existing)
+    if not to_add:
+        return {
+            "model": name,
+            "target": request.replicas,
+            "current": current,
+            "adding": [],
+            "event_ids": [],
+            "channel": None,
+        }
+    ctx_len = request.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH
+    channel = f"scale:{uuid.uuid4().hex}"
+    event_ids: list[str] = []
+    for deployment_name in to_add:
+        data = {
+            "model": name,
+            "deployment_name": deployment_name,
+            "context_length": ctx_len,
+            "channel": channel,
+        }
+        ids = await inngest_client.send(inngest.Event(name=DEPLOY_EVENT, data=data))
+        event_ids.extend(ids)
+    return {
+        "model": name,
+        "target": request.replicas,
+        "current": current,
+        "adding": to_add,
+        "event_ids": event_ids,
+        "channel": channel,
+    }
 
 
 class RepairRequest(BaseModel):

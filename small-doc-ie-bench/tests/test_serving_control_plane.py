@@ -14,6 +14,9 @@ from docie_bench.serving.control_plane import (
     PortAllocator,
     _DefaultSupervisor,
     _socket_is_free,
+    count_replica_deployments,
+    replica_deployment_name,
+    replica_names_to_add,
     to_data,
 )
 from docie_bench.serving.model_store import ModelStore, ModelStoreError
@@ -236,6 +239,69 @@ def test_up_missing_entry_raises_with_store_root_and_seeding_pointer(tmp_path: P
     message = str(excinfo.value)
     assert str(root.resolve()) in message
     assert "Seed it first" in message
+
+
+# ── scale: replica naming (pure) + deployment_name override ──────────────────
+
+
+def test_replica_deployment_name_first_is_bare() -> None:
+    assert replica_deployment_name("qwen", 1) == "qwen"
+    assert replica_deployment_name("qwen", 2) == "qwen-2"
+    assert replica_deployment_name("qwen", 3) == "qwen-3"
+
+
+def test_count_replica_deployments_matches_base_and_suffixed() -> None:
+    existing = ["qwen", "qwen-2", "qwen-vl", "other", "qwen-3"]
+    # "qwen-vl" is a DIFFERENT model, not a numeric replica of "qwen".
+    assert count_replica_deployments("qwen", existing) == 3
+    assert count_replica_deployments("other", existing) == 1
+    assert count_replica_deployments("absent", existing) == 0
+
+
+def test_replica_names_to_add_from_zero() -> None:
+    assert replica_names_to_add("qwen", [], 3) == ["qwen", "qwen-2", "qwen-3"]
+
+
+def test_replica_names_to_add_is_idempotent_and_skips_taken() -> None:
+    existing = ["qwen", "qwen-2"]
+    # Already 2 → scaling to 3 adds exactly one, the next free suffix.
+    assert replica_names_to_add("qwen", existing, 3) == ["qwen-3"]
+    # Already at target → nothing.
+    assert replica_names_to_add("qwen", existing, 2) == []
+    # Below current → never removes; returns [].
+    assert replica_names_to_add("qwen", existing, 1) == []
+
+
+def test_replica_names_to_add_avoids_unrelated_and_gapped_names() -> None:
+    # "qwen-2" already counts as one replica (current=1); scaling to 2 total
+    # adds exactly one — the free BASE name "qwen", not another suffix.
+    assert replica_names_to_add("qwen", ["qwen-2", "zzz"], 2) == ["qwen"]
+    # Scaling to 3 with only "qwen-2" present fills base then the next free suffix.
+    assert replica_names_to_add("qwen", ["qwen-2", "zzz"], 3) == ["qwen", "qwen-3"]
+
+
+def test_up_deployment_name_overrides_record_but_keeps_base_alias(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    _seed_nuextract3_store(root)
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.LLAMACPP: FakeAdapter()},
+    )
+    wrapper = _DefaultSupervisor(supervisor, planner=None, model_store_root=root)
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.up("nuextract3", port=8090, deployment_name="nuextract3-2"))
+
+    # The record is keyed on the deployment (replica) name...
+    launch = supervisor.get("nuextract3-2").spec.launch
+    assert launch.port == 8090
+    # ...but the llama-server --alias stays the BASE store name so every replica
+    # answers to the same routable model id.
+    assert launch.alias == "nuextract3"
+    assert launch.model.endswith("model.gguf")
+    # The bare base name is NOT itself a record for this replica-only deploy.
+    with pytest.raises(KeyError):
+        supervisor.get("nuextract3")
 
 
 # ── PR-B: per-deploy port allocation ────────────────────────────────────────────
