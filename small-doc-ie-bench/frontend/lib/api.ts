@@ -292,6 +292,10 @@ export interface ModelFamily {
   analyzer?: boolean;
   /** The analyzer library for an analyzer family (e.g. "gliner" | "gliner2"). */
   encoder_backend?: string | null;
+  /** True for the transformers/AutoModel LAST-RESORT families (no GGUF path). */
+  transformers_runtime?: boolean;
+  /** True when the family executes the repo's custom Python on the serving node. */
+  trust_remote_code?: boolean;
   ollama_faithful?: boolean;
   template_delivery?: string;
   [k: string]: unknown;

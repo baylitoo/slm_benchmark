@@ -26,6 +26,7 @@ class RuntimeKind(StrEnum):
     OLLAMA = "ollama"
     REMOTE = "remote"
     ENCODER = "encoder"
+    TRANSFORMERS = "transformers"
 
 
 class LifecycleState(StrEnum):
@@ -598,6 +599,76 @@ class EncoderRuntime(RuntimeAdapter):
         )
 
 
+class TransformersRuntime(RuntimeAdapter):
+    """Launch ``docie transformers`` — the OpenAI-compatible shim over an
+    ``AutoModel`` checkpoint (see ``docie_bench.transformers_server.server``).
+
+    The LAST-RESORT runtime: it serves a model with no GGUF (or an arch
+    llama.cpp cannot load) directly from unquantized ``transformers`` weights,
+    at ~2-3x a GGUF Q4's RAM and slower CPU inference — prefer a GGUF repo
+    whenever one exists. ``spec.model`` is a local snapshot directory (seeded
+    like an encoder) or an HF id; the family carries ``--trust-remote-code``
+    into ``extra_args`` only when a custom-code checkpoint opts in. Everything
+    else — port allocation, deployment record, health probing (``/healthz``),
+    reconciler overlay, load/unload/delete lifecycle — is inherited unchanged.
+    """
+
+    kind = RuntimeKind.TRANSFORMERS
+    executable_names = ("docie", "docie-serving")
+    health_path = "/healthz"
+    features = frozenset({RuntimeFeature.VISION})
+
+    def resolve_executable(self, spec: RuntimeLaunchSpec) -> str | None:
+        # The console script may be off PATH inside a container; the current
+        # interpreter can always launch the CLI module instead (build_command),
+        # so this runtime never reads as "not installed".
+        return super().resolve_executable(spec) or sys.executable
+
+    def detect_version(self, executable: str) -> str | None:
+        # The meaningful version is transformers', not the CLI's.
+        try:
+            return f"transformers {importlib.metadata.version('transformers')}"
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    def probe(self, spec: RuntimeLaunchSpec) -> RuntimeCapabilities:
+        capabilities = super().probe(spec)
+        # Fail the deploy at probe time with the actionable reason, not after a
+        # spawn whose child dies on ImportError.
+        if (
+            importlib.util.find_spec("torch") is None
+            or importlib.util.find_spec("transformers") is None
+        ):
+            return replace(
+                capabilities,
+                compatible=False,
+                reasons=(
+                    *capabilities.reasons,
+                    "torch + transformers are not installed on the serving node "
+                    "(pip install 'small-doc-ie-bench[encoders]')",
+                ),
+            )
+        return capabilities
+
+    def build_command(self, spec: RuntimeLaunchSpec) -> tuple[str, ...]:
+        self.validate(spec)
+        # Base lookup (no interpreter fallback): a found console script runs
+        # directly; otherwise launch the CLI module with this interpreter.
+        found = RuntimeAdapter.resolve_executable(self, spec)
+        base = (found,) if found else (sys.executable, "-m", "docie_bench.serving.cli")
+        return (
+            *base,
+            "transformers",
+            "--model",
+            spec.model,
+            "--host",
+            spec.host,
+            "--port",
+            str(spec.port),
+            *spec.extra_args,
+        )
+
+
 def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
     return {
         RuntimeKind.VLLM: VLLMRuntime(),
@@ -605,6 +676,7 @@ def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
         RuntimeKind.OLLAMA: OllamaRuntime(),
         RuntimeKind.REMOTE: RemoteRuntime(),
         RuntimeKind.ENCODER: EncoderRuntime(),
+        RuntimeKind.TRANSFORMERS: TransformersRuntime(),
     }
 
 

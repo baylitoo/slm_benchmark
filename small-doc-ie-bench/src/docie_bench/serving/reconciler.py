@@ -92,6 +92,7 @@ _ENGINE_BY_RUNTIME: dict[RuntimeKind, str] = {
     RuntimeKind.VLLM: "vllm",
     RuntimeKind.REMOTE: "remote",
     RuntimeKind.ENCODER: "encoder",
+    RuntimeKind.TRANSFORMERS: "transformers",
 }
 
 

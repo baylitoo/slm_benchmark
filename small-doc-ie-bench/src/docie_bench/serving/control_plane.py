@@ -883,6 +883,15 @@ class _DefaultSupervisor:
                 if contract.encoder_backend
                 else ()
             )
+        elif contract.transformers_runtime:
+            # LAST-RESORT: a safetensors snapshot served by the TRANSFORMERS
+            # runtime (no GGUF / arch llama.cpp can't load). The snapshot dir is
+            # the model; --trust-remote-code rides in only when the family opts
+            # in (a custom-code checkpoint), never by default.
+            runtime_kind = RuntimeKind.TRANSFORMERS
+            launch_extra_args = (
+                ("--trust-remote-code",) if contract.trust_remote_code else ()
+            )
         else:
             runtime_kind = RuntimeKind.LLAMACPP
             launch_extra_args = store.family_launch_args(name)
@@ -1052,10 +1061,16 @@ def _record_placement(model_name: str, record: object) -> None:
     spec = getattr(record, "spec", None)
     state = getattr(record, "state", None)
     # Engine follows the launch runtime: llama-server for GGUF, "encoder" for an
-    # analyzer snapshot (serve_store_model now branches by family).
+    # analyzer snapshot, "transformers" for the AutoModel last-resort snapshot
+    # (serve_store_model branches by family).
     launch = getattr(spec, "launch", None)
     runtime = getattr(launch, "runtime", None)
-    engine = "encoder" if str(getattr(runtime, "value", runtime)) == "encoder" else "llama-server"
+    runtime_label = str(getattr(runtime, "value", runtime))
+    engine = (
+        runtime_label
+        if runtime_label in {"encoder", "transformers"}
+        else "llama-server"
+    )
     try:
         ModelCatalog().record_placement(
             str(getattr(spec, "name", None) or model_name),

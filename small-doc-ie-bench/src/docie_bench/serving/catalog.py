@@ -325,6 +325,10 @@ def available_backends(family: str) -> list[str]:
     contract = FAMILIES.get(family)
     if contract is not None and contract.analyzer:
         return ["encoder"]
+    # Transformers/AutoModel families are served ONLY by the transformers
+    # runtime (no GGUF exists for them), never llama.cpp/Ollama.
+    if contract is not None and contract.transformers_runtime:
+        return ["transformers"]
     backends = ["llama-server"]
     if contract is not None and contract.ollama_faithful:
         backends.append("ollama")

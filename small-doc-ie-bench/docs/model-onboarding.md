@@ -89,6 +89,60 @@ Independent of our code: `llama-server` must support the model's architecture
 llama.cpp build. If unsupported, the GGUF refuses to load — visible in the
 deployment's runtime log. Adding a family does not add runtime support.
 
+## The serving ladder — and the last-resort transformers runtime
+
+Onboarding is a ladder, tried top-down. Each rung is lighter and more faithful
+than the one below; you drop to the next only when the one above can't serve the
+model **from this repo**:
+
+1. **GGUF + llama.cpp** — the preferred path. A quantized GGUF served by
+   `llama-server` (`--jinja`, `--mmproj`, `--embedding` as the family needs).
+   Light, fast, portable. Covers a model when a GGUF exists *and* llama.cpp
+   supports the arch.
+2. **Add a family** (`~10 lines + a test`) — llama.cpp already supports the
+   arch, but its serving *contract* (template/response shape) has no family yet.
+   The NuExtract3-vs-Unlimited-OCR case study above is exactly this rung.
+3. **transformers / AutoModel** — the **last resort**. A model with **no GGUF in
+   its repo** (or an arch llama.cpp cannot load) is served directly from
+   unquantized `transformers` weights by the `docie transformers` shim
+   (`transformers_server/server.py`, `RuntimeKind.TRANSFORMERS`), the exact
+   mirror of the encoder shim. `AutoProcessor` + `AutoModelForImageTextToText` /
+   `AutoModelForCausalLM` load the checkpoint, its chat template and its
+   (multimodal) processor from the repo — so onboarding needs **no per-model
+   family contract at all**. Chat and vision both work generically.
+
+### Why rung 3 is deliberately last
+
+This is the tradeoff [LocalAI](https://localai.io/blog/why-we-write-our-own-engines/)
+frames precisely. Their objection to wrapping heavyweight Python engines is
+*deployment friction* — "a multi-gigabyte Python install we could not ship."
+**That objection does not bite us**: the serving image already carries
+torch + transformers for the GLiNER encoders (`PIP_EXTRAS=ocr,encoders`), so the
+transformers runtime costs ~zero marginal image size. What *does* bite us is
+their second axis — **runtime memory and speed**: unquantized safetensors use
+**~2-3x the RAM** of a GGUF Q4 and CPU inference is markedly slower. So the
+transformers runtime is a safety net, never the strategy: the real fix for the
+onboarding bottleneck is widening rungs 1-2 (GGUF discovery + arch-map breadth),
+not leaning on the escape hatch.
+
+The last-resort posture is enforced, not just advised:
+
+- **The "no servable GGUF" gate** (`arch_registry.resolve_family`): a repo with a
+  GGUF is *never* routed to transformers. Only a safetensors-only repo falls to
+  the `transformers` family — and even then the verdict carries a `runtime_note`
+  memory disclaimer ("prefer a GGUF repo of this model if one exists") that the
+  Studio renders in the same amber caveat as a runtime gate.
+- **`trust_remote_code` is a separate, explicit family.** Native-arch checkpoints
+  load with zero custom code. A custom-code checkpoint (`config.json` `auto_map`
+  — e.g. UnlimitedOCR/DeepSeek-OCR) needs `trust_remote_code=True`, which
+  executes the repo's Python **on the serving node**. That trust is a *distinct*
+  family (`transformers_trust_remote_code`), so it is an auditable choice at
+  deploy, never a default.
+
+Storage/lifecycle-wise, a transformers model is a **safetensors snapshot** in the
+store — the same directory-entry path the encoders already use — so seed,
+deploy, sizing and the fit gate all treat it like any other store model.
+
 ## Where this is going: pre-flight support detection
 
 Today onboarding is try-and-see. The target is **HuggingFace-like browsing with a
