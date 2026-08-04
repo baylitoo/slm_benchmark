@@ -68,7 +68,9 @@ export function AppShell() {
                 hidden={id !== active}
                 className={id === active ? "animate-fade-in" : undefined}
               >
-                {id === "playground" && <Playground active={active === "playground"} />}
+                {id === "playground" && (
+                  <Playground active={active === "playground"} onNavigate={onNavigate} />
+                )}
                 {id === "deploy" && <Deploy active={active === "deploy"} view={view} />}
                 {id === "agents" && <Agents view={view} />}
                 {id === "benchmark" && <Benchmark view={view} />}
