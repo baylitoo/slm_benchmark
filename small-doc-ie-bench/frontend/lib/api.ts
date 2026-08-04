@@ -598,6 +598,36 @@ export function whatifSizing(plan: WhatIfPlanEntry[]): Promise<WhatIfView> {
   });
 }
 
+/**
+ * Result of scaling a store model to a target replica count
+ * (POST /v1/serving/store/{name}/scale). Idempotent: `adding` is empty when the
+ * model is already at/above the requested target.
+ */
+export interface ScaleResult {
+  model: string;
+  /** The requested TARGET TOTAL number of deployments of this model. */
+  target: number;
+  /** Deployments of this model that already existed when scaling. */
+  current: number;
+  /** New deployment names spun up (empty when already at target). */
+  adding: string[];
+  event_ids: string[];
+  channel: string | null;
+  [k: string]: unknown;
+}
+
+/**
+ * Scale a store model to a TARGET TOTAL replica count (idempotent): at or above
+ * the target the server spawns nothing. `replicas` is the absolute target, not
+ * a delta — callers add the desired count to the running instances.
+ */
+export function scaleStoreModel(name: string, replicas: number): Promise<ScaleResult> {
+  return request<ScaleResult>(
+    `/v1/serving/store/${encodeURIComponent(name)}/scale`,
+    { method: "POST", body: JSON.stringify({ replicas }) },
+  );
+}
+
 /** Seed the store from a local Ollama/HF reference. Returns a trigger to stream. */
 export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/seed-ollama", {
