@@ -19,10 +19,21 @@ WORKDIR /app
 # Public config baked into the bundle. Override per environment at build time.
 ARG NEXT_PUBLIC_API_BASE=http://localhost:8080
 ARG NEXT_PUBLIC_GRAFANA_URL=http://localhost:3000
+# The Inngest dashboard LINK (Observability). Distinct from the realtime base
+# below: this is just where "open the Inngest dashboard" points.
 ARG NEXT_PUBLIC_INNGEST_URL=http://localhost:8288
+# The Inngest API the @inngest/realtime BROWSER hook connects to for live
+# progress. The lib reads exactly this name (getEnvVar("INNGEST_BASE_URL") ->
+# process.env.NEXT_PUBLIC_INNGEST_BASE_URL); unset, it defaults to Inngest Cloud
+# (api.inngest.com) and a self-hosted-minted token's socket is refused -> the UI
+# silently falls back to /runs polling. Point it at the BROWSER-reachable
+# host-published Inngest API port (INNGEST_HOST_PORT, default 8288) — never the
+# internal docker name (ws://inngest:8289), which the browser cannot resolve.
+ARG NEXT_PUBLIC_INNGEST_BASE_URL=http://localhost:8288
 ENV NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE \
     NEXT_PUBLIC_GRAFANA_URL=$NEXT_PUBLIC_GRAFANA_URL \
     NEXT_PUBLIC_INNGEST_URL=$NEXT_PUBLIC_INNGEST_URL \
+    NEXT_PUBLIC_INNGEST_BASE_URL=$NEXT_PUBLIC_INNGEST_BASE_URL \
     NEXT_TELEMETRY_DISABLED=1
 
 COPY --from=deps /app/node_modules ./node_modules

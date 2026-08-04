@@ -235,6 +235,11 @@ services:
         NEXT_PUBLIC_GRAFANA_URL: ${NEXT_PUBLIC_GRAFANA_URL:-http://localhost:3001}
         # Host port of the Inngest dashboard (matches INNGEST_HOST_PORT).
         NEXT_PUBLIC_INNGEST_URL: ${NEXT_PUBLIC_INNGEST_URL:-http://localhost:8290}
+        # BROWSER-reachable Inngest API for realtime live progress (the
+        # @inngest/realtime hook reads this exact name; unset => Inngest Cloud =>
+        # the self-hosted token is refused and the UI falls back to polling).
+        # Must be the host-published Inngest API port (INNGEST_HOST_PORT).
+        NEXT_PUBLIC_INNGEST_BASE_URL: ${NEXT_PUBLIC_INNGEST_BASE_URL:-http://localhost:${INNGEST_HOST_PORT:-8288}}
     restart: unless-stopped
     depends_on:
       api:
