@@ -651,6 +651,18 @@ export function getSeedProgress(channel: string): Promise<SeedProgress | null> {
   ).then((r) => r.progress ?? null);
 }
 
+/** Rasterize an uploaded PDF (or image) to PNG page-image data URLs a vision
+ * model can read (POST /v1/studio/render-document). One data URL per page. */
+export function renderDocument(
+  contentB64: string,
+  filename: string,
+): Promise<{ images: string[]; pages: number }> {
+  return request<{ images: string[]; pages: number }>("/v1/studio/render-document", {
+    method: "POST",
+    body: JSON.stringify({ content_b64: contentB64, filename }),
+  });
+}
+
 /** Seed the store from a local Ollama/HF reference. Returns a trigger to stream. */
 export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/seed-ollama", {

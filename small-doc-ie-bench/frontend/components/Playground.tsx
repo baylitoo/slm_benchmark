@@ -26,6 +26,7 @@ import {
   selectableDeployments,
   isLiveDeployment,
   fileToBase64,
+  renderDocument,
   ApiError,
   ApiUnavailable,
   type TriggerResponse,
@@ -630,13 +631,27 @@ function VisionPanel({
     setAnswer(null);
     try {
       const b64 = await fileToBase64(file);
-      const dataUri = `data:${file.type || "image/png"};base64,${b64}`;
+      // Vision models take IMAGES, not PDFs (llama-server rejects a
+      // data:application/pdf URL). A PDF is rasterized to PNG page images
+      // server-side first; a plain image is sent as-is.
+      const isPdf =
+        file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+      const imageUrls = isPdf
+        ? (await renderDocument(b64, file.name)).images
+        : [`data:${file.type || "image/png"};base64,${b64}`];
+      if (imageUrls.length === 0) {
+        setError("The document produced no page images.");
+        return;
+      }
       const res = await chatCompletion(model, [
         {
           role: "user",
           content: [
             { type: "text", text: prompt.trim() || "Describe this image." },
-            { type: "image_url", image_url: { url: dataUri } },
+            ...imageUrls.map((url) => ({
+              type: "image_url" as const,
+              image_url: { url },
+            })),
           ],
         },
       ]);
