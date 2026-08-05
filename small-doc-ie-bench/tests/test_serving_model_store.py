@@ -308,3 +308,34 @@ def test_add_gguf_copy_is_verified_and_faithful(tmp_path: Path) -> None:
     )
     assert entry.model_path.read_bytes() == b"weights-abc"
     assert not entry.model_path.with_name("model.gguf.tmp").exists()
+
+
+def test_transfer_verified_uses_unique_tmp_per_call(tmp_path: Path) -> None:
+    """Overlapping transfers to the same canonical destination must not share a
+    ``.tmp`` — the seed race that failed at 'registering' (blob integrity check).
+    """
+    import docie_bench.serving.model_store as ms
+
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"payload" * 4096)
+    dest = tmp_path / "store" / "model.gguf"
+    dest.parent.mkdir(parents=True)
+
+    seen: list[str] = []
+    original = ms._transfer
+
+    def spy(source: Path, tmp: Path, *, link: bool) -> None:
+        seen.append(tmp.name)
+        return original(source, tmp, link=link)
+
+    ms._transfer = spy  # type: ignore[assignment]
+    try:
+        ms._transfer_verified(src, dest, link=False, expected_digest=None)
+        ms._transfer_verified(src, dest, link=False, expected_digest=None)
+    finally:
+        ms._transfer = original  # type: ignore[assignment]
+
+    assert dest.read_bytes() == b"payload" * 4096  # canonical file is correct
+    assert len(set(seen)) == 2  # a distinct tmp each call
+    assert "model.gguf.tmp" not in seen  # not the old shared name
+    assert not list(dest.parent.glob("*.tmp"))  # no tmp left behind

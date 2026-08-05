@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -1128,7 +1129,13 @@ async def _run_seed_hf(
     contract = get_family(family)  # fail fast on an unknown family
 
     store = ModelStore(_serving_home() / "models")
-    tmp_dir = store.root / ".hf-downloads" / name
+    # A UNIQUE staging dir per attempt (NOT a fixed path per name): a large seed
+    # can exceed the Inngest step limit and get RETRIED while the first attempt
+    # is still downloading. A shared `.hf-downloads/<name>` then lets the retry
+    # overwrite model.gguf under the running attempt's feet — the copy/link
+    # integrity check hashes mismatched bytes and the seed fails at registering.
+    # An isolated dir per attempt removes the collision; `finally` cleans it.
+    tmp_dir = store.root / ".hf-downloads" / f"{name}-{uuid.uuid4().hex[:8]}"
 
     throttle = {"at": 0.0, "percent": -100.0}
 

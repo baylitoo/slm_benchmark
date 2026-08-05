@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import shutil
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -794,7 +795,12 @@ def _transfer_verified(
         trivially true (same inode); for a copy it catches a truncated/altered
         copy. There is no canonical digest to assert here (HF trust boundary).
     """
-    tmp = destination.with_name(destination.name + ".tmp")
+    # A UNIQUE tmp per call: two overlapping transfers to the same canonical
+    # destination (e.g. a big seed whose Inngest step retries while the first
+    # attempt is still running) must not share one ``.tmp`` — a shared tmp lets
+    # one attempt's hash read another's bytes, failing the integrity check. The
+    # final os.replace onto the canonical name stays atomic and idempotent.
+    tmp = destination.with_name(f"{destination.name}.{uuid.uuid4().hex[:12]}.tmp")
     try:
         _transfer(source, tmp, link=link)
         got = _sha256_file(tmp)
