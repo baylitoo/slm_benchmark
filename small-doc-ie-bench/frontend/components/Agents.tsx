@@ -40,6 +40,7 @@ import {
   getStore,
   isLiveDeployment,
   listSchemas,
+  renderDocument,
   selectableDeployments,
   updateAgent,
   visionDeploymentNames,
@@ -405,6 +406,17 @@ const SAMPLE_PII_TEXT =
 
 function TryPanel({ agent }: { agent: AgentView }) {
   const isOcr = agent.kind === "ocr";
+  // Vision-mode agents send the image straight to a vision model, so a PDF must
+  // be rasterized to page images first (like the Playground). OCR modes keep
+  // the raw PDF — the server-side OCR backend (e.g. pdf_text) reads it directly.
+  const options = (agent.options ?? {}) as Record<string, unknown>;
+  const ocrMode =
+    typeof options.mode === "string"
+      ? options.mode
+      : options.extractor
+        ? "ocr_extract"
+        : "ocr";
+  const isVisionAgent = isOcr && ocrMode === "vision";
   const [text, setText] = useState(SAMPLE_PII_TEXT);
   const [file, setFile] = useState<File | null>(null);
   const [running, setRunning] = useState(false);
@@ -421,16 +433,27 @@ function TryPanel({ agent }: { agent: AgentView }) {
         return;
       }
       const b64 = await fileToBase64(file);
+      const isPdf =
+        file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+      // Vision mode + PDF → rasterize to page images (a vision model can't read
+      // a data:application/pdf URL); every page is sent. Otherwise the file goes
+      // as-is (the OCR backend handles a raw PDF).
+      const imageParts =
+        isPdf && isVisionAgent
+          ? (await renderDocument(b64, file.name, 200)).images.map((url) => ({
+              type: "image_url",
+              image_url: { url },
+            }))
+          : [
+              {
+                type: "image_url",
+                image_url: { url: `data:${file.type || "image/png"};base64,${b64}` },
+              },
+            ];
       messages = [
         {
           role: "user",
-          content: [
-            { type: "text", text: "OCR this document." },
-            {
-              type: "image_url",
-              image_url: { url: `data:${file.type || "image/png"};base64,${b64}` },
-            },
-          ],
+          content: [{ type: "text", text: "OCR this document." }, ...imageParts],
         },
       ];
     } else {
