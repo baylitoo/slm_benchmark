@@ -194,6 +194,66 @@ def test_inject_response_format_builds_json_schema() -> None:
     assert isinstance(rf["json_schema"]["schema"], dict)
 
 
+def _completion(model: str, content: str = "{}") -> dict:
+    return {
+        "id": "c",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+async def test_schema_fallback_downgrades_on_grammar_400() -> None:
+    # llama.cpp fails to compile a deep schema's grammar (400 "failed to parse
+    # grammar"); the vision forward downgrades json_schema -> json_object.
+    from docie_bench.agents.runtime import _post_chat_with_schema
+
+    seen: list[dict | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body.get("response_format"))
+        rf = body.get("response_format") or {}
+        if rf.get("type") == "json_schema":
+            return httpx.Response(
+                400,
+                json={"error": {"message": "failed to parse grammar"}},
+            )
+        return httpx.Response(200, json=_completion(body["model"]))
+
+    msgs = {"messages": [{"role": "user", "content": "x"}]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_chat_with_schema(
+            UPSTREAM, msgs, "invoice", http_client=client
+        )
+    assert seen[0] is not None
+    assert seen[0]["type"] == "json_schema"  # tried strict first
+    assert seen[1] is not None
+    assert seen[1]["type"] == "json_object"  # then downgraded
+    assert result["choices"][0]["message"]["content"] == "{}"
+
+
+async def test_schema_fallback_reraises_non_grammar_400() -> None:
+    # A 400 that is NOT a grammar/response_format problem must NOT be swallowed.
+    from docie_bench.agents.runtime import AgentError, _post_chat_with_schema
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "context length exceeded"}})
+
+    msgs = {"messages": [{"role": "user", "content": "x"}]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(AgentError) as exc:
+            await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
+    assert exc.value.status_code == 400
+    assert "context length" in str(exc.value)
+
+
 def test_ocr_agent_vision_mode_forwards_image_with_schema(api) -> None:
     client, captured = api
     created = client.post(
