@@ -101,6 +101,48 @@ def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
     }
 
 
+async def _post_chat_with_schema(
+    upstream: ModelProfile,
+    body: dict[str, Any],
+    schema_name: str | None,
+    *,
+    http_client: httpx.AsyncClient,
+) -> dict[str, Any]:
+    """Forward a chat request, delivering ``schema_name`` as ``response_format``
+    but resilient to a backend that cannot compile a deep schema's grammar.
+
+    llama.cpp turns a strict json_schema into a GBNF grammar; a large nested
+    schema (``$defs``/``$ref``/``anyOf`` — e.g. the invoice schema) makes it
+    fail with 'failed to parse grammar' (HTTP 400). The extraction client
+    survives this via its style ladder; the agent forward gets the same one
+    here: strict json_schema -> json_object (valid-JSON, no schema grammar) ->
+    no constraint. Only a grammar/response_format 400 downgrades; any other
+    error propagates."""
+    if not schema_name:
+        return await _post_chat(upstream, dict(body), http_client=http_client)
+
+    strict = dict(body)
+    _inject_response_format(strict, schema_name)  # unknown schema -> AgentError (propagates)
+    json_object = {**body, "response_format": {"type": "json_object"}}
+    plain = dict(body)
+    attempts = (strict, json_object, plain)
+
+    last_error: AgentError | None = None
+    for index, attempt in enumerate(attempts):
+        try:
+            return await _post_chat(upstream, attempt, http_client=http_client)
+        except AgentError as exc:
+            downgradable = exc.status_code == 400 and any(
+                token in str(exc).lower()
+                for token in ("grammar", "response_format", "json_schema", "json schema")
+            )
+            if index < len(attempts) - 1 and downgradable:
+                last_error = exc
+                continue
+            raise
+    raise last_error  # pragma: no cover - the last attempt sends no response_format
+
+
 async def _complete_ocr(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
@@ -119,16 +161,19 @@ async def _complete_ocr(
                 error_type="invalid_agent_config",
             )
         upstream = _resolve_backing(str(vision_selector))
-        forward = dict(body)
+        base = dict(body)
         if spec.system_prompt:
-            forward["messages"] = [
+            base["messages"] = [
                 {"role": "system", "content": spec.system_prompt},
-                *(forward.get("messages") or []),
+                *(base.get("messages") or []),
             ]
         schema_name = options.get("schema")
-        if schema_name:
-            _inject_response_format(forward, str(schema_name))
-        completion = await _post_chat(upstream, forward, http_client=http_client)
+        completion = await _post_chat_with_schema(
+            upstream,
+            base,
+            str(schema_name) if schema_name else None,
+            http_client=http_client,
+        )
         completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind, "mode": mode}
         return completion
 
