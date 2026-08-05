@@ -106,6 +106,10 @@ class RenderDocumentRequest(BaseModel):
     content_b64: str
     filename: str = "document.pdf"
     max_pages: int = 8
+    # Rasterization DPI. 200 (not liteparse's 150 default) sharpens dense
+    # document text noticeably for small vision models, at a larger payload;
+    # clamped below to keep a page from exploding into millions of pixels.
+    dpi: int = 200
 
 
 @router.post("/render-document")
@@ -134,6 +138,7 @@ async def render_document(
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid base64 content: {exc}") from exc
     max_pages = max(1, min(int(payload.max_pages), 20))
+    dpi = max(72, min(int(payload.dpi), 400))
     suffix = Path(payload.filename).suffix or ".pdf"
 
     def _render() -> list[str]:
@@ -141,7 +146,10 @@ async def render_document(
             handle.write(raw)
             tmp = Path(handle.name)
         try:
-            return [img.data_url() for img in load_document_images(tmp, max_pages=max_pages)]
+            return [
+                img.data_url()
+                for img in load_document_images(tmp, max_pages=max_pages, pdf_dpi=dpi)
+            ]
         finally:
             tmp.unlink(missing_ok=True)
 
