@@ -657,10 +657,16 @@ export function renderDocument(
   contentB64: string,
   filename: string,
   dpi?: number,
+  maxPages?: number,
 ): Promise<{ images: string[]; pages: number }> {
   return request<{ images: string[]; pages: number }>("/v1/studio/render-document", {
     method: "POST",
-    body: JSON.stringify({ content_b64: contentB64, filename, ...(dpi ? { dpi } : {}) }),
+    body: JSON.stringify({
+      content_b64: contentB64,
+      filename,
+      ...(dpi ? { dpi } : {}),
+      ...(maxPages ? { max_pages: maxPages } : {}),
+    }),
   });
 }
 
