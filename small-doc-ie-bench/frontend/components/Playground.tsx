@@ -598,6 +598,7 @@ function VisionPanel({
   const [prompt, setPrompt] = useState(VISION_PRESETS[0]);
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
   // PDF rasterization DPI — higher = sharper text (better for dense documents /
   // small vision models), larger payload. Only used for PDFs.
   const [dpi, setDpi] = useState(200);
@@ -613,11 +614,30 @@ function VisionPanel({
     if (!names.includes(model)) setModel(names[0]);
   }, [names, model]);
 
-  function onFile(f: File | null) {
-    setFile(f);
+  async function onFile(f: File | null) {
     setAnswer(null);
-    if (preview) URL.revokeObjectURL(preview);
-    setPreview(f ? URL.createObjectURL(f) : null);
+    setError(null);
+    if (preview?.startsWith("blob:")) URL.revokeObjectURL(preview);
+    setPreview(null);
+    setFile(f);
+    if (!f) return;
+    if (f.type.startsWith("image/")) {
+      setPreview(URL.createObjectURL(f));
+      return;
+    }
+    // PDF: rasterize page 1 (low DPI, single page) for a real visual preview —
+    // an <img> can't show a PDF directly. Best-effort: on failure the run still
+    // renders the pages when sent.
+    setPreviewLoading(true);
+    try {
+      const b64 = await fileToBase64(f);
+      const { images } = await renderDocument(b64, f.name, 150, 1);
+      setPreview(images[0] ?? null);
+    } catch {
+      setPreview(null);
+    } finally {
+      setPreviewLoading(false);
+    }
   }
 
   async function run() {
@@ -710,7 +730,13 @@ function VisionPanel({
             </label>
           </Field>
 
-          {preview && file && file.type.startsWith("image/") && (
+          {previewLoading && (
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Spinner /> Rendering preview…
+            </p>
+          )}
+          {preview && (
+            // A PDF's preview is its rasterized page 1 (an <img> can't show a PDF).
             <img
               src={preview}
               alt="preview"
@@ -718,12 +744,11 @@ function VisionPanel({
             />
           )}
           {file && !file.type.startsWith("image/") && (
-            // A PDF can't render in <img>; it's rasterized to page images on run.
             <div className="space-y-2 rounded-md border border-border bg-muted/40 px-3 py-2">
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <FileText className="h-4 w-4 shrink-0" />
                 <span className="truncate">{file.name}</span>
-                <span className="ml-auto shrink-0 text-xs">PDF · rendered to page images on run</span>
+                <span className="ml-auto shrink-0 text-xs">PDF · page 1 shown; all pages sent</span>
               </div>
               <label className="flex items-center gap-2 text-xs text-muted-foreground">
                 <span>Render quality</span>
