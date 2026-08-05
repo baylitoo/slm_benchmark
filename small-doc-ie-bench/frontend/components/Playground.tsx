@@ -79,7 +79,10 @@ export function Playground({
   // demand), so it must stay selectable here or the flagship flow would be
   // unreachable from the UI. Polling is paused while the tab is hidden.
   const deployments = usePolling<DeploymentRecord[]>(getDeployments, DEPLOY_POLL_MS, active);
-  const store = useAsync<StoreEntry[]>(getStore, []);
+  // Poll the store (not a one-shot fetch): the vision/embed model pickers derive
+  // from it, so a model seeded/deployed after the Playground opened must appear
+  // without a page reload — same cadence as the deployments list.
+  const store = usePolling<StoreEntry[]>(getStore, DEPLOY_POLL_MS, active);
   const families = useAsync<ModelFamily[]>(getFamilies, []);
   const embeddingNames = useMemo(
     () => embeddingDeploymentNames(store.data, families.data),
@@ -574,16 +577,20 @@ function VisionPanel({
   visionNames: Set<string>;
   onNavigate?: NavigateToDeploy;
 }) {
-  const liveVision = useMemo(
+  // Include evicted (managed) deployments, not just live ones — a request to an
+  // evicted vision deployment auto-reloads it (the first request waits for the
+  // load), exactly like the Extract picker. Requiring isLiveDeployment hid a
+  // deployed-but-idle VLM as "no vision model deployed yet".
+  const selectableVision = useMemo(
     () =>
-      deployments.filter(
-        (d) => d.spec?.name && visionNames.has(d.spec.name) && isLiveDeployment(d),
+      selectableDeployments(deployments).filter(
+        (d) => d.spec?.name && visionNames.has(d.spec.name),
       ),
     [deployments, visionNames],
   );
   const names = useMemo(
-    () => liveVision.map((d) => d.spec?.name ?? "").filter(Boolean),
-    [liveVision],
+    () => selectableVision.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [selectableVision],
   );
 
   const [model, setModel] = useState("");
@@ -770,10 +777,12 @@ function EmbedPanel({
   embeddingNames: Set<string>;
   onNavigate?: NavigateToDeploy;
 }) {
+  // Same as the vision picker: an evicted embedding deployment reloads on the
+  // next request, so include selectable (live + managed-evicted), not only live.
   const embedDeployments = useMemo(
     () =>
-      deployments.filter(
-        (d) => d.spec?.name && embeddingNames.has(d.spec.name) && isLiveDeployment(d),
+      selectableDeployments(deployments).filter(
+        (d) => d.spec?.name && embeddingNames.has(d.spec.name),
       ),
     [deployments, embeddingNames],
   );
