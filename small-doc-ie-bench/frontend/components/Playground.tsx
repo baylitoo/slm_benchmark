@@ -707,12 +707,20 @@ function VisionPanel({
             </label>
           </Field>
 
-          {preview && (
+          {preview && file && file.type.startsWith("image/") && (
             <img
               src={preview}
               alt="preview"
               className="max-h-56 w-full rounded-md border border-border object-contain"
             />
+          )}
+          {file && !file.type.startsWith("image/") && (
+            // A PDF can't render in <img>; it's rasterized to page images on run.
+            <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+              <FileText className="h-4 w-4 shrink-0" />
+              <span className="truncate">{file.name}</span>
+              <span className="ml-auto shrink-0 text-xs">PDF · rendered to page images on run</span>
+            </div>
           )}
 
           <Field label="Prompt">
