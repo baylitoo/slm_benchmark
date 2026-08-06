@@ -101,6 +101,28 @@ def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
     }
 
 
+def _schema_instruction(schema_name: str) -> str | None:
+    """A prompt that names the fields to extract. The response_format grammar
+    constrains the SHAPE but never tells the model WHICH fields to pull; when the
+    grammar can't compile and we fall back to json_object, that's all the model
+    has — without it a vision model just echoes the prompt (``{"OCR": true}``).
+    So the target fields ride in the prompt too, for every attempt."""
+    from docie_bench.schemas.extraction import schema_json
+
+    try:
+        properties = schema_json(schema_name).get("properties")
+    except ValueError:
+        return None
+    if not isinstance(properties, dict) or not properties:
+        return None
+    fields = ", ".join(properties)
+    return (
+        "You extract structured data from the document in the image. Return ONLY "
+        "a single JSON object with these fields (use null when a field is absent "
+        f"from the document): {fields}. No prose, no explanation — JSON only."
+    )
+
+
 async def _post_chat_with_schema(
     upstream: ModelProfile,
     body: dict[str, Any],
@@ -121,10 +143,21 @@ async def _post_chat_with_schema(
     if not schema_name:
         return await _post_chat(upstream, dict(body), http_client=http_client)
 
-    strict = dict(body)
+    # Name the target fields in the prompt (every attempt), so the model knows
+    # WHAT to extract even when the schema grammar is dropped — see
+    # _schema_instruction.
+    guided = dict(body)
+    instruction = _schema_instruction(schema_name)
+    if instruction:
+        guided["messages"] = [
+            {"role": "system", "content": instruction},
+            *(guided.get("messages") or []),
+        ]
+
+    strict = dict(guided)
     _inject_response_format(strict, schema_name)  # unknown schema -> AgentError (propagates)
-    json_object = {**body, "response_format": {"type": "json_object"}}
-    plain = dict(body)
+    json_object = {**guided, "response_format": {"type": "json_object"}}
+    plain = dict(guided)
     attempts = (strict, json_object, plain)
 
     last_error: AgentError | None = None
