@@ -69,35 +69,59 @@ def test_authentication_and_quotas_are_isolated_per_tenant() -> None:
     manager.acquire(tenant_a, now=71)
 
 
-def test_quotas_disabled_when_auth_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With auth off, per-tenant rate/concurrency limits must not fire.
+def test_auth_off_keeps_anonymous_throttling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turning auth off must NOT turn off request bounding.
 
-    Regression: the Studio UI is chatty and every caller collapses into the one
-    anonymous tenant, so enforcing the default 60/window throttled the dashboard.
+    Previously AUTH_REQUIRED=false zeroed the quotas too — one env var
+    silently disabled both authentication AND throttling, so a LAN-exposed
+    dev instance had no request bounding at all. Anonymous callers now get
+    their own (generous, per-client-IP) limits; the tenant limits stay
+    configured for authenticated callers.
     """
     from types import SimpleNamespace
 
     from docie_bench import security
 
-    # Configure limits that WOULD trip (1/window, 1 concurrent) but with auth off.
     fake_settings = SimpleNamespace(
         api_keys=SimpleNamespace(get_secret_value=lambda: ""),
         auth_required=False,
         rate_limit_requests=1,
         rate_limit_window_seconds=60,
         tenant_max_concurrent_requests=1,
+        anonymous_rate_limit_requests=3,
+        anonymous_max_concurrent_requests=2,
     )
     monkeypatch.setattr(security, "get_settings", lambda: fake_settings)
     security.get_quota_manager.cache_clear()
     try:
         manager = security.get_quota_manager()
-        assert manager.requests_per_window == 0  # disabled, not the configured 1
-        assert manager.max_concurrent == 0
-        context = manager.authenticate(None)
-        assert context.tenant_id == "anonymous"
-        # Many concurrent, over-"limit" acquires without release must not 429.
-        for _ in range(5):
+        # Tenant limits stay configured (not zeroed); anonymous has its own.
+        assert manager.requests_per_window == 1
+        assert manager.anonymous_requests_per_window == 3
+
+        context = manager.authenticate(None, "10.0.0.7")
+        assert context.tenant_id == "anon:10.0.0.7"
+
+        # Anonymous concurrency: the 3rd in-flight acquire trips the limit of 2.
+        manager.acquire(context, now=10)
+        manager.acquire(context, now=10)
+        with pytest.raises(HTTPException) as concurrent:
             manager.acquire(context, now=10)
+        assert concurrent.value.status_code == 429
+        manager.release(context)
+        manager.release(context)
+
+        # Rate limit: 3 requests are in the window; the 4th is refused.
+        manager.acquire(context, now=11)
+        manager.release(context)
+        with pytest.raises(HTTPException) as rate_limited:
+            manager.acquire(context, now=12)
+        assert rate_limited.value.status_code == 429
+
+        # A DIFFERENT client IP is an independent bucket — not starved.
+        other = manager.authenticate(None, "10.0.0.8")
+        manager.acquire(other, now=12)
+        manager.release(other)
     finally:
         security.get_quota_manager.cache_clear()
 
