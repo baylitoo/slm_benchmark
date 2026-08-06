@@ -45,6 +45,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from docie_bench.serving.resources import (
+    DEFAULT_DEPLOY_CONTEXT_LENGTH,
     FootprintStore,
     NodeMemory,
     footprint_bytes,
@@ -113,6 +114,35 @@ def mmproj_bytes_from_launch(launch: RuntimeLaunchSpec) -> int:
     return 0
 
 
+def _predicted_for(launch: RuntimeLaunchSpec) -> int | None:
+    """Predicted footprint for a launch — ONE context policy for every caller.
+
+    Context prices at the launch's own setting, else the DEPLOY default
+    (8192) — the default every deploy surface applies and the sizing engine
+    prices — never llama-server's bare 4096 fallback, which silently
+    under-priced a default deploy by 256 MiB of KV per instance.
+    """
+    return predicted_footprint_for_model(
+        size_bytes=None,
+        model_path=launch.model,
+        context_length=launch.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH,
+        mmproj_bytes=mmproj_bytes_from_launch(launch),
+    )
+
+
+def price_launch(launch: RuntimeLaunchSpec, footprints: FootprintStore) -> int | None:
+    """``max(calibrated steady RSS, predicted)`` for a launch — THE currency.
+
+    Shared by the fit gate ("what a candidate needs") and eviction pricing
+    ("what a victim frees"), so the two can never drift. ``None`` =
+    unpriceable (fail-open for the gate, skip-victim for eviction).
+    """
+    predicted = _predicted_for(launch)
+    if predicted is None:
+        return None
+    return footprint_bytes(predicted, footprints.get(launch.model))
+
+
 def assess_fit(
     record: DeploymentRecord,
     *,
@@ -133,12 +163,8 @@ def assess_fit(
     from docie_bench.settings import get_settings
 
     launch = record.spec.launch
-    predicted = predicted_footprint_for_model(
-        size_bytes=None,
-        model_path=launch.model,
-        context_length=launch.context_length,
-        mmproj_bytes=mmproj_bytes_from_launch(launch),
-    )
+    store = footprints if footprints is not None else FootprintStore()
+    predicted = _predicted_for(launch)
     if predicted is None:
         return FitDecision(True, None, None, 0, "")
     store = footprints if footprints is not None else FootprintStore()
@@ -207,16 +233,8 @@ def releasable_bytes(record: DeploymentRecord, footprints: FootprintStore) -> in
     An unpriceable victim reads 0 and is skipped by selection: evicting it
     would free an unknown amount, which must never be counted toward a fit.
     """
-    launch = record.spec.launch
-    predicted = predicted_footprint_for_model(
-        size_bytes=None,
-        model_path=launch.model,
-        context_length=launch.context_length,
-        mmproj_bytes=mmproj_bytes_from_launch(launch),
-    )
-    if predicted is None:
-        return 0
-    return footprint_bytes(predicted, footprints.get(launch.model))
+    priced = price_launch(record.spec.launch, footprints)
+    return priced if priced is not None else 0
 
 
 def _is_hot(record: DeploymentRecord) -> bool:
@@ -393,6 +411,15 @@ class LoadCoordinator:
             try:
                 with self.supervisor.lock:
                     record = self.supervisor.get(name)
+                    if record.state == LifecycleState.FAILED:
+                        # An explicit load is fresh operator intent, not one
+                        # more crash-loop iteration: without this a deployment
+                        # that exhausted its restart budget while FAILED is
+                        # permanently un-loadable (deploy() preserves the count
+                        # for an identical launch and the reconciler's
+                        # healthy-streak forgiveness never fires on a
+                        # never-healthy record) — Repair was the only escape.
+                        self.supervisor.reset_restart_budget(name)
                     spec = replace(record.spec, desired_state=DesiredState.RUNNING)
                     record = self.supervisor.deploy(spec)
                 if record.state == LifecycleState.READY:

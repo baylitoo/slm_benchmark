@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import json
 import logging
 import os
@@ -84,6 +85,18 @@ logger = logging.getLogger(__name__)
 # create_time is stable for the lifetime of a process; allow a small slack for
 # float rounding across psutil reads.
 _CREATE_TIME_TOLERANCE_S = 1.0
+
+# Stderr signatures of a port bind collision, as captured into ``last_error``
+# by the supervisor's log tail (llama-server / uvicorn / raw OS strings).
+_BIND_COLLISION_MARKERS = ("address already in use", "couldn't bind", "failed to bind")
+# Minimum spacing between reallocating repairs of the same deployment, so a
+# port-range exhaustion cannot turn into a tight redeploy loop.
+_REPAIR_RETRY_S = 60.0
+
+
+def _looks_like_bind_collision(record: DeploymentRecord) -> bool:
+    error = (record.last_error or "").lower()
+    return any(marker in error for marker in _BIND_COLLISION_MARKERS)
 
 # RuntimeKind -> the "engine" label the placement rows/resolver key on.
 _ENGINE_BY_RUNTIME: dict[RuntimeKind, str] = {
@@ -191,6 +204,12 @@ class ObservedDeployment:
     # Launch model reference (GGUF path) — the resource tracker's calibration
     # key, so a per-model footprint survives redeploys under new names.
     model: str = ""
+    # When this observation was computed (under the supervisor lock). The
+    # publisher passes it to ``publish_observed`` so a placement write that
+    # landed AFTER this cycle's snapshot (e.g. a load marking the row ready)
+    # is never clobbered by the older observation — the publish happens
+    # outside the lock and can otherwise race fresher writers.
+    observed_at: dt.datetime | None = None
 
 
 def default_fit_check(
@@ -264,6 +283,7 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
                 rss_bytes=observed.rss_bytes,
                 health_ok=observed.health_ok,
                 last_error=observed.last_error,
+                probed_at=observed.observed_at,
             )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: observed state not published (repair-only cycle)")
@@ -292,6 +312,7 @@ class ServingReconciler:
         idle_ttl_s: float = 0.0,
         min_hot_s: float = 0.0,
         clock: Callable[[], float] = time.time,
+        repair: Callable[[str], object] | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -347,6 +368,16 @@ class ServingReconciler:
         # ~10-minute slow-load tolerance (see _was_previously_ready).
         self._was_ready: set[str] = set()
         self._misses: dict[str, int] = {}
+        # Port-collision self-healing: the ControlPlane repair seam (redeploy
+        # the SAME launch on a reallocated port). Without it a respawn always
+        # reuses record.spec.launch.port — an orphan process holding that port
+        # (e.g. a container restart that did not reap children) makes every
+        # respawn EADDRINUSE until the budget is exhausted, and only a human
+        # clicking Repair recovers. Repairs run OUTSIDE the observation lock
+        # (they block on await_ready) and are throttled per deployment.
+        self._repair = repair
+        self._repairs_due: list[str] = []
+        self._repair_last: dict[str, float] = {}
         # Consecutive healthy cycles per deployment: after
         # ``healthy_reset_threshold`` of them the restart budget is forgiven
         # (reset to 0), so the budget bounds crash STORMS without becoming a
@@ -415,6 +446,19 @@ class ServingReconciler:
                 self._snapshot_publisher(snapshot)
             except Exception:  # noqa: BLE001 - publish hiccup != broken cycle
                 logger.warning("node snapshot publish failed this cycle", exc_info=True)
+        # Port-collision repairs queued during observation: run them here,
+        # outside the lock (repair blocks on await_ready) and after the
+        # publish so this cycle's honest "loading" phase is already visible.
+        due, self._repairs_due = self._repairs_due, []
+        for name in due:
+            try:
+                logger.warning(
+                    "deployment %s: bind collision — redeploying on a reallocated port",
+                    name,
+                )
+                self._repair(name)  # type: ignore[misc]  # queued only when set
+            except Exception:  # noqa: BLE001 - a failed repair must not kill the loop
+                logger.warning("port reallocation for %s failed", name, exc_info=True)
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
@@ -441,6 +485,7 @@ class ServingReconciler:
             del self._misses[stale]
         for stale in set(self._healthy_streak) - set(records):
             del self._healthy_streak[stale]
+        self._forget_removed(set(records))
         return observations
 
     def _observe_one(self, name: str, record: DeploymentRecord) -> ObservedDeployment:
@@ -529,6 +574,24 @@ class ServingReconciler:
     def _maybe_restart(
         self, name: str, record: DeploymentRecord, allowed: bool, reason: str
     ) -> ObservedDeployment:
+        if (
+            self._repair is not None
+            and _looks_like_bind_collision(record)
+            and self._clock() - self._repair_last.get(name, 0.0) >= _REPAIR_RETRY_S
+        ):
+            # A same-port respawn cannot fix a bind collision — something else
+            # holds the port. Queue a port-reallocating repair (executed after
+            # the observation lock is released) instead of burning the restart
+            # budget on attempts that fail identically.
+            self._repair_last[name] = self._clock()
+            self._repairs_due.append(name)
+            queued_error = (
+                f"{record.last_error or 'runtime process exited'} | "
+                "port collision: redeploying on a reallocated port"
+            )
+            return self._observation(
+                name, record, phase="loading", health_ok=False, last_error=queued_error
+            )
         if allowed:
             logger.info("deployment %s: gated restart approved; respawning", name)
             record = self.supervisor.reconcile(name)
@@ -644,6 +707,10 @@ class ServingReconciler:
         self._misses.pop(name, None)
         self._healthy_streak.pop(name, None)
 
+    def _forget_removed(self, names: set[str]) -> None:
+        for stale in set(self._repair_last) - names:
+            del self._repair_last[stale]
+
     def _observation(
         self,
         name: str,
@@ -657,6 +724,11 @@ class ServingReconciler:
         rss = 0
         if record.pid is not None and phase in {"hot", "loading"}:
             rss = self._rss_reader(record.pid)
+        # Persist the computed verdict onto the record (DB-optional liveness):
+        # profile_resolver reads observed_phase/observed_at as truth, keeping
+        # the sticky state==READY high-water mark for was-ready detection only.
+        with contextlib.suppress(KeyError):  # removed concurrently within the cycle
+            record = self.supervisor.record_observation(name, phase=phase)
         return ObservedDeployment(
             name=name,
             engine=_ENGINE_BY_RUNTIME.get(record.spec.launch.runtime, "llama-server"),
@@ -671,6 +743,7 @@ class ServingReconciler:
             health_ok=health_ok,
             last_error=last_error if last_error is not None else record.last_error,
             model=record.spec.launch.model,
+            observed_at=dt.datetime.now(dt.UTC),
         )
 
 

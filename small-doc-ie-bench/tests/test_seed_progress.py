@@ -56,3 +56,25 @@ def test_endpoint_returns_progress(home: Path) -> None:
 
 def test_endpoint_null_when_absent(home: Path) -> None:
     assert asyncio.run(seed_progress(channel="seed:none"))["progress"] is None
+
+
+def test_prune_stale_removes_only_old_sidecars(tmp_path, monkeypatch) -> None:
+    """A hard-killed seed never reaches clear_progress — the nightly GC's
+    prune_stale is the only reclaimer for its sidecar."""
+    import os
+    import time
+
+    from docie_bench.serving import seed_progress
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+    seed_progress.write_progress("seed:fresh", {"percent": 10})
+    seed_progress.write_progress("seed:stale", {"percent": 62})
+    stale_path = tmp_path / "seed-progress" / "seed_stale.json"
+    old = time.time() - 8 * 86400
+    os.utime(stale_path, (old, old))
+
+    removed = seed_progress.prune_stale(max_age_s=7 * 86400)
+
+    assert removed == 1
+    assert not stale_path.exists()
+    assert seed_progress.read_progress("seed:fresh") == {"percent": 10}

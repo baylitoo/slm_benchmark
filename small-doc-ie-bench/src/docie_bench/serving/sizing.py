@@ -7,15 +7,18 @@ other.
 
 Relationship to the deploy path's fit gate (``reconciler.default_fit_check``),
 stated honestly: both price a candidate with the SAME footprint formula
-(``max(calibrated steady RSS, predicted weights + KV + overhead + mmproj)``)
-and hold back the SAME explicit safety margin. They differ in when and where
-the free number is read: the gate runs inside the serving container and
-re-measures node memory LIVE at decision time; this engine prices against the
-snapshot that same reader published last cycle. The gate also stats the launch
-GGUF for weights (record-driven, DB-optional) where this engine prefers the
-store's ``size_bytes`` — the recorded size of the same file. So sizing is the
-gate's math against a reading up to one reconcile interval older, never a
-different policy.
+(``max(calibrated steady RSS, predicted weights + KV + overhead + mmproj)``),
+the SAME context default (``DEFAULT_DEPLOY_CONTEXT_LENGTH`` when the launch
+carries none — see ``lifecycle.price_launch``) and hold back the SAME explicit
+safety margin. They differ in when and where the free number is read: the gate
+runs inside the serving container and re-measures node memory LIVE at decision
+time; this engine prices against the snapshot that same reader published last
+cycle. The gate also stats the launch GGUF for weights (record-driven,
+DB-optional) where this engine prefers the store's ``size_bytes`` — the
+recorded size of the same file. So sizing is the gate's math against a reading
+up to one reconcile interval older, never a different policy. The runtime
+*selection* planner (``planner.ResourcePlanner``) prices with this same
+formula too (it delegates to ``resources.predict_footprint_bytes``).
 
 Inputs are the observed surfaces the reconciler publishes (design doc §3): the
 store models (``ModelCatalog.list``), the live observed placements, and the

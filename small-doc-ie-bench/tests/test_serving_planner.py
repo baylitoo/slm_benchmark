@@ -148,3 +148,79 @@ def test_benchmark_history_changes_compatible_runtime_ranking() -> None:
     recommendation = ResourcePlanner().recommend(PlanningRequest(model=model, resources=_cpu()))
 
     assert recommendation.runtime == RuntimeName.OLLAMA
+
+
+# ── one footprint math: planner == the canonical resources formula ─────────────
+
+
+def test_planner_memory_is_the_canonical_footprint_formula() -> None:
+    """The planner previously carried a second, divergent formula (x1.2
+    weights, no mmproj, per-runtime overhead guesses) and could approve a
+    deploy the fit gate rejects. It must now price EXACTLY what
+    resources.predict_footprint_bytes prices."""
+    from docie_bench.serving.resources import predict_footprint_bytes
+
+    gib = 1024**3
+    model = _model(
+        artifacts=(_artifact(), _artifact(name="mmproj-f16.gguf", size_gb=1)),
+        required_memory_gb=5,
+        context_length=8192,
+    )
+    request = PlanningRequest(model=model, resources=_cpu(), concurrency=2)
+
+    plan = ResourcePlanner().evaluate(request, RuntimeName.LLAMACPP)
+
+    expected = predict_footprint_bytes(
+        5 * gib, context_length=8192, n_parallel=2, mmproj_bytes=1 * gib
+    )
+    assert plan.estimated_memory_gb == round(expected / gib, 4)
+
+
+def test_planner_holds_back_the_safety_margin() -> None:
+    """A model that fits in raw RAM but NOT under the configured margin must be
+    refused — the Sizing tab and the fit gate hold the margin back, and the
+    planner approving what they reject caused real OOMs."""
+    from docie_bench.serving.sizing import safety_margin_bytes
+    from docie_bench.settings import get_settings
+
+    gib = 1024**3
+    planner = ResourcePlanner()
+    resources = _cpu(memory_gb=16, gpu_count=0)
+    margin_gb = (
+        safety_margin_bytes(16 * gib, get_settings().serving_sizing_margin_fraction) / gib
+    )
+    headroom = 16 - margin_gb
+
+    fits = planner.evaluate(
+        PlanningRequest(model=_model(required_memory_gb=2), resources=resources),
+        RuntimeName.LLAMACPP,
+    )
+    over = planner.evaluate(
+        PlanningRequest(
+            model=_model(required_memory_gb=int(headroom)), resources=resources
+        ),
+        RuntimeName.LLAMACPP,
+    )
+
+    assert fits.compatible is True
+    assert over.compatible is False
+    assert any("safety margin" in reason for reason in over.reasons)
+
+
+def test_planner_context_defaults_to_the_deploy_default() -> None:
+    """No context anywhere => price at the deploy default (8192), the same
+    constant every deploy surface applies — not llama-server's 4096 fallback."""
+    from docie_bench.serving.resources import (
+        DEFAULT_DEPLOY_CONTEXT_LENGTH,
+        predict_footprint_bytes,
+    )
+
+    gib = 1024**3
+    model = _model(context_length=None)
+    plan = ResourcePlanner().evaluate(
+        PlanningRequest(model=model, resources=_cpu()), RuntimeName.LLAMACPP
+    )
+    expected = predict_footprint_bytes(
+        5 * gib, context_length=DEFAULT_DEPLOY_CONTEXT_LENGTH
+    )
+    assert plan.estimated_memory_gb == round(expected / gib, 4)

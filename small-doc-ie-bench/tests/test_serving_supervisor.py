@@ -19,7 +19,6 @@ from docie_bench.serving.supervisor import (
     DesiredState,
     PersistentSupervisor,
     RestartPolicy,
-    SupervisorStateError,
 )
 
 
@@ -391,9 +390,55 @@ def test_launch_exception_marks_not_exited_after_start(tmp_path: Path) -> None:
     assert record.last_error == "llama-server not found"
 
 
-def test_corrupt_state_is_rejected(tmp_path: Path) -> None:
+def test_corrupt_state_is_quarantined_not_fatal(tmp_path: Path) -> None:
+    """A corrupt deployments.json must not take down every consumer.
+
+    profile_resolver builds a supervisor per extraction request, so raising
+    here failed ALL document extraction over one bad file. The supervisor now
+    quarantines the corrupt file (kept for post-mortem) and starts empty.
+    """
     state_path = tmp_path / "state.json"
     state_path.write_text("{not-json", encoding="utf-8")
 
-    with pytest.raises(SupervisorStateError, match="Invalid supervisor state"):
-        PersistentSupervisor(state_path, adapters={RuntimeKind.VLLM: FakeAdapter()})
+    supervisor = PersistentSupervisor(state_path, adapters={RuntimeKind.VLLM: FakeAdapter()})
+
+    assert supervisor.list() == ()
+    quarantined = list(tmp_path.glob("state.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "{not-json"
+    assert not state_path.exists()
+
+
+def test_record_observation_persists_liveness_verdict(tmp_path: Path) -> None:
+    """The reconciler's computed phase survives a reload; state stays sticky."""
+    state_path = tmp_path / "state.json"
+    adapter = FakeAdapter()
+    supervisor = PersistentSupervisor(state_path, adapters={RuntimeKind.VLLM: adapter})
+    supervisor.deploy(_deployment())
+
+    record = supervisor.record_observation("invoice", phase="hot")
+    assert record.observed_phase == "hot"
+    assert record.observed_at is not None
+
+    # Reload from disk: the verdict is persisted (DB-optional routing input).
+    reloaded = PersistentSupervisor(state_path, adapters={RuntimeKind.VLLM: adapter})
+    stored = reloaded.get("invoice")
+    assert stored.observed_phase == "hot"
+    assert stored.observed_at is not None
+
+    # A hung runtime: reconciler reports loading/failed while state stays READY.
+    supervisor.record_observation("invoice", phase="loading")
+    assert supervisor.get("invoice").observed_phase == "loading"
+    assert supervisor.get("invoice").state == LifecycleState.READY
+
+
+def test_get_returns_a_defensive_copy(tmp_path: Path) -> None:
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.VLLM: FakeAdapter()}
+    )
+    supervisor.deploy(_deployment())
+
+    snapshot = supervisor.get("invoice")
+    snapshot.state = LifecycleState.FAILED  # mutating the copy must not leak
+
+    assert supervisor.get("invoice").state == LifecycleState.READY

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import threading
 import time
@@ -9,6 +11,8 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("docie_bench.serving.supervisor")
 
 from docie_bench.serving.runtime import (
     LifecycleState,
@@ -113,6 +117,16 @@ class DeploymentRecord:
     # reconciler-local memory would forget across serving restarts. Persisted;
     # None => never spawned (or a pre-PR-4 record).
     loaded_at: float | None = None
+    # The reconciler's computed liveness verdict ("hot"/"loading"/"cold"/
+    # "evicted"/"failed") + when it was computed. ``state`` is deliberately a
+    # sticky high-water mark (READY survives health misses so the fast-death
+    # path can tell "was ready" from "still loading") — so ``state`` must NOT
+    # be read as liveness. Routers read THIS pair instead: fresh + "hot" means
+    # actually serving; absent/stale falls back to the state heuristic (the
+    # reconciler is off or never ran). Persisted so the DB-optional routing
+    # path gets the verdict without Postgres.
+    observed_phase: str | None = None
+    observed_at: float | None = None
     # True once a runtime process was observed to start and then exit on its own
     # (crash / bind collision) — as opposed to a launch that never spawned (a
     # missing binary raises before start). The reallocation caller uses this to
@@ -175,6 +189,18 @@ class PersistentSupervisor:
             return tuple(replace(self._records[name]) for name in sorted(self._records))
 
     def get(self, name: str) -> DeploymentRecord:
+        """A defensive COPY of one record, taken under the lock.
+
+        Same contract as ``list()``: readers in other threads (api process,
+        LoadCoordinator snapshots) must never hold the live object the
+        reconciler is mid-mutating — a serialized view could otherwise mix
+        fields from two different moments. Internal mutators use
+        ``_get_live`` and hold the lock for the whole read-modify-save.
+        """
+        with self._lock:
+            return replace(self._get_live(name))
+
+    def _get_live(self, name: str) -> DeploymentRecord:
         try:
             return self._records[name]
         except KeyError as exc:
@@ -218,7 +244,7 @@ class PersistentSupervisor:
 
     def stop(self, name: str) -> DeploymentRecord:
         with self._lock:
-            record = self.get(name)
+            record = self._get_live(name)
             record.spec = replace(record.spec, desired_state=DesiredState.STOPPED)
             # A user Stop is always MANUAL: it stays cold and is never
             # auto-reloaded. The managed/evicted flavor is set by the PR-4
@@ -236,7 +262,7 @@ class PersistentSupervisor:
         record and its port reservation survive; only ``remove()`` frees them.
         """
         with self._lock:
-            record = self.get(name)
+            record = self._get_live(name)
             record.spec = replace(record.spec, desired_state=DesiredState.STOPPED)
             record.activation = Activation.MANAGED
             return self.reconcile(name)
@@ -247,7 +273,7 @@ class PersistentSupervisor:
         ``deployments.json`` (not Postgres) with the rest of the
         lifecycle-control metadata (design fix #5)."""
         with self._lock:
-            record = self.get(name)
+            record = self._get_live(name)
             if record.pinned == pinned:
                 return record
             record.pinned = pinned
@@ -257,7 +283,7 @@ class PersistentSupervisor:
 
     def remove(self, name: str) -> None:
         with self._lock:
-            record = self.get(name)
+            record = self._get_live(name)
             if record.pid is not None:
                 self.adapters[record.spec.launch.runtime].shutdown(record.pid)
             del self._records[name]
@@ -277,7 +303,7 @@ class PersistentSupervisor:
         caller wants torn down (fast-death of an unresponsive READY runtime).
         """
         with self._lock:
-            record = self.get(name)
+            record = self._get_live(name)
             if shutdown and record.pid is not None:
                 self.adapters[record.spec.launch.runtime].shutdown(record.pid)
             if error is None and record.pid is not None:
@@ -306,7 +332,7 @@ class PersistentSupervisor:
         routing by itself.
         """
         with self._lock:
-            record = self.get(name)
+            record = self._get_live(name)
             if healthy:
                 record.state = LifecycleState.READY
                 record.consecutive_health_failures = 0
@@ -316,6 +342,26 @@ class PersistentSupervisor:
                 record.last_error = detail or "health check failed"
             record.updated_at = self._clock()
             self._save()
+            return record
+
+    def record_observation(self, name: str, *, phase: str) -> DeploymentRecord:
+        """Persist the reconciler's computed liveness verdict (reconciler seam).
+
+        Routers (profile_resolver) read ``observed_phase``/``observed_at`` as
+        liveness; ``state`` stays the sticky was-ready high-water mark the
+        fast-death logic needs. Saves only when the phase actually changed —
+        ``observed_at`` still refreshes in memory every cycle, and the cycle's
+        other mutators (observe_health etc.) persist it as a passenger, so the
+        stamp on disk stays within a cycle of truth without an extra fsync
+        per deployment per cycle.
+        """
+        with self._lock:
+            record = self._get_live(name)
+            changed = record.observed_phase != phase
+            record.observed_phase = phase
+            record.observed_at = self._clock()
+            if changed:
+                self._save()
             return record
 
     def reset_restart_budget(self, name: str) -> DeploymentRecord:
@@ -331,7 +377,7 @@ class PersistentSupervisor:
         is already zero (no churn, no _save).
         """
         with self._lock:
-            record = self.get(name)
+            record = self._get_live(name)
             if record.restart_count == 0:
                 return record
             record.restart_count = 0
@@ -369,7 +415,7 @@ class PersistentSupervisor:
             return self._reconcile_locked(name)
 
     def _reconcile_locked(self, name: str) -> DeploymentRecord:
-        record = self.get(name)
+        record = self._get_live(name)
         adapter = self.adapters[record.spec.launch.runtime]
         if record.spec.desired_state == DesiredState.STOPPED:
             adapter.shutdown(record.pid)
@@ -558,8 +604,25 @@ class PersistentSupervisor:
                 name: _record_from_dict(value)
                 for name, value in payload.get("deployments", {}).items()
             }
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise SupervisorStateError(f"Invalid supervisor state: {self.state_path}") from exc
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            # A corrupt state file must not take down every consumer that
+            # builds a supervisor (profile_resolver constructs one per
+            # extraction request — raising here fails all document extraction,
+            # a blast radius far outside serving). Quarantine the bad file for
+            # post-mortem and restart from empty state; the reconciler
+            # re-discovers nothing (records are the source of truth), so the
+            # honest outcome of a corrupt file is "no deployments" either way.
+            quarantine = self.state_path.with_name(
+                f"{self.state_path.name}.corrupt-{os.getpid()}"
+            )
+            logger.exception(
+                "invalid supervisor state %s: quarantining to %s and starting empty",
+                self.state_path,
+                quarantine,
+            )
+            with contextlib.suppress(OSError):
+                os.replace(self.state_path, quarantine)
+            return {}
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -569,7 +632,12 @@ class PersistentSupervisor:
                 name: _record_to_dict(record) for name, record in sorted(self._records.items())
             },
         }
-        temporary = self.state_path.with_name(f".{self.state_path.name}.tmp")
+        # Per-process temp name: two writers colliding on ONE fixed temp file
+        # could interleave into genuinely corrupt JSON that survives the atomic
+        # os.replace. A second writer is already a misconfiguration
+        # (single-writer contract), but the failure mode should stay
+        # "last-write-wins", never "corrupt state for everyone".
+        temporary = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(payload, indent=2, sort_keys=True))
             handle.flush()
@@ -610,6 +678,7 @@ def _record_from_dict(value: dict[str, Any]) -> DeploymentRecord:
     raw_create_time = value.get("pid_create_time")
     raw_last_served = value.get("last_served")
     raw_loaded_at = value.get("loaded_at")
+    raw_observed_at = value.get("observed_at")
     return DeploymentRecord(
         spec=spec,
         state=LifecycleState(value["state"]),
@@ -625,4 +694,6 @@ def _record_from_dict(value: dict[str, Any]) -> DeploymentRecord:
         pinned=bool(value.get("pinned", False)),
         last_served=float(raw_last_served) if raw_last_served is not None else None,
         loaded_at=float(raw_loaded_at) if raw_loaded_at is not None else None,
+        observed_phase=value.get("observed_phase"),
+        observed_at=float(raw_observed_at) if raw_observed_at is not None else None,
     )
