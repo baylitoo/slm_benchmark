@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import Depends, Header, HTTPException, UploadFile
+from fastapi import Depends, Header, HTTPException, Request, UploadFile
 
 from docie_bench.settings import get_settings
 
@@ -51,6 +51,12 @@ def parse_api_keys(raw: str) -> dict[str, str]:
     return result
 
 
+# Ceiling on distinct throttle buckets kept in memory. Anonymous buckets are
+# keyed per client IP, and an attacker who can spoof source addresses (or churn
+# through proxies) must not grow the dicts without bound.
+_MAX_TRACKED_BUCKETS = 10_000
+
+
 class TenantQuotaManager:
     def __init__(
         self,
@@ -60,17 +66,25 @@ class TenantQuotaManager:
         requests_per_window: int,
         window_seconds: int,
         max_concurrent: int,
+        anonymous_requests_per_window: int = 0,
+        anonymous_max_concurrent: int = 0,
     ) -> None:
         self.api_keys = api_keys
         self.auth_required = auth_required
         self.requests_per_window = requests_per_window
         self.window_seconds = window_seconds
         self.max_concurrent = max_concurrent
+        # Anonymous (auth-off) callers get their OWN limits, bucketed per client
+        # IP. Previously AUTH_REQUIRED=false zeroed the quotas entirely — one
+        # env var silently disabled BOTH authentication AND throttling, so a
+        # LAN-exposed dev instance had no request bounding at all.
+        self.anonymous_requests_per_window = anonymous_requests_per_window
+        self.anonymous_max_concurrent = anonymous_max_concurrent
         self._requests: dict[str, deque[float]] = defaultdict(deque)
         self._concurrent: dict[str, int] = defaultdict(int)
         self._lock = threading.Lock()
 
-    def authenticate(self, api_key: str | None) -> TenantContext:
+    def authenticate(self, api_key: str | None, client_host: str | None = None) -> TenantContext:
         if api_key:
             for configured_key, tenant_id in self.api_keys.items():
                 if hmac.compare_digest(api_key, configured_key):
@@ -81,21 +95,31 @@ class TenantQuotaManager:
                 detail="A valid API key is required",
                 headers={"WWW-Authenticate": "ApiKey"},
             )
-        return TenantContext(tenant_id="anonymous", authenticated=False)
+        # Per-IP bucket so one noisy client cannot starve the others and the
+        # anonymous limits actually bound *someone* rather than one global pool.
+        bucket = f"anon:{client_host}" if client_host else "anonymous"
+        return TenantContext(tenant_id=bucket, authenticated=False)
+
+    def _limits_for(self, context: TenantContext) -> tuple[int, int]:
+        if context.authenticated:
+            return self.requests_per_window, self.max_concurrent
+        return self.anonymous_requests_per_window, self.anonymous_max_concurrent
 
     def acquire(self, context: TenantContext, *, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
+        requests_per_window, max_concurrent = self._limits_for(context)
         with self._lock:
+            self._prune_locked()
             requests = self._requests[context.tenant_id]
             cutoff = current - self.window_seconds
             while requests and requests[0] <= cutoff:
                 requests.popleft()
             if (
-                self.max_concurrent > 0
-                and self._concurrent[context.tenant_id] >= self.max_concurrent
+                max_concurrent > 0
+                and self._concurrent[context.tenant_id] >= max_concurrent
             ):
                 raise HTTPException(status_code=429, detail="Tenant concurrency limit exceeded")
-            if self.requests_per_window > 0 and len(requests) >= self.requests_per_window:
+            if requests_per_window > 0 and len(requests) >= requests_per_window:
                 raise HTTPException(
                     status_code=429,
                     detail="Tenant request rate limit exceeded",
@@ -103,6 +127,21 @@ class TenantQuotaManager:
                 )
             requests.append(current)
             self._concurrent[context.tenant_id] += 1
+
+    def _prune_locked(self) -> None:
+        """Bound the bucket dicts (caller holds the lock).
+
+        Drops empty/idle buckets first; a pathological flood of DISTINCT
+        source addresses then falls back to clearing request history (never
+        the in-flight concurrency counts, which must stay balanced for
+        ``release``).
+        """
+        if len(self._requests) < _MAX_TRACKED_BUCKETS:
+            return
+        for key in [k for k, q in self._requests.items() if not q]:
+            del self._requests[key]
+        while len(self._requests) >= _MAX_TRACKED_BUCKETS:
+            self._requests.pop(next(iter(self._requests)))
 
     def release(self, context: TenantContext) -> None:
         with self._lock:
@@ -191,27 +230,31 @@ def get_quota_manager() -> TenantQuotaManager:
     (and get_settings.cache_clear()).
     """
     settings = get_settings()
-    auth_required = settings.auth_required
-    # With auth off (local single-operator dev) every caller collapses into the
-    # one "anonymous" tenant, so per-tenant quotas are pure friction — the chatty
-    # Studio UI (auto-refresh + realtime-token + polling) trips the default
-    # 60/window. Disable them by passing 0 (acquire()'s `> 0` guards then skip the
-    # checks). Networked runs keep auth on and the configured quotas apply.
+    # Auth and throttling are DECOUPLED. AUTH_REQUIRED=false used to zero the
+    # quotas too — one env var silently disabled both. Anonymous callers now
+    # keep their own (generous — the Studio UI is chatty: auto-refresh +
+    # realtime-token + polling) per-client-IP limits, so a LAN-exposed dev
+    # instance is still bounded. Authenticated tenants keep the configured
+    # per-tenant quotas exactly as before.
     return TenantQuotaManager(
         api_keys=parse_api_keys(settings.api_keys.get_secret_value()),
-        auth_required=auth_required,
-        requests_per_window=settings.rate_limit_requests if auth_required else 0,
+        auth_required=settings.auth_required,
+        requests_per_window=settings.rate_limit_requests,
         window_seconds=settings.rate_limit_window_seconds,
-        max_concurrent=settings.tenant_max_concurrent_requests if auth_required else 0,
+        max_concurrent=settings.tenant_max_concurrent_requests,
+        anonymous_requests_per_window=settings.anonymous_rate_limit_requests,
+        anonymous_max_concurrent=settings.anonymous_max_concurrent_requests,
     )
 
 
 async def tenant_guard(
+    request: Request,
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> AsyncIterator[TenantContext]:
     """FastAPI dependency: authenticate the caller, then bound per-tenant quota."""
     manager = get_quota_manager()
-    context = manager.authenticate(x_api_key)
+    client_host = request.client.host if request.client else None
+    context = manager.authenticate(x_api_key, client_host)
     manager.acquire(context)
     try:
         yield context

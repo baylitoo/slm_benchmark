@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     rate_limit_requests: int = Field(default=60, ge=0)
     rate_limit_window_seconds: int = Field(default=60, ge=1)
     tenant_max_concurrent_requests: int = Field(default=4, ge=0)
+    # Limits for UNAUTHENTICATED callers (auth_required=false), bucketed per
+    # client IP. Deliberately generous — the Studio UI is chatty (auto-refresh,
+    # realtime tokens, polling) — but never zero: turning auth off must not also
+    # turn off request bounding. 0 disables the respective check.
+    anonymous_rate_limit_requests: int = Field(default=600, ge=0)
+    anonymous_max_concurrent_requests: int = Field(default=16, ge=0)
     enable_benchmark_api: bool = False
 
     redacted_response_fields: str = ""
