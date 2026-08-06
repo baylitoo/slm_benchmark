@@ -5,47 +5,55 @@ Next.js (App Router, TypeScript) and Tailwind CSS, with a modern SaaS-style
 shell: sidebar navigation, cards, dark mode by default with a light toggle,
 loading skeletons, empty states, and toast notifications.
 
-Four sections (all stay mounted; only the active one is shown so a running job
-survives navigation):
+Five sections, routed as `/{section}/{view?}` (deep links, refresh and the
+browser back button all work). All sections stay mounted across navigation —
+the shell lives in an app-router layout — so a running job survives moving
+around the app:
 
-1. **Playground** — paste text or upload a PDF/image, run an extraction, and
-   watch live progress. Uses Inngest **realtime** (`@inngest/realtime`) when the
-   backend can mint a token, and transparently **falls back to polling**
-   `GET /v1/studio/runs/{event_id}` when realtime is unavailable (HTTP 501).
-2. **Deploy** — pick a model from the GGUF model store, choose a runtime scoped
-   to that model, and serve it; plus an "Add model" form to seed the store from
-   a local Ollama reference. Models and deployments **auto-refresh** on an
-   interval. (See "Deploy tab" below.)
-3. **Benchmark** — start a benchmark run (a `dataset` is required) and browse
-   past runs + their metrics.
-4. **Observability** — embeds Grafana and links to Inngest and raw Prometheus
-   metrics (all driven by the env vars below so they can point anywhere).
+1. **Playground** (`/playground`) — extraction, chat, vision and embeddings
+   panels over live deployments. Uses Inngest **realtime**
+   (`@inngest/realtime`) when the backend can mint a token, and transparently
+   **falls back to polling** `GET /v1/studio/runs/{event_id}` when realtime is
+   unavailable.
+2. **Serving** (`/deploy/models`, `/deploy/deployments`, `/deploy/ports`,
+   `/deploy/sizing`) — the model store, browse-and-deploy from Hugging Face,
+   deployments with lifecycle actions (load/unload/pin/repair/scale), port
+   administration, and the RAM sizing/what-if tab. Models and deployments
+   **auto-refresh** on an interval; see "Serving pages" below.
+3. **Agents** (`/agents/catalog`, `/agents/instances`, `/agents/create`) —
+   preconfigured agents (security proxy, document extraction) exposed as
+   OpenAI-compatible endpoints.
+4. **Benchmark** (`/benchmark/run`, `/benchmark/results`) — start a benchmark
+   run (a `dataset` is required) and browse past runs + their metrics.
+5. **Observability** (`/observability`) — embeds Grafana and links to Inngest
+   and raw Prometheus metrics (driven by the env vars below).
 
-The API client treats `404`/`501` as "coming soon" and the UI degrades
-gracefully — endpoints that aren't enabled on a given backend never crash the UI.
+The API client treats a **bare** `404`/`501` as "not available on this
+backend" and the UI degrades gracefully; a `404` carrying the
+`X-Docie-Error` header is a domain answer ("deployment 'x' not found") and
+its detail is shown verbatim.
 
-## Deploy tab
+## Serving pages
 
-- **Available models** come from `GET /v1/serving/store` (the queryable GGUF
-  model-store catalog), shown as an accessible, selectable radio-group list. If
-  the catalog isn't enabled the route returns `501` (or `404` on older builds)
-  and a friendly "no models in the store yet" / "coming soon" state is shown.
-- **Runtime picker** is scoped to the chosen model: it uses that store entry's
-  `available_backends` array directly (e.g. `llama-server`, `ollama`). Picking a
-  runtime is optional — "Auto" deploys the bare store entry and lets the server
-  choose; selecting a backend serves it explicitly.
-- **Add model (seed)** posts to `POST /v1/studio/seed-ollama`
-  `{ reference, name, family }` and streams progress; the family list comes from
-  `GET /v1/serving/families`.
-- **Deploy** posts to `POST /v1/studio/deploy`
-  `{ model, runtime?, name?, port?, context_length? }` and streams progress via
-  the returned `channel` (realtime, else polling). The **Deployments** table
-  (`GET /v1/serving/deployments`) reflects the new deployment on its next
-  auto-refresh.
-- **Auto-refresh**: the model store and deployments lists poll every ~4s with a
+- **Available models** come from `GET /v1/serving/store` (the on-disk model
+  store: GGUFs, encoder and transformers snapshots). If the route isn't
+  enabled a friendly "no models in the store yet" / "not available" state is
+  shown.
+- **Runtime picker** is scoped to the chosen model (its store entry's
+  compatible backends). Picking a runtime is optional — "Auto" lets the
+  server choose; selecting a backend serves it explicitly.
+- **Add model** seeds the store from Hugging Face (search, by-repo, or a
+  curated collection), from a local Ollama reference, or as an encoder
+  snapshot; progress streams over the returned `channel` (realtime, else
+  polling with the seed-progress sidecar).
+- **Deploy** posts to `POST /v1/studio/deploy` and streams progress the same
+  way. The **Deployments** table (`GET /v1/serving/deployments`) reflects new
+  deployments on its next auto-refresh and carries the lifecycle actions.
+- **Auto-refresh**: the store and deployments lists poll every ~4s with a
   visible "Live · Xs ago" indicator and a manual refresh button. Polling
-  auto-pauses when the browser tab is hidden **and** when Deploy isn't the
-  active section.
+  auto-pauses when the browser tab is hidden **and** when the section isn't
+  active. One-shot lists (families, agents, runs, schemas) are SWR-cached and
+  revalidate when the window regains focus.
 
 ## Tech / dependencies
 
@@ -57,6 +65,7 @@ Runtime deps added for the redesign (all small, React 19-compatible):
 | `next-themes`    | Dark/light theme toggle (dark by default).       |
 | `clsx`           | Conditional class names.                         |
 | `tailwind-merge` | Resolve Tailwind class conflicts (`cn()` helper).|
+| `swr`            | Cache/dedup/focus-revalidate for one-shot reads. |
 
 Theme tokens are CSS variables (see `app/globals.css`) mapped to semantic
 Tailwind colors (`background`, `card`, `border`, `muted`, `accent`, …). Dark
