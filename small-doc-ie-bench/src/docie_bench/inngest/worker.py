@@ -148,6 +148,9 @@ def _build_reconciler(instance_id: str) -> Any:
         # PR-4 idle-TTL unload knobs (0 disables; see settings.py).
         idle_ttl_s=settings.serving_idle_ttl_seconds,
         min_hot_s=settings.serving_min_hot_seconds,
+        # Port-collision self-healing: redeploy on a reallocated port when a
+        # respawn keeps dying on EADDRINUSE (orphan process holding the port).
+        repair=control_plane.supervisor.repair,
     )
 
 

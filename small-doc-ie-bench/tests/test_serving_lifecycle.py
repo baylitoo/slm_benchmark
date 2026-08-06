@@ -854,3 +854,31 @@ def test_lifecycle_endpoints_404_an_unknown_deployment(
             asyncio.run(call())
         assert excinfo.value.status_code == 404
     assert fake.sent == []  # a typo never queues a job
+
+
+def test_operator_load_forgives_exhausted_restart_budget(tmp_path: Path) -> None:
+    """A crash-looped FAILED deployment used to be permanently un-loadable:
+    deploy() preserves restart_count for an identical launch, the FAILED path
+    never satisfies _may_restart's escape hatch, and the healthy-streak
+    forgiveness never fires on a never-healthy record — Repair was the only
+    way out. An explicit Load is fresh operator intent and resets the budget."""
+    adapter = ScriptedAdapter()
+    supervisor = _supervisor(tmp_path, adapter)
+    supervisor.deploy(_spec())
+    supervisor.mark_failed("invoice", "boom", shutdown=True)
+    with supervisor.lock:
+        record = supervisor.records()["invoice"]
+        record.restart_count = record.spec.max_restarts  # budget exhausted
+
+    coordinator = LoadCoordinator(
+        supervisor,
+        assess=lambda record: _fits(),
+        sleep=lambda seconds: None,
+        timeout_for=lambda model: 30.0,
+    )
+    record = coordinator.load("invoice")
+
+    assert record.state == LifecycleState.READY
+    # The budget was reset; the respawn itself legitimately counts as one
+    # restart (the record had an endpoint), leaving plenty of headroom.
+    assert record.restart_count == 1

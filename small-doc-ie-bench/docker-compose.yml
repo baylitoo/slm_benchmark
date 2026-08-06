@@ -6,6 +6,12 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
+    environment:
+      # Pinned (not left to .env): every service MUST resolve the shared
+      # serving state to the same mounted path. A missing .env line would
+      # silently fall back to a container-local $HOME path — the volume then
+      # mounts unused and the api reads an empty deployments.json forever.
+      DOCIE_SERVING_HOME: /app/.serving
     depends_on:
       postgres:
         condition: service_healthy
@@ -151,6 +157,8 @@ services:
       # dedicated docie-serving Inngest app + runs the reconciler, so a
       # serving/* event can only land on this replica.
       DOCIE_WORKER_ROLE: serving
+      # Pinned for the same reason as on `api`: one shared serving home.
+      DOCIE_SERVING_HOME: /app/.serving
       # Deliberately NOT `${DOCIE_SERVING_ADVERTISE_HOST:-serving}`: a .env
       # written before the PR-1 service split carries
       # DOCIE_SERVING_ADVERTISE_HOST=worker, and interpolating the legacy
@@ -209,6 +217,8 @@ services:
       # Registers ONLY extraction/benchmark/GC — no lifecycle functions, no
       # reconciler, never spawns a runtime process.
       DOCIE_WORKER_ROLE: worker
+      # Pinned for the same reason as on `api`: one shared serving home.
+      DOCIE_SERVING_HOME: /app/.serving
     restart: unless-stopped
     depends_on:
       postgres:

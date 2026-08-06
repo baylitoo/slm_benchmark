@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -7,9 +8,13 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Hermetic-test escape hatch: the suite sets this in tests/conftest.py before any
+# docie_bench import so a developer's local .env can never change test behavior.
+_ENV_FILE = None if os.environ.get("DOCIE_IGNORE_ENV_FILE") == "1" else ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, extra="ignore", case_sensitive=False)
 
     app_env: str = "local"
     log_level: str = "INFO"

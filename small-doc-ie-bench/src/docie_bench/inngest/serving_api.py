@@ -179,8 +179,8 @@ async def list_deployments() -> Any:
 # The api NEVER measures RAM itself: a psutil call in this process would
 # describe the api container's cgroup, not the serving node's. Numbers come
 # from the ``serving_node`` row the in-``serving`` reconciler publishes every
-# cycle. Auth matches the sibling serving reads (unauthenticated ops view;
-# mutations stay evented).
+# cycle. Auth: the whole serving router is mounted behind tenant_guard
+# (api.py); reads and mutations alike require a key.
 @router.get("/resources")
 async def serving_resources() -> dict[str, Any]:
     """Node RAM snapshot + per-deployment memory usage (read-only).
@@ -716,8 +716,8 @@ async def list_store() -> Any:
     ``serve_store_model`` can deploy), then enriched with the Postgres catalog's
     placement/timestamps when a catalog is configured. Reading on-disk first
     means a model seeded without DATABASE_URL still appears — no store/catalog
-    desync. ``model_path``/``mmproj_path`` (container paths) are never exposed
-    on this unauthenticated surface.
+    desync. ``model_path``/``mmproj_path`` (container filesystem paths) are
+    internal sizing inputs and are never included in the response.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 

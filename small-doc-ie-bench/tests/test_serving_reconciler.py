@@ -972,7 +972,8 @@ def test_default_fit_check_prices_the_calibrated_footprint(
     tracker.footprints.record_steady(str(gguf), free + 1)  # measured bigger than free
     fits, reason = default_fit_check(record, tracker=tracker, margin_fraction=0.0)
     assert fits is False
-    assert "calibrated" in reason
+    assert f"needs ~{free + 1} bytes" in reason  # the calibrated footprint governs
+    assert "(measured)" in reason  # and the reason says the number was measured
 
 
 def test_default_fit_check_prices_the_mmproj_for_vision_launches(
@@ -1160,3 +1161,159 @@ def test_raising_snapshot_publisher_does_not_abort_the_cycle_tail(tmp_path: Path
     assert [obs.phase for obs in observations] == ["hot"]
     payload = json_lib.loads(lease_path.read_text(encoding="utf-8"))
     assert payload["timestamp"] == 700.0  # lease heartbeat still ran
+
+
+# ── port-collision self-healing ────────────────────────────────────────────────
+
+
+def _failed_bind_record(supervisor: PersistentSupervisor) -> None:
+    """A deployment declared dead with a bind-collision stderr tail, desired
+    RUNNING — the state after a respawn attempt died on EADDRINUSE."""
+    supervisor.mark_failed(
+        "invoice",
+        "main: couldn't bind HTTP server socket, hostname: 127.0.0.1, port: 8090 "
+        "(address already in use)",
+        shutdown=True,
+    )
+
+
+def test_bind_collision_queues_port_reallocating_repair(tmp_path: Path) -> None:
+    adapter = ScriptedAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json",
+        adapters={RuntimeKind.LLAMACPP: adapter},
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+    )
+    repaired: list[str] = []
+    reconciler = ServingReconciler(
+        supervisor,
+        interval_s=0.01,
+        fit_check=lambda record: (True, ""),
+        rss_reader=lambda pid: 0,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+        repair=repaired.append,
+    )
+    supervisor.deploy(_spec())
+    starts_before = adapter.starts
+    _failed_bind_record(supervisor)
+
+    observations = reconciler.run_cycle()
+
+    observed = _only(observations, "invoice")
+    assert repaired == ["invoice"]  # repair ran (after the lock was released)
+    assert adapter.starts == starts_before  # NOT respawned on the same port
+    assert observed.phase == "loading"
+    assert observed.last_error is not None
+    assert "reallocated port" in observed.last_error
+
+    # Throttled: an immediately-following cycle does not queue a second repair.
+    _failed_bind_record(supervisor)
+    reconciler.run_cycle()
+    assert repaired == ["invoice"]
+
+
+def test_non_collision_death_keeps_the_ordinary_restart_path(tmp_path: Path) -> None:
+    adapter = ScriptedAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json",
+        adapters={RuntimeKind.LLAMACPP: adapter},
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+    )
+    repaired: list[str] = []
+    reconciler = ServingReconciler(
+        supervisor,
+        interval_s=0.01,
+        fit_check=lambda record: (True, ""),
+        rss_reader=lambda pid: 0,
+        create_time=lambda pid: SPAWN_CREATE_TIME,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+        repair=repaired.append,
+    )
+    supervisor.deploy(_spec())
+    starts_before = adapter.starts
+    supervisor.mark_failed("invoice", "CUDA out of memory", shutdown=True)
+
+    reconciler.run_cycle()
+
+    assert repaired == []  # not a bind collision: no port churn
+    assert adapter.starts == starts_before + 1  # the gated respawn ran
+
+
+def test_reconciler_persists_observed_phase_on_records(tmp_path: Path) -> None:
+    supervisor, adapter, reconciler, _published = _build(tmp_path)
+    supervisor.deploy(_spec())
+
+    reconciler.run_cycle()
+
+    record = supervisor.get("invoice")
+    assert record.observed_phase == "hot"
+    assert record.observed_at is not None
+
+
+@pytest.mark.usefixtures("_sqlite_catalog")
+def test_publish_observed_never_clobbers_a_fresher_write() -> None:
+    """The reconciler snapshots under the supervisor lock but publishes outside
+    it. A load that marked the row ready AFTER the snapshot must win: the
+    older observation is skipped (monotonic guard), and the next fresh
+    observation applies normally."""
+    import datetime as dt
+
+    from docie_bench.serving.catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    stamp_before_ready = dt.datetime.now(dt.UTC)
+    catalog.publish_observed(
+        "dep",
+        engine="llama-server",
+        state="ready",
+        endpoint="http://x:8090/v1",
+        phase="hot",
+        pid=1,
+        pid_create_time=None,
+        rss_bytes=0,
+        health_ok=True,
+        last_error=None,
+        probed_at=stamp_before_ready,
+    )
+    # A load completes and refreshes the row AFTER the cycle snapshot above.
+    assert catalog.mark_placement_ready("dep", endpoint="http://x:9001/v1")
+
+    # The stale cycle snapshot (taken before the load) arrives late: skipped.
+    catalog.publish_observed(
+        "dep",
+        engine="llama-server",
+        state="stopped",
+        endpoint="",
+        phase="evicted",
+        pid=None,
+        pid_create_time=None,
+        rss_bytes=0,
+        health_ok=False,
+        last_error=None,
+        probed_at=stamp_before_ready,
+    )
+    row = catalog.get_placement("dep")
+    assert row is not None
+    assert row["phase"] == "hot"
+    assert row["endpoint"] == "http://x:9001/v1"
+
+    # The NEXT cycle's genuinely fresh observation applies normally.
+    catalog.publish_observed(
+        "dep",
+        engine="llama-server",
+        state="stopped",
+        endpoint="",
+        phase="evicted",
+        pid=None,
+        pid_create_time=None,
+        rss_bytes=0,
+        health_ok=False,
+        last_error=None,
+        probed_at=dt.datetime.now(dt.UTC) + dt.timedelta(seconds=1),
+    )
+    row = catalog.get_placement("dep")
+    assert row is not None
+    assert row["phase"] == "evicted"

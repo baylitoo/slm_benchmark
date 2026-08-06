@@ -142,7 +142,8 @@ def assess_fit(
     if predicted is None:
         return FitDecision(True, None, None, 0, "")
     store = footprints if footprints is not None else FootprintStore()
-    needed = footprint_bytes(predicted, store.get(launch.model))
+    calibrated = store.get(launch.model)
+    needed = footprint_bytes(predicted, calibrated)
     reader = memory_reader if memory_reader is not None else read_node_memory
     try:
         memory = reader()
@@ -155,15 +156,18 @@ def assess_fit(
     )
     margin = safety_margin_bytes(memory.total_bytes, fraction)
     if memory.free_bytes - margin < needed:
+        provenance = (
+            "measured" if calibrated is not None and calibrated >= predicted else "estimated"
+        )
         return FitDecision(
             False,
             needed,
             memory.free_bytes,
             margin,
             (
-                f"needs ~{needed} bytes but only {memory.free_bytes} free minus the "
-                f"{margin}-byte safety margin leaves {memory.free_bytes - margin} "
-                f"available"
+                f"needs ~{needed} bytes ({provenance}) but only {memory.free_bytes} "
+                f"free minus the {margin}-byte safety margin leaves "
+                f"{memory.free_bytes - margin} available"
             ),
         )
     return FitDecision(True, needed, memory.free_bytes, margin, "")
@@ -389,6 +393,15 @@ class LoadCoordinator:
             try:
                 with self.supervisor.lock:
                     record = self.supervisor.get(name)
+                    if record.state == LifecycleState.FAILED:
+                        # An explicit load is fresh operator intent, not one
+                        # more crash-loop iteration: without this a deployment
+                        # that exhausted its restart budget while FAILED is
+                        # permanently un-loadable (deploy() preserves the count
+                        # for an identical launch and the reconciler's
+                        # healthy-streak forgiveness never fires on a
+                        # never-healthy record) — Repair was the only escape.
+                        self.supervisor.reset_restart_budget(name)
                     spec = replace(record.spec, desired_state=DesiredState.RUNNING)
                     record = self.supervisor.deploy(spec)
                 if record.state == LifecycleState.READY:
