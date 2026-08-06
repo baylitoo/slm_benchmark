@@ -4,6 +4,8 @@ import asyncio
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,6 +19,16 @@ from docie_bench.orchestrator.schemas import RunCreate, TaskSpec
 from docie_bench.orchestrator.service import LeaseConflictError, OrchestratorService
 from docie_bench.orchestrator.worker import ArtifactOutput, BenchmarkWorker, TaskOutput
 from docie_bench.storage.db import Base
+
+
+def _uri_to_path(uri: str) -> Path:
+    """A ``file://`` URI back to a filesystem path, portably.
+
+    ``uri.removeprefix("file:///")`` only worked on Windows (drive letters keep
+    the path absolute); on POSIX it yields a RELATIVE path and every ``.exists()``
+    silently checks the wrong location.
+    """
+    return Path(url2pathname(urlparse(uri).path))
 
 
 @pytest.fixture
@@ -189,7 +201,7 @@ def test_worker_records_artifact_and_retries_after_executor_failure(
     assert completed["status"] == "completed", completed["tasks"][0]["error"]
     assert completed["tasks"][0]["attempt"] == 2
     assert completed["artifacts"][0]["name"] == "metrics.json"
-    assert Path(completed["artifacts"][0]["uri"].removeprefix("file:///")).exists()
+    assert _uri_to_path(completed["artifacts"][0]["uri"]).exists()
 
 
 def test_competing_attempt_artifacts_do_not_overwrite_each_other(tmp_path: Path) -> None:
@@ -199,8 +211,8 @@ def test_competing_attempt_artifacts_do_not_overwrite_each_other(tmp_path: Path)
     second = store.put(run_id="run", task_id="task", name="result.json", content=b"second")
 
     assert first.uri != second.uri
-    assert Path(first.uri.removeprefix("file:///")).read_bytes() == b"first"
-    assert Path(second.uri.removeprefix("file:///")).read_bytes() == b"second"
+    assert _uri_to_path(first.uri).read_bytes() == b"first"
+    assert _uri_to_path(second.uri).read_bytes() == b"second"
 
 
 def test_worker_routes_require_auth_and_bind_identity_to_principal(

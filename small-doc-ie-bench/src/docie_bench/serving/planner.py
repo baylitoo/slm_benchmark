@@ -6,6 +6,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from docie_bench.serving.registry import BenchmarkRecord, ModelManifest
+from docie_bench.serving.resources import (
+    DEFAULT_DEPLOY_CONTEXT_LENGTH,
+    predict_footprint_bytes,
+)
+
+_GIB = 1024**3
 
 
 class RuntimeName(StrEnum):
@@ -235,19 +241,21 @@ class ResourcePlanner:
                 )
             if resources.gpu_count:
                 configuration["device"] = "gpu"
-                if memory > resources.gpu_memory_gb:
+                headroom = self._headroom_gb(resources.gpu_memory_gb)
+                if memory > headroom:
                     failures.append(
                         f"requires {memory:.2f} GB GPU memory but only "
-                        f"{resources.gpu_memory_gb:.2f} GB is available"
+                        f"{headroom:.2f} GB remains after the safety margin"
                     )
             else:
                 configuration["device"] = "cpu"
                 if resources.architecture.lower() not in {"x86_64", "amd64"}:
                     failures.append("vLLM CPU support is not verified for this architecture")
-                if memory > resources.memory_gb:
+                headroom = self._headroom_gb(resources.memory_gb)
+                if memory > headroom:
                     failures.append(
                         f"requires {memory:.2f} GB memory but only "
-                        f"{resources.memory_gb:.2f} GB is available"
+                        f"{headroom:.2f} GB remains after the safety margin"
                     )
                 warnings.append(
                     "vLLM CPU performance and quantization support require benchmarking"
@@ -256,30 +264,69 @@ class ResourcePlanner:
             configuration["device"] = "gpu" if resources.gpu_count else "cpu"
             if not has_gguf:
                 failures.append("llama.cpp requires a verified GGUF artifact")
-            available = resources.memory_gb + resources.gpu_memory_gb
-            if memory > available:
+            headroom = self._headroom_gb(resources.memory_gb + resources.gpu_memory_gb)
+            if memory > headroom:
                 failures.append(
                     f"requires {memory:.2f} GB combined memory but only "
-                    f"{available:.2f} GB is available"
+                    f"{headroom:.2f} GB remains after the safety margin"
                 )
         elif runtime == RuntimeName.OLLAMA:
             configuration["device"] = "gpu" if resources.gpu_count else "cpu"
-            if memory > resources.memory_gb + resources.gpu_memory_gb:
+            headroom = self._headroom_gb(resources.memory_gb + resources.gpu_memory_gb)
+            if memory > headroom:
                 failures.append(
                     f"requires {memory:.2f} GB combined memory but only "
-                    f"{resources.memory_gb + resources.gpu_memory_gb:.2f} GB is available"
+                    f"{headroom:.2f} GB remains after the safety margin"
                 )
             warnings.append("Ollama runtime compatibility must be confirmed by an import probe")
 
     def _estimate_memory_gb(self, request: PlanningRequest, runtime: RuntimeName) -> float:
+        """Price with the canonical footprint formula (``serving.resources``).
+
+        This module previously carried a second, divergent formula (x1.2
+        weights inflation, no mmproj, a fabricated 0.1 GiB floor for
+        unpriceable models, per-runtime overhead guesses) — so the planner
+        could approve a deploy the fit gate and the Sizing tab correctly
+        reject. One formula, one verdict. Weights come from the manifest's
+        declared requirement or its artifact bytes; a manifest with neither
+        prices KV + overhead only (an honest lower bound, not an invented
+        number). Context defaults to the deploy default (8192), matching every
+        deploy surface — not llama-server's bare 4096 fallback.
+        """
         if runtime == RuntimeName.REMOTE:
             return 0
         model = request.model
-        weights = model.required_memory_gb or max(0.1, self._artifact_disk_gb(model) * 1.2)
-        context = request.context_length or model.context_length or 4096
-        kv_cache = 0.25 * request.concurrency * (context / 4096)
-        overhead = 1.0 if runtime == RuntimeName.VLLM else 0.5
-        return round(weights + kv_cache + overhead, 4)
+        weights_gb = model.required_memory_gb or self._artifact_disk_gb(model)
+        mmproj_bytes = sum(
+            int(artifact.size_bytes)
+            for artifact in model.artifacts
+            if "mmproj" in artifact.name.lower()
+        )
+        predicted = predict_footprint_bytes(
+            int(weights_gb * _GIB),
+            context_length=(
+                request.context_length or model.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH
+            ),
+            n_parallel=request.concurrency,
+            mmproj_bytes=mmproj_bytes,
+        )
+        return round(predicted / _GIB, 4)
+
+    @staticmethod
+    def _headroom_gb(total_gb: float) -> float:
+        """``total`` minus the SAME safety margin the fit gate/Sizing tab hold.
+
+        The planner previously compared footprints against 100% of available
+        RAM while every other surface held back the configured margin — the
+        planner then green-lit deploys the node could not actually absorb.
+        """
+        from docie_bench.serving.sizing import safety_margin_bytes
+        from docie_bench.settings import get_settings
+
+        margin_bytes = safety_margin_bytes(
+            int(total_gb * _GIB), get_settings().serving_sizing_margin_fraction
+        )
+        return max(total_gb - margin_bytes / _GIB, 0.0)
 
     @staticmethod
     def _artifact_disk_gb(model: ModelManifest) -> float:
