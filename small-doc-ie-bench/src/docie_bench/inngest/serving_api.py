@@ -29,7 +29,7 @@ import inngest
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from docie_bench.inngest.client import inngest_client
+from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
 from docie_bench.settings import get_settings
@@ -515,7 +515,7 @@ async def _fire_lifecycle_event(
         raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
     channel = f"{prefix}:{uuid.uuid4().hex}"
     data: dict[str, Any] = {"name": name, "channel": channel, **(extra or {})}
-    ids = await inngest_client.send(inngest.Event(name=event, data=data))
+    ids = await send_or_503(inngest_client, inngest.Event(name=event, data=data))
     return {"event_ids": list(ids), "channel": channel, "name": name}
 
 
@@ -613,7 +613,7 @@ async def scale_store_model(
             "context_length": ctx_len,
             "channel": channel,
         }
-        ids = await inngest_client.send(inngest.Event(name=DEPLOY_EVENT, data=data))
+        ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
         event_ids.extend(ids)
     return {
         "model": name,

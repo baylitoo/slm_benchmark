@@ -74,9 +74,9 @@ All are **public** and inlined into the client bundle **at build time**
 | `NEXT_PUBLIC_GRAFANA_URL` | `http://localhost:3000`  | Grafana URL embedded/linked on the Observability tab.    |
 | `NEXT_PUBLIC_INNGEST_URL` | `http://localhost:8288`  | Inngest dashboard URL linked on Observability.           |
 
-> In this deployment Grafana is actually published on host port **3001** and the
-> Inngest dashboard on **8290**. Override the two URL vars accordingly at build
-> time (e.g. compose `build.args`) so the Observability links resolve correctly.
+> The Inngest dashboard default matches compose's `INNGEST_HOST_PORT` (8288).
+> If you publish Grafana or Inngest on non-default host ports, override the URL
+> vars at build time (compose `build.args`) so the Observability links resolve.
 
 Copy `.env.example` to `.env.local` for local development:
 
@@ -109,7 +109,7 @@ npm run typecheck    # tsc --noEmit
 docker build \
   --build-arg NEXT_PUBLIC_API_BASE=http://localhost:8080 \
   --build-arg NEXT_PUBLIC_GRAFANA_URL=http://localhost:3001 \
-  --build-arg NEXT_PUBLIC_INNGEST_URL=http://localhost:8290 \
+  --build-arg NEXT_PUBLIC_INNGEST_URL=http://localhost:8288 \
   -t docie-studio ./frontend
 
 docker run -p 3000:3000 docie-studio

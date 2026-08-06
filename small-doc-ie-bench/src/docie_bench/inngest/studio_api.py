@@ -25,7 +25,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from docie_bench.inngest.client import inngest_client
+from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.inngest.functions import benchmark_idempotency_key
 from docie_bench.inngest.realtime import (
     TOPIC_ERROR,
@@ -97,7 +97,7 @@ async def trigger_extract(payload: ExtractRequest, tenant: TenantDependency) -> 
     # Bind provenance to the authenticated principal (mirrors trigger_benchmark) so
     # the worker's audit row is tenant-scoped rather than anonymous.
     data["tenant_id"] = tenant.tenant_id
-    ids = await inngest_client.send(inngest.Event(name=EXTRACT_EVENT, data=data))
+    ids = await send_or_503(inngest_client, inngest.Event(name=EXTRACT_EVENT, data=data))
     # Record ownership so the run-status proxy is tenant-scoped: an extraction run
     # has no durable StudioRun row, so this is its only ownership signal.
     _record_event_owners(list(ids), tenant.tenant_id)
@@ -204,7 +204,7 @@ async def trigger_benchmark(payload: BenchmarkRequest, tenant: TenantDependency)
         except RunStoreUnavailableError:
             effective_key = base_key
     data["idempotency_key"] = effective_key
-    ids = await inngest_client.send(inngest.Event(name=BENCHMARK_EVENT, data=data))
+    ids = await send_or_503(inngest_client, inngest.Event(name=BENCHMARK_EVENT, data=data))
     _record_event_owners(list(ids), tenant.tenant_id)
     return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
 
@@ -229,7 +229,7 @@ async def trigger_deploy(payload: DeployRequest, tenant: TenantDependency) -> Tr
     channel = f"deploy:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
-    ids = await inngest_client.send(inngest.Event(name=DEPLOY_EVENT, data=data))
+    ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
     # Deploy has no durable StudioRun row; record ownership so the triggering
     # principal can poll its status via /runs and a cross-tenant id is 404 (never
     # proxied). Every event-producing trigger records an owner for parity — an
@@ -256,7 +256,7 @@ async def trigger_seed_hf(payload: SeedHfRequest, tenant: TenantDependency) -> T
     channel = f"seed:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
-    ids = await inngest_client.send(inngest.Event(name="serving/seed-hf.requested", data=data))
+    ids = await send_or_503(inngest_client, inngest.Event(name="serving/seed-hf.requested", data=data))
     _record_event_owners(list(ids), tenant.tenant_id)
     return TriggerResponse(event_ids=list(ids), channel=channel, topics=DEFAULT_TOPICS)
 
@@ -352,7 +352,7 @@ async def trigger_seed_ollama(
     channel = f"seed:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
-    ids = await inngest_client.send(inngest.Event(name=SEED_EVENT, data=data))
+    ids = await send_or_503(inngest_client, inngest.Event(name=SEED_EVENT, data=data))
     # Seed has no durable StudioRun row; record ownership so the triggering
     # principal can poll its status via /runs (no 404 regression) while a
     # cross-tenant id stays 404 rather than leaking through the Inngest proxy.
@@ -363,8 +363,18 @@ async def trigger_seed_ollama(
 @router.get("/realtime-token")
 async def realtime_token(
     channel: Annotated[str, Query(min_length=1)],
+    tenant: TenantDependency,
     topics: Annotated[list[str] | None, Query()] = None,
 ) -> Any:
+    """Mint a realtime subscription token (authenticated).
+
+    Every sibling trigger route requires a key; this route previously handed
+    out subscription JWTs for an arbitrary channel string unauthenticated.
+    Channels are unguessable uuid4 hexes, so it was exposure-by-guessing
+    rather than a leak — but there is no reason for the one credential-minting
+    route to be the only open one.
+    """
+    del tenant  # authenticated principal required; channels are per-run uuids
     try:
         return await subscription_token(channel, topics or DEFAULT_TOPICS)
     except RuntimeError as exc:

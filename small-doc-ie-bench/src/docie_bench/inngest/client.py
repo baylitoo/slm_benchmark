@@ -86,4 +86,30 @@ def _build_client(app_id: str) -> inngest.Inngest:
 inngest_client = _build_client(APP_ID)
 serving_client = _build_client(SERVING_APP_ID)
 
-__all__ = ["inngest_client", "serving_client", "APP_ID", "SERVING_APP_ID"]
+
+async def send_or_503(client: inngest.Inngest, event: inngest.Event) -> list[str]:
+    """Send one event, or raise an honest 503 when the queue is unreachable.
+
+    Every Studio mutation (deploy, seed, lifecycle, extract, benchmark) is an
+    event; with the Inngest server down each of them previously bubbled a raw
+    SDK exception out as a 500 while every read kept working — the Studio
+    degraded into a read-only console with no message saying why. A 503 with
+    an explicit detail lets the UI say what is actually wrong.
+    """
+    from fastapi import HTTPException
+
+    try:
+        return list(await client.send(event))
+    except Exception as exc:  # noqa: BLE001 - any transport failure => same honest answer
+        logger.error("could not enqueue %s: %s", event.name, exc)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The job queue is unreachable, so this action cannot start. "
+                "Viewing existing data still works. Check the Inngest service "
+                "and try again."
+            ),
+        ) from exc
+
+
+__all__ = ["inngest_client", "serving_client", "send_or_503", "APP_ID", "SERVING_APP_ID"]
