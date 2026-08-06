@@ -225,3 +225,18 @@ def test_store_reads_on_disk_without_a_catalog(serving_home: Path) -> None:
     assert by_name["guardrails-pii"]["size_bytes"] == len(b"w") + len("{}")
     assert "model_path" not in by_name["guardrails-pii"]
     assert by_name["lfm2.5-350m"]["family"] == "lfm2"
+
+
+def test_domain_404_carries_the_discriminator_header(serving_home: Path) -> None:
+    """A lifecycle 404 for an unknown deployment is a DOMAIN answer, not
+    "endpoint not built": the X-Docie-Error header is what stops the Studio
+    from swallowing the detail and rendering "endpoint unavailable"."""
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import deployment_status
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(deployment_status("no-such-deployment"))
+
+    assert exc.value.status_code == 404
+    assert (exc.value.headers or {}).get("X-Docie-Error") == "not_found"

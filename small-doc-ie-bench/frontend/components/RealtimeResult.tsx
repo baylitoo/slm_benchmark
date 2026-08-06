@@ -37,6 +37,29 @@ function stateTone(state: InngestSubscriptionState): BadgeTone {
   }
 }
 
+/** Friendly badge label instead of the raw subscription-state enum value. */
+function stateLabel(state: InngestSubscriptionState): string {
+  switch (state) {
+    case InngestSubscriptionState.Active:
+      return "live";
+    case InngestSubscriptionState.Error:
+      return "connection error";
+    case InngestSubscriptionState.Closed:
+      return "closed";
+    default:
+      return "connecting";
+  }
+}
+
+/** The error topic carries `{message}` — show the sentence, not raw JSON. */
+function errorText(payload: unknown): string | null {
+  if (payload && typeof payload === "object" && "message" in payload) {
+    const message = (payload as { message: unknown }).message;
+    if (typeof message === "string" && message) return message;
+  }
+  return null;
+}
+
 export function RealtimeResult({
   channel,
   topics,
@@ -119,7 +142,7 @@ export function RealtimeResult({
         <Badge tone="info">
           <Radio className="h-3 w-3" /> realtime
         </Badge>
-        <Badge tone={stateTone(state)}>{state}</Badge>
+        <Badge tone={stateTone(state)}>{stateLabel(state)}</Badge>
         {result !== undefined && <Badge tone="ok">{noun} received</Badge>}
         {errTopic !== undefined && <Badge tone="err">error</Badge>}
         {fallbackActive && <Badge tone="warn">realtime silent — polling</Badge>}
@@ -143,7 +166,13 @@ export function RealtimeResult({
       )}
       {errTopic !== undefined && (
         <Section label="Error">
-          <JsonView value={errTopic} maxHeight="8rem" />
+          {errorText(errTopic) ? (
+            <p className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+              {errorText(errTopic)}
+            </p>
+          ) : (
+            <JsonView value={errTopic} maxHeight="8rem" />
+          )}
         </Section>
       )}
 

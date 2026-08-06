@@ -13,6 +13,7 @@ import {
   type TriggerResponse,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
+import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
 import { Badge, Button, Card, Field, TextInput } from "./ui";
 import { ResultPanel } from "./ResultPanel";
@@ -62,14 +63,10 @@ export function Benchmark({ view = "run" }: { view?: string }) {
       toast({ title: "Benchmark started", description: dataset.trim(), tone: "success" });
       runs.reload();
     } catch (err) {
-      const msg =
-        err instanceof ApiUnavailable
-          ? "Benchmarking isn't available on this server."
-          : err instanceof ApiError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : "Failed to start benchmark.";
+      const msg = toUserMessage(err, {
+        unavailable: "Benchmarking isn't available on this server.",
+        fallback: "Failed to start benchmark.",
+      });
       setError(msg);
       toast({ title: "Benchmark failed", description: msg, tone: "error" });
     } finally {

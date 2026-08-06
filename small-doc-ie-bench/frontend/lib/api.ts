@@ -409,7 +409,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const body = await readBody(res);
   if (res.ok) return body as T;
 
-  if (isUnavailableStatus(res.status)) {
+  // A BARE 404/501 means the route isn't built/enabled on this backend and the
+  // UI degrades to its "not available" state. A 404 carrying X-Docie-Error is
+  // a DOMAIN answer ("deployment 'x' not found") — surface its detail verbatim
+  // instead of swallowing it as "endpoint unavailable".
+  if (isUnavailableStatus(res.status) && !res.headers.get("x-docie-error")) {
     throw new ApiUnavailable(res.status, detailOf(body, "Endpoint not available"));
   }
   throw new ApiError(res.status, detailOf(body, `Request failed (HTTP ${res.status})`));

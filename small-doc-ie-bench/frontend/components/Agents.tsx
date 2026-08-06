@@ -52,6 +52,7 @@ import {
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
+import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
 import { Badge, Button, Card, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
@@ -1259,8 +1260,7 @@ function CreateView({
 // ---------------------------------------------------------------------------
 
 function errMessage(e: unknown): string {
-  if (e instanceof ApiError || e instanceof Error) return e.message;
-  return String(e);
+  return toUserMessage(e);
 }
 
 /** Agent names are OpenAI model ids: normalize typing into the slug the

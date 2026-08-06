@@ -167,6 +167,7 @@ def assess_fit(
     predicted = _predicted_for(launch)
     if predicted is None:
         return FitDecision(True, None, None, 0, "")
+    store = footprints if footprints is not None else FootprintStore()
     calibrated = store.get(launch.model)
     needed = footprint_bytes(predicted, calibrated)
     reader = memory_reader if memory_reader is not None else read_node_memory

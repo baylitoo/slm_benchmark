@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { useSectionActive } from "./shell/SectionActivity";
 import { StatusDot } from "./ui";
 
 function timeAgo(ts: number | null): string {
@@ -31,11 +32,31 @@ export function LiveIndicator({
   lastUpdated: number | null;
   onRefresh: () => void;
 }) {
+  const sectionActive = useSectionActive();
   const [, force] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => force((n) => n + 1), 1000);
-    return () => clearInterval(id);
-  }, []);
+    // The tick only keeps the relative time fresh — never run it inside a
+    // hidden section or a hidden browser tab. (Previously this ticked 1 Hz
+    // for the whole session in every mounted-but-hidden subtree.)
+    if (!sectionActive) return;
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (id == null) id = setInterval(() => force((n) => n + 1), 1000);
+    };
+    const stop = () => {
+      if (id != null) {
+        clearInterval(id);
+        id = null;
+      }
+    };
+    const onVisibility = () => (document.hidden ? stop() : start());
+    document.addEventListener("visibilitychange", onVisibility);
+    onVisibility();
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      stop();
+    };
+  }, [sectionActive]);
 
   return (
     <div className="flex items-center gap-2">
