@@ -33,7 +33,7 @@ const PAGE_SIZE = 10;
  */
 export function Benchmark({ view = "run" }: { view?: string }) {
   const { toast } = useToast();
-  const runs = useAsync(getBenchmarks, []);
+  const runs = useAsync("benchmark-runs", getBenchmarks);
 
   const [dataset, setDataset] = useState("");
   const [modelProfile, setModelProfile] = useState("");
