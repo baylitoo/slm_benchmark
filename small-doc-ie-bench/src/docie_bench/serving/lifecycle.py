@@ -410,6 +410,15 @@ class LoadCoordinator:
             try:
                 with self.supervisor.lock:
                     record = self.supervisor.get(name)
+                    if record.state == LifecycleState.FAILED:
+                        # An explicit load is fresh operator intent, not one
+                        # more crash-loop iteration: without this a deployment
+                        # that exhausted its restart budget while FAILED is
+                        # permanently un-loadable (deploy() preserves the count
+                        # for an identical launch and the reconciler's
+                        # healthy-streak forgiveness never fires on a
+                        # never-healthy record) — Repair was the only escape.
+                        self.supervisor.reset_restart_budget(name)
                     spec = replace(record.spec, desired_state=DesiredState.RUNNING)
                     record = self.supervisor.deploy(spec)
                 if record.state == LifecycleState.READY:

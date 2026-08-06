@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -81,3 +82,25 @@ def clear_progress(channel: str) -> None:
         return
     with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
+
+
+def prune_stale(*, max_age_s: float) -> int:
+    """Delete sidecars older than ``max_age_s``; returns how many were removed.
+
+    ``clear_progress`` only runs when a seed settles normally — a hard-killed
+    job leaves its sidecar forever, and a reconnecting poller would read a
+    permanently stale percentage. The nightly GC calls this so the directory
+    stays bounded. Best-effort like every other operation here.
+    """
+    try:
+        children = list(_progress_dir().iterdir())
+    except OSError:
+        return 0
+    now = time.time()
+    removed = 0
+    for path in children:
+        with contextlib.suppress(OSError):
+            if now - path.stat().st_mtime > max_age_s:
+                path.unlink()
+                removed += 1
+    return removed

@@ -907,12 +907,7 @@ def _serving_home() -> Path:
 
 async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     """Seed a GGUF from the host's Ollama into the store + record it in the catalog."""
-    from docie_bench.serving.catalog import (
-        CatalogUnavailableError,
-        ModelCatalog,
-        available_backends,
-    )
-    from docie_bench.serving.model_store import FAMILIES, ModelStore
+    from docie_bench.serving.model_store import ModelStore
 
     reference = data.get("reference")
     name = data.get("name")
@@ -930,51 +925,12 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     entry = await asyncio.to_thread(
         store.seed_from_ollama, reference, name=name, family=family, mmproj_source=mmproj
     )
-    size = entry.model_path.stat().st_size if entry.model_path.exists() else None
-    # Catalog registration has two distinct failure modes and they must NOT be
-    # conflated:
-    #   * NO catalog configured (dev/local: DATABASE_URL unset) -> the catalog is
-    #     genuinely unavailable. The on-disk store entry is a complete, usable
-    #     seed; it is simply not registered in the Postgres catalog (Studio won't
-    #     list it). Degrade gracefully: keep the on-disk entry, warn, succeed.
-    #   * A catalog that IS configured but whose WRITE fails -> a real, half-done
-    #     seed (on-disk entry with no catalog row). That is fatal: compensate by
-    #     rolling back the on-disk entry so the seed is all-or-nothing.
-    # CatalogUnavailableError is a subclass of Exception, so it MUST be caught
-    # first — otherwise the generic handler would wrongly compensate the no-DB
-    # case (the local/dev regression this fix removes).
-    try:
-        return ModelCatalog().upsert(entry, size_bytes=size)
-    except CatalogUnavailableError:
-        contract = FAMILIES.get(entry.family)
-        logger.warning(
-            "no catalog configured (no DATABASE_URL): seed %r written to the store but "
-            "NOT catalog-registered (store-only; Studio will not list it until a catalog "
-            "is configured)",
-            name,
-        )
-        return {
-            "name": entry.name,
-            "family": entry.family,
-            "vision": bool(contract and contract.vision),
-            "available_backends": available_backends(entry.family),
-            "has_mmproj": entry.mmproj_path is not None,
-            "source": entry.source,
-            "size_bytes": size,
-            "placement": None,
-            "created_at": None,
-            "updated_at": None,
-            "catalog_registered": False,
-        }
-    except Exception:  # noqa: BLE001 - configured catalog write FAILED: compensate then re-raise
-        # Roll back the just-written on-disk entry so the seed is all-or-nothing:
-        # both index.json + catalog row, or neither. The compensation itself must
-        # never mask the original failure (the bug this PR exists to kill).
-        try:
-            await asyncio.to_thread(store.remove_entry, name)
-        except Exception:  # noqa: BLE001 - log; never shadow the original error
-            logger.exception("seed compensation remove_entry failed for %r", name)
-        raise
+    # Shared with the HF seeds: no-catalog degrades to store-only success,
+    # a FAILED catalog write compensates (removes the on-disk entry) and
+    # re-raises so the seed stays all-or-nothing. This path previously carried
+    # an inline copy of that logic, which had already drifted twice from the
+    # helper (directory sizing, threaded vs blocking compensation).
+    return await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
 
 
 async def _publish_error_safely(channel: str, message: str) -> None:
@@ -1103,6 +1059,14 @@ def _register_seed_in_catalog(store: Any, entry: Any, name: str) -> dict[str, An
             store.remove_entry(name)
         except Exception:  # noqa: BLE001 - log; never shadow the original error
             logger.exception("seed compensation remove_entry failed for %r", name)
+        # A RE-seed can hit this with a catalog row from the earlier successful
+        # seed still present — after remove_entry that row points at deleted
+        # files, and the Studio would list a model nothing can deploy. Drop it
+        # too (best-effort; the DB just failed, so this may fail as well).
+        try:
+            ModelCatalog().delete(name)
+        except Exception:  # noqa: BLE001 - log; never shadow the original error
+            logger.warning("seed compensation catalog delete failed for %r", name, exc_info=True)
         raise
 
 
@@ -1222,9 +1186,16 @@ async def _run_seed_hf(
                     source=f"hf:{repo}",
                     link=True,
                 )
-                return await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
-            finally:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                result = await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
+            except BaseException:
+                # KEEP the staging dir, exactly like the GGUF branch below: the
+                # downloader resumes per-file (.part + Range), so a retry of a
+                # 20-file snapshot killed on file 19 re-fetches only the
+                # remainder. The old unconditional cleanup here destroyed the
+                # 19 completed files too. Success cleans up right after.
+                raise
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return result
 
     async with _seed_lock(name):
         # Idempotent: a prior attempt already downloaded + registered this name →
@@ -1336,20 +1307,63 @@ async def seed_hf_job(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
+# Seed leftovers older than this are unreachable-by-resume in practice: the
+# staging dir is only reused when the SAME store name is re-seeded, and a
+# week-old .part is stale enough that restarting the download costs less than
+# multi-GB files sitting on the volume forever.
+_SEED_LEFTOVER_MAX_AGE_S = 7 * 86400.0
+
+
+def _gc_seed_leftovers_sync() -> dict[str, int]:
+    """Prune stale seed staging dirs + progress sidecars (blocking, best-effort).
+
+    Both are cleaned on a successful seed; a SIGKILL mid-download leaves the
+    multi-GB ``models/.hf-downloads/<name>`` staging dir and the run's
+    ``seed-progress`` sidecar behind with no other reclaimer.
+    """
+    from docie_bench.serving.seed_progress import prune_stale
+
+    removed_staging = 0
+    staging_root = _serving_home() / "models" / ".hf-downloads"
+    now = time.time()
+    try:
+        children = list(staging_root.iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        try:
+            # Newest mtime under the dir: directory mtime alone misses writes
+            # into an existing .part file.
+            stamps = [child.stat().st_mtime]
+            stamps += [p.stat().st_mtime for p in child.rglob("*")]
+        except OSError:
+            continue
+        if now - max(stamps) > _SEED_LEFTOVER_MAX_AGE_S:
+            shutil.rmtree(child, ignore_errors=True)
+            removed_staging += 1
+    removed_progress = prune_stale(max_age_s=_SEED_LEFTOVER_MAX_AGE_S)
+    return {"deleted_seed_staging": removed_staging, "deleted_seed_progress": removed_progress}
+
+
 def _gc_studio_runs_sync() -> dict[str, int]:
     """Apply the retention policy to the durable Studio run index (blocking)."""
     from docie_bench.studio.store import default_run_store
 
     store = default_run_store()
-    if not store.enabled:
+    if store.enabled:
+        settings = get_settings()
+        summary = dict(
+            store.gc(
+                max_age_days=settings.studio_run_retention_days,
+                max_runs=settings.studio_run_retention_max,
+                orphan_grace_hours=settings.studio_orphan_grace_hours,
+            )
+        )
+    else:
         logger.info("studio run GC skipped: no DATABASE_URL")
-        return {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
-    settings = get_settings()
-    summary = store.gc(
-        max_age_days=settings.studio_run_retention_days,
-        max_runs=settings.studio_run_retention_max,
-        orphan_grace_hours=settings.studio_orphan_grace_hours,
-    )
+        summary = {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
+    # The serving-volume sweep needs no database — run it either way.
+    summary.update(_gc_seed_leftovers_sync())
     logger.info("studio run GC: %s", summary)
     return summary
 

@@ -427,3 +427,63 @@ def test_api_resolve_profile_none_is_studio_default(inject_deployments) -> None:
     inject_deployments([])
     profile = api.resolve_profile(None)
     assert profile.name == "studio_default"
+
+
+# ── observed liveness (reconciler verdict) vs sticky READY state ───────────────
+
+
+def _observed(record: DeploymentRecord, phase: str, age_s: float = 0.0) -> DeploymentRecord:
+    import time
+
+    record.observed_phase = phase
+    record.observed_at = time.time() - age_s
+    return record
+
+
+def test_fresh_non_hot_verdict_refuses_despite_sticky_ready(models_config: Path) -> None:
+    """A hung llama-server: state stays READY (the reconciler keeps it as a
+    was-ready high-water mark while counting misses), but the fresh observed
+    phase says 'loading'. Routing on state alone sent extractions into the
+    hung runtime for the full client timeout — the verdict must win."""
+    hung = _observed(
+        _record(name="hung", runtime=RuntimeKind.LLAMACPP, model="/m.gguf", alias="hung"),
+        "loading",
+    )
+    with pytest.raises(ProfileResolutionError):
+        resolve_extraction_profile(
+            deployment="hung", models_config_path=models_config, deployments=[hung]
+        )
+
+
+def test_fresh_hot_verdict_routes(models_config: Path) -> None:
+    live = _observed(
+        _record(name="live", runtime=RuntimeKind.LLAMACPP, model="/m.gguf", alias="live"),
+        "hot",
+    )
+    profile = resolve_extraction_profile(
+        deployment="live", models_config_path=models_config, deployments=[live]
+    )
+    assert profile.base_url == "http://127.0.0.1:8088/v1"
+
+
+def test_stale_verdict_falls_back_to_state_heuristic(models_config: Path) -> None:
+    """Reconciler dead for an hour: its last verdict is no longer trusted and
+    the resolver falls back to the state==READY heuristic (the DB-optional,
+    reconciler-optional contract)."""
+    stale = _observed(
+        _record(name="st", runtime=RuntimeKind.LLAMACPP, model="/m.gguf", alias="st"),
+        "loading",
+        age_s=3600.0,
+    )
+    profile = resolve_extraction_profile(
+        deployment="st", models_config_path=models_config, deployments=[stale]
+    )
+    assert profile.model == "st"
+
+
+def test_no_verdict_keeps_previous_behavior(models_config: Path) -> None:
+    plain = _record(name="pl", runtime=RuntimeKind.LLAMACPP, model="/m.gguf", alias="pl")
+    profile = resolve_extraction_profile(
+        deployment="pl", models_config_path=models_config, deployments=[plain]
+    )
+    assert profile.model == "pl"

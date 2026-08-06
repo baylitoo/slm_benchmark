@@ -569,6 +569,17 @@ class ModelCatalog:
                     engine=engine,
                 )
                 session.add(row)
+            elif probed_at is not None and row.updated_at is not None:
+                # Monotonic guard: the reconciler snapshots under the supervisor
+                # lock but publishes OUTSIDE it, so a load/stop that updated
+                # this row after the snapshot (mark_placement_ready et al.)
+                # must not be clobbered by the older observation. The next
+                # cycle's fresher observation applies normally.
+                updated = row.updated_at
+                if updated.tzinfo is None:  # sqlite naive round-trip
+                    updated = updated.replace(tzinfo=dt.UTC)
+                if updated > probed_at:
+                    return _placement_view(row)
             row.state = state
             row.endpoint = endpoint
             row.phase = phase
