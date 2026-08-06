@@ -198,27 +198,53 @@ async def download_file(
     client: httpx.AsyncClient,
     revision: str = "main",
     progress: ProgressCallback | None = None,
+    resume: bool = True,
 ) -> Path:
     """Stream one repo file to ``destination`` (``.part`` then atomic rename).
 
     ``progress(received_bytes, total_bytes)`` is awaited as chunks land; the
     caller owns throttling. Redirects (Hub -> CDN) are followed.
+
+    RESUMABLE (``resume=True``): a partial ``.part`` left by a previous attempt
+    (e.g. an Inngest seed step killed at its lease limit mid-2.6GB download) is
+    CONTINUED via an HTTP ``Range`` request instead of restarting from zero — the
+    whole reason a slow, large seed can converge across retries. The ``.part`` is
+    therefore KEPT on error/cancellation (only removed on an all-or-nothing
+    restart), and the caller must serialize concurrent writers to the same
+    ``.part`` (see the seed's per-name lock). If the server ignores ``Range``
+    (200 not 206) the download restarts cleanly; a 416 means the ``.part`` is
+    already complete.
     """
     url = f"{HF_BASE}/{repo}/resolve/{revision}/{filename}"
     destination.parent.mkdir(parents=True, exist_ok=True)
     part = destination.with_suffix(destination.suffix + ".part")
+    existing = part.stat().st_size if (resume and part.exists()) else 0
+
+    headers = hf_headers()
+    if existing:
+        headers = {**headers, "Range": f"bytes={existing}-"}
     try:
         async with client.stream(
-            "GET", url, headers=hf_headers(), follow_redirects=True, timeout=None
+            "GET", url, headers=headers, follow_redirects=True, timeout=None
         ) as response:
+            # Range already satisfied -> the .part holds the whole file; finalize.
+            if existing and response.status_code == 416:
+                part.replace(destination)
+                return destination
             if response.status_code >= 400:
                 raise HfHubError(
                     f"download of {filename!r} failed: HTTP {response.status_code}"
                 )
-            total_raw = response.headers.get("content-length")
-            total = int(total_raw) if total_raw and total_raw.isdigit() else None
-            received = 0
-            with part.open("wb") as handle:
+            # Asked to resume but got a full 200 -> the server ignored Range;
+            # start over from byte 0 (truncate) rather than appending a duplicate.
+            resuming = existing > 0 and response.status_code == 206
+            if existing and not resuming:
+                existing = 0
+
+            total = _content_total(response, offset=existing)
+            received = existing
+            mode = "ab" if resuming else "wb"
+            with part.open(mode) as handle:
                 async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                     handle.write(chunk)
                     received += len(chunk)
@@ -227,11 +253,22 @@ async def download_file(
         part.replace(destination)
         return destination
     except httpx.RequestError as exc:
-        part.unlink(missing_ok=True)
+        # KEEP the .part: the next attempt resumes it. Do not restart from zero.
         raise HfHubError(f"download of {filename!r} failed: {exc}") from exc
-    except BaseException:
-        part.unlink(missing_ok=True)
-        raise
+
+
+def _content_total(response: httpx.Response, *, offset: int) -> int | None:
+    """The FULL file size for the progress bar. For a 206 resume, Content-Length
+    is only the remaining bytes, so prefer Content-Range's ``.../<total>``."""
+    content_range = response.headers.get("content-range")
+    if content_range and "/" in content_range:
+        tail = content_range.rsplit("/", 1)[1].strip()
+        if tail.isdigit():
+            return int(tail)
+    length = response.headers.get("content-length")
+    if length and length.isdigit():
+        return offset + int(length) if offset else int(length)
+    return None
 
 
 # Snapshot download (analyzer/encoder checkpoints — safetensors + configs).
@@ -328,7 +365,12 @@ async def download_snapshot(
                 await progress(_base + received, total)  # type: ignore[misc]
 
             await download_file(
-                repo, file.filename, target, client=client, revision=revision, progress=file_progress
+                repo,
+                file.filename,
+                target,
+                client=client,
+                revision=revision,
+                progress=file_progress,
             )
         else:
             await download_file(repo, file.filename, target, client=client, revision=revision)
