@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import logging
 import os
 import shutil
@@ -1032,6 +1033,22 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
+# One asyncio lock per store name, serializing seed attempts for that name on
+# the single-replica serving service: a big download can exceed the Inngest step
+# lease and get RETRIED while the first attempt is still running. The retry then
+# blocks here, and once it proceeds it RESUMES the partial (or no-ops if the
+# first already registered) — so overlapping attempts can never append to the
+# same .part and corrupt it, and no work is redone.
+_SEED_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _seed_lock(name: str) -> asyncio.Lock:
+    lock = _SEED_LOCKS.get(name)
+    if lock is None:
+        lock = _SEED_LOCKS[name] = asyncio.Lock()
+    return lock
+
+
 def _entry_size_bytes(entry: Any) -> int | None:
     """On-disk size of a store entry — a file's size, or a snapshot dir's tree sum."""
     path = entry.model_path
@@ -1112,7 +1129,7 @@ async def _run_seed_hf(
         pick_gguf,
         pick_mmproj,
     )
-    from docie_bench.serving.model_store import ModelStore, get_family
+    from docie_bench.serving.model_store import ModelStore, ModelStoreError, get_family
 
     repo = data.get("repo")
     if not repo:
@@ -1168,102 +1185,120 @@ async def _run_seed_hf(
     # exact same progress/registration machinery: analyzer (encoder) checkpoints
     # and the LAST-RESORT transformers/AutoModel path (no GGUF for this model).
     if contract.analyzer or contract.transformers_runtime:
+        async with _seed_lock(name):
+            with contextlib.suppress(ModelStoreError):
+                done = store.entry(name)
+                if done.model_path.exists():
+                    return await asyncio.to_thread(
+                        _register_seed_in_catalog, store, done, name
+                    )
+            try:
+                async with httpx.AsyncClient(transport=transport) as client:
+                    snap_files = await list_snapshot_files(repo, client=client)
+                    await publish(
+                        channel,
+                        TOPIC_STATUS,
+                        {
+                            "state": "downloading",
+                            "repo": repo,
+                            "files": len(snap_files),
+                            "size_bytes": sum(f.size_bytes or 0 for f in snap_files) or None,
+                        },
+                    )
+                    snapshot_tmp = tmp_dir / "snapshot"
+                    await download_snapshot(
+                        repo,
+                        snap_files,
+                        snapshot_tmp,
+                        client=client,
+                        progress=_progress_reporter("download-snapshot", repo),
+                    )
+                await publish(channel, TOPIC_STATUS, {"state": "registering", "name": name})
+                entry = await asyncio.to_thread(
+                    store.add_snapshot,
+                    name=name,
+                    family=family,
+                    snapshot_dir=snapshot_tmp,
+                    source=f"hf:{repo}",
+                    link=True,
+                )
+                return await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async with _seed_lock(name):
+        # Idempotent: a prior attempt already downloaded + registered this name →
+        # re-run only the cheap catalog upsert and skip the (multi-GB) download.
+        with contextlib.suppress(ModelStoreError):
+            done = store.entry(name)
+            if done.model_path.exists():
+                return await asyncio.to_thread(_register_seed_in_catalog, store, done, name)
         try:
             async with httpx.AsyncClient(transport=transport) as client:
-                snap_files = await list_snapshot_files(repo, client=client)
+                files = await list_repo_ggufs(repo, client=client)
+                chosen = pick_gguf(files, quant, prefer=quant_prefer)
+                mmproj_file = pick_mmproj(files)
+                if contract.needs_mmproj and mmproj_file is None:
+                    raise ValueError(
+                        f"family {family!r} requires a vision projector but {repo!r} ships "
+                        "no mmproj GGUF — pick a repo that includes one"
+                    )
+
                 await publish(
                     channel,
                     TOPIC_STATUS,
                     {
                         "state": "downloading",
                         "repo": repo,
-                        "files": len(snap_files),
-                        "size_bytes": sum(f.size_bytes or 0 for f in snap_files) or None,
+                        "file": chosen.filename,
+                        "quant": chosen.quant,
+                        "size_bytes": chosen.size_bytes,
                     },
                 )
-                snapshot_tmp = tmp_dir / "snapshot"
-                await download_snapshot(
-                    repo,
-                    snap_files,
-                    snapshot_tmp,
-                    client=client,
-                    progress=_progress_reporter("download-snapshot", repo),
-                )
-            await publish(channel, TOPIC_STATUS, {"state": "registering", "name": name})
-            entry = await asyncio.to_thread(
-                store.add_snapshot,
-                name=name,
-                family=family,
-                snapshot_dir=snapshot_tmp,
-                source=f"hf:{repo}",
-                link=True,
-            )
-            return await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    try:
-        async with httpx.AsyncClient(transport=transport) as client:
-            files = await list_repo_ggufs(repo, client=client)
-            chosen = pick_gguf(files, quant, prefer=quant_prefer)
-            mmproj_file = pick_mmproj(files)
-            if contract.needs_mmproj and mmproj_file is None:
-                raise ValueError(
-                    f"family {family!r} requires a vision projector but {repo!r} ships "
-                    "no mmproj GGUF — pick a repo that includes one"
-                )
-
-            await publish(
-                channel,
-                TOPIC_STATUS,
-                {
-                    "state": "downloading",
-                    "repo": repo,
-                    "file": chosen.filename,
-                    "quant": chosen.quant,
-                    "size_bytes": chosen.size_bytes,
-                },
-            )
-            model_tmp = tmp_dir / "model.gguf"
-            await download_file(
-                repo,
-                chosen.filename,
-                model_tmp,
-                client=client,
-                progress=_progress_reporter("download", chosen.filename),
-            )
-            mmproj_tmp: Path | None = None
-            if contract.needs_mmproj and mmproj_file is not None:
-                await publish(
-                    channel,
-                    TOPIC_STATUS,
-                    {"state": "downloading-mmproj", "file": mmproj_file.filename},
-                )
-                mmproj_tmp = tmp_dir / "mmproj.gguf"
+                model_tmp = tmp_dir / "model.gguf"
                 await download_file(
                     repo,
-                    mmproj_file.filename,
-                    mmproj_tmp,
+                    chosen.filename,
+                    model_tmp,
                     client=client,
-                    progress=_progress_reporter("download-mmproj", mmproj_file.filename),
+                    progress=_progress_reporter("download", chosen.filename),
                 )
+                mmproj_tmp: Path | None = None
+                if contract.needs_mmproj and mmproj_file is not None:
+                    await publish(
+                        channel,
+                        TOPIC_STATUS,
+                        {"state": "downloading-mmproj", "file": mmproj_file.filename},
+                    )
+                    mmproj_tmp = tmp_dir / "mmproj.gguf"
+                    await download_file(
+                        repo,
+                        mmproj_file.filename,
+                        mmproj_tmp,
+                        client=client,
+                        progress=_progress_reporter("download-mmproj", mmproj_file.filename),
+                    )
 
-        await publish(channel, TOPIC_STATUS, {"state": "registering", "name": name})
-        # Hard-link into the canonical entry (same volume, instant), verify, index.
-        entry = await asyncio.to_thread(
-            store.add_gguf,
-            name=name,
-            family=family,
-            model_gguf=model_tmp,
-            mmproj=mmproj_tmp,
-            source=f"hf:{repo}:{chosen.quant or chosen.filename}",
-            link=True,
-        )
-        return await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
-    finally:
-        # The canonical entry holds hard links to this data; removing the
-        # download dir never touches the registered blobs.
+            await publish(channel, TOPIC_STATUS, {"state": "registering", "name": name})
+            # Hard-link into the canonical entry (same volume, instant), verify, index.
+            entry = await asyncio.to_thread(
+                store.add_gguf,
+                name=name,
+                family=family,
+                model_gguf=model_tmp,
+                mmproj=mmproj_tmp,
+                source=f"hf:{repo}:{chosen.quant or chosen.filename}",
+                link=True,
+            )
+            result = await asyncio.to_thread(_register_seed_in_catalog, store, entry, name)
+        except BaseException:
+            # KEEP the staging dir (its .part) so a retry RESUMES the download
+            # instead of restarting from zero. Only a SUCCESS cleans it below.
+            raise
+        # Success: the blobs are hard-linked into the store; drop the staging dir.
+        # (Removing a hard link never touches the registered inode.)
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        return result
 
 
 @serving_client.create_function(
