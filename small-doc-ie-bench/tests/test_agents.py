@@ -239,6 +239,27 @@ async def test_schema_fallback_downgrades_on_grammar_400() -> None:
     assert result["choices"][0]["message"]["content"] == "{}"
 
 
+async def test_schema_instruction_names_fields_in_prompt() -> None:
+    # The schema's fields must ride in the PROMPT (a system message), so the model
+    # knows what to extract even under json_object — not just echo "OCR" garbage.
+    from docie_bench.agents.runtime import _post_chat_with_schema
+
+    sent: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=_completion(json.loads(request.content)["model"]))
+
+    msgs = {"messages": [{"role": "user", "content": "x"}]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
+
+    first = sent[0]["messages"][0]
+    assert first["role"] == "system"
+    assert "invoice_number" in first["content"]  # real invoice fields named
+    assert "total_ttc" in first["content"]
+
+
 async def test_schema_fallback_reraises_non_grammar_400() -> None:
     # A 400 that is NOT a grammar/response_format problem must NOT be swallowed.
     from docie_bench.agents.runtime import AgentError, _post_chat_with_schema
