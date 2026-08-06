@@ -985,6 +985,7 @@ def test_default_fit_check_prices_the_mmproj_for_vision_launches(
     from docie_bench.serving import reconciler as reconciler_module
     from docie_bench.serving.reconciler import default_fit_check
     from docie_bench.serving.resources import (
+        DEFAULT_DEPLOY_CONTEXT_LENGTH,
         FootprintStore,
         NodeMemory,
         ResourceTracker,
@@ -995,7 +996,11 @@ def test_default_fit_check_prices_the_mmproj_for_vision_launches(
     gguf.write_bytes(b"g" * 1024)
     mmproj = tmp_path / "mmproj.gguf"
     mmproj.write_bytes(b"p" * 4096)
-    base = predicted_footprint_for_model(size_bytes=None, model_path=str(gguf))
+    # The gate prices a context-less launch at the DEPLOY default (8192), the
+    # same default every deploy surface applies — mirror it here.
+    base = predicted_footprint_for_model(
+        size_bytes=None, model_path=str(gguf), context_length=DEFAULT_DEPLOY_CONTEXT_LENGTH
+    )
     assert base is not None
     free = base + 2000  # enough without the projector, NOT enough with it
     monkeypatch.setattr(

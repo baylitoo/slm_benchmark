@@ -266,6 +266,7 @@ class ControlPlane:
         import psutil
 
         from docie_bench.serving.planner import HostResources, ResourcePlanner, RuntimeName
+        from docie_bench.serving.resources import read_node_memory
         from docie_bench.serving.registry import ModelRegistry
         from docie_bench.serving.runtime import default_runtime_adapters
         from docie_bench.serving.supervisor import PersistentSupervisor
@@ -283,7 +284,11 @@ class ControlPlane:
             registry.backend,
             HostResources(
                 cpu_cores=psutil.cpu_count(logical=True) or 1,
-                memory_gb=round(psutil.virtual_memory().available / (1024**3), 4),
+                # cgroup-v2-first, same reader as the fit gate and the sizing
+                # snapshot: in a container psutil describes the whole VM, and
+                # the planner would approve deploys against RAM the cgroup
+                # never grants.
+                memory_gb=round(read_node_memory().free_bytes / (1024**3), 4),
                 disk_gb=round(shutil.disk_usage(home.parent).free / (1024**3), 4),
                 # Only the planner-scorable chat runtimes: non-chat kinds (the
                 # encoder shim) are deploy-explicit (`runtime="encoder"`) and
