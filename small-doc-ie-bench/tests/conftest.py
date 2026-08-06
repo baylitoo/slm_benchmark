@@ -4,6 +4,12 @@ import os
 
 import pytest
 
+# Tests must be hermetic: a developer's local .env (model profiles, compose
+# ports, auth) must never change test results. docie_bench.settings reads this
+# flag at import time, so it has to be set here — conftest runs before any test
+# module imports the package. Shell-exported variables still apply (see below).
+os.environ["DOCIE_IGNORE_ENV_FILE"] = "1"
+
 # The API now fails closed by default (AUTH_REQUIRED=true, B3). The existing
 # suite exercises /v1 routes via TestClient without sending keys, so default the
 # test session to auth-off; tests that assert auth behaviour opt back in by

@@ -1,0 +1,60 @@
+name: regression-gate
+
+# The project lives in the small-doc-ie-bench/ subdirectory of this repository;
+# workflows are only discovered at the repository root, so this file lives here
+# and every step runs with that working directory.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: small-doc-ie-bench
+
+jobs:
+  deterministic-regression-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: small-doc-ie-bench/pyproject.toml
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest -q --timeout=600
+      - name: Compare deterministic benchmark fixture
+        run: |
+          docie-bench benchmark compare \
+            tests/fixtures/regression/baseline \
+            tests/fixtures/regression/candidate \
+            --budgets tests/fixtures/regression/budgets.yaml \
+            --output-dir comparison
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-comparison
+          path: small-doc-ie-bench/comparison/
+
+  frontend-typecheck:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: small-doc-ie-bench/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: small-doc-ie-bench/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck

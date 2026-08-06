@@ -972,7 +972,8 @@ def test_default_fit_check_prices_the_calibrated_footprint(
     tracker.footprints.record_steady(str(gguf), free + 1)  # measured bigger than free
     fits, reason = default_fit_check(record, tracker=tracker, margin_fraction=0.0)
     assert fits is False
-    assert "calibrated" in reason
+    assert f"needs ~{free + 1} bytes" in reason  # the calibrated footprint governs
+    assert "(measured)" in reason  # and the reason says the number was measured
 
 
 def test_default_fit_check_prices_the_mmproj_for_vision_launches(
