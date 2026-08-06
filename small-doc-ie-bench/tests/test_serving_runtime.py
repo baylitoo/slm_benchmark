@@ -21,7 +21,10 @@ from docie_bench.serving.runtime import (
 
 
 class FakeProcess:
-    def __init__(self, pid: int = 41) -> None:
+    # An intentionally implausible pid: after shutdown() the adapter falls back
+    # to psutil.pid_exists, and a small pid like 41 EXISTS on Linux CI runners
+    # (kernel threads), turning "is it still running?" into a platform lottery.
+    def __init__(self, pid: int = 2_147_400_041) -> None:
         self.pid = pid
         self.returncode: int | None = None
         self.terminated = False

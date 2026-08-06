@@ -637,25 +637,33 @@ def test_sizing_endpoint_reserves_loading_placements() -> None:
     assert fit["fits_now"] == max((6 * GIB - margin - reserve) // _fp(2 * GIB), 0) == 0
 
 
-@pytest.mark.usefixtures("_sqlite_catalog", "_serving_home")
-def test_store_endpoint_strips_container_paths() -> None:
+@pytest.mark.usefixtures("_sqlite_catalog")
+def test_store_endpoint_strips_container_paths(_serving_home: Path) -> None:
     """model_path/mmproj_path are server-side sizing inputs (calibration key +
-    projector pricing) — the unauthenticated /store surface must not echo
-    container filesystem paths to the browser."""
+    projector pricing) — /store must not echo container filesystem paths to the
+    browser. The endpoint reads the ON-DISK store index (not the catalog), so
+    the seed goes through ModelStore."""
     from docie_bench.inngest.serving_api import list_store
     from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.model_store import ModelStore
 
-    _seed_store("small", 2 * GIB)
+    source = _serving_home / "seed-src" / "small.gguf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"g" * 2048)
+    stored = ModelStore(_serving_home / "models").add_gguf(
+        name="small", family="openai_chat", model_gguf=source, link=False
+    )
+    ModelCatalog().upsert(stored, size_bytes=2048)
     # The catalog view itself still carries the paths for the sizing engine.
     (view,) = ModelCatalog().list()
-    assert view["model_path"] == "/store/small/model.gguf"
+    assert view["model_path"] == stored.model_path.as_posix()
 
     (entry,) = asyncio.run(list_store())
 
     assert "model_path" not in entry
     assert "mmproj_path" not in entry
     assert entry["name"] == "small"  # the rest of the view is untouched
-    assert entry["size_bytes"] == 2 * GIB
+    assert entry["size_bytes"] == 2048  # measured from disk
 
 
 @pytest.mark.usefixtures("_serving_home")
