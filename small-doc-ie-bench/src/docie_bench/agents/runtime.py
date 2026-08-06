@@ -86,11 +86,18 @@ def _resolve_ocr_mode(options: dict[str, Any]) -> str:
 def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
     """Constrain the completion to the named extraction schema via OpenAI
     ``response_format`` (llama.cpp compiles it to a GBNF grammar). Shared by the
-    OCR→LLM (over OCR text) and vision (over the image) paths."""
-    from docie_bench.schemas.extraction import schema_json
+    OCR→LLM (over OCR text) and vision (over the image) paths.
+
+    Uses the FLATTENED schema (flat_schema_json): the raw schema's per-field
+    ``{value, evidence_ids, confidence}`` wrapper + a negative-lookahead regex on
+    the money/number fields make llama.cpp fail to compile the grammar. The flat
+    form (values only, no lookahead, additionalProperties:false) compiles, so the
+    strict grammar actually applies — a clean ``{field: value | null}`` with no
+    extra or duplicate keys, instead of falling back to shapeless json_object."""
+    from docie_bench.schemas.extraction import flat_schema_json
 
     try:
-        json_schema = schema_json(schema_name)
+        json_schema = flat_schema_json(schema_name)
     except ValueError as exc:
         raise AgentError(
             str(exc), status_code=400, error_type="invalid_request_error"
