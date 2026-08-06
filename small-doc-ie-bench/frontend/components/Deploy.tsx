@@ -59,6 +59,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
+import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
 import {
   Badge,
@@ -587,12 +588,10 @@ function DeploymentsView({
       });
       deployments.refresh();
     } catch (err) {
-      const msg =
-        err instanceof ApiUnavailable
-          ? "The lifecycle endpoints aren't available yet on this backend."
-          : err instanceof Error
-            ? err.message
-            : `${action} failed.`;
+      const msg = toUserMessage(err, {
+        unavailable: "The lifecycle endpoints aren't available on this server.",
+        fallback: `${action} failed.`,
+      });
       toast({ title: `${action} failed`, description: msg, tone: "error" });
     } finally {
       setBusy(null);
@@ -1449,14 +1448,10 @@ function DeployForm({
       });
       onDeployed();
     } catch (err) {
-      const msg =
-        err instanceof ApiUnavailable
-          ? "Deploying isn't available on this server."
-          : err instanceof ApiError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : "Deploy failed.";
+      const msg = toUserMessage(err, {
+        unavailable: "Deploying isn't available on this server.",
+        fallback: "Deploy failed.",
+      });
       setError(msg);
       toast({ title: "Deploy failed", description: msg, tone: "error" });
     } finally {
@@ -2676,11 +2671,7 @@ function HfCollectionSeed({
 }
 
 function errText(err: unknown, fallback: string): string {
-  if (err instanceof ApiUnavailable) {
-    return "The endpoint isn't available yet — is the backend up to date?";
-  }
-  if (err instanceof ApiError || err instanceof Error) return err.message;
-  return fallback;
+  return toUserMessage(err, { fallback });
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,14 +2723,10 @@ function SeedForm({
       toast({ title: "Seeding started", description: name.trim(), tone: "success" });
       onSeeded();
     } catch (err) {
-      const msg =
-        err instanceof ApiUnavailable
-          ? "Adding models isn't available on this server."
-          : err instanceof ApiError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : "Seeding failed.";
+      const msg = toUserMessage(err, {
+        unavailable: "Adding models isn't available on this server.",
+        fallback: "Seeding failed.",
+      });
       setError(msg);
       toast({ title: "Seed failed", description: msg, tone: "error" });
     } finally {

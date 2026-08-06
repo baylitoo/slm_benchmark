@@ -38,6 +38,12 @@ logger = logging.getLogger("docie_bench.inngest.serving_api")
 
 router = APIRouter(prefix="/v1/serving", tags=["serving"])
 
+# Domain "not found" marker. The Studio treats a BARE 404/501 as "endpoint not
+# built on this backend" and swallows the detail; this header tells it the
+# route exists and the detail is a real, user-relevant answer ("deployment 'x'
+# not found"), so typos and races stop rendering as "endpoint unavailable".
+_DOMAIN_404 = {"X-Docie-Error": "not_found"}
+
 DELETE_EVENT = "serving/delete.requested"
 LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
@@ -414,7 +420,7 @@ async def deployment_status(name: str) -> Any:
     try:
         return await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
 
 
 def _serving_home() -> Path:
@@ -462,7 +468,7 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
                 else None
             )
     except (KeyError, ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
 
     tail: list[str] = []
     try:
@@ -506,7 +512,7 @@ async def _fire_lifecycle_event(
     try:
         await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
     channel = f"{prefix}:{uuid.uuid4().hex}"
     data: dict[str, Any] = {"name": name, "channel": channel, **(extra or {})}
     ids = await inngest_client.send(inngest.Event(name=event, data=data))

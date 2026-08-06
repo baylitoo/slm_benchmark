@@ -25,6 +25,7 @@ import {
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
+import { toUserMessage } from "@/lib/errors";
 import { Badge, Button, Card, Select, TextInput } from "./ui";
 import { LiveIndicator } from "./LiveIndicator";
 import { useToast } from "./Toast";
@@ -390,14 +391,10 @@ function DeployMoreCell({
     } catch (err) {
       toast({
         title: "Scale failed",
-        description:
-          err instanceof ApiUnavailable
-            ? "The scale endpoint isn't available on this backend."
-            : err instanceof ApiError
-              ? err.message
-              : err instanceof Error
-                ? err.message
-                : "Scale failed.",
+        description: toUserMessage(err, {
+          unavailable: "Scaling isn't available on this server.",
+          fallback: "Scale failed.",
+        }),
         tone: "error",
       });
     } finally {
@@ -489,13 +486,10 @@ function WhatIf({ data }: { data: SizingView | null }) {
       setResult(await whatifSizing(plan));
     } catch (err) {
       setError(
-        err instanceof ApiUnavailable
-          ? "The what-if endpoint isn't available on this backend."
-          : err instanceof ApiError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : "What-if failed.",
+        toUserMessage(err, {
+          unavailable: "What-if sizing isn't available on this server.",
+          fallback: "What-if failed.",
+        }),
       );
     } finally {
       setSubmitting(false);

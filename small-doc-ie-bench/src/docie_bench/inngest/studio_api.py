@@ -40,6 +40,10 @@ from docie_bench.studio.store import RunStoreUnavailableError, default_run_store
 
 router = APIRouter(prefix="/v1/studio", tags=["studio"])
 
+# Domain "not found" marker (see serving_api._DOMAIN_404): without it the
+# Studio renders these 404s as "endpoint unavailable" and drops the detail.
+_DOMAIN_404 = {"X-Docie-Error": "not_found"}
+
 DEFAULT_TOPICS = [TOPIC_STATUS, TOPIC_PROGRESS, TOPIC_RESULT, TOPIC_ERROR]
 EXTRACT_EVENT = "doc/extract.requested"
 BENCHMARK_EVENT = "benchmark/run.requested"
@@ -385,7 +389,7 @@ async def event_runs(event_id: str, tenant: TenantDependency) -> Any:
             # Ownership is recorded (benchmark run row or extraction event owner):
             # serve it only to its owner. A cross-tenant id is 404, never proxied.
             if owner != tenant.tenant_id:
-                raise HTTPException(status_code=404, detail="Run not found")
+                raise HTTPException(status_code=404, detail="Run not found", headers=_DOMAIN_404)
             record = store.get_run(event_id, tenant_id=tenant.tenant_id)
             if record is not None:
                 # Durable benchmark run: answer from the index.
@@ -396,7 +400,7 @@ async def event_runs(event_id: str, tenant: TenantDependency) -> Any:
             # Store is enabled but no ownership is recorded for this id: we cannot
             # prove the caller owns it, so refuse rather than leak another
             # principal's run status/output through the tenant-agnostic proxy.
-            raise HTTPException(status_code=404, detail="Run not found")
+            raise HTTPException(status_code=404, detail="Run not found", headers=_DOMAIN_404)
 
     base = os.getenv("INNGEST_BASE_URL", "http://localhost:8288").rstrip("/")
     headers = {}
@@ -435,13 +439,13 @@ async def download_artifact(artifact_id: str, tenant: TenantDependency) -> Respo
     """
     store = default_run_store()
     if not store.enabled:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+        raise HTTPException(status_code=404, detail="Artifact not found", headers=_DOMAIN_404)
     try:
         resolved = store.open_artifact(artifact_id, tenant_id=tenant.tenant_id)
     except RunStoreUnavailableError:
-        raise HTTPException(status_code=404, detail="Artifact not found") from None
+        raise HTTPException(status_code=404, detail="Artifact not found", headers=_DOMAIN_404) from None
     if resolved is None:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+        raise HTTPException(status_code=404, detail="Artifact not found", headers=_DOMAIN_404)
     meta, content = resolved
     return Response(
         content=content,
