@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -107,8 +108,35 @@ def _default_live_deployments() -> list[DeploymentRecord]:
     return list(supervisor.list())
 
 
+def _observed_stale_after_s() -> float:
+    """How long a reconciler verdict stays trustworthy (3 cycles, min 30s).
+
+    Mirrors the api's node-snapshot staleness gate: same env knob, same
+    multiple, same floor — one policy for "the reconciler stopped talking".
+    """
+    try:
+        interval = float(os.environ.get("DOCIE_SERVING_RECONCILE_INTERVAL", "10"))
+    except ValueError:
+        interval = 10.0
+    if interval <= 0:
+        interval = 10.0
+    return max(3.0 * interval, 30.0)
+
+
 def _is_live(record: DeploymentRecord) -> bool:
-    """A deployment is selectable iff it is READY and advertises an endpoint."""
+    """A deployment is selectable iff it is actually serving.
+
+    ``state == READY`` is deliberately sticky (the reconciler keeps it as a
+    was-ready high-water mark while it counts health misses), so state alone
+    routes requests into a hung runtime for the full client timeout. Prefer
+    the reconciler's computed verdict: a FRESH ``observed_phase`` is the
+    truth ("hot" = probed healthy this cycle). Fall back to the state
+    heuristic only when there is no fresh verdict (reconciler off/never ran —
+    the DB-optional, reconciler-optional contract).
+    """
+    if record.observed_phase is not None and record.observed_at is not None:
+        if time.time() - record.observed_at <= _observed_stale_after_s():
+            return record.observed_phase == "hot" and bool(record.endpoint)
     return record.state == LifecycleState.READY and bool(record.endpoint)
 
 
