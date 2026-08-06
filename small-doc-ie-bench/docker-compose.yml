@@ -9,6 +9,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Every mutation (deploy/seed/lifecycle/extract/benchmark) is an Inngest
+      # event; without this dependency the api boots fine and then 503s every
+      # write while the queue is still starting.
+      inngest:
+        condition: service_healthy
     ports:
       - "${API_PORT:-8080}:8080"
     volumes:
@@ -175,7 +180,7 @@ services:
       postgres:
         condition: service_healthy
       inngest:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./configs:/app/configs:ro
       - ./data:/app/data
@@ -214,7 +219,7 @@ services:
       postgres:
         condition: service_healthy
       inngest:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./configs:/app/configs:ro
       - ./data:/app/data
@@ -234,7 +239,9 @@ services:
         NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8080}
         NEXT_PUBLIC_GRAFANA_URL: ${NEXT_PUBLIC_GRAFANA_URL:-http://localhost:3001}
         # Host port of the Inngest dashboard (matches INNGEST_HOST_PORT).
-        NEXT_PUBLIC_INNGEST_URL: ${NEXT_PUBLIC_INNGEST_URL:-http://localhost:8290}
+        # Must match INNGEST_HOST_PORT above (default 8288) or the Observability
+        # dashboard link 404s.
+        NEXT_PUBLIC_INNGEST_URL: ${NEXT_PUBLIC_INNGEST_URL:-http://localhost:8288}
         # BROWSER-reachable Inngest API for realtime live progress (the
         # @inngest/realtime hook reads this exact name; unset => Inngest Cloud =>
         # the self-hosted token is refused and the UI falls back to polling).
