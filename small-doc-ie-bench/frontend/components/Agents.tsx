@@ -113,8 +113,8 @@ export function Agents({ view = "catalog" }: { view?: string }) {
   // working between nav clicks.
   useEffect(() => setTab(view || "catalog"), [view]);
 
-  const templates = useAsync(getAgentTemplates, []);
-  const agents = useAsync(getAgents, []);
+  const templates = useAsync("agent-templates", getAgentTemplates);
+  const agents = useAsync("agents", getAgents);
   const [prefill, setPrefill] = useState<AgentTemplate | null>(null);
   const [editAgent, setEditAgent] = useState<AgentView | null>(null);
 
@@ -610,7 +610,7 @@ function CreateView({
 }) {
   const editing = editAgent !== null;
   const { toast } = useToast();
-  const deployments = useAsync(getDeployments, []);
+  const deployments = useAsync("deployments", getDeployments);
   // Managed deployments, segmented by semantic type — every model an agent
   // uses is a deployment the platform orchestrates, picked (not typed).
   const chatDeployments = useMemo(
@@ -634,7 +634,7 @@ function CreateView({
   // Analyzer models SEEDED into the store but not yet deployed — offered as
   // one-click "Deploy" shortcuts (store path, no hardcoded repo, no
   // download-at-boot). Generic: whatever analyzer entries the store holds.
-  const store = useAsync<StoreEntry[]>(getStore, []);
+  const store = useAsync<StoreEntry[]>("store", getStore);
   const seededUndeployedEncoders = useMemo(() => {
     const deployed = new Set(encoderDeployments.map((d) => d.name));
     return (store.data ?? [])
@@ -697,7 +697,7 @@ function CreateView({
       .filter((n): n is string => !!n && visionSet.has(n));
   }, [deployments.data, store.data]);
   // Extraction schemas available for structured output (GET /v1/schemas).
-  const schemas = useAsync<string[]>(listSchemas, []);
+  const schemas = useAsync<string[]>("schemas", listSchemas);
 
   const template = templates.find((t) => t.id === templateId) ?? null;
   const kind: AgentKind = template?.kind ?? "custom";

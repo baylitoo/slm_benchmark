@@ -761,7 +761,7 @@ function RepairControls({
   disabled: boolean;
   onRepair: (port?: number | null) => void;
 }) {
-  const ports = useAsync<PortsViewData>(getPorts, []);
+  const ports = useAsync<PortsViewData>("ports", getPorts);
   const [showPort, setShowPort] = useState(false);
   const [port, setPort] = useState("");
   const used = ports.data?.used ?? [];

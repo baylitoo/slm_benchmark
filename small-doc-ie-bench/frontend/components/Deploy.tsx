@@ -44,7 +44,7 @@ export function Deploy({
   // level so switching sub-views never remounts a poller.
   const store = usePolling<StoreEntry[]>(getStore, POLL_MS, active);
   const deployments = usePolling<DeploymentRecord[]>(getDeployments, POLL_MS, active);
-  const families = useAsync(getFamilies, []); // static-ish; one-shot fetch
+  const families = useAsync("families", getFamilies); // shared SWR key with the Playground
 
   const [slideOver, setSlideOver] = useState<SlideOver>(null);
 

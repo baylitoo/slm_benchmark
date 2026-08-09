@@ -84,7 +84,7 @@ export function Playground({
   // from it, so a model seeded/deployed after the Playground opened must appear
   // without a page reload — same cadence as the deployments list.
   const store = usePolling<StoreEntry[]>(getStore, DEPLOY_POLL_MS, active);
-  const families = useAsync<ModelFamily[]>(getFamilies, []);
+  const families = useAsync<ModelFamily[]>("families", getFamilies);
   const embeddingNames = useMemo(
     () => embeddingDeploymentNames(store.data, families.data),
     [store.data, families.data],
