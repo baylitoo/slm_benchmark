@@ -40,6 +40,7 @@ from docie_bench.telemetry import AGENT_LATENCY, AGENT_PII_DETECTED, AGENT_REQUE
 
 
 async def agents_tenant_guard(
+    request: Request,
     x_api_key: Annotated[str | None, Header()] = None,
     authorization: Annotated[str | None, Header()] = None,
 ) -> AsyncIterator[TenantContext]:
@@ -48,7 +49,7 @@ async def agents_tenant_guard(
     if not key and authorization and authorization.lower().startswith("bearer "):
         key = authorization[7:].strip()
     manager = get_quota_manager()
-    context = manager.authenticate(key)
+    context = manager.authenticate(key, request.client.host if request.client else None)
     manager.acquire(context)
     try:
         yield context
