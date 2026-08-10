@@ -242,6 +242,27 @@ class PersistentSupervisor:
             self._save()
             return self.reconcile(spec.name)
 
+    def _reap(self, record: DeploymentRecord) -> None:
+        """Kill this deployment's runtime process, INCLUDING a pidless orphan.
+
+        ``shutdown(record.pid)`` handles the normal case (a no-op when the pid
+        is ``None``). But a health-failure can clear ``record.pid`` while the OS
+        process stays alive (the DEGRADED path below, or a reconciler that
+        declared the runtime dead); killing only the recorded pid then leaks the
+        process, which holds its multi-GB RAM forever and blocks every future
+        deployment via the fit-check. ``find_processes`` reaps that orphan by
+        matching the deployment's reserved port + model in the process command
+        line — the seam that makes stop/remove/teardown actually free memory.
+        """
+        adapter = self.adapters[record.spec.launch.runtime]
+        adapter.shutdown(record.pid)
+        finder = getattr(adapter, "find_processes", None)
+        if finder is None:
+            return
+        for pid in finder(record.spec.launch):
+            if pid != record.pid:
+                adapter.shutdown(pid)
+
     def stop(self, name: str) -> DeploymentRecord:
         with self._lock:
             record = self._get_live(name)
@@ -284,8 +305,7 @@ class PersistentSupervisor:
     def remove(self, name: str) -> None:
         with self._lock:
             record = self._get_live(name)
-            if record.pid is not None:
-                self.adapters[record.spec.launch.runtime].shutdown(record.pid)
+            self._reap(record)
             del self._records[name]
             self._save()
 
@@ -304,8 +324,8 @@ class PersistentSupervisor:
         """
         with self._lock:
             record = self._get_live(name)
-            if shutdown and record.pid is not None:
-                self.adapters[record.spec.launch.runtime].shutdown(record.pid)
+            if shutdown:
+                self._reap(record)
             if error is None and record.pid is not None:
                 log_path = self.logs_dir / f"{record.spec.name}.log"
                 error = self._log_tail(log_path, record.log_offset) or "runtime process exited"
@@ -418,7 +438,7 @@ class PersistentSupervisor:
         record = self._get_live(name)
         adapter = self.adapters[record.spec.launch.runtime]
         if record.spec.desired_state == DesiredState.STOPPED:
-            adapter.shutdown(record.pid)
+            self._reap(record)
             record.pid = None
             record.pid_create_time = None
             record.endpoint = None

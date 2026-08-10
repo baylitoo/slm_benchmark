@@ -290,6 +290,35 @@ class RuntimeAdapter:
             return process.poll() is None
         return bool(psutil.pid_exists(pid))
 
+    def find_processes(self, spec: RuntimeLaunchSpec) -> tuple[int, ...]:
+        """PIDs of live OS processes serving this spec (orphan reaping).
+
+        The supervisor loses ``record.pid`` when a health-failure clears it
+        while the process is still alive; a later stop/remove that kills only
+        that (now ``None``) pid leaks the process and holds its multi-GB RAM
+        forever, which then blocks every future deployment via the fit-check.
+        This finds the process by its command line instead: matching the
+        deployment's reserved ``--port`` AND ``--model`` tokens is unique to the
+        deployment and still valid after the pid was lost — and safer than the
+        recorded pid, which a PID reuse could point at an unrelated process.
+        Runtimes with no owned local process (remote, shared ollama) return
+        nothing.
+        """
+        needles = [str(spec.port)] if spec.port is not None else []
+        if spec.model:
+            needles.append(str(spec.model))
+        if not needles:
+            return ()
+        found: list[int] = []
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                tokens = set(proc.info.get("cmdline") or ())
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if all(needle in tokens for needle in needles):
+                found.append(int(proc.info["pid"]))
+        return tuple(found)
+
     def shutdown(self, pid: int | None, *, timeout: float = 10) -> None:
         """Terminate the runtime process and WAIT until it is actually gone.
 
@@ -477,6 +506,11 @@ class OllamaRuntime(RuntimeAdapter):
             raise RuntimeUnavailableError("ollama executable was not found")
         return (executable, "serve", *spec.extra_args)
 
+    def find_processes(self, spec: RuntimeLaunchSpec) -> tuple[int, ...]:
+        # One shared `ollama serve` hosts every model; killing it by port would
+        # take down unrelated deployments. Never orphan-reap here.
+        return ()
+
 
 class RemoteRuntime(RuntimeAdapter):
     kind = RuntimeKind.REMOTE
@@ -523,6 +557,11 @@ class RemoteRuntime(RuntimeAdapter):
 
     def shutdown(self, pid: int | None, *, timeout: float = 10) -> None:
         del pid, timeout
+
+    def find_processes(self, spec: RuntimeLaunchSpec) -> tuple[int, ...]:
+        # A remote runtime owns no local process to reap.
+        del spec
+        return ()
 
     def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> HealthResult:
         headers: dict[str, str] = {}
