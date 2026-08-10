@@ -15,9 +15,9 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     DateTime,
     ForeignKey,
-    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -72,7 +72,8 @@ class StudioRunArtifact(Base):
     # Store-relative, content-addressed key (never an absolute worker path).
     relkey: Mapped[str] = mapped_column(String(400))
     sha256: Mapped[str] = mapped_column(String(64), index=True)
-    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    # BigInteger: an artifact can exceed Postgres INTEGER's ~2.147 GB cap.
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     media_type: Mapped[str] = mapped_column(String(150), default="application/octet-stream")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

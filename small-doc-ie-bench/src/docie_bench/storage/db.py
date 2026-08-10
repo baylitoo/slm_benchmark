@@ -160,8 +160,14 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.serving.catalog import (
         ensure_placement_observed_columns,
         ensure_serving_node_table,
+        ensure_size_bytes_bigint,
     )
 
+    # Widen any pre-BigInteger `size_bytes` (model_store_entry + artifact tables)
+    # from int4 to BIGINT so a multi-GB model/artifact size no longer overflows
+    # on insert. No-op on fresh databases and on SQLite. See the caveat on
+    # `ModelStoreEntry.size_bytes`.
+    ensure_size_bytes_bigint(_engine)
     ensure_placement_observed_columns(_engine)
     # serving_node is a NEW table, which create_all would create — but the
     # api, serving service, and N workers all run init_engine concurrently at

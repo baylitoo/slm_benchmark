@@ -214,10 +214,26 @@ async def download_file(
     ``.part`` (see the seed's per-name lock). If the server ignores ``Range``
     (200 not 206) the download restarts cleanly; a 416 means the ``.part`` is
     already complete.
+
+    ALREADY-COMPLETE short-circuit: if a previous attempt already FINALIZED this
+    file (the canonical ``destination`` exists and no ``.part`` remains), its
+    size is compared to the remote's Content-Length and, on a match, the
+    download is skipped entirely. The resume path only continues a ``.part`` —
+    without this, re-running a seed whose file already finished (renamed away its
+    ``.part``) would restart it from byte 0 and re-fetch a multi-GB blob already
+    on disk.
     """
     url = f"{HF_BASE}/{repo}/resolve/{revision}/{filename}"
     destination.parent.mkdir(parents=True, exist_ok=True)
     part = destination.with_suffix(destination.suffix + ".part")
+
+    if resume and destination.exists() and not part.exists():
+        remote = await _remote_size(client, url)
+        if remote is not None and destination.stat().st_size == remote:
+            if progress is not None:
+                await progress(remote, remote)
+            return destination
+
     existing = part.stat().st_size if (resume and part.exists()) else 0
 
     headers = hf_headers()
@@ -255,6 +271,25 @@ async def download_file(
     except httpx.RequestError as exc:
         # KEEP the .part: the next attempt resumes it. Do not restart from zero.
         raise HfHubError(f"download of {filename!r} failed: {exc}") from exc
+
+
+async def _remote_size(client: httpx.AsyncClient, url: str) -> int | None:
+    """Content-Length of the remote file via a HEAD, or None if unavailable.
+
+    Used only by the already-complete short-circuit: a ``None`` (HEAD failed,
+    redirect target dropped the header, etc.) means "can't confirm complete", so
+    the caller falls through to the normal (re)download rather than skipping.
+    """
+    try:
+        response = await client.head(
+            url, headers=hf_headers(), follow_redirects=True, timeout=30.0
+        )
+    except httpx.RequestError:
+        return None
+    if response.status_code >= 400:
+        return None
+    length = response.headers.get("content-length")
+    return int(length) if length and length.isdigit() else None
 
 
 def _content_total(response: httpx.Response, *, offset: int) -> int | None:

@@ -57,8 +57,10 @@ class ModelStoreEntry(Base):
     source: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # BigInteger: GGUF blobs routinely exceed Postgres INTEGER's ~2.147 GB cap
     # (a 7B Q4 is ~4 GB), which would overflow on insert. This app uses
-    # create_all (no migrations), so an EXISTING database must be migrated
-    # manually: ALTER TABLE model_store_entry ALTER COLUMN size_bytes TYPE BIGINT.
+    # create_all (no migrations) and create_all never widens an EXISTING integer
+    # column, so a pre-BigInteger database is repaired by ensure_size_bytes_bigint
+    # (an explicit forward ALTER run in init_engine). Fresh databases get BIGINT
+    # from create_all.
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
@@ -341,6 +343,68 @@ def ensure_placement_observed_columns(engine: Engine) -> list[str]:
     if added:
         logger.info("model_placement migration: added observed columns %s", added)
     return added
+
+
+_SIZE_BYTES_WIDEN_LOCK_KEY = 0x0D0C1E03
+
+# Tables whose ``size_bytes`` column stores an on-disk model/artifact byte count
+# that can exceed Postgres INTEGER's ~2.147 GB cap (a multi-GB GGUF blob or a
+# benchmark artifact). Their ORM columns are ``BigInteger``, but ``create_all``
+# never widens an EXISTING integer column — the documented ``size_bytes`` hazard
+# — so a database created before the type was BigInteger keeps int4 and
+# overflows on insert (``NumericValueOutOfRange``).
+_SIZE_BYTES_BIGINT_TABLES = (
+    "model_store_entry",
+    "benchmark_run_artifacts",
+    "studio_run_artifacts",
+)
+
+
+def ensure_size_bytes_bigint(engine: Engine) -> list[str]:
+    """Forward migration: widen ``size_bytes`` from INTEGER to BIGINT in place.
+
+    ``create_all`` creates the column as BIGINT from the ORM but never ALTERs an
+    existing INTEGER column, so a long-lived database keeps int4 and any row with
+    a >2.147 GB size (a multi-GB model blob) fails to insert with
+    ``NumericValueOutOfRange``. This ALTERs each still-INTEGER column across the
+    tables in ``_SIZE_BYTES_BIGINT_TABLES``.
+
+    PostgreSQL-only. On SQLite (tests/dev) it is a no-op — SQLite INTEGER is a
+    dynamic up-to-8-byte type with no 2 GB cap. Idempotent + concurrency-safe
+    like the sibling migrations: it inspects the live column type and ALTERs only
+    the ones still INTEGER, inside one transaction guarded by
+    ``pg_advisory_xact_lock`` so concurrent migrators (api, serving, N workers)
+    serialize. A fresh database created by ``create_all`` already has BIGINT and
+    this is a no-op. Returns the table names actually widened.
+    """
+    if engine.dialect.name != "postgresql":
+        return []
+    inspector = sa_inspect(engine)
+    widened: list[str] = []
+    with engine.begin() as connection:
+        connection.execute(
+            sa_text("SELECT pg_advisory_xact_lock(:key)"),
+            {"key": _SIZE_BYTES_WIDEN_LOCK_KEY},
+        )
+        for table in _SIZE_BYTES_BIGINT_TABLES:
+            if not inspector.has_table(table):
+                continue  # create_all will create it complete (BIGINT)
+            data_type = connection.execute(
+                sa_text(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = 'size_bytes'"
+                ),
+                {"t": table},
+            ).scalar()
+            if data_type == "integer":
+                # Table name comes from the hard-coded tuple above, never input.
+                connection.execute(
+                    sa_text(f"ALTER TABLE {table} ALTER COLUMN size_bytes TYPE BIGINT")
+                )
+                widened.append(table)
+    if widened:
+        logger.info("size_bytes migration: widened %s to BIGINT", widened)
+    return widened
 
 
 def available_backends(family: str) -> list[str]:
@@ -813,4 +877,5 @@ __all__ = [
     "available_backends",
     "ensure_placement_observed_columns",
     "ensure_serving_node_table",
+    "ensure_size_bytes_bigint",
 ]
