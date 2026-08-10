@@ -164,6 +164,10 @@ export interface DeploymentRecord {
   endpoint?: string | null;
   restart_count?: number;
   last_error?: string | null;
+  /** Coarse failure category derived server-side from state + last_error, for a
+   * badge. One of: "oom" | "insufficient-memory" | "port-conflict" |
+   * "spawn-error" | "crashed" | "unhealthy". Null when not in a failure. */
+  failure_kind?: string | null;
   updated_at?: number;
   /** Lifecycle-control metadata (PR-4): who stopped it — "manual" stays cold,
    * "managed" (evicted) auto-reloads on the next request. */
