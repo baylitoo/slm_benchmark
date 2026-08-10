@@ -111,6 +111,35 @@ class BenchmarkTask:
     document_hash: str
 
 
+def _select_profile(profiles: dict[str, ModelProfile], selector: str) -> ModelProfile:
+    """Resolve ``selector`` to one profile: models.yaml name OR live deployment.
+
+    A benchmark must be able to target what the control plane actually serves,
+    not only hand-written models.yaml endpoints — otherwise the deploy →
+    benchmark loop is impossible and every Studio-deployed model is invisible
+    to the very tool that exists to compare models. So a name that is not a
+    models.yaml profile falls through to the SAME resolver the extraction path
+    uses (deployment name, or ``store:<name>``), and an unresolvable name
+    raises an error that says what is actually available.
+    """
+    if selector in profiles:
+        return profiles[selector]
+    from docie_bench.serving.profile_resolver import (
+        ProfileResolutionError,
+        resolve_extraction_profile,
+    )
+
+    try:
+        return resolve_extraction_profile(model_profile=selector)
+    except (ProfileResolutionError, ValueError) as exc:
+        known = ", ".join(sorted(profiles)) or "(none configured)"
+        raise ValueError(
+            f"Unknown model {selector!r}: it is neither a profile in models.yaml "
+            f"({known}) nor a LIVE deployment. Deploy it — or load it if it is "
+            f"evicted — then run the benchmark again."
+        ) from exc
+
+
 async def run_benchmark(
     *,
     dataset_path: str | Path | None,
@@ -178,7 +207,9 @@ async def run_benchmark(
         selected_profiles = resolve_routing_profiles(routing_policy, profiles)
         routing_label = f"routed:{routing_policy.version}"
     else:
-        selected_profiles = [profiles[model_profile]] if model_profile else list(profiles.values())
+        selected_profiles = (
+            [_select_profile(profiles, model_profile)] if model_profile else list(profiles.values())
+        )
         if selected_judge is not None and model_profile is None:
             selected_profiles = [
                 profile for profile in selected_profiles if profile.name != selected_judge.name

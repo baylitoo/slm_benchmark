@@ -203,3 +203,59 @@ def test_benchmark_validity_gate_fails_loudly(
     assert metrics["validity_gate"]["passed"] is False
     assert metrics["validity_gate"]["failing_profiles"][0]["model_profile"] == "stub"
     assert metrics["summary"][0]["valid_rate"] == 0.0
+
+
+# ── benchmarking what the control plane actually serves ───────────────────────
+
+
+def test_select_profile_prefers_models_yaml_then_live_deployment(tmp_path, monkeypatch):
+    """A benchmark must be able to target a LIVE DEPLOYMENT, not only a
+    models.yaml profile.
+
+    Every profile in configs/models.yaml points at a hand-written localhost
+    URL, while the control plane advertises deployments at serving:<port> — so
+    before this, the deploy -> benchmark loop was impossible: the runner did
+    `profiles[name]` and a deployment name raised a bare KeyError whose message
+    was just the name.
+    """
+    from docie_bench.benchmark import runner as runner_module
+    from docie_bench.llm.model_profiles import ModelProfile
+
+    yaml_profile = ModelProfile(name="from_yaml", model="m", base_url="http://x/v1", api_key="k")
+    live_profile = ModelProfile(name="from_deployment", model="m", base_url="http://serving:8090/v1", api_key="k")
+    profiles = {"from_yaml": yaml_profile}
+
+    # A models.yaml name resolves without consulting the deployment resolver.
+    assert runner_module._select_profile(profiles, "from_yaml") is yaml_profile
+
+    # An unknown name falls through to the SAME resolver the extraction path uses.
+    monkeypatch.setattr(
+        "docie_bench.serving.profile_resolver.resolve_extraction_profile",
+        lambda **kwargs: live_profile,
+    )
+    assert runner_module._select_profile(profiles, "a-deployment") is live_profile
+
+
+def test_select_profile_error_names_what_is_available(monkeypatch):
+    """An unresolvable name must say what IS valid — not raise KeyError('name')."""
+    import pytest
+
+    from docie_bench.benchmark import runner as runner_module
+    from docie_bench.llm.model_profiles import ModelProfile
+    from docie_bench.serving.profile_resolver import ProfileResolutionError
+
+    profiles = {"alpha": ModelProfile(name="alpha", model="m", base_url="http://x/v1", api_key="k")}
+
+    def _refuse(**kwargs):
+        raise ProfileResolutionError("not a live deployment")
+
+    monkeypatch.setattr(
+        "docie_bench.serving.profile_resolver.resolve_extraction_profile", _refuse
+    )
+    with pytest.raises(ValueError) as exc:
+        runner_module._select_profile(profiles, "typo-name")
+
+    message = str(exc.value)
+    assert "typo-name" in message
+    assert "alpha" in message  # lists what is actually available
+    assert "deploy" in message.lower()  # tells the user what to do
