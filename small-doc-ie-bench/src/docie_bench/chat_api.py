@@ -30,10 +30,12 @@ from docie_bench.agents.api import (
     _single_chunk_sse,
     agents_tenant_guard,
 )
+from docie_bench.llm.mojibake import fix_completion_content
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
 )
+from docie_bench.settings import get_settings
 
 router = APIRouter(tags=["chat"], dependencies=[Depends(agents_tenant_guard)])
 
@@ -41,13 +43,13 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(agents_tenant_guard)])
 @router.get("/v1/models")
 async def list_models() -> dict[str, Any]:
     """Routable model ids: models.yaml profiles + live deployments."""
+    from docie_bench.llm.model_profiles import load_model_profiles
     from docie_bench.serving.profile_resolver import (
         DEFAULT_MODELS_CONFIG,
         _default_live_deployments,
         _is_live,
         build_profile_table,
     )
-    from docie_bench.llm.model_profiles import load_model_profiles
 
     path = DEFAULT_MODELS_CONFIG
     yaml_profiles = load_model_profiles(path) if path.exists() else {}
@@ -135,6 +137,10 @@ async def chat_completions(request: Request) -> Any:
             status_code=502,
             error_type="upstream_error",
         )
+    # Repair model-emitted UTF-8 mojibake in the answer (accented OCR/description
+    # on small vision models — the Playground Vision path lands here).
+    if get_settings().fix_mojibake:
+        completion = fix_completion_content(completion)
     if wants_stream:
         return _single_chunk_sse(completion)
     return completion

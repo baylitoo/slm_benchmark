@@ -34,7 +34,8 @@ dependencies = [
   "questionary>=2.0.0",
   "textual>=1.0.0",
   "inngest>=0.5.19",
-  "protobuf>=4.25"
+  "protobuf>=4.25",
+  "ftfy>=6.0"
 ]
 
 [project.optional-dependencies]
