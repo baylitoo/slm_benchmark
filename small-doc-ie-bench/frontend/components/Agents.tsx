@@ -683,6 +683,9 @@ function CreateView({
   const [ocrBackend, setOcrBackend] = useState("tesseract");
   const [ocrLanguage, setOcrLanguage] = useState("");
   const [ocrExtractor, setOcrExtractor] = useState("");
+  // OCR→extract step-1 may be a deployed VISION model (VLM as OCR) instead of a
+  // built-in backend. When set it wins; the built-in backend is ignored.
+  const [ocrModel, setOcrModel] = useState("");
   // Staged document-extraction mode: plain OCR | OCR→LLM | vision→structured.
   const [ocrMode, setOcrMode] = useState<"ocr" | "ocr_extract" | "vision">("ocr");
   const [visionModel, setVisionModel] = useState("");
@@ -736,6 +739,7 @@ function CreateView({
     if (typeof o.backend === "string") setOcrBackend(o.backend);
     setOcrLanguage(typeof o.language === "string" ? o.language : "");
     setOcrExtractor(typeof o.extractor === "string" ? o.extractor : "");
+    setOcrModel(typeof o.ocr_model === "string" ? o.ocr_model : "");
     setVisionModel(typeof o.vision_model === "string" ? o.vision_model : "");
     setSchemaName(typeof o.schema === "string" ? o.schema : "");
     // Back-compat: an agent saved before `mode` derives it — extractor → the
@@ -787,6 +791,9 @@ function CreateView({
                 ? {
                     mode: "ocr_extract",
                     backend: ocrBackend,
+                    // A VLM-as-OCR selection (a deployment name) wins over the
+                    // built-in backend; null falls back to `backend`.
+                    ocr_model: ocrModel || null,
                     language: ocrLanguage || null,
                     extractor: ocrExtractor || null,
                     schema: schemaName || null,
@@ -1118,32 +1125,59 @@ function CreateView({
                   ))}
                 </div>
 
-                {/* OCR engine + language — the OCR-based stages */}
+                {/* OCR engine + language — the OCR-based stages. In OCR→extract
+                    the engine may be a deployed vision model (VLM as OCR). */}
                 {ocrMode !== "vision" && (
                   <>
                     <Field label="OCR engine" htmlFor="agent-ocr-backend">
                       <Select
                         id="agent-ocr-backend"
-                        value={ocrBackend}
-                        onChange={(e) => setOcrBackend(e.target.value)}
+                        value={ocrMode === "ocr_extract" && ocrModel ? ocrModel : ocrBackend}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (ocrMode === "ocr_extract" && visionModels.includes(v)) {
+                            setOcrModel(v); // a vision deployment does the OCR
+                          } else {
+                            setOcrBackend(v);
+                            setOcrModel("");
+                          }
+                        }}
                       >
-                        <option value="tesseract">tesseract</option>
-                        <option value="pdf_text">pdf_text — embedded PDF text</option>
-                        <option value="paddleocr">paddleocr — needs the paddle extra</option>
+                        <optgroup label="Built-in">
+                          <option value="liteparse">
+                            liteparse — PDF text + OCR fallback (light)
+                          </option>
+                          <option value="tesseract">tesseract</option>
+                          <option value="paddleocr">paddleocr — needs the paddle extra</option>
+                          {ocrBackend === "pdf_text" && !ocrModel && (
+                            <option value="pdf_text">pdf_text — legacy alias of liteparse</option>
+                          )}
+                        </optgroup>
+                        {ocrMode === "ocr_extract" && visionModels.length > 0 && (
+                          <optgroup label="Vision model (VLM as OCR)">
+                            {visionModels.map((n) => (
+                              <option key={n} value={n}>
+                                {n} — transcribe with this VLM
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
                       </Select>
                     </Field>
-                    <Field
-                      label="Language"
-                      htmlFor="agent-ocr-language"
-                      hint="Engine-specific, e.g. en / fr. Empty = default."
-                    >
-                      <TextInput
-                        id="agent-ocr-language"
-                        value={ocrLanguage}
-                        onChange={(e) => setOcrLanguage(e.target.value)}
-                        placeholder="en"
-                      />
-                    </Field>
+                    {!(ocrMode === "ocr_extract" && ocrModel) && (
+                      <Field
+                        label="Language"
+                        htmlFor="agent-ocr-language"
+                        hint="Engine-specific, e.g. en / fr. Empty = default."
+                      >
+                        <TextInput
+                          id="agent-ocr-language"
+                          value={ocrLanguage}
+                          onChange={(e) => setOcrLanguage(e.target.value)}
+                          placeholder="en"
+                        />
+                      </Field>
+                    )}
                   </>
                 )}
 
