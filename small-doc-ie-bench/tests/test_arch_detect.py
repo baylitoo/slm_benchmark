@@ -61,17 +61,57 @@ def test_unknown_arch_with_mmproj_suggests_vision() -> None:
     assert v.verdict == "needs_family" and v.family == "lfm2_vl"
 
 
-def test_resolve_qwen35_is_nuextract3() -> None:
-    # NuExtract3's GGUF backbone arch "qwen35" + mmproj → the nuextract3 schema
-    # contract (not the generic json_schema vision family that would drop it).
-    v = resolve_family("qwen35", has_gguf=True, has_safetensors=False, has_mmproj=True)
+def test_qwen35_nuextract3_by_name() -> None:
+    # NuExtract3 shares the qwen35 backbone but needs its own contract — detected
+    # by NAME (not arch). With a projector → nuextract3; without → needs_family
+    # (a missing projector, not a text mis-serve).
+    v = resolve_family(
+        "qwen35",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=True,
+        repo_id="numind/NuExtract3-GGUF",
+    )
     assert v.verdict == "supported"
     assert v.family == "nuextract3"
-    # Same arch without a projector fails the vision sanity check, not a silent
-    # text mis-serve.
-    t = resolve_family("qwen35", has_gguf=True, has_safetensors=False, has_mmproj=False)
+    t = resolve_family(
+        "qwen35",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="numind/NuExtract3-GGUF",
+    )
     assert t.verdict == "needs_family"
+    assert t.family == "nuextract3"
     assert "mmproj" in t.reason
+
+
+def test_qwen35_generic_text_is_chat_not_nuextract3() -> None:
+    # A plain Qwen3.5 text GGUF (unsloth/Qwen3.5-0.8B-GGUF) must NOT default to
+    # the nuextract3 vision contract — it is a text chat model.
+    v = resolve_family(
+        "qwen35",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="unsloth/Qwen3.5-0.8B-GGUF",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "openai_chat"
+
+
+def test_qwen35_generic_vl_is_lfm2vl_not_nuextract3() -> None:
+    # A generic Qwen3.5-VL (projector, non-NuExtract name) → the generic vision
+    # family, NOT nuextract3.
+    v = resolve_family(
+        "qwen35",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=True,
+        repo_id="unsloth/Qwen3.5-VL-4B-GGUF",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "lfm2_vl"
 
 
 def test_resolve_gliner_marker() -> None:

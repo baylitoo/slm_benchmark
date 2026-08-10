@@ -520,6 +520,7 @@ async def search_models(
             has_gguf=has_gguf,
             has_safetensors=has_safetensors,
             has_mmproj=has_mmproj,
+            repo_id=str(repo_id),
         )
         params_count = _param_count(item.get("safetensors"))
         card_data = item.get("cardData") if isinstance(item.get("cardData"), dict) else {}
@@ -653,6 +654,7 @@ async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any
         has_gguf=has_gguf,
         has_safetensors=has_safetensors,
         has_mmproj=has_mmproj,
+        repo_id=repo,
     )
     return {
         "repo": repo,
