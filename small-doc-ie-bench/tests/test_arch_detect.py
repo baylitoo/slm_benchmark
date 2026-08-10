@@ -218,3 +218,82 @@ async def test_search_models_returns_light_cards() -> None:
     assert "LiquidAI/LFM2.5-350M-GGUF" in ids
     assert "owner/via-modelId-GGUF" in ids  # HF's modelId key handled
     assert cards[0]["downloads"] == 42000 and cards[0]["likes"] == 85
+
+
+async def test_search_enriches_card_with_family_and_params() -> None:
+    # expand[] pulls arch + param count inline, so the card carries a PRELIM
+    # verdict (resolve_family) and a size — no per-repo inspect round-trip.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("expand[]") is not None  # expand requested
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+                    "downloads": 1000,
+                    "downloadsAllTime": 5000,
+                    "likes": 50,
+                    "trendingScore": 9.9,
+                    "tags": ["gguf", "text-generation"],
+                    "pipeline_tag": "text-generation",
+                    "library_name": "transformers",
+                    "createdAt": "2024-09-18T00:00:00Z",
+                    "lastModified": "2025-01-02T00:00:00Z",
+                    "config": {"model_type": "qwen2"},
+                    "gguf": {"architecture": "qwen2"},
+                    "safetensors": {"total": 1_500_000_000},
+                    "cardData": {"license": "apache-2.0"},
+                }
+            ],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        (card,) = await search_models("qwen", client=client)
+    assert card["architecture"] == "qwen2"
+    assert card["verdict"] == "supported"
+    assert card["family"] == "openai_chat"
+    assert card["params"] == 1_500_000_000
+    assert card["param_label"] == "1.5B"
+    assert card["size_est_bytes"] == int(1_500_000_000 * 0.6)
+    assert card["downloads_all_time"] == 5000
+    assert card["trending_score"] == 9.9
+    assert card["license"] == "apache-2.0"
+    assert card["prelim"] is True
+
+
+async def test_search_trending_empty_query_uses_trendingscore() -> None:
+    # An empty query + sort=trending is the discovery feed: sort=trendingScore,
+    # no `search` param.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("sort") == "trendingScore"
+        assert request.url.params.get("search") is None
+        assert request.url.params.get("pipeline_tag") == "image-text-to-text"
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        cards = await search_models(
+            "", client=client, sort="trending", pipeline_tag="image-text-to-text"
+        )
+    assert cards == []
+
+
+async def test_search_vision_prelim_assumes_projector() -> None:
+    # The list can't see the mmproj file; a vision arch must still PRELIM-resolve
+    # to a vision family, not be wrongly flagged "needs mmproj" (inspect corrects).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF",
+                    "tags": ["gguf", "image-text-to-text"],
+                    "pipeline_tag": "image-text-to-text",
+                    "gguf": {"architecture": "qwen2.5vl"},
+                }
+            ],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        (card,) = await search_models("qwen vl", client=client)
+    assert card["verdict"] == "supported"
+    assert card["family"] == "lfm2_vl"

@@ -293,17 +293,33 @@ async def hf_repo_ggufs(repo: Annotated[str, Query(min_length=3)]) -> dict[str, 
 
 @router.get("/hf/search")
 async def hf_search(
-    query: Annotated[str, Query(min_length=1)],
+    query: Annotated[str, Query()] = "",
     limit: Annotated[int, Query(ge=1, le=50)] = 25,
     gguf_only: bool = True,
+    sort: Annotated[str, Query(pattern="^(trending|downloads|likes|recent)$")] = "downloads",
+    pipeline_tag: Annotated[str, Query()] = "",
+    author: Annotated[str, Query()] = "",
 ) -> list[dict[str, Any]]:
-    """Search the Hub for deployable models (server-side proxy). Each card is
-    inspected on demand via /hf/inspect for its support verdict."""
+    """Search the Hub for deployable models (server-side proxy).
+
+    Enriched, catalog-oriented cards: each carries an inline PRELIMINARY support
+    verdict (architecture -> family, no download). ``query`` may be empty — with
+    ``sort=trending`` (or ``recent``/``likes``) that returns a discovery feed.
+    ``pipeline_tag``/``author`` are Hub-side facets. ``/hf/inspect`` remains the
+    authoritative per-repo check (it reads the projector the list omits)."""
     from docie_bench.serving.hf_hub import HfHubError, search_models
 
     try:
         async with httpx.AsyncClient() as client:
-            return await search_models(query, client=client, limit=limit, gguf_only=gguf_only)
+            return await search_models(
+                query,
+                client=client,
+                limit=limit,
+                gguf_only=gguf_only,
+                sort=sort,
+                pipeline_tag=pipeline_tag or None,
+                author=author or None,
+            )
     except HfHubError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

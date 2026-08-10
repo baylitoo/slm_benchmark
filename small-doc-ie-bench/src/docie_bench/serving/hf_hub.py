@@ -413,23 +413,76 @@ async def download_snapshot(
     return destination
 
 
+# Studio sort keys -> the Hub's `sort` field. "trending" is the discovery
+# default a catalog wants; the Hub calls it `trendingScore`.
+_SORT_FIELDS: dict[str, str] = {
+    "trending": "trendingScore",
+    "downloads": "downloads",
+    "likes": "likes",
+    "recent": "createdAt",
+}
+# Model-info fields requested inline on the LIST so a card can be family-resolved
+# and roughly sized WITHOUT a per-repo round-trip (the old flow was 1 search + N
+# inspect_repo calls). `config`/`gguf` carry the architecture; `safetensors`
+# carries the parameter count.
+_CATALOG_EXPAND: tuple[str, ...] = (
+    "config",
+    "gguf",
+    "safetensors",
+    "downloads",
+    "downloadsAllTime",
+    "likes",
+    "trendingScore",
+    "tags",
+    "pipeline_tag",
+    "library_name",
+    "createdAt",
+    "lastModified",
+    "gated",
+    "cardData",
+)
+
+
 async def search_models(
-    query: str, *, client: httpx.AsyncClient, limit: int = 25, gguf_only: bool = True
+    query: str,
+    *,
+    client: httpx.AsyncClient,
+    limit: int = 25,
+    gguf_only: bool = True,
+    sort: str = "downloads",
+    pipeline_tag: str | None = None,
+    author: str | None = None,
+    library: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search the Hub for models (server-side proxy, HF_TOKEN aware).
 
-    ``gguf_only`` filters to GGUF repos (the primary deploy path); drop it to
-    also surface safetensors (encoders). Sorted by downloads. Returns light
-    cards — verdicts are fetched per-repo on demand via :func:`inspect_repo`.
+    Enriched, catalog-oriented cards. ``query`` may be empty — an empty query
+    with ``sort="trending"`` (or ``recent``/``likes``) returns a discovery feed
+    (top trending / newest / most-liked). ``pipeline_tag``/``author``/``library``
+    are Hub-side facets. ``expand[]`` pulls each card's architecture + parameter
+    count inline, so every card carries a PRELIMINARY support verdict
+    (``resolve_family``) without a per-repo fetch — ``/hf/inspect`` remains the
+    authoritative check (it also reads the projector, which the list omits).
     """
-    params: dict[str, str] = {
-        "search": query,
-        "limit": str(max(1, min(limit, 50))),
-        "sort": "downloads",
-        "direction": "-1",
-    }
+    from docie_bench.serving.arch_registry import VISION_ARCHS, resolve_family
+
+    params: list[tuple[str, str]] = [
+        ("limit", str(max(1, min(limit, 50)))),
+        ("sort", _SORT_FIELDS.get(sort, "downloads")),
+        ("direction", "-1"),
+    ]
+    if query:
+        params.append(("search", query))
     if gguf_only:
-        params["filter"] = "gguf"
+        params.append(("filter", "gguf"))
+    if pipeline_tag:
+        params.append(("pipeline_tag", pipeline_tag))
+    if author:
+        params.append(("author", author))
+    if library:
+        params.append(("library", library))
+    params.extend(("expand[]", field) for field in _CATALOG_EXPAND)
+
     try:
         response = await client.get(
             f"{HF_BASE}/api/models", params=params, headers=hf_headers(), timeout=20.0
@@ -441,6 +494,7 @@ async def search_models(
     payload = response.json()
     if not isinstance(payload, list):
         return []
+
     cards: list[dict[str, Any]] = []
     for item in payload:
         if not isinstance(item, dict):
@@ -448,16 +502,95 @@ async def search_models(
         repo_id = item.get("id") or item.get("modelId")  # HF uses either
         if not repo_id:
             continue
+        tags = [str(t) for t in (item.get("tags") or []) if isinstance(t, str)]
+        pipe = item.get("pipeline_tag")
+        architecture = _extract_architecture(item)
+        has_gguf = bool(item.get("gguf")) or "gguf" in tags
+        has_safetensors = bool(item.get("safetensors")) or "safetensors" in tags
+        # The list can't see the projector file; approximate for the PRELIM
+        # verdict so a vision repo isn't wrongly flagged "needs mmproj" here.
+        # inspect_repo reads the real file list and corrects it on select.
+        has_mmproj = (
+            (architecture or "").lower() in VISION_ARCHS
+            or pipe == "image-text-to-text"
+            or "image-text-to-text" in tags
+        )
+        verdict = resolve_family(
+            architecture,
+            has_gguf=has_gguf,
+            has_safetensors=has_safetensors,
+            has_mmproj=has_mmproj,
+        )
+        params_count = _param_count(item.get("safetensors"))
+        card_data = item.get("cardData") if isinstance(item.get("cardData"), dict) else {}
         cards.append(
             {
                 "id": str(repo_id),
                 "downloads": item.get("downloads"),
+                "downloads_all_time": item.get("downloadsAllTime"),
                 "likes": item.get("likes"),
+                "trending_score": item.get("trendingScore"),
                 "gated": bool(item.get("gated")),
-                "tags": [str(t) for t in (item.get("tags") or []) if isinstance(t, str)][:12],
+                "tags": tags[:12],
+                "pipeline_tag": str(pipe) if pipe else None,
+                "library_name": item.get("library_name"),
+                "created_at": item.get("createdAt"),
+                "last_modified": item.get("lastModified"),
+                "license": (card_data or {}).get("license") or item.get("license"),
+                "architecture": architecture,
+                "params": params_count,
+                "param_label": _param_label(params_count),
+                "size_est_bytes": _size_est_bytes(params_count, has_gguf=has_gguf),
+                "verdict": verdict.verdict,
+                "family": verdict.family,
+                "reason": verdict.reason,
+                "runtime_note": verdict.runtime_note,
+                # The list omits the projector file, so this verdict is a fast
+                # pre-check; the Studio confirms via /hf/inspect before download.
+                "prelim": True,
             }
         )
     return cards
+
+
+def _param_count(safetensors: Any) -> int | None:
+    """Parameter count from the Hub's ``safetensors`` block, or None.
+
+    Prefers ``total``; else sums the per-dtype ``parameters`` map. GGUF-only
+    repos usually omit this block, so a null count is normal (the card shows a
+    dash and falls back to the size hint in the repo name)."""
+    if not isinstance(safetensors, dict):
+        return None
+    total = safetensors.get("total")
+    if isinstance(total, int) and total > 0:
+        return total
+    parameters = safetensors.get("parameters")
+    if isinstance(parameters, dict):
+        summed = sum(v for v in parameters.values() if isinstance(v, int))
+        return summed or None
+    return None
+
+
+def _param_label(params: int | None) -> str | None:
+    """Human parameter label: 1_500_000_000 -> "1.5B", 137_000_000 -> "137M"."""
+    if not params or params <= 0:
+        return None
+    if params >= 1_000_000_000:
+        return f"{params / 1_000_000_000:.1f}".rstrip("0").rstrip(".") + "B"
+    if params >= 1_000_000:
+        return f"{round(params / 1_000_000)}M"
+    return f"{round(params / 1_000)}K"
+
+
+def _size_est_bytes(params: int | None, *, has_gguf: bool) -> int | None:
+    """Rough on-disk/RAM estimate from the parameter count, or None when unknown.
+
+    A GGUF Q4 lands near ~0.6 bytes/param (4-bit weights + KV/overhead); an
+    unquantized safetensors checkpoint is ~2 bytes/param (bf16). Deliberately
+    coarse — enough to badge "fits this node" at browse time, not a promise."""
+    if not params or params <= 0:
+        return None
+    return int(params * (0.6 if has_gguf else 2.0))
 
 
 async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
