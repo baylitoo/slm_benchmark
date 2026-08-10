@@ -297,3 +297,25 @@ async def test_search_vision_prelim_assumes_projector() -> None:
         (card,) = await search_models("qwen vl", client=client)
     assert card["verdict"] == "supported"
     assert card["family"] == "lfm2_vl"
+
+
+def test_annotate_fits_marks_fit_over_budget_and_unknown() -> None:
+    from docie_bench.inngest.studio_api import _annotate_fits
+
+    cards = [
+        {"id": "a", "size_est_bytes": 1_000_000_000},   # fits
+        {"id": "b", "size_est_bytes": 9_000_000_000},   # over budget
+        {"id": "c", "size_est_bytes": None},            # unknown size
+    ]
+    out = _annotate_fits(cards, budget=3_000_000_000)
+    fits = {c["id"]: c["fits_node"] for c in out}
+    assert fits == {"a": True, "b": False, "c": None}
+    assert all(c["node_available_bytes"] == 3_000_000_000 for c in out)
+
+
+def test_annotate_fits_unknown_budget_is_none() -> None:
+    from docie_bench.inngest.studio_api import _annotate_fits
+
+    (card,) = _annotate_fits([{"id": "a", "size_est_bytes": 1_000_000_000}], budget=None)
+    assert card["fits_node"] is None  # no snapshot -> never a false "fits"
+    assert card["node_available_bytes"] is None

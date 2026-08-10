@@ -291,6 +291,36 @@ async def hf_repo_ggufs(repo: Annotated[str, Query(min_length=3)]) -> dict[str, 
     }
 
 
+def _node_available_bytes() -> int | None:
+    """Deploy budget for a NEW model on this node: ``free - safety_margin``.
+
+    The exact quantity the reconciler's fit-check withholds a restart against
+    ("free minus the safety margin leaves N available"), so a catalog "fits this
+    node" badge can't disagree with what actually gets denied at deploy. Best-
+    effort + DB-optional: any gap (no snapshot, DB down) returns None → the badge
+    reads "unknown", never a false "fits". The projector/loading refinements are
+    a live-state concern the per-repo inspect + deploy path handle; this is a
+    browse-time signal against a coarse size estimate."""
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.sizing import safety_margin_bytes
+    from docie_bench.settings import get_settings
+
+    try:
+        snapshot = ModelCatalog().get_node_snapshot()
+    except CatalogUnavailableError:
+        return None
+    except Exception:  # noqa: BLE001 - a DB hiccup must not fail the search
+        return None
+    if not snapshot:
+        return None
+    free = snapshot.get("free_bytes")
+    total = snapshot.get("total_bytes")
+    if not isinstance(free, int) or not isinstance(total, int):
+        return None
+    margin = safety_margin_bytes(total, get_settings().serving_sizing_margin_fraction)
+    return max(free - margin, 0)
+
+
 @router.get("/hf/search")
 async def hf_search(
     query: Annotated[str, Query()] = "",
@@ -311,7 +341,7 @@ async def hf_search(
 
     try:
         async with httpx.AsyncClient() as client:
-            return await search_models(
+            cards = await search_models(
                 query,
                 client=client,
                 limit=limit,
@@ -322,6 +352,25 @@ async def hf_search(
             )
     except HfHubError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # Annotate "fits this node": compare each card's coarse size estimate to the
+    # node's deploy budget (free - safety margin). None on either side → unknown.
+    return _annotate_fits(cards, _node_available_bytes())
+
+
+def _annotate_fits(cards: list[dict[str, Any]], budget: int | None) -> list[dict[str, Any]]:
+    """Stamp ``fits_node`` (bool | None) + ``node_available_bytes`` on each card.
+
+    ``None`` when the estimate or the budget is unknown — the badge reads
+    "unknown", never a false "fits". Pure so the fit logic is tested without a
+    node snapshot / database."""
+    for card in cards:
+        est = card.get("size_est_bytes")
+        card["node_available_bytes"] = budget
+        card["fits_node"] = (
+            est <= budget if isinstance(est, int) and isinstance(budget, int) else None
+        )
+    return cards
 
 
 @router.get("/hf/inspect")
