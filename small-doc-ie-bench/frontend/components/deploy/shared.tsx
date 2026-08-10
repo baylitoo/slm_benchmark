@@ -29,6 +29,28 @@ export function stateTone(state?: string | null): BadgeTone {
   }
 }
 
+// Server-derived failure kind → short badge label. Mirrors
+// docie_bench.serving.failure.FAILURE_LABELS; unknown kinds pass through so a
+// new backend category still renders (as its raw slug) with no UI change.
+const FAILURE_LABELS: Record<string, string> = {
+  oom: "OOM",
+  "insufficient-memory": "Won't fit",
+  "port-conflict": "Port in use",
+  "spawn-error": "Won't start",
+  crashed: "Crashed",
+  unhealthy: "Unhealthy",
+};
+
+export function failureLabel(kind?: string | null): string | null {
+  if (!kind) return null;
+  return FAILURE_LABELS[kind] ?? kind;
+}
+
+export function failureTone(kind?: string | null): BadgeTone {
+  if (!kind) return "neutral";
+  return kind === "unhealthy" ? "warn" : "err";
+}
+
 export function errText(err: unknown, fallback: string): string {
   return toUserMessage(err, { fallback });
 }
