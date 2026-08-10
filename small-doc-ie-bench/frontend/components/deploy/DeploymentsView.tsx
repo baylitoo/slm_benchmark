@@ -39,7 +39,7 @@ import { Toolbar } from "../patterns/Toolbar";
 import { ResultLine } from "../patterns/ResultLine";
 import { Pager } from "../patterns/Pager";
 import { Table, type Column } from "../patterns/Table";
-import { POLL_MS, PAGE_SIZE, stateTone, errText } from "./shared";
+import { POLL_MS, PAGE_SIZE, stateTone, errText, failureLabel, failureTone } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Lifecycle phase (PR-4) — reconciler-observed when available, else derived
@@ -562,20 +562,26 @@ export function DeploymentsView({
       key: "state",
       header: "State",
       sortAccessor: (r) => r.state ?? "",
-      render: (r) => (
-        <span
-          title={
-            [
-              r.last_error ? `error: ${r.last_error}` : null,
-              r.restart_count ? `restarts: ${r.restart_count}` : null,
-            ]
-              .filter(Boolean)
-              .join(" · ") || undefined
-          }
-        >
-          <Badge tone={stateTone(r.state)}>{r.state ?? "unknown"}</Badge>
-        </span>
-      ),
+      render: (r) => {
+        const failure = r.failure_kind ?? null;
+        const reason = r.last_error ?? r.observed?.last_error ?? null;
+        return (
+          <span
+            className="inline-flex items-center gap-1"
+            title={
+              [
+                reason ? `error: ${reason}` : null,
+                r.restart_count ? `restarts: ${r.restart_count}` : null,
+              ]
+                .filter(Boolean)
+                .join(" · ") || undefined
+            }
+          >
+            <Badge tone={stateTone(r.state)}>{r.state ?? "unknown"}</Badge>
+            {failure && <Badge tone={failureTone(failure)}>{failureLabel(failure)}</Badge>}
+          </span>
+        );
+      },
     },
     {
       key: "phase",

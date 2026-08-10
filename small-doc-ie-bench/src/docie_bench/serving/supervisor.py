@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -21,6 +22,38 @@ from docie_bench.serving.runtime import (
     RuntimeLaunchSpec,
     default_runtime_adapters,
 )
+
+# SIGKILL number, resolved safely: the constant is absent on non-POSIX hosts
+# (Windows test runners), where the serving container's Linux value (9) is the
+# right fallback for parsing a Popen exit status.
+_SIGKILL = int(getattr(signal, "SIGKILL", 9))
+
+
+def _exit_reason(tail: str | None, exit_status: int | None) -> str:
+    """One-line failure reason for a self-exited runtime process.
+
+    A ``Popen`` exit status is negative for a killing signal and positive for a
+    non-zero exit code. A SIGKILL is flagged as a probable OOM — the diagnosis
+    an OOM-killed process cannot leave in its own stderr — and the stderr tail
+    is appended when present. The wording is load-bearing: the failure
+    classifier keys on ``out of memory`` / ``signal N`` / ``exited with code``.
+    """
+    parts: list[str] = []
+    if exit_status is not None and exit_status < 0:
+        sig = -exit_status
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        note = f"process killed by {name} (signal {sig})"
+        if sig == _SIGKILL:
+            note += " — likely out of memory (OOM)"
+        parts.append(note)
+    elif exit_status:  # positive, non-zero
+        parts.append(f"process exited with code {exit_status}")
+    if tail:
+        parts.append(tail)
+    return " | ".join(parts) or "runtime process exited"
 
 
 class DesiredState(StrEnum):
@@ -457,12 +490,18 @@ class PersistentSupervisor:
                 # own — surface the real reason (its stderr tail from THIS attempt,
                 # via the pre-spawn offset) instead of a bare, undiagnosable string,
                 # and flag it so the deploy caller can reallocate off a bad port.
+                # Read the exit status BEFORE clearing the pid: a negative code is
+                # the killing signal (SIGKILL = a kernel OOM-kill, the common
+                # failure on a RAM-starved node), which the stderr tail can't show
+                # — an OOM-killed process writes nothing on the way out.
+                status_reader = getattr(adapter, "exit_status", None)
+                exit_status = status_reader(record.pid) if status_reader else None
                 record.pid = None
                 record.pid_create_time = None
                 record.state = LifecycleState.FAILED
                 record.exited_after_start = True
-                record.last_error = self._log_tail(log_path, record.log_offset) or (
-                    "runtime process exited"
+                record.last_error = _exit_reason(
+                    self._log_tail(log_path, record.log_offset), exit_status
                 )
             if not self._may_restart(record):
                 record.updated_at = self._clock()

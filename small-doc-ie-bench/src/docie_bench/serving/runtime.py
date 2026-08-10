@@ -319,6 +319,21 @@ class RuntimeAdapter:
                 found.append(int(proc.info["pid"]))
         return tuple(found)
 
+    def exit_status(self, pid: int | None) -> int | None:
+        """Exit status of an OWNED process that has exited, else None.
+
+        ``Popen.poll()`` yields the status once the child is reaped: a positive
+        exit code, or a NEGATIVE signal number (``-9`` for SIGKILL). ``None``
+        means the process is still running, or was not launched by this adapter
+        (a recovered pid after a serving restart holds no Popen handle). This is
+        what lets an OOM SIGKILL be told apart from an ordinary non-zero crash —
+        an OOM-killed process writes nothing to its own stderr.
+        """
+        if pid is None:
+            return None
+        process = self._processes.get(pid)
+        return process.poll() if process is not None else None
+
     def shutdown(self, pid: int | None, *, timeout: float = 10) -> None:
         """Terminate the runtime process and WAIT until it is actually gone.
 

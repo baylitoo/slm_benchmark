@@ -69,6 +69,7 @@ class ScriptedAdapter:
         self.by_port: dict[int, list[int]] = {}
         self.starts = 0
         self.stops: list[int | None] = []
+        self.exit_codes: dict[int, int] = {}
         self.healthy: dict[str, bool] = {}
         self.start_delay_s = 0.0
 
@@ -95,6 +96,10 @@ class ScriptedAdapter:
         # Mirrors the real adapter: the still-alive processes launched for this
         # spec's (unique) port — how an orphan is found once its pid is lost.
         return tuple(p for p in self.by_port.get(spec.port, ()) if p in self.running)
+
+    def exit_status(self, pid: int | None) -> int | None:
+        # Scripted exit status (negative = killing signal, e.g. -9 SIGKILL/OOM).
+        return self.exit_codes.get(pid) if pid is not None else None
 
     def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> HealthResult:
         del timeout
@@ -197,6 +202,25 @@ def test_stop_reaps_orphan_when_pid_was_cleared(tmp_path: Path) -> None:
 
     assert orphan_pid in adapter.stops
     assert orphan_pid not in adapter.running
+
+
+def test_self_exit_by_sigkill_is_recorded_as_probable_oom(tmp_path: Path) -> None:
+    """A kernel OOM-kill (SIGKILL) leaves no stderr, so the exit SIGNAL is the
+    only tell. The supervisor must fold it into last_error as a probable OOM."""
+    adapter = ScriptedAdapter()
+    supervisor = _supervisor(tmp_path, adapter)
+    supervisor.deploy(_spec(max_restarts=0))  # no respawn: stays FAILED
+    pid = supervisor.get("invoice").pid
+    assert pid is not None
+
+    # The process is gone with exit status -SIGKILL (the OOM-killer's signature).
+    adapter.running.discard(pid)
+    adapter.exit_codes[pid] = -9
+
+    record = supervisor.reconcile("invoice")
+
+    assert record.state == LifecycleState.FAILED
+    assert "out of memory" in (record.last_error or "").lower()
 
 
 def test_manual_stop_stays_manual_and_is_never_auto_reloaded(tmp_path: Path) -> None:

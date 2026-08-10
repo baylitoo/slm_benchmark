@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
+from docie_bench.serving.failure import classify_failure
 from docie_bench.settings import get_settings
 
 logger = logging.getLogger("docie_bench.inngest.serving_api")
@@ -178,7 +179,14 @@ async def list_deployments() -> Any:
         spec = record.get("spec") or {}
         name = spec.get("name")
         record["observed_available"] = observed is not None
-        record["observed"] = observed.get(name) if observed and name else None
+        obs = observed.get(name) if observed and name else None
+        record["observed"] = obs
+        # Derived, not stored (no migration): the published last_error already
+        # carries the killing signal (OOM) and the fit-check reason. The
+        # observed row's last_error is the superset (the reconciler appends the
+        # withheld-restart reason to it), so prefer it over the raw record's.
+        last_error = (obs or {}).get("last_error") or record.get("last_error")
+        record["failure_kind"] = classify_failure(record.get("state"), last_error)
     return records
 
 
