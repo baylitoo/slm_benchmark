@@ -40,6 +40,13 @@ What a cycle does per record (design doc §1):
   ``endpoint=""`` whenever not live) best-effort: with no DATABASE_URL the
   cycle still repairs and ``_save()``s ``deployments.json`` (which the api
   reads fresh per request), it just skips the Postgres publish.
+* Measures inference throughput (tokens/sec + TTFT) once a deployment has been
+  hot for a few consecutive cycles, and publishes it alongside the observation.
+  MEASURED, never predicted: a tok/s guessed from the CPU model name would be
+  a confident fabrication (memory bandwidth, cgroup CPU quota, co-resident
+  runtimes and the served quantization all move it by multiples), so an
+  un-probed deployment publishes nothing at all. See ``serving.throughput``;
+  the probe runs OUTSIDE the supervisor lock, exactly like the port repairs.
 * Publishes the ``serving_node`` resource snapshot (PR-2): the
   ``ResourceTracker`` folds this cycle's observations (steady-state footprint
   calibration, live-RSS sum) and reads node total/free RAM cgroup-v2-first,
@@ -79,6 +86,14 @@ from docie_bench.serving.supervisor import (
     RestartPolicy,
     _default_create_time,
 )
+from docie_bench.serving.throughput import (
+    SOURCE_NOT_APPLICABLE,
+    ProbeRequest,
+    ThroughputSample,
+    ThroughputStore,
+    probe_applicability,
+    probe_deployment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +107,20 @@ _BIND_COLLISION_MARKERS = ("address already in use", "couldn't bind", "failed to
 # Minimum spacing between reallocating repairs of the same deployment, so a
 # port-range exhaustion cannot turn into a tight redeploy loop.
 _REPAIR_RETRY_S = 60.0
+
+# Minimum spacing between throughput probes of the same deployment. A probe
+# that fails (or measures nothing usable) writes no sidecar on purpose — this
+# is what stops the retry from becoming a per-cycle generation request against
+# a runtime that is already unwell.
+_PROBE_RETRY_S = 300.0
+
+# Consecutive `hot` observations a deployment must accrue before it is probed.
+# Same reason ``ResourceTracker`` waits before calibrating RSS: llama.cpp mmaps
+# the GGUF and pages keep faulting in after /health starts passing, so the
+# first hot cycles measure a cold cache. That pessimistic number would be
+# persisted per MODEL PATH and inherited by every future redeploy, so the wait
+# is not politeness — it is what keeps the stored measurement meaningful.
+_PROBE_HOT_CYCLES = 6
 
 
 def _looks_like_bind_collision(record: DeploymentRecord) -> bool:
@@ -210,6 +239,14 @@ class ObservedDeployment:
     # is never clobbered by the older observation — the publish happens
     # outside the lock and can otherwise race fresher writers.
     observed_at: dt.datetime | None = None
+    # Measured throughput, carried forward from the per-model-path sidecar
+    # (serving.throughput). None means "not measured" — never 0. Nothing here
+    # is ever predicted from the hardware: a deployment that has not been
+    # probed publishes nothing at all.
+    tokens_per_second: float | None = None
+    ttft_ms: float | None = None
+    throughput_measured_at: dt.datetime | None = None
+    throughput_source: str | None = None
 
 
 def default_fit_check(
@@ -284,6 +321,10 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
                 health_ok=observed.health_ok,
                 last_error=observed.last_error,
                 probed_at=observed.observed_at,
+                tokens_per_second=observed.tokens_per_second,
+                ttft_ms=observed.ttft_ms,
+                throughput_measured_at=observed.throughput_measured_at,
+                throughput_source=observed.throughput_source,
             )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: observed state not published (repair-only cycle)")
@@ -313,6 +354,9 @@ class ServingReconciler:
         min_hot_s: float = 0.0,
         clock: Callable[[], float] = time.time,
         repair: Callable[[str], object] | None = None,
+        throughput: ThroughputStore | None = None,
+        probe: Callable[[ProbeRequest], ThroughputSample | None] = probe_deployment,
+        probe_hot_cycles: int = _PROBE_HOT_CYCLES,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -324,6 +368,8 @@ class ServingReconciler:
             raise ValueError("idle_ttl_s must be non-negative (0 disables idle unload)")
         if min_hot_s < 0:
             raise ValueError("min_hot_s must be non-negative")
+        if probe_hot_cycles < 1:
+            raise ValueError("probe_hot_cycles must be positive")
         self.supervisor = supervisor
         self.interval_s = interval_s
         self.ready_miss_threshold = ready_miss_threshold
@@ -378,6 +424,21 @@ class ServingReconciler:
         self._repair = repair
         self._repairs_due: list[str] = []
         self._repair_last: dict[str, float] = {}
+        # Measured throughput: one fixed generation probe per model path, run
+        # OUTSIDE the observation lock (it blocks on HTTP) and against the
+        # deployment's own endpoint — never through the gateway, whose recency
+        # sidecars would make every probed deployment look permanently "just
+        # served" and silently disable the idle-TTL unload. At most one probe
+        # per cycle, throttled per deployment, and every failure is contained:
+        # a probe can never change a deployment's phase or fail the cycle.
+        if throughput is None:
+            throughput = ThroughputStore(home=recency_home)
+        self._throughput = throughput
+        self._probe = probe
+        self.probe_hot_cycles = probe_hot_cycles
+        self._probes_due: list[ProbeRequest] = []
+        self._probe_last: dict[str, float] = {}
+        self._hot_cycles: dict[str, int] = {}
         # Consecutive healthy cycles per deployment: after
         # ``healthy_reset_threshold`` of them the restart budget is forgiven
         # (reset to 0), so the budget bounds crash STORMS without becoming a
@@ -459,6 +520,11 @@ class ServingReconciler:
                 self._repair(name)  # type: ignore[misc]  # queued only when set
             except Exception:  # noqa: BLE001 - a failed repair must not kill the loop
                 logger.warning("port reallocation for %s failed", name, exc_info=True)
+        # Throughput probes queued during observation: same discipline as the
+        # repairs — outside the lock, after the publish, and fully contained.
+        # The measurement lands in the sidecar and is published NEXT cycle, so
+        # a slow probe never delays this cycle's honest liveness numbers.
+        self._run_due_probes()
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
@@ -612,6 +678,98 @@ class ServingReconciler:
             name, record, phase="failed", health_ok=False, last_error=last_error
         )
 
+    # ------------------------------------------------------- throughput probe
+    def _run_due_probes(self) -> None:
+        """Execute this cycle's queued probes (outside the lock). Never raises.
+
+        Each probe is contained individually: a transport failure, a hostile
+        response body or an exploding injected probe records nothing and leaves
+        the cycle — and the deployment's phase — untouched. A probe that
+        measured nothing usable is deliberately NOT persisted, so a transient
+        bad reading cannot become this model's answer for the whole TTL; the
+        per-deployment throttle is what spaces the retry.
+        """
+        due, self._probes_due = self._probes_due, []
+        for request in due:
+            try:
+                sample = self._probe(request)
+            except Exception:  # noqa: BLE001 - a probe must never break the cycle
+                logger.warning(
+                    "throughput probe of %s failed", request.name, exc_info=True
+                )
+                continue
+            if sample is None:
+                continue
+            if not sample.measured:
+                logger.info(
+                    "throughput probe of %s measured nothing usable (%s)",
+                    request.name,
+                    sample.detail or sample.source,
+                )
+                continue
+            logger.info(
+                "deployment %s measured at %.1f tok/s (source=%s)",
+                request.name,
+                sample.tokens_per_second or 0.0,
+                sample.source,
+            )
+            self._throughput.record(request.model, sample)
+
+    def _throughput_fields(
+        self, name: str, record: DeploymentRecord, *, phase: str
+    ) -> tuple[float | None, float | None, dt.datetime | None, str | None]:
+        """This cycle's publishable throughput, queueing a probe when one is due.
+
+        Returns ``(tokens_per_second, ttft_ms, measured_at, source)``. A
+        runtime the probe is meaningless for reports ``not-applicable`` with no
+        numbers; an unmeasured model reports nothing at all rather than a zero.
+        """
+        launch = record.spec.launch
+        probeable, reason = probe_applicability(launch)
+        if not probeable:
+            self._hot_cycles.pop(name, None)
+            return None, None, None, SOURCE_NOT_APPLICABLE
+
+        # Consecutive-hot streak, mirroring the resource tracker's calibration
+        # gate: any non-hot observation restarts it from zero.
+        if phase == "hot":
+            streak = self._hot_cycles.get(name, 0) + 1
+            self._hot_cycles[name] = streak
+        else:
+            streak = 0
+            self._hot_cycles.pop(name, None)
+
+        sample = self._throughput.get(launch.model)
+        now = self._clock()
+        fresh = sample is not None and sample.is_fresh(now)
+        if (
+            phase == "hot"
+            and not fresh
+            and streak >= self.probe_hot_cycles
+            and not self._probes_due  # at most one probe per cycle
+            and now - self._probe_last.get(name, 0.0) >= _PROBE_RETRY_S
+            and record.endpoint
+        ):
+            self._probe_last[name] = now
+            self._probes_due.append(
+                ProbeRequest(
+                    name=name,
+                    model=launch.model,
+                    endpoint=record.endpoint,
+                    alias=launch.alias,
+                )
+            )
+        if sample is None or sample.tokens_per_second is None:
+            return None, None, None, None
+        # A stale sample is still published — with its own measured_at, so every
+        # reader can see the age and say so — never re-stamped as current.
+        return (
+            sample.tokens_per_second,
+            sample.ttft_ms,
+            dt.datetime.fromtimestamp(sample.measured_at, dt.UTC),
+            sample.source,
+        )
+
     # -------------------------------------------------------------- plumbing
     def _idle_unload_due(self, record: DeploymentRecord) -> bool:
         """True when a healthy deployment crossed the idle TTL (PR-4, §4).
@@ -706,10 +864,17 @@ class ServingReconciler:
         self._was_ready.discard(name)
         self._misses.pop(name, None)
         self._healthy_streak.pop(name, None)
+        # A death/unload means the next hot observation belongs to a NEW
+        # process with a cold page cache: the pre-probe hot streak starts over.
+        self._hot_cycles.pop(name, None)
 
     def _forget_removed(self, names: set[str]) -> None:
         for stale in set(self._repair_last) - names:
             del self._repair_last[stale]
+        for stale in set(self._probe_last) - names:
+            del self._probe_last[stale]
+        for stale in set(self._hot_cycles) - names:
+            del self._hot_cycles[stale]
 
     def _observation(
         self,
@@ -724,6 +889,11 @@ class ServingReconciler:
         rss = 0
         if record.pid is not None and phase in {"hot", "loading"}:
             rss = self._rss_reader(record.pid)
+        # Measured throughput (may queue a probe for AFTER the lock is released;
+        # nothing here performs I/O beyond reading the sidecar).
+        tokens_per_second, ttft_ms, throughput_at, throughput_source = (
+            self._throughput_fields(name, record, phase=phase)
+        )
         # Persist the computed verdict onto the record (DB-optional liveness):
         # profile_resolver reads observed_phase/observed_at as truth, keeping
         # the sticky state==READY high-water mark for was-ready detection only.
@@ -744,6 +914,10 @@ class ServingReconciler:
             last_error=last_error if last_error is not None else record.last_error,
             model=record.spec.launch.model,
             observed_at=dt.datetime.now(dt.UTC),
+            tokens_per_second=tokens_per_second,
+            ttft_ms=ttft_ms,
+            throughput_measured_at=throughput_at,
+            throughput_source=throughput_source,
         )
 
 

@@ -154,6 +154,91 @@ function PhaseChip({ record }: { record: DeploymentRecord }) {
 }
 
 // ---------------------------------------------------------------------------
+// Measured throughput. Every number in this cell came from an actual request
+// sent to the deployment — nothing is estimated from the hardware. A model that
+// has not been measured shows a dash, never a zero and never a guess.
+// ---------------------------------------------------------------------------
+
+// A measurement older than this is labelled stale. Mirrors the serving-side
+// TTL, after which a hot deployment is measured again.
+const THROUGHPUT_STALE_MS = 6 * 60 * 60 * 1000;
+
+/** "12s" / "5m" / "3h" / "2d" since an ISO stamp (null when unparseable). */
+function elapsedSince(iso: string | null | undefined): { label: string; ms: number } | null {
+  if (!iso) return null;
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return null;
+  const ms = Math.max(0, Date.now() - then);
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return { label: `${secs}s`, ms };
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return { label: `${mins}m`, ms };
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return { label: `${hrs}h`, ms };
+  return { label: `${Math.round(hrs / 24)}d`, ms };
+}
+
+function Dash({ title }: { title: string }) {
+  return (
+    <span className="text-muted-foreground" title={title}>
+      —
+    </span>
+  );
+}
+
+function ThroughputCell({ record }: { record: DeploymentRecord }) {
+  const observed = record.observed;
+  if (observed?.throughput_source === "not-applicable") {
+    return (
+      <Dash title="This deployment doesn't generate text, so there's no generation speed to measure." />
+    );
+  }
+  const rate = observed?.tokens_per_second;
+  if (rate == null || !(rate > 0)) {
+    return (
+      <Dash title="Not measured yet. Speed is measured by sending one fixed request once the model has been serving for a few minutes." />
+    );
+  }
+  const age = elapsedSince(observed?.throughput_measured_at);
+  const stale = age != null && age.ms > THROUGHPUT_STALE_MS;
+  const ttft = observed?.ttft_ms;
+  const detail = [
+    ttft != null && ttft > 0 ? `first token ${Math.round(ttft)} ms` : null,
+    age ? `${age.label} ago` : null,
+    stale ? "stale" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const hint = [
+    `Measured: ${rate.toFixed(1)} tokens per second.`,
+    ttft != null && ttft > 0
+      ? observed?.throughput_source === "timings"
+        ? `Time to the first token: ${Math.round(ttft)} ms, as reported by the runtime.`
+        : `Time to the first token: ${Math.round(ttft)} ms.`
+      : "Time to the first token wasn't reported by this runtime.",
+    age ? `Taken ${age.label} ago.` : null,
+    stale ? "This measurement is old — it will be taken again while the model is loaded." : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <span className="block leading-tight" title={hint}>
+      <span
+        className={cn(
+          "font-mono tabular-nums text-xs",
+          stale ? "text-muted-foreground" : "text-foreground",
+        )}
+      >
+        {rate.toFixed(rate >= 100 ? 0 : 1)} tok/s
+      </span>
+      {detail && (
+        <span className="block text-[10px] text-muted-foreground">{detail}</span>
+      )}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Deployments view — explicit-column table over DeploymentRecord[].
 // ---------------------------------------------------------------------------
 
@@ -510,6 +595,12 @@ export function DeploymentsView({
         ) : (
           <span className="text-muted-foreground">—</span>
         ),
+    },
+    {
+      key: "speed",
+      header: "Speed",
+      sortAccessor: (r) => r.observed?.tokens_per_second ?? 0,
+      render: (r) => <ThroughputCell record={r} />,
     },
     {
       key: "endpoint",

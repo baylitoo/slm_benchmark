@@ -127,6 +127,19 @@ export interface ObservedPlacement {
   endpoint?: string | null;
   last_error?: string | null;
   last_probe_at?: string | null;
+  /** Measured generation rate. Null when never measured — never a guess: this
+   * number only ever comes from an actual request to the deployment. */
+  tokens_per_second?: number | null;
+  /** Time to the first token, in milliseconds. Null when the runtime did not
+   * report it (a non-streamed total round-trip is not a TTFT). */
+  ttft_ms?: number | null;
+  /** When the measurement was taken (ISO). Drives the "measured N ago" label
+   * and the stale marker. */
+  throughput_measured_at?: string | null;
+  /** Where the numbers came from: "timings" (the runtime's own server-side
+   * measurement), "wall-clock" (timed by the caller), "not-applicable" (a
+   * deployment that generates no tokens), "unmeasured". */
+  throughput_source?: string | null;
   [k: string]: unknown;
 }
 
