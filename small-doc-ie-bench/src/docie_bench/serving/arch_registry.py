@@ -30,6 +30,12 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "qwen2moe": "openai_chat",
     "qwen3": "openai_chat",
     "qwen3moe": "openai_chat",
+    # Qwen3.5 backbone: TEXT by default. NuExtract3 shares this exact arch but
+    # needs a different serving contract (template via chat_template_kwargs) — it
+    # is disambiguated BY NAME in resolve_family, not by arch. A generic Qwen3.5
+    # text model lands here (openai_chat); a generic Qwen3.5-VL gets upgraded to
+    # a vision family by the mmproj signal below.
+    "qwen35": "openai_chat",
     "mistral": "openai_chat",
     "mixtral": "openai_chat",
     "gemma": "openai_chat",
@@ -43,17 +49,10 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "qwen2vl": "lfm2_vl",
     "qwen2_vl": "lfm2_vl",
     "qwen2.5vl": "lfm2_vl",
+    "qwen3vl": "lfm2_vl",
+    "qwen3_vl": "lfm2_vl",
     "lfm2-vl": "lfm2_vl",
     "lfm2_vl": "lfm2_vl",
-    # NuExtract3's GGUF reports the "qwen35" backbone (numind/NuExtract3-GGUF).
-    # NuExtract3 is the canonical qwen35-vl model in this project, so map it to
-    # the nuextract3 CONTRACT (chat_template_kwargs schema extraction) rather
-    # than the generic vision family — a generic Qwen3.5-VL would otherwise
-    # need a manual override, but defaulting the flagship to a json_schema
-    # family (lfm2_vl) would silently drop its template (the exact trap the
-    # family contract exists to prevent). Override to lfm2_vl/vision_ocr for a
-    # non-NuExtract qwen35 repo.
-    "qwen35": "nuextract3",
     # OCR vision. Unlimited-OCR IS the DeepSeek-OCR architecture (SAM-ViT-B +
     # CLIP-L/14 vision tower → projector → DeepSeek-V2 MoE decoder). Its GGUF
     # `general.architecture` is "unlimited-ocr" (llama.cpp mtmd support merged
@@ -76,7 +75,8 @@ VISION_ARCHS = frozenset(
         "qwen2vl",
         "qwen2_vl",
         "qwen2.5vl",
-        "qwen35",
+        "qwen3vl",
+        "qwen3_vl",
         "lfm2-vl",
         "lfm2_vl",
         "unlimited-ocr",
@@ -99,6 +99,7 @@ TEXT_ARCH_TO_VISION_FAMILY: dict[str, str] = {
     "lfm2": "lfm2_vl",
     "qwen2": "lfm2_vl",
     "qwen3": "lfm2_vl",
+    "qwen35": "lfm2_vl",  # generic Qwen3.5-VL (a NuExtract3 is caught by name first)
     "llama": "lfm2_vl",
 }
 DEFAULT_VISION_FAMILY = "lfm2_vl"
@@ -153,18 +154,31 @@ class SupportVerdict:
     runtime_note: str | None = None
 
 
+def _is_nuextract3(arch: str, repo_id: str | None) -> bool:
+    """NuExtract3 shares the qwen3.5-VL backbone (arch ``qwen35``) with generic
+    Qwen3.5 text/VL models but needs a DIFFERENT serving contract (the extraction
+    template rides ``chat_template_kwargs``, not ``response_format``). The arch
+    alone can't tell them apart, so the flagship is detected by name; an
+    unmatched ``qwen35`` falls through to the generic text/vision handling."""
+    return arch == "qwen35" and bool(repo_id) and "nuextract" in repo_id.lower()
+
+
 def resolve_family(
     architecture: str | None,
     *,
     has_gguf: bool,
     has_safetensors: bool,
     has_mmproj: bool,
+    repo_id: str | None = None,
 ) -> SupportVerdict:
     """Map a detected architecture (+ repo shape) to a family and a verdict.
 
     The GGUF/llama.cpp path is always preferred. Only when the repo ships NO
     servable GGUF (safetensors-only) does the LAST-RESORT transformers family
     apply — the "no servable GGUF" hard gate (see ``_transformers_verdict``).
+
+    ``repo_id`` disambiguates archs shared by models with different serving
+    contracts (NuExtract3 vs a generic Qwen3.5-VL, both ``qwen35``).
     """
     arch = architecture.strip().lower() if architecture else ""
     runtime_note = RUNTIME_NOTES.get(arch)
@@ -208,6 +222,23 @@ def resolve_family(
             None,
             f"architecture {architecture!r} detected but the repo ships neither a "
             "GGUF nor safetensors weights — nothing servable here",
+        )
+
+    # NuExtract3 (qwen3.5-VL + chat_template_kwargs extraction contract), caught
+    # by name BEFORE the generic qwen35 handling — which would otherwise serve it
+    # as a plain vision model (lfm2_vl) and silently drop its template. It is
+    # vision, so a missing projector is a needs_family, not a text mis-serve.
+    if _is_nuextract3(arch, repo_id):
+        if not has_mmproj:
+            return SupportVerdict(
+                "needs_family",
+                "nuextract3",
+                "NuExtract3 needs a vision projector but this repo ships no mmproj — "
+                "pick a repo that includes one",
+                runtime_note=runtime_note,
+            )
+        return SupportVerdict(
+            "supported", "nuextract3", f"NuExtract3 ({architecture!r} extraction contract)"
         )
 
     family = ARCH_TO_FAMILY.get(arch)
