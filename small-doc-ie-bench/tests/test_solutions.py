@@ -196,9 +196,21 @@ def test_existing_passthrough_profiles_still_load(tmp_path) -> None:  # noqa: AN
 # ── VLM-as-OCR pipeline + liteparse alias ────────────────────────────────────
 
 
-async def test_pipeline_vlm_ocr_then_llm_fixes_mojibake() -> None:
+async def test_pipeline_vlm_ocr_then_llm_fixes_mojibake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Two-stage with a VISION deployment as the OCR step: image -> text (VLM) ->
     # JSON (extractor). The VLM's mojibake is repaired before the extractor sees it.
+    from docie_bench.vision import DocumentImage
+
+    # The doc is rasterized to PNG page images before the VLM (llama-server
+    # rejects a PDF URI); stub the rasterizer — this test is about routing.
+    monkeypatch.setattr(
+        "docie_bench.serving.solutions.load_document_images",
+        lambda path, *, pdf_dpi=150: [
+            DocumentImage(page=1, media_type="image/png", data=b"PNGBYTES")
+        ],
+    )
     seen: dict[str, dict] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -229,14 +241,15 @@ async def test_pipeline_vlm_ocr_then_llm_fixes_mojibake() -> None:
         solution = build_solution(pipe, profiles=profiles, http_client=http)
         result = await solution.complete(_image_request("pipe"))
 
-    # OCR step went to the vision deployment, carrying the image.
+    # OCR step went to the vision deployment carrying the RASTERIZED PNG page
+    # image (never the original document URI — the whole point of the fix).
     assert seen["ocr"]["model"] == "up-vlm"
-    ocr_parts = [
-        part
-        for message in seen["ocr"]["messages"]
-        for part in (message["content"] if isinstance(message["content"], list) else [])
+    ocr_content = seen["ocr"]["messages"][0]["content"]
+    assert ocr_content[0]["type"] == "text"  # the OCR instruction
+    image_urls = [p["image_url"]["url"] for p in ocr_content if p.get("type") == "image_url"]
+    assert image_urls == [
+        DocumentImage(page=1, media_type="image/png", data=b"PNGBYTES").data_url()
     ]
-    assert any(p.get("type") == "image_url" for p in ocr_parts)
 
     # Extractor received the MOJIBAKE-FIXED OCR text (image swapped out).
     extractor_texts = [
