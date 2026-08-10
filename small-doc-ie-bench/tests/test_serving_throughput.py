@@ -618,7 +618,8 @@ def test_an_embedding_deployment_reports_not_applicable(tmp_path: Path) -> None:
 def test_a_failed_probe_is_throttled_not_retried_every_cycle(tmp_path: Path) -> None:
     """A probe that measured nothing writes no sidecar (so a transient bad
     reading is not persisted as the answer) — which means only the per-
-    deployment throttle stands between it and a generation request per cycle."""
+    deployment throttle stands between it and a generation request per cycle.
+    The attempt budget (tested separately) then stops the retries entirely."""
     clock = FakeClock()
     probe = RecordingProbe(None)  # transport failure
     supervisor, reconciler, _ = _build(tmp_path, probe=probe, clock=clock)
@@ -635,6 +636,33 @@ def test_a_failed_probe_is_throttled_not_retried_every_cycle(tmp_path: Path) -> 
     clock.now += 2
     reconciler.run_cycle()
     assert len(probe.calls) == 2
+
+
+def test_a_runtime_that_can_never_be_measured_is_left_alone(tmp_path: Path) -> None:
+    """The transformers server answers chat completions but reports usage
+    counts of 0 by construction, so its probe can NEVER yield a number. Without
+    an attempt budget the retry timer would fire a 64-token generation against
+    it every five minutes forever, on this node, producing nothing."""
+    clock = FakeClock()
+    probe = RecordingProbe(None)
+    supervisor, reconciler, _ = _build(
+        tmp_path, probe=probe, clock=clock, probe_hot_cycles=1
+    )
+    supervisor.deploy(_spec())
+
+    for _ in range(10):
+        reconciler.run_cycle()
+        clock.now += 301
+    assert len(probe.calls) == 3  # three attempts, then quiet
+
+    # A respawn is a NEW process — maybe the one that can be measured. The
+    # attempt budget resets with it rather than condemning the deployment.
+    supervisor.adapters[RuntimeKind.LLAMACPP].crash(  # type: ignore[attr-defined]
+        supervisor.get("invoice").pid
+    )
+    reconciler.run_cycle()  # dead -> respawned, budget reset, probed again
+
+    assert len(probe.calls) == 4
 
 
 def test_at_most_one_probe_runs_per_cycle(tmp_path: Path) -> None:

@@ -122,6 +122,16 @@ _PROBE_RETRY_S = 300.0
 # is not politeness — it is what keeps the stored measurement meaningful.
 _PROBE_HOT_CYCLES = 6
 
+# How many probes of one loaded runtime may come back with nothing usable
+# before this deployment is left alone. An unmeasurable probe writes no
+# sidecar, so without a cap the retry timer would re-fire forever — and some
+# runtimes CANNOT ever answer: the transformers server reports usage counts of
+# 0 by construction, so probing it is a 64-token generation every five minutes,
+# on this node, producing nothing, indefinitely. The counter is cleared
+# whenever the runtime is respawned or reloaded (see ``_forget``), so a genuine
+# transient failure still gets a fresh set of attempts.
+_PROBE_MAX_ATTEMPTS = 3
+
 
 def _looks_like_bind_collision(record: DeploymentRecord) -> bool:
     error = (record.last_error or "").lower()
@@ -438,6 +448,7 @@ class ServingReconciler:
         self.probe_hot_cycles = probe_hot_cycles
         self._probes_due: list[ProbeRequest] = []
         self._probe_last: dict[str, float] = {}
+        self._probe_attempts: dict[str, int] = {}
         self._hot_cycles: dict[str, int] = {}
         # Consecutive healthy cycles per deployment: after
         # ``healthy_reset_threshold`` of them the restart budget is forgiven
@@ -686,8 +697,9 @@ class ServingReconciler:
         response body or an exploding injected probe records nothing and leaves
         the cycle — and the deployment's phase — untouched. A probe that
         measured nothing usable is deliberately NOT persisted, so a transient
-        bad reading cannot become this model's answer for the whole TTL; the
-        per-deployment throttle is what spaces the retry.
+        bad reading cannot become this model's answer for the whole TTL. The
+        per-deployment throttle spaces the retry, and the attempt budget stops
+        a runtime that can never report tokens from being probed forever.
         """
         due, self._probes_due = self._probes_due, []
         for request in due:
@@ -697,8 +709,10 @@ class ServingReconciler:
                 logger.warning(
                     "throughput probe of %s failed", request.name, exc_info=True
                 )
+                self._count_failed_probe(request.name)
                 continue
             if sample is None:
+                self._count_failed_probe(request.name)
                 continue
             if not sample.measured:
                 logger.info(
@@ -706,6 +720,7 @@ class ServingReconciler:
                     request.name,
                     sample.detail or sample.source,
                 )
+                self._count_failed_probe(request.name)
                 continue
             logger.info(
                 "deployment %s measured at %.1f tok/s (source=%s)",
@@ -713,7 +728,20 @@ class ServingReconciler:
                 sample.tokens_per_second or 0.0,
                 sample.source,
             )
+            self._probe_attempts.pop(request.name, None)
             self._throughput.record(request.model, sample)
+
+    def _count_failed_probe(self, name: str) -> None:
+        """Charge one unusable probe against this deployment's attempt budget."""
+        attempts = self._probe_attempts.get(name, 0) + 1
+        self._probe_attempts[name] = attempts
+        if attempts == _PROBE_MAX_ATTEMPTS:
+            logger.info(
+                "deployment %s produced no usable throughput measurement in %d "
+                "attempts: not probing it again until it is reloaded",
+                name,
+                attempts,
+            )
 
     def _throughput_fields(
         self, name: str, record: DeploymentRecord, *, phase: str
@@ -748,6 +776,10 @@ class ServingReconciler:
             and streak >= self.probe_hot_cycles
             and not self._probes_due  # at most one probe per cycle
             and now - self._probe_last.get(name, 0.0) >= _PROBE_RETRY_S
+            # Give up after a few unusable probes: an unmeasurable one writes
+            # no sidecar, so without this the retry timer would re-fire on this
+            # runtime forever (see _PROBE_MAX_ATTEMPTS).
+            and self._probe_attempts.get(name, 0) < _PROBE_MAX_ATTEMPTS
             and record.endpoint
         ):
             self._probe_last[name] = now
@@ -865,14 +897,19 @@ class ServingReconciler:
         self._misses.pop(name, None)
         self._healthy_streak.pop(name, None)
         # A death/unload means the next hot observation belongs to a NEW
-        # process with a cold page cache: the pre-probe hot streak starts over.
+        # process with a cold page cache: the pre-probe hot streak starts over,
+        # and a runtime that could not be measured before gets a fresh set of
+        # attempts (the reload may be exactly what fixed it).
         self._hot_cycles.pop(name, None)
+        self._probe_attempts.pop(name, None)
 
     def _forget_removed(self, names: set[str]) -> None:
         for stale in set(self._repair_last) - names:
             del self._repair_last[stale]
         for stale in set(self._probe_last) - names:
             del self._probe_last[stale]
+        for stale in set(self._probe_attempts) - names:
+            del self._probe_attempts[stale]
         for stale in set(self._hot_cycles) - names:
             del self._hot_cycles[stale]
 

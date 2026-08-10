@@ -77,13 +77,17 @@ class ModelPlacement(Base):
     metadata row.
 
     Migration note (PR-1 reconciler): the base table shipped before the
-    *observed* columns below (``phase`` .. ``last_error``), and ``create_all``
-    NEVER adds columns to an existing table — the same hazard documented on
+    *observed* columns below (everything from ``phase`` through
+    ``throughput_source``), and ``create_all`` NEVER adds columns to an
+    existing table — the same hazard documented on
     ``ModelStoreEntry.size_bytes``. ``init_engine`` therefore runs
     :func:`ensure_placement_observed_columns` (an explicit forward ``ALTER
     TABLE .. ADD COLUMN`` migration) right after ``create_all`` so an existing
     database gains the columns instead of throwing ``UndefinedColumn`` on the
     reconciler's first publish. Fresh databases get them via ``create_all``.
+    Every later observed column must be added to BOTH this class and
+    ``_OBSERVED_COLUMNS`` — mapping it here alone leaves existing databases
+    behind.
 
     Row lifecycle (PR-1): the reconciler is the sole observed-state writer and
     UPDATEs this row every cycle; ``stop``/future ``unload`` UPDATE it
