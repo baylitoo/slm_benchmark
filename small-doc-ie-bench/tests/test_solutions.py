@@ -191,3 +191,81 @@ def test_existing_passthrough_profiles_still_load(tmp_path) -> None:  # noqa: AN
     profiles = load_model_profiles(cfg)
     assert profiles["legacy"].kind == "passthrough"
     assert profiles["legacy"].options == {}
+
+
+# ── VLM-as-OCR pipeline + liteparse alias ────────────────────────────────────
+
+
+async def test_pipeline_vlm_ocr_then_llm_fixes_mojibake() -> None:
+    # Two-stage with a VISION deployment as the OCR step: image -> text (VLM) ->
+    # JSON (extractor). The VLM's mojibake is repaired before the extractor sees it.
+    seen: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.host == "vlm-x":  # the OCR (vision) step
+            seen["ocr"] = body
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "FACTURE universitÃ©"}}]}
+            )
+        seen["extractor"] = body  # the extractor step
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": '{"vendor":"x"}'}}]}
+        )
+
+    profiles = {
+        "vlm_x": ModelProfile(
+            name="vlm_x", model="up-vlm", base_url="http://vlm-x/v1", api_key="k"
+        ),
+        "llm_x": ModelProfile(
+            name="llm_x", model="up-llm", base_url="http://llm-x/v1", api_key="k"
+        ),
+    }
+    pipe = ModelProfile(
+        name="pipe", model="", base_url="", api_key="", kind="pipeline",
+        options={"extractor": "llm_x", "ocr_model": "vlm_x"},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        solution = build_solution(pipe, profiles=profiles, http_client=http)
+        result = await solution.complete(_image_request("pipe"))
+
+    # OCR step went to the vision deployment, carrying the image.
+    assert seen["ocr"]["model"] == "up-vlm"
+    ocr_parts = [
+        part
+        for message in seen["ocr"]["messages"]
+        for part in (message["content"] if isinstance(message["content"], list) else [])
+    ]
+    assert any(p.get("type") == "image_url" for p in ocr_parts)
+
+    # Extractor received the MOJIBAKE-FIXED OCR text (image swapped out).
+    extractor_texts = [
+        part["text"]
+        for message in seen["extractor"]["messages"]
+        for part in (message["content"] if isinstance(message["content"], list) else [])
+        if part.get("type") == "text"
+    ]
+    assert any("université" in t for t in extractor_texts)
+    assert not any("universitÃ©" in t for t in extractor_texts)
+    assert seen["extractor"]["model"] == "up-llm"
+    assert result["choices"][0]["message"]["content"] == '{"vendor":"x"}'
+
+
+def test_pipeline_unknown_ocr_model_raises() -> None:
+    pipe = ModelProfile(
+        name="pipe", model="", base_url="", api_key="", kind="pipeline",
+        options={"extractor": "llm_x", "ocr_model": "nope"},
+    )
+    profiles = {"llm_x": ModelProfile(name="llm_x", model="x", base_url="http://x/v1", api_key="k")}
+    with pytest.raises(SolutionError, match="ocr_model 'nope' is not configured"):
+        build_solution(pipe, profiles=profiles, http_client=httpx.AsyncClient())
+
+
+def test_factory_liteparse_is_pdf_text_backend() -> None:
+    from docie_bench.ocr.factory import get_ocr_backend
+    from docie_bench.ocr.pdf_text import PdfTextBackend
+
+    assert isinstance(get_ocr_backend("liteparse"), PdfTextBackend)
+    assert isinstance(get_ocr_backend("pdf_text"), PdfTextBackend)  # legacy alias
+    with pytest.raises(ValueError, match="Unknown OCR backend"):
+        get_ocr_backend("nonsense")

@@ -25,7 +25,15 @@ from typing import Any, Protocol
 import httpx
 
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.llm.mojibake import fix_mojibake
 from docie_bench.ocr.factory import get_ocr_backend
+
+# OCR instruction for a VLM used as the pipeline's OCR step (image -> text). It
+# must transcribe, NOT summarise or answer — the extractor does the reasoning.
+_VLM_OCR_PROMPT = (
+    "Transcribe ALL text in this document image, verbatim and in reading order. "
+    "Output only the transcribed text — no commentary, no markdown, no analysis."
+)
 
 _DATA_URI_SUFFIX = {
     "image/png": ".png",
@@ -117,7 +125,31 @@ class PipelineSolution:
         self.profile = profile
         self.backend_name = str(profile.options.get("ocr_backend", "tesseract"))
         self.language = profile.options.get("language")
-        get_ocr_backend(self.backend_name, language=self.language)  # fail fast
+
+        # OCR engine: EITHER a deployed vision model (``ocr_model``) that
+        # transcribes the image to text, OR a built-in backend (``ocr_backend``:
+        # liteparse / tesseract / paddleocr). The VLM route lets a small vision
+        # model be the "eyes" while a stronger text model does the extraction.
+        ocr_model_name = profile.options.get("ocr_model")
+        self.ocr_model: ModelProfile | None = None
+        if ocr_model_name:
+            vision = (profiles or {}).get(str(ocr_model_name))
+            if vision is None:
+                raise SolutionError(
+                    f"pipeline ocr_model {ocr_model_name!r} is not configured",
+                    status_code=500,
+                    error_type="invalid_profile",
+                )
+            if vision.kind != "passthrough":
+                raise SolutionError(
+                    f"pipeline ocr_model {ocr_model_name!r} must be a passthrough "
+                    "(vision) deployment profile",
+                    status_code=500,
+                    error_type="invalid_profile",
+                )
+            self.ocr_model = vision
+        else:
+            get_ocr_backend(self.backend_name, language=self.language)  # fail fast
 
         extractor_name = profile.options.get("extractor")
         if not extractor_name:
@@ -150,8 +182,13 @@ class PipelineSolution:
         self.http = http_client
 
     async def complete(self, request: dict[str, Any]) -> dict[str, Any]:
-        raw, suffix = _extract_document(request)
-        text = await asyncio.to_thread(_ocr_to_text, self.backend_name, self.language, raw, suffix)
+        if self.ocr_model is not None:
+            text = await self._vlm_ocr(request)
+        else:
+            raw, suffix = _extract_document(request)
+            text = await asyncio.to_thread(
+                _ocr_to_text, self.backend_name, self.language, raw, suffix
+            )
         # Hand the extractor the original prompt with the image swapped for OCR text.
         llm_request: dict[str, Any] = {
             **request,
@@ -181,6 +218,53 @@ class PipelineSolution:
                 error_type="upstream_error",
             )
         return resp.json()
+
+    async def _vlm_ocr(self, request: dict[str, Any]) -> str:
+        """Transcribe the document image to text with the vision deployment.
+
+        The image (data URI) already rides the request messages; prepend an OCR
+        instruction and forward to the VLM. Mojibake is repaired here so the
+        extractor — and the final JSON — never sees ``universitÃ©``."""
+        vision = self.ocr_model
+        assert vision is not None  # guarded by the caller (complete)
+        ocr_request: dict[str, Any] = {
+            "model": vision.model,
+            "messages": [
+                {"role": "system", "content": _VLM_OCR_PROMPT},
+                *(request.get("messages") or []),
+            ],
+            "temperature": 0,
+        }
+        url = f"{vision.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {vision.api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = await self.http.post(
+                url, json=ocr_request, headers=headers, timeout=vision.timeout_seconds
+            )
+        except httpx.RequestError as exc:
+            raise SolutionError(
+                f"pipeline ocr_model upstream is unreachable: {exc}",
+                status_code=502,
+                error_type="upstream_unavailable",
+            ) from exc
+        if resp.status_code >= 400:
+            raise SolutionError(
+                f"pipeline ocr_model returned {resp.status_code}: {resp.text[:200]}",
+                status_code=resp.status_code,
+                error_type="upstream_error",
+            )
+        try:
+            content = resp.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, ValueError):
+            content = ""
+        if isinstance(content, list):  # multimodal parts → concatenate text
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        return fix_mojibake(str(content or "")) or ""
 
 
 def _ocr_to_text(backend_name: str, language: object, raw: bytes, suffix: str) -> str:

@@ -235,6 +235,14 @@ async def _complete_ocr(
             "language": options.get("language"),
             "extractor": extractor.name,
         }
+        # OCR step may be a deployed VISION model (VLM as OCR: image -> text)
+        # instead of a built-in backend — resolved like the extractor and passed
+        # to the pipeline adapter, which then transcribes with it.
+        ocr_model_sel = options.get("ocr_model")
+        if ocr_model_sel:
+            ocr_vision = _resolve_backing(str(ocr_model_sel))
+            profiles[ocr_vision.name] = ocr_vision
+            solution_options["ocr_model"] = ocr_vision.name
         # An optional schema makes the OCR→LLM extraction reliably structured —
         # the same grammar constraint the vision path uses, over OCR text.
         schema_name = options.get("schema")
