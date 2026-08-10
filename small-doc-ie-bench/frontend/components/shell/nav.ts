@@ -54,6 +54,7 @@ export const NAV_GROUPS: NavGroup[] = [
     heading: "Serving",
     items: [
       { id: "playground", label: "Playground", icon: FlaskConical },
+      { id: "deploy", label: "Catalog", icon: LayoutGrid, view: "catalog" },
       { id: "deploy", label: "Models", icon: Boxes, view: "models" },
       { id: "deploy", label: "Deployments", icon: Server, view: "deployments" },
       { id: "deploy", label: "Ports", icon: Network, view: "ports" },

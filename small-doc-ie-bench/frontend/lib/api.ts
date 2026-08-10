@@ -770,6 +770,80 @@ export function searchHf(query: string, gguf = true): Promise<HfSearchCard[]> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Catalog browser (enriched /v1/studio/hf/search — the Azure-Foundry-like view)
+// ---------------------------------------------------------------------------
+
+/** How the catalog orders results. Empty query + a sort = "top trending/new". */
+export type CatalogSort = "trending" | "downloads" | "likes" | "recent";
+
+/**
+ * An enriched Hub search result — the same `/v1/studio/hf/search` endpoint as
+ * `searchHf`, extended with an in-list pre-verdict + serving-family resolution
+ * so the catalog can segment models by support tier before any download.
+ *
+ * EVERY enriched field is defensively nullable: while the backend is still
+ * emitting the plain `HfSearchCard` shape these keys arrive as `undefined`, so
+ * the UI guards each with `== null` and renders a dash. `verdict`/`family`/
+ * `prelim` are a FAST pre-check — `/v1/studio/hf/inspect` remains authoritative.
+ */
+export interface CatalogCard {
+  id: string;
+  downloads: number | null;
+  downloads_all_time: number | null;
+  likes: number | null;
+  trending_score: number | null;
+  gated: boolean;
+  tags: string[];
+  pipeline_tag: string | null;
+  library_name: string | null;
+  created_at: string | null;
+  last_modified: string | null;
+  license: string | null;
+  architecture: string | null;
+  params: number | null;
+  param_label: string | null;
+  size_est_bytes: number | null;
+  verdict: "supported" | "needs_family" | "unsupported" | null;
+  family: string | null;
+  reason: string;
+  runtime_note: string | null;
+  prelim: boolean;
+  /** Estimated size fits the node's deploy budget (free − safety margin — the
+   *  exact quantity the deploy fit-check uses). false = too big; null = unknown
+   *  (no node snapshot / DB down) — never render a false "fits" for null. */
+  fits_node: boolean | null;
+  /** That deploy budget in bytes, for a tooltip. */
+  node_available_bytes: number | null;
+}
+
+/** Query for the enriched catalog search. All fields optional/defensive. */
+export interface CatalogSearchParams {
+  query?: string;
+  sort?: CatalogSort;
+  pipeline_tag?: string | null;
+  author?: string | null;
+  gguf_only?: boolean;
+  limit?: number;
+}
+
+/**
+ * Enriched Hub search for the Catalog browser. Hits the SAME endpoint as
+ * `searchHf` (`/v1/studio/hf/search`, backward compatible) with the extra facet
+ * + sort params. An empty `query` combined with a `sort` returns the top
+ * trending/most-downloaded/newest models — the catalog's default first paint.
+ */
+export function searchCatalog(params: CatalogSearchParams = {}): Promise<CatalogCard[]> {
+  const q = new URLSearchParams();
+  q.set("query", params.query ?? "");
+  if (params.sort) q.set("sort", params.sort);
+  if (params.pipeline_tag) q.set("pipeline_tag", params.pipeline_tag);
+  if (params.author) q.set("author", params.author);
+  q.set("gguf_only", String(params.gguf_only ?? true));
+  if (params.limit != null) q.set("limit", String(params.limit));
+  return request<CatalogCard[]>(`/v1/studio/hf/search?${q.toString()}`);
+}
+
 /** Pre-flight support verdict + suggested family for a repo (no download). */
 export function inspectHf(repo: string): Promise<HfInspect> {
   return request<HfInspect>(`/v1/studio/hf/inspect?repo=${encodeURIComponent(repo)}`);
