@@ -77,13 +77,17 @@ class ModelPlacement(Base):
     metadata row.
 
     Migration note (PR-1 reconciler): the base table shipped before the
-    *observed* columns below (``phase`` .. ``last_error``), and ``create_all``
-    NEVER adds columns to an existing table — the same hazard documented on
+    *observed* columns below (everything from ``phase`` through
+    ``throughput_source``), and ``create_all`` NEVER adds columns to an
+    existing table — the same hazard documented on
     ``ModelStoreEntry.size_bytes``. ``init_engine`` therefore runs
     :func:`ensure_placement_observed_columns` (an explicit forward ``ALTER
     TABLE .. ADD COLUMN`` migration) right after ``create_all`` so an existing
     database gains the columns instead of throwing ``UndefinedColumn`` on the
     reconciler's first publish. Fresh databases get them via ``create_all``.
+    Every later observed column must be added to BOTH this class and
+    ``_OBSERVED_COLUMNS`` — mapping it here alone leaves existing databases
+    behind.
 
     Row lifecycle (PR-1): the reconciler is the sole observed-state writer and
     UPDATEs this row every cycle; ``stop``/future ``unload`` UPDATE it
@@ -118,6 +122,22 @@ class ModelPlacement(Base):
         DateTime(timezone=True), nullable=True
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --------------------------------------------- measured throughput
+    # Published from the per-model-path sidecar the reconciler's probe writes
+    # (serving.throughput). NULL means "not measured" — never 0, which a reader
+    # would render as a real and terrible number. ``throughput_source`` says
+    # where the numbers came from ("timings" = llama.cpp's own server-side
+    # measurement, "wall-clock" = client-timed over usage counts,
+    # "not-applicable" = a runtime that generates no tokens, "unmeasured" = the
+    # probe ran but yielded no defensible rate). ``ttft_ms`` is NULL on the
+    # wall-clock source by construction: a non-streamed round-trip is not a
+    # time-to-first-token. NOTHING here is ever predicted from hardware.
+    tokens_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ttft_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    throughput_measured_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    throughput_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -227,7 +247,10 @@ def ensure_serving_node_table(engine: Engine) -> bool:
 
 
 # The observed columns added by PR-1 (see ModelPlacement docstring). Kept as a
-# module-level tuple so the migration below and tests agree on one list.
+# module-level tuple so the migration below and tests agree on one list. Any
+# LATER observed column must be appended here too — ``create_all`` will give a
+# fresh database the mapped column while an existing one silently keeps the old
+# shape and throws ``UndefinedColumn`` on the next publish.
 _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     ("phase", String(32)),
     ("pid", Integer()),
@@ -236,6 +259,11 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     ("health_ok", Boolean()),
     ("last_probe_at", DateTime(timezone=True)),
     ("last_error", Text()),
+    # Measured throughput (see the ModelPlacement docstring).
+    ("tokens_per_second", Float()),
+    ("ttft_ms", Float()),
+    ("throughput_measured_at", DateTime(timezone=True)),
+    ("throughput_source", String(32)),
 )
 
 
@@ -350,6 +378,12 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "health_ok": row.health_ok,
         "last_probe_at": row.last_probe_at.isoformat() if row.last_probe_at else None,
         "last_error": row.last_error,
+        "tokens_per_second": row.tokens_per_second,
+        "ttft_ms": row.ttft_ms,
+        "throughput_measured_at": (
+            row.throughput_measured_at.isoformat() if row.throughput_measured_at else None
+        ),
+        "throughput_source": row.throughput_source,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
@@ -545,6 +579,10 @@ class ModelCatalog:
         health_ok: bool,
         last_error: str | None,
         probed_at: dt.datetime | None = None,
+        tokens_per_second: float | None = None,
+        ttft_ms: float | None = None,
+        throughput_measured_at: dt.datetime | None = None,
+        throughput_source: str | None = None,
     ) -> dict[str, Any]:
         """Publish one reconciler observation (the reconciler is the sole caller).
 
@@ -555,6 +593,12 @@ class ModelCatalog:
         exists — mirroring what the deploy path would have recorded.
         ``endpoint`` must already be ``""`` for any non-live observation (the
         reconciler enforces that; this method stores what it is given).
+
+        The throughput fields carry the reconciler's per-model-path sidecar
+        sample forward each cycle (``None`` = not measured). They are written
+        unconditionally alongside the rest of the observation so a measurement
+        that stops being valid — model replaced, sample expired — clears
+        instead of lingering as a number nothing stands behind.
         """
         with session_scope() as session:
             if session is None:
@@ -589,6 +633,10 @@ class ModelCatalog:
             row.health_ok = health_ok
             row.last_probe_at = probed_at or _utcnow()
             row.last_error = last_error
+            row.tokens_per_second = tokens_per_second
+            row.ttft_ms = ttft_ms
+            row.throughput_measured_at = throughput_measured_at
+            row.throughput_source = throughput_source
             session.flush()
             return _placement_view(row)
 

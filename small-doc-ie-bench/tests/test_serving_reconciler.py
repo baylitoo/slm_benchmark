@@ -528,6 +528,10 @@ def test_migration_adds_observed_columns_to_a_legacy_table(tmp_path: Path) -> No
         "health_ok",
         "last_probe_at",
         "last_error",
+        "tokens_per_second",
+        "ttft_ms",
+        "throughput_measured_at",
+        "throughput_source",
     ]
     columns = {column["name"] for column in sa_inspect(engine).get_columns("model_placement")}
     assert {"phase", "pid", "rss_bytes", "health_ok", "last_probe_at", "last_error"} <= columns
