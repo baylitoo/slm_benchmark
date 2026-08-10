@@ -221,3 +221,45 @@ def test_version_detection_uses_argv_and_no_shell() -> None:
     assert adapter.probe(_spec(RuntimeKind.VLLM)).version == "vllm 1.2.3"
     assert observed["command"] == ["vllm", "--version"]
     assert observed["kwargs"]["shell"] is False
+
+
+class _FakeProcInfo:
+    def __init__(self, pid: int, cmdline: list[str]) -> None:
+        self.info = {"pid": pid, "cmdline": cmdline}
+
+
+def test_find_processes_matches_port_and_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Orphan reaping keys on the deployment's unique port AND model in the
+    # cmdline: both instances of a.gguf:8090 match; the other model, the other
+    # port, and a stray process that merely mentions 8090 do not.
+    from docie_bench.serving import runtime as runtime_mod
+
+    procs = [
+        _FakeProcInfo(10, ["llama-server", "--model", "/models/a.gguf", "--port", "8090"]),
+        _FakeProcInfo(11, ["llama-server", "--model", "/models/b.gguf", "--port", "8091"]),
+        _FakeProcInfo(12, ["python", "job.py", "8090"]),
+        _FakeProcInfo(13, ["llama-server", "--model", "/models/a.gguf", "--port", "8090"]),
+    ]
+    monkeypatch.setattr(runtime_mod.psutil, "process_iter", lambda attrs=None: iter(procs))
+
+    spec = _spec(RuntimeKind.LLAMACPP, model="/models/a.gguf", port=8090)
+    assert set(LlamaCppRuntime().find_processes(spec)) == {10, 13}
+
+
+def test_find_processes_exempts_shared_and_remote_runtimes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A shared ollama server and a remote endpoint own no reap-able local
+    # process, so they must not even scan (killing ollama by port would take
+    # down every model it hosts).
+    from docie_bench.serving import runtime as runtime_mod
+
+    def _boom(attrs: Any = None) -> Any:
+        raise AssertionError("shared/remote runtimes must not scan processes")
+
+    monkeypatch.setattr(runtime_mod.psutil, "process_iter", _boom)
+
+    assert OllamaRuntime().find_processes(_spec(RuntimeKind.OLLAMA, port=11434)) == ()
+    assert (
+        RemoteRuntime().find_processes(_spec(RuntimeKind.REMOTE, endpoint="http://x/v1")) == ()
+    )

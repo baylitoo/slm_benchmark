@@ -66,6 +66,7 @@ class ScriptedAdapter:
     def __init__(self) -> None:
         self.next_pid = 100
         self.running: set[int] = set()
+        self.by_port: dict[int, list[int]] = {}
         self.starts = 0
         self.stops: list[int | None] = []
         self.healthy: dict[str, bool] = {}
@@ -78,6 +79,7 @@ class ScriptedAdapter:
         self.starts += 1
         self.next_pid += 1
         self.running.add(self.next_pid)
+        self.by_port.setdefault(spec.port, []).append(self.next_pid)
         return RuntimeProcess(spec.runtime, f"http://{spec.host}:{spec.port}/v1", self.next_pid)
 
     def is_running(self, pid: int | None) -> bool:
@@ -88,6 +90,11 @@ class ScriptedAdapter:
         self.stops.append(pid)
         if pid is not None:
             self.running.discard(pid)
+
+    def find_processes(self, spec: RuntimeLaunchSpec) -> tuple[int, ...]:
+        # Mirrors the real adapter: the still-alive processes launched for this
+        # spec's (unique) port — how an orphan is found once its pid is lost.
+        return tuple(p for p in self.by_port.get(spec.port, ()) if p in self.running)
 
     def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> HealthResult:
         del timeout
@@ -152,6 +159,44 @@ def test_unload_keeps_record_port_and_flips_activation_managed(tmp_path: Path) -
         tmp_path / "deployments.json", adapters={RuntimeKind.LLAMACPP: adapter}
     )
     assert reloaded.get("invoice").activation == Activation.MANAGED
+
+
+def test_remove_reaps_orphan_when_pid_was_cleared(tmp_path: Path) -> None:
+    """A health-failure can clear ``record.pid`` while the OS process stays
+    alive. Deleting the deployment must still reap that orphan (matched by
+    port/model), not kill a null pid and leak its multi-GB RAM forever."""
+    adapter = ScriptedAdapter()
+    supervisor = _supervisor(tmp_path, adapter)
+    record = supervisor.deploy(_spec())
+    orphan_pid = record.pid
+    assert orphan_pid in adapter.running
+
+    # The orphan seed: control plane lost the pid, the process never died.
+    live = supervisor.get("invoice")
+    live.pid = None
+    live.pid_create_time = None
+
+    supervisor.remove("invoice")
+
+    assert orphan_pid in adapter.stops  # reaped despite the null recorded pid
+    assert orphan_pid not in adapter.running
+
+
+def test_stop_reaps_orphan_when_pid_was_cleared(tmp_path: Path) -> None:
+    """Same orphan hazard on the Stop path (desired_state=stopped)."""
+    adapter = ScriptedAdapter()
+    supervisor = _supervisor(tmp_path, adapter)
+    record = supervisor.deploy(_spec())
+    orphan_pid = record.pid
+
+    live = supervisor.get("invoice")
+    live.pid = None
+    live.pid_create_time = None
+
+    supervisor.stop("invoice")
+
+    assert orphan_pid in adapter.stops
+    assert orphan_pid not in adapter.running
 
 
 def test_manual_stop_stays_manual_and_is_never_auto_reloaded(tmp_path: Path) -> None:
