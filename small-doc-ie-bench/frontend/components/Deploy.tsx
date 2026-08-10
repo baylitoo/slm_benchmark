@@ -15,6 +15,7 @@ import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { Button } from "./ui";
 import { Sizing } from "./Sizing";
+import { Catalog } from "./Catalog";
 import { PageHeader } from "./patterns/PageHeader";
 import { POLL_MS } from "./deploy/shared";
 import { DeploymentsView } from "./deploy/DeploymentsView";
@@ -55,17 +56,23 @@ export function Deploy({
   );
 
   const heading =
-    view === "models"
-      ? { title: "Models", subtitle: "The model store you can deploy — GGUFs, encoders, embeddings." }
-      : view === "ports"
-        ? { title: "Ports", subtitle: "Live port allocation across running deployments." }
-        : view === "sizing"
-          ? {
-              title: "Sizing",
-              subtitle:
-                "GET /v1/serving/sizing — how many more instances fit in RAM right now.",
-            }
-          : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
+    view === "catalog"
+      ? {
+          title: "Catalog",
+          subtitle:
+            "Browse the Hugging Face Hub — segmented by serving family and support tier, ready to seed.",
+        }
+      : view === "models"
+        ? { title: "Models", subtitle: "The model store you can deploy — GGUFs, encoders, embeddings." }
+        : view === "ports"
+          ? { title: "Ports", subtitle: "Live port allocation across running deployments." }
+          : view === "sizing"
+            ? {
+                title: "Sizing",
+                subtitle:
+                  "GET /v1/serving/sizing — how many more instances fit in RAM right now.",
+              }
+            : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
 
   return (
     <div>
@@ -86,7 +93,9 @@ export function Deploy({
         }
       />
 
-      {view === "models" ? (
+      {view === "catalog" ? (
+        <Catalog families={families.data} onSeeded={() => store.refresh()} />
+      ) : view === "models" ? (
         <ModelsView store={store} onDeploy={() => setSlideOver("deploy")} />
       ) : view === "ports" ? (
         <PortsView deployments={deployments} />
