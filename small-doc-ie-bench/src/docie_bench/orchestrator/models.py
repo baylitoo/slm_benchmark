@@ -3,7 +3,17 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from docie_bench.storage.db import Base
@@ -100,7 +110,8 @@ class RunArtifact(Base):
     name: Mapped[str] = mapped_column(String(300))
     uri: Mapped[str] = mapped_column(Text)
     sha256: Mapped[str] = mapped_column(String(64))
-    size_bytes: Mapped[int] = mapped_column(Integer)
+    # BigInteger: an artifact can exceed Postgres INTEGER's ~2.147 GB cap.
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
     media_type: Mapped[str] = mapped_column(String(150), default="application/octet-stream")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
