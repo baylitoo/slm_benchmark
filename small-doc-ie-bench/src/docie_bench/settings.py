@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     annotation_export_dir: Path = Path("annotations")
 
     default_schema_name: str = "invoice"
+    # Repair UTF-8 mojibake in model output ("universitÃ©" -> "université"): small
+    # OCR/vision models emit double-encoded UTF-8 on accented (esp. French) text.
+    # ftfy's encoding-only fix, applied to completion + extraction content. Set
+    # False for a byte-faithful proxy (the transport itself is already clean).
+    fix_mojibake: bool = True
     # Studio-friendly default: strongest structured style declared, with the
     # serving negotiation ladder auto-downgrading per runtime so the Playground
     # returns valid JSON out-of-box even on small models.

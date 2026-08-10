@@ -16,6 +16,7 @@ from docie_bench.llm.model_gateway import (
     classify_response_error,
 )
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.llm.mojibake import fix_mojibake
 from docie_bench.llm.response_format import (
     build_response_format,
     is_generic_style,
@@ -339,6 +340,11 @@ class OpenAICompatibleClient:
                     )
                 if not isinstance(content, str):
                     raise InvalidModelResponseError("Model response content must be text")
+
+                # Repair model-emitted UTF-8 mojibake (accented OCR/extraction on
+                # small models) before parsing, so field values read correctly.
+                if get_settings().fix_mojibake:
+                    content = fix_mojibake(content)
 
                 logger.debug(
                     "llm_response",
