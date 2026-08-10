@@ -27,6 +27,8 @@ import httpx
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
 from docie_bench.ocr.factory import get_ocr_backend
+from docie_bench.settings import get_settings
+from docie_bench.vision import DocumentImage, load_document_images
 
 # OCR instruction for a VLM used as the pipeline's OCR step (image -> text). It
 # must transcribe, NOT summarise or answer — the extractor does the reasoning.
@@ -227,12 +229,23 @@ class PipelineSolution:
         extractor — and the final JSON — never sees ``universitÃ©``."""
         vision = self.ocr_model
         assert vision is not None  # guarded by the caller (complete)
+        raw, suffix = _extract_document(request)
+        # llama-server rejects a data:application/pdf URI (and multipage TIFF):
+        # rasterize to PNG page images first, the same path the vision Playground
+        # uses. An image passes through normalized to PNG.
+        try:
+            images = await asyncio.to_thread(_document_to_images, raw, suffix)
+        except ValueError as exc:
+            raise SolutionError(
+                str(exc), status_code=400, error_type="invalid_request_error"
+            ) from exc
+        content: list[dict[str, Any]] = [{"type": "text", "text": _VLM_OCR_PROMPT}]
+        content += [
+            {"type": "image_url", "image_url": {"url": image.data_url()}} for image in images
+        ]
         ocr_request: dict[str, Any] = {
             "model": vision.model,
-            "messages": [
-                {"role": "system", "content": _VLM_OCR_PROMPT},
-                *(request.get("messages") or []),
-            ],
+            "messages": [{"role": "user", "content": content}],
             "temperature": 0,
         }
         url = f"{vision.base_url}/chat/completions"
@@ -265,6 +278,18 @@ class PipelineSolution:
                 part.get("text", "") for part in content if isinstance(part, dict)
             )
         return fix_mojibake(str(content or "")) or ""
+
+
+def _document_to_images(raw: bytes, suffix: str) -> list[DocumentImage]:
+    """Rasterize the document for a vision model: PDF -> PNG pages, image ->
+    normalized PNG. llama-server only accepts image data URIs, never a PDF."""
+    with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        handle.write(raw)
+        tmp = Path(handle.name)
+    try:
+        return load_document_images(tmp, pdf_dpi=get_settings().ocr_dpi)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _ocr_to_text(backend_name: str, language: object, raw: bytes, suffix: str) -> str:
