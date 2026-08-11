@@ -46,6 +46,42 @@ _VLM_OCR_PROMPT = (
 _PIPELINE_UPSTREAM_TIMEOUT_S = 600.0
 
 
+def prefill_json_object(body: dict[str, Any]) -> dict[str, Any]:
+    """Append an assistant turn opening a JSON object so the model CONTINUES it.
+
+    The one reliable, model-agnostic way to suppress a reasoning model's <think>
+    ramble on a structured-extraction call: prefilling "{" (continue-final-
+    message) makes the model emit the answer directly instead of thinking and
+    then returning an empty ``{}`` (observed on lfm2.5-2.6b AND qwen3.5-0.8b;
+    ``enable_thinking=false`` is honored only by some families and did nothing
+    for LFM2.5). It cooperates with the response_format grammar — llama.cpp
+    assembles the prefix + the constrained continuation into one valid object —
+    and is harmless on a non-reasoning model (it just starts the JSON)."""
+    body["messages"] = [*(body.get("messages") or []), {"role": "assistant", "content": "{"}]
+    return body
+
+
+def repair_prefilled_content(completion: Any) -> Any:
+    """Ensure a prefilled completion's content is a complete object.
+
+    This llama-server build returns the assembled ``{...}``; a server that
+    returns only the continuation would drop the leading brace. Prepend it when
+    missing so the content always parses as JSON. Best-effort on any shape."""
+    if not isinstance(completion, dict):
+        return completion
+    for choice in completion.get("choices") or []:
+        message = choice.get("message") if isinstance(choice, dict) else None
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            content = message["content"]
+            if content.lstrip() and not content.lstrip().startswith("{"):
+                message["content"] = "{" + content
+    return completion
+
+
+def wants_json_schema(response_format: Any) -> bool:
+    return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
+
+
 def apply_no_think(body: dict[str, Any]) -> dict[str, Any]:
     """Add the reasoning-off signal to a chat request (in place + returned).
 
@@ -227,6 +263,12 @@ class PipelineSolution:
         llm_request.pop("stream", None)  # the gateway re-streams the final completion
         if self.no_think:
             apply_no_think(llm_request)
+        # Suppress a reasoning extractor's <think>-then-empty-{} on a structured
+        # call by prefilling the JSON open brace — model-agnostic, cooperates
+        # with the grammar. Applied whenever the extraction is schema-constrained.
+        prefilled = wants_json_schema(llm_request.get("response_format"))
+        if prefilled:
+            prefill_json_object(llm_request)
         url = f"{self.extractor.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.extractor.api_key}",
@@ -251,7 +293,10 @@ class PipelineSolution:
                 status_code=resp.status_code,
                 error_type="upstream_error",
             )
-        return resp.json()
+        completion = resp.json()
+        if prefilled:
+            repair_prefilled_content(completion)
+        return completion
 
     async def _vlm_ocr(self, request: dict[str, Any]) -> str:
         """Transcribe the document image to text with the vision deployment.

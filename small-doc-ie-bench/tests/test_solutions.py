@@ -334,3 +334,54 @@ async def test_pipeline_no_think_rides_ocr_and_extractor(
         )
     assert seen["vlm"]["chat_template_kwargs"]["enable_thinking"] is False
     assert seen["ext"]["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_prefill_and_repair_helpers() -> None:
+    from docie_bench.serving.solutions import (
+        prefill_json_object,
+        repair_prefilled_content,
+        wants_json_schema,
+    )
+
+    body = {"messages": [{"role": "user", "content": "x"}]}
+    prefill_json_object(body)
+    assert body["messages"][-1] == {"role": "assistant", "content": "{"}
+    assert wants_json_schema({"type": "json_schema"}) is True
+    assert wants_json_schema({"type": "json_object"}) is False
+    # continuation-only content (no leading brace) gets the brace back; a
+    # complete object is left untouched.
+    c1 = {"choices": [{"message": {"content": ' "a": 1}'}}]}
+    assert repair_prefilled_content(c1)["choices"][0]["message"]["content"] == '{ "a": 1}'
+    c2 = {"choices": [{"message": {"content": '{"a": 1}'}}]}
+    assert repair_prefilled_content(c2)["choices"][0]["message"]["content"] == '{"a": 1}'
+
+
+async def test_pipeline_prefills_json_and_repairs_extractor_content(fake_ocr: None) -> None:
+    # A schema-constrained extraction prefills the assistant "{" (suppresses a
+    # reasoning ramble) and repairs a continuation-only response to valid JSON.
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["req"] = json.loads(request.content)
+        return httpx.Response(  # server returns only the continuation
+            200, json={"choices": [{"message": {"content": ' "total_ttc": 10}'}}]}
+        )
+
+    profiles = {
+        "llm_x": ModelProfile(name="llm_x", model="ul", base_url="http://llm-x/v1", api_key="k")
+    }
+    pipe = ModelProfile(
+        name="pipe", model="", base_url="", api_key="", kind="pipeline",
+        options={"ocr_backend": "tesseract", "extractor": "llm_x"},
+    )
+    req = _image_request("pipe")
+    req["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {"name": "invoice", "schema": {}},
+    }
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await build_solution(pipe, profiles=profiles, http_client=http).complete(req)
+
+    assert seen["req"]["messages"][-1] == {"role": "assistant", "content": "{"}
+    assert result["choices"][0]["message"]["content"] == '{ "total_ttc": 10}'
