@@ -27,7 +27,7 @@ from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
 )
-from docie_bench.serving.solutions import SolutionError, build_solution
+from docie_bench.serving.solutions import SolutionError, apply_no_think, build_solution
 
 PROXY_MODES = ("placeholder", "block", "detect")
 
@@ -207,6 +207,8 @@ async def _complete_ocr(
                 {"role": "system", "content": spec.system_prompt},
                 *(base.get("messages") or []),
             ]
+        if options.get("no_think"):
+            apply_no_think(base)
         schema_name = options.get("schema")
         completion = await _post_chat_with_schema(
             upstream,
@@ -234,6 +236,7 @@ async def _complete_ocr(
             "ocr_backend": options.get("backend", "tesseract"),
             "language": options.get("language"),
             "extractor": extractor.name,
+            "no_think": bool(options.get("no_think")),
         }
         # OCR step may be a deployed VISION model (VLM as OCR: image -> text)
         # instead of a built-in backend — resolved like the extractor and passed

@@ -37,6 +37,30 @@ _VLM_OCR_PROMPT = (
     "Output only the transcribed text — no commentary, no markdown, no analysis."
 )
 
+
+# Document extraction (OCR text -> JSON, or image -> text) on a CPU box is slow:
+# a multi-page invoice easily generates 1k+ grammar-constrained tokens at single
+# digits tok/s. The model's CHAT default timeout (e.g. 180s for lfm2) then fires
+# mid-JSON and the request is cancelled. The pipeline's upstream calls get at
+# least this floor so a legitimate long extraction completes.
+_PIPELINE_UPSTREAM_TIMEOUT_S = 600.0
+
+
+def apply_no_think(body: dict[str, Any]) -> dict[str, Any]:
+    """Add the reasoning-off signal to a chat request (in place + returned).
+
+    Qwen3/3.5 and similar honor ``chat_template_kwargs.enable_thinking=false``
+    (via llama-server ``--jinja``): the model skips its reasoning channel and
+    emits the answer directly. Without it a reasoning model used as an OCR or
+    extraction step burns the whole token budget on a <think> ramble and never
+    reaches the grammar-constrained answer (observed: a 0.8B emitting 5.7k
+    reasoning tokens and an empty ``content``). Templates that ignore the flag
+    are unaffected, so it is safe to send whenever the operator opts in."""
+    kwargs = dict(body.get("chat_template_kwargs") or {})
+    kwargs["enable_thinking"] = False
+    body["chat_template_kwargs"] = kwargs
+    return body
+
 _DATA_URI_SUFFIX = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -182,6 +206,9 @@ class PipelineSolution:
             )
         self.extractor = extractor
         self.http = http_client
+        # Suppress the model's reasoning channel on both the OCR and extraction
+        # calls (reasoning models otherwise ramble past the token budget).
+        self.no_think = bool(profile.options.get("no_think"))
 
     async def complete(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.ocr_model is not None:
@@ -198,6 +225,8 @@ class PipelineSolution:
             "messages": _inject_ocr_text(request.get("messages") or [], text),
         }
         llm_request.pop("stream", None)  # the gateway re-streams the final completion
+        if self.no_think:
+            apply_no_think(llm_request)
         url = f"{self.extractor.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.extractor.api_key}",
@@ -205,7 +234,10 @@ class PipelineSolution:
         }
         try:
             resp = await self.http.post(
-                url, json=llm_request, headers=headers, timeout=self.extractor.timeout_seconds
+                url,
+                json=llm_request,
+                headers=headers,
+                timeout=max(self.extractor.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
             )
         except httpx.RequestError as exc:
             raise SolutionError(
@@ -248,6 +280,8 @@ class PipelineSolution:
             "messages": [{"role": "user", "content": content}],
             "temperature": 0,
         }
+        if self.no_think:
+            apply_no_think(ocr_request)
         url = f"{vision.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {vision.api_key}",
@@ -255,7 +289,10 @@ class PipelineSolution:
         }
         try:
             resp = await self.http.post(
-                url, json=ocr_request, headers=headers, timeout=vision.timeout_seconds
+                url,
+                json=ocr_request,
+                headers=headers,
+                timeout=max(vision.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
             )
         except httpx.RequestError as exc:
             raise SolutionError(
