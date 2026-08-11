@@ -178,18 +178,35 @@ async def _post_chat_with_schema(
 
     strict = dict(guided)
     _inject_response_format(strict, schema_name)  # unknown schema -> AgentError (propagates)
-    json_object = {**guided, "response_format": {"type": "json_object"}}
-    plain = dict(guided)
-    attempts = (strict, json_object, plain)
+    # Ladder, strongest first:
+    #  1. grammar + JSON prefill — suppresses a reasoning model's <think> ramble.
+    #  2. grammar, NO prefill — some models fail grammar-SAMPLER init when the
+    #     assistant turn is prefilled ("Failed to initialize samplers"); keep the
+    #     schema, drop the prefill (a non-reasoning extractor answers directly).
+    #  3. json_object + prefill — valid JSON, no schema grammar.
+    #  4. plain.
+    attempts = (
+        prefill_json_object(dict(strict)),
+        strict,
+        prefill_json_object({**guided, "response_format": {"type": "json_object"}}),
+        dict(guided),
+    )
 
     last_error: AgentError | None = None
     for index, attempt in enumerate(attempts):
         try:
-            return await _post_chat(upstream, attempt, http_client=http_client)
+            completion = await _post_chat(upstream, attempt, http_client=http_client)
+            return repair_prefilled_content(completion)
         except AgentError as exc:
             downgradable = exc.status_code == 400 and any(
                 token in str(exc).lower()
-                for token in ("grammar", "response_format", "json_schema", "json schema")
+                for token in (
+                    "grammar",
+                    "response_format",
+                    "json_schema",
+                    "json schema",
+                    "sampler",  # "Failed to initialize samplers" — prefill+grammar
+                )
             )
             if index < len(attempts) - 1 and downgradable:
                 last_error = exc
@@ -225,19 +242,15 @@ async def _complete_ocr(
         if options.get("no_think"):
             apply_no_think(base)
         schema_name = options.get("schema")
-        # Prefill the JSON open brace so a reasoning vision model continues the
-        # object directly instead of a <think> ramble + empty {} (see
-        # prefill_json_object). Only for the schema-constrained path.
-        if schema_name:
-            prefill_json_object(base)
+        # Prefill + repair are managed per-attempt inside _post_chat_with_schema
+        # (it tries grammar+prefill, then grammar WITHOUT prefill for models whose
+        # sampler init fails on a prefilled turn) — not here.
         completion = await _post_chat_with_schema(
             upstream,
             base,
             str(schema_name) if schema_name else None,
             http_client=http_client,
         )
-        if schema_name:
-            repair_prefilled_content(completion)
         completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind, "mode": mode}
         return completion
 
