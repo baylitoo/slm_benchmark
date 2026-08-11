@@ -282,3 +282,55 @@ def test_factory_liteparse_is_pdf_text_backend() -> None:
     assert isinstance(get_ocr_backend("pdf_text"), PdfTextBackend)  # legacy alias
     with pytest.raises(ValueError, match="Unknown OCR backend"):
         get_ocr_backend("nonsense")
+
+
+def test_apply_no_think_sets_flag_and_merges() -> None:
+    from docie_bench.serving.solutions import apply_no_think
+
+    body: dict = {"messages": []}
+    apply_no_think(body)
+    assert body["chat_template_kwargs"]["enable_thinking"] is False
+    # merges with pre-existing chat_template_kwargs.
+    body2 = {"chat_template_kwargs": {"foo": 1}}
+    apply_no_think(body2)
+    assert body2["chat_template_kwargs"] == {"foo": 1, "enable_thinking": False}
+
+
+async def test_pipeline_no_think_rides_ocr_and_extractor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A reasoning extractor otherwise burns the budget thinking and emits no JSON;
+    # no_think must ride BOTH the VLM-OCR call and the extractor call.
+    from docie_bench.vision import DocumentImage
+
+    monkeypatch.setattr(
+        "docie_bench.serving.solutions.load_document_images",
+        lambda path, *, pdf_dpi=150: [
+            DocumentImage(page=1, media_type="image/png", data=b"P")
+        ],
+    )
+    seen: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen["vlm" if request.url.host == "vlm-x" else "ext"] = body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "x"}}]})
+
+    profiles = {
+        "vlm_x": ModelProfile(
+            name="vlm_x", model="uv", base_url="http://vlm-x/v1", api_key="k"
+        ),
+        "llm_x": ModelProfile(
+            name="llm_x", model="ul", base_url="http://llm-x/v1", api_key="k"
+        ),
+    }
+    pipe = ModelProfile(
+        name="pipe", model="", base_url="", api_key="", kind="pipeline",
+        options={"extractor": "llm_x", "ocr_model": "vlm_x", "no_think": True},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await build_solution(pipe, profiles=profiles, http_client=http).complete(
+            _image_request("pipe")
+        )
+    assert seen["vlm"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert seen["ext"]["chat_template_kwargs"]["enable_thinking"] is False

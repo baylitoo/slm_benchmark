@@ -686,6 +686,9 @@ function CreateView({
   // OCR→extract step-1 may be a deployed VISION model (VLM as OCR) instead of a
   // built-in backend. When set it wins; the built-in backend is ignored.
   const [ocrModel, setOcrModel] = useState("");
+  // Suppress a reasoning model's think channel (enable_thinking=false) so it
+  // emits the answer directly instead of rambling past the token budget.
+  const [noThink, setNoThink] = useState(false);
   // Staged document-extraction mode: plain OCR | OCR→LLM | vision→structured.
   const [ocrMode, setOcrMode] = useState<"ocr" | "ocr_extract" | "vision">("ocr");
   const [visionModel, setVisionModel] = useState("");
@@ -740,6 +743,7 @@ function CreateView({
     setOcrLanguage(typeof o.language === "string" ? o.language : "");
     setOcrExtractor(typeof o.extractor === "string" ? o.extractor : "");
     setOcrModel(typeof o.ocr_model === "string" ? o.ocr_model : "");
+    setNoThink(o.no_think === true);
     setVisionModel(typeof o.vision_model === "string" ? o.vision_model : "");
     setSchemaName(typeof o.schema === "string" ? o.schema : "");
     // Back-compat: an agent saved before `mode` derives it — extractor → the
@@ -786,6 +790,7 @@ function CreateView({
                   mode: "vision",
                   vision_model: visionModel || null,
                   schema: schemaName || null,
+                  no_think: noThink,
                 }
               : ocrMode === "ocr_extract"
                 ? {
@@ -797,6 +802,7 @@ function CreateView({
                     language: ocrLanguage || null,
                     extractor: ocrExtractor || null,
                     schema: schemaName || null,
+                    no_think: noThink,
                   }
                 : {
                     mode: "ocr",
@@ -1256,6 +1262,27 @@ function CreateView({
                       ))}
                     </Select>
                   </Field>
+                )}
+
+                {/* Reasoning models ramble past the token budget and never reach
+                    the grammar answer — let the operator turn thinking off. */}
+                {ocrMode !== "ocr" && (
+                  <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground/90">
+                    <input
+                      type="checkbox"
+                      checked={noThink}
+                      onChange={(e) => setNoThink(e.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5"
+                    />
+                    <span>
+                      Disable thinking (reasoning models)
+                      <span className="block text-muted-foreground">
+                        Sends enable_thinking=false so the model emits the answer
+                        directly instead of a long think channel. No effect on models
+                        without one.
+                      </span>
+                    </span>
+                  </label>
                 )}
 
                 {ocrMode === "vision" && (
