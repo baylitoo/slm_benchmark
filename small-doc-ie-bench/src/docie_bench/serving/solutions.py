@@ -38,6 +38,14 @@ _VLM_OCR_PROMPT = (
 )
 
 
+# Document extraction (OCR text -> JSON, or image -> text) on a CPU box is slow:
+# a multi-page invoice easily generates 1k+ grammar-constrained tokens at single
+# digits tok/s. The model's CHAT default timeout (e.g. 180s for lfm2) then fires
+# mid-JSON and the request is cancelled. The pipeline's upstream calls get at
+# least this floor so a legitimate long extraction completes.
+_PIPELINE_UPSTREAM_TIMEOUT_S = 600.0
+
+
 def apply_no_think(body: dict[str, Any]) -> dict[str, Any]:
     """Add the reasoning-off signal to a chat request (in place + returned).
 
@@ -226,7 +234,10 @@ class PipelineSolution:
         }
         try:
             resp = await self.http.post(
-                url, json=llm_request, headers=headers, timeout=self.extractor.timeout_seconds
+                url,
+                json=llm_request,
+                headers=headers,
+                timeout=max(self.extractor.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
             )
         except httpx.RequestError as exc:
             raise SolutionError(
@@ -278,7 +289,10 @@ class PipelineSolution:
         }
         try:
             resp = await self.http.post(
-                url, json=ocr_request, headers=headers, timeout=vision.timeout_seconds
+                url,
+                json=ocr_request,
+                headers=headers,
+                timeout=max(vision.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
             )
         except httpx.RequestError as exc:
             raise SolutionError(
