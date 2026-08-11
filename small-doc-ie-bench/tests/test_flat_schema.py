@@ -43,3 +43,29 @@ def test_flat_schema_forbids_extra_keys() -> None:
 def test_unknown_schema_raises() -> None:
     with pytest.raises(ValueError, match="Unknown schema_name"):
         flat_schema_json("not-a-schema")
+
+
+def test_flat_schema_omits_meta_fields_so_data_lands_in_typed_fields() -> None:
+    # document_type (a const) and extraction_notes (the free-text catch-all) are
+    # dropped from the GRAMMAR so a small model can't dump the whole document into
+    # notes; Pydantic fills both from defaults on parse, so the model still
+    # validates. The real typed fields stay.
+    props = flat_schema_json("invoice")["properties"]
+    assert "extraction_notes" not in props
+    assert "document_type" not in props
+    assert "total_ttc" in props
+    assert "invoice_number" in props
+    required = flat_schema_json("invoice").get("required", [])
+    assert "extraction_notes" not in required
+    assert "document_type" not in required
+
+
+def test_flat_schema_result_still_validates_the_basemodel() -> None:
+    # A grammar-shaped object (no meta fields) must still build the BaseModel:
+    # document_type defaults to the const, extraction_notes to [].
+    from docie_bench.schemas.extraction import get_schema_model
+
+    model = get_schema_model("invoice")
+    obj = model.model_validate({"invoice_number": {"value": "F-1"}})
+    assert obj.document_type == "invoice"
+    assert obj.extraction_notes == []

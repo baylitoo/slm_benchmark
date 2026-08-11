@@ -105,6 +105,15 @@ _FLATTEN_DROP = frozenset(
 # metadata siblings of `value`.
 _WRAPPER_MARKERS = frozenset({"evidence_ids", "confidence"})
 
+# Meta fields OMITTED from the GRAMMAR (not the model): the const document_type
+# and the free-text extraction_notes catch-all. Keeping them in the grammar lets
+# a small model route the data into notes instead of the typed fields (observed:
+# a whole invoice dumped into extraction_notes). Pydantic fills both from their
+# defaults on parse (document_type is a const, extraction_notes defaults to []),
+# so the BaseModel still validates — and the model is forced to populate the
+# typed fields. Mirrors the NuExtract templates, which omit the same two.
+_GRAMMAR_OMIT_FIELDS = frozenset({"document_type", "extraction_notes"})
+
 
 def flat_schema_json(schema_name: str) -> dict:
     """A llama.cpp-GBNF-compatible, FLATTENED copy of the extraction schema.
@@ -162,6 +171,14 @@ def flat_schema_json(schema_name: str) -> dict:
         return out
 
     result = transform(root)
+    if isinstance(result, dict):
+        props = result.get("properties")
+        if isinstance(props, dict):
+            for meta in _GRAMMAR_OMIT_FIELDS:
+                props.pop(meta, None)
+        required = result.get("required")
+        if isinstance(required, list):
+            result["required"] = [r for r in required if r not in _GRAMMAR_OMIT_FIELDS]
     return result if isinstance(result, dict) else {}
 
 
