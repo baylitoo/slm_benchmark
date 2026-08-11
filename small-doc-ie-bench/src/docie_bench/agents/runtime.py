@@ -115,24 +115,33 @@ def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
 
 
 def _schema_instruction(schema_name: str) -> str | None:
-    """A prompt that names the fields to extract. The response_format grammar
-    constrains the SHAPE but never tells the model WHICH fields to pull; when the
-    grammar can't compile and we fall back to json_object, that's all the model
-    has — without it a vision model just echoes the prompt (``{"OCR": true}``).
-    So the target fields ride in the prompt too, for every attempt."""
-    from docie_bench.schemas.extraction import schema_json
+    """Name the exact typed fields to populate and forbid the free-text dump.
+
+    The response_format grammar constrains the SHAPE but does not tell the model
+    to put each value in its OWN field — a small model otherwise routes the whole
+    document into a catch-all (observed: an entire invoice inside
+    ``extraction_notes``). Fields come from the FLATTENED schema, where the meta
+    ``document_type``/``extraction_notes`` are already omitted, so the prompt
+    names exactly what the grammar accepts. Also the fallback signal when the
+    grammar can't compile (json_object) — without it a vision model just echoes
+    the prompt (``{"OCR": true}``)."""
+    from docie_bench.schemas.extraction import flat_schema_json
 
     try:
-        properties = schema_json(schema_name).get("properties")
+        properties = flat_schema_json(schema_name).get("properties")
     except ValueError:
         return None
     if not isinstance(properties, dict) or not properties:
         return None
     fields = ", ".join(properties)
     return (
-        "You extract structured data from the document in the image. Return ONLY "
-        "a single JSON object with these fields (use null when a field is absent "
-        f"from the document): {fields}. No prose, no explanation — JSON only."
+        "Extract the document's data into a single JSON object. Populate each of "
+        f"these typed fields directly: {fields}. Put every value in its OWN field "
+        "(the total in the total field, the invoice number in the number field, "
+        "and so on); use null only when a field is genuinely absent. Do NOT "
+        "summarize the document or dump values into a notes/remarks field — the "
+        "output must validate against the strict schema. Output only the JSON "
+        "object: no prose, no markdown."
     )
 
 
@@ -260,10 +269,19 @@ async def _complete_ocr(
             profiles[ocr_vision.name] = ocr_vision
             solution_options["ocr_model"] = ocr_vision.name
         # An optional schema makes the OCR→LLM extraction reliably structured —
-        # the same grammar constraint the vision path uses, over OCR text.
+        # the same grammar constraint the vision path uses, over OCR text. The
+        # field-naming instruction rides too (as it does on the vision path): the
+        # grammar shapes the object, this makes the model populate the TYPED
+        # fields instead of dumping the document into a notes field.
         schema_name = options.get("schema")
         if schema_name:
             _inject_response_format(body, str(schema_name))
+            instruction = _schema_instruction(str(schema_name))
+            if instruction:
+                body["messages"] = [
+                    {"role": "system", "content": instruction},
+                    *(body.get("messages") or []),
+                ]
     else:
         kind = "ocr"
         solution_options = {
