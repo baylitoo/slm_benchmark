@@ -309,9 +309,14 @@ def test_ocr_agent_vision_mode_forwards_image_with_schema(api) -> None:
     # Schema injected as response_format (GBNF structuring).
     assert sent["response_format"]["json_schema"]["name"] == "invoice"
     # The image reaches the model untouched (no OCR step).
+    # The schema-constrained call prefills an assistant "{" (suppresses a
+    # reasoning ramble); the image rides the user turn just before it.
+    assert sent["messages"][-1] == {"role": "assistant", "content": "{"}
     assert any(
-        isinstance(p, dict) and p.get("type") == "image_url"
-        for p in sent["messages"][-1]["content"]
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for message in sent["messages"]
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
     )
     assert resp.json()["docie_agent"]["mode"] == "vision"
 
