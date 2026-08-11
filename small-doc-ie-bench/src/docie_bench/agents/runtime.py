@@ -27,7 +27,13 @@ from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
 )
-from docie_bench.serving.solutions import SolutionError, apply_no_think, build_solution
+from docie_bench.serving.solutions import (
+    SolutionError,
+    apply_no_think,
+    build_solution,
+    prefill_json_object,
+    repair_prefilled_content,
+)
 
 PROXY_MODES = ("placeholder", "block", "detect")
 
@@ -210,12 +216,19 @@ async def _complete_ocr(
         if options.get("no_think"):
             apply_no_think(base)
         schema_name = options.get("schema")
+        # Prefill the JSON open brace so a reasoning vision model continues the
+        # object directly instead of a <think> ramble + empty {} (see
+        # prefill_json_object). Only for the schema-constrained path.
+        if schema_name:
+            prefill_json_object(base)
         completion = await _post_chat_with_schema(
             upstream,
             base,
             str(schema_name) if schema_name else None,
             http_client=http_client,
         )
+        if schema_name:
+            repair_prefilled_content(completion)
         completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind, "mode": mode}
         return completion
 
