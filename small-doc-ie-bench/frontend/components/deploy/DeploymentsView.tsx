@@ -555,7 +555,12 @@ export function DeploymentsView({
       header: "Port",
       sortAccessor: (r) => r.spec?.launch?.port ?? 0,
       render: (r) => (
-        <span className="font-mono tabular-nums text-xs">{r.spec?.launch?.port ?? "—"}</span>
+        <span
+          className="font-mono tabular-nums text-xs"
+          title={r.pid != null ? `pid: ${r.pid}` : undefined}
+        >
+          {r.spec?.launch?.port ?? "—"}
+        </span>
       ),
     },
     {
