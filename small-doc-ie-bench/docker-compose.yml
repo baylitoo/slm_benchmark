@@ -356,6 +356,14 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
+      # The Studio embeds the docie dashboard in an iframe (Observability tab).
+      # Grafana refuses to be framed (X-Frame-Options: deny) and requires login
+      # by default — both block the panel outright, showing a blank iframe.
+      # Anonymous Viewer access + explicit embedding removes both blockers
+      # without weakening admin auth (still required to edit/configure).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro

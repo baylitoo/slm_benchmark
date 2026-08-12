@@ -20,7 +20,6 @@ import {
   Play,
   History,
   BarChart3,
-  ExternalLink,
   Bot,
   LayoutGrid,
   PlusCircle,
@@ -79,10 +78,10 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     heading: "Observability",
-    items: [
-      { id: "observability", label: "Dashboards", icon: BarChart3, view: "dashboards" },
-      { id: "observability", label: "Links", icon: ExternalLink, view: "links" },
-    ],
+    // A single view — no sub-tabs (mirrors Playground): the page combines the
+    // quick-link tiles and the embedded dashboard together, so there is
+    // nothing left to split into a separate "Links" tab.
+    items: [{ id: "observability", label: "Dashboards", icon: BarChart3 }],
   },
 ];
 
@@ -101,5 +100,5 @@ export const DEFAULT_VIEW: Record<SectionId, string> = {
   deploy: "deployments",
   agents: "catalog",
   benchmark: "run",
-  observability: "dashboards",
+  observability: "",
 };
