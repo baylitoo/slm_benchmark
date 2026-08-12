@@ -101,7 +101,7 @@ export function AppShell() {
                   {id === "deploy" && <Deploy active={active === "deploy"} view={viewFor(id)} />}
                   {id === "agents" && <Agents view={viewFor(id)} />}
                   {id === "benchmark" && <Benchmark view={viewFor(id)} />}
-                  {id === "observability" && <Observability view={viewFor(id)} />}
+                  {id === "observability" && <Observability />}
                 </SectionActivityProvider>
               </div>
             ))}
