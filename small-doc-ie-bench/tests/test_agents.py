@@ -232,11 +232,39 @@ async def test_schema_fallback_downgrades_on_grammar_400() -> None:
         result = await _post_chat_with_schema(
             UPSTREAM, msgs, "invoice", http_client=client
         )
-    assert seen[0] is not None
-    assert seen[0]["type"] == "json_schema"  # tried strict first
-    assert seen[1] is not None
-    assert seen[1]["type"] == "json_object"  # then downgraded
+    # Ladder: grammar+prefill, grammar (no prefill), then json_object.
+    assert [s and s["type"] for s in seen] == ["json_schema", "json_schema", "json_object"]
     assert result["choices"][0]["message"]["content"] == "{}"
+
+
+async def test_schema_fallback_grammar_without_prefill_on_sampler_400() -> None:
+    # Some models fail grammar-SAMPLER init only when the assistant turn is
+    # prefilled ("Failed to initialize samplers"). The ladder then retries the
+    # SAME grammar without the prefill — keeping schema enforcement — before
+    # dropping to json_object. Verified live on lfm2.5-vl-1.6b-extract.
+    from docie_bench.agents.runtime import _post_chat_with_schema
+
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        prefilled = (body.get("messages") or [])[-1:] == [{"role": "assistant", "content": "{"}]
+        if body.get("response_format", {}).get("type") == "json_schema" and prefilled:
+            return httpx.Response(
+                400, json={"error": {"message": "Failed to initialize samplers: std::exception"}}
+            )
+        return httpx.Response(200, json=_completion(body["model"]))
+
+    msgs = {"messages": [{"role": "user", "content": "x"}]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
+    # 1st = grammar + prefill (400 sampler), 2nd = grammar WITHOUT prefill (200).
+    assert seen[0]["response_format"]["type"] == "json_schema"
+    assert seen[0]["messages"][-1] == {"role": "assistant", "content": "{"}
+    assert seen[1]["response_format"]["type"] == "json_schema"  # grammar KEPT
+    assert seen[1]["messages"][-1] != {"role": "assistant", "content": "{"}  # no prefill
+    assert len(seen) == 2  # no need to reach json_object
 
 
 async def test_schema_instruction_names_fields_in_prompt() -> None:
