@@ -165,6 +165,36 @@ async def render_document(
     return {"images": images, "pages": len(images)}
 
 
+@router.get("/datasets")
+async def list_datasets() -> list[dict[str, Any]]:
+    """Registered benchmark datasets (``data/datasets.yaml``) — what a "Dataset"
+    field in the Studio can actually reference, so the Benchmark form can offer
+    a picker instead of a free-text guess.
+
+    Each entry is a name (the ``dataset`` value ``/benchmark`` and
+    ``run_benchmark`` resolve), its latest version, all known versions, and the
+    latest version's document count. Missing registry file degrades to an
+    empty list (``load_registry``'s own contract), never a 500.
+    """
+    from docie_bench.benchmark.registry import DEFAULT_REGISTRY_PATH, load_registry
+
+    registry = load_registry(DEFAULT_REGISTRY_PATH)
+    return [
+        {
+            "name": name,
+            "description": record.description,
+            "latest": record.latest,
+            "versions": sorted(record.versions),
+            "documents": (
+                record.versions[record.latest].statistics.get("documents")
+                if record.latest and record.latest in record.versions
+                else None
+            ),
+        }
+        for name, record in sorted(registry.datasets.items())
+    ]
+
+
 class BenchmarkRequest(BaseModel):
     dataset: str
     split: str | None = None

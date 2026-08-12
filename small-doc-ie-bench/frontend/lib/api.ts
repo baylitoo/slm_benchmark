@@ -567,6 +567,22 @@ export function getDeploymentLogs(name: string, lines = 200): Promise<Deployment
   );
 }
 
+/** A registered benchmark dataset (GET /v1/studio/datasets) — the values a
+ * Benchmark run's `dataset` field can actually reference. */
+export interface DatasetSummary {
+  name: string;
+  description: string | null;
+  latest: string | null;
+  versions: string[];
+  documents: number | null;
+}
+
+/** Registered datasets, so the Benchmark form can offer a picker instead of a
+ * free-text guess at a name that may not be registered. */
+export function listDatasets(): Promise<DatasetSummary[]> {
+  return request<DatasetSummary[]>("/v1/studio/datasets");
+}
+
 /** Benchmark returns the same trigger shape as extract. */
 export function triggerBenchmark(payload: BenchmarkRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/benchmark", {
