@@ -1,8 +1,105 @@
 # Small Document IE Benchmark
 
-Enterprise-grade CPU-only benchmark harness for structured information extraction from invoices and identity documents using small local/open models behind an OpenAI-compatible API.
+A local small-language-model (SLM) serving fabric and document-information-extraction
+platform, plus the enterprise-grade CPU-only benchmark harness that qualifies which
+model to trust for a given task. It separates OCR/layout, model serving, constrained
+JSON extraction, validation, persistence, and benchmark reporting behind one
+OpenAI-compatible API.
 
-The project is designed for a Ryzen-class CPU server with 64 GB RAM and no GPU. It separates OCR/layout, model serving, constrained JSON extraction, validation, persistence, and benchmark reporting.
+The project is designed for a Ryzen-class CPU server with 64 GB RAM and no GPU — it
+runs an SLM fleet (LFM2.5, Qwen, Gemma, NuExtract, and any GGUF/HF model) as workflow
+steps: OCR, structured extraction, PII detection, embeddings.
+
+**Two ways in:**
+
+- **DocIE Studio** — a web UI (Next.js + FastAPI + Inngest) for deploying models from a
+  Hugging Face catalog, building extraction agents (vision→JSON, OCR→LLM pipelines,
+  security proxies), running benchmarks, and watching capacity/throughput in Grafana.
+  One command: `make studio`. See "DocIE Studio" below.
+- **The CLI + benchmark harness** — `docie` for serving a single model, `docie-bench`
+  for scripted/headless benchmark runs and dataset versioning. Documented below.
+
+## DocIE Studio
+
+A web app + async backend on top of the framework below. One `docker compose up`
+brings up the whole stack; extraction, benchmark runs, and model deploys run as
+durable [Inngest](https://www.inngest.com/) functions on a background **worker**,
+and a Next.js UI drives and observes them. It's additive — the CLI and the
+hand-rolled `orchestrator/` queue are untouched; Inngest is a separate,
+event-driven path on top.
+
+```
+ browser ──► web (Next.js :3000) ──► api (FastAPI :8080) ──inngest.send(event)──► inngest server (:8288 / :8289)
+                  ▲  realtime hook            │  /v1/studio/*, /v1/serving/*, /v1/agents/*   │ dispatch (Connect WS)
+                  └──────────── realtime ◄────┴── token / runs proxy                         ▼
+                                                                                     worker (docie-worker)
+                                                                                     runs the functions, calls
+                                                                                     ExtractionService / run_benchmark
+```
+
+`worker` holds the Inngest functions and dials *out* to the Connect gateway
+(`:8289`) — no inbound HTTP, no public reachability needed; scale it with
+`docker compose up -d --scale worker=3`. `api` only sends events and proxies
+status/realtime tokens back to the UI.
+
+| Service | Port | Purpose |
+|---|---|---|
+| `web` | 3000 | DocIE Studio UI |
+| `api` | 8080 | FastAPI: `/v1/studio/*`, `/v1/serving/*`, `/v1/agents/*` |
+| `inngest` | 8288 / 8289 | Dashboard+API / Connect gateway |
+| `grafana` | 3001 | Dashboards (observability profile) |
+| `prometheus` | 9090 | Metrics (observability profile) |
+| `postgres` | 5432 | App DB + `inngest` DB |
+| `redis` | — | Inngest run state |
+
+```bash
+cp .env.example .env
+# In .env set two hex keys (even length): openssl rand -hex 32
+#   INNGEST_EVENT_KEY=...
+#   INNGEST_SIGNING_KEY=...
+#   INNGEST_DEV=0
+make studio            # == docker compose up -d --build postgres redis inngest worker api web
+```
+
+Open **http://localhost:3000** for the Studio, **http://localhost:8288** for the
+Inngest dashboard (the worker shows under *Apps*).
+
+> **Gotcha:** `infra/postgres/init.sql` only runs on a *fresh* Postgres volume. If
+> you already have a `postgres-data` volume, create the `inngest` DB once:
+> `docker compose exec postgres psql -U docie -d docie -c "CREATE DATABASE inngest;"`
+
+**The tabs:**
+
+- **Playground** — paste text or upload a file (PDF/image), pick a schema and a
+  live deployment, run an extraction or a vision/chat/embedding request, and
+  watch the result stream in.
+- **Serving → Catalog / Models / Deployments / Sizing** — browse the Hugging
+  Face Hub (segmented by serving family and support tier, with a
+  fits-this-node estimate before you download anything), seed a model into the
+  local store, deploy/scale/stop it, and see live RAM headroom — how many more
+  instances fit right now, and a what-if planner for a hypothetical mix.
+- **Agents → Templates / My Agents / Create** — build a reusable extraction
+  agent from a template (an OCR pipeline — plain OCR, OCR→LLM, or vision→JSON
+  — or a security/PII proxy) over any deployed model; every agent is an
+  OpenAI-compatible endpoint (`/v1/agents/<name>/chat/completions`) you can
+  point any downstream tool at.
+- **Benchmark → Run / Results** — pick a registered dataset, a model, and a
+  schema from real dropdowns (not free text), trigger a run, and browse past
+  runs with their metrics and downloadable artifacts (`report.html`,
+  `predictions.jsonl`, `metrics.json`).
+- **Observability → Dashboards** — the project's own Grafana dashboard
+  (request outcomes, PII detections, latency, gate blocks) embedded live,
+  plus quick links out to Grafana/Inngest/raw Prometheus metrics.
+
+A benchmark run's results are made addressable rather than returned as
+worker-local paths, since the `api`/`web` replicas can't read the worker's
+filesystem: a content-addressed blob store holds the artifacts, and a Postgres
+run index (keyed by the Inngest event id) holds status + a metrics summary +
+artifact URIs — the bulk `predictions.jsonl` never lands in Postgres. The whole
+`/v1/studio` router requires an API key; `tenant_id` is bound to the
+authenticated principal at trigger time (never a client field), so a run is
+only ever visible to its owner (a cross-tenant id 404s, never leaking
+existence). A bounded retention cron prunes old runs and unreferenced blobs.
 
 ## Model serving factory
 
@@ -20,15 +117,16 @@ docie list
 docie status my-model
 ```
 
-Every command supports deterministic automation output through `--json`.
-See [docs/serving-factory.md](docs/serving-factory.md) for architecture,
-runtime requirements, model manifests, and operational examples.
+Every command supports deterministic automation output through `--json`. A
+model manifest declares the family contract (prompt template, quantization,
+context window, whether it needs a vision projector) the runtime uses to serve
+it faithfully — `docie model pull` fetches a GGUF and writes that manifest into
+the content-addressed store once; every later `docie serve`/`docie up` reads it.
 
 ### Quickstart — serve a model, then benchmark it
 
-Seed a GGUF into the canonical store once (see
-[src/docie_bench/serving/README.md](src/docie_bench/serving/README.md)), then it's
-three commands — no separate `llama-server` window:
+`docie model pull` seeds a GGUF into the canonical store once, then it's three
+commands — no separate `llama-server` window:
 
 ```powershell
 docie up nuextract3        # serve in the background with the right family flags (--jinja/--mmproj, :8088)
@@ -39,18 +137,22 @@ docie stop nuextract3
 `docie up <name>` launches the model **detached** via the supervisor and pins the
 port to the model profile's `base_url`, so the benchmark consumes it unchanged.
 To put *every* configured profile behind one OpenAI-compatible `/v1` endpoint,
-run `docie gateway`. Full flow: [serving README](src/docie_bench/serving/README.md).
+run `docie gateway` instead of starting each one individually.
 
 ## What this project gives you
 
+- **A local SLM serving fabric**: a family-contract-aware llama.cpp/vLLM/Ollama
+  supervisor with content-addressed model storage, RAM-aware sizing (what fits
+  right now, what a hypothetical deploy would cost), and a Hugging Face catalog
+  with per-model support verdicts.
 - **OpenAI-compatible LLM abstraction**: call local `llama.cpp`, vLLM, Ollama-compatible gateways, or a remote OpenAI-compatible endpoint through one client.
 - **Schema-constrained extraction**: JSON Schema / Pydantic first; no free-form JSON guessing.
-- **OCR modularity**: `pdf_text`, `tesseract`, and `paddleocr` backends behind one interface.
+- **OCR modularity**: `liteparse` (PDFium spatial text + OCR fallback), `tesseract`, `paddleocr`, or a deployed vision model, behind one interface.
 - **OCR laboratory**: content-addressed OCR artifacts, persistent cache, and no-LLM OCR reports.
 - **Production API**: FastAPI service with health checks, metrics, file-size limits, structured logs, and optional Postgres audit persistence.
 - **Benchmark runner**: run many model profiles over the same dataset and produce JSONL predictions, metrics, and an HTML report.
-- **Docker Compose stack**: API, benchmark container, local llama.cpp-compatible server, Postgres, Prometheus, and Grafana.
-- **Model-agnostic**: benchmark Qwen/Gemma/Granite/SmolLM/Llama/Phi/Ministral GGUFs or any HTTP endpoint exposing `/v1/chat/completions`.
+- **Docker Compose stack**: the Studio (web/api/worker), Inngest, Postgres, Redis, Prometheus, and Grafana — or the bare CLI + llama.cpp-compatible server.
+- **Model-agnostic**: LFM2.5 (text, vision, embedding, encoder), NuExtract, Qwen, Gemma, Granite, SmolLM, Llama, Phi, Ministral GGUFs, or any HTTP endpoint exposing `/v1/chat/completions`.
 
 ## Architecture
 
@@ -58,9 +160,10 @@ run `docie gateway`. Full flow: [serving README](src/docie_bench/serving/README.
 PDF/image
   │
   ├── OCR/layout backend
-  │     ├── pdf_text: text layer extraction for digital PDFs
+  │     ├── liteparse: PDFium spatial text layer + OCR fallback (default)
   │     ├── tesseract: CPU OCR fallback
-  │     └── paddleocr: richer OCR/layout backend
+  │     ├── paddleocr: richer OCR/layout backend
+  │     └── a deployed vision model: image → text directly (VLM as OCR)
   │
   ├── OCR blocks with evidence ids + bounding boxes
   │
@@ -79,6 +182,8 @@ PDF/image
 
 ## Fast start
 
+The bare API + one local model, no Studio, no `docie` CLI:
+
 ```bash
 cp .env.example .env
 make build
@@ -88,7 +193,7 @@ make up-infra
 Place a GGUF model at `./models/model.gguf`, then run:
 
 ```bash
-MODEL_PATH=/models/model.gguf docker compose --profile local-llm up -d llm-llamacpp
+MODEL_PATH=/models/model.gguf make up-local-llm
 make up-api
 ```
 
@@ -416,12 +521,24 @@ exclusive.
 
 Recommended benchmark order:
 
-1. Qwen3/Qwen3.5 tiny profile if your runtime supports it.
-2. Gemma 3/4 small profile if available as GGUF and runtime-compatible.
-3. Granite 4.x 1B/3B for enterprise/compliance-friendly experiments.
-4. SmolLM3-3B for open small text baseline.
-5. Llama 3.2 3B Instruct as stable deployment baseline.
-6. Phi-4-mini or similar if you can accept higher CPU latency.
+1. LFM2.5 (350M–2.6B) — the fastest CPU tok/s at each size class here, and the
+   native family (its own prompt template + grammar handling are first-class).
+2. NuExtract3/NuExtract-2.0 — purpose-built document→JSON; usually the sharpest
+   field precision of anything this size, at the cost of being extraction-only.
+3. Qwen3/Qwen3.5 tiny profile if your runtime supports it.
+4. Gemma 3/4 small profile if available as GGUF and runtime-compatible.
+5. Granite 4.x 1B/3B for enterprise/compliance-friendly experiments.
+6. SmolLM3-3B for open small text baseline.
+7. Llama 3.2 3B Instruct as stable deployment baseline.
+8. Phi-4-mini or similar if you can accept higher CPU latency.
+
+A reasoning model (Qwen3.5's "thinking" checkpoints included) used for
+extraction needs care: it can spend its whole token budget explaining itself
+in a `reasoning_content` channel and never reach the answer. The pipeline
+guards against this by prefilling the JSON object's opening brace, which
+makes the model continue the object directly instead of narrating first —
+but it's worth knowing the failure mode exists if you point a new reasoning
+model at extraction and get an empty result.
 
 Do not select by leaderboard alone. Select by field-level accuracy under constrained decoding.
 
@@ -489,9 +606,7 @@ correction rate, reviewer agreement, queue latency, and per-reviewer workload.
 
 ## Security boundaries
 
-This project does not claim PII compliance out of the box. See
-[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for deployment guidance, residual risks, and
-security configuration. The API provides:
+This project does not claim PII compliance out of the box. The API provides:
 
 - bounded upload, text, and OCR-block limits;
 - MIME allowlisting with content validation;
@@ -509,6 +624,13 @@ make lint
 make test
 make format
 ```
+
+The `docs/` directory currently holds working notes written during
+development (architecture, the serving control plane, model onboarding) —
+useful, but not maintained as a coherent reference and not linked from here.
+A proper documentation site (Sphinx) covering the CLI, the Studio, the
+serving fabric, and the benchmark harness end to end is planned; until then,
+this README and the code itself are the source of truth.
 
 ## Why not one monolithic “document AI” model?
 
