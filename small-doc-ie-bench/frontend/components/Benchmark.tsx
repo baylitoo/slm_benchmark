@@ -5,17 +5,23 @@ import { Gauge, Play, AlertCircle, Download } from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
+  listDatasets,
+  getDeployments,
+  selectableDeployments,
+  listSchemas,
   artifactUrl,
   ApiError,
   ApiUnavailable,
   type BenchmarkRun,
   type RunArtifact,
   type TriggerResponse,
+  type DatasetSummary,
+  type DeploymentRecord,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
-import { Badge, Button, Card, Field, TextInput } from "./ui";
+import { Badge, Button, Card, Field, Select, TextInput } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
@@ -34,6 +40,24 @@ const PAGE_SIZE = 10;
 export function Benchmark({ view = "run" }: { view?: string }) {
   const { toast } = useToast();
   const runs = useAsync("benchmark-runs", getBenchmarks);
+
+  // Discoverability for the three selectors below: registered datasets (what
+  // `dataset` can actually reference), live/loadable deployments (what
+  // `model_profile` resolves — the shared resolver accepts a deployment name
+  // or `store:<name>` directly, not just a models.yaml profile), and the
+  // extraction schemas (same GET /v1/schemas + Select pattern as the OCR
+  // agent form). Shared SWR keys ("deployments"/"schemas") with the other
+  // pages that already fetch them.
+  const datasets = useAsync<DatasetSummary[]>("datasets", listDatasets);
+  const deployments = useAsync<DeploymentRecord[]>("deployments", getDeployments);
+  const schemas = useAsync<string[]>("schemas", listSchemas);
+  const modelOptions = useMemo(
+    () =>
+      selectableDeployments(deployments.data ?? [])
+        .map((d) => d.spec?.name)
+        .filter((n): n is string => !!n),
+    [deployments.data],
+  );
 
   const [dataset, setDataset] = useState("");
   const [modelProfile, setModelProfile] = useState("");
@@ -88,27 +112,48 @@ export function Benchmark({ view = "run" }: { view?: string }) {
       <div className="grid gap-6 lg:grid-cols-2">
         <Card icon={<Gauge className="h-5 w-5" />} title="New run">
           <form onSubmit={onRun} className="space-y-4">
-            <Field label="Dataset" required hint="Dataset name registered server-side.">
-              <TextInput
-                value={dataset}
-                onChange={(e) => setDataset(e.target.value)}
-                placeholder="e.g. voxel51_invoices"
-              />
+            <Field
+              label="Dataset"
+              required
+              hint={
+                datasets.data && datasets.data.length === 0
+                  ? "No datasets registered — see docie_bench.benchmark.registry to add one."
+                  : "A dataset registered in data/datasets.yaml."
+              }
+            >
+              <Select value={dataset} onChange={(e) => setDataset(e.target.value)}>
+                <option value="">Select a dataset…</option>
+                {(datasets.data ?? []).map((d) => (
+                  <option key={d.name} value={d.name}>
+                    {d.name}
+                    {d.latest ? ` (${d.latest})` : ""}
+                    {d.documents != null ? ` — ${d.documents} docs` : ""}
+                  </option>
+                ))}
+              </Select>
             </Field>
             <div className="grid gap-4 sm:grid-cols-3">
-              <Field label="Model profile" hint="Optional.">
-                <TextInput
-                  value={modelProfile}
-                  onChange={(e) => setModelProfile(e.target.value)}
-                  placeholder="(default)"
-                />
+              <Field
+                label="Model profile"
+                hint="A live deployment, or leave empty for the default profile."
+              >
+                <Select value={modelProfile} onChange={(e) => setModelProfile(e.target.value)}>
+                  <option value="">(default)</option>
+                  {modelOptions.map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </Select>
               </Field>
               <Field label="Schema name">
-                <TextInput
-                  value={schemaName}
-                  onChange={(e) => setSchemaName(e.target.value)}
-                  placeholder="invoice"
-                />
+                <Select value={schemaName} onChange={(e) => setSchemaName(e.target.value)}>
+                  {(schemas.data ?? []).map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </Select>
               </Field>
               <Field label="Concurrency">
                 <TextInput
