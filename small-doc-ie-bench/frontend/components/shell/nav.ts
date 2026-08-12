@@ -16,7 +16,6 @@ import {
   FlaskConical,
   Boxes,
   Server,
-  Network,
   Gauge,
   Play,
   History,
@@ -57,14 +56,16 @@ export const NAV_GROUPS: NavGroup[] = [
       { id: "deploy", label: "Catalog", icon: LayoutGrid, view: "catalog" },
       { id: "deploy", label: "Models", icon: Boxes, view: "models" },
       { id: "deploy", label: "Deployments", icon: Server, view: "deployments" },
-      { id: "deploy", label: "Ports", icon: Network, view: "ports" },
       { id: "deploy", label: "Sizing", icon: Gauge, view: "sizing" },
     ],
   },
   {
     heading: "Agents",
     items: [
-      { id: "agents", label: "Catalog", icon: LayoutGrid, view: "catalog" },
+      // "Templates", not "Catalog" — Serving's Catalog (HF Hub browse-to-seed)
+      // already owns that word; this is the preconfigured agent starting points
+      // (Security Proxy, OCR Agent, …), a different concept entirely.
+      { id: "agents", label: "Templates", icon: LayoutGrid, view: "catalog" },
       { id: "agents", label: "My Agents", icon: Bot, view: "instances" },
       { id: "agents", label: "Create", icon: PlusCircle, view: "create" },
     ],

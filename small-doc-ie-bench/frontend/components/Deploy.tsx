@@ -20,15 +20,14 @@ import { PageHeader } from "./patterns/PageHeader";
 import { POLL_MS } from "./deploy/shared";
 import { DeploymentsView } from "./deploy/DeploymentsView";
 import { ModelsView } from "./deploy/ModelsView";
-import { PortsView } from "./deploy/PortsView";
 import { DeployForm } from "./deploy/DeployForm";
 import { AddModelForm } from "./deploy/seed/AddModelForm";
 
 type SlideOver = null | "deploy" | "seed";
 
 /**
- * Deploy = a table-first serving console with three nav-driven sub-views
- * ("models" / "deployments" / "ports"). The Deploy + Seed forms live in
+ * Deploy = a table-first serving console with nav-driven sub-views
+ * ("catalog" / "models" / "deployments" / "sizing"). The Deploy + Seed forms live in
  * persistently-mounted slide-overs (visibility toggled, never unmounted) so an
  * in-flight deploy/seed and its ResultPanel survive closing the panel or
  * switching views. All pollers, handlers, and API calls are unchanged.
@@ -64,15 +63,13 @@ export function Deploy({
         }
       : view === "models"
         ? { title: "Models", subtitle: "The model store you can deploy — GGUFs, encoders, embeddings." }
-        : view === "ports"
-          ? { title: "Ports", subtitle: "Live port allocation across running deployments." }
-          : view === "sizing"
-            ? {
-                title: "Sizing",
-                subtitle:
-                  "GET /v1/serving/sizing — how many more instances fit in RAM right now.",
-              }
-            : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
+        : view === "sizing"
+          ? {
+              title: "Sizing",
+              subtitle:
+                "GET /v1/serving/sizing — how many more instances fit in RAM right now.",
+            }
+          : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
 
   return (
     <div>
@@ -97,8 +94,6 @@ export function Deploy({
         <Catalog families={families.data} onSeeded={() => store.refresh()} />
       ) : view === "models" ? (
         <ModelsView store={store} onDeploy={() => setSlideOver("deploy")} />
-      ) : view === "ports" ? (
-        <PortsView deployments={deployments} />
       ) : view === "sizing" ? (
         <Sizing active={active && view === "sizing"} />
       ) : (

@@ -174,17 +174,17 @@ export function Agents({ view = "catalog" }: { view?: string }) {
           }}
         />
       ) : (
-        <CatalogView templates={templates} onUse={useTemplate} />
+        <TemplatesView templates={templates} onUse={useTemplate} />
       )}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Catalog
+// Templates
 // ---------------------------------------------------------------------------
 
-function CatalogView({
+function TemplatesView({
   templates,
   onUse,
 }: {
