@@ -385,3 +385,42 @@ async def test_pipeline_prefills_json_and_repairs_extractor_content(fake_ocr: No
 
     assert seen["req"]["messages"][-1] == {"role": "assistant", "content": "{"}
     assert result["choices"][0]["message"]["content"] == '{ "total_ttc": 10}'
+
+
+async def test_pipeline_retries_grammar_without_prefill_on_sampler_400(fake_ocr: None) -> None:
+    # Prefill can break a model's grammar-sampler init (400 "Failed to initialize
+    # samplers"). The pipeline retries the SAME grammar without the prefill —
+    # keeping schema enforcement — instead of surfacing the 400.
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        prefilled = (body.get("messages") or [])[-1:] == [{"role": "assistant", "content": "{"}]
+        if prefilled:
+            return httpx.Response(
+                400, json={"error": {"message": "Failed to initialize samplers: std::exception"}}
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"total_ttc": 5}'}}]})
+
+    profiles = {
+        "llm_x": ModelProfile(name="llm_x", model="ul", base_url="http://llm-x/v1", api_key="k")
+    }
+    pipe = ModelProfile(
+        name="pipe", model="", base_url="", api_key="", kind="pipeline",
+        options={"ocr_backend": "tesseract", "extractor": "llm_x"},
+    )
+    req = _image_request("pipe")
+    req["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {"name": "invoice", "schema": {}},
+    }
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await build_solution(pipe, profiles=profiles, http_client=http).complete(req)
+
+    assert seen[0]["messages"][-1] == {"role": "assistant", "content": "{"}  # 1st: prefill
+    assert seen[1]["messages"][-1] != {"role": "assistant", "content": "{"}  # retry: no prefill
+    assert seen[1]["response_format"]["type"] == "json_schema"  # grammar kept
+    assert result["choices"][0]["message"]["content"] == '{"total_ttc": 5}'
+    assert len(seen) == 2

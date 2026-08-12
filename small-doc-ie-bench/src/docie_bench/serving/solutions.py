@@ -82,6 +82,26 @@ def wants_json_schema(response_format: Any) -> bool:
     return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
 
 
+# Substrings marking an HTTP 400 as a grammar/sampler failure (not a genuine bad
+# request). Some models reject a json_schema grammar when the assistant turn is
+# prefilled — "Failed to initialize samplers" — and the pipeline then retries the
+# SAME grammar without the prefill (schema kept). "grammar"/"json_schema" also
+# cover a real parse failure surfaced in the body.
+_GRAMMAR_SAMPLER_400_MARKERS = ("sampler", "grammar", "response_format", "json_schema")
+
+
+def _is_grammar_sampler_400(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _GRAMMAR_SAMPLER_400_MARKERS)
+
+
+def _strip_json_prefill(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop a trailing assistant '{' prefill turn; leave everything else."""
+    if messages and messages[-1] == {"role": "assistant", "content": "{"}:
+        return messages[:-1]
+    return messages
+
+
 def apply_no_think(body: dict[str, Any]) -> dict[str, Any]:
     """Add the reasoning-off signal to a chat request (in place + returned).
 
@@ -274,10 +294,31 @@ class PipelineSolution:
             "Authorization": f"Bearer {self.extractor.api_key}",
             "Content-Type": "application/json",
         }
+        resp = await self._post_extractor(url, headers, llm_request)
+        # Prefill can break some models' grammar-sampler init ("Failed to
+        # initialize samplers"); retry WITHOUT the prefill, keeping the grammar
+        # (mirrors the agent vision ladder's grammar-no-prefill rung).
+        if prefilled and resp.status_code == 400 and _is_grammar_sampler_400(resp.text):
+            no_prefill = {**llm_request, "messages": _strip_json_prefill(llm_request["messages"])}
+            resp = await self._post_extractor(url, headers, no_prefill)
+        if resp.status_code >= 400:
+            raise SolutionError(
+                f"pipeline extractor returned {resp.status_code}: {resp.text[:200]}",
+                status_code=resp.status_code,
+                error_type="upstream_error",
+            )
+        completion = resp.json()
+        if prefilled:
+            repair_prefilled_content(completion)  # no-op after a no-prefill retry
+        return completion
+
+    async def _post_extractor(
+        self, url: str, headers: dict[str, str], body: dict[str, Any]
+    ) -> httpx.Response:
         try:
-            resp = await self.http.post(
+            return await self.http.post(
                 url,
-                json=llm_request,
+                json=body,
                 headers=headers,
                 timeout=max(self.extractor.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
             )
@@ -287,16 +328,6 @@ class PipelineSolution:
                 status_code=502,
                 error_type="upstream_unavailable",
             ) from exc
-        if resp.status_code >= 400:
-            raise SolutionError(
-                f"pipeline extractor returned {resp.status_code}: {resp.text[:200]}",
-                status_code=resp.status_code,
-                error_type="upstream_error",
-            )
-        completion = resp.json()
-        if prefilled:
-            repair_prefilled_content(completion)
-        return completion
 
     async def _vlm_ocr(self, request: dict[str, Any]) -> str:
         """Transcribe the document image to text with the vision deployment.
