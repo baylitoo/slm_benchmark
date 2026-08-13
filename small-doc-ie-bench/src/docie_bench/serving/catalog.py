@@ -559,6 +559,53 @@ def _node_snapshot_upsert(dialect_name: str, values: dict[str, Any]) -> Insert |
     return None
 
 
+def _activity_upsert(dialect_name: str, model_name: str, now: dt.datetime) -> Insert | None:
+    """One-statement ``INSERT .. ON CONFLICT (model_name) DO UPDATE`` that
+    ATOMICALLY increments ``window_count``, for the same reason
+    :func:`_node_snapshot_upsert` exists: this table is written from
+    concurrent request-handling processes (every ``store:`` request), not a
+    single writer, so a naive ``row.window_count += 1`` (Python-side
+    read-modify-write) silently loses increments under READ COMMITTED — two
+    concurrent requests both read N, both write N+1, one increment vanishes
+    with no error. ``window_started_at`` is deliberately NOT in the
+    conflict SET: it stays at its first-ever value until something (a
+    future reconciler read) resets it — this call only ever advances
+    ``window_count``/``last_request_at``/``updated_at``.
+    """
+    values = {
+        "model_name": model_name,
+        "window_count": 1,
+        "window_started_at": now,
+        "last_request_at": now,
+        "updated_at": now,
+    }
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        pg_statement = pg_insert(ModelActivity).values(**values)
+        return pg_statement.on_conflict_do_update(
+            index_elements=[ModelActivity.model_name],
+            set_={
+                "window_count": ModelActivity.window_count + 1,
+                "last_request_at": pg_statement.excluded.last_request_at,
+                "updated_at": pg_statement.excluded.updated_at,
+            },
+        )
+    if dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        sqlite_statement = sqlite_insert(ModelActivity).values(**values)
+        return sqlite_statement.on_conflict_do_update(
+            index_elements=[ModelActivity.model_name],
+            set_={
+                "window_count": ModelActivity.window_count + 1,
+                "last_request_at": sqlite_statement.excluded.last_request_at,
+                "updated_at": sqlite_statement.excluded.updated_at,
+            },
+        )
+    return None
+
+
 def _to_view(row: ModelStoreEntry, placement: ModelPlacement | None = None) -> dict[str, Any]:
     contract = FAMILIES.get(row.family)
     return {
@@ -928,32 +975,46 @@ class ModelCatalog:
     def record_activity(self, model_name: str) -> None:
         """Bump ``model_activity`` for ``model_name`` by one request.
 
+        A REAL upsert (:func:`_activity_upsert`), not get-then-INSERT: this
+        is called from the hot request-resolution path
+        (``resolve_store_profile``) by every concurrent request for a store
+        model, not a single writer, so a naive read-modify-write would
+        silently lose increments under concurrent traffic (see
+        ``_activity_upsert``'s docstring) — exactly the accuracy an
+        eventual autoscale-up read needs.
+
         A no-op (not an error) when DATABASE_URL is not configured — unlike
         every other write on this class, this one is inherently best-effort:
-        it's called from the hot request-resolution path
-        (``resolve_store_profile``), where a missing/unhealthy DB must never
-        block routing. A genuine DB error (e.g. a rare concurrent-insert
-        race on a model's first-ever request) still raises; the caller is
-        responsible for swallowing it (see ``placement_resolver``'s call
-        site, which wraps this broadly and logs at debug level).
+        a missing/unhealthy DB must never block routing. A genuine DB error
+        still raises; the caller is responsible for swallowing it (see
+        ``placement_resolver``'s call site, which wraps this broadly and
+        logs at debug level).
         """
         with session_scope() as session:
             if session is None:
                 return
             now = _utcnow()
-            row = session.get(ModelActivity, model_name)
-            if row is None:
+            statement = _activity_upsert(session.get_bind().dialect.name, model_name, now)
+            if statement is not None:
+                session.execute(statement)
+                return
+            # Fallback for a dialect without ON CONFLICT support: the old
+            # get-then-INSERT (single-writer semantics only). No third
+            # dialect is in use.
+            row = session.get(ModelActivity, model_name)  # pragma: no cover
+            if row is None:  # pragma: no cover
                 session.add(
                     ModelActivity(
                         model_name=model_name,
                         window_count=1,
                         window_started_at=now,
                         last_request_at=now,
+                        updated_at=now,
                     )
                 )
                 return
-            row.window_count += 1
-            row.last_request_at = now
+            row.window_count += 1  # pragma: no cover
+            row.last_request_at = now  # pragma: no cover
 
     def get_activity(self, model_name: str) -> dict[str, Any] | None:
         with session_scope() as session:

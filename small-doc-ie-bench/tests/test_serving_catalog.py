@@ -11,10 +11,15 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import BigInteger
+from sqlalchemy import BigInteger, create_engine
 
 import docie_bench.storage.db as db
-from docie_bench.serving.catalog import ModelCatalog, ModelStoreEntry
+from docie_bench.serving.catalog import (
+    ModelActivity,
+    ModelCatalog,
+    ModelStoreEntry,
+    ensure_model_activity_table,
+)
 from docie_bench.serving.model_store import StoreEntry
 
 # Larger than a signed 32-bit int (Postgres INTEGER max ~2.147 GB) — the size
@@ -130,3 +135,55 @@ def test_activity_tracks_independently_per_model(_sqlite_catalog: None) -> None:
 
     by_name = {row["model_name"]: row["window_count"] for row in catalog.list_activity()}
     assert by_name == {"qwen2.5-7b-q4": 2, "lfm2.5-350m": 1}
+
+
+@pytest.mark.parametrize("dialect_name", ["postgresql", "sqlite"])
+def test_record_activity_is_a_native_atomic_upsert(dialect_name: str) -> None:
+    """record_activity must not be get-then-INSERT: two concurrent requests
+    for the SAME store model both reading window_count=N and both writing
+    N+1 would silently lose an increment under READ COMMITTED — the exact
+    accuracy an autoscale-up read needs. Verified at statement-shape level,
+    mirroring test_publish_node_snapshot_is_a_native_on_conflict_upsert:
+    the SET clause must reference the column (an atomic SQL increment),
+    never a literal or excluded.window_count (which would just overwrite)."""
+    import datetime as dt
+
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from docie_bench.serving.catalog import _activity_upsert
+
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    statement = _activity_upsert(dialect_name, "qwen2.5-7b-q4", now)
+    assert statement is not None
+    dialect = postgresql.dialect() if dialect_name == "postgresql" else sqlite.dialect()
+    sql = str(statement.compile(dialect=dialect))
+    assert "INSERT INTO model_activity" in sql
+    assert "ON CONFLICT (model_name) DO UPDATE" in sql
+    # The atomic increment: window_count = model_activity.window_count + :window_count_1
+    # (or the sqlite-quoted equivalent) -- NOT "= excluded.window_count".
+    assert "window_count = model_activity.window_count +" in sql or (
+        "window_count = " in sql and "excluded.window_count" not in sql
+    )
+    assert "last_request_at = excluded.last_request_at" in sql
+    # window_started_at is set on first INSERT only -- never touched by the
+    # conflict SET, so an existing model's window never silently resets.
+    assert "window_started_at = excluded.window_started_at" not in sql
+
+
+def test_ensure_model_activity_table_is_race_safe_and_idempotent(tmp_path: Path) -> None:
+    """Mirrors ensure_serving_node_table's own test: CREATE TABLE IF NOT
+    EXISTS (advisory lock on PostgreSQL), so concurrently starting processes
+    (api, serving, N workers) cannot abort each other; a second run no-ops."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh.db'}")
+    assert ensure_model_activity_table(engine) is True
+    assert ensure_model_activity_table(engine) is False  # already there: no-op
+
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    ddl = str(
+        CreateTable(ModelActivity.__table__, if_not_exists=True).compile(
+            dialect=postgresql.dialect()
+        )
+    )
+    assert "CREATE TABLE IF NOT EXISTS model_activity" in ddl
