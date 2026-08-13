@@ -16,6 +16,7 @@ from docie_bench.agents.api import router as agents_router
 from docie_bench.chat_api import router as chat_router
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.serving_api import router as serving_router
+from docie_bench.inngest.serving_api import trigger_deployment_load
 from docie_bench.inngest.studio_api import router as studio_router
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.logging_config import configure_logging
@@ -145,24 +146,49 @@ async def enforce_request_content_length(
     return await call_next(request)
 
 
-def resolve_profile(profile_name: str | None) -> ModelProfile:
+async def resolve_profile(profile_name: str | None) -> ModelProfile:
     """Resolve a request's ``model_profile`` via the shared resolver.
 
     ``None`` deterministically resolves ``settings.default_model_profile``
     (``studio_default``) FROM ``configs/models.yaml`` — the honest label, not the
     old env-synthesized profile. An unknown name is a 400 (unchanged surface).
     ``store:<name>`` refs resolve via the Postgres placement recorded at deploy
-    time — mapped to 404 (never deployed) / 409 (not ready). Note: these direct
+    time. A store model that ISN'T live yet (never deployed, or deployed then
+    evicted) doesn't just 404/409 here: it fires the load/deploy itself and
+    answers 202 with an ETA, so a caller picking any catalog model gets an
+    honest "starting, retry in ~Ns" instead of an error for something one API
+    call away from working — the whole point being nobody has to know in
+    advance whether a model happens to be warm. A name that isn't in the
+    catalog at all still 404s; there's nothing to start. Note: these direct
     endpoints run in the api container, so a name that resolves to a worker-local
     deployment endpoint is unreachable here (deployment routing is supported via
     the worker ``/v1/studio/extract`` path — see profile_resolver).
     """
     try:
         profile = resolve_extraction_profile(model_profile=profile_name)
-    except PlacementNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except PlacementNotReadyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (PlacementNotFoundError, PlacementNotReadyError) as exc:
+        store_name = (
+            profile_name[len(STORE_PROFILE_PREFIX) :]
+            if profile_name and profile_name.startswith(STORE_PROFILE_PREFIX)
+            else None
+        )
+        triggered = await trigger_deployment_load(store_name) if store_name else None
+        if triggered is not None:
+            name, eta = triggered
+            raise HTTPException(
+                status_code=202,
+                detail={
+                    "status": "loading",
+                    "deployment": name,
+                    "eta_seconds": round(eta, 1),
+                    "message": (
+                        f"Model {name!r} is starting — this can take a moment "
+                        f"the first time. Retry in ~{int(eta)}s."
+                    ),
+                },
+            ) from exc
+        status_code = 404 if isinstance(exc, PlacementNotFoundError) else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except ProfileResolutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if (
@@ -268,9 +294,9 @@ async def extract_text(
     tenant: TenantDependency,
 ) -> ExtractionResponse:
     validate_text_request(payload)
-    profile = resolve_profile(payload.model_profile)
+    profile = await resolve_profile(payload.model_profile)
     proposer_profile = (
-        resolve_profile(payload.schema_proposer_profile)
+        await resolve_profile(payload.schema_proposer_profile)
         if payload.schema_proposer_profile
         else None
     )
@@ -305,7 +331,7 @@ async def extract_file(
         allowed_mime_types=settings.allowed_mime_types,
     )
 
-    profile = resolve_profile(model_profile)
+    profile = await resolve_profile(model_profile)
     service = ExtractionService(profile)
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(body)
