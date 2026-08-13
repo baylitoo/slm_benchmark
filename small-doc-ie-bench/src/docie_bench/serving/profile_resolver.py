@@ -289,30 +289,44 @@ def _synthesize_profile(
 
 
 def _record_activity_if_cataloged(name: str) -> None:
-    """Bump ``model_activity`` for ``name`` when it is a store catalog entry.
+    """Bump ``model_activity`` for the store model backing deployment ``name``.
 
     The ``deployment=`` and bare ``model_profile`` routes both address a live
-    deployment by its ``deployments.json`` name — the same name a store deploy
-    registers in the Postgres catalog. Without this, activity tracking only
-    saw the explicit ``store:<name>`` convention, so a store model driven
+    deployment by its ``deployments.json`` name — the same name the reconciler
+    publishes ``ModelPlacement`` rows under. Without this, activity tracking
+    only saw the explicit ``store:<name>`` convention, so a store model driven
     entirely through the Studio's own Chat/Vision/Extract UI (which sends the
     bare deployment name, see chat_api.py's docstring) never showed up in the
-    activity tile — exactly the traffic an autoscale signal needs. A
-    deployment with no matching catalog row (a pure models.yaml deployment) is
-    not a store model; silently skip it, mirroring ``_catalog_family``'s
-    best-effort DB lookup.
+    activity tile — exactly the traffic an autoscale signal needs.
+
+    Deliberately looks up ``ModelPlacement`` (keyed by DEPLOYMENT name), not
+    ``ModelStoreEntry`` (keyed by STORE model name) — those are different
+    namespaces, both caller-supplied, that only coincide by convention for an
+    unscaled single-instance deploy. Querying the store table directly by
+    deployment name would (a) misattribute activity to an unrelated store
+    entry that happens to share the deployment's name, and (b) silently miss
+    every scaled replica, whose deployment name is ``<base>-2`` while the
+    store entry stays keyed under ``<base>`` alone. Recording under the
+    placement's own ``model_name`` fixes both and aggregates correctly with
+    ``resolve_store_profile``'s counts for the same store model. A deployment
+    with no placement row, or one with ``model_name`` unset (a pure
+    models.yaml deployment, not a store model), is silently skipped —
+    mirroring ``_catalog_family``'s best-effort DB lookup.
     """
     try:
         from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
         catalog = ModelCatalog()
         try:
-            entry = catalog.get(name)
+            placement = catalog.get_placement(name)
         except CatalogUnavailableError:
             return
-        if entry is None:
+        if placement is None:
             return
-        catalog.record_activity(name)
+        model_name = placement.get("model_name")
+        if not model_name:
+            return
+        catalog.record_activity(str(model_name))
     except Exception:  # pragma: no cover - a DB hiccup must not break routing
         logger.debug("model-activity bump failed for %r", name, exc_info=True)
 
