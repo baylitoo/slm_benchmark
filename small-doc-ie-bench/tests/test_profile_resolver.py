@@ -487,3 +487,117 @@ def test_no_verdict_keeps_previous_behavior(models_config: Path) -> None:
         deployment="pl", models_config_path=models_config, deployments=[plain]
     )
     assert profile.model == "pl"
+
+
+# ── activity tracking: deployment/model_profile routes also bump model_activity ─
+#
+# Only the store: convention bumped model_activity before this -- the Studio's own
+# Chat/Vision/Extract UI sends the bare deployment name (see chat_api.py), so a
+# store model driven purely through the UI never showed up in the Activity tile.
+
+
+def test_deployment_selector_records_activity_when_cataloged(
+    models_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving import catalog as catalog_module
+
+    calls: list[str] = []
+
+    class _FakeCatalog:
+        def get(self, name: str) -> dict[str, object] | None:
+            return {"name": name} if name == "cataloged" else None
+
+        def record_activity(self, name: str) -> None:
+            calls.append(name)
+
+    monkeypatch.setattr(catalog_module, "ModelCatalog", _FakeCatalog)
+    record = _record(
+        name="cataloged", runtime=RuntimeKind.LLAMACPP, model="/p/m.gguf", alias="cataloged"
+    )
+    resolve_extraction_profile(
+        deployment="cataloged", models_config_path=models_config, deployments=[record]
+    )
+    assert calls == ["cataloged"]
+
+
+def test_deployment_selector_skips_activity_when_not_cataloged(
+    models_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving import catalog as catalog_module
+
+    calls: list[str] = []
+
+    class _FakeCatalog:
+        def get(self, name: str) -> dict[str, object] | None:
+            return None  # a pure models.yaml deployment, not a store model
+
+        def record_activity(self, name: str) -> None:
+            calls.append(name)
+
+    monkeypatch.setattr(catalog_module, "ModelCatalog", _FakeCatalog)
+    record = _record(
+        name="yaml-only", runtime=RuntimeKind.LLAMACPP, model="/p/m.gguf", alias="yaml-only"
+    )
+    resolve_extraction_profile(
+        deployment="yaml-only", models_config_path=models_config, deployments=[record]
+    )
+    assert calls == []
+
+
+def test_model_profile_naming_a_live_deployment_records_activity(
+    models_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving import catalog as catalog_module
+
+    calls: list[str] = []
+
+    class _FakeCatalog:
+        def get(self, name: str) -> dict[str, object] | None:
+            return {"name": name}
+
+        def record_activity(self, name: str) -> None:
+            calls.append(name)
+
+    monkeypatch.setattr(catalog_module, "ModelCatalog", _FakeCatalog)
+    record = _record(
+        name="my-dep", runtime=RuntimeKind.LLAMACPP, model="/p/m.gguf", alias="my-dep"
+    )
+    resolve_extraction_profile(
+        model_profile="my-dep", models_config_path=models_config, deployments=[record]
+    )
+    assert calls == ["my-dep"]
+
+
+def test_model_profile_naming_a_yaml_profile_does_not_touch_activity(
+    models_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving import catalog as catalog_module
+
+    class _Boom:
+        def __init__(self) -> None:
+            raise RuntimeError("catalog must not be consulted for a pure yaml profile match")
+
+    monkeypatch.setattr(catalog_module, "ModelCatalog", _Boom)
+    profile = resolve_extraction_profile(
+        model_profile="local_llamacpp", models_config_path=models_config, deployments=[]
+    )
+    assert profile.name == "local_llamacpp"
+
+
+def test_activity_recording_hiccup_never_breaks_resolution(
+    models_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving import catalog as catalog_module
+
+    class _Boom:
+        def __init__(self) -> None:
+            raise RuntimeError("DB is having a bad day")
+
+    monkeypatch.setattr(catalog_module, "ModelCatalog", _Boom)
+    record = _record(
+        name="resilient", runtime=RuntimeKind.LLAMACPP, model="/p/m.gguf", alias="resilient"
+    )
+    profile = resolve_extraction_profile(
+        deployment="resilient", models_config_path=models_config, deployments=[record]
+    )
+    assert profile.model == "resilient"

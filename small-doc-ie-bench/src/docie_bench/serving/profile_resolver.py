@@ -288,6 +288,35 @@ def _synthesize_profile(
     )
 
 
+def _record_activity_if_cataloged(name: str) -> None:
+    """Bump ``model_activity`` for ``name`` when it is a store catalog entry.
+
+    The ``deployment=`` and bare ``model_profile`` routes both address a live
+    deployment by its ``deployments.json`` name — the same name a store deploy
+    registers in the Postgres catalog. Without this, activity tracking only
+    saw the explicit ``store:<name>`` convention, so a store model driven
+    entirely through the Studio's own Chat/Vision/Extract UI (which sends the
+    bare deployment name, see chat_api.py's docstring) never showed up in the
+    activity tile — exactly the traffic an autoscale signal needs. A
+    deployment with no matching catalog row (a pure models.yaml deployment) is
+    not a store model; silently skip it, mirroring ``_catalog_family``'s
+    best-effort DB lookup.
+    """
+    try:
+        from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+        catalog = ModelCatalog()
+        try:
+            entry = catalog.get(name)
+        except CatalogUnavailableError:
+            return
+        if entry is None:
+            return
+        catalog.record_activity(name)
+    except Exception:  # pragma: no cover - a DB hiccup must not break routing
+        logger.debug("model-activity bump failed for %r", name, exc_info=True)
+
+
 def _env_fallback_profile(settings: Settings) -> ModelProfile:
     """Last-resort profile from OPENAI_COMPAT_* env — reached only when models.yaml
     is entirely absent. Labeled ``env_fallback`` (never a real profile name) so the
@@ -347,6 +376,7 @@ def resolve_extraction_profile(
             raise ProfileResolutionError(
                 f"deployment {deployment!r} is not a live (ready) deployment"
             )
+        _record_activity_if_cataloged(deployment)
         return _synthesize_profile(record, yaml_profiles)
 
     # (1b) "store:<name>" -> the Postgres placement the deploy job recorded for a
@@ -364,9 +394,12 @@ def resolve_extraction_profile(
     # (2) explicit model_profile -> a config profile / upstream id / deployment name.
     if model_profile:
         try:
-            return gateway_resolve_profile(model_profile, table)
+            resolved = gateway_resolve_profile(model_profile, table)
         except GatewayRoutingError as exc:
             raise ProfileResolutionError(exc.message) from exc
+        if model_profile in live:
+            _record_activity_if_cataloged(model_profile)
+        return resolved
 
     # (3) default -> studio_default from models.yaml (honest label); env only as a
     # labeled last resort when models.yaml is entirely absent.
