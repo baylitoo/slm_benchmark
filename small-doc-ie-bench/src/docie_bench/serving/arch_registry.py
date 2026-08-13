@@ -154,6 +154,19 @@ class SupportVerdict:
     runtime_note: str | None = None
 
 
+def _is_reranker(repo_id: str | None) -> bool:
+    """Rerankers / late-interaction retrievers are repurposed backbones —
+    LFM2.5-ColBERT-350M reports arch ``lfm2`` (identical to the chat family),
+    a BERT cross-encoder reports ``bert`` (identical to the embedding family).
+    The arch alone can't tell a reranker apart from a chat/embedding model on
+    the same backbone, so — same pattern as NuExtract3 — it is caught by name
+    before the generic arch lookup runs."""
+    if not repo_id:
+        return False
+    name = repo_id.lower()
+    return any(kw in name for kw in ("colbert", "rerank", "cross-encoder", "crossencoder"))
+
+
 def _is_nuextract3(arch: str, repo_id: str | None) -> bool:
     """NuExtract3 shares the qwen3.5-VL backbone (arch ``qwen35``) with generic
     Qwen3.5 text/VL models but needs a DIFFERENT serving contract (the extraction
@@ -239,6 +252,19 @@ def resolve_family(
             )
         return SupportVerdict(
             "supported", "nuextract3", f"NuExtract3 ({architecture!r} extraction contract)"
+        )
+
+    # Reranker (LFM2.5-ColBERT-350M, a BERT cross-encoder, ...), caught by name
+    # BEFORE the generic arch lookup — which would otherwise serve it as a plain
+    # chat or embedding model on the shared backbone and silently drop its
+    # actual task (query+documents -> relevance scores, not a chat/embed model).
+    if _is_reranker(repo_id):
+        return SupportVerdict(
+            "supported",
+            "reranker",
+            f"repo name indicates a reranker/cross-encoder ({architecture!r} backbone) "
+            "→ reranker",
+            runtime_note=runtime_note,
         )
 
     family = ARCH_TO_FAMILY.get(arch)
