@@ -1,13 +1,23 @@
 "use client";
 
-import { BarChart3, ExternalLink, Workflow, Gauge, ClipboardCheck, HardDrive } from "lucide-react";
+import {
+  BarChart3,
+  ExternalLink,
+  Workflow,
+  Gauge,
+  ClipboardCheck,
+  HardDrive,
+  Activity,
+} from "lucide-react";
 import { GRAFANA_URL, GRAFANA_DASHBOARD_URL, INNGEST_URL, METRICS_URL } from "@/lib/env";
 import {
   getReviewMetrics,
   getOcrCacheStats,
+  getActivity,
   ApiError,
   type ReviewMetricsView,
   type OcrCacheStatsView,
+  type ActivityView,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Card, Badge } from "./ui";
@@ -15,6 +25,7 @@ import { PageHeader } from "./patterns/PageHeader";
 
 const REVIEW_POLL_MS = 10000;
 const OCR_CACHE_POLL_MS = 15000;
+const ACTIVITY_POLL_MS = 15000;
 
 /**
  * Observability = external tooling: quick-link tiles (Grafana / Inngest /
@@ -65,9 +76,10 @@ export function Observability({ active = true }: { active?: boolean }) {
             icon={<Gauge className="h-5 w-5" />}
           />
         </div>
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
           <ReviewQueueCard active={active} />
           <OcrCacheCard active={active} />
+          <ActivityCard active={active} />
         </div>
         <Card
           title="Small Document IE Benchmark"
@@ -230,6 +242,60 @@ function OcrCacheCard({ active }: { active: boolean }) {
                 : "n/a — cache is empty"}
             </span>
           </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function secondsAgo(iso: string): number {
+  return Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+}
+
+function ActivityCard({ active }: { active: boolean }) {
+  const activity = usePolling<ActivityView>(getActivity, ACTIVITY_POLL_MS, active);
+  const entries = activity.data?.entries ?? [];
+  const detail = activity.data?.detail;
+  const shown = entries.slice(0, 6);
+
+  return (
+    <Card
+      icon={<Activity className="h-5 w-5" />}
+      title="Model activity"
+      subtitle="Requests per store: model since the window last reset — a load signal, not a rate. Nothing scales on it yet."
+    >
+      {activity.error ? (
+        <p className="text-sm text-muted-foreground">
+          Couldn&apos;t load activity. Is the API reachable?
+        </p>
+      ) : activity.loading ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : detail ? (
+        <p className="text-sm text-muted-foreground">{detail}</p>
+      ) : entries.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          No store: model requests tracked yet — activity is recorded when a
+          request routes through a store: reference (chat/embeddings/rerank/
+          extract), not on every deployment.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {shown.map((e) => (
+            <div key={e.model_name} className="flex items-center justify-between gap-2 text-sm">
+              <span className="truncate font-medium text-foreground">{e.model_name}</span>
+              <div className="flex shrink-0 items-center gap-2">
+                <Badge tone="info">{e.window_count} req</Badge>
+                <span className="w-14 text-right text-xs text-muted-foreground">
+                  {e.last_request_at ? `${formatAge(secondsAgo(e.last_request_at))} ago` : "n/a"}
+                </span>
+              </div>
+            </div>
+          ))}
+          {entries.length > shown.length && (
+            <p className="text-xs text-muted-foreground">
+              +{entries.length - shown.length} more
+            </p>
+          )}
         </div>
       )}
     </Card>
