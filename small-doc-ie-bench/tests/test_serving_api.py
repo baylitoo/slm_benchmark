@@ -19,6 +19,7 @@ from docie_bench.inngest.serving_api import (
     deployment_logs,
     list_store,
     ocr_cache_stats,
+    serving_activity,
     serving_ports,
 )
 from docie_bench.serving.control_plane import PortAllocator
@@ -344,6 +345,33 @@ def test_trigger_deployment_load_declines_an_unseeded_name(
 
     assert result is None
     assert sent == []
+
+
+# ── /activity: the autoscale-up signal, purely observational for now ───────
+
+
+def test_activity_endpoint_degrades_without_a_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    import docie_bench.storage.db as db
+
+    db.dispose_engine()  # no DATABASE_URL configured
+    payload = asyncio.run(serving_activity())
+    assert payload["entries"] == []
+    assert "detail" in payload
+
+
+def test_activity_endpoint_reports_recorded_models(sqlite_catalog: None) -> None:
+    from docie_bench.serving.catalog import ModelCatalog
+
+    _seed_catalog("qwen2.5-1.5b")
+    ModelCatalog().record_activity("qwen2.5-1.5b")
+    ModelCatalog().record_activity("qwen2.5-1.5b")
+
+    payload = asyncio.run(serving_activity())
+
+    assert "detail" not in payload
+    assert len(payload["entries"]) == 1
+    assert payload["entries"][0]["model_name"] == "qwen2.5-1.5b"
+    assert payload["entries"][0]["window_count"] == 2
 
 
 def test_deployment_logs_tail(serving_home: Path) -> None:

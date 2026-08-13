@@ -75,6 +75,40 @@ def test_resolve_store_llama_server_default_style(_sqlite_catalog: None) -> None
     assert ENGINE_DEFAULT_STYLE["llama-server"] == "openai_json_schema"
 
 
+def test_resolve_store_records_activity(_sqlite_catalog: None) -> None:
+    """Every live resolution bumps model_activity — the signal a future
+    autoscale-up decision would read (see catalog.ModelActivity)."""
+    _seed("qwen2.5-1.5b", family="openai_chat")
+    _place("qwen2.5-1.5b", engine="llama-server")
+
+    assert ModelCatalog().get_activity("qwen2.5-1.5b") is None
+
+    resolve_store_profile("qwen2.5-1.5b")
+    activity = ModelCatalog().get_activity("qwen2.5-1.5b")
+    assert activity is not None
+    assert activity["window_count"] == 1
+
+    resolve_store_profile("qwen2.5-1.5b")
+    assert ModelCatalog().get_activity("qwen2.5-1.5b")["window_count"] == 2
+
+
+def test_resolve_store_survives_activity_write_failure(
+    _sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Activity tracking is best-effort — a DB hiccup on the bump must never
+    break a resolution that otherwise succeeded cleanly."""
+    _seed("qwen2.5-1.5b", family="openai_chat")
+    _place("qwen2.5-1.5b", engine="llama-server")
+
+    def boom(self: ModelCatalog, model_name: str) -> None:
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(ModelCatalog, "record_activity", boom)
+
+    profile = resolve_store_profile("qwen2.5-1.5b")
+    assert profile.name == "store:qwen2.5-1.5b"
+
+
 def test_resolve_store_ollama_default_style(_sqlite_catalog: None) -> None:
     _seed("qwen2.5-1.5b", family="openai_chat")
     _place("qwen2.5-1.5b", engine="ollama")

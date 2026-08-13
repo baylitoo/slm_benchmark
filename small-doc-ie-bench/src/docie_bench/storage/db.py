@@ -224,6 +224,7 @@ def init_engine(database_url: str | None = None) -> None:
     # the placement table instead of trusted to create_all). No-op on fresh
     # databases (create_all then creates the table complete).
     from docie_bench.serving.catalog import (
+        ensure_model_activity_table,
         ensure_placement_observed_columns,
         ensure_serving_node_table,
         ensure_size_bytes_bigint,
@@ -246,6 +247,9 @@ def init_engine(database_url: str | None = None) -> None:
     # lock on PostgreSQL) makes the creation race-safe (PR-2, mirroring the
     # PR-1 observed-columns pattern above).
     ensure_serving_node_table(_engine)
+    # Same race as serving_node above: model_activity is also new, also
+    # created by every process's concurrent init_engine() at stack-up.
+    ensure_model_activity_table(_engine)
     Base.metadata.create_all(bind=_engine)
 
 

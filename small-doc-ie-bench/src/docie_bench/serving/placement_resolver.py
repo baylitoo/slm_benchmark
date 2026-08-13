@@ -23,6 +23,7 @@ Style precedence (the load-bearing rule):
 from __future__ import annotations
 
 import ipaddress
+import logging
 import random
 import urllib.parse
 from collections.abc import Callable, Sequence
@@ -31,6 +32,8 @@ from typing import Any
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.catalog import ModelCatalog
 from docie_bench.serving.model_store import FAMILIES, FamilyContract, TemplateDelivery
+
+logger = logging.getLogger(__name__)
 
 STORE_PROFILE_PREFIX = "store:"
 
@@ -107,6 +110,19 @@ def _placement_is_live(placement: dict[str, Any]) -> bool:
     )
 
 
+def _record_activity_best_effort(name: str, catalog: ModelCatalog) -> None:
+    """Bump ``model_activity`` for ``name`` — best-effort, mirroring
+    ``profile_resolver._catalog_family``'s swallow pattern for a similar
+    advisory lookup. An activity-tracking hiccup (a DB error, or a rare
+    concurrent-insert race on the model's very first request) must never
+    break resolution for a request that otherwise resolved cleanly.
+    """
+    try:
+        catalog.record_activity(name)
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.debug("model-activity bump failed for %r", name, exc_info=True)
+
+
 def resolve_store_profile(
     name: str,
     *,
@@ -155,6 +171,7 @@ def resolve_store_profile(
             f"wait for the deploy/reload to finish or redeploy."
         )
     placement = live[0] if len(live) == 1 else chooser(live)
+    _record_activity_best_effort(name, catalog)
     contract = FAMILIES.get(str(entry.get("family") or ""))
     engine = str(placement.get("engine") or "")
     return ModelProfile(
