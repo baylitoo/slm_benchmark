@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 
 from docie_bench.agents.api import (
     _client,
@@ -30,7 +31,14 @@ from docie_bench.agents.api import (
     _single_chunk_sse,
     agents_tenant_guard,
 )
+from docie_bench.inngest.serving_api import trigger_deployment_load
+from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_completion_content
+from docie_bench.serving.placement_resolver import (
+    STORE_PROFILE_PREFIX,
+    PlacementNotFoundError,
+    PlacementNotReadyError,
+)
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
@@ -38,6 +46,47 @@ from docie_bench.serving.profile_resolver import (
 from docie_bench.settings import get_settings
 
 router = APIRouter(tags=["chat"], dependencies=[Depends(agents_tenant_guard)])
+
+
+async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
+    """Resolve ``model`` the same way every route here needs to, folding in
+    load-on-demand for a store model that isn't live yet.
+
+    Mirrors api.py's resolve_profile (same trigger_deployment_load seam): a
+    store: model with no live placement fires its own load/deploy and answers
+    202 with an ETA instead of a bare 404/409 — the point being a caller of
+    /v1/chat/completions, /v1/embeddings or /v1/rerank shouldn't need to know
+    in advance whether the model it asked for happens to be warm, any more
+    than a caller of /v1/extract/* does. A name that isn't a catalog entry at
+    all still 404s; there's nothing to start.
+    """
+    try:
+        return resolve_extraction_profile(model_profile=model)
+    except (PlacementNotFoundError, PlacementNotReadyError) as exc:
+        store_name = (
+            model[len(STORE_PROFILE_PREFIX) :] if model.startswith(STORE_PROFILE_PREFIX) else None
+        )
+        triggered = await trigger_deployment_load(store_name) if store_name else None
+        if triggered is not None:
+            name, eta = triggered
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "loading",
+                    "deployment": name,
+                    "eta_seconds": round(eta, 1),
+                    "message": (
+                        f"Model {name!r} is starting — this can take a moment "
+                        f"the first time. Retry in ~{int(eta)}s."
+                    ),
+                },
+            )
+        not_found = isinstance(exc, PlacementNotFoundError)
+        error_type = "model_not_found" if not_found else "model_not_ready"
+        status_code = 404 if not_found else 409
+        return _openai_error(str(exc), status_code=status_code, error_type=error_type)
+    except ProfileResolutionError as exc:
+        return _openai_error(str(exc), status_code=404, error_type="model_not_found")
 
 
 @router.get("/v1/models")
@@ -91,10 +140,10 @@ async def chat_completions(request: Request) -> Any:
             status_code=400,
             error_type="invalid_request_error",
         )
-    try:
-        profile = resolve_extraction_profile(model_profile=model)
-    except ProfileResolutionError as exc:
-        return _openai_error(str(exc), status_code=404, error_type="model_not_found")
+    resolved = await _resolve_or_error(model)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    profile = resolved
     if profile.kind != "passthrough":
         return _openai_error(
             f"model {model!r} is a {profile.kind!r} solution profile — use the "
@@ -182,10 +231,10 @@ async def embeddings(request: Request) -> Any:
             status_code=400,
             error_type="invalid_request_error",
         )
-    try:
-        profile = resolve_extraction_profile(model_profile=model)
-    except ProfileResolutionError as exc:
-        return _openai_error(str(exc), status_code=404, error_type="model_not_found")
+    resolved = await _resolve_or_error(model)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    profile = resolved
 
     forward = dict(body)
     forward["model"] = profile.model
@@ -268,10 +317,10 @@ async def rerank(request: Request) -> Any:
             status_code=400,
             error_type="invalid_request_error",
         )
-    try:
-        profile = resolve_extraction_profile(model_profile=model)
-    except ProfileResolutionError as exc:
-        return _openai_error(str(exc), status_code=404, error_type="model_not_found")
+    resolved = await _resolve_or_error(model)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    profile = resolved
 
     forward = dict(body)
     forward["model"] = profile.model

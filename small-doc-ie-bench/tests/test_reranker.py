@@ -140,3 +140,29 @@ def test_rerank_upstream_error_names_the_flags_needed(api, monkeypatch) -> None:
     )
     assert response.status_code == 400
     assert "--reranking" in response.json()["error"]["message"]
+
+
+def test_rerank_store_model_not_live_triggers_load_and_returns_202(monkeypatch) -> None:
+    # Same shared chat_api._resolve_or_error as /v1/chat/completions and
+    # /v1/embeddings -- proves the wiring reaches /v1/rerank too.
+    from docie_bench.serving.placement_resolver import PlacementNotReadyError
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        raise PlacementNotReadyError("store model 'cold-reranker' placement is 'starting'")
+
+    async def fake_trigger(name: str) -> tuple[str, float] | None:
+        assert name == "cold-reranker"
+        return name, 20.0
+
+    monkeypatch.setattr("docie_bench.chat_api.resolve_extraction_profile", fake_resolver)
+    monkeypatch.setattr("docie_bench.chat_api.trigger_deployment_load", fake_trigger)
+
+    app = FastAPI()
+    app.include_router(chat_router)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/rerank",
+        json={"model": "store:cold-reranker", "query": "x", "documents": ["a"]},
+    )
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "loading"
