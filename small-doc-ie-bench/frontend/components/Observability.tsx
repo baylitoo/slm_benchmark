@@ -1,13 +1,20 @@
 "use client";
 
-import { BarChart3, ExternalLink, Workflow, Gauge, ClipboardCheck } from "lucide-react";
+import { BarChart3, ExternalLink, Workflow, Gauge, ClipboardCheck, HardDrive } from "lucide-react";
 import { GRAFANA_URL, GRAFANA_DASHBOARD_URL, INNGEST_URL, METRICS_URL } from "@/lib/env";
-import { getReviewMetrics, ApiError, type ReviewMetricsView } from "@/lib/api";
+import {
+  getReviewMetrics,
+  getOcrCacheStats,
+  ApiError,
+  type ReviewMetricsView,
+  type OcrCacheStatsView,
+} from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Card, Badge } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
 
 const REVIEW_POLL_MS = 10000;
+const OCR_CACHE_POLL_MS = 15000;
 
 /**
  * Observability = external tooling: quick-link tiles (Grafana / Inngest /
@@ -58,7 +65,10 @@ export function Observability({ active = true }: { active?: boolean }) {
             icon={<Gauge className="h-5 w-5" />}
           />
         </div>
-        <ReviewQueueCard active={active} />
+        <div className="grid gap-4 lg:grid-cols-2">
+          <ReviewQueueCard active={active} />
+          <OcrCacheCard active={active} />
+        </div>
         <Card
           title="Small Document IE Benchmark"
           subtitle="Agent requests, PII detections, latency, and gate blocks — live from Prometheus."
@@ -144,6 +154,82 @@ function ReviewQueueCard({ active }: { active: boolean }) {
             <code className="rounded bg-muted px-1 py-0.5">POST /v1/reviews/&#123;id&#125;/claim</code>{" "}
             and friends directly.
           </p>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function formatAge(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
+}
+
+function OcrCacheCard({ active }: { active: boolean }) {
+  const stats = usePolling<OcrCacheStatsView>(getOcrCacheStats, OCR_CACHE_POLL_MS, active);
+  const data = stats.data;
+
+  return (
+    <Card
+      icon={<HardDrive className="h-5 w-5" />}
+      title="OCR cache"
+      subtitle="Content-addressed OCR artifacts on disk — how full, how old. Hit rate isn't tracked yet (needs aggregating across replicas)."
+    >
+      {stats.error ? (
+        <p className="text-sm text-muted-foreground">
+          Couldn&apos;t load OCR cache stats. Is the API reachable?
+        </p>
+      ) : stats.loading ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : data && !data.enabled ? (
+        <p className="text-sm text-muted-foreground">
+          Disabled — set OCR_CACHE_ENABLED=true to cache OCR results across runs.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone="info">{data?.entry_count ?? 0} entries</Badge>
+            <Badge
+              tone={
+                (data?.utilization_pct ?? 0) > 90
+                  ? "err"
+                  : (data?.utilization_pct ?? 0) > 70
+                    ? "warn"
+                    : "ok"
+              }
+            >
+              {formatBytes(data?.total_bytes ?? 0)} / {formatBytes(data?.max_bytes ?? 0)} (
+              {data?.utilization_pct ?? 0}%)
+            </Badge>
+          </div>
+          <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+            <span>
+              Oldest entry:{" "}
+              {data?.oldest_entry_age_seconds != null
+                ? `${formatAge(data.oldest_entry_age_seconds)} ago`
+                : "n/a — cache is empty"}
+            </span>
+            <span>
+              Newest entry:{" "}
+              {data?.newest_entry_age_seconds != null
+                ? `${formatAge(data.newest_entry_age_seconds)} ago`
+                : "n/a — cache is empty"}
+            </span>
+          </div>
         </div>
       )}
     </Card>

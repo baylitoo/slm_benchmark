@@ -9,12 +9,18 @@ and assert the shape + that ``recommended_next`` equals the SAME
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from docie_bench.inngest.serving_api import deployment_logs, list_store, serving_ports
+from docie_bench.inngest.serving_api import (
+    deployment_logs,
+    list_store,
+    ocr_cache_stats,
+    serving_ports,
+)
 from docie_bench.serving.control_plane import PortAllocator
 from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
 from docie_bench.serving.supervisor import DeploymentSpec, PersistentSupervisor
@@ -112,6 +118,68 @@ def test_ports_empty_when_no_deployments(serving_home: Path) -> None:
     assert payload["used"] == []
     assert payload["deployments"] == []
     assert payload["recommended_next"] == 8088  # first pick unchanged for a single deploy
+
+
+# ── OCR cache stats: on-disk utilization, no aggregation needed ────────────
+
+
+@pytest.fixture
+def ocr_cache_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    cache_dir = tmp_path / "ocr-cache"
+    monkeypatch.setenv("OCR_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("OCR_CACHE_ENABLED", "true")
+    monkeypatch.setenv("OCR_CACHE_MAX_MB", "1")  # 1 MiB, easy to reason about
+    get_settings.cache_clear()
+    try:
+        yield cache_dir
+    finally:
+        get_settings.cache_clear()
+
+
+def _write_cache_entry(cache_dir: Path, name: str, *, size_bytes: int, age_seconds: float) -> None:
+    import os
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{name}.json"
+    path.write_text("x" * size_bytes, encoding="utf-8")
+    stamp = time.time() - age_seconds
+    os.utime(path, (stamp, stamp))
+
+
+def test_ocr_cache_stats_empty_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OCR_CACHE_ENABLED", "false")
+    get_settings.cache_clear()
+    try:
+        payload = asyncio.run(ocr_cache_stats())
+    finally:
+        get_settings.cache_clear()
+    assert payload == {"enabled": False}
+
+
+def test_ocr_cache_stats_empty_cache_dir(ocr_cache_dir: Path) -> None:
+    payload = asyncio.run(ocr_cache_stats())
+
+    assert payload["enabled"] is True
+    assert payload["entry_count"] == 0
+    assert payload["total_bytes"] == 0
+    assert payload["max_bytes"] == 1024 * 1024
+    assert payload["utilization_pct"] == 0.0
+    assert payload["oldest_entry_age_seconds"] is None
+    assert payload["newest_entry_age_seconds"] is None
+
+
+def test_ocr_cache_stats_reports_size_and_age(ocr_cache_dir: Path) -> None:
+    _write_cache_entry(ocr_cache_dir, "a", size_bytes=1000, age_seconds=100)
+    _write_cache_entry(ocr_cache_dir, "b", size_bytes=2000, age_seconds=10)
+
+    payload = asyncio.run(ocr_cache_stats())
+
+    assert payload["entry_count"] == 2
+    assert payload["total_bytes"] == 3000
+    assert payload["utilization_pct"] == round(100 * 3000 / (1024 * 1024), 1)
+    # "a" was written 100s ago, "b" only 10s ago.
+    assert payload["oldest_entry_age_seconds"] >= 99
+    assert payload["newest_entry_age_seconds"] < 15
 
 
 # ── scale endpoint: fan-out to deploy events ────────────────────────────────

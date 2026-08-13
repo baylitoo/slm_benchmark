@@ -643,6 +643,28 @@ export function getReviewMetrics(): Promise<ReviewMetricsView> {
 }
 
 // ---------------------------------------------------------------------------
+// OCR cache utilization (Observability tab tile — GET /v1/serving/ocr-cache)
+// ---------------------------------------------------------------------------
+
+export interface OcrCacheStatsView {
+  enabled: boolean;
+  entry_count?: number;
+  total_bytes?: number;
+  max_bytes?: number;
+  utilization_pct?: number | null;
+  oldest_entry_age_seconds?: number | null;
+  newest_entry_age_seconds?: number | null;
+}
+
+/** On-disk OCR cache size/entry count, scanned live from the shared cache
+ * dir — accurate regardless of which api/worker replica served a request.
+ * Hit-rate isn't included: that needs aggregation across replicas the same
+ * way an autoscale load signal would, and isn't built yet. */
+export function getOcrCacheStats(): Promise<OcrCacheStatsView> {
+  return request<OcrCacheStatsView>("/v1/serving/ocr-cache");
+}
+
+// ---------------------------------------------------------------------------
 // Sizing tab (PR-3)
 // ---------------------------------------------------------------------------
 
