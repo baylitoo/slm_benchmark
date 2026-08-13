@@ -249,6 +249,67 @@ def test_chat_bare_evicted_deployment_name_also_triggers_load(
     assert body["deployment"] == "gemma-2-2b-it"
 
 
+def test_chat_store_model_worker_loopback_endpoint_is_rejected(monkeypatch) -> None:
+    """Mirrors api.py's resolve_profile guard: the deploy runtime records a
+    placement's endpoint from the WORKER's point of view, so a loopback
+    endpoint is unreachable from the api container this route runs in.
+    Without the guard, this "resolves" fine and then burns
+    timeout_seconds x retries on a doomed connect before a confusing
+    upstream_unavailable 502 -- fail fast with a 501 instead."""
+    loopback_profile = ModelProfile(
+        name="store:qwen2.5-1.5b",
+        model="qwen2.5-1.5b",
+        base_url="http://127.0.0.1:8088/v1",
+        api_key="local-not-used",
+    )
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        if model_profile == "store:qwen2.5-1.5b":
+            return loopback_profile
+        raise ProfileResolutionError(f"model {model_profile!r} is not routable")
+
+    monkeypatch.setattr("docie_bench.chat_api.resolve_extraction_profile", fake_resolver)
+
+    app = FastAPI()
+    app.include_router(chat_router)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "store:qwen2.5-1.5b", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 501, response.text
+    body = response.json()
+    assert "127.0.0.1:8088" in body["error"]["message"]
+    assert "/v1/studio/extract" in body["error"]["message"]
+
+
+def test_chat_deployment_selector_with_loopback_endpoint_is_not_guarded(monkeypatch) -> None:
+    """The guard is scoped to store: refs (api.py's does the same) -- a bare
+    deployment name resolving to a loopback endpoint is a different, already
+    load-on-demand-covered surface and must not be swept in here too."""
+    loopback_profile = ModelProfile(
+        name="local-dep", model="local-dep", base_url="http://127.0.0.1:8088/v1", api_key="k"
+    )
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        if model_profile == "local-dep":
+            return loopback_profile
+        raise ProfileResolutionError(f"model {model_profile!r} is not routable")
+
+    monkeypatch.setattr("docie_bench.chat_api.resolve_extraction_profile", fake_resolver)
+
+    app = FastAPI()
+    app.include_router(chat_router)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "local-dep", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    # Not rejected by the loopback guard; it proceeds to the actual (failing,
+    # unreachable-in-tests) upstream call instead of a 501.
+    assert response.status_code != 501, response.text
+
+
 def test_chat_store_model_genuinely_unseeded_still_404s(api_store, monkeypatch) -> None:
     async def fake_trigger(name: str) -> tuple[str, float] | None:
         return None  # not a catalog entry at all -- nothing to trigger
