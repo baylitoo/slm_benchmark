@@ -4,30 +4,29 @@ their own right.
 
 ``POST /v1/chat/completions`` routes the request's ``model`` through the same
 resolver as everything else (live deployment name, models.yaml profile,
-``store:<name>``) and forwards to that upstream. ``POST /v1/embeddings`` does
+``store:<name>``) and forwards to that upstream — proxying a real
+token-by-token SSE stream when the caller asks for one (``stream: true``),
+same wire protocol llama-server itself emits. ``POST /v1/embeddings`` does
 the same for an embedding deployment (llama-server ``--embedding``), so a
 RAG/retrieval pipeline computes document vectors on THIS node — they never
 leave the infra. ``GET /v1/models`` advertises the routable ids. Unlike the
 standalone ``docie gateway`` (its own process, models.yaml only), this rides
 the main API: live deployments work out of the box and the agents'
 bearer-friendly tenant guard applies.
-
-Kept deliberately small: non-streaming forward (a ``stream: true`` request is
-answered as a single SSE chunk, same convention as the agents surface). The
-full streaming proxy remains the gateway's job.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 
 from docie_bench.agents.api import (
     _client,
     _openai_error,
-    _single_chunk_sse,
     agents_tenant_guard,
 )
 from docie_bench.llm.mojibake import fix_completion_content
@@ -106,13 +105,19 @@ async def chat_completions(request: Request) -> Any:
     wants_stream = bool(body.get("stream"))
     forward = dict(body)
     forward["model"] = profile.model
-    forward.pop("stream", None)
     url = f"{profile.base_url}/chat/completions"
     headers = {
         "Authorization": f"Bearer {profile.api_key}",
         "Content-Type": "application/json",
     }
     client: httpx.AsyncClient = _client()
+
+    if wants_stream:
+        return await _stream_chat_completions(
+            client, url, headers, forward, profile.timeout_seconds
+        )
+
+    forward.pop("stream", None)
     try:
         upstream = await client.post(
             url, json=forward, headers=headers, timeout=profile.timeout_seconds
@@ -141,9 +146,55 @@ async def chat_completions(request: Request) -> Any:
     # on small vision models — the Playground Vision path lands here).
     if get_settings().fix_mojibake:
         completion = fix_completion_content(completion)
-    if wants_stream:
-        return _single_chunk_sse(completion)
     return completion
+
+
+async def _stream_chat_completions(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forward: dict[str, Any],
+    timeout: float,
+) -> Any:
+    """Real token-by-token proxy: forward raw SSE bytes as the upstream emits
+    them, instead of buffering the full completion first. Ported from the
+    gateway's ``_forward_stream`` — same shape, chat-only entry point.
+
+    No mojibake repair here (unlike the non-streaming path): a fix-up needs
+    the full decoded string, and a multi-byte UTF-8 sequence can straddle a
+    chunk boundary. The gateway's proven streaming path skips it too.
+    """
+    forward["stream"] = True
+    stream_ctx = client.stream("POST", url, json=forward, headers=headers, timeout=timeout)
+    try:
+        upstream = await stream_ctx.__aenter__()
+    except httpx.RequestError as exc:
+        return _openai_error(
+            f"upstream {url} is unreachable: {exc}",
+            status_code=502,
+            error_type="upstream_unavailable",
+        )
+    media_type = upstream.headers.get("content-type", "text/event-stream")
+    if upstream.status_code >= 400:
+        body_bytes = await upstream.aread()
+        await stream_ctx.__aexit__(None, None, None)
+        detail = body_bytes[:300].decode("utf-8", "replace")
+        return _openai_error(
+            f"upstream returned {upstream.status_code}: {detail}",
+            status_code=upstream.status_code,
+            error_type="upstream_error",
+        )
+
+    async def body_iterator() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await stream_ctx.__aexit__(None, None, None)
+
+    return StreamingResponse(
+        body_iterator(), status_code=upstream.status_code, media_type=media_type
+    )
 
 
 @router.post("/v1/embeddings")
