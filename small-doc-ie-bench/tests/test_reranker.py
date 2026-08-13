@@ -142,6 +142,20 @@ def test_rerank_upstream_error_names_the_flags_needed(api, monkeypatch) -> None:
     assert "--reranking" in response.json()["error"]["message"]
 
 
+def test_rerank_stamps_recency_for_the_served_deployment(api, monkeypatch) -> None:
+    client, _ = api
+    calls: list[str | None] = []
+    monkeypatch.setattr(
+        "docie_bench.chat_api.recency.stamp_served_profile", lambda name: calls.append(name)
+    )
+    response = client.post(
+        "/v1/rerank",
+        json={"model": "lfm-rerank", "query": "x", "documents": ["a", "b"]},
+    )
+    assert response.status_code == 200, response.text
+    assert calls == ["lfm-rerank"]
+
+
 def test_rerank_store_model_not_live_triggers_load_and_returns_202(monkeypatch) -> None:
     # Same shared chat_api._resolve_or_error as /v1/chat/completions and
     # /v1/embeddings -- proves the wiring reaches /v1/rerank too.

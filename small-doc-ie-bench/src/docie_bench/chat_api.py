@@ -35,6 +35,7 @@ from docie_bench.agents.api import (
 from docie_bench.inngest.serving_api import trigger_deployment_load
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_completion_content
+from docie_bench.serving import recency
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
     PlacementNotFoundError,
@@ -180,7 +181,7 @@ async def chat_completions(request: Request) -> Any:
 
     if wants_stream:
         return await _stream_chat_completions(
-            client, url, headers, forward, profile.timeout_seconds
+            client, url, headers, forward, profile.timeout_seconds, profile.name
         )
 
     forward.pop("stream", None)
@@ -208,6 +209,10 @@ async def chat_completions(request: Request) -> Any:
             status_code=502,
             error_type="upstream_error",
         )
+    # PR-4 recency: this surface serves traffic too — stamp last_served like
+    # api.py's extract path, or a deployment driven only through chat reads
+    # as idle forever and becomes the first idle-TTL/LRU eviction victim.
+    recency.stamp_served_profile(profile.name)
     # Repair model-emitted UTF-8 mojibake in the answer (accented OCR/description
     # on small vision models — the Playground Vision path lands here).
     if get_settings().fix_mojibake:
@@ -221,6 +226,7 @@ async def _stream_chat_completions(
     headers: dict[str, str],
     forward: dict[str, Any],
     timeout: float,
+    profile_name: str,
 ) -> Any:
     """Real token-by-token proxy: forward raw SSE bytes as the upstream emits
     them, instead of buffering the full completion first. Ported from the
@@ -250,6 +256,10 @@ async def _stream_chat_completions(
             status_code=upstream.status_code,
             error_type="upstream_error",
         )
+    # PR-4 recency, see the non-streaming path's comment above — a stream
+    # that gets this far has an accepted upstream connection, which counts
+    # as this deployment serving traffic.
+    recency.stamp_served_profile(profile_name)
 
     async def body_iterator() -> AsyncIterator[bytes]:
         try:
@@ -330,13 +340,15 @@ async def embeddings(request: Request) -> Any:
             error_type="upstream_error",
         )
     try:
-        return upstream.json()
+        result = upstream.json()
     except ValueError:
         return _openai_error(
             "upstream returned a non-JSON response",
             status_code=502,
             error_type="upstream_error",
         )
+    recency.stamp_served_profile(profile.name)  # PR-4 recency, see chat_completions
+    return result
 
 
 @router.post("/v1/rerank")
@@ -416,10 +428,12 @@ async def rerank(request: Request) -> Any:
             error_type="upstream_error",
         )
     try:
-        return upstream.json()
+        result = upstream.json()
     except ValueError:
         return _openai_error(
             "upstream returned a non-JSON response",
             status_code=502,
             error_type="upstream_error",
         )
+    recency.stamp_served_profile(profile.name)  # PR-4 recency, see chat_completions
+    return result
