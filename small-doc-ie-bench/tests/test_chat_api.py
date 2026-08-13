@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -30,9 +31,18 @@ def api(monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
 
     captured: list[httpx.Request] = []
 
+    async def _sse_chunks() -> AsyncIterator[bytes]:
+        for piece in ("Hel", "lo", "!"):
+            yield f'data: {{"choices":[{{"delta":{{"content":"{piece}"}}}}]}}\n\n'.encode()
+        yield b"data: [DONE]\n\n"
+
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
         body = json.loads(request.content)
+        if body.get("stream"):
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=_sse_chunks()
+            )
         last = body["messages"][-1]["content"]
         return httpx.Response(
             200,
@@ -97,16 +107,31 @@ def test_chat_requires_model(api) -> None:
     assert response.status_code == 400
 
 
-def test_chat_stream_answers_single_sse_chunk(api) -> None:
-    client, _ = api
-    response = client.post(
+def test_chat_stream_proxies_real_upstream_chunks(api) -> None:
+    """A stream: true request gets the upstream's actual token-by-token SSE
+    frames relayed as they arrive — not one buffered chunk built after the
+    full completion finishes. The mock upstream emits 4 separate SSE events;
+    all 4 must show up verbatim, in order, and the forwarded request must
+    still carry stream: true (previously stripped before reaching upstream)."""
+    client, captured = api
+    with client.stream(
+        "POST",
         "/v1/chat/completions",
         json={
             "model": "lfm2.5-350m",
             "stream": True,
             "messages": [{"role": "user", "content": "hi"}],
         },
-    )
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert "data: [DONE]" in response.text
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [line for line in response.iter_lines() if line.startswith("data: ")]
+
+    assert events == [
+        'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+        'data: {"choices":[{"delta":{"content":"lo"}}]}',
+        'data: {"choices":[{"delta":{"content":"!"}}]}',
+        "data: [DONE]",
+    ]
+    sent = json.loads(captured[-1].content)
+    assert sent["stream"] is True
