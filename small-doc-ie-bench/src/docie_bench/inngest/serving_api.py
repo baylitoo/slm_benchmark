@@ -323,6 +323,33 @@ async def serving_sizing() -> dict[str, Any]:
     return payload
 
 
+@router.get("/activity")
+async def serving_activity() -> dict[str, Any]:
+    """Per-store-model request activity: a crude "how hot is this model
+    right now" signal (``model_activity`` — see ``catalog.ModelActivity``).
+
+    Purely observational today — nothing scales on this yet. It exists so
+    an operator can see load next to the Sizing tab's fit numbers before
+    anyone builds a decision on top of it. ``window_count`` resets whenever
+    something reads-then-zeros the window (nothing does yet — a fresh
+    process never sees fewer requests than actually happened, it just
+    hasn't been zeroed), so treat it as "requests since window_started_at",
+    not a live rate.
+
+    Degrades honestly like ``/sizing``: an empty list plus a ``detail``
+    reason when the database is down, never a 500.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        entries = ModelCatalog().list_activity()
+    except CatalogUnavailableError:
+        return {"entries": [], "detail": "activity unavailable: DATABASE_URL is not configured"}
+    except Exception:  # noqa: BLE001 - a DB hiccup must not 500 this tile
+        return {"entries": [], "detail": "activity unavailable: database error"}
+    return {"entries": entries}
+
+
 # Errors here are 422, NEVER 404: the Studio treats 404/501 as "endpoint not
 # available" (api.ts isUnavailableStatus), so a store-removal racing the UI
 # poll must surface the server's detail, not a bogus "endpoint unavailable".

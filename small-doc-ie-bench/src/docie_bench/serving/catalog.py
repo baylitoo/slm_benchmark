@@ -177,6 +177,62 @@ class ServingNode(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ModelActivity(Base):
+    """Per-store-model request-activity signal, the seam an autoscale-up
+    decision would read (design doc: autoscale-up research).
+
+    One row per store model name (not per replica — replicas of the same
+    model share load, so activity is tracked at the model level). Written
+    best-effort from ``placement_resolver.resolve_store_profile`` on every
+    live-placement pick; a write failure must never break routing (see the
+    call site). ``window_count``/``window_started_at`` form a crude tumbling
+    window: intentionally NOT a rolling rate or a request log — the
+    reconciler is expected to read-then-zero the window each cycle (an
+    autoscale decision only needs "how many requests since I last looked",
+    not a precise rate). Read-only today (surfaced on ``GET
+    /v1/serving/activity``, purely observational) — nothing acts on it yet;
+    the reconciler wiring is deliberately a separate, later change.
+    """
+
+    __tablename__ = "model_activity"
+
+    model_name: Mapped[str] = mapped_column(String(200), primary_key=True)
+    window_count: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_request_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+# Arbitrary-but-stable advisory-lock key for the model_activity table
+# creation. Distinct from every other migration's key so none of them
+# serialize against each other needlessly.
+_MODEL_ACTIVITY_LOCK_KEY = 0x0D0C1E05
+
+
+def ensure_model_activity_table(engine: Engine) -> bool:
+    """Race-safe forward migration: create ``model_activity`` if missing.
+
+    Same pattern as :func:`ensure_serving_node_table` — ``CREATE TABLE IF
+    NOT EXISTS`` under ``pg_advisory_xact_lock`` so concurrently starting
+    processes (api, serving, N workers) can't race each other into a
+    duplicate-table abort. No added-columns step: this table is new, so
+    there is no pre-existing shape to migrate yet.
+    """
+    activity_table = ModelActivity.__table__
+    assert isinstance(activity_table, Table)  # narrow FromClause for the compiler
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _MODEL_ACTIVITY_LOCK_KEY},
+            )
+        existed = sa_inspect(connection).has_table("model_activity")
+        connection.execute(CreateTable(activity_table, if_not_exists=True))
+    return not existed
+
+
 # Arbitrary-but-stable advisory-lock key for the serving_node table creation
 # ("docie placement v2"). Distinct from the placement-columns key so the two
 # migrations never serialize against each other needlessly.
@@ -460,6 +516,16 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         "source": row.source,
         "sum_rss_bytes": row.sum_rss_bytes,
         "reclaimable_bytes": row.reclaimable_bytes,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _activity_view(row: ModelActivity) -> dict[str, Any]:
+    return {
+        "model_name": row.model_name,
+        "window_count": row.window_count,
+        "window_started_at": row.window_started_at.isoformat() if row.window_started_at else None,
+        "last_request_at": row.last_request_at.isoformat() if row.last_request_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
 
@@ -858,6 +924,58 @@ class ModelCatalog:
             ).all()
             return [_placement_view(row) for row in rows]
 
+    # --------------------------------------------------------------- activity
+    def record_activity(self, model_name: str) -> None:
+        """Bump ``model_activity`` for ``model_name`` by one request.
+
+        A no-op (not an error) when DATABASE_URL is not configured — unlike
+        every other write on this class, this one is inherently best-effort:
+        it's called from the hot request-resolution path
+        (``resolve_store_profile``), where a missing/unhealthy DB must never
+        block routing. A genuine DB error (e.g. a rare concurrent-insert
+        race on a model's first-ever request) still raises; the caller is
+        responsible for swallowing it (see ``placement_resolver``'s call
+        site, which wraps this broadly and logs at debug level).
+        """
+        with session_scope() as session:
+            if session is None:
+                return
+            now = _utcnow()
+            row = session.get(ModelActivity, model_name)
+            if row is None:
+                session.add(
+                    ModelActivity(
+                        model_name=model_name,
+                        window_count=1,
+                        window_started_at=now,
+                        last_request_at=now,
+                    )
+                )
+                return
+            row.window_count += 1
+            row.last_request_at = now
+
+    def get_activity(self, model_name: str) -> dict[str, Any] | None:
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ModelActivity, model_name)
+            return _activity_view(row) if row is not None else None
+
+    def list_activity(self) -> Sequence[dict[str, Any]]:
+        # Sequence, not the bare `list[...]` used elsewhere in this class —
+        # this class already has a method literally named `list`, which
+        # shadows the builtin for any bare `list[...]` annotation appearing
+        # after it (a pre-existing mypy false-positive on
+        # list_placements_for_model, left as-is; not reproducing it here).
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            rows = session.scalars(
+                select(ModelActivity).order_by(ModelActivity.last_request_at.desc())
+            ).all()
+            return [_activity_view(row) for row in rows]
+
     @staticmethod
     def _placement_row_for_model(session: Session, model_name: str) -> ModelPlacement | None:
         return session.scalars(
@@ -870,6 +988,7 @@ class ModelCatalog:
 __all__ = [
     "ModelStoreEntry",
     "ModelPlacement",
+    "ModelActivity",
     "ModelCatalog",
     "CatalogUnavailableError",
     "SERVING_NODE_ROW_ID",
@@ -877,5 +996,6 @@ __all__ = [
     "available_backends",
     "ensure_placement_observed_columns",
     "ensure_serving_node_table",
+    "ensure_model_activity_table",
     "ensure_size_bytes_bigint",
 ]

@@ -88,3 +88,45 @@ def test_store_view_includes_placement_or_null(_sqlite_catalog: None) -> None:
     assert placement["updated_at"] is not None
     listed = catalog.list()
     assert listed[0]["placement"]["state"] == "ready"
+
+
+# ── model_activity: the autoscale-up signal (write side only — nothing acts
+# on it yet, see catalog.ModelActivity's docstring) ─────────────────────────
+
+
+def test_activity_starts_absent(_sqlite_catalog: None) -> None:
+    assert ModelCatalog().get_activity("qwen2.5-7b-q4") is None
+    assert ModelCatalog().list_activity() == []
+
+
+def test_activity_first_record_creates_the_row(_sqlite_catalog: None) -> None:
+    catalog = ModelCatalog()
+    catalog.record_activity("qwen2.5-7b-q4")
+
+    activity = catalog.get_activity("qwen2.5-7b-q4")
+    assert activity is not None
+    assert activity["model_name"] == "qwen2.5-7b-q4"
+    assert activity["window_count"] == 1
+    assert activity["window_started_at"] is not None
+    assert activity["last_request_at"] is not None
+
+
+def test_activity_repeated_records_increment_the_same_row(_sqlite_catalog: None) -> None:
+    catalog = ModelCatalog()
+    for _ in range(3):
+        catalog.record_activity("qwen2.5-7b-q4")
+
+    activity = catalog.get_activity("qwen2.5-7b-q4")
+    assert activity["window_count"] == 3
+    # One row per model, not one per request.
+    assert len(catalog.list_activity()) == 1
+
+
+def test_activity_tracks_independently_per_model(_sqlite_catalog: None) -> None:
+    catalog = ModelCatalog()
+    catalog.record_activity("qwen2.5-7b-q4")
+    catalog.record_activity("qwen2.5-7b-q4")
+    catalog.record_activity("lfm2.5-350m")
+
+    by_name = {row["model_name"]: row["window_count"] for row in catalog.list_activity()}
+    assert by_name == {"qwen2.5-7b-q4": 2, "lfm2.5-350m": 1}
