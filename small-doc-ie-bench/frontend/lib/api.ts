@@ -624,6 +624,25 @@ export function getFamilies(): Promise<ModelFamily[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Human review queue (Observability tab tile — GET /v1/reviews/metrics)
+// ---------------------------------------------------------------------------
+
+export interface ReviewMetricsView {
+  queue_depth: Record<string, number>;
+  correction_rate: number | null;
+  reviewer_agreement: number | null;
+  average_queue_latency_seconds: number | null;
+  workload_by_reviewer: Record<string, Record<string, number>>;
+}
+
+/** Review-queue health: depth by status, correction/agreement rates. 422
+ * ("Review workflow requires DATABASE_URL") when database persistence isn't
+ * enabled — the whole review workflow needs it. */
+export function getReviewMetrics(): Promise<ReviewMetricsView> {
+  return request<ReviewMetricsView>("/v1/reviews/metrics");
+}
+
+// ---------------------------------------------------------------------------
 // Sizing tab (PR-3)
 // ---------------------------------------------------------------------------
 
