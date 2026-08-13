@@ -303,6 +303,51 @@ async def test_schema_fallback_reraises_non_grammar_400() -> None:
     assert "context length" in str(exc.value)
 
 
+async def test_schema_fallback_downgrades_on_empty_200_content() -> None:
+    # The small-Ollama-and-friends defect: a strong response_format style
+    # compiles fine (200, not 400) but the model emits nothing. Before this
+    # fix, the agent forward accepted that as a "successful" empty
+    # completion on the very first attempt -- openai_client.chat_json's
+    # ladder already treats this as downgradable; the agent path needs its
+    # own check since it forwards through _post_chat directly.
+    from docie_bench.agents.runtime import _post_chat_with_schema
+
+    seen: list[dict | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        rf = body.get("response_format")
+        seen.append(rf)
+        if rf and rf.get("type") == "json_schema":
+            return httpx.Response(200, json=_completion(body["model"], content=""))
+        return httpx.Response(200, json=_completion(body["model"], content='{"ok":true}'))
+
+    msgs = {"messages": [{"role": "user", "content": "x"}]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
+    # Both json_schema attempts (prefill, no-prefill) came back empty ->
+    # downgraded to json_object, which answered.
+    assert [s and s["type"] for s in seen] == ["json_schema", "json_schema", "json_object"]
+    assert result["choices"][0]["message"]["content"] == '{"ok":true}'
+
+
+async def test_schema_fallback_raises_when_every_rung_is_empty() -> None:
+    # Even the unconstrained final rung came back empty: there is no weaker
+    # style left, so this must raise rather than hand back an empty
+    # "successful" completion.
+    from docie_bench.agents.runtime import AgentError, _post_chat_with_schema
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(200, json=_completion(body["model"], content=""))
+
+    msgs = {"messages": [{"role": "user", "content": "x"}]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(AgentError) as exc:
+            await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
+    assert "empty content" in str(exc.value)
+
+
 def test_ocr_agent_vision_mode_forwards_image_with_schema(api) -> None:
     client, captured = api
     created = client.post(
