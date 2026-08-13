@@ -31,6 +31,15 @@ jobs:
           cache-dependency-path: small-doc-ie-bench/pyproject.toml
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q --timeout=600
+      # ruff/mypy have pre-existing repo-wide findings (127 ruff errors, a mypy
+      # bootstrap error) that predate this addition — reported but non-blocking
+      # until that debt is paid down in a dedicated pass.
+      - name: Lint (informational)
+        if: always()
+        run: ruff check . || true
+      - name: Type check (informational)
+        if: always()
+        run: mypy src || true
       - name: Compare deterministic benchmark fixture
         run: |
           docie-bench benchmark compare \
