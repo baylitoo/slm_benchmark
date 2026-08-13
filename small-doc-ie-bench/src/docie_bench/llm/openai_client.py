@@ -36,6 +36,18 @@ def _clean_content(text: str) -> str:
     - Markdown code fences (```json ... ```)
     - Run-on text after a complete JSON object (bracket-balance extraction)
     """
+    # A <think> opened but never closed means generation was cut off (usually
+    # max_tokens) WHILE the model was still reasoning -- there is no answer to
+    # extract yet. Bail out here with the raw text (which starts with
+    # "<think>", not "{", so json.loads fails cleanly) rather than falling
+    # through to the bracket-balance extraction below: reasoning prose that
+    # merely mentions a field in brace notation (e.g. musing about `{"vendor":
+    # "string"}` while planning the answer) parses as syntactically valid,
+    # semantically wrong, JSON otherwise -- a silent corruption, not a clean
+    # failure. Confirmed reproducible, not hypothetical.
+    if "<think>" in text and "</think>" not in text:
+        return text
+
     # NuExtract3 reasoning mode prefixes the answer with a <think>...</think>
     # block; keep only what follows the final </think>.
     if "</think>" in text:
