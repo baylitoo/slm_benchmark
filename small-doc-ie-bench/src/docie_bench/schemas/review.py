@@ -19,6 +19,7 @@ class ReviewReason(BaseModel):
         "invalid",
         "low_confidence",
         "weak_evidence",
+        "arithmetic_mismatch",
         "model_disagreement",
         "learning_value",
         "manual",
@@ -49,6 +50,11 @@ class ReviewTaskCreate(BaseModel):
     original_prediction: dict[str, Any]
     validation_valid: bool = True
     validation_errors: list[str] = Field(default_factory=list)
+    # Non-fatal findings (e.g. arithmetic reconciliation: subtotal + vat_amount
+    # != total_ttc) — the extraction is schema-valid, so these never populate
+    # validation_errors, but they're exactly what a reviewer needs to see:
+    # ExtractionValidation.warnings, forwarded through untouched.
+    validation_warnings: list[str] = Field(default_factory=list)
     dynamic_schema: dict[str, Any] | None = None
     disagreement_score: float | None = Field(default=None, ge=0.0, le=1.0)
     expected_learning_value: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -117,6 +123,7 @@ class ReviewTaskView(BaseModel):
     original_prediction: dict[str, Any]
     latest_prediction: dict[str, Any]
     validation_errors: list[str]
+    validation_warnings: list[str] = Field(default_factory=list)
     dynamic_schema: dict[str, Any] | None
     metadata: dict[str, str]
     claimed_by: str | None

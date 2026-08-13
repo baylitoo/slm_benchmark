@@ -118,6 +118,23 @@ def score_review_candidate(
                 )
             )
 
+    if payload.validation_warnings:
+        # Schema-valid but arithmetically inconsistent (subtotal+vat != total_ttc,
+        # a line's quantity*unit_price != line_total, ...) -- the extraction
+        # passes validation_valid, so without this it would only reach the
+        # queue by coincidence of another signal, and a reviewer who did see it
+        # would have no idea why. detail carries the first (enriched, values-
+        # included) warning so the reason itself is diagnostic.
+        reasons.append(
+            ReviewReason(
+                code="arithmetic_mismatch",
+                score=1.0,
+                detail=(
+                    f"{len(payload.validation_warnings)} arithmetic reconciliation "
+                    f"warning(s): {payload.validation_warnings[0]}"
+                ),
+            )
+        )
     if payload.disagreement_score:
         reasons.append(
             ReviewReason(
@@ -140,6 +157,7 @@ def score_review_candidate(
         "invalid": 40.0,
         "low_confidence": 25.0,
         "weak_evidence": 20.0,
+        "arithmetic_mismatch": 20.0,
         "model_disagreement": 30.0,
         "learning_value": 15.0,
     }
@@ -239,6 +257,10 @@ def _task_view(task: ReviewTask, *, include_history: bool = True) -> ReviewTaskV
         original_prediction=task.original_prediction_json,
         latest_prediction=task.latest_prediction_json,
         validation_errors=task.validation_errors_json,
+        # Pre-migration rows have NULL here (the forward migration's ADD COLUMN
+        # carries no DB-side default, only new inserts set Python's default=list)
+        # -- coalesce so the Pydantic list[str] field never sees None.
+        validation_warnings=task.validation_warnings_json or [],
         dynamic_schema=task.dynamic_schema_json,
         metadata=task.metadata_json,
         claimed_by=task.claimed_by,
@@ -306,6 +328,7 @@ def enqueue_review(payload: ReviewTaskCreate, *, force: bool = False) -> ReviewT
             original_prediction_json=payload.original_prediction,
             latest_prediction_json=payload.original_prediction,
             validation_errors_json=payload.validation_errors,
+            validation_warnings_json=payload.validation_warnings,
             dynamic_schema_json=payload.dynamic_schema,
             metadata_json=payload.metadata,
             status=ReviewStatus.PENDING,
