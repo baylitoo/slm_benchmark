@@ -184,6 +184,30 @@ def test_chat_store_model_not_live_triggers_load_and_returns_202(
         assert "30s" in body["message"]
 
 
+def test_chat_bare_evicted_deployment_name_also_triggers_load(
+    api_store, monkeypatch
+) -> None:
+    """The Playground's Chat/Vision pickers submit a raw deployment name,
+    never store:-prefixed (unlike an explicit store:<name> API call) — an
+    evicted deployment picked there must still cold-start, not 404, or the
+    picker offering evicted deployments at all would be dead UI."""
+
+    async def fake_trigger(name: str) -> tuple[str, float] | None:
+        assert name == "gemma-2-2b-it"
+        return name, 45.0
+
+    monkeypatch.setattr("docie_bench.chat_api.trigger_deployment_load", fake_trigger)
+
+    response = api_store.post(
+        "/v1/chat/completions",
+        json={"model": "gemma-2-2b-it", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "loading"
+    assert body["deployment"] == "gemma-2-2b-it"
+
+
 def test_chat_store_model_genuinely_unseeded_still_404s(api_store, monkeypatch) -> None:
     async def fake_trigger(name: str) -> tuple[str, float] | None:
         return None  # not a catalog entry at all -- nothing to trigger

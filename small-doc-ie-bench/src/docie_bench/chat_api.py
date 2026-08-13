@@ -49,6 +49,22 @@ from docie_bench.settings import get_settings
 router = APIRouter(tags=["chat"], dependencies=[Depends(agents_tenant_guard)])
 
 
+def _loading_response(triggered: tuple[str, float]) -> JSONResponse:
+    name, eta = triggered
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "loading",
+            "deployment": name,
+            "eta_seconds": round(eta, 1),
+            "message": (
+                f"Model {name!r} is starting — this can take a moment "
+                f"the first time. Retry in ~{int(eta)}s."
+            ),
+        },
+    )
+
+
 async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
     """Resolve ``model`` the same way every route here needs to, folding in
     load-on-demand for a store model that isn't live yet.
@@ -60,6 +76,14 @@ async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
     in advance whether the model it asked for happens to be warm, any more
     than a caller of /v1/extract/* does. A name that isn't a catalog entry at
     all still 404s; there's nothing to start.
+
+    Also tries the trigger for a BARE (non-``store:``-prefixed) name that
+    fails resolution: the Playground's Chat/Vision pickers submit a raw
+    deployment name, never ``store:``-prefixed (unlike an explicit API
+    caller), so an evicted deployment picked there would otherwise 404
+    outright — trigger_deployment_load safely returns None for a name that
+    isn't a real catalog entry, so this is a no-op for a genuinely unknown
+    model.
     """
     try:
         return resolve_extraction_profile(model_profile=model)
@@ -69,24 +93,15 @@ async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
         )
         triggered = await trigger_deployment_load(store_name) if store_name else None
         if triggered is not None:
-            name, eta = triggered
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "status": "loading",
-                    "deployment": name,
-                    "eta_seconds": round(eta, 1),
-                    "message": (
-                        f"Model {name!r} is starting — this can take a moment "
-                        f"the first time. Retry in ~{int(eta)}s."
-                    ),
-                },
-            )
+            return _loading_response(triggered)
         not_found = isinstance(exc, PlacementNotFoundError)
         error_type = "model_not_found" if not_found else "model_not_ready"
         status_code = 404 if not_found else 409
         return _openai_error(str(exc), status_code=status_code, error_type=error_type)
     except ProfileResolutionError as exc:
+        triggered = await trigger_deployment_load(model)
+        if triggered is not None:
+            return _loading_response(triggered)
         return _openai_error(str(exc), status_code=404, error_type="model_not_found")
 
 
