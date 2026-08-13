@@ -681,6 +681,31 @@ export function getOcrCacheStats(): Promise<OcrCacheStatsView> {
 }
 
 // ---------------------------------------------------------------------------
+// Store-model activity (Observability tab tile — GET /v1/serving/activity)
+// ---------------------------------------------------------------------------
+
+export interface ActivityEntry {
+  model_name: string;
+  window_count: number;
+  window_started_at: string | null;
+  last_request_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ActivityView {
+  entries: ActivityEntry[];
+  detail?: string;
+}
+
+/** Per-store-model request counts since the window last reset — purely
+ * observational (see catalog.ModelActivity's docstring): nothing scales on
+ * this yet, it's here so an operator can see load next to the Sizing tab's
+ * fit numbers before anyone builds a decision on top of it. */
+export function getActivity(): Promise<ActivityView> {
+  return request<ActivityView>("/v1/serving/activity");
+}
+
+// ---------------------------------------------------------------------------
 // Sizing tab (PR-3)
 // ---------------------------------------------------------------------------
 
