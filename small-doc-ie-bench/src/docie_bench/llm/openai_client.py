@@ -358,6 +358,7 @@ class OpenAICompatibleClient:
                 if get_settings().fix_mojibake:
                     content = fix_mojibake(content)
 
+                finish_reason = data.get("choices", [{}])[0].get("finish_reason")
                 logger.debug(
                     "llm_response",
                     extra={
@@ -370,11 +371,34 @@ class OpenAICompatibleClient:
                             if getattr(get_settings(), "log_document_content", False)
                             else {}
                         ),
-                        "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+                        "docie_finish_reason": finish_reason,
                         "docie_usage": data.get("usage"),
                         "docie_llm_latency_ms": llm_latency_ms,
                     },
                 )
+                if (
+                    finish_reason == "length"
+                    and "<think>" in content
+                    and "</think>" not in content
+                ):
+                    # max_tokens is identical across every rung (build_payload
+                    # above), so a different response_format style will not
+                    # fix a token-budget problem -- walking the rest of the
+                    # ladder here would just burn N-1 more real round-trips
+                    # before failing on the last rung anyway (the model will
+                    # very likely truncate again). finish_reason == "length"
+                    # corroborates the unclosed-<think> heuristic that
+                    # _clean_content also acts on (that one still bails safely
+                    # if this stronger, cheaper-to-check-here signal is
+                    # absent). Fail fast with an actionable message instead.
+                    raise InvalidModelResponseError(
+                        f"Generation was cut off by max_tokens "
+                        f"({self.profile.max_tokens}) while {self.profile.model!r} was "
+                        "still reasoning (an unclosed <think> block) -- there is no "
+                        "answer to extract. Raise max_tokens, or disable extended "
+                        "thinking for this profile (no_think / a non-reasoning "
+                        "response_format_style)."
+                    )
                 cleaned = _clean_content(content)
                 try:
                     parsed = json.loads(cleaned)

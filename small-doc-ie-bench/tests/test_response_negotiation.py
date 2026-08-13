@@ -293,3 +293,80 @@ async def test_singleton_style_does_not_downgrade_and_raises() -> None:
     # Only the declared style was attempted, no downgrade to another family.
     assert calls == 1
     assert client.last_response_format_style is None
+
+
+async def test_truncated_think_with_finish_reason_length_fails_fast() -> None:
+    # max_tokens is the same on every rung (build_payload), so if the model
+    # truncates mid-reasoning on one style it will almost certainly truncate
+    # on the others too -- walking the whole ladder would just burn real
+    # round-trips before failing anyway. finish_reason == "length" plus an
+    # unclosed <think> must raise on the FIRST attempt, no downgrade.
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '<think>Let me look at fields like {"vendor": "x"} '
+                                "and figure out the total..."
+                            )
+                        },
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 900, "total_tokens": 901},
+            },
+        )
+
+    client = await _client(_profile(capability_discovery="disabled"), handler)
+    try:
+        with pytest.raises(InvalidModelResponseError, match="max_tokens"):
+            await _chat(client)
+    finally:
+        await client.aclose()
+    # No ladder downgrade: this fails fast on the very first rung.
+    assert calls == 1
+
+
+async def test_truncated_think_without_length_finish_reason_still_downgrades() -> None:
+    # The fail-fast path requires BOTH signals (finish_reason == "length" AND
+    # an unclosed <think>). Without the finish_reason corroboration, this
+    # falls through to the existing #150 safety net in _clean_content (bails
+    # without extracting a bogus fragment) and the ordinary downgrade-then-
+    # raise path -- still safe, just not short-circuited.
+    styles_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payload = json.loads(request.read().decode("utf-8"))
+        rf = payload.get("response_format")
+        styles_seen.append(rf.get("type") if rf else "none")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": '<think>musing about {"x": 1}...'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client = await _client(_profile(capability_discovery="disabled"), handler)
+    try:
+        with pytest.raises(InvalidModelResponseError):
+            await _chat(client)
+    finally:
+        await client.aclose()
+    # Downgraded through the full ladder (json_schema -> json_object -> none)
+    # before raising, unlike the finish_reason == "length" fail-fast case.
+    assert styles_seen == ["json_schema", "json_object", "none"]
