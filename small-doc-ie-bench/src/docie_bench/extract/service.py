@@ -81,38 +81,47 @@ def _norm_date(raw: str) -> str:
         return s
 
 
-def _derive_invoice_subtotal(result: dict[str, Any]) -> None:
+def _derive_invoice_subtotal(result: dict[str, Any]) -> bool:
+    """Fill a missing subtotal from total_ttc - vat_amount when both are
+    present. Returns whether it actually derived a value, so the caller can
+    flag it as computed rather than extracted (see the derived-subtotal
+    warning in _extract_blocks) -- without that, a synthesized number is
+    indistinguishable from one the model actually read off the page."""
     if result.get("subtotal") is not None:
-        return
+        return False
 
     total = result.get("total_ttc")
     vat = result.get("vat_amount")
     if not isinstance(total, dict) or not isinstance(vat, dict):
-        return
+        return False
 
     try:
         subtotal = Decimal(str(total["amount"])) - Decimal(str(vat["amount"]))
     except (InvalidOperation, KeyError, TypeError, ValueError):
-        return
+        return False
     if not subtotal.is_finite() or subtotal < 0:
-        return
+        return False
 
     total_currency = total.get("currency")
     vat_currency = vat.get("currency")
     if total_currency and vat_currency and total_currency != vat_currency:
-        return
+        return False
 
     result["subtotal"] = {
         "amount": format(subtotal, "f"),
         "currency": total_currency or vat_currency,
     }
+    return True
 
 
-def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> dict[str, Any]:
+def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dict[str, Any], bool]:
     """Post-process NuExtract3 output: enforce document_type, strip IBAN spaces,
     null-out empty MoneyFields, and apply fallback normalization for any values the
     model returned in locale format despite type hints. Derive a missing invoice
-    subtotal when total and VAT provide an unambiguous fallback."""
+    subtotal when total and VAT provide an unambiguous fallback.
+
+    Returns (result, derived_subtotal) -- the caller turns a True flag into a
+    validation warning (see _extract_blocks)."""
     result: dict[str, Any] = {"document_type": schema_name}
     for key, val in raw.items():
         if key == "document_type":
@@ -165,9 +174,10 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> dict[str,
             continue
 
         result[key] = sub
+    derived_subtotal = False
     if schema_name == "invoice":
-        _derive_invoice_subtotal(result)
-    return result
+        derived_subtotal = _derive_invoice_subtotal(result)
+    return result, derived_subtotal
 
 
 def _normalize_nested_nuextract(obj: Any, field_name: str | None = None) -> Any:
@@ -408,10 +418,21 @@ class ExtractionService:
             effective_style = getattr(client, "last_response_format_style", None)
         finally:
             await client.aclose()
+        derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
-            raw = _normalize_nuextract_raw(raw, schema_name)
+            raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
+        if derived_subtotal:
+            # The model didn't report a subtotal; it was computed here from
+            # total_ttc - vat_amount, not read off the document. Without this,
+            # a synthesized value is indistinguishable from a genuine
+            # extraction to every downstream consumer (API response, review
+            # queue, benchmark scoring).
+            validation.warnings.append(
+                "subtotal.amount was derived from total_ttc - vat_amount "
+                "(the model did not extract it directly)"
+            )
         latency_ms = int((time.perf_counter() - started) * 1000)
         usage = Usage.model_validate(usage_dict) if isinstance(usage_dict, dict) else None
 
