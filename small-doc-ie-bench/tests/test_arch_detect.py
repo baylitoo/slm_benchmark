@@ -119,6 +119,48 @@ def test_resolve_gliner_marker() -> None:
     assert v.verdict == "supported" and v.family == "encoder_gliner2"
 
 
+def test_lfm2_colbert_reranker_by_name() -> None:
+    # LFM2.5-ColBERT-350M reports arch "lfm2" — identical to the chat family's
+    # backbone. Caught by NAME so it lands on "reranker", not "lfm2" (chat).
+    v = resolve_family(
+        "lfm2",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="LiquidAI/LFM2.5-ColBERT-350M-GGUF",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "reranker"
+
+
+def test_bert_cross_encoder_reranker_by_name() -> None:
+    # A BERT cross-encoder reports arch "bert" — identical to the embedding
+    # family's backbone. Caught by NAME so it lands on "reranker", not
+    # "embedding".
+    v = resolve_family(
+        "bert",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="mixedbread-ai/mxbai-rerank-base-v2-GGUF",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "reranker"
+
+
+def test_lfm2_generic_chat_is_not_reranker() -> None:
+    # A plain LFM2 chat GGUF, non-reranker name, must NOT default to reranker.
+    v = resolve_family(
+        "lfm2",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="LiquidAI/LFM2-1.2B-GGUF",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "lfm2"
+
+
 def test_resolve_unknown_arch_needs_family() -> None:
     v = resolve_family("some-brand-new-moe", has_gguf=True, has_safetensors=False, has_mmproj=False)
     assert v.verdict == "needs_family" and v.family is None

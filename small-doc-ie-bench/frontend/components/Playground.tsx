@@ -252,7 +252,8 @@ export function Playground({
           onNavigate={onNavigate}
         />
       </div>
-      <div hidden={mode !== "extract"} className="grid gap-6 lg:grid-cols-2">
+      <div hidden={mode !== "extract"}>
+      <div className="grid gap-6 lg:grid-cols-2">
       <Card
         icon={<Sparkles className="h-5 w-5" />}
         title="Extract"
@@ -381,6 +382,7 @@ export function Playground({
           </p>
         )}
       </Card>
+      </div>
       </div>
     </div>
   );
