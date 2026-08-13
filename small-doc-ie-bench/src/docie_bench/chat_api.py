@@ -40,6 +40,7 @@ from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
     PlacementNotFoundError,
     PlacementNotReadyError,
+    endpoint_is_loopback,
 )
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
@@ -85,9 +86,17 @@ async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
     outright — trigger_deployment_load safely returns None for a name that
     isn't a real catalog entry, so this is a no-op for a genuinely unknown
     model.
+
+    A resolved ``store:`` profile also gets api.py's worker-loopback guard:
+    the deploy runtime records a placement's endpoint from the WORKER's
+    point of view, so a loopback endpoint is unreachable from this (api)
+    process. Unlike api.py's extract path, there is no worker-side chat
+    equivalent to redirect to — a chat/embeddings/rerank caller stuck behind
+    this guard has to fix the deployment (a non-loopback advertised
+    endpoint), not switch routes.
     """
     try:
-        return resolve_extraction_profile(model_profile=model)
+        profile = resolve_extraction_profile(model_profile=model)
     except (PlacementNotFoundError, PlacementNotReadyError) as exc:
         store_name = (
             model[len(STORE_PROFILE_PREFIX) :] if model.startswith(STORE_PROFILE_PREFIX) else None
@@ -104,6 +113,26 @@ async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
         if triggered is not None:
             return _loading_response(triggered)
         return _openai_error(str(exc), status_code=404, error_type="model_not_found")
+    if (
+        model.startswith(STORE_PROFILE_PREFIX)
+        and endpoint_is_loopback(profile.base_url)
+    ):
+        # See api.py's resolve_profile: the deploy runtime records a
+        # placement's endpoint from the WORKER's point of view, so a
+        # loopback endpoint is unreachable from this (api) process. Without
+        # this guard the request "resolves" fine and then burns
+        # timeout_seconds x retries on a doomed connect before a confusing
+        # upstream_unavailable 502.
+        return _openai_error(
+            f"{model} resolved to {profile.base_url}, which is loopback on "
+            "the worker that deployed it and not reachable from the API. "
+            "Record a non-loopback advertised endpoint at deploy time, or "
+            "extract through the worker (POST /v1/studio/extract) if "
+            "extraction — not chat — is what you actually need.",
+            status_code=501,
+            error_type="deployment_unreachable",
+        )
+    return profile
 
 
 @router.get("/v1/models")
