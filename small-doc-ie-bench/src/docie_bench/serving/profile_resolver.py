@@ -288,6 +288,49 @@ def _synthesize_profile(
     )
 
 
+def _record_activity_if_cataloged(name: str) -> None:
+    """Bump ``model_activity`` for the store model backing deployment ``name``.
+
+    The ``deployment=`` and bare ``model_profile`` routes both address a live
+    deployment by its ``deployments.json`` name — the same name the reconciler
+    publishes ``ModelPlacement`` rows under. Without this, activity tracking
+    only saw the explicit ``store:<name>`` convention, so a store model driven
+    entirely through the Studio's own Chat/Vision/Extract UI (which sends the
+    bare deployment name, see chat_api.py's docstring) never showed up in the
+    activity tile — exactly the traffic an autoscale signal needs.
+
+    Deliberately looks up ``ModelPlacement`` (keyed by DEPLOYMENT name), not
+    ``ModelStoreEntry`` (keyed by STORE model name) — those are different
+    namespaces, both caller-supplied, that only coincide by convention for an
+    unscaled single-instance deploy. Querying the store table directly by
+    deployment name would (a) misattribute activity to an unrelated store
+    entry that happens to share the deployment's name, and (b) silently miss
+    every scaled replica, whose deployment name is ``<base>-2`` while the
+    store entry stays keyed under ``<base>`` alone. Recording under the
+    placement's own ``model_name`` fixes both and aggregates correctly with
+    ``resolve_store_profile``'s counts for the same store model. A deployment
+    with no placement row, or one with ``model_name`` unset (a pure
+    models.yaml deployment, not a store model), is silently skipped —
+    mirroring ``_catalog_family``'s best-effort DB lookup.
+    """
+    try:
+        from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+        catalog = ModelCatalog()
+        try:
+            placement = catalog.get_placement(name)
+        except CatalogUnavailableError:
+            return
+        if placement is None:
+            return
+        model_name = placement.get("model_name")
+        if not model_name:
+            return
+        catalog.record_activity(str(model_name))
+    except Exception:  # pragma: no cover - a DB hiccup must not break routing
+        logger.debug("model-activity bump failed for %r", name, exc_info=True)
+
+
 def _env_fallback_profile(settings: Settings) -> ModelProfile:
     """Last-resort profile from OPENAI_COMPAT_* env — reached only when models.yaml
     is entirely absent. Labeled ``env_fallback`` (never a real profile name) so the
@@ -347,6 +390,7 @@ def resolve_extraction_profile(
             raise ProfileResolutionError(
                 f"deployment {deployment!r} is not a live (ready) deployment"
             )
+        _record_activity_if_cataloged(deployment)
         return _synthesize_profile(record, yaml_profiles)
 
     # (1b) "store:<name>" -> the Postgres placement the deploy job recorded for a
@@ -364,9 +408,12 @@ def resolve_extraction_profile(
     # (2) explicit model_profile -> a config profile / upstream id / deployment name.
     if model_profile:
         try:
-            return gateway_resolve_profile(model_profile, table)
+            resolved = gateway_resolve_profile(model_profile, table)
         except GatewayRoutingError as exc:
             raise ProfileResolutionError(exc.message) from exc
+        if model_profile in live:
+            _record_activity_if_cataloged(model_profile)
+        return resolved
 
     # (3) default -> studio_default from models.yaml (honest label); env only as a
     # labeled last resort when models.yaml is entirely absent.
