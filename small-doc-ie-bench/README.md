@@ -559,6 +559,9 @@ Do not select by leaderboard alone. Select by field-level accuracy under constra
 - `GET /v1/schemas`
 - `POST /v1/extract/text`
 - `POST /v1/extract/file`
+- `POST /v1/embeddings` — vectors from an `embedding`-family deployment.
+- `POST /v1/rerank` — relevance-score a query against a document list, from a
+  `reranker`-family deployment (e.g. LFM2.5-ColBERT-350M).
 - `POST /v1/benchmarks/run`
 - `POST /v1/reviews`
 - `GET /v1/reviews`
@@ -584,6 +587,22 @@ The extraction endpoints return:
   "usage": {...},
   "latency_ms": 1234
 }
+```
+
+### Retrieval: embeddings + rerank, two-stage
+
+`scripts/rag_demo.py` runs both endpoints together against live deployments: a
+cheap cosine-similarity pass over a small corpus, then a reranker pass over
+the shortlist. It prints both rankings side by side and flags when they
+disagree on the top result — the concrete case for the two-stage pattern
+(a fast, cheap first pass narrows a large corpus; a slower, more accurate
+cross-encoder pass reorders the shortlist by actual relevance).
+
+```bash
+python scripts/rag_demo.py \
+  --embed-model <your embedding deployment name> \
+  --rerank-model <your reranker deployment name> \
+  --query "What is the invoice total?"
 ```
 
 ### Human review workflow
