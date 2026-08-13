@@ -135,3 +135,64 @@ def test_chat_stream_proxies_real_upstream_chunks(api) -> None:
     ]
     sent = json.loads(captured[-1].content)
     assert sent["stream"] is True
+
+
+# ── store: model that isn't live yet: load-on-demand, not a bare error ──────
+
+
+@pytest.fixture
+def api_store(monkeypatch) -> TestClient:
+    from docie_bench.serving.placement_resolver import (
+        PlacementNotFoundError,
+        PlacementNotReadyError,
+    )
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        if model_profile == "store:never-deployed":
+            raise PlacementNotFoundError("store model 'never-deployed' is not in the catalog")
+        if model_profile == "store:evicted":
+            raise PlacementNotReadyError("store model 'evicted' placement is 'stopped'")
+        if model_profile == "store:truly-unseeded":
+            raise PlacementNotFoundError("store model 'truly-unseeded' is not in the catalog")
+        raise ProfileResolutionError(f"model {model_profile!r} is not routable")
+
+    monkeypatch.setattr("docie_bench.chat_api.resolve_extraction_profile", fake_resolver)
+
+    app = FastAPI()
+    app.include_router(chat_router)
+    return TestClient(app)
+
+
+def test_chat_store_model_not_live_triggers_load_and_returns_202(
+    api_store, monkeypatch
+) -> None:
+    async def fake_trigger(name: str) -> tuple[str, float] | None:
+        assert name in ("never-deployed", "evicted")
+        return name, 30.0
+
+    monkeypatch.setattr("docie_bench.chat_api.trigger_deployment_load", fake_trigger)
+
+    for model in ("store:never-deployed", "store:evicted"):
+        response = api_store.post(
+            "/v1/chat/completions",
+            json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 202, response.text
+        body = response.json()
+        assert body["status"] == "loading"
+        assert body["eta_seconds"] == 30.0
+        assert "30s" in body["message"]
+
+
+def test_chat_store_model_genuinely_unseeded_still_404s(api_store, monkeypatch) -> None:
+    async def fake_trigger(name: str) -> tuple[str, float] | None:
+        return None  # not a catalog entry at all -- nothing to trigger
+
+    monkeypatch.setattr("docie_bench.chat_api.trigger_deployment_load", fake_trigger)
+
+    response = api_store.post(
+        "/v1/chat/completions",
+        json={"model": "store:truly-unseeded", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["type"] == "model_not_found"

@@ -101,3 +101,29 @@ def test_embeddings_unknown_model_is_404(api) -> None:
     response = client.post("/v1/embeddings", json={"model": "ghost", "input": "x"})
     assert response.status_code == 404
     assert response.json()["error"]["type"] == "model_not_found"
+
+
+def test_embeddings_store_model_not_live_triggers_load_and_returns_202(monkeypatch) -> None:
+    # /v1/embeddings shares chat_api._resolve_or_error with /v1/chat/completions
+    # and /v1/rerank -- this proves the load-on-demand wiring actually reaches
+    # this endpoint too, not just that the shared helper works in isolation.
+    from docie_bench.serving.placement_resolver import PlacementNotFoundError
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        raise PlacementNotFoundError("store model 'cold-embedder' is not in the catalog")
+
+    async def fake_trigger(name: str) -> tuple[str, float] | None:
+        assert name == "cold-embedder"
+        return name, 15.0
+
+    monkeypatch.setattr("docie_bench.chat_api.resolve_extraction_profile", fake_resolver)
+    monkeypatch.setattr("docie_bench.chat_api.trigger_deployment_load", fake_trigger)
+
+    app = FastAPI()
+    app.include_router(chat_router)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/embeddings", json={"model": "store:cold-embedder", "input": "x"}
+    )
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "loading"
