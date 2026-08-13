@@ -1,17 +1,25 @@
 "use client";
 
-import { BarChart3, ExternalLink, Workflow, Gauge } from "lucide-react";
+import { BarChart3, ExternalLink, Workflow, Gauge, ClipboardCheck } from "lucide-react";
 import { GRAFANA_URL, GRAFANA_DASHBOARD_URL, INNGEST_URL, METRICS_URL } from "@/lib/env";
-import { Card } from "./ui";
+import { getReviewMetrics, ApiError, type ReviewMetricsView } from "@/lib/api";
+import { usePolling } from "@/lib/usePolling";
+import { Card, Badge } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
+
+const REVIEW_POLL_MS = 10000;
 
 /**
  * Observability = external tooling: quick-link tiles (Grafana / Inngest /
- * Prometheus) plus the docie Grafana dashboard embedded in an iframe. One
- * view — a prior "links" sub-view was dropped: it rendered the same tiles
- * already shown here, a strict subset with nothing the combined page lacks.
+ * Prometheus) plus the docie Grafana dashboard embedded in an iframe, plus a
+ * live review-queue tile. The human review workflow (POST /v1/reviews,
+ * claim/correct/approve/reject) is API-only — no Studio tab for it yet — so
+ * this is the only place an operator sees the backlog exists at all without
+ * curling the API directly. One view — a prior "links" sub-view was dropped:
+ * it rendered the same tiles already shown here, a strict subset with
+ * nothing the combined page lacks.
  */
-export function Observability() {
+export function Observability({ active = true }: { active?: boolean }) {
   return (
     <div>
       <PageHeader
@@ -50,6 +58,7 @@ export function Observability() {
             icon={<Gauge className="h-5 w-5" />}
           />
         </div>
+        <ReviewQueueCard active={active} />
         <Card
           title="Small Document IE Benchmark"
           subtitle="Agent requests, PII detections, latency, and gate blocks — live from Prometheus."
@@ -82,6 +91,62 @@ export function Observability() {
         </Card>
       </div>
     </div>
+  );
+}
+
+function ReviewQueueCard({ active }: { active: boolean }) {
+  const metrics = usePolling<ReviewMetricsView>(getReviewMetrics, REVIEW_POLL_MS, active);
+  const notEnabled = metrics.error instanceof ApiError && metrics.error.status === 422;
+
+  return (
+    <Card
+      icon={<ClipboardCheck className="h-5 w-5" />}
+      title="Review queue"
+      subtitle="Extractions admitted for human review — low confidence, weak evidence, arithmetic mismatches, or model disagreement."
+    >
+      {notEnabled ? (
+        <p className="text-sm text-muted-foreground">
+          Not enabled — the review workflow needs DATABASE_URL set (persistence
+          is what the queue is stored in).
+        </p>
+      ) : metrics.error ? (
+        <p className="text-sm text-muted-foreground">
+          Couldn&apos;t load review metrics. Is the API reachable?
+        </p>
+      ) : metrics.loading ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone={(metrics.data?.queue_depth.pending ?? 0) > 0 ? "warn" : "ok"}>
+              {metrics.data?.queue_depth.pending ?? 0} pending
+            </Badge>
+            <Badge tone="info">{metrics.data?.queue_depth.claimed ?? 0} claimed</Badge>
+            <Badge tone="ok">{metrics.data?.queue_depth.approved ?? 0} approved</Badge>
+            <Badge tone="neutral">{metrics.data?.queue_depth.rejected ?? 0} rejected</Badge>
+          </div>
+          <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+            <span>
+              Correction rate:{" "}
+              {metrics.data?.correction_rate != null
+                ? `${(metrics.data.correction_rate * 100).toFixed(0)}%`
+                : "n/a — no decided tasks yet"}
+            </span>
+            <span>
+              Reviewer agreement:{" "}
+              {metrics.data?.reviewer_agreement != null
+                ? `${(metrics.data.reviewer_agreement * 100).toFixed(0)}%`
+                : "n/a — needs 2+ reviewers on the same task"}
+            </span>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            No Studio tab for claim/correct/decide yet — use{" "}
+            <code className="rounded bg-muted px-1 py-0.5">POST /v1/reviews/&#123;id&#125;/claim</code>{" "}
+            and friends directly.
+          </p>
+        </div>
+      )}
+    </Card>
   );
 }
 
