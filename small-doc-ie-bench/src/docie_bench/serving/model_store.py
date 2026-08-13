@@ -73,6 +73,12 @@ class FamilyContract:
     # answered on /v1/embeddings — never chat/extraction. Deployments of an
     # embedding family are typed "embedding" and routed by the embeddings API.
     embedding: bool = False
+    # A reranker / late-interaction retriever (e.g. LFM2.5-ColBERT-350M): served
+    # with llama-server's --reranking + --embedding --pooling rank (llama.cpp
+    # requires both), and answered on /v1/rerank — never chat/extraction/plain
+    # embeddings. Deployments of a reranker family are typed "reranker" and
+    # routed by the rerank API, same shape as the embedding family above.
+    reranker: bool = False
     # An analyzer (encoder) family: a transformers/safetensors checkpoint served
     # by the ENCODER runtime (docie encoder), NOT llama.cpp. Stored as a
     # directory snapshot rather than a single GGUF, and typed "encoder".
@@ -215,6 +221,23 @@ FAMILIES: dict[str, FamilyContract] = {
         llama_server_args=("--embedding", "--pooling", "mean"),
         embedding=True,
         ollama_faithful=True,
+    ),
+    # Rerankers / late-interaction retrievers (LFM2.5-ColBERT-350M, or any GGUF
+    # reranker). llama-server exposes /rerank (aliases /v1/rerank,
+    # /v1/reranking) when launched with --reranking; llama.cpp additionally
+    # requires --embedding --pooling rank alongside it (--reranking alone is not
+    # enough — verified against the server's own --help and README). No
+    # template, no schema — the family exists to type the deployment and carry
+    # the launch flags, exactly like the embedding family above. Ollama has no
+    # equivalent rerank pooling mode, so this is never Ollama-faithful.
+    "reranker": FamilyContract(
+        name="reranker",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,  # unused on the rerank path
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--reranking", "--embedding", "--pooling", "rank"),
+        reranker=True,
+        ollama_faithful=False,
     ),
     # Encoder analyzers (safetensors checkpoints served by the encoder runtime,
     # never llama.cpp): GLiNER zero-shot NER (urchade/gliner_*) and GLiNER2

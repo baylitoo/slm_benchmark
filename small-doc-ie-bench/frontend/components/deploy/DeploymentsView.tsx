@@ -392,19 +392,21 @@ function ScaleRow({
 export function DeploymentsView({
   deployments,
   embeddingNames,
+  rerankerNames,
   store,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   embeddingNames: Set<string>;
+  rerankerNames: Set<string>;
   store: ReturnType<typeof usePolling<StoreEntry[]>>;
 }) {
   const { toast } = useToast();
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
-  // Segment by semantic model type (chat SLMs / encoder analyzers / embeddings).
-  const [typeFilter, setTypeFilter] = useState<"all" | "chat" | "encoder" | "embedding">(
-    "all",
-  );
+  // Segment by semantic model type (chat SLMs / encoder analyzers / embeddings / rerankers).
+  const [typeFilter, setTypeFilter] = useState<
+    "all" | "chat" | "encoder" | "embedding" | "reranker"
+  >("all");
   // Which row's runtime log is expanded (click a row to see WHY it failed).
   const [expanded, setExpanded] = useState<string | null>(null);
   // One in-flight lifecycle action at a time, keyed "name:action" so exactly
@@ -462,7 +464,7 @@ export function DeploymentsView({
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return all.filter((r) => {
-      if (typeFilter !== "all" && deploymentModelType(r, embeddingNames) !== typeFilter)
+      if (typeFilter !== "all" && deploymentModelType(r, embeddingNames, rerankerNames) !== typeFilter)
         return false;
       if (!q) return true;
       const hay = [r.spec?.name, r.spec?.launch?.model, r.spec?.launch?.runtime, r.state]
@@ -528,13 +530,15 @@ export function DeploymentsView({
     {
       key: "type",
       header: "Type",
-      sortAccessor: (r) => deploymentModelType(r, embeddingNames),
+      sortAccessor: (r) => deploymentModelType(r, embeddingNames, rerankerNames),
       render: (r) => {
-        const t = deploymentModelType(r, embeddingNames);
+        const t = deploymentModelType(r, embeddingNames, rerankerNames);
         return t === "encoder" ? (
           <Badge tone="info">Encoder</Badge>
         ) : t === "embedding" ? (
           <Badge tone="warn">Embedding</Badge>
+        ) : t === "reranker" ? (
+          <Badge tone="warn">Reranker</Badge>
         ) : (
           <Badge tone="neutral">Chat</Badge>
         );
@@ -712,7 +716,8 @@ export function DeploymentsView({
               ["chat", "Chat"],
               ["encoder", "Encoders"],
               ["embedding", "Embeddings"],
-            ] as ["all" | "chat" | "encoder" | "embedding", string][]
+              ["reranker", "Rerankers"],
+            ] as ["all" | "chat" | "encoder" | "embedding" | "reranker", string][]
           ).map(([t, label]) => (
             <button
               key={t}

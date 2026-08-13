@@ -7,6 +7,7 @@ import {
   getFamilies,
   getDeployments,
   embeddingDeploymentNames,
+  rerankerDeploymentNames,
   type StoreEntry,
   type DeploymentRecord,
 } from "@/lib/api";
@@ -48,9 +49,14 @@ export function Deploy({
 
   const [slideOver, setSlideOver] = useState<SlideOver>(null);
 
-  // Deployment names that are embedding models (store family flagged embedding).
+  // Deployment names that are embedding/reranker models (store family flagged
+  // accordingly) — the Deployments table's "Type" column source.
   const embeddingNames = useMemo(
     () => embeddingDeploymentNames(store.data, families.data),
+    [store.data, families.data],
+  );
+  const rerankerNames = useMemo(
+    () => rerankerDeploymentNames(store.data, families.data),
     [store.data, families.data],
   );
 
@@ -100,6 +106,7 @@ export function Deploy({
         <DeploymentsView
           deployments={deployments}
           embeddingNames={embeddingNames}
+          rerankerNames={rerankerNames}
           store={store}
         />
       )}

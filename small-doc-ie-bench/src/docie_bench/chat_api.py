@@ -220,3 +220,89 @@ async def embeddings(request: Request) -> Any:
             status_code=502,
             error_type="upstream_error",
         )
+
+
+@router.post("/v1/rerank")
+async def rerank(request: Request) -> Any:
+    """Rerank documents against a query over a reranker deployment (llama-server
+    --reranking + --embedding --pooling rank — llama.cpp requires both flags
+    together; --reranking alone leaves the endpoint unable to score).
+
+    Body: ``model`` (deployment/profile), ``query``, ``documents`` (list of
+    strings), optional ``top_n``. Forwarded verbatim to the upstream's
+    ``/rerank`` with the served model id. Same locality point as embeddings:
+    scoring happens on this node, so ranking never ships document text to a
+    frontier reranking API.
+    """
+    try:
+        body = await request.json()
+    except ValueError:
+        return _openai_error(
+            "request body must be valid JSON",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    if not isinstance(body, dict):
+        return _openai_error(
+            "request body must be a JSON object",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    model = str(body.get("model") or "")
+    if not model:
+        return _openai_error(
+            "missing required 'model' field (a reranker deployment)",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    if not body.get("query"):
+        return _openai_error(
+            "missing required 'query' field",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    documents = body.get("documents")
+    if not isinstance(documents, list) or not documents:
+        return _openai_error(
+            "missing required 'documents' field (a non-empty list of strings)",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    try:
+        profile = resolve_extraction_profile(model_profile=model)
+    except ProfileResolutionError as exc:
+        return _openai_error(str(exc), status_code=404, error_type="model_not_found")
+
+    forward = dict(body)
+    forward["model"] = profile.model
+    url = f"{profile.base_url}/rerank"
+    headers = {
+        "Authorization": f"Bearer {profile.api_key}",
+        "Content-Type": "application/json",
+    }
+    client: httpx.AsyncClient = _client()
+    try:
+        upstream = await client.post(
+            url, json=forward, headers=headers, timeout=profile.timeout_seconds
+        )
+    except httpx.RequestError as exc:
+        return _openai_error(
+            f"upstream {profile.base_url} is unreachable: {exc}",
+            status_code=502,
+            error_type="upstream_unavailable",
+        )
+    if upstream.status_code >= 400:
+        return _openai_error(
+            f"upstream returned {upstream.status_code}: {upstream.text[:300]} "
+            "(is this deployment a reranker, served with --reranking --embedding --pooling rank?)",
+            status_code=upstream.status_code,
+            error_type="upstream_error",
+        )
+    try:
+        return upstream.json()
+    except ValueError:
+        return _openai_error(
+            "upstream returned a non-JSON response",
+            status_code=502,
+            error_type="upstream_error",
+        )
