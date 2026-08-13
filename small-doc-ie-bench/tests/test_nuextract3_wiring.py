@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from docie_bench.llm.openai_client import _clean_content
 from docie_bench.llm.prompts import build_nuextract3_prompts, nuextract_template_for
 from docie_bench.llm.response_format import build_response_format
@@ -30,6 +32,23 @@ def test_clean_content_strips_reasoning_block() -> None:
 
 def test_clean_content_without_think_is_unchanged() -> None:
     assert _clean_content('{"store":"X"}') == '{"store":"X"}'
+
+
+def test_clean_content_bails_on_truncated_unclosed_think_block() -> None:
+    # Generation cut off (max_tokens) mid-reasoning, before </think> -- no
+    # answer was produced yet. Reasoning prose can legitimately mention a
+    # field in brace notation (musing about the schema), which the
+    # bracket-balance extraction below this check would otherwise grab as a
+    # syntactically valid but semantically wrong "answer". Must fail to
+    # parse, not silently return that fragment.
+    truncated = (
+        '<think>Let me look at the fields, things like {"vendor_name": "string"} '
+        "and figure out the invoice number..."
+    )
+    cleaned = _clean_content(truncated)
+    assert cleaned == truncated
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(cleaned)
 
 
 def test_build_nuextract3_prompts_image_mode_is_empty() -> None:
