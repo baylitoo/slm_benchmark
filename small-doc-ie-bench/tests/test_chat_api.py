@@ -89,6 +89,47 @@ def test_chat_forwards_with_served_model_id(api) -> None:
     assert captured[-1].url.host == "upstream"
 
 
+def test_chat_stamps_recency_for_the_served_deployment(api, monkeypatch) -> None:
+    # PR-4 recency must be stamped by every surface that serves traffic (see
+    # recency.py's docstring) -- api.py's extract path already does this; this
+    # generic chat surface didn't, so a deployment driven only through chat
+    # read as idle forever and became the first idle-TTL/LRU eviction victim.
+    client, _ = api
+    calls: list[str | None] = []
+    monkeypatch.setattr(
+        "docie_bench.chat_api.recency.stamp_served_profile", lambda name: calls.append(name)
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert calls == ["lfm2.5-350m"]
+
+
+def test_chat_stream_stamps_recency_for_the_served_deployment(api, monkeypatch) -> None:
+    # Streaming skips completion parsing entirely, so recency must be stamped
+    # once the upstream connection is accepted -- not deferred to a
+    # non-streaming-only code path that a streaming request never reaches.
+    client, _ = api
+    calls: list[str | None] = []
+    monkeypatch.setattr(
+        "docie_bench.chat_api.recency.stamp_served_profile", lambda name: calls.append(name)
+    )
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())  # drain the stream
+    assert calls == ["lfm2.5-350m"]
+
+
 def test_chat_unknown_model_is_openai_404(api) -> None:
     client, _ = api
     response = client.post(

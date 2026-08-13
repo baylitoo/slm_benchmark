@@ -103,6 +103,23 @@ def test_embeddings_unknown_model_is_404(api) -> None:
     assert response.json()["error"]["type"] == "model_not_found"
 
 
+def test_embeddings_stamps_recency_for_the_served_deployment(api, monkeypatch) -> None:
+    # PR-4 recency must be stamped by EVERY surface that serves traffic (see
+    # recency.py's docstring) -- api.py's extract path already does this;
+    # chat_api's /v1/embeddings didn't, so a deployment driven only through
+    # this surface read as idle forever and became the first idle-TTL victim.
+    client, _ = api
+    calls: list[str | None] = []
+    monkeypatch.setattr(
+        "docie_bench.chat_api.recency.stamp_served_profile", lambda name: calls.append(name)
+    )
+    response = client.post(
+        "/v1/embeddings", json={"model": "lfm-embed", "input": "invoice total 5400 EUR"}
+    )
+    assert response.status_code == 200, response.text
+    assert calls == ["lfm-embed"]
+
+
 def test_embeddings_store_model_not_live_triggers_load_and_returns_202(monkeypatch) -> None:
     # /v1/embeddings shares chat_api._resolve_or_error with /v1/chat/completions
     # and /v1/rerank -- this proves the load-on-demand wiring actually reaches
