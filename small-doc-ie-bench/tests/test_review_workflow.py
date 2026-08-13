@@ -102,6 +102,37 @@ def test_priority_is_explainable_and_clean_extraction_is_not_queued() -> None:
     assert forced.priority_reasons[0].code == "manual"
 
 
+def test_arithmetic_warning_alone_queues_and_survives_the_round_trip() -> None:
+    # Schema-valid (validation_errors stays empty) but arithmetically
+    # inconsistent -- exactly the NuExtract3 case this reason exists for:
+    # without it, a clean-looking extraction with a wrong total never reaches
+    # the queue at all.
+    payload = _payload("arith-mismatch")
+    payload.validation_valid = True
+    payload.validation_errors = []
+    payload.disagreement_score = None
+    payload.expected_learning_value = None
+    payload.validation_warnings = [
+        "subtotal + vat_amount (100.00 + 20.00 = 120.00) does not match total_ttc (115.00) "
+        "within 0.05"
+    ]
+    payload.original_prediction = {
+        "invoice_number": {"value": "INV-1", "confidence": 0.99, "evidence_ids": ["b1"]}
+    }
+
+    priority, reasons = score_review_candidate(payload)
+    assert priority > 0
+    (reason,) = [r for r in reasons if r.code == "arithmetic_mismatch"]
+    assert "120.00" in reason.detail
+    assert "115.00" in reason.detail
+
+    task = enqueue_review(payload)
+    assert task is not None
+    # Round-trips through the DB (JSON column) and back out unchanged.
+    assert task.validation_warnings == payload.validation_warnings
+    assert get_review(task.id).validation_warnings == payload.validation_warnings
+
+
 def test_full_correction_approval_lifecycle_is_immutable_and_conflict_safe() -> None:
     task = enqueue_review(_payload())
     assert task is not None
@@ -239,6 +270,48 @@ def test_extraction_audit_automatically_admits_review_candidate() -> None:
         assert {reason["code"] for reason in task.priority_reasons_json} == {
             "low_confidence",
             "weak_evidence",
+        }
+        assert task.validation_warnings_json == []
+
+
+def test_extraction_audit_forwards_validation_warnings_to_the_review_task() -> None:
+    # ExtractionValidation.warnings (arithmetic reconciliation, unknown
+    # evidence_ids, ...) must reach the review queue -- schema-valid so
+    # validation_errors stays empty, which is exactly the case that used to
+    # get silently dropped between validate_extraction and enqueue_review.
+    save_extraction_audit(
+        ExtractionResponse(
+            request_id="extraction-with-warnings",
+            schema_name="invoice",
+            model_profile="model-a",
+            document_hash="sha256:warn",
+            result={
+                "invoice_number": {"value": "INV-1", "confidence": 0.99, "evidence_ids": ["b1"]}
+            },
+            validation=ExtractionValidation(
+                valid=True,
+                warnings=[
+                    "subtotal + vat_amount (100.00 + 20.00 = 120.00) does not match "
+                    "total_ttc (115.00) within 0.05"
+                ],
+            ),
+            latency_ms=10,
+        )
+    )
+
+    with session_scope() as session:
+        assert session is not None
+        task = (
+            session.query(ReviewTask)
+            .filter_by(source_request_id="extraction-with-warnings")
+            .one()
+        )
+        assert task.validation_warnings_json == [
+            "subtotal + vat_amount (100.00 + 20.00 = 120.00) does not match total_ttc "
+            "(115.00) within 0.05"
+        ]
+        assert {reason["code"] for reason in task.priority_reasons_json} == {
+            "arithmetic_mismatch"
         }
 
 

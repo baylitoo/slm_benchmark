@@ -38,6 +38,7 @@ def save_extraction_audit(response: ExtractionResponse, *, tenant_id: str | None
                 original_prediction=response.result,
                 validation_valid=response.validation.valid,
                 validation_errors=response.validation.errors,
+                validation_warnings=response.validation.warnings,
                 dynamic_schema=response.dynamic_schema,
             )
         )

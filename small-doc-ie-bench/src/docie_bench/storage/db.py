@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     DateTime,
+    Engine,
     Float,
     ForeignKey,
     Integer,
@@ -16,6 +18,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+)
+from sqlalchemy import (
+    inspect as sa_inspect,
+)
+from sqlalchemy import (
+    text as sa_text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -27,6 +35,8 @@ from sqlalchemy.orm import (
 )
 
 from docie_bench.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 metadata = MetaData()
 
@@ -68,6 +78,7 @@ class ReviewTask(Base):
     original_prediction_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     latest_prediction_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     validation_errors_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    validation_warnings_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     dynamic_schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     metadata_json: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
@@ -138,6 +149,61 @@ class ReviewEvent(Base):
 _engine = None
 _SessionLocal: sessionmaker[Session] | None = None
 
+_REVIEW_TASK_MIGRATION_LOCK_KEY = 0x0D0C1E04
+
+
+def ensure_review_task_validation_warnings_column(engine: Engine) -> bool:
+    """Forward migration: add ``validation_warnings_json`` to an existing
+    ``review_task`` table (mirrors ``ensure_placement_observed_columns`` in
+    ``serving/catalog.py``). ``create_all`` never ALTERs an existing table, so
+    a database that predates this column needs it added explicitly or
+    ``enqueue_review`` throws ``UndefinedColumn`` on the first insert that
+    carries a warning. Nullable-with-default, so no table rewrite / no lock
+    pain. Returns whether the column was actually added.
+
+    Same concurrency story as the placement migration: every process calling
+    ``init_engine`` (api, worker, N replicas) may run this simultaneously, so
+    PostgreSQL serializes via ``pg_advisory_xact_lock`` and uses
+    ``ADD COLUMN IF NOT EXISTS``; sqlite (single-process dev/test only) falls
+    back to inspect-then-ALTER. A fresh database already has the column via
+    ``create_all`` and this is a no-op either way.
+    """
+    inspector = sa_inspect(engine)
+    if not inspector.has_table("review_task"):
+        return False  # create_all will create it complete
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _REVIEW_TASK_MIGRATION_LOCK_KEY},
+            )
+            existing = {
+                row[0]
+                for row in connection.execute(
+                    sa_text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'review_task'"
+                    )
+                )
+            }
+            connection.execute(
+                sa_text(
+                    "ALTER TABLE review_task ADD COLUMN IF NOT EXISTS "
+                    "validation_warnings_json JSON"
+                )
+            )
+            added = "validation_warnings_json" not in existing
+        else:
+            existing = {column["name"] for column in inspector.get_columns("review_task")}
+            added = "validation_warnings_json" not in existing
+            if added:
+                connection.execute(
+                    sa_text("ALTER TABLE review_task ADD COLUMN validation_warnings_json JSON")
+                )
+    if added:
+        logger.info("review_task migration: added validation_warnings_json")
+    return added
+
 
 def init_engine(database_url: str | None = None) -> None:
     global _engine, _SessionLocal
@@ -169,6 +235,10 @@ def init_engine(database_url: str | None = None) -> None:
     # `ModelStoreEntry.size_bytes`.
     ensure_size_bytes_bigint(_engine)
     ensure_placement_observed_columns(_engine)
+    # Same hazard, review_task's validation_warnings_json (added alongside the
+    # arithmetic-reconciliation warning enrichment): a pre-existing table needs
+    # it added explicitly, create_all only completes brand-new tables.
+    ensure_review_task_validation_warnings_column(_engine)
     # serving_node is a NEW table, which create_all would create — but the
     # api, serving service, and N workers all run init_engine concurrently at
     # stack-up, and create_all's inspect-then-CREATE can race into a
