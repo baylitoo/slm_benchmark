@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -420,6 +421,57 @@ async def serving_ports() -> dict[str, Any]:
         "used": sorted(used),
         "free_sample": free_sample,
         "recommended_next": recommended_next,
+    }
+
+
+@router.get("/ocr-cache")
+async def ocr_cache_stats() -> dict[str, Any]:
+    """OCR cache utilization: entry count, size on disk, oldest/newest entry age.
+
+    OCRCache.get()/put() record a per-call cache_hit flag, but it was never
+    aggregated or exposed anywhere -- an operator has no way to tell if the
+    cache is helping, or how close it is to its ocr_cache_max_mb budget.
+    Scans the shared cache directory directly (the same technique
+    OCRCache.evict() already uses internally: root.glob("*.json") + stat), so
+    this is accurate regardless of which api/worker replica served a given
+    request -- unlike a hit/miss RATE counter, size-on-disk has no
+    process-locality problem (every replica reads the same
+    DOCIE_OCR_CACHE_DIR volume). A true hit-rate metric needs aggregation
+    across replicas -- the same class of gap as an autoscale load signal --
+    and is deliberately left for later rather than reported dishonestly here.
+    """
+    settings = get_settings()
+    if not settings.ocr_cache_enabled:
+        return {"enabled": False}
+
+    root = Path(settings.ocr_cache_dir)
+    entry_count = 0
+    total_bytes = 0
+    oldest_mtime: float | None = None
+    newest_mtime: float | None = None
+    if root.exists():
+        for path in root.glob("*.json"):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue  # evicted between glob() and stat() -- benign race
+            entry_count += 1
+            total_bytes += stat.st_size
+            if oldest_mtime is None or stat.st_mtime < oldest_mtime:
+                oldest_mtime = stat.st_mtime
+            if newest_mtime is None or stat.st_mtime > newest_mtime:
+                newest_mtime = stat.st_mtime
+
+    max_bytes = settings.ocr_cache_max_mb * 1024 * 1024
+    now = time.time()
+    return {
+        "enabled": True,
+        "entry_count": entry_count,
+        "total_bytes": total_bytes,
+        "max_bytes": max_bytes,
+        "utilization_pct": round(100 * total_bytes / max_bytes, 1) if max_bytes else None,
+        "oldest_entry_age_seconds": round(now - oldest_mtime, 1) if oldest_mtime else None,
+        "newest_entry_age_seconds": round(now - newest_mtime, 1) if newest_mtime else None,
     }
 
 
