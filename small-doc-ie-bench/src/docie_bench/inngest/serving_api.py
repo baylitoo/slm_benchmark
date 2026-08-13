@@ -502,6 +502,62 @@ async def seed_progress(channel: str) -> dict[str, Any]:
     return {"channel": channel, "progress": read_progress(channel)}
 
 
+async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
+    """Fire whichever event turns store model ``name`` into a live deployment,
+    for a caller that hit "not live yet" and would rather wait than fail.
+
+    Returns ``(name, eta_seconds)`` when a load/deploy was actually fired, or
+    ``None`` when ``name`` is genuinely not a catalog entry at all (nothing to
+    trigger — the caller's original error stands). Two cases, both real:
+
+    * never deployed (no placement row at all) -- fires the same
+      ``serving/deploy.requested`` a first :func:`scale_store_model` replica
+      would, using the base name as the deployment name (the established
+      convention: the first replica of ``name`` IS the bare store name).
+    * deployed then evicted / not yet ready (a placement row exists but none
+      is live) -- fires :data:`LOAD_EVENT`, same as ``POST
+      /deployments/{name}/load``.
+
+    Best-effort on the ETA: a size-aware budget when the catalog knows the
+    weights' byte size, else the same conservative floor
+    :func:`_autoload_target` (the async Studio worker's own auto-reload) uses
+    when it cannot stat the file directly.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.lifecycle import load_timeout_s
+    from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
+    try:
+        catalog = ModelCatalog()
+        entry = catalog.get(name)
+        if entry is None:
+            return None
+        placements = catalog.list_placements_for_model(name)
+    except CatalogUnavailableError:
+        return None
+
+    size_bytes = entry.get("size_bytes") if isinstance(entry, dict) else None
+    eta = load_timeout_s(None, size_bytes=size_bytes if isinstance(size_bytes, int) else None)
+
+    if not placements:
+        channel = f"deploy:{uuid.uuid4().hex}"
+        data = {
+            "model": name,
+            "deployment_name": name,
+            "context_length": DEFAULT_DEPLOY_CONTEXT_LENGTH,
+            "channel": channel,
+        }
+        await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
+    else:
+        try:
+            await _fire_lifecycle_event(name, event=LOAD_EVENT, prefix="load")
+        except HTTPException:
+            # The deployment record vanished between the catalog read above and
+            # this call (rare race) -- nothing sane left to trigger.
+            return None
+    return name, eta
+
+
 async def _fire_lifecycle_event(
     name: str,
     *,

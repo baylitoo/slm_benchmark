@@ -171,6 +171,113 @@ def test_scale_is_idempotent_no_events_when_already_at_target(
     assert sent == []
 
 
+# ── trigger_deployment_load: the "available models" load-on-demand seam ────
+
+
+@pytest.fixture
+def sqlite_catalog(tmp_path: Path) -> Iterator[None]:
+    import docie_bench.storage.db as db
+
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path / 'catalog.db'}")
+    try:
+        yield
+    finally:
+        db.dispose_engine()
+
+
+def _seed_catalog(name: str, family: str = "openai_chat") -> None:
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.model_store import StoreEntry
+
+    ModelCatalog().upsert(
+        StoreEntry(name=name, family=family, model_path=Path(f"/models/{name}/model.gguf"))
+    )
+
+
+def test_trigger_deployment_load_fires_deploy_for_a_never_deployed_model(
+    serving_home: Path, sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Catalog entry exists, but no placement row at all -- the "available
+    # models" case: seeded, never deployed. Must fire a first-replica deploy,
+    # not a reload (there's nothing to reload).
+    from docie_bench.inngest import serving_api
+
+    _seed_catalog("qwen2.5-1.5b")
+    sent: list[object] = []
+
+    async def fake_send(event: object) -> list[str]:
+        sent.append(event)
+        return ["evt-1"]
+
+    monkeypatch.setattr(serving_api.inngest_client, "send", fake_send)
+
+    result = asyncio.run(serving_api.trigger_deployment_load("qwen2.5-1.5b"))
+
+    assert result is not None
+    name, eta = result
+    assert name == "qwen2.5-1.5b"
+    assert eta > 0
+    assert len(sent) == 1
+    assert sent[0].name == "serving/deploy.requested"  # type: ignore[attr-defined]
+    assert sent[0].data["deployment_name"] == "qwen2.5-1.5b"  # type: ignore[attr-defined]
+    assert sent[0].data["model"] == "qwen2.5-1.5b"  # type: ignore[attr-defined]
+
+
+def test_trigger_deployment_load_reloads_an_evicted_deployment(
+    serving_home: Path, sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A placement row exists (deployed before) AND a deployments.json record
+    # exists (so _fire_lifecycle_event's 404-gate passes) -- must fire a
+    # RELOAD (serving/load.requested), not a fresh deploy.
+    from docie_bench.inngest import serving_api
+    from docie_bench.serving.catalog import ModelCatalog
+
+    _seed_catalog("qwen2.5-1.5b")
+    ModelCatalog().record_placement(
+        "qwen2.5-1.5b",
+        model_name="qwen2.5-1.5b",
+        engine="llama-server",
+        endpoint="",
+        state="stopped",
+    )
+    _seed_deployments(serving_home, {"qwen2.5-1.5b": 8088})
+    sent: list[object] = []
+
+    async def fake_send(event: object) -> list[str]:
+        sent.append(event)
+        return ["evt-1"]
+
+    monkeypatch.setattr(serving_api.inngest_client, "send", fake_send)
+
+    result = asyncio.run(serving_api.trigger_deployment_load("qwen2.5-1.5b"))
+
+    assert result is not None
+    assert result[0] == "qwen2.5-1.5b"
+    assert len(sent) == 1
+    assert sent[0].name == "serving/load.requested"  # type: ignore[attr-defined]
+    assert sent[0].data["name"] == "qwen2.5-1.5b"  # type: ignore[attr-defined]
+
+
+def test_trigger_deployment_load_declines_an_unseeded_name(
+    serving_home: Path, sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.inngest import serving_api
+
+    sent: list[object] = []
+
+    async def fake_send(event: object) -> list[str]:
+        sent.append(event)
+        return ["evt-1"]
+
+    monkeypatch.setattr(serving_api.inngest_client, "send", fake_send)
+
+    result = asyncio.run(serving_api.trigger_deployment_load("never-seeded"))
+
+    assert result is None
+    assert sent == []
+
+
 def test_deployment_logs_tail(serving_home: Path) -> None:
     _seed_deployments(serving_home, {"qwen": 8088})
     logs_dir = serving_home / "logs"

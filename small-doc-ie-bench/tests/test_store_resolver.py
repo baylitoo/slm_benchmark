@@ -143,18 +143,65 @@ def test_resolve_store_not_ready_raises(_sqlite_catalog: None) -> None:
     assert "starting" in str(excinfo.value)
 
 
-def test_api_resolve_profile_store_maps_error_to_http(_sqlite_catalog: None) -> None:
+async def test_api_resolve_profile_store_maps_error_to_http(_sqlite_catalog: None) -> None:
     from docie_bench.api import resolve_profile
 
     with pytest.raises(HTTPException) as missing:
-        resolve_profile("store:never-seeded")
+        await resolve_profile("store:never-seeded")
     assert missing.value.status_code == 404
 
     _seed("qwen2.5-1.5b", family="openai_chat")
     _place("qwen2.5-1.5b", state="starting")
+    # A placement row exists (not live yet) -- trigger_deployment_load tries
+    # to fire a reload, but this test's fixture has no deployments.json
+    # record / reachable Inngest client for it to fire against, so it
+    # degrades to None and the original 409 stands (see the next test file
+    # for the case where the trigger genuinely fires).
     with pytest.raises(HTTPException) as not_ready:
-        resolve_profile("store:qwen2.5-1.5b")
+        await resolve_profile("store:qwen2.5-1.5b")
     assert not_ready.value.status_code == 409
+
+
+async def test_api_resolve_profile_triggers_load_and_returns_202(
+    _sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The core of the "available models, load on first request" behavior: a
+    # store model that isn't live yet gets a load/deploy fired for it and an
+    # honest 202 "starting" response, instead of a bare 404/409. This test
+    # stubs trigger_deployment_load itself (its own real logic -- catalog
+    # lookup, never-deployed vs evicted branching, Inngest event shape -- is
+    # exercised by test_serving_control_plane.py); here we're proving
+    # resolve_profile actually calls it and turns a hit into a 202.
+    from docie_bench import api
+
+    async def fake_trigger(name: str) -> tuple[str, float] | None:
+        assert name == "qwen2.5-1.5b"
+        return name, 42.0
+
+    monkeypatch.setattr(api, "trigger_deployment_load", fake_trigger)
+
+    _seed("qwen2.5-1.5b", family="openai_chat")  # catalog entry, no placement at all
+    with pytest.raises(HTTPException) as excinfo:
+        await api.resolve_profile("store:qwen2.5-1.5b")
+    assert excinfo.value.status_code == 202
+    detail = excinfo.value.detail
+    assert detail["status"] == "loading"
+    assert detail["deployment"] == "qwen2.5-1.5b"
+    assert detail["eta_seconds"] == 42.0
+    assert "42s" in detail["message"]
+
+
+async def test_api_resolve_profile_unknown_catalog_name_still_404s(
+    _sqlite_catalog: None,
+) -> None:
+    # trigger_deployment_load itself (not mocked here) must decline to fire
+    # anything for a name that was never seeded -- there's genuinely nothing
+    # to load, so the original 404 has to survive.
+    from docie_bench.api import resolve_profile
+
+    with pytest.raises(HTTPException) as excinfo:
+        await resolve_profile("store:genuinely-never-seeded")
+    assert excinfo.value.status_code == 404
 
 
 # ── PR-C: load-balancing across scaled replicas ─────────────────────────────
@@ -255,7 +302,7 @@ def test_endpoint_is_loopback(url: str, loopback: bool) -> None:
     assert endpoint_is_loopback(url) is loopback
 
 
-def test_api_resolve_profile_rejects_worker_loopback_endpoint(_sqlite_catalog: None) -> None:
+async def test_api_resolve_profile_rejects_worker_loopback_endpoint(_sqlite_catalog: None) -> None:
     """The placement endpoint is recorded from the WORKER's point of view; in
     the documented api/worker compose topology the API can never reach the
     worker's 127.0.0.1, so resolving it 'successfully' would burn
@@ -266,21 +313,21 @@ def test_api_resolve_profile_rejects_worker_loopback_endpoint(_sqlite_catalog: N
     _place("qwen2.5-1.5b")  # loopback _ENDPOINT
 
     with pytest.raises(HTTPException) as excinfo:
-        resolve_profile("store:qwen2.5-1.5b")
+        await resolve_profile("store:qwen2.5-1.5b")
     assert excinfo.value.status_code == 501
     assert "127.0.0.1:8088" in excinfo.value.detail
     # The message must point at the working alternatives.
     assert "/v1/studio/extract" in excinfo.value.detail
 
 
-def test_api_resolve_profile_accepts_advertised_endpoint(_sqlite_catalog: None) -> None:
+async def test_api_resolve_profile_accepts_advertised_endpoint(_sqlite_catalog: None) -> None:
     """A non-loopback (advertised) endpoint passes the guard untouched."""
     from docie_bench.api import resolve_profile
 
     _seed("qwen2.5-1.5b", family="openai_chat")
     _place("qwen2.5-1.5b", endpoint="http://worker:8088/v1")
 
-    profile = resolve_profile("store:qwen2.5-1.5b")
+    profile = await resolve_profile("store:qwen2.5-1.5b")
     assert profile.base_url == "http://worker:8088/v1"
 
 

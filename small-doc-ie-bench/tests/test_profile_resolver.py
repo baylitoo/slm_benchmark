@@ -410,22 +410,22 @@ def test_functions_resolve_default_is_studio_default(inject_deployments) -> None
     assert profile.name == "studio_default"  # honest label, not env_fallback
 
 
-def test_api_resolve_profile_400s_on_unknown(inject_deployments) -> None:
+async def test_api_resolve_profile_400s_on_unknown(inject_deployments) -> None:
     from fastapi import HTTPException
 
     from docie_bench import api
 
     inject_deployments([])
     with pytest.raises(HTTPException) as exc:
-        api.resolve_profile("does-not-exist")
+        await api.resolve_profile("does-not-exist")
     assert exc.value.status_code == 400
 
 
-def test_api_resolve_profile_none_is_studio_default(inject_deployments) -> None:
+async def test_api_resolve_profile_none_is_studio_default(inject_deployments) -> None:
     from docie_bench import api
 
     inject_deployments([])
-    profile = api.resolve_profile(None)
+    profile = await api.resolve_profile(None)
     assert profile.name == "studio_default"
 
 
