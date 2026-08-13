@@ -470,7 +470,13 @@ function ChatPanel({
     setBusy(true);
     const payload = [
       ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
-      ...next,
+      // "status" bubbles (a give-up-and-retry-later notice from an earlier
+      // turn's cold start) are UI-only — an unrecognized role sent upstream
+      // can break the model's chat template. Only user/assistant turns are
+      // real conversation history.
+      ...next
+        .filter((m): m is ChatMsg & { role: "user" | "assistant" } => m.role !== "status")
+        .map((m) => ({ role: m.role, content: m.content })),
     ];
     await attempt(next, payload, 0);
     setBusy(false);
@@ -539,6 +545,7 @@ function ChatPanel({
               onChange={setModel}
               emptyNoun="chat"
               onNavigate={onNavigate}
+              disabled={busy}
             />
           </Field>
           <Field label="System prompt" hint="Optional — applied to the whole conversation.">
@@ -1250,6 +1257,7 @@ function DeploymentSelect({
   onChange,
   emptyNoun = "chat",
   onNavigate,
+  disabled = false,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   selectable: DeploymentRecord[];
@@ -1257,6 +1265,10 @@ function DeploymentSelect({
   onChange: (name: string) => void;
   emptyNoun?: "chat" | "vision" | "embedding";
   onNavigate?: NavigateToDeploy;
+  /** Locks the picker mid-request — e.g. Chat's cold-start retry chain keeps
+   * calling the model it started with; switching mid-retry would silently
+   * orphan the in-flight chain against the old selection. */
+  disabled?: boolean;
 }) {
   // First load, nothing cached yet.
   if (deployments.loading && !deployments.data) {
@@ -1285,7 +1297,7 @@ function DeploymentSelect({
   }
 
   return (
-    <Select value={value} onChange={(e) => onChange(e.target.value)}>
+    <Select value={value} onChange={(e) => onChange(e.target.value)} disabled={disabled}>
       {selectable.map((d) => {
         const name = d.spec?.name ?? "";
         const model = d.spec?.launch?.model ?? "?";
