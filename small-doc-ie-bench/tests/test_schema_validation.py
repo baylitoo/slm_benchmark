@@ -33,8 +33,37 @@ def test_invoice_line_items_validate_arithmetic_and_evidence_ids():
     assert validation.valid
     assert normalized["line_items"][0]["quantity"]["value"] == "2"
     assert "Unknown evidence_id referenced by model: missing" in validation.warnings
-    assert any("quantity * unit_price" in warning for warning in validation.warnings)
-    assert any("sum(line_items.line_total)" in warning for warning in validation.warnings)
+    # The computed value rides in the warning text itself — a reviewer sees the
+    # actual mismatch (2 * 100.00 = 200.00 vs the model's 190.00) without doing
+    # the arithmetic by hand.
+    assert any(
+        "quantity * unit_price (2 * 100.00 = 200.00) does not match line_total (190.00)" in w
+        for w in validation.warnings
+    )
+    assert any(
+        "sum(line_items.line_total) (190.00) does not match subtotal (210.00)" in w
+        for w in validation.warnings
+    )
+
+
+def test_invoice_total_mismatch_warning_shows_computed_sum():
+    # The documented NuExtract3 failure mode: text/quantities read correctly,
+    # but the model's own addition (subtotal + vat) is wrong. The warning must
+    # surface the correct computed total so a reviewer doesn't have to add it
+    # up themselves.
+    blocks = [OCRBlock(id="b1", text="Total", source="manual")]
+    payload = {
+        "document_type": "invoice",
+        "subtotal": {"amount": "100.00", "currency": "EUR"},
+        "vat_amount": {"amount": "20.00", "currency": "EUR"},
+        "total_ttc": {"amount": "115.00", "currency": "EUR"},
+    }
+    _normalized, validation = validate_extraction("invoice", payload, blocks)
+    assert validation.valid
+    assert any(
+        "subtotal + vat_amount (100.00 + 20.00 = 120.00) does not match total_ttc (115.00)" in w
+        for w in validation.warnings
+    )
 
 
 def test_optional_fields_with_null_value_are_valid():

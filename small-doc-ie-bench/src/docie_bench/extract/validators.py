@@ -60,7 +60,10 @@ def _validate_invoice_arithmetic(invoice: dict[str, Any]) -> list[str]:
         and total is not None
         and abs((subtotal + vat) - total) > tolerance
     ):
-        warnings.append("subtotal + vat_amount does not match total_ttc within 0.05")
+        warnings.append(
+            f"subtotal + vat_amount ({subtotal} + {vat} = {subtotal + vat}) does not match "
+            f"total_ttc ({total}) within {tolerance}"
+        )
 
     line_totals: list[Decimal] = []
     for index, item in enumerate(invoice.get("line_items", [])):
@@ -78,8 +81,9 @@ def _validate_invoice_arithmetic(invoice: dict[str, Any]) -> list[str]:
             and abs((quantity * unit_price) - line_total) > tolerance
         ):
             warnings.append(
-                f"line_items[{index}].quantity * unit_price does not match "
-                "line_total within 0.05"
+                f"line_items[{index}].quantity * unit_price "
+                f"({quantity} * {unit_price} = {quantity * unit_price}) does not match "
+                f"line_total ({line_total}) within {tolerance}"
             )
         currencies = {
             value.get("currency")
@@ -89,7 +93,10 @@ def _validate_invoice_arithmetic(invoice: dict[str, Any]) -> list[str]:
         if len(currencies) > 1:
             warnings.append(f"line_items[{index}] contains inconsistent currencies")
     if subtotal is not None and line_totals and abs(sum(line_totals) - subtotal) > tolerance:
-        warnings.append("sum(line_items.line_total) does not match subtotal within 0.05")
+        warnings.append(
+            f"sum(line_items.line_total) ({sum(line_totals)}) does not match "
+            f"subtotal ({subtotal}) within {tolerance}"
+        )
     return warnings
 
 
