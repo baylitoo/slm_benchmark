@@ -324,6 +324,9 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
+      # Local-dev defaults, published to the host below (not container-network
+      # only) — change POSTGRES_PASSWORD (and DATABASE_URL in .env to match)
+      # before running this stack anywhere shared or networked.
       POSTGRES_USER: docie
       POSTGRES_PASSWORD: docie
       POSTGRES_DB: docie
