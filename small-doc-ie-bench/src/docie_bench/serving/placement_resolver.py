@@ -189,6 +189,13 @@ def resolve_store_profile(
         vision=bool(contract.vision) if contract else False,
         stop_sequences=tuple(contract.stop_sequences) if contract else (),
         temperature=contract.default_temperature if contract else 0.0,
+        # The family's generation tuning, not ModelProfile's bare defaults
+        # (900/180s) -- profile_resolver.py's family-synthesis path already
+        # carries these (guarding NuExtract3's 4096/600s requirement); this
+        # sibling store: routing path never did, so a store-deployed
+        # NuExtract3 silently ran capped at 900 tokens / timing out at 180s.
+        max_tokens=contract.default_max_tokens if contract else 900,
+        timeout_seconds=contract.default_timeout_seconds if contract else 180.0,
     )
 
 
