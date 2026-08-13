@@ -145,6 +145,27 @@ def _schema_instruction(schema_name: str) -> str | None:
     )
 
 
+def _is_empty_completion(completion: dict[str, Any]) -> bool:
+    """True when every choice's message content is empty/whitespace-only.
+
+    The small-Ollama-and-friends defect this whole ladder exists for: a
+    strong response_format style compiles fine server-side but the model
+    emits nothing. openai_client.chat_json's ladder already treats an empty
+    200 as downgradable; this mirrors that check for the agent forward path,
+    which previously only reacted to an explicit HTTP 400."""
+    choices = completion.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return True
+    for choice in choices:
+        message = choice.get("message") if isinstance(choice, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str) and content.strip():
+            return False
+        if isinstance(content, list) and content:
+            return False
+    return True
+
+
 async def _post_chat_with_schema(
     upstream: ModelProfile,
     body: dict[str, Any],
@@ -153,15 +174,19 @@ async def _post_chat_with_schema(
     http_client: httpx.AsyncClient,
 ) -> dict[str, Any]:
     """Forward a chat request, delivering ``schema_name`` as ``response_format``
-    but resilient to a backend that cannot compile a deep schema's grammar.
+    but resilient to a backend that cannot compile a deep schema's grammar,
+    or one that compiles it fine and returns nothing.
 
     llama.cpp turns a strict json_schema into a GBNF grammar; a large nested
     schema (``$defs``/``$ref``/``anyOf`` — e.g. the invoice schema) makes it
     fail with 'failed to parse grammar' (HTTP 400). The extraction client
     survives this via its style ladder; the agent forward gets the same one
     here: strict json_schema -> json_object (valid-JSON, no schema grammar) ->
-    no constraint. Only a grammar/response_format 400 downgrades; any other
-    error propagates."""
+    no constraint. A grammar/response_format 400 downgrades, and so does a
+    200 with empty content (the small-Ollama-and-friends defect
+    openai_client.chat_json's ladder already guards against — this path
+    forwards through _post_chat directly, so it needs its own check). Any
+    other error propagates."""
     if not schema_name:
         return await _post_chat(upstream, dict(body), http_client=http_client)
 
@@ -194,9 +219,9 @@ async def _post_chat_with_schema(
 
     last_error: AgentError | None = None
     for index, attempt in enumerate(attempts):
+        is_last = index == len(attempts) - 1
         try:
             completion = await _post_chat(upstream, attempt, http_client=http_client)
-            return repair_prefilled_content(completion)
         except AgentError as exc:
             downgradable = exc.status_code == 400 and any(
                 token in str(exc).lower()
@@ -208,11 +233,27 @@ async def _post_chat_with_schema(
                     "sampler",  # "Failed to initialize samplers" — prefill+grammar
                 )
             )
-            if index < len(attempts) - 1 and downgradable:
+            if not is_last and downgradable:
                 last_error = exc
                 continue
             raise
-    raise last_error  # pragma: no cover - the last attempt sends no response_format
+        repaired = repair_prefilled_content(completion)
+        if _is_empty_completion(repaired):
+            empty_error = AgentError(
+                f"backing model {upstream.model!r} returned empty content",
+                status_code=502,
+                error_type="upstream_empty_content",
+            )
+            if not is_last:
+                last_error = empty_error
+                continue
+            # Even the unconstrained final rung came back empty -- there is no
+            # weaker style left to try. Raise rather than hand back an empty
+            # "successful" completion (the exact class of silent-non-answer
+            # bug the whole ladder exists to avoid elsewhere in this codebase).
+            raise empty_error
+        return repaired
+    raise last_error  # pragma: no cover - unreachable: is_last always returns/raises above
 
 
 async def _complete_ocr(
