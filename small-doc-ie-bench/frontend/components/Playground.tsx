@@ -32,6 +32,7 @@ import {
   renderDocument,
   ApiError,
   ApiUnavailable,
+  ModelLoading,
   type TriggerResponse,
   type ExtractRequest,
   type DeploymentRecord,
@@ -394,9 +395,15 @@ export function Playground({
 // ---------------------------------------------------------------------------
 
 interface ChatMsg {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "status";
   content: string;
 }
+
+// A cold store: model's first request can take a while to boot. Auto-retry a
+// bounded number of times (the backend's load trigger is idempotent — see
+// loadDeployment's own doc comment) rather than making the user notice the
+// status message and resend by hand.
+const MAX_LOAD_RETRIES = 3;
 
 function ChatPanel({
   deployments,
@@ -411,19 +418,31 @@ function ChatPanel({
   // the Extract-side selection (which legitimately includes evicted
   // auto-reload targets) would let the select DISPLAY one model while the
   // request carries another — the exact mismatch this state split fixes.
+  // Evicted deployments stay selectable — a request to one auto-reloads it
+  // (load-on-demand), same convention as the Extract and Vision pickers.
+  // Prefer a live model as the default so the FIRST message a user sends
+  // doesn't automatically eat a cold-start wait, but still let a cold one be
+  // picked deliberately.
   const [model, setModel] = useState("");
-  const liveOnly = useMemo(() => selectable.filter(isLiveDeployment), [selectable]);
+  const chatNames = useMemo(
+    () => selectable.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [selectable],
+  );
   const liveNames = useMemo(
-    () => liveOnly.map((d) => d.spec?.name ?? "").filter(Boolean),
-    [liveOnly],
+    () =>
+      selectable
+        .filter(isLiveDeployment)
+        .map((d) => d.spec?.name ?? "")
+        .filter(Boolean),
+    [selectable],
   );
   useEffect(() => {
-    if (liveNames.length === 0) {
+    if (chatNames.length === 0) {
       if (model !== "") setModel("");
       return;
     }
-    if (!liveNames.includes(model)) setModel(liveNames[0]);
-  }, [liveNames, model]);
+    if (!chatNames.includes(model)) setModel(liveNames[0] ?? chatNames[0]);
+  }, [chatNames, liveNames, model]);
 
   const [system, setSystem] = useState("");
   const [input, setInput] = useState("");
@@ -440,7 +459,7 @@ function ChatPanel({
     const text = input.trim();
     if (!text || busy) return;
     if (!model) {
-      setError("No live deployment selected — deploy a model under Serving → Models first.");
+      setError("No deployment selected — deploy a model under Serving → Models first.");
       return;
     }
     setError(null);
@@ -448,22 +467,47 @@ function ChatPanel({
     setMsgs(next);
     setInput("");
     setBusy(true);
+    const payload = [
+      ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
+      ...next,
+    ];
+    await attempt(next, payload, 0);
+    setBusy(false);
+  }
+
+  async function attempt(
+    next: ChatMsg[],
+    payload: { role: string; content: unknown }[],
+    retryCount: number,
+  ) {
     try {
-      const payload = [
-        ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
-        ...next,
-      ];
       const res = await chatCompletion(model, payload);
       const content = res.choices?.[0]?.message?.content ?? "(empty response)";
       setMsgs([...next, { role: "assistant", content }]);
     } catch (e) {
+      if (e instanceof ModelLoading) {
+        const willRetry = retryCount < MAX_LOAD_RETRIES;
+        setMsgs([
+          ...next,
+          {
+            role: "status",
+            content: willRetry
+              ? `${e.message} Retrying automatically…`
+              : `${e.message} Still starting — send your message again in a bit.`,
+          },
+        ]);
+        if (willRetry) {
+          const waitMs = Math.min(Math.max(e.etaSeconds, 2), 30) * 1000;
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          await attempt(next, payload, retryCount + 1);
+        }
+        return;
+      }
       const msg =
         e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
           ? e.message
           : "Chat request failed.";
       setError(msg);
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -477,11 +521,11 @@ function ChatPanel({
         <div className="grid gap-4 sm:grid-cols-2">
           <Field
             label="Deployment"
-            hint="Live deployments only — load evicted ones from Serving → Deployments first."
+            hint="Evicted deployments reload on request (first message waits for the load)."
           >
             <DeploymentSelect
               deployments={deployments}
-              selectable={liveOnly}
+              selectable={selectable}
               value={model}
               onChange={setModel}
               emptyNoun="chat"
@@ -504,23 +548,32 @@ function ChatPanel({
               the OpenAI-compatible surface.
             </p>
           )}
-          {msgs.map((m, i) => (
-            <div
-              key={i}
-              className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}
-            >
-              <div
-                className={cn(
-                  "max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",
-                  m.role === "user"
-                    ? "bg-accent text-accent-foreground"
-                    : "border border-border bg-card text-foreground",
-                )}
+          {msgs.map((m, i) =>
+            m.role === "status" ? (
+              <p
+                key={i}
+                className="flex items-center gap-2 text-xs italic text-muted-foreground"
               >
-                {m.content}
+                <Spinner /> {m.content}
+              </p>
+            ) : (
+              <div
+                key={i}
+                className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}
+              >
+                <div
+                  className={cn(
+                    "max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",
+                    m.role === "user"
+                      ? "bg-accent text-accent-foreground"
+                      : "border border-border bg-card text-foreground",
+                  )}
+                >
+                  {m.content}
+                </div>
               </div>
-            </div>
-          ))}
+            ),
+          )}
           {busy && (
             <p className="flex items-center gap-2 text-xs text-muted-foreground">
               <Spinner /> Waiting for the model…
@@ -552,7 +605,7 @@ function ChatPanel({
           <Button
             type="button"
             loading={busy}
-            disabled={liveNames.length === 0}
+            disabled={chatNames.length === 0}
             onClick={() => void send()}
           >
             <Send className="h-4 w-4" />
@@ -624,6 +677,9 @@ function VisionPanel({
   const [dpi, setDpi] = useState(200);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A cold store: model triggering a load isn't a failure — style it apart
+  // from an actual error so "warming up" doesn't read as "something broke".
+  const [errorIsLoading, setErrorIsLoading] = useState(false);
   const [answer, setAnswer] = useState<string | null>(null);
 
   useEffect(() => {
@@ -670,6 +726,7 @@ function VisionPanel({
       return;
     }
     setError(null);
+    setErrorIsLoading(false);
     setBusy(true);
     setAnswer(null);
     try {
@@ -700,6 +757,7 @@ function VisionPanel({
       ]);
       setAnswer(res.choices?.[0]?.message?.content ?? "(empty response)");
     } catch (e) {
+      setErrorIsLoading(e instanceof ModelLoading);
       setError(
         e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
           ? e.message
@@ -804,12 +862,17 @@ function VisionPanel({
             ))}
           </div>
 
-          {error && (
-            <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              {error}
-            </p>
-          )}
+          {error &&
+            (errorIsLoading ? (
+              <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
+                <Spinner /> {error}
+              </p>
+            ) : (
+              <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                {error}
+              </p>
+            ))}
 
           <Button type="button" loading={busy} disabled={!model || !file} onClick={() => void run()}>
             <Play className="h-4 w-4" />

@@ -387,6 +387,22 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Raised instead of returning a completion when the model is a cold `store:`
+ * deployment the backend just triggered a load for (HTTP 202, load-on-demand
+ * — see chat_api._resolve_or_error). Distinct from ApiError: this isn't a
+ * failure, it's "keep waiting" — callers should show a status, not a red error.
+ */
+export class ModelLoading extends Error {
+  constructor(
+    public deployment: string,
+    public etaSeconds: number,
+  ) {
+    super(`Model '${deployment}' is starting — retry in ~${Math.ceil(etaSeconds)}s.`);
+    this.name = "ModelLoading";
+  }
+}
+
 function isUnavailableStatus(status: number): boolean {
   return status === 404 || status === 501;
 }
@@ -1051,6 +1067,12 @@ async function openaiPost(url: string, payload: unknown): Promise<AgentChatRespo
     throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
   }
   const body = await readBody(res);
+  if (res.status === 202 && body && typeof body === "object" && "status" in body) {
+    const loading = body as { status?: string; deployment?: string; eta_seconds?: number };
+    if (loading.status === "loading") {
+      throw new ModelLoading(loading.deployment ?? "model", loading.eta_seconds ?? 0);
+    }
+  }
   if (res.ok) return body as AgentChatResponse;
   const err =
     body && typeof body === "object" && "error" in body
