@@ -197,6 +197,8 @@ export interface StoreEntry {
   vision?: boolean;
   /** True for embedding families (served via /v1/embeddings). */
   embedding?: boolean;
+  /** True for reranker families (served via /v1/rerank). */
+  reranker?: boolean;
   /** True for analyzer (encoder) families (served by the encoder runtime). */
   analyzer?: boolean;
   /** Backends that can serve THIS model faithfully — the runtime picker source. */
@@ -305,6 +307,9 @@ export interface ModelFamily {
   needs_mmproj?: boolean;
   /** True for embedding families — served with --embedding, used via /v1/embeddings. */
   embedding?: boolean;
+  /** True for reranker families — served with --reranking --embedding --pooling
+   * rank, used via /v1/rerank. */
+  reranker?: boolean;
   /** True for analyzer (encoder) families — served by the encoder runtime. */
   analyzer?: boolean;
   /** The analyzer library for an analyzer family (e.g. "gliner" | "gliner2"). */
@@ -1057,19 +1062,22 @@ export function isLiveDeployment(r: DeploymentRecord): boolean {
  * The semantic model type of a deployment — what it can be USED for.
  * "chat" (generative SLMs: extraction, agent backing, Playground chat),
  * "encoder" (analyzers: agent guard models), "embedding" (vectors:
- * /v1/embeddings, RAG). Encoder is derived from the launch runtime; embedding
- * needs the family, so pass `embeddingNames` (deployment names whose store
- * family is an embedding family — see embeddingDeploymentNames).
+ * /v1/embeddings, RAG), "reranker" (relevance scoring: /v1/rerank). Encoder is
+ * derived from the launch runtime; embedding/reranker need the family, so pass
+ * `embeddingNames`/`rerankerNames` (deployment names whose store family is
+ * that family — see embeddingDeploymentNames / rerankerDeploymentNames).
  */
-export type DeployedModelType = "chat" | "encoder" | "embedding";
+export type DeployedModelType = "chat" | "encoder" | "embedding" | "reranker";
 
 export function deploymentModelType(
   r: DeploymentRecord,
   embeddingNames?: Set<string>,
+  rerankerNames?: Set<string>,
 ): DeployedModelType {
   if (r.spec?.launch?.runtime === "encoder") return "encoder";
   const name = r.spec?.name;
   if (name && embeddingNames?.has(name)) return "embedding";
+  if (name && rerankerNames?.has(name)) return "reranker";
   return "chat";
 }
 
@@ -1089,6 +1097,24 @@ export function embeddingDeploymentNames(
   return new Set(
     (store ?? [])
       .filter((e) => e.family && embeddingFamilies.has(e.family))
+      .map((e) => e.name),
+  );
+}
+
+/**
+ * Deployment names that are reranker models: a store entry whose family is
+ * flagged `reranker`. Mirrors embeddingDeploymentNames exactly.
+ */
+export function rerankerDeploymentNames(
+  store: StoreEntry[] | null | undefined,
+  families: ModelFamily[] | null | undefined,
+): Set<string> {
+  const rerankerFamilies = new Set(
+    (families ?? []).filter((f) => f.reranker).map((f) => f.name),
+  );
+  return new Set(
+    (store ?? [])
+      .filter((e) => e.family && rerankerFamilies.has(e.family))
       .map((e) => e.name),
   );
 }
@@ -1117,6 +1143,30 @@ export function embed(model: string, input: string | string[]): Promise<Embeddin
   return request<EmbeddingResponse>("/v1/embeddings", {
     method: "POST",
     body: JSON.stringify({ model, input }),
+  });
+}
+
+export interface RerankResponse {
+  results?: { index?: number; relevance_score?: number }[];
+  model?: string;
+  [k: string]: unknown;
+}
+
+/** Rerank documents against a query over a reranker deployment (POST /v1/rerank). */
+export function rerank(
+  model: string,
+  query: string,
+  documents: string[],
+  topN?: number,
+): Promise<RerankResponse> {
+  return request<RerankResponse>("/v1/rerank", {
+    method: "POST",
+    body: JSON.stringify({
+      model,
+      query,
+      documents,
+      ...(topN != null ? { top_n: topN } : {}),
+    }),
   });
 }
 

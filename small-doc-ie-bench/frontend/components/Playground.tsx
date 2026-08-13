@@ -6,6 +6,7 @@ import {
   FileText,
   Fingerprint,
   Image as ImageIcon,
+  ListOrdered,
   MessageSquare,
   Play,
   Send,
@@ -18,7 +19,9 @@ import {
   triggerExtract,
   chatCompletion,
   embed,
+  rerank,
   embeddingDeploymentNames,
+  rerankerDeploymentNames,
   visionDeploymentNames,
   getDeployments,
   getStore,
@@ -34,6 +37,7 @@ import {
   type DeploymentRecord,
   type StoreEntry,
   type ModelFamily,
+  type RerankResponse,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -44,7 +48,7 @@ import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 
 type InputMode = "text" | "file";
-type PlaygroundMode = "extract" | "chat" | "vision" | "embed";
+type PlaygroundMode = "extract" | "chat" | "vision" | "embed" | "rerank";
 
 // Deep-link callback threaded from AppShell so first-run empty states can send
 // the user straight to Models to deploy a model. Optional everywhere: when it
@@ -87,6 +91,10 @@ export function Playground({
   const families = useAsync<ModelFamily[]>("families", getFamilies);
   const embeddingNames = useMemo(
     () => embeddingDeploymentNames(store.data, families.data),
+    [store.data, families.data],
+  );
+  const rerankerNames = useMemo(
+    () => rerankerDeploymentNames(store.data, families.data),
     [store.data, families.data],
   );
   const visionNames = useMemo(() => visionDeploymentNames(store.data), [store.data]);
@@ -184,7 +192,9 @@ export function Playground({
               ? "Send an image to a vision deployment (OCR / description) — free-text answer."
               : mode === "embed"
                 ? "Compute embeddings with your deployed models (RAG-ready)."
-                : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
+                : mode === "rerank"
+                  ? "Score documents against a query with a reranker deployment (retrieval, ranked)."
+                  : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
         }
         actions={
           <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
@@ -194,6 +204,7 @@ export function Playground({
                 ["chat", "Chat", MessageSquare],
                 ["vision", "Vision", ImageIcon],
                 ["embed", "Embed", Fingerprint],
+                ["rerank", "Rerank", ListOrdered],
               ] as [PlaygroundMode, string, typeof Sparkles][]
             ).map(([m, label, Icon]) => (
               <button
@@ -231,6 +242,13 @@ export function Playground({
         <EmbedPanel
           deployments={deployments.data ?? []}
           embeddingNames={embeddingNames}
+          onNavigate={onNavigate}
+        />
+      </div>
+      <div hidden={mode !== "rerank"}>
+        <RerankPanel
+          deployments={deployments.data ?? []}
+          rerankerNames={rerankerNames}
           onNavigate={onNavigate}
         />
       </div>
@@ -969,6 +987,145 @@ function EmbedPanel({
   );
 }
 
+function RerankPanel({
+  deployments,
+  rerankerNames,
+  onNavigate,
+}: {
+  deployments: DeploymentRecord[];
+  rerankerNames: Set<string>;
+  onNavigate?: NavigateToDeploy;
+}) {
+  // Same as the embed picker: an evicted reranker deployment reloads on the
+  // next request, so include selectable (live + managed-evicted), not only live.
+  const rerankDeployments = useMemo(
+    () =>
+      selectableDeployments(deployments).filter(
+        (d) => d.spec?.name && rerankerNames.has(d.spec.name),
+      ),
+    [deployments, rerankerNames],
+  );
+  const names = useMemo(
+    () => rerankDeployments.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [rerankDeployments],
+  );
+
+  const [model, setModel] = useState("");
+  const [query, setQuery] = useState("What is the invoice total?");
+  const [docs, setDocs] = useState(
+    "FACTURE total 5 400 € TTC, échéance 30 jours.\nWeather forecast for tomorrow: light rain.\nInvoice total 5400 EUR, net 30 payment terms.",
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{ doc: string; score: number }[] | null>(null);
+
+  useEffect(() => {
+    if (names.length === 0) {
+      if (model !== "") setModel("");
+      return;
+    }
+    if (!names.includes(model)) setModel(names[0]);
+  }, [names, model]);
+
+  async function run() {
+    if (!model) {
+      setError("No live reranker deployment — deploy a reranker model (family: reranker).");
+      return;
+    }
+    const documents = docs.split("\n").map((d) => d.trim()).filter(Boolean);
+    if (documents.length === 0) {
+      setError("Add at least one document to rank, one per line.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const res: RerankResponse = await rerank(model, query, documents);
+      const ranked = (res.results ?? [])
+        .map((r) => ({
+          doc: documents[r.index ?? -1] ?? "?",
+          score: r.relevance_score ?? 0,
+        }))
+        .sort((a, b) => b.score - a.score);
+      setResult(ranked);
+    } catch (e) {
+      setError(
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Rerank request failed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card
+      icon={<ListOrdered className="h-5 w-5" />}
+      title="Rerank"
+      subtitle="A query and a list of documents in, relevance-ranked out — the retrieval second stage, computed on-node."
+    >
+      <div className="space-y-4">
+        <Field
+          label="Reranker deployment"
+          hint="Deploy a reranker GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF) with family 'reranker'."
+        >
+          {names.length === 0 ? (
+            <EmptyModelState noun="reranker" onNavigate={onNavigate} />
+          ) : (
+            <Select value={model} onChange={(e) => setModel(e.target.value)}>
+              {names.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+
+        <Field label="Query">
+          <TextInput value={query} onChange={(e) => setQuery(e.target.value)} />
+        </Field>
+        <Field label="Documents" hint="One document per line.">
+          <TextArea rows={5} value={docs} onChange={(e) => setDocs(e.target.value)} />
+        </Field>
+
+        {error && (
+          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            {error}
+          </p>
+        )}
+
+        <Button type="button" loading={busy} onClick={() => void run()} disabled={!model}>
+          <ListOrdered className="h-4 w-4" />
+          Rerank
+        </Button>
+
+        {result && (
+          <div className="space-y-2 rounded-md border border-border bg-muted/20 p-4">
+            {result.map((r, i) => (
+              <div
+                key={i}
+                className="flex items-start gap-2 rounded-md border border-border bg-card p-2 text-sm"
+              >
+                <Badge tone={i === 0 ? "ok" : r.score > 0 ? "info" : "neutral"}>
+                  {r.score.toFixed(4)}
+                </Badge>
+                <p className="text-foreground/90">{r.doc}</p>
+              </div>
+            ))}
+            <p className="text-xs text-muted-foreground">
+              Sorted by relevance_score, highest first — the same order a retrieval pipeline
+              would keep.
+            </p>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Deployment selector — a dropdown of routable deployments: live ones plus
 // evicted/loading `managed` ones (a request auto-reloads those; PR-4). Falls
@@ -983,7 +1140,7 @@ function EmptyModelState({
   noun,
   onNavigate,
 }: {
-  noun: "chat" | "vision" | "embedding";
+  noun: "chat" | "vision" | "embedding" | "reranker";
   onNavigate?: NavigateToDeploy;
 }) {
   return (
