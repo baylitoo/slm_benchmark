@@ -1109,6 +1109,86 @@ export function chatCompletion(
   return openaiPost(`${API_BASE}/v1/chat/completions`, { model, messages });
 }
 
+/**
+ * Same call as `chatCompletion`, but with `stream: true` — the backend
+ * relays llama-server's real token-by-token SSE frames (chat_api.py's
+ * `_stream_chat_completions`), so `onToken` fires once per delta as the
+ * model generates instead of once after the full completion lands.
+ *
+ * A cold `store:` model resolves BEFORE the stream ever opens (same
+ * `_resolve_or_error` seam as the non-streaming path), so a 202 loading
+ * response still arrives as one JSON body — `ModelLoading` throws exactly
+ * like `chatCompletion`, before any `onToken` call.
+ */
+export async function chatCompletionStream(
+  model: string,
+  messages: { role: string; content: unknown }[],
+  onToken: (text: string) => void,
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      body: JSON.stringify({ model, messages, stream: true }),
+    });
+  } catch (e) {
+    throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
+  }
+
+  // 202 is a 2xx — res.ok is true for it too, so the loading check must run
+  // BEFORE the ok/error branch, not inside it (a store: model resolves to a
+  // plain JSON loading body before the stream ever opens; treating it as an
+  // SSE body silently reads zero tokens instead of surfacing the load).
+  if (res.status === 202) {
+    const body = await readBody(res);
+    if (body && typeof body === "object" && "status" in body) {
+      const loading = body as { status?: string; deployment?: string; eta_seconds?: number };
+      if (loading.status === "loading") {
+        throw new ModelLoading(loading.deployment ?? "model", loading.eta_seconds ?? 0);
+      }
+    }
+  }
+  if (!res.ok) {
+    const body = await readBody(res);
+    const err =
+      body && typeof body === "object" && "error" in body
+        ? (body as { error?: { message?: string; type?: string } }).error
+        : undefined;
+    const detail = err?.message ?? detailOf(body, `Request failed (HTTP ${res.status})`);
+    throw new ApiError(res.status, err?.type ? `${err.type}: ${detail}` : detail);
+  }
+  if (!res.body) return;
+
+  // SSE frames are separated by a blank line; a network chunk can split a
+  // frame (or a multi-byte UTF-8 char) anywhere, so buffer and only consume
+  // complete "\n\n"-terminated frames.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let frameEnd: number;
+    while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, frameEnd);
+      buffer = buffer.slice(frameEnd + 2);
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") return;
+        try {
+          const delta = JSON.parse(data)?.choices?.[0]?.delta?.content;
+          if (typeof delta === "string" && delta) onToken(delta);
+        } catch {
+          // Malformed/partial frame — skip it rather than kill the stream.
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Derived helpers
 // ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ import {
 import {
   triggerExtract,
   chatCompletion,
+  chatCompletionStream,
   embed,
   rerank,
   embeddingDeploymentNames,
@@ -481,9 +482,17 @@ function ChatPanel({
     retryCount: number,
   ) {
     try {
-      const res = await chatCompletion(model, payload);
-      const content = res.choices?.[0]?.message?.content ?? "(empty response)";
-      setMsgs([...next, { role: "assistant", content }]);
+      let content = "";
+      const appendToken = (token: string) => {
+        content += token;
+        setMsgs((prev) =>
+          prev.length <= next.length
+            ? [...next, { role: "assistant", content }]
+            : prev.map((m, i) => (i === next.length ? { role: "assistant", content } : m)),
+        );
+      };
+      await chatCompletionStream(model, payload, appendToken);
+      if (!content) setMsgs([...next, { role: "assistant", content: "(empty response)" }]);
     } catch (e) {
       if (e instanceof ModelLoading) {
         const willRetry = retryCount < MAX_LOAD_RETRIES;
