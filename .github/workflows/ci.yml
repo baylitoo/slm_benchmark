@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+defaults:
+  run:
+    working-directory: small-doc-ie-bench
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test
+        run: python -m pytest -q
+
+      # ruff/mypy have pre-existing repo-wide findings (127 ruff errors, a mypy
+      # bootstrap error) that predate this workflow — reported but non-blocking
+      # until that debt is paid down in a dedicated pass. New code should still
+      # be run through `ruff check` locally before opening a PR.
+      - name: Lint (informational)
+        if: always()
+        run: ruff check . || true
+
+      - name: Type check (informational)
+        if: always()
+        run: mypy src || true
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: small-doc-ie-bench/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: small-doc-ie-bench/frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
