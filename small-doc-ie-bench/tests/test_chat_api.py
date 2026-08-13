@@ -284,9 +284,17 @@ def test_chat_store_model_worker_loopback_endpoint_is_rejected(monkeypatch) -> N
 
 
 def test_chat_deployment_selector_with_loopback_endpoint_is_not_guarded(monkeypatch) -> None:
-    """The guard is scoped to store: refs (api.py's does the same) -- a bare
-    deployment name resolving to a loopback endpoint is a different, already
-    load-on-demand-covered surface and must not be swept in here too."""
+    """The guard is scoped to store: refs only, mirroring api.py's guard
+    exactly. This is a KNOWN, pre-existing gap, not a covered case: a bare
+    deployment name can ALSO carry a loopback endpoint (control_plane.py's
+    _guard_deterministic_advertise fail-opens on loopback for both serve()
+    and serve_store_model() alike), and load-on-demand only helps a COLD
+    model -- a warm-but-loopback deployment hits the same doomed-connect
+    failure this guard exists to prevent, unguarded. Widening the check
+    naively would risk false-positive 501s on a legitimate same-host local
+    `docie up` deployment (control_plane.py treats that as reachable on
+    purpose), so this needs its own deliberate fix, not a blind broaden --
+    tracked as a follow-up, not silently claimed as covered."""
     loopback_profile = ModelProfile(
         name="local-dep", model="local-dep", base_url="http://127.0.0.1:8088/v1", api_key="k"
     )
