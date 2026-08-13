@@ -133,6 +133,64 @@ def test_arithmetic_warning_alone_queues_and_survives_the_round_trip() -> None:
     assert get_review(task.id).validation_warnings == payload.validation_warnings
 
 
+def test_suggested_correction_offers_the_computed_total_on_mismatch() -> None:
+    payload = _payload("suggest-total")
+    payload.validation_valid = False
+    payload.validation_errors = ["placeholder so this reaches the queue"]
+    payload.original_prediction = {
+        "subtotal": {"amount": "100.00", "currency": "EUR"},
+        "vat_amount": {"amount": "20.00", "currency": "EUR"},
+        "total_ttc": {"amount": "115.00", "currency": "EUR"},
+    }
+    task = enqueue_review(payload)
+    assert task is not None
+
+    (suggestion,) = get_review(task.id).suggested_corrections
+    assert suggestion.field_path == "total_ttc.amount"
+    assert suggestion.value == "120.00"
+    assert "100.00" in (suggestion.comment or "")
+    assert "20.00" in (suggestion.comment or "")
+
+
+def test_no_suggestion_when_arithmetic_already_reconciles() -> None:
+    payload = _payload("suggest-clean")
+    payload.validation_valid = False
+    payload.validation_errors = ["placeholder so this reaches the queue"]
+    payload.original_prediction = {
+        "subtotal": {"amount": "100.00", "currency": "EUR"},
+        "vat_amount": {"amount": "20.00", "currency": "EUR"},
+        "total_ttc": {"amount": "120.00", "currency": "EUR"},
+    }
+    task = enqueue_review(payload)
+    assert task is not None
+    assert get_review(task.id).suggested_corrections == []
+
+
+def test_suggestion_disappears_once_the_task_is_decided() -> None:
+    # Moot once the queue item is closed -- nothing left to apply it to, and a
+    # stale suggestion on a decided task would just be confusing.
+    payload = _payload("suggest-decided")
+    payload.validation_valid = False
+    payload.validation_errors = ["placeholder so this reaches the queue"]
+    payload.original_prediction = {
+        "subtotal": {"amount": "100.00", "currency": "EUR"},
+        "vat_amount": {"amount": "20.00", "currency": "EUR"},
+        "total_ttc": {"amount": "115.00", "currency": "EUR"},
+    }
+    task = enqueue_review(payload)
+    assert task is not None
+    assert get_review(task.id).suggested_corrections != []
+
+    claimed = _claim(task.id, task.version)
+    decided = decide_review(
+        task.id,
+        reviewer_id="alice",
+        expected_version=claimed.version,
+        decision=ReviewStatus.APPROVED,
+    )
+    assert decided.suggested_corrections == []
+
+
 def test_full_correction_approval_lifecycle_is_immutable_and_conflict_safe() -> None:
     task = enqueue_review(_payload())
     assert task is not None

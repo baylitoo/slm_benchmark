@@ -136,6 +136,11 @@ class ReviewTaskView(BaseModel):
     decision_comment: str | None
     corrections: list[ReviewCorrectionView] = Field(default_factory=list)
     events: list[ReviewEventView] = Field(default_factory=list)
+    # Computed fresh from latest_prediction on every fetch, never persisted --
+    # a reviewer accepts one via the existing POST .../correct (field_path +
+    # value already line up with a FieldCorrection), nothing is ever applied
+    # automatically. See _suggest_arithmetic_corrections.
+    suggested_corrections: list[FieldCorrection] = Field(default_factory=list)
 
 
 class ReviewMetricsView(BaseModel):

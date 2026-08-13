@@ -4,6 +4,7 @@ import copy
 import datetime as dt
 import json
 from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -244,6 +245,49 @@ def _assert_claim_owner(task: ReviewTask, reviewer_id: str) -> None:
         raise ReviewConflictError(f"Review task {task.id} is not claimed by {reviewer_id!r}")
 
 
+def _money_value(node: Any) -> Decimal | None:
+    if not isinstance(node, dict) or node.get("amount") is None:
+        return None
+    try:
+        return Decimal(str(node["amount"]))
+    except InvalidOperation:
+        return None
+
+
+def _suggest_arithmetic_corrections(prediction: dict[str, Any]) -> list[FieldCorrection]:
+    """One conservative, well-defined suggestion: when subtotal + vat_amount
+    disagrees with total_ttc, trust the two addends over the total.
+
+    This is the documented NuExtract3 failure mode -- amounts are read off the
+    page correctly, the model's own addition is wrong -- so recomputing the
+    total from its two inputs is a much safer bet than the reverse (deriving
+    subtotal or vat FROM a total that may itself be a misread, not a bad
+    computation). Deliberately narrow: no line-item suggestions, no touching
+    subtotal/vat_amount, no chained edits. Computed fresh from
+    latest_prediction on every fetch, never persisted or applied automatically
+    -- a reviewer accepts it via the existing POST .../correct, where
+    field_path/value already line up with a FieldCorrection.
+    """
+    subtotal = _money_value(prediction.get("subtotal"))
+    vat = _money_value(prediction.get("vat_amount"))
+    total = _money_value(prediction.get("total_ttc"))
+    if subtotal is None or vat is None or total is None:
+        return []
+    computed = subtotal + vat
+    if abs(computed - total) <= Decimal("0.05"):
+        return []
+    return [
+        FieldCorrection(
+            field_path="total_ttc.amount",
+            value=str(computed),
+            comment=(
+                f"Suggested: subtotal ({subtotal}) + vat_amount ({vat}) = {computed}, "
+                f"vs the extracted total_ttc ({total})"
+            ),
+        )
+    ]
+
+
 def _task_view(task: ReviewTask, *, include_history: bool = True) -> ReviewTaskView:
     return ReviewTaskView(
         id=task.id,
@@ -300,6 +344,12 @@ def _task_view(task: ReviewTask, *, include_history: bool = True) -> ReviewTaskV
         ]
         if include_history
         else [],
+        suggested_corrections=(
+            _suggest_arithmetic_corrections(task.latest_prediction_json)
+            if task.schema_name == "invoice"
+            and task.status in (ReviewStatus.PENDING, ReviewStatus.CLAIMED)
+            else []
+        ),
     )
 
 
