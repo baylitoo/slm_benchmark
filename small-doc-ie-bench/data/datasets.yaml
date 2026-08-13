@@ -46,3 +46,34 @@ datasets:
             vat_amount.amount: 7
             vendor_name: 7
           labeled_documents: 9
+  voxel51_invoices:
+    description: Voxel51 high-quality-invoice-images sample (10 docs); vendor/customer/dates/totals
+      from Voxel51 annotation, currency/iban/vat_rate vision-completed
+    latest: 1.0.0
+    versions:
+      1.0.0:
+        manifest: voxel51_invoices/manifest.jsonl
+        dataset_hash: sha256:0e5583cc042cabb26ccf97464f436a28694545d2813ed9c9669e2605847f2fa1
+        created_at: '2026-08-12T23:05:00.443985+00:00'
+        statistics:
+          documents: 10
+          total_bytes: 2102346
+          schemas:
+            invoice: 10
+          languages:
+            en: 10
+          splits:
+            unspecified: 10
+          ground_truth_fields:
+            currency: 10
+            customer_name: 10
+            iban: 10
+            invoice_number: 10
+            issue_date.value: 10
+            line_items: 10
+            subtotal.amount: 10
+            total_ttc.amount: 10
+            vat_amount.amount: 10
+            vat_rate.value: 10
+            vendor_name: 10
+          labeled_documents: 10
