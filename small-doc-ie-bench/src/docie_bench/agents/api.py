@@ -162,7 +162,7 @@ async def create_agent(payload: CreateAgentRequest) -> dict[str, Any]:
     try:
         spec = AgentSpec(
             name=payload.name,
-            kind=kind,  # type: ignore[arg-type] — pydantic re-validates the literal
+            kind=kind,  # type: ignore[arg-type]  # pydantic re-validates the literal
             display_name=payload.display_name
             or (template["display_name"] if template else payload.name),
             description=payload.description or (template["description"] if template else ""),

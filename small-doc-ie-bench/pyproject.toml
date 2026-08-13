@@ -83,7 +83,13 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.mypy]
-python_version = "3.11"
+# NOT the minimum supported runtime (requires-python stays >=3.11, and CI runs
+# 3.11) — numpy>=2.x ships stubs using PEP 695 `type` statements, which mypy
+# only parses when the check target is >=3.12. This only widens what mypy
+# permits during static analysis; it has no effect on what the code actually
+# runs on. At 3.11 mypy aborts after 2 files with a stub syntax error instead
+# of checking the codebase at all.
+python_version = "3.12"
 strict = true
 warn_unused_configs = true
 ignore_missing_imports = true
