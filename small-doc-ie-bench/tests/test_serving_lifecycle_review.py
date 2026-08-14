@@ -248,7 +248,7 @@ def test_benchmark_runner_stamps_recency(
     )
 
     class FakeExtractionService:
-        def __init__(self, profile: Any) -> None:
+        def __init__(self, profile: Any, profiles: Any = None) -> None:
             self.profile = profile
 
         async def extract_from_file(self, **kwargs: Any) -> Any:

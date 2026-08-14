@@ -50,7 +50,7 @@ def _install_runner_fakes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> li
     calls: list[str] = []
 
     class FakeExtractionService:
-        def __init__(self, profile: Any) -> None:
+        def __init__(self, profile: Any, profiles: Any = None) -> None:
             self.profile = profile
 
         async def extract_from_file(self, **kwargs: Any) -> Any:
@@ -272,7 +272,7 @@ def test_failed_task_records_reason_and_is_not_retried_on_resume(
     calls: list[str] = []
 
     class FailingExtractionService:
-        def __init__(self, profile: Any) -> None:
+        def __init__(self, profile: Any, profiles: Any = None) -> None:
             pass
 
         async def extract_from_file(self, **kwargs: Any) -> Any:

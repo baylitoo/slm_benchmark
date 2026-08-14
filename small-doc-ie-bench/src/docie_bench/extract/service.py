@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -216,9 +217,19 @@ def hash_file(path: Path) -> str:
 
 
 class ExtractionService:
-    def __init__(self, profile: ModelProfile, proposer_profile: ModelProfile | None = None) -> None:
+    def __init__(
+        self,
+        profile: ModelProfile,
+        proposer_profile: ModelProfile | None = None,
+        profiles: Mapping[str, ModelProfile] | None = None,
+    ) -> None:
         self.profile = profile
         self.proposer_profile = proposer_profile
+        # Needed only for kind="pipeline" profiles, to resolve options.extractor
+        # (and, later, options.ocr_model) by name -- the benchmark runner
+        # already loads the full profile map for routing, so this just
+        # threads it through instead of loading it again.
+        self.profiles = profiles or {}
 
     async def extract_from_text(
         self,
@@ -271,6 +282,15 @@ class ExtractionService:
         language: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> ExtractionResponse:
+        if getattr(self.profile, "kind", "passthrough") == "pipeline":
+            return await self._extract_pipeline(
+                path=path,
+                schema_name=schema_name,
+                schema_mode=schema_mode,
+                dynamic_schema=dynamic_schema,
+                language=language,
+                metadata=metadata or {},
+            )
         if self.profile.vision:
             t0 = time.perf_counter()
             images = load_document_images(
@@ -332,6 +352,95 @@ class ExtractionService:
             document_hash=ocr_result.artifact.document_hash,
             metadata=metadata or {},
         )
+
+    async def _extract_pipeline(
+        self,
+        *,
+        path: Path,
+        schema_name: str,
+        schema_mode: str,
+        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
+        language: str | None,
+        metadata: dict[str, str],
+    ) -> ExtractionResponse:
+        """kind="pipeline": OCR the document, then extract with the configured
+        `options.extractor` profile -- the benchmark-side counterpart to
+        `serving.solutions.PipelineSolution`, which does the same OCR step for
+        the gateway but returns a raw completion (fine for the Studio Agents
+        chat surface, not enough to score: no schema validation, grounding, or
+        nuextract normalization).
+
+        Delegating to a fresh ExtractionService(extractor_profile) for the
+        actual extraction reuses ALL of that machinery unchanged -- the only
+        difference from a normal text profile is that the input came from OCR
+        instead of the caller. `options.ocr_model` (VLM-as-OCR, mirroring the
+        gateway's own second pipeline mode) is not wired here yet -- only the
+        `options.ocr_backend` (tesseract/paddleocr/pdf_text) path, which is
+        the more common case and the one every existing pipeline profile in
+        this project actually uses.
+        """
+        options = self.profile.options
+        extractor_name = options.get("extractor")
+        if not extractor_name:
+            raise ValueError(
+                f"pipeline profile {self.profile.name!r} requires options.extractor "
+                "(the name of a passthrough LLM profile)"
+            )
+        extractor = self.profiles.get(str(extractor_name))
+        if extractor is None:
+            raise ValueError(
+                f"pipeline extractor profile {extractor_name!r} is not configured "
+                f"(known profiles: {sorted(self.profiles)})"
+            )
+        if extractor.kind != "passthrough":
+            raise ValueError(
+                f"pipeline extractor {extractor_name!r} must be a passthrough LLM "
+                f"profile, got kind={extractor.kind!r}"
+            )
+        if options.get("ocr_model"):
+            raise ValueError(
+                f"pipeline profile {self.profile.name!r} sets options.ocr_model "
+                "(VLM-as-OCR), which the benchmark doesn't wire yet -- only "
+                "options.ocr_backend is supported here"
+            )
+
+        backend_name = str(options.get("ocr_backend", "tesseract"))
+        ocr_language = options.get("language") or language
+        t0 = time.perf_counter()
+        ocr_result = processor_from_settings(get_settings()).process(
+            path,
+            backend_name=backend_name,
+            language=ocr_language,
+        )
+        blocks = ocr_result.artifact.blocks
+        logger.debug(
+            "ocr_complete",
+            extra={
+                "docie_step": "ocr",
+                "docie_backend": backend_name,
+                "docie_path": str(path),
+                "docie_block_count": len(blocks),
+                "docie_ocr_latency_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
+
+        extractor_service = ExtractionService(
+            extractor, proposer_profile=self.proposer_profile, profiles=self.profiles
+        )
+        response = await extractor_service.extract_from_text(
+            text=None,
+            ocr_blocks=blocks,
+            schema_name=schema_name,
+            schema_mode=schema_mode,
+            dynamic_schema=dynamic_schema,
+            language=language,
+            document_hash=ocr_result.artifact.document_hash,
+            metadata=metadata,
+        )
+        # Report as the pipeline profile the caller asked to benchmark, not
+        # the inner extractor -- matches what predictions.jsonl/metrics key
+        # on elsewhere in the runner (task.profile.name).
+        return response.model_copy(update={"model_profile": self.profile.name})
 
     async def _extract_blocks(
         self,

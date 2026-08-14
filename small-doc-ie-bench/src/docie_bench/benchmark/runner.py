@@ -401,10 +401,22 @@ async def run_benchmark(
             item = task.item
             routing_active = routing_policy is not None
             label = routing_label if routing_active else profile.name
+            # getattr, not direct access: several tests stand a bare
+            # SimpleNamespace(name=..., vision=...) in for task.profile
+            # (only the fields the old code read) -- kind/options default
+            # the same way a real ModelProfile does (passthrough / {}).
+            profile_kind = getattr(profile, "kind", "passthrough")
+            profile_options = getattr(profile, "options", {})
             ingestion_path = (
                 "routed"
                 if routing_active
-                else ("vision" if profile.vision else f"ocr:{settings.default_ocr_backend}")
+                else (
+                    f"pipeline:{profile_options.get('ocr_backend', 'tesseract')}"
+                    if profile_kind == "pipeline"
+                    else "vision"
+                    if profile.vision
+                    else f"ocr:{settings.default_ocr_backend}"
+                )
             )
             extract_kwargs: dict[str, Any] = {
                 "path": Path(item.file_path),
@@ -428,7 +440,10 @@ async def run_benchmark(
                             f"{routed.audit.terminal_reason}"
                         )
                 else:
-                    service = ExtractionService(profile)
+                    # profiles: so a kind="pipeline" task can resolve
+                    # options.extractor by name (see ExtractionService.
+                    # _extract_pipeline) -- same map routing already uses.
+                    service = ExtractionService(profile, profiles=profiles)
                     response = await service.extract_from_file(**extract_kwargs)
                 # PR-4 recency (review fix): a benchmark drives sustained load
                 # through a deployment — that IS served traffic, so stamp the
