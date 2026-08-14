@@ -35,10 +35,10 @@ from docie_bench.schemas.extraction import schema_json
 from docie_bench.security import redact_fields
 
 # Shared verbatim with the gateway's own VLM-as-OCR step (serving.solutions.
-# PipelineSolution._vlm_ocr) -- same prompt, same model, same task, whether
-# the pipeline is exercised via Studio or the benchmark CLI; duplicating the
-# string would risk the two silently drifting apart.
-from docie_bench.serving.solutions import _VLM_OCR_PROMPT
+# PipelineSolution._vlm_ocr) -- same prompt, same timeout floor, same model,
+# same task, whether the pipeline is exercised via Studio or the benchmark
+# CLI; duplicating either would risk the two silently drifting apart.
+from docie_bench.serving.solutions import _PIPELINE_UPSTREAM_TIMEOUT_S, _VLM_OCR_PROMPT
 from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
 
@@ -513,7 +513,13 @@ class ExtractionService:
                         "Authorization": f"Bearer {vision.api_key}",
                         "Content-Type": "application/json",
                     },
-                    timeout=vision.timeout_seconds,
+                    # Floored, not raw vision.timeout_seconds: a CPU-bound
+                    # multi-page transcription at single-digit tok/s
+                    # routinely outlasts a model's default 180s chat
+                    # timeout mid-response -- the exact scenario this
+                    # benchmark exists to measure. Matches the gateway's
+                    # own floor on this same call (PipelineSolution._vlm_ocr).
+                    timeout=max(vision.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
                 )
             except httpx.RequestError as exc:
                 raise ValueError(

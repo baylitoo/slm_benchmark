@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from docie_bench.extract.service import ExtractionService
@@ -288,4 +289,68 @@ async def test_pipeline_vlm_ocr_requires_passthrough_vision_profile() -> None:
     with pytest.raises(ValueError, match="vision deployment"):
         await service.extract_from_file(
             path=Path("doc.png"), ocr_backend_name="tesseract", schema_name="invoice"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_vlm_ocr_surfaces_upstream_http_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    document = tmp_path / "invoice.png"
+    document.write_bytes(b"not a real png, never read")
+    http_client = FakeHttpClient(FakeHttpResponse("model not found", status_code=404))
+
+    monkeypatch.setattr(
+        "docie_bench.extract.service.load_document_images",
+        lambda path, **kw: [DocumentImage(page=1, media_type="image/png", data=b"png")],
+    )
+    monkeypatch.setattr(
+        "docie_bench.extract.service.httpx.AsyncClient", lambda: http_client
+    )
+
+    profiles = {
+        "extractor-profile": _extractor_profile(),
+        "vision-profile": _vision_profile(),
+    }
+    service = ExtractionService(
+        _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
+    )
+
+    with pytest.raises(ValueError, match="404"):
+        await service.extract_from_file(
+            path=document, ocr_backend_name="tesseract", schema_name="invoice"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_vlm_ocr_surfaces_upstream_unreachable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    document = tmp_path / "invoice.png"
+    document.write_bytes(b"not a real png, never read")
+
+    class UnreachableHttpClient(FakeHttpClient):
+        async def post(self, url: str, **kwargs: object) -> FakeHttpResponse:
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(
+        "docie_bench.extract.service.load_document_images",
+        lambda path, **kw: [DocumentImage(page=1, media_type="image/png", data=b"png")],
+    )
+    monkeypatch.setattr(
+        "docie_bench.extract.service.httpx.AsyncClient",
+        lambda: UnreachableHttpClient(FakeHttpResponse({})),
+    )
+
+    profiles = {
+        "extractor-profile": _extractor_profile(),
+        "vision-profile": _vision_profile(),
+    }
+    service = ExtractionService(
+        _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
+    )
+
+    with pytest.raises(ValueError, match="unreachable"):
+        await service.extract_from_file(
+            path=document, ocr_backend_name="tesseract", schema_name="invoice"
         )
