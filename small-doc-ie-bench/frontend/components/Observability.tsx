@@ -31,14 +31,19 @@ const ACTIVITY_POLL_MS = 15000;
 /**
  * Observability = external tooling: quick-link tiles (Grafana / Inngest /
  * Prometheus) plus the docie Grafana dashboard embedded in an iframe, plus a
- * live review-queue tile. The human review workflow (POST /v1/reviews,
- * claim/correct/approve/reject) is API-only — no Studio tab for it yet — so
- * this is the only place an operator sees the backlog exists at all without
- * curling the API directly. One view — a prior "links" sub-view was dropped:
- * it rendered the same tiles already shown here, a strict subset with
- * nothing the combined page lacks.
+ * live review-queue summary tile (the actual claim/correct/approve/reject
+ * workflow now lives in its own Review tab — this tile is a health signal +
+ * deep-link, not the only way to reach it). One view — a prior "links"
+ * sub-view was dropped: it rendered the same tiles already shown here, a
+ * strict subset with nothing the combined page lacks.
  */
-export function Observability({ active = true }: { active?: boolean }) {
+export function Observability({
+  active = true,
+  onNavigate,
+}: {
+  active?: boolean;
+  onNavigate?: (id: "review") => void;
+}) {
   return (
     <div>
       <PageHeader
@@ -78,7 +83,7 @@ export function Observability({ active = true }: { active?: boolean }) {
           />
         </div>
         <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
-          <ReviewQueueCard active={active} />
+          <ReviewQueueCard active={active} onNavigate={onNavigate} />
           <OcrCacheCard active={active} />
           <ActivityCard active={active} />
         </div>
@@ -117,7 +122,13 @@ export function Observability({ active = true }: { active?: boolean }) {
   );
 }
 
-function ReviewQueueCard({ active }: { active: boolean }) {
+function ReviewQueueCard({
+  active,
+  onNavigate,
+}: {
+  active: boolean;
+  onNavigate?: (id: "review") => void;
+}) {
   const metrics = usePolling<ReviewMetricsView>(getReviewMetrics, REVIEW_POLL_MS, active);
   const notEnabled = metrics.error instanceof ApiError && metrics.error.status === 422;
 
@@ -126,6 +137,17 @@ function ReviewQueueCard({ active }: { active: boolean }) {
       icon={<ClipboardCheck className="h-5 w-5" />}
       title="Review queue"
       subtitle="Extractions admitted for human review — low confidence, weak evidence, arithmetic mismatches, or model disagreement."
+      actions={
+        onNavigate && (
+          <button
+            type="button"
+            onClick={() => onNavigate("review")}
+            className="text-xs font-medium text-accent hover:underline"
+          >
+            Open queue →
+          </button>
+        )
+      }
     >
       {notEnabled ? (
         <p className="text-sm text-muted-foreground">
@@ -162,11 +184,6 @@ function ReviewQueueCard({ active }: { active: boolean }) {
                 : "n/a — needs 2+ reviewers on the same task"}
             </span>
           </div>
-          <p className="text-xs text-muted-foreground">
-            No Studio tab for claim/correct/decide yet — use{" "}
-            <code className="rounded bg-muted px-1 py-0.5">POST /v1/reviews/&#123;id&#125;/claim</code>{" "}
-            and friends directly.
-          </p>
         </div>
       )}
     </Card>

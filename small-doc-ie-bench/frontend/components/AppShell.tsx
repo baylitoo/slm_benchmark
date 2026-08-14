@@ -7,6 +7,7 @@ import { Playground } from "./Playground";
 import { Deploy } from "./Deploy";
 import { Agents } from "./Agents";
 import { Benchmark } from "./Benchmark";
+import { Review } from "./Review";
 import { Observability } from "./Observability";
 import { Sidebar } from "./shell/Sidebar";
 import { TopBar } from "./shell/TopBar";
@@ -82,7 +83,7 @@ export function AppShell() {
 
         <main className="flex-1 overflow-y-auto bg-background">
           <div className="px-6 py-5">
-            {/* All FIVE sections stay mounted; only the active one is shown so a
+            {/* All SIX sections stay mounted; only the active one is shown so a
                 running extraction / deploy / benchmark survives nav changes.
                 Iterates the de-duped SECTIONS list — never the grouped nav —
                 so each section (and its pollers) mounts exactly once. The
@@ -103,8 +104,9 @@ export function AppShell() {
                     <Agents view={viewFor(id)} onNavigate={onNavigate} />
                   )}
                   {id === "benchmark" && <Benchmark view={viewFor(id)} />}
+                  {id === "review" && <Review active={active === "review"} />}
                   {id === "observability" && (
-                    <Observability active={active === "observability"} />
+                    <Observability active={active === "observability"} onNavigate={onNavigate} />
                   )}
                 </SectionActivityProvider>
               </div>
