@@ -282,6 +282,14 @@ class ExtractionService:
         language: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> ExtractionResponse:
+        # kind="ocr" (no extractor -- just OCR text as the "completion", per
+        # serving.solutions.OcrSolution) is NOT handled here: it falls through
+        # to the branches below and hits the same bug this method fixes for
+        # "pipeline" -- OCRs with the wrong backend, then tries calling the
+        # OCR profile's placeholder base_url as if it were a real LLM. Left
+        # alone deliberately: a pure-OCR profile has no schema-shaped output,
+        # so there's nothing for the benchmark to score it against in the
+        # first place. Flagging here so this isn't silently rediscovered.
         if getattr(self.profile, "kind", "passthrough") == "pipeline":
             return await self._extract_pipeline(
                 path=path,
