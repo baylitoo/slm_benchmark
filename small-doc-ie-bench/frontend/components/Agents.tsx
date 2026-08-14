@@ -327,8 +327,12 @@ function InstancesView({
       key: "kind",
       header: "Kind",
       sortAccessor: (a) => a.kind,
+      // Kind is a category, not a status -- warn here previously read as
+      // "something's wrong with OCR agents." ok/info/neutral are all just
+      // distinct category colors, same non-status use as the Deployments
+      // table's Type column.
       render: (a) => (
-        <Badge tone={a.kind === "proxy_security" ? "info" : a.kind === "ocr" ? "warn" : "neutral"}>
+        <Badge tone={a.kind === "proxy_security" ? "info" : a.kind === "ocr" ? "ok" : "neutral"}>
           {KIND_META[a.kind]?.label ?? a.kind}
         </Badge>
       ),

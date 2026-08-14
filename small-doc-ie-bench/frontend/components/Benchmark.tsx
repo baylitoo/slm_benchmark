@@ -248,8 +248,13 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
       key: "metrics",
       header: "Metrics",
       render: (r) => {
+        // "metrics.json exists" is a metadata-availability flag, not a
+        // pass/fail signal -- the real run outcome is the Status column
+        // right before this one (ok/err/neutral for completed/failed/
+        // other). tone="ok" here would read as "this run succeeded",
+        // which isn't what it means.
         const has = Boolean(r.metrics?.summary?.length);
-        return <Badge tone={has ? "ok" : "neutral"}>{has ? "metrics" : "—"}</Badge>;
+        return <Badge tone={has ? "info" : "neutral"}>{has ? "metrics" : "—"}</Badge>;
       },
     },
     {

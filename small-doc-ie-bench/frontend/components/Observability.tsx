@@ -177,7 +177,10 @@ function ReviewQueueCard({
             </Badge>
             <Badge tone="info">{metrics.data?.queue_depth.claimed ?? 0} claimed</Badge>
             <Badge tone="ok">{metrics.data?.queue_depth.approved ?? 0} approved</Badge>
-            <Badge tone="neutral">{metrics.data?.queue_depth.rejected ?? 0} rejected</Badge>
+            {/* err, not neutral -- matches Review.tsx's own STATUS_TONE for
+                the same status, so the two surfaces read consistently
+                instead of one treating "rejected" as a non-event. */}
+            <Badge tone="err">{metrics.data?.queue_depth.rejected ?? 0} rejected</Badge>
           </div>
           <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
             <span>
