@@ -21,7 +21,7 @@ import {
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
-import { Alert, Badge, Button, Field, Select, TextInput } from "./ui";
+import { Alert, Badge, Button, Checkbox, Field, Segmented, Select, TextInput } from "./ui";
 import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
 import { Toolbar } from "./patterns/Toolbar";
@@ -419,27 +419,11 @@ export function Catalog({
 
       {/* Sort tabs + search */}
       <div className="flex flex-wrap items-center gap-2">
-        <div className="inline-flex rounded-md border border-border bg-card p-0.5 text-xs">
-          {SORTS.map((s) => {
-            const Icon = s.icon;
-            return (
-              <button
-                key={s.id}
-                type="button"
-                onClick={() => setSort(s.id)}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded px-2.5 py-1 transition",
-                  sort === s.id
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                <Icon className="h-3.5 w-3.5" />
-                {s.label}
-              </button>
-            );
-          })}
-        </div>
+        <Segmented
+          value={sort}
+          onChange={setSort}
+          options={SORTS.map((s) => ({ value: s.id, label: s.label, icon: s.icon }))}
+        />
         <div className="ml-auto w-full sm:w-72">
           <TextInput
             value={query}
@@ -486,15 +470,12 @@ export function Catalog({
           className="h-8 w-44 text-xs"
           aria-label="Author"
         />
-        <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground">
-          <input
-            type="checkbox"
-            checked={ggufOnly}
-            onChange={(e) => setGgufOnly(e.target.checked)}
-            className="h-3.5 w-3.5"
-          />
-          GGUF only
-        </label>
+        <Checkbox
+          checked={ggufOnly}
+          onChange={(e) => setGgufOnly(e.target.checked)}
+          label="GGUF only"
+          className="rounded-md border border-border bg-card px-2.5 py-1.5 text-muted-foreground"
+        />
       </Toolbar>
 
       <ResultLine
