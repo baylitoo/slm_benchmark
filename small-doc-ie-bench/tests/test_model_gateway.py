@@ -254,6 +254,49 @@ async def test_circuit_breaker_rejects_then_allows_recovery_probe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_circuit_breaker_recovers_after_permanent_error_during_probe() -> None:
+    """A non-transient (PERMANENT/CAPABILITY) error during the half-open
+    recovery probe must not wedge the circuit open forever. _record_failure
+    only counts TRANSIENT/RATE_LIMITED/INVALID_RESPONSE toward re-opening the
+    breaker -- correct, those are the endpoint-health signals -- but it must
+    still release the half_open_in_flight token on ANY outcome, success or
+    failure of any classification, or the next call permanently finds a
+    "probe already running" CircuitOpenError with no way to ever clear it
+    (nothing else resets the flag except a successful call, which can never
+    happen if every call is rejected first)."""
+    now = 0.0
+    status = 503  # trips the breaker (transient), then probes with 400 (permanent)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if status == 200:
+            return _completion('{"ok": true}')
+        return httpx.Response(status, text="failing")
+
+    client = await _client(
+        _profile(circuit_breaker_failure_threshold=1, circuit_breaker_reset_seconds=10),
+        handler,
+    )
+    client._gateway._monotonic = lambda: now
+    try:
+        with pytest.raises(ModelGatewayError, match="503"):
+            await _chat(client)  # trips the breaker (transient failure)
+
+        now = 11  # cooldown elapsed -- this call becomes the half-open probe
+        status = 400  # the probe itself fails with a PERMANENT error
+        with pytest.raises(ModelGatewayError, match="400"):
+            await _chat(client)
+
+        # The bug: half_open_in_flight stayed True, so every call from here
+        # on raises CircuitOpenError ("recovery probe is already running")
+        # forever, even though the clock has moved on and nothing is
+        # actually running. A healthy model is now permanently unreachable.
+        status = 200
+        assert await _chat(client) == {"ok": True}
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_shared_per_model_concurrency_and_queue_limit() -> None:
     active = 0
     max_active = 0
