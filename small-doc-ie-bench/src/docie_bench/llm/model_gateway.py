@@ -401,13 +401,21 @@ class ModelGateway:
         self._state.half_open_in_flight = True
 
     def _record_failure(self, error: ModelGatewayError) -> None:
+        # Unconditional: a half-open recovery probe releases its token on ANY
+        # outcome, success or failure of any classification. Gating this
+        # behind the classification check below (as this line used to be)
+        # means a PERMANENT/CAPABILITY error during a probe leaves
+        # half_open_in_flight stuck True forever -- nothing else clears it
+        # except a successful call, which can never happen once every call
+        # is rejected with "probe already running" first. Permanently wedges
+        # an otherwise-healthy model until process restart.
+        self._state.half_open_in_flight = False
         if error.classification not in {
             ErrorClassification.TRANSIENT,
             ErrorClassification.RATE_LIMITED,
             ErrorClassification.INVALID_RESPONSE,
         }:
             return
-        self._state.half_open_in_flight = False
         self._state.failures += 1
         if self._state.failures >= self.profile.circuit_breaker_failure_threshold:
             self._state.circuit_opened_at = self._monotonic()
