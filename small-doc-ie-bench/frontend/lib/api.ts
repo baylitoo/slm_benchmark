@@ -361,6 +361,57 @@ export interface BenchmarkRun {
   [k: string]: unknown;
 }
 
+// One (dimension, group, metric) delta row from POST /v1/studio/comparisons.
+// "aggregate" dimension rows (group: {}) are the whole-run summary; the other
+// dimensions (model_profile/schema_name/language/document/field) are the same
+// shape sliced narrower -- the UI only renders "aggregate" for now (see
+// build_comparison_payload's own docstring on why root_causes, not a
+// dimension drill-down, is the mechanism for "what got worse").
+export interface ComparisonRow {
+  dimension: string;
+  group: Record<string, string>;
+  metric: string;
+  direction: "higher" | "lower";
+  baseline: number;
+  candidate: number;
+  delta: number;
+  signed_improvement: number;
+  paired_samples: number;
+  baseline_only: number;
+  candidate_only: number;
+  confidence_interval_95: [number, number];
+  sign_test_p_value: number | null;
+  warnings: string[];
+}
+
+export interface ComparisonBudgetCheck {
+  status: "pass" | "fail" | "error";
+  metric?: string;
+  dimension?: string;
+  reason?: string;
+  [k: string]: unknown;
+}
+
+interface ComparisonRunMeta {
+  event_id?: string;
+  dataset?: string | null;
+  model_profile?: string | null;
+  created_at?: string | null;
+}
+
+/** POST /v1/studio/comparisons response — the CLI's compare_runs payload, live. */
+export interface ComparisonPayload {
+  contract_version: number;
+  generated_at: string;
+  baseline: ComparisonRunMeta;
+  candidate: ComparisonRunMeta;
+  verdict: "pass" | "fail" | "error";
+  comparisons: ComparisonRow[];
+  budget_checks: ComparisonBudgetCheck[];
+  compatibility_errors: string[];
+  root_causes: { documents?: ComparisonRow[]; fields?: ComparisonRow[] };
+}
+
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
@@ -489,6 +540,20 @@ export async function getRuns(eventId: string): Promise<InngestRun[]> {
     return (raw as { data: InngestRun[] }).data;
   }
   return [];
+}
+
+/** Compare two completed runs (deltas, CI, sign test, root causes, budget verdicts). */
+export function compareRuns(
+  baselineEventId: string,
+  candidateEventId: string,
+): Promise<ComparisonPayload> {
+  return request<ComparisonPayload>("/v1/studio/comparisons", {
+    method: "POST",
+    body: JSON.stringify({
+      baseline_event_id: baselineEventId,
+      candidate_event_id: candidateEventId,
+    }),
+  });
 }
 
 // ---------------------------------------------------------------------------

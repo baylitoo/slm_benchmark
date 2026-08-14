@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { Gauge, Play, Download } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Gauge, Play, Download, GitCompare } from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
@@ -10,6 +10,7 @@ import {
   selectableDeployments,
   listSchemas,
   artifactUrl,
+  compareRuns,
   ApiError,
   ApiUnavailable,
   type BenchmarkRun,
@@ -17,11 +18,14 @@ import {
   type TriggerResponse,
   type DatasetSummary,
   type DeploymentRecord,
+  type ComparisonPayload,
+  type ComparisonRow,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
+import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
-import { Alert, Badge, Button, Card, Field, Select, TextInput } from "./ui";
+import { Alert, Badge, Button, Card, Field, Select, Sheet, TextInput } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
@@ -229,6 +233,7 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [compareOpen, setCompareOpen] = useState(false);
 
   const all = runs.data ?? [];
   const total = all.length;
@@ -314,7 +319,15 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
       <PageHeader
         title="Runs"
         subtitle="GET /v1/studio/runs — durable, addressable benchmark runs."
+        actions={
+          <Button type="button" variant="secondary" onClick={() => setCompareOpen(true)}>
+            <GitCompare className="h-4 w-4" />
+            Compare runs
+          </Button>
+        }
       />
+
+      <ComparisonSheet open={compareOpen} onClose={() => setCompareOpen(false)} runs={all} />
 
       <Toolbar
         onReset={() => {
@@ -374,6 +387,251 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
           );
         }}
       />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Comparison — POST /v1/studio/comparisons. Deliberately the smallest useful
+// slice: aggregate metric deltas + budget verdict + root-cause lists. No
+// per-dimension drill-down, Pareto chart, or promote-as-baseline UI here --
+// the backend (PR #184) doesn't persist a baseline concept yet, and the
+// aggregate table + root_causes already answer "did this get better or
+// worse, and what specifically regressed" without it.
+// ---------------------------------------------------------------------------
+
+function ComparisonSheet({
+  open,
+  onClose,
+  runs,
+}: {
+  open: boolean;
+  onClose: () => void;
+  runs: BenchmarkRun[];
+}) {
+  const completed = useMemo(
+    () => runs.filter((r) => r.status === "completed" && r.event_id),
+    [runs],
+  );
+  const [baselineId, setBaselineId] = useState("");
+  const [candidateId, setCandidateId] = useState("");
+  const [result, setResult] = useState<ComparisonPayload | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setResult(null);
+      setError(null);
+    }
+  }, [open]);
+
+  async function onCompare() {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      setResult(await compareRuns(baselineId, candidateId));
+    } catch (err) {
+      setError(
+        toUserMessage(err, {
+          unavailable: "Run comparison isn't available on this server.",
+          fallback: "Failed to compare runs.",
+        }),
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function runLabel(r: BenchmarkRun): string {
+    const when = r.created_at ? r.created_at.slice(0, 19).replace("T", " ") : r.event_id;
+    return `${r.dataset ?? "?"} · ${r.model_profile ?? "default"} (${when})`;
+  }
+
+  const sameRun = Boolean(baselineId) && baselineId === candidateId;
+
+  return (
+    <Sheet open={open} onClose={onClose}>
+      <div className="space-y-5">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">Compare runs</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            POST /v1/studio/comparisons — deltas, confidence intervals and a budget
+            verdict between two completed runs.
+          </p>
+        </div>
+
+        {completed.length < 2 ? (
+          <Alert tone="info">Need at least two completed runs to compare.</Alert>
+        ) : (
+          <>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Baseline">
+                <Select value={baselineId} onChange={(e) => setBaselineId(e.target.value)}>
+                  <option value="">Select a run…</option>
+                  {completed.map((r) => (
+                    <option key={r.event_id} value={r.event_id}>
+                      {runLabel(r)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Candidate">
+                <Select value={candidateId} onChange={(e) => setCandidateId(e.target.value)}>
+                  <option value="">Select a run…</option>
+                  {completed.map((r) => (
+                    <option key={r.event_id} value={r.event_id}>
+                      {runLabel(r)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+
+            {sameRun && <Alert tone="warn">Pick two different runs to compare.</Alert>}
+
+            <Button
+              type="button"
+              onClick={onCompare}
+              loading={loading}
+              disabled={!baselineId || !candidateId || sameRun}
+            >
+              <GitCompare className="h-4 w-4" />
+              {loading ? "Comparing…" : "Compare"}
+            </Button>
+          </>
+        )}
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        {result && <ComparisonResultView payload={result} />}
+      </div>
+    </Sheet>
+  );
+}
+
+function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
+  const aggregate = payload.comparisons.filter((c) => c.dimension === "aggregate");
+  const verdictTone =
+    payload.verdict === "pass" ? "ok" : payload.verdict === "fail" ? "err" : "warn";
+  const hasRootCauses =
+    (payload.root_causes.documents?.length ?? 0) > 0 ||
+    (payload.root_causes.fields?.length ?? 0) > 0;
+
+  return (
+    <div className="space-y-4 border-t border-border pt-4">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-muted-foreground">Verdict</span>
+        <Badge tone={verdictTone}>{payload.verdict}</Badge>
+      </div>
+
+      {payload.compatibility_errors.length > 0 && (
+        <Alert tone="err">{payload.compatibility_errors.join("; ")}</Alert>
+      )}
+
+      {aggregate.length > 0 && (
+        <div className="scroll-thin overflow-auto rounded-md border border-border">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-muted/60 uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Metric</th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Baseline</th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Candidate</th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Delta</th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium">n</th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Flags</th>
+              </tr>
+            </thead>
+            <tbody>
+              {aggregate.map((row) => (
+                <tr key={row.metric} className="border-t border-border">
+                  <td className="whitespace-nowrap px-2.5 py-1.5 font-mono text-foreground/90">
+                    {row.metric}
+                  </td>
+                  <td className="whitespace-nowrap px-2.5 py-1.5 font-mono tabular-nums text-foreground/90">
+                    {row.baseline.toFixed(3)}
+                  </td>
+                  <td className="whitespace-nowrap px-2.5 py-1.5 font-mono tabular-nums text-foreground/90">
+                    {row.candidate.toFixed(3)}
+                  </td>
+                  <td
+                    className={cn(
+                      "whitespace-nowrap px-2.5 py-1.5 font-mono tabular-nums font-medium",
+                      row.signed_improvement > 0
+                        ? "text-emerald-500"
+                        : row.signed_improvement < 0
+                          ? "text-red-500"
+                          : "text-foreground/90",
+                    )}
+                  >
+                    {row.delta > 0 ? "+" : ""}
+                    {row.delta.toFixed(3)}
+                  </td>
+                  <td className="whitespace-nowrap px-2.5 py-1.5 font-mono tabular-nums text-muted-foreground">
+                    {row.paired_samples}
+                  </td>
+                  <td className="whitespace-nowrap px-2.5 py-1.5 text-muted-foreground">
+                    {row.warnings.length > 0 ? row.warnings.join(", ") : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {payload.budget_checks.length > 0 && (
+        <div>
+          <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">Budget checks</h3>
+          <ul className="space-y-1.5">
+            {payload.budget_checks.map((check, i) => (
+              <li key={i} className="flex items-center gap-2 text-xs">
+                <Badge
+                  tone={
+                    check.status === "pass" ? "ok" : check.status === "fail" ? "err" : "warn"
+                  }
+                >
+                  {check.status}
+                </Badge>
+                <span className="text-muted-foreground">
+                  {check.metric ?? "?"} ({check.dimension ?? "aggregate"})
+                  {check.reason ? ` — ${check.reason}` : ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {hasRootCauses && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          {(payload.root_causes.documents?.length ?? 0) > 0 && (
+            <RootCauseList title="Regressed documents" rows={payload.root_causes.documents!} />
+          )}
+          {(payload.root_causes.fields?.length ?? 0) > 0 && (
+            <RootCauseList title="Regressed fields" rows={payload.root_causes.fields!} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RootCauseList({ title, rows }: { title: string; rows: ComparisonRow[] }) {
+  return (
+    <div>
+      <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">{title}</h3>
+      <ul className="space-y-1">
+        {rows.slice(0, 10).map((row, i) => (
+          <li key={i} className="flex items-center justify-between gap-2 text-xs">
+            <span className="truncate font-mono text-foreground/90">
+              {Object.values(row.group)[0] ?? row.metric}
+            </span>
+            <span className="tabular-nums text-red-500">{row.delta.toFixed(3)}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
