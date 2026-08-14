@@ -137,6 +137,69 @@ def test_activity_tracks_independently_per_model(_sqlite_catalog: None) -> None:
     assert by_name == {"qwen2.5-7b-q4": 2, "lfm2.5-350m": 1}
 
 
+# ── list_activity replica-count enrichment: the missing half of the "how hot
+# is this model" picture. window_count alone can't tell an operator whether
+# a busy model is already scaled out or still a single point of contention —
+# that's exactly the judgment call a human makes before clicking the
+# existing scale stepper (Deployments tab, #92-95). This is a pure display
+# join, nothing here decides or acts on its own. ───────────────────────────
+
+
+def test_activity_reports_zero_replicas_when_never_placed(_sqlite_catalog: None) -> None:
+    catalog = ModelCatalog()
+    catalog.record_activity("lfm2.5-350m")
+
+    row = catalog.list_activity()[0]
+    assert row["live_replica_count"] == 0
+    assert row["total_replica_count"] == 0
+
+
+def test_activity_reports_live_and_evicted_replicas_separately(_sqlite_catalog: None) -> None:
+    """A model that WAS hot and has since had its only placement evicted
+    (stopped, endpoint cleared) must read as 0 live replicas -- not "still
+    running" -- while still counting toward total_replica_count so the UI
+    can tell "never deployed" apart from "was deployed, now idle-unloaded"."""
+    catalog = ModelCatalog()
+    catalog.record_activity("lfm2.5-350m")
+    catalog.record_placement(
+        "lfm2.5-350m",
+        model_name="lfm2.5-350m",
+        engine="llama-server",
+        endpoint="",
+        state="stopped",
+    )
+
+    row = catalog.list_activity()[0]
+    assert row["live_replica_count"] == 0
+    assert row["total_replica_count"] == 1
+
+
+def test_activity_counts_scaled_replicas_correctly(_sqlite_catalog: None) -> None:
+    """A scaled model has several placement rows sharing model_name (one per
+    replica record name, e.g. <base>/<base>-2) -- live_replica_count must
+    count only the ones actually serving, total_replica_count all of them."""
+    catalog = ModelCatalog()
+    catalog.record_activity("lfm2.5-350m")
+    catalog.record_placement(
+        "lfm2.5-350m",
+        model_name="lfm2.5-350m",
+        engine="llama-server",
+        endpoint="http://worker:8091/v1",
+        state="ready",
+    )
+    catalog.record_placement(
+        "lfm2.5-350m-2",
+        model_name="lfm2.5-350m",
+        engine="llama-server",
+        endpoint="",
+        state="starting",
+    )
+
+    row = catalog.list_activity()[0]
+    assert row["live_replica_count"] == 1
+    assert row["total_replica_count"] == 2
+
+
 @pytest.mark.parametrize("dialect_name", ["postgresql", "sqlite"])
 def test_record_activity_is_a_native_atomic_upsert(dialect_name: str) -> None:
     """record_activity must not be get-then-INSERT: two concurrent requests

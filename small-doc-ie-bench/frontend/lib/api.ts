@@ -690,6 +690,12 @@ export interface ActivityEntry {
   window_started_at: string | null;
   last_request_at: string | null;
   updated_at: string | null;
+  /** Placements for this model currently state=ready with a live endpoint. */
+  live_replica_count: number;
+  /** All non-removed placements for this model, live or not (0 for a
+   * model that has request history but was never actually deployed, e.g.
+   * a stale row from a since-cleared catalog). */
+  total_replica_count: number;
 }
 
 export interface ActivityView {
