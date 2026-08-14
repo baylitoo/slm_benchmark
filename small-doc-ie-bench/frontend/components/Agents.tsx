@@ -107,7 +107,18 @@ const KIND_META: Record<AgentKind, { label: string; icon: React.ReactNode }> = {
   custom: { label: "Custom", icon: <Wand2 className="h-5 w-5" /> },
 };
 
-export function Agents({ view = "catalog" }: { view?: string }) {
+// Narrowed to this section, same trick Playground.tsx uses for its own
+// `NavigateToDeploy` — AppShell's `onNavigate(id: SectionId, view?)` is a
+// valid supertype, so passing it straight through type-checks.
+type NavigateWithinAgents = (id: "agents", view?: string) => void;
+
+export function Agents({
+  view = "catalog",
+  onNavigate,
+}: {
+  view?: string;
+  onNavigate?: NavigateWithinAgents;
+}) {
   const [tab, setTab] = useState(view || "catalog");
   // Follow sidebar deep-links, but keep local switches (e.g. "Use template")
   // working between nav clicks.
@@ -118,16 +129,22 @@ export function Agents({ view = "catalog" }: { view?: string }) {
   const [prefill, setPrefill] = useState<AgentTemplate | null>(null);
   const [editAgent, setEditAgent] = useState<AgentView | null>(null);
 
+  // setTab() alone used to leave the sidebar/URL pointing at the old
+  // sub-view (still highlighting Templates/My Agents) while the Create form
+  // was already showing -- onNavigate keeps both in sync; setTab stays so
+  // the switch is instant rather than waiting on a route transition.
   function useTemplate(template: AgentTemplate) {
     setEditAgent(null);
     setPrefill(template);
     setTab("create");
+    onNavigate?.("agents", "create");
   }
 
   function editExisting(agent: AgentView) {
     setPrefill(null);
     setEditAgent(agent);
     setTab("create");
+    onNavigate?.("agents", "create");
   }
 
   const subtitle =
@@ -151,6 +168,7 @@ export function Agents({ view = "catalog" }: { view?: string }) {
               setEditAgent(null);
               setPrefill(null);
               setTab("create");
+              onNavigate?.("agents", "create");
             }}
           >
             <PlusCircle className="h-4 w-4" />
@@ -171,6 +189,7 @@ export function Agents({ view = "catalog" }: { view?: string }) {
             setPrefill(null);
             setEditAgent(null);
             setTab("instances");
+            onNavigate?.("agents", "instances");
           }}
         />
       ) : (

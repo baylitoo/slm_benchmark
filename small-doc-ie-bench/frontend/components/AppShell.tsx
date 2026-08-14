@@ -99,7 +99,9 @@ export function AppShell() {
                     <Playground active={active === "playground"} onNavigate={onNavigate} />
                   )}
                   {id === "deploy" && <Deploy active={active === "deploy"} view={viewFor(id)} />}
-                  {id === "agents" && <Agents view={viewFor(id)} />}
+                  {id === "agents" && (
+                    <Agents view={viewFor(id)} onNavigate={onNavigate} />
+                  )}
                   {id === "benchmark" && <Benchmark view={viewFor(id)} />}
                   {id === "observability" && (
                     <Observability active={active === "observability"} />
