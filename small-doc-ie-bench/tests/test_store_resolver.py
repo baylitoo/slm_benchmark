@@ -131,6 +131,14 @@ def test_resolve_store_family_contract_wins(_sqlite_catalog: None) -> None:
     assert profile.prompt_profile == "nuextract3"
     assert profile.temperature == 0.2  # family default_temperature
     assert profile.stop_sequences == ()
+    # Generation tuning must come from the family contract too, not
+    # ModelProfile's bare defaults (900/180s) -- NuExtract3 needs 4096
+    # tokens and up to 600s on CPU vision inference, or extraction silently
+    # truncates/times out (see profile_resolver.py's sibling family-synthesis
+    # path, which already guards this for the deployment=/model_profile=
+    # routes; this store: route didn't, until now).
+    assert profile.max_tokens == 4096
+    assert profile.timeout_seconds == pytest.approx(600.0)
 
 
 def test_resolve_store_nuextract_v1_family_style_and_stops(_sqlite_catalog: None) -> None:
