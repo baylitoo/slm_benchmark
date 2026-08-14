@@ -7,11 +7,7 @@ import { LiveIndicator } from "../LiveIndicator";
 import { Table, type Column } from "../patterns/Table";
 import { stateTone } from "./shared";
 
-interface PortRow {
-  name: string | null;
-  port: number;
-  state: string | null;
-}
+type PortRow = PortsViewData["deployments"][number];
 
 const COLUMNS: Column<PortRow>[] = [
   {
@@ -72,7 +68,11 @@ export function PortsAdmin({ ports }: { ports: ReturnType<typeof usePolling<Port
         rows={data?.deployments ?? null}
         loading={ports.loading}
         error={ports.error}
-        getRowKey={(r) => String(r.port)}
+        // Index-fallback like every sibling Table caller (DeploymentsView,
+        // Benchmark, Catalog) -- port isn't guaranteed unique: an orphaned
+        // deployment record not yet reaped (the class of bug #119 fixed)
+        // can share a port with a newer one before cleanup catches up.
+        getRowKey={(r, i) => `${r.port}-${i}`}
         emptyLabel="No ports in use"
         emptyDescription="Deploy a model — its port appears here on the next refresh."
       />
