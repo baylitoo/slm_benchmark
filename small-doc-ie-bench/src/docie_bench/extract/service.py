@@ -10,9 +10,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from docie_bench.extract.grounding import ground_evidence
 from docie_bench.extract.validators import validate_extraction
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.llm.mojibake import fix_mojibake
 from docie_bench.llm.openai_client import OpenAICompatibleClient
 from docie_bench.llm.prompts import (
     SCHEMA_PROPOSER_SYSTEM_PROMPT,
@@ -30,6 +33,12 @@ from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 from docie_bench.schemas.extraction import schema_json
 from docie_bench.security import redact_fields
+
+# Shared verbatim with the gateway's own VLM-as-OCR step (serving.solutions.
+# PipelineSolution._vlm_ocr) -- same prompt, same model, same task, whether
+# the pipeline is exercised via Studio or the benchmark CLI; duplicating the
+# string would risk the two silently drifting apart.
+from docie_bench.serving.solutions import _VLM_OCR_PROMPT
 from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
 
@@ -381,11 +390,10 @@ class ExtractionService:
         Delegating to a fresh ExtractionService(extractor_profile) for the
         actual extraction reuses ALL of that machinery unchanged -- the only
         difference from a normal text profile is that the input came from OCR
-        instead of the caller. `options.ocr_model` (VLM-as-OCR, mirroring the
-        gateway's own second pipeline mode) is not wired here yet -- only the
-        `options.ocr_backend` (tesseract/paddleocr/pdf_text) path, which is
-        the more common case and the one every existing pipeline profile in
-        this project actually uses.
+        instead of the caller. The OCR step is EITHER a built-in backend
+        (`options.ocr_backend`, default tesseract) or a deployed vision model
+        doing VLM-as-OCR (`options.ocr_model`), mirroring the gateway's own
+        two pipeline modes.
         """
         options = self.profile.options
         extractor_name = options.get("extractor")
@@ -405,27 +413,45 @@ class ExtractionService:
                 f"pipeline extractor {extractor_name!r} must be a passthrough LLM "
                 f"profile, got kind={extractor.kind!r}"
             )
-        if options.get("ocr_model"):
-            raise ValueError(
-                f"pipeline profile {self.profile.name!r} sets options.ocr_model "
-                "(VLM-as-OCR), which the benchmark doesn't wire yet -- only "
-                "options.ocr_backend is supported here"
-            )
 
-        backend_name = str(options.get("ocr_backend", "tesseract"))
-        ocr_language = options.get("language") or language
         t0 = time.perf_counter()
-        ocr_result = processor_from_settings(get_settings()).process(
-            path,
-            backend_name=backend_name,
-            language=ocr_language,
-        )
-        blocks = ocr_result.artifact.blocks
+        ocr_model_name = options.get("ocr_model")
+        if ocr_model_name:
+            vision = self.profiles.get(str(ocr_model_name))
+            if vision is None:
+                raise ValueError(
+                    f"pipeline ocr_model {ocr_model_name!r} is not configured "
+                    f"(known profiles: {sorted(self.profiles)})"
+                )
+            if vision.kind != "passthrough" or not vision.vision:
+                raise ValueError(
+                    f"pipeline ocr_model {ocr_model_name!r} must be a passthrough "
+                    f"vision deployment profile, got kind={vision.kind!r} "
+                    f"vision={vision.vision!r}"
+                )
+            ocr_backend_label = f"vlm:{vision.name}"
+            text = await self._vlm_ocr_text(vision, path)
+            # "manual" -- same convention extract_from_text uses for text that
+            # didn't come through a registered OCR backend (see its own
+            # text_to_blocks(..., source="manual") call).
+            blocks = text_to_blocks(text, source="manual")
+            document_hash = hash_file(path)
+        else:
+            backend_name = str(options.get("ocr_backend", "tesseract"))
+            ocr_language = options.get("language") or language
+            ocr_result = processor_from_settings(get_settings()).process(
+                path,
+                backend_name=backend_name,
+                language=ocr_language,
+            )
+            ocr_backend_label = backend_name
+            blocks = ocr_result.artifact.blocks
+            document_hash = ocr_result.artifact.document_hash
         logger.debug(
             "ocr_complete",
             extra={
                 "docie_step": "ocr",
-                "docie_backend": backend_name,
+                "docie_backend": ocr_backend_label,
                 "docie_path": str(path),
                 "docie_block_count": len(blocks),
                 "docie_ocr_latency_ms": int((time.perf_counter() - t0) * 1000),
@@ -442,13 +468,69 @@ class ExtractionService:
             schema_mode=schema_mode,
             dynamic_schema=dynamic_schema,
             language=language,
-            document_hash=ocr_result.artifact.document_hash,
+            document_hash=document_hash,
             metadata=metadata,
         )
         # Report as the pipeline profile the caller asked to benchmark, not
         # the inner extractor -- matches what predictions.jsonl/metrics key
         # on elsewhere in the runner (task.profile.name).
         return response.model_copy(update={"model_profile": self.profile.name})
+
+    async def _vlm_ocr_text(self, vision: ModelProfile, path: Path) -> str:
+        """Transcribe a document to text with a vision deployment
+        (options.ocr_model). Mirrors serving.solutions.PipelineSolution.
+        _vlm_ocr: an unconstrained plain-text chat completion, deliberately
+        NOT going through OpenAICompatibleClient.chat_json -- that wrapper
+        negotiates a JSON response_format style, retries, and a circuit
+        breaker, all built for structured extraction; asking a VLM to wrap a
+        verbatim transcription in JSON is unneeded indirection for a task
+        that already IS plain text. A raw httpx POST, same as the gateway.
+
+        load_document_images (already used by the vision extraction path
+        above) reads directly from the file path -- simpler here than the
+        gateway's own route, which reconstructs images from an inline
+        request data URI because its input is already an HTTP request, not
+        a file on disk.
+        """
+        images = load_document_images(
+            path, max_pages=vision.vision_max_pages, pdf_dpi=vision.vision_pdf_dpi
+        )
+        content: list[dict[str, Any]] = [{"type": "text", "text": _VLM_OCR_PROMPT}]
+        content += [
+            {"type": "image_url", "image_url": {"url": image.data_url()}} for image in images
+        ]
+        request = {
+            "model": vision.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0,
+        }
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.post(
+                    f"{vision.base_url}/chat/completions",
+                    json=request,
+                    headers={
+                        "Authorization": f"Bearer {vision.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=vision.timeout_seconds,
+                )
+            except httpx.RequestError as exc:
+                raise ValueError(
+                    f"pipeline ocr_model {vision.name!r} upstream is unreachable: {exc}"
+                ) from exc
+        if resp.status_code >= 400:
+            raise ValueError(
+                f"pipeline ocr_model {vision.name!r} returned {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+        try:
+            text = resp.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, ValueError):
+            text = ""
+        if isinstance(text, list):  # multimodal parts -> concatenate text
+            text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+        return fix_mojibake(str(text or "")) or ""
 
     async def _extract_blocks(
         self,
