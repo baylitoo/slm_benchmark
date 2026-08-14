@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Server,
   Plus,
@@ -393,14 +393,23 @@ export function DeploymentsView({
   embeddingNames,
   rerankerNames,
   store,
+  initialFilter,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   embeddingNames: Set<string>;
   rerankerNames: Set<string>;
   store: ReturnType<typeof usePolling<StoreEntry[]>>;
+  /** Deep-link seed (e.g. from Observability's activity tile) -- a model
+   * name to pre-fill the text filter with. Re-applies on every change, not
+   * just mount, so clicking a second activity row while already on this
+   * tab re-filters instead of no-op'ing on the first click's value. */
+  initialFilter?: string;
 }) {
   const { toast } = useToast();
-  const [filter, setFilter] = useState("");
+  const [filter, setFilter] = useState(initialFilter ?? "");
+  useEffect(() => {
+    if (initialFilter != null) setFilter(initialFilter);
+  }, [initialFilter]);
   const [page, setPage] = useState(1);
   // Segment by semantic model type (chat SLMs / encoder analyzers / embeddings / rerankers).
   const [typeFilter, setTypeFilter] = useState<

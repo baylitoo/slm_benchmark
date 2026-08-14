@@ -36,9 +36,14 @@ type SlideOver = null | "deploy" | "seed";
 export function Deploy({
   active = true,
   view = "deployments",
+  filterQuery,
 }: {
   active?: boolean;
   view?: string;
+  /** Deep-link seed for the Deployments table's text filter (e.g. from
+   * Observability's activity tile). Only relevant when view="deployments";
+   * DeploymentsView ignores it otherwise. */
+  filterQuery?: string;
 }) {
   // Auto-refreshing lists — paused when the tab is hidden OR Deploy isn't the
   // active section (every section stays mounted in the shell). Held at the top
@@ -108,6 +113,7 @@ export function Deploy({
           embeddingNames={embeddingNames}
           rerankerNames={rerankerNames}
           store={store}
+          initialFilter={filterQuery}
         />
       )}
 
