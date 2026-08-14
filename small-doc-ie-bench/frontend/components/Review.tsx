@@ -180,7 +180,19 @@ export function Review({ active = true }: { active?: boolean }) {
       ) : (
         <>
           <Toolbar>
-            <Segmented value={status} onChange={setStatus} options={STATUS_FILTERS} />
+            <Segmented
+              value={status}
+              onChange={(next) => {
+                setStatus(next);
+                // A pinned task's status can differ from the newly-selected
+                // filter (that's the whole point of pinning) -- carrying it
+                // across an unrelated filter switch would show it inside a
+                // list it no longer belongs to.
+                setExpanded(null);
+                setPinnedTask(null);
+              }}
+              options={STATUS_FILTERS}
+            />
           </Toolbar>
 
           <ResultLine
@@ -208,7 +220,11 @@ export function Review({ active = true }: { active?: boolean }) {
               <TaskDetail
                 task={t}
                 onChanged={(updated) => {
-                  setPinnedTask(updated);
+                  // A mutation started on this row before the operator
+                  // collapsed it or moved to a different one can still
+                  // resolve after that happened -- only pin if this row is
+                  // still the one actually expanded.
+                  if (expanded === updated.id) setPinnedTask(updated);
                   queue.refresh();
                 }}
                 onConflict={handleConflict}
