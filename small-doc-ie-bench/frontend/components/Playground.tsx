@@ -1167,9 +1167,11 @@ function RerankPanel({
                 key={i}
                 className="flex items-start gap-2 rounded-md border border-border bg-card p-2 text-sm"
               >
-                <Badge tone={i === 0 ? "ok" : r.score > 0 ? "info" : "neutral"}>
-                  {r.score.toFixed(4)}
-                </Badge>
+                {/* Score-based tone only -- ok/"healthy" for rank #1 was
+                    conflating "best result" with a health signal. Results
+                    are already sorted best-first (see the caption below),
+                    so rank is conveyed by position, not badge color. */}
+                <Badge tone={r.score > 0 ? "info" : "neutral"}>{r.score.toFixed(4)}</Badge>
                 <p className="text-foreground/90">{r.doc}</p>
               </div>
             ))}

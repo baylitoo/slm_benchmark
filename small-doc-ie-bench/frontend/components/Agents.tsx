@@ -327,8 +327,14 @@ function InstancesView({
       key: "kind",
       header: "Kind",
       sortAccessor: (a) => a.kind,
+      // Kind is a category, not a status -- warn here previously read as
+      // "something's wrong with OCR agents." Review feedback: swapping it
+      // for ok isn't actually a fix, just a different false health signal
+      // (ok reads as "healthy" the same way this file's own Status column
+      // uses it) -- neutral is the honest choice for a plain category with
+      // no health meaning, same as the "custom" kind already gets.
       render: (a) => (
-        <Badge tone={a.kind === "proxy_security" ? "info" : a.kind === "ocr" ? "warn" : "neutral"}>
+        <Badge tone={a.kind === "proxy_security" ? "info" : "neutral"}>
           {KIND_META[a.kind]?.label ?? a.kind}
         </Badge>
       ),
