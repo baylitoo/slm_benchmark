@@ -17,6 +17,7 @@ import {
   ApiError,
   type ReviewMetricsView,
   type OcrCacheStatsView,
+  type ActivityEntry,
   type ActivityView,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
@@ -252,6 +253,22 @@ function secondsAgo(iso: string): number {
   return Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
 }
 
+function replicaBadge(e: ActivityEntry): { tone: "ok" | "warn" | "neutral"; label: string } {
+  if (e.live_replica_count > 0) {
+    return {
+      tone: "ok",
+      label: e.live_replica_count === 1 ? "1 replica" : `${e.live_replica_count} replicas`,
+    };
+  }
+  if (e.total_replica_count > 0) {
+    // Had a placement, none of them live now — idle-unloaded or stopped,
+    // not gone. This is the signal the Deployments tab's scale stepper
+    // (#92-95) needs: a model with request history but nothing serving it.
+    return { tone: "warn", label: "evicted" };
+  }
+  return { tone: "neutral", label: "no placement" };
+}
+
 function ActivityCard({ active }: { active: boolean }) {
   const activity = usePolling<ActivityView>(getActivity, ACTIVITY_POLL_MS, active);
   const entries = activity.data?.entries ?? [];
@@ -262,7 +279,7 @@ function ActivityCard({ active }: { active: boolean }) {
     <Card
       icon={<Activity className="h-5 w-5" />}
       title="Model activity"
-      subtitle="Requests per store: model since the window last reset — a load signal, not a rate. Nothing scales on it yet."
+      subtitle="Requests per store: model since the window last reset, next to how many replicas are actually live — a load signal, not a rate. Nothing scales on it yet."
     >
       {activity.error ? (
         <p className="text-sm text-muted-foreground">
@@ -280,17 +297,21 @@ function ActivityCard({ active }: { active: boolean }) {
         </p>
       ) : (
         <div className="space-y-2">
-          {shown.map((e) => (
-            <div key={e.model_name} className="flex items-center justify-between gap-2 text-sm">
-              <span className="truncate font-medium text-foreground">{e.model_name}</span>
-              <div className="flex shrink-0 items-center gap-2">
-                <Badge tone="info">{e.window_count} req</Badge>
-                <span className="w-14 text-right text-xs text-muted-foreground">
-                  {e.last_request_at ? `${formatAge(secondsAgo(e.last_request_at))} ago` : "n/a"}
-                </span>
+          {shown.map((e) => {
+            const replicas = replicaBadge(e);
+            return (
+              <div key={e.model_name} className="flex items-center justify-between gap-2 text-sm">
+                <span className="truncate font-medium text-foreground">{e.model_name}</span>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Badge tone="info">{e.window_count} req</Badge>
+                  <Badge tone={replicas.tone}>{replicas.label}</Badge>
+                  <span className="w-14 text-right text-xs text-muted-foreground">
+                    {e.last_request_at ? `${formatAge(secondsAgo(e.last_request_at))} ago` : "n/a"}
+                  </span>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           {entries.length > shown.length && (
             <p className="text-xs text-muted-foreground">
               +{entries.length - shown.length} more

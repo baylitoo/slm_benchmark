@@ -1035,7 +1035,31 @@ class ModelCatalog:
             rows = session.scalars(
                 select(ModelActivity).order_by(ModelActivity.last_request_at.desc())
             ).all()
-            return [_activity_view(row) for row in rows]
+            # One placement fetch for the whole listing (mirrors `list()`'s own
+            # comment above) — replica counts are a display enrichment, not
+            # worth a query per activity row. A model with activity but
+            # live_replica_count == 0 is a real, useful signal on its own:
+            # it was hot recently and has since been evicted/removed
+            # entirely, not just idle.
+            placements = session.scalars(
+                select(ModelPlacement).where(ModelPlacement.model_name.is_not(None))
+            ).all()
+            live_counts: dict[str, int] = {}
+            total_counts: dict[str, int] = {}
+            for placement in placements:
+                if placement.model_name is None:
+                    continue
+                total_counts[placement.model_name] = total_counts.get(placement.model_name, 0) + 1
+                if placement.state == "ready" and (placement.endpoint or "").strip():
+                    live_counts[placement.model_name] = live_counts.get(placement.model_name, 0) + 1
+            return [
+                {
+                    **_activity_view(row),
+                    "live_replica_count": live_counts.get(row.model_name, 0),
+                    "total_replica_count": total_counts.get(row.model_name, 0),
+                }
+                for row in rows
+            ]
 
     @staticmethod
     def _placement_row_for_model(session: Session, model_name: str) -> ModelPlacement | None:
