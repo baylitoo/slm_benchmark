@@ -534,6 +534,59 @@ async def list_runs(
         return []
 
 
+class ComparisonRequest(BaseModel):
+    baseline_event_id: str
+    candidate_event_id: str
+
+
+@router.post("/comparisons")
+async def create_comparison(payload: ComparisonRequest, tenant: TenantDependency) -> dict[str, Any]:
+    """Compare two of this tenant's completed runs -- the CLI's ``compare_runs``
+    logic (deltas, confidence intervals, sign tests, root causes), reachable
+    without leaving the Studio.
+
+    Stateless by design: each run's ``metrics_json`` already lives in Postgres
+    (``StudioRun``), so recomputing the comparison on every call is cheap pure
+    computation, not a second I/O round-trip. No budgets/promote/persistence
+    yet -- this is the comparison-viewing slice; gating and a revisitable
+    comparison id are deliberately deferred until there's a real caller for them.
+    """
+    from docie_bench.benchmark.comparison import build_comparison_payload
+
+    store = default_run_store()
+    if not store.enabled:
+        raise HTTPException(
+            status_code=503, detail="Studio run index requires a configured DATABASE_URL"
+        )
+    baseline = store.get_run(payload.baseline_event_id, tenant_id=tenant.tenant_id)
+    candidate = store.get_run(payload.candidate_event_id, tenant_id=tenant.tenant_id)
+    if baseline is None or candidate is None:
+        raise HTTPException(status_code=404, detail="Run not found", headers=_DOMAIN_404)
+    for label, run in (("baseline", baseline), ("candidate", candidate)):
+        if not run.get("metrics"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{label} run {run['event_id']!r} has no metrics yet "
+                f"(status={run['status']!r}) -- wait for it to complete",
+            )
+    return build_comparison_payload(
+        baseline["metrics"],
+        candidate["metrics"],
+        baseline_meta={
+            "event_id": baseline["event_id"],
+            "dataset": baseline["dataset"],
+            "model_profile": baseline["model_profile"],
+            "created_at": baseline["created_at"],
+        },
+        candidate_meta={
+            "event_id": candidate["event_id"],
+            "dataset": candidate["dataset"],
+            "model_profile": candidate["model_profile"],
+            "created_at": candidate["created_at"],
+        },
+    )
+
+
 @router.get("/artifacts/{artifact_id}")
 async def download_artifact(artifact_id: str, tenant: TenantDependency) -> Response:
     """Stream a run artifact (``report.html`` / ``predictions.jsonl`` / ``metrics.json``).
