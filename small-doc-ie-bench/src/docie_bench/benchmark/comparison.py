@@ -5,6 +5,7 @@ import json
 import math
 import shutil
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +55,58 @@ class ComparisonResult:
     report_path: Path
 
 
+def build_comparison_payload(
+    baseline_metrics: dict[str, Any],
+    candidate_metrics: dict[str, Any],
+    *,
+    baseline_meta: dict[str, Any],
+    candidate_meta: dict[str, Any],
+    budgets: Sequence[dict[str, Any]] = (),
+    calibration_path: Path | None = None,
+    max_judge_mae: float = DEFAULT_MAX_JUDGE_MAE,
+) -> dict[str, Any]:
+    """Core comparison: decoded metrics dicts in, a JSON-able payload out.
+
+    No filesystem/blob I/O -- callers (the CLI's ``compare_runs``, or a Studio
+    API route reading two ``StudioRun.metrics_json`` rows straight out of
+    Postgres) own retrieving the metrics and describing their own provenance
+    via ``baseline_meta``/``candidate_meta``. Shape IS validated here (unlike
+    metrics loaded from a trusted local file via ``compare_runs``, a DB-sourced
+    caller has no file-read boundary to reject a malformed contract at).
+    """
+    _ensure_metrics_shape(baseline_metrics, "baseline")
+    _ensure_metrics_shape(candidate_metrics, "candidate")
+    baseline_observations = _observations(baseline_metrics)
+    candidate_observations = _observations(candidate_metrics)
+    comparisons = _compare_observations(baseline_observations, candidate_observations)
+    # Gap (a): an uncalibrated judge must not block a release. Measure judge<->human
+    # agreement (default: no calibration -> judge budgets only warn).
+    calibration_report, judge_calibration = calibration_gate(
+        calibration_path, max_mae=max_judge_mae
+    )
+    checks = _evaluate_budgets(
+        comparisons, list(budgets), judge_calibrated=bool(judge_calibration["calibrated"])
+    )
+    failures = [check for check in checks if check["status"] == "fail"]
+    errors = [check for check in checks if check["status"] == "error"]
+    incompatible = not comparisons
+    verdict = "error" if errors or incompatible else ("fail" if failures else "pass")
+    return {
+        "contract_version": 1,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "baseline": baseline_meta,
+        "candidate": candidate_meta,
+        "verdict": verdict,
+        "comparisons": comparisons,
+        "budget_checks": checks,
+        "judge_calibration": {"gate": judge_calibration, "report": calibration_report},
+        "compatibility_errors": (
+            ["No comparable matched observations were found"] if incompatible else []
+        ),
+        "root_causes": _root_causes(comparisons),
+    }
+
+
 def compare_runs(
     baseline: Path,
     candidate: Path,
@@ -65,52 +118,31 @@ def compare_runs(
 ) -> ComparisonResult:
     baseline_path = _metrics_path(baseline)
     candidate_path = _metrics_path(candidate)
-    baseline_metrics = _load_json(baseline_path)
-    candidate_metrics = _load_json(candidate_path)
-    baseline_observations = _observations(baseline_metrics)
-    candidate_observations = _observations(candidate_metrics)
-    comparisons = _compare_observations(baseline_observations, candidate_observations)
-    budgets = _load_budgets(budgets_path)
-    # Gap (a): an uncalibrated judge must not block a release. Measure judge<->human
-    # agreement (default: no calibration -> judge budgets only warn).
-    calibration_report, judge_calibration = calibration_gate(
-        calibration_path, max_mae=max_judge_mae
+    payload = build_comparison_payload(
+        _load_json(baseline_path),
+        _load_json(candidate_path),
+        baseline_meta=_source_metadata(baseline_path),
+        candidate_meta=_source_metadata(candidate_path),
+        budgets=_load_budgets(budgets_path),
+        calibration_path=calibration_path,
+        max_judge_mae=max_judge_mae,
     )
-    checks = _evaluate_budgets(
-        comparisons, budgets, judge_calibrated=bool(judge_calibration["calibrated"])
-    )
+    verdict = payload["verdict"]
+    checks = payload["budget_checks"]
     failures = [check for check in checks if check["status"] == "fail"]
     errors = [check for check in checks if check["status"] == "error"]
-    incompatible = not comparisons
-    verdict = "error" if errors or incompatible else ("fail" if failures else "pass")
     exit_code = 0 if verdict == "pass" else 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "contract_version": 1,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "baseline": _source_metadata(baseline_path),
-        "candidate": _source_metadata(candidate_path),
-        "verdict": verdict,
-        "comparisons": comparisons,
-        "budget_checks": checks,
-        "judge_calibration": {"gate": judge_calibration, "report": calibration_report},
-        "compatibility_errors": (
-            ["No comparable matched observations were found"] if incompatible else []
-        ),
-        "root_causes": _root_causes(comparisons),
-    }
     verdict_payload = {
         "contract_version": 1,
         "verdict": verdict,
         "exit_code": exit_code,
         "checks": checks,
-        "judge_calibration": judge_calibration,
+        "judge_calibration": payload["judge_calibration"]["gate"],
         "failed_checks": failures,
         "error_checks": errors,
-        "compatibility_errors": (
-            ["No comparable matched observations were found"] if incompatible else []
-        ),
+        "compatibility_errors": payload["compatibility_errors"],
     }
     comparison_path = output_dir / "comparison.json"
     verdict_path = output_dir / "verdict.json"
@@ -196,6 +228,11 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict) or not isinstance(value.get("rows"), list):
         raise ValueError(f"Incompatible metrics file (missing rows): {path}")
     return value
+
+
+def _ensure_metrics_shape(metrics: dict[str, Any], label: str) -> None:
+    if not isinstance(metrics, dict) or not isinstance(metrics.get("rows"), list):
+        raise ValueError(f"Incompatible {label} metrics (missing rows)")
 
 
 def _source_metadata(path: Path) -> dict[str, str]:
