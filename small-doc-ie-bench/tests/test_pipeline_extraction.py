@@ -108,6 +108,13 @@ async def test_pipeline_ocrs_with_its_own_backend_then_delegates_to_extractor(
     assert captured[0]["profile"] == "extractor-profile"
     assert captured[0]["blocks"][0].text == "hello from ocr"
     assert captured[0]["schema_name"] == "invoice"
+    # document_hash must come from the OCR result, not be dropped -- it feeds
+    # reproducibility/caching elsewhere in the benchmark, so losing it in a
+    # future refactor would be a real (not cosmetic) regression.
+    assert captured[0]["document_hash"] is not None
+    assert captured[0]["schema_mode"] == "static"
+    assert captured[0]["language"] is None
+    assert captured[0]["metadata"] == {}
     # The response is reported under the PIPELINE profile's name (what the
     # caller asked to benchmark), even though _extract_blocks ran as the
     # inner extractor.
