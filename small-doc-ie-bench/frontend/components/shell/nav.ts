@@ -4,7 +4,7 @@
 //   • NAV_GROUPS  — PRESENTATION only (grouped, with duplicate SectionIds for
 //                   split sub-views like Models/Deployments). The sidebar reads
 //                   this.
-//   • SECTIONS    — the flat, de-duped list of the FOUR unique sections. The
+//   • SECTIONS    — the flat, de-duped list of the unique sections. The
 //                   AppShell mount loop reads THIS so each section (and its
 //                   pollers) mounts exactly once.
 //
@@ -23,6 +23,7 @@ import {
   Bot,
   LayoutGrid,
   PlusCircle,
+  ClipboardCheck,
   type LucideIcon,
 } from "lucide-react";
 
@@ -31,6 +32,7 @@ export type SectionId =
   | "deploy"
   | "agents"
   | "benchmark"
+  | "review"
   | "observability";
 
 export interface NavItem {
@@ -77,6 +79,13 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
+    heading: "Review",
+    // A single view — the queue table itself carries the status filter, so
+    // there's nothing left to split into separate sub-tabs (mirrors
+    // Observability/Playground's single-view sections).
+    items: [{ id: "review", label: "Queue", icon: ClipboardCheck }],
+  },
+  {
     heading: "Observability",
     // A single view — no sub-tabs (mirrors Playground): the page combines the
     // quick-link tiles and the embedded dashboard together, so there is
@@ -85,12 +94,13 @@ export const NAV_GROUPS: NavGroup[] = [
   },
 ];
 
-/** The FIVE unique sections — the single source of truth for the mount loop. */
+/** The SIX unique sections — the single source of truth for the mount loop. */
 export const SECTIONS: SectionId[] = [
   "playground",
   "deploy",
   "agents",
   "benchmark",
+  "review",
   "observability",
 ];
 
@@ -100,5 +110,6 @@ export const DEFAULT_VIEW: Record<SectionId, string> = {
   deploy: "deployments",
   agents: "catalog",
   benchmark: "run",
+  review: "",
   observability: "",
 };
