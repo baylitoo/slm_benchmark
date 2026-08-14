@@ -449,9 +449,11 @@ export function Segmented<T extends string>({
 
 export const Checkbox = forwardRef<
   HTMLInputElement,
-  React.InputHTMLAttributes<HTMLInputElement> & {
+  Omit<React.InputHTMLAttributes<HTMLInputElement>, "type"> & {
     label: React.ReactNode;
     hint?: string;
+    /** Applies to the wrapping <label> row, not the checkbox control itself. */
+    className?: string;
   }
 >(function Checkbox({ label, hint, className, ...props }, ref) {
   return (
