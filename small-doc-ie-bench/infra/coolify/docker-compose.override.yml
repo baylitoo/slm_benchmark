@@ -1,0 +1,49 @@
+# Coolify overlay: applied ON TOP OF the root docker-compose.yml (Coolify lets
+# you point a "Docker Compose" resource at a base file plus this override, or
+# you can paste this in as additional compose content in the app's Compose
+# tab). It does NOT change what runs -- only how it's reachable.
+#
+# Rationale: the root compose file publishes almost every service on a host
+# port (postgres, inngest, prometheus, grafana) for local-dev convenience.
+# Coolify's proxy/TLS/domain routing only applies to services it fronts; a
+# service with its own `ports:` mapping is exposed DIRECTLY on the host's
+# public IP, bypassing the proxy entirely (see Coolify's docker-compose docs,
+# "Service Port Mapping"). On a shared, internet-facing box that means an
+# unauthenticated Postgres and an unauthenticated Inngest dashboard/event API
+# on the open internet the moment this deploys.
+#
+# Compose list-type keys (like `ports:`) are REPLACED, not merged, by an
+# override file -- `ports: []` here clears the base file's mapping for that
+# service, keeping it reachable only over the compose network by service name
+# (e.g. `postgres:5432`, `inngest:8288`), which is all the api/worker/serving
+# containers need. `api` and `web` keep no `ports:` here either: assign them
+# real domains through Coolify (UI, or SERVICE_FQDN_API / SERVICE_FQDN_WEB
+# magic env vars) so they get TLS termination and proper routing instead of a
+# bare host:port.
+#
+# `serving` and `redis` are not listed here -- they never published a port in
+# the base file (serving is the sole holder of the unauth llama-server
+# processes and deliberately has no `ports:`; redis is compose-network-only).
+# `llm-llamacpp` and `bench` are behind the `local-llm`/`tools` compose
+# profiles and are OFF by default -- do not activate the `local-llm` profile
+# in Coolify, production model serving goes through the `serving` control
+# plane, not this static container.
+
+services:
+  api:
+    ports: []
+
+  web:
+    ports: []
+
+  postgres:
+    ports: []
+
+  inngest:
+    ports: []
+
+  prometheus:
+    ports: []
+
+  grafana:
+    ports: []
