@@ -45,7 +45,7 @@ import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
-import { Button, Card, Field, Select, TextArea, TextInput, Badge, Spinner } from "./ui";
+import { Alert, Button, Card, Field, Select, TextArea, TextInput, Badge, Spinner } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 
@@ -349,12 +349,7 @@ export function Playground({
             </Field>
           </div>
 
-          {error && (
-            <p className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              {error}
-            </p>
-          )}
+          {error && <Alert tone="err">{error}</Alert>}
 
           <div className="space-y-1.5">
             <Button type="submit" loading={submitting} disabled={extractNoModel}>
@@ -598,12 +593,7 @@ function ChatPanel({
           <div ref={bottomRef} />
         </div>
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         <div className="flex items-end gap-2">
           <TextArea
@@ -884,10 +874,7 @@ function VisionPanel({
                 <Spinner /> {error}
               </p>
             ) : (
-              <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                {error}
-              </p>
+              <Alert tone="err">{error}</Alert>
             ))}
 
           <Button type="button" loading={busy} disabled={!model || !file} onClick={() => void run()}>
@@ -1029,12 +1016,7 @@ function EmbedPanel({
           </Field>
         </div>
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         <Button type="button" loading={busy} onClick={() => void run()} disabled={!model}>
           <Fingerprint className="h-4 w-4" />
@@ -1171,12 +1153,7 @@ function RerankPanel({
           <TextArea rows={5} value={docs} onChange={(e) => setDocs(e.target.value)} />
         </Field>
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         <Button type="button" loading={busy} onClick={() => void run()} disabled={!model}>
           <ListOrdered className="h-4 w-4" />
@@ -1284,11 +1261,10 @@ function DeploymentSelect({
   // default applies, and explain why.
   if (deployments.error && !deployments.data) {
     return (
-      <p className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-        <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <Alert tone="warn">
         Deployments unavailable — is the serving API up? The server default will
         be used.
-      </p>
+      </Alert>
     );
   }
 

@@ -6,7 +6,6 @@ import {
   Plus,
   Minus,
   Layers,
-  AlertCircle,
   Pin,
   PinOff,
   RefreshCw,
@@ -33,7 +32,7 @@ import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
-import { Badge, Button, Card, Field, TextInput } from "../ui";
+import { Alert, Badge, Button, Card, Field, TextInput } from "../ui";
 import { LiveIndicator } from "../LiveIndicator";
 import { Toolbar } from "../patterns/Toolbar";
 import { ResultLine } from "../patterns/ResultLine";
@@ -828,10 +827,9 @@ function DeploymentLogsPanel({
         />
       </div>
       {data?.last_error && (
-        <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-400">
-          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <Alert tone="err">
           <span className="break-words font-mono">{data.last_error}</span>
-        </p>
+        </Alert>
       )}
       <pre className="scroll-thin max-h-72 overflow-auto rounded-md border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground/90">
         {logs.loading && !data

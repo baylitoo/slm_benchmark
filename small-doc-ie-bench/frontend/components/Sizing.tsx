@@ -26,7 +26,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
 import { toUserMessage } from "@/lib/errors";
-import { Badge, Button, Card, Select, TextInput } from "./ui";
+import { Alert, Badge, Button, Card, Select, TextInput } from "./ui";
 import { LiveIndicator } from "./LiveIndicator";
 import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
@@ -60,14 +60,11 @@ export function Sizing({ active = true }: { active?: boolean }) {
       </div>
 
       {data && !data.observed_available && (
-        <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>
-            Observed capacity unavailable — {data.detail ?? "no node snapshot published"}.
-            Footprints below are still priced from the store; fit counts need a live
-            snapshot.
-          </span>
-        </p>
+        <Alert tone="warn">
+          Observed capacity unavailable — {data.detail ?? "no node snapshot published"}.
+          Footprints below are still priced from the store; fit counts need a live
+          snapshot.
+        </Alert>
       )}
 
       <CapacityBar data={data} />
@@ -569,12 +566,7 @@ function WhatIf({ data }: { data: SizingView | null }) {
           </Button>
         </div>
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         {result && <WhatIfVerdict result={result} />}
       </div>
@@ -585,13 +577,10 @@ function WhatIf({ data }: { data: SizingView | null }) {
 function WhatIfVerdict({ result }: { result: WhatIfView }) {
   if (result.ok == null) {
     return (
-      <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
-        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-        <span>
-          Plan needs {formatBytes(result.total_predicted_bytes)}, but there is no live node
-          snapshot to judge it against ({result.detail ?? "observed state unavailable"}).
-        </span>
-      </p>
+      <Alert tone="warn">
+        Plan needs {formatBytes(result.total_predicted_bytes)}, but there is no live node
+        snapshot to judge it against ({result.detail ?? "observed state unavailable"}).
+      </Alert>
     );
   }
   if (result.ok) {
@@ -606,13 +595,10 @@ function WhatIfVerdict({ result }: { result: WhatIfView }) {
     );
   }
   return (
-    <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-      <span>
-        Does not fit — plan needs {formatBytes(result.total_predicted_bytes)}, which is{" "}
-        {formatBytes(result.deficit_bytes)} more than the deployable budget (free −
-        margin).
-      </span>
-    </p>
+    <Alert tone="err">
+      Does not fit — plan needs {formatBytes(result.total_predicted_bytes)}, which is{" "}
+      {formatBytes(result.deficit_bytes)} more than the deployable budget (free −
+      margin).
+    </Alert>
   );
 }

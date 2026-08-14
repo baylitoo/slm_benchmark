@@ -11,7 +11,7 @@ import {
 } from "@/lib/api";
 import { JsonView } from "./JsonView";
 import { ProgressView } from "./ProgressBar";
-import { Badge } from "./ui";
+import { Alert, Badge } from "./ui";
 
 /** Best-effort human error out of an Inngest run's output/error shape. */
 function runErrorMessage(run: InngestRun | undefined): string | null {
@@ -121,9 +121,7 @@ export function PollingResult({
         {completed && primary?.output !== undefined ? (
           <JsonView value={primary.output} />
         ) : failed ? (
-          <p className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            The {noun} failed{failMsg ? `: ${failMsg}` : "."}
-          </p>
+          <Alert tone="err">The {noun} failed{failMsg ? `: ${failMsg}` : "."}</Alert>
         ) : progress && typeof progress.percent === "number" ? (
           // Realtime is down, but the pollable sidecar gives us the live
           // percentage — render the same bar the realtime stream would.

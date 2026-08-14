@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Cpu, Plus, AlertCircle } from "lucide-react";
+import { Cpu, Plus } from "lucide-react";
 import { seedHf, type ModelFamily, type TriggerResponse } from "@/lib/api";
 import { useToast } from "../../Toast";
-import { Button, Card, Field, Select, TextInput } from "../../ui";
+import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { errText } from "../shared";
 
@@ -111,12 +111,7 @@ export function EncoderSeedForm({
           </Field>
         </div>
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         <Button type="submit" loading={submitting} disabled={!family}>
           <Plus className="h-4 w-4" />

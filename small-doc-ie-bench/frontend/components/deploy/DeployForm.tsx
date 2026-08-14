@@ -23,6 +23,7 @@ import { cn } from "@/lib/cn";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -270,12 +271,7 @@ export function DeployForm({
           )}
         </div>
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         <Button type="submit" loading={submitting} disabled={!selected}>
           <Rocket className="h-4 w-4" />

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Rocket, Boxes, AlertCircle, ShieldAlert } from "lucide-react";
+import { Rocket, Boxes, ShieldAlert } from "lucide-react";
 import {
   searchHf,
   inspectHf,
@@ -14,6 +14,7 @@ import {
 import { cn } from "@/lib/cn";
 import { useToast } from "../../Toast";
 import {
+  Alert,
   Badge,
   type BadgeTone,
   Button,
@@ -179,10 +180,9 @@ export function HfSearchSeed({
       </form>
 
       {error && (
-        <p className="mt-3 flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+        <Alert tone="err" className="mt-3">
           {error}
-        </p>
+        </Alert>
       )}
 
       {results && (
@@ -238,10 +238,7 @@ export function HfSearchSeed({
                   <p className="text-xs text-muted-foreground">{inspect.reason}</p>
                 )}
                 {inspect.runtime_note && (
-                  <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-                    <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    Runtime: {inspect.runtime_note}
-                  </p>
+                  <Alert tone="warn">Runtime: {inspect.runtime_note}</Alert>
                 )}
                 {inspect.needs_trust_remote_code && (
                   <p className="flex items-start gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-400">

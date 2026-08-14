@@ -21,7 +21,7 @@ import {
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
-import { Badge, Button, Field, Select, TextInput } from "./ui";
+import { Alert, Badge, Button, Field, Select, TextInput } from "./ui";
 import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
 import { Toolbar } from "./patterns/Toolbar";
@@ -612,10 +612,9 @@ function SeedDialog({
         {card.reason && <p className="mb-3 text-xs text-muted-foreground">{card.reason}</p>}
 
         {card.runtime_note && (
-          <p className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <Alert tone="warn" className="mb-3">
             {card.runtime_note}
-          </p>
+          </Alert>
         )}
 
         <div className="space-y-3">
