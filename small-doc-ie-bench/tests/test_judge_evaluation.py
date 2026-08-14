@@ -179,7 +179,7 @@ def test_runner_evaluates_unlabeled_document_and_excludes_judge_profile(
     called_profiles = []
 
     class FakeExtractionService:
-        def __init__(self, profile):
+        def __init__(self, profile, profiles=None):
             called_profiles.append(profile.name)
 
         async def extract_from_file(self, **kwargs):
