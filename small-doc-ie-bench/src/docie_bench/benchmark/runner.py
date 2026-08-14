@@ -411,7 +411,9 @@ async def run_benchmark(
                 "routed"
                 if routing_active
                 else (
-                    f"pipeline:{profile_options.get('ocr_backend', 'tesseract')}"
+                    f"pipeline:vlm:{profile_options.get('ocr_model')}"
+                    if profile_kind == "pipeline" and profile_options.get("ocr_model")
+                    else f"pipeline:{profile_options.get('ocr_backend', 'tesseract')}"
                     if profile_kind == "pipeline"
                     else "vision"
                     if profile.vision

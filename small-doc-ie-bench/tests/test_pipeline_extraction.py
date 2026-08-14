@@ -8,10 +8,12 @@ plain-OCR branch, which OCRs with the GLOBAL default backend (ignoring the
 profile's own options) and then tries to call the pipeline profile itself
 as if it were a real LLM (it isn't -- the real work is delegated to
 options.extractor). These tests cover the fix: ExtractionService now
-dispatches kind="pipeline" to its own OCR step (honoring options.ocr_backend)
-followed by a delegated extract_from_text call on the resolved extractor
-profile, reusing 100% of the normal text-extraction machinery (prompts,
-schema validation, grounding, nuextract normalization) unchanged.
+dispatches kind="pipeline" to its own OCR step -- EITHER a built-in backend
+(options.ocr_backend) or a deployed vision model doing VLM-as-OCR
+(options.ocr_model) -- followed by a delegated extract_from_text call on the
+resolved extractor profile, reusing 100% of the normal text-extraction
+machinery (prompts, schema validation, grounding, nuextract normalization)
+unchanged.
 """
 
 from __future__ import annotations
@@ -19,11 +21,13 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation, OCRBlock
+from docie_bench.vision import DocumentImage
 
 
 class FakeBackend:
@@ -62,6 +66,49 @@ def _extractor_profile(kind: str = "passthrough") -> ModelProfile:
         api_key="test",
         kind=kind,
     )
+
+
+def _vision_profile(*, kind: str = "passthrough", vision: bool = True) -> ModelProfile:
+    return ModelProfile(
+        name="vision-profile",
+        model="vision-model",
+        base_url="http://vision.test/v1",
+        api_key="test",
+        kind=kind,
+        vision=vision,
+    )
+
+
+class FakeHttpResponse:
+    def __init__(self, payload: object, status_code: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.text = str(payload)
+
+    def json(self) -> object:
+        return self._payload
+
+
+class FakeHttpClient:
+    """Stands in for `async with httpx.AsyncClient() as client: ...` --
+    _vlm_ocr_text constructs its own client per call (no DI, mirroring the
+    gateway's PipelineSolution having http_client injected instead), so the
+    test monkeypatches httpx.AsyncClient itself rather than passing a
+    transport."""
+
+    def __init__(self, response: FakeHttpResponse) -> None:
+        self.response = response
+        self.calls: list[dict] = []
+
+    async def __aenter__(self) -> FakeHttpClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def post(self, url: str, **kwargs: object) -> FakeHttpResponse:
+        self.calls.append({"url": url, **kwargs})
+        return self.response
 
 
 @pytest.mark.asyncio
@@ -156,13 +203,154 @@ async def test_pipeline_requires_passthrough_extractor() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_ocr_model_not_wired_yet() -> None:
-    profiles = {"extractor-profile": _extractor_profile()}
-    service = ExtractionService(
-        _pipeline_profile(ocr_model="some-vision-profile"), profiles=profiles
+async def test_pipeline_vlm_ocr_transcribes_then_delegates_to_extractor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    document = tmp_path / "invoice.png"
+    document.write_bytes(b"not a real png, never read")
+    captured: list[dict] = []
+    http_client = FakeHttpClient(
+        FakeHttpResponse({"choices": [{"message": {"content": "hello from the vlm"}}]})
     )
 
-    with pytest.raises(ValueError, match="ocr_model"):
+    async def fake_extract_blocks(self, **kwargs):
+        captured.append({"profile": self.profile.name, **kwargs})
+        return ExtractionResponse(
+            request_id="r1",
+            schema_name=kwargs["schema_name"],
+            model_profile=self.profile.name,
+            document_hash=kwargs["document_hash"],
+            result={},
+            validation=ExtractionValidation(valid=True),
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(
+        "docie_bench.extract.service.load_document_images",
+        lambda path, **kw: [DocumentImage(page=1, media_type="image/png", data=b"png")],
+    )
+    monkeypatch.setattr(
+        "docie_bench.extract.service.httpx.AsyncClient", lambda: http_client
+    )
+    monkeypatch.setattr(ExtractionService, "_extract_blocks", fake_extract_blocks)
+
+    profiles = {
+        "extractor-profile": _extractor_profile(),
+        "vision-profile": _vision_profile(),
+    }
+    service = ExtractionService(
+        _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
+    )
+
+    response = await service.extract_from_file(
+        path=document, ocr_backend_name="tesseract", schema_name="invoice"
+    )
+
+    # The vision model was called with the OCR transcription prompt + the
+    # image, not the extraction schema/prompt -- that's the extractor's job.
+    assert len(http_client.calls) == 1
+    sent = http_client.calls[0]["json"]
+    assert sent["model"] == "vision-model"
+    content = sent["messages"][0]["content"]
+    assert content[0]["type"] == "text"
+    assert "Transcribe" in content[0]["text"]
+    assert content[1]["type"] == "image_url"
+    # The vision model's transcription became the extractor's input text --
+    # not the pipeline profile's own (unused) endpoint.
+    assert captured[0]["profile"] == "extractor-profile"
+    assert captured[0]["blocks"][0].text == "hello from the vlm"
+    assert captured[0]["document_hash"] is not None
+    assert response.model_profile == "pipeline-profile"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_vlm_ocr_requires_known_profile() -> None:
+    profiles = {"extractor-profile": _extractor_profile()}
+    service = ExtractionService(
+        _pipeline_profile(ocr_model="missing-vision-profile"), profiles=profiles
+    )
+
+    with pytest.raises(ValueError, match="not configured"):
         await service.extract_from_file(
-            path=Path("doc.txt"), ocr_backend_name="tesseract", schema_name="invoice"
+            path=Path("doc.png"), ocr_backend_name="tesseract", schema_name="invoice"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_vlm_ocr_requires_passthrough_vision_profile() -> None:
+    profiles = {
+        "extractor-profile": _extractor_profile(),
+        "vision-profile": _vision_profile(vision=False),  # not actually a vision model
+    }
+    service = ExtractionService(
+        _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
+    )
+
+    with pytest.raises(ValueError, match="vision deployment"):
+        await service.extract_from_file(
+            path=Path("doc.png"), ocr_backend_name="tesseract", schema_name="invoice"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_vlm_ocr_surfaces_upstream_http_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    document = tmp_path / "invoice.png"
+    document.write_bytes(b"not a real png, never read")
+    http_client = FakeHttpClient(FakeHttpResponse("model not found", status_code=404))
+
+    monkeypatch.setattr(
+        "docie_bench.extract.service.load_document_images",
+        lambda path, **kw: [DocumentImage(page=1, media_type="image/png", data=b"png")],
+    )
+    monkeypatch.setattr(
+        "docie_bench.extract.service.httpx.AsyncClient", lambda: http_client
+    )
+
+    profiles = {
+        "extractor-profile": _extractor_profile(),
+        "vision-profile": _vision_profile(),
+    }
+    service = ExtractionService(
+        _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
+    )
+
+    with pytest.raises(ValueError, match="404"):
+        await service.extract_from_file(
+            path=document, ocr_backend_name="tesseract", schema_name="invoice"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_vlm_ocr_surfaces_upstream_unreachable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    document = tmp_path / "invoice.png"
+    document.write_bytes(b"not a real png, never read")
+
+    class UnreachableHttpClient(FakeHttpClient):
+        async def post(self, url: str, **kwargs: object) -> FakeHttpResponse:
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(
+        "docie_bench.extract.service.load_document_images",
+        lambda path, **kw: [DocumentImage(page=1, media_type="image/png", data=b"png")],
+    )
+    monkeypatch.setattr(
+        "docie_bench.extract.service.httpx.AsyncClient",
+        lambda: UnreachableHttpClient(FakeHttpResponse({})),
+    )
+
+    profiles = {
+        "extractor-profile": _extractor_profile(),
+        "vision-profile": _vision_profile(),
+    }
+    service = ExtractionService(
+        _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
+    )
+
+    with pytest.raises(ValueError, match="unreachable"):
+        await service.extract_from_file(
+            path=document, ocr_backend_name="tesseract", schema_name="invoice"
         )
