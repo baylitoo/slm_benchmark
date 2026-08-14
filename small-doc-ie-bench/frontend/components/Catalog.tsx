@@ -5,7 +5,6 @@ import {
   Rocket,
   Info,
   AlertCircle,
-  X,
   Flame,
   Download,
   Heart,
@@ -21,7 +20,7 @@ import {
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
-import { Alert, Badge, Button, Checkbox, Field, Segmented, Select, TextInput } from "./ui";
+import { Alert, Badge, Button, Checkbox, Dialog, Field, Segmented, Select, TextInput } from "./ui";
 import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
 import { Toolbar } from "./patterns/Toolbar";
@@ -558,70 +557,17 @@ function SeedDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden />
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={`Seed ${card.id}`}
-        className="relative z-10 w-full max-w-md rounded-lg border border-border bg-card p-5 shadow-elevated"
-      >
-        <div className="mb-3 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h3 className="text-sm font-semibold text-foreground">Seed model</h3>
-            <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground" title={card.id}>
-              {card.id}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="-m-1 grid h-8 w-8 place-items-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="mb-3 flex flex-wrap items-center gap-1.5">
-          <TierBadge tier={tierOf(card)} />
-          <FitBadge card={card} />
-          {card.architecture && <Badge tone="neutral">arch: {card.architecture}</Badge>}
-          {card.param_label && <Badge tone="neutral">{card.param_label}</Badge>}
-        </div>
-
-        {card.reason && <p className="mb-3 text-xs text-muted-foreground">{card.reason}</p>}
-
-        {card.runtime_note && (
-          <Alert tone="warn" className="mb-3">
-            {card.runtime_note}
-          </Alert>
-        )}
-
-        <div className="space-y-3">
-          <Field
-            label="Family"
-            hint={
-              tierOf(card) === "override"
-                ? "No confirmed family for this architecture — pick one to try."
-                : "Suggested from the architecture — override if needed."
-            }
-          >
-            <Select value={family} onChange={(e) => setFamily(e.target.value)}>
-              {!family && <option value="">Select a family…</option>}
-              <FamilyOptions families={families} />
-            </Select>
-          </Field>
-          <Field label="Quantization" hint="Optional — a preference; the server falls back per repo.">
-            <TextInput
-              value={quant}
-              onChange={(e) => setQuant(e.target.value)}
-              placeholder="e.g. Q4_K_M"
-            />
-          </Field>
-        </div>
-
-        <div className="mt-4 flex items-center justify-end gap-2">
+    <Dialog
+      open
+      onClose={onClose}
+      title="Seed model"
+      subtitle={
+        <span className="font-mono" title={card.id}>
+          {card.id}
+        </span>
+      }
+      footer={
+        <>
           <Button variant="secondary" size="sm" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
@@ -629,8 +575,46 @@ function SeedDialog({
             <Rocket className="h-3.5 w-3.5" />
             Download &amp; seed
           </Button>
-        </div>
+        </>
+      }
+    >
+      <div className="mb-3 flex flex-wrap items-center gap-1.5">
+        <TierBadge tier={tierOf(card)} />
+        <FitBadge card={card} />
+        {card.architecture && <Badge tone="neutral">arch: {card.architecture}</Badge>}
+        {card.param_label && <Badge tone="neutral">{card.param_label}</Badge>}
       </div>
-    </div>
+
+      {card.reason && <p className="mb-3 text-xs text-muted-foreground">{card.reason}</p>}
+
+      {card.runtime_note && (
+        <Alert tone="warn" className="mb-3">
+          {card.runtime_note}
+        </Alert>
+      )}
+
+      <div className="space-y-3">
+        <Field
+          label="Family"
+          hint={
+            tierOf(card) === "override"
+              ? "No confirmed family for this architecture — pick one to try."
+              : "Suggested from the architecture — override if needed."
+          }
+        >
+          <Select value={family} onChange={(e) => setFamily(e.target.value)}>
+            {!family && <option value="">Select a family…</option>}
+            <FamilyOptions families={families} />
+          </Select>
+        </Field>
+        <Field label="Quantization" hint="Optional — a preference; the server falls back per repo.">
+          <TextInput
+            value={quant}
+            onChange={(e) => setQuant(e.target.value)}
+            placeholder="e.g. Q4_K_M"
+          />
+        </Field>
+      </div>
+    </Dialog>
   );
 }
