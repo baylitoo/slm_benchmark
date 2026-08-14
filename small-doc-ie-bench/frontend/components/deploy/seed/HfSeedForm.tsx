@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { PackagePlus, Plus, AlertCircle } from "lucide-react";
+import { PackagePlus, Plus } from "lucide-react";
 import {
   getHfRepo,
   seedHf,
@@ -12,7 +12,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { useToast } from "../../Toast";
-import { Button, Card, Field, Select, TextInput } from "../../ui";
+import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { errText, FamilyOptions } from "../shared";
 
@@ -178,12 +178,7 @@ export function HfSeedForm({
           </>
         )}
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         <Button type="submit" loading={submitting}>
           <Plus className="h-4 w-4" />

@@ -11,7 +11,7 @@ import { getRealtimeToken, type RealtimeToken } from "@/lib/api";
 import { JsonView } from "./JsonView";
 import { PollingResult } from "./PollingResult";
 import { ProgressView } from "./ProgressBar";
-import { Badge, type BadgeTone } from "./ui";
+import { Alert, Badge, type BadgeTone } from "./ui";
 
 // If the subscription connects but NO message (status/progress heartbeat or a
 // terminal topic) arrives within this window, the realtime publish was likely
@@ -167,9 +167,7 @@ export function RealtimeResult({
       {errTopic !== undefined && (
         <Section label="Error">
           {errorText(errTopic) ? (
-            <p className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-              {errorText(errTopic)}
-            </p>
+            <Alert tone="err">{errorText(errTopic)}</Alert>
           ) : (
             <JsonView value={errTopic} maxHeight="8rem" />
           )}

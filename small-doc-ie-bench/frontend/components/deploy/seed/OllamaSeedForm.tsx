@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { PackagePlus, Plus, AlertCircle } from "lucide-react";
+import { PackagePlus, Plus } from "lucide-react";
 import { seedOllama, type ModelFamily, type TriggerResponse } from "@/lib/api";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../../Toast";
-import { Button, Card, Field, Select, TextInput } from "../../ui";
+import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { FamilyOptions } from "../shared";
 
@@ -121,12 +121,7 @@ export function SeedForm({
           </Field>
         )}
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         <Button type="submit" variant="secondary" loading={submitting}>
           <Plus className="h-4 w-4" />

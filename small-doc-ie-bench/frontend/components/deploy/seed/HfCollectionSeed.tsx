@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Boxes, Plus, AlertCircle } from "lucide-react";
+import { Boxes, Plus } from "lucide-react";
 import {
   getHfCollection,
   seedHf,
@@ -9,7 +9,7 @@ import {
   type TriggerResponse,
 } from "@/lib/api";
 import { useToast } from "../../Toast";
-import { Badge, Button, Card, Field, Select, TextInput } from "../../ui";
+import { Alert, Badge, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { errText, FamilyOptions } from "../shared";
 
@@ -165,12 +165,7 @@ export function HfCollectionSeed({
           </>
         )}
 
-        {error && (
-          <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         {triggers.map(({ repo, trigger }) => (
           <details key={trigger.channel} className="rounded-md border border-border p-3" open>

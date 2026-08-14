@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Gauge, Play, AlertCircle, Download } from "lucide-react";
+import { Gauge, Play, Download } from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
@@ -21,7 +21,7 @@ import {
 import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
-import { Badge, Button, Card, Field, Select, TextInput } from "./ui";
+import { Alert, Badge, Button, Card, Field, Select, TextInput } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
@@ -166,12 +166,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
               </Field>
             </div>
 
-            {error && (
-              <p className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
-                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                {error}
-              </p>
-            )}
+            {error && <Alert tone="err">{error}</Alert>}
 
             <Button type="submit" loading={submitting}>
               <Play className="h-4 w-4" />

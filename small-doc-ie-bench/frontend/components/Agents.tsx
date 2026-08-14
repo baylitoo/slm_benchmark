@@ -54,7 +54,7 @@ import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
-import { Badge, Button, Card, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
+import { Alert, Badge, Button, Card, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
 import { Table, type Column } from "./patterns/Table";
 
@@ -523,11 +523,7 @@ function TryPanel({ agent }: { agent: AgentView }) {
           )}
         </div>
 
-        {error && (
-          <p className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-400">
-            {error}
-          </p>
-        )}
+        {error && <Alert tone="err">{error}</Alert>}
 
         {result && (
           <div className="space-y-2">
