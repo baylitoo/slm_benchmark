@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -194,3 +195,53 @@ def test_comparison_endpoint_rejects_run_without_metrics_yet(tmp_path: Path, mon
     )
 
     assert resp.status_code == 409
+
+
+def test_comparison_endpoint_reports_failed_run_as_unprocessable_not_409(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    _complete_run(store, event_id="base", tenant="tenant-a", rows=[_row("one", correct=True)])
+    store.claim(event_id="cand", idempotency_key="k-cand", tenant_id="tenant-a", dataset="ds")
+    store.fail(event_id="cand", error="model unreachable")
+    client = _client_with_store(store, monkeypatch)
+
+    resp = client.post(
+        "/v1/studio/comparisons",
+        json={"baseline_event_id": "base", "candidate_event_id": "cand"},
+        headers={"X-API-Key": "secret-a"},
+    )
+
+    # A failed run will never produce metrics -- distinct from "still running"
+    # (409) so a client doesn't poll/retry forever.
+    assert resp.status_code == 422
+    assert "model unreachable" in resp.json()["detail"]
+
+
+def test_comparison_endpoint_rejects_malformed_metrics_shape(tmp_path: Path, monkeypatch) -> None:
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    _complete_run(store, event_id="base", tenant="tenant-a", rows=[_row("one", correct=True)])
+    # A metrics_json row missing "rows" (shape drift, hand-edited row) has no
+    # file-read boundary to reject it at the way the CLI's compare_runs does.
+    store.claim(event_id="cand", idempotency_key="k-cand", tenant_id="tenant-a", dataset="ds")
+    store.complete(event_id="cand", metrics={"not_rows": "oops"}, artifacts=[])
+    client = _client_with_store(store, monkeypatch)
+
+    resp = client.post(
+        "/v1/studio/comparisons",
+        json={"baseline_event_id": "base", "candidate_event_id": "cand"},
+        headers={"X-API-Key": "secret-a"},
+    )
+
+    assert resp.status_code == 422
+    assert "missing rows" in resp.json()["detail"]
+
+
+def test_build_comparison_payload_rejects_malformed_metrics_shape() -> None:
+    with pytest.raises(ValueError, match="missing rows"):
+        build_comparison_payload(
+            {"not_rows": "oops"},
+            {"rows": [_row("one", correct=True)]},
+            baseline_meta={},
+            candidate_meta={},
+        )

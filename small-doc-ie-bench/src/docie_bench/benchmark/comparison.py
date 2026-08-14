@@ -70,8 +70,12 @@ def build_comparison_payload(
     No filesystem/blob I/O -- callers (the CLI's ``compare_runs``, or a Studio
     API route reading two ``StudioRun.metrics_json`` rows straight out of
     Postgres) own retrieving the metrics and describing their own provenance
-    via ``baseline_meta``/``candidate_meta``.
+    via ``baseline_meta``/``candidate_meta``. Shape IS validated here (unlike
+    metrics loaded from a trusted local file via ``compare_runs``, a DB-sourced
+    caller has no file-read boundary to reject a malformed contract at).
     """
+    _ensure_metrics_shape(baseline_metrics, "baseline")
+    _ensure_metrics_shape(candidate_metrics, "candidate")
     baseline_observations = _observations(baseline_metrics)
     candidate_observations = _observations(candidate_metrics)
     comparisons = _compare_observations(baseline_observations, candidate_observations)
@@ -224,6 +228,11 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict) or not isinstance(value.get("rows"), list):
         raise ValueError(f"Incompatible metrics file (missing rows): {path}")
     return value
+
+
+def _ensure_metrics_shape(metrics: dict[str, Any], label: str) -> None:
+    if not isinstance(metrics, dict) or not isinstance(metrics.get("rows"), list):
+        raise ValueError(f"Incompatible {label} metrics (missing rows)")
 
 
 def _source_metadata(path: Path) -> dict[str, str]:

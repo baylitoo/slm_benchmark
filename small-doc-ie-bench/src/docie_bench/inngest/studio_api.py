@@ -564,27 +564,41 @@ async def create_comparison(payload: ComparisonRequest, tenant: TenantDependency
         raise HTTPException(status_code=404, detail="Run not found", headers=_DOMAIN_404)
     for label, run in (("baseline", baseline), ("candidate", candidate)):
         if not run.get("metrics"):
+            if run["status"] == "failed":
+                # Permanently unusable -- distinct from "running" so a client
+                # doesn't poll/retry a comparison that can never succeed.
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label} run {run['event_id']!r} failed and has no metrics "
+                    f"to compare: {run.get('error') or 'no error detail recorded'}",
+                )
             raise HTTPException(
                 status_code=409,
                 detail=f"{label} run {run['event_id']!r} has no metrics yet "
                 f"(status={run['status']!r}) -- wait for it to complete",
             )
-    return build_comparison_payload(
-        baseline["metrics"],
-        candidate["metrics"],
-        baseline_meta={
-            "event_id": baseline["event_id"],
-            "dataset": baseline["dataset"],
-            "model_profile": baseline["model_profile"],
-            "created_at": baseline["created_at"],
-        },
-        candidate_meta={
-            "event_id": candidate["event_id"],
-            "dataset": candidate["dataset"],
-            "model_profile": candidate["model_profile"],
-            "created_at": candidate["created_at"],
-        },
-    )
+    try:
+        return build_comparison_payload(
+            baseline["metrics"],
+            candidate["metrics"],
+            baseline_meta={
+                "event_id": baseline["event_id"],
+                "dataset": baseline["dataset"],
+                "model_profile": baseline["model_profile"],
+                "created_at": baseline["created_at"],
+            },
+            candidate_meta={
+                "event_id": candidate["event_id"],
+                "dataset": candidate["dataset"],
+                "model_profile": candidate["model_profile"],
+                "created_at": candidate["created_at"],
+            },
+        )
+    except ValueError as exc:
+        # A malformed metrics_json row (shape drift, hand-edited DB row) has no
+        # file-read boundary to reject it at the way the CLI's Path-based
+        # compare_runs does -- surface it as a client-facing 422, not a 500.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/artifacts/{artifact_id}")
