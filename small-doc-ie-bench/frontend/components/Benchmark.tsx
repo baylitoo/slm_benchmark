@@ -61,6 +61,12 @@ export function Benchmark({ view = "run" }: { view?: string }) {
 
   const [dataset, setDataset] = useState("");
   const [modelProfile, setModelProfile] = useState("");
+  // The Select below only lists live deployments -- a models.yaml profile
+  // that's never been deployed (e.g. a kind="pipeline" OCR->LLM profile,
+  // which has no base_url/model of its own to deploy in the first place)
+  // was otherwise unreachable from this tab. Mirrors Agents Create's own
+  // "Custom reference" escape hatch for the same underlying gap.
+  const [customModelProfile, setCustomModelProfile] = useState(false);
   const [schemaName, setSchemaName] = useState("invoice");
   const [concurrency, setConcurrency] = useState("1");
   const [submitting, setSubmitting] = useState(false);
@@ -135,16 +141,42 @@ export function Benchmark({ view = "run" }: { view?: string }) {
             <div className="grid gap-4 sm:grid-cols-3">
               <Field
                 label="Model profile"
-                hint="A live deployment, or leave empty for the default profile."
+                hint="A live deployment, a models.yaml profile by name (e.g. a pipeline OCR->LLM profile -- pick Custom), or leave empty for the default."
               >
-                <Select value={modelProfile} onChange={(e) => setModelProfile(e.target.value)}>
+                <Select
+                  value={
+                    customModelProfile
+                      ? "__custom__"
+                      : modelOptions.includes(modelProfile)
+                        ? modelProfile
+                        : ""
+                  }
+                  onChange={(e) => {
+                    if (e.target.value === "__custom__") {
+                      setCustomModelProfile(true);
+                      setModelProfile("");
+                    } else {
+                      setCustomModelProfile(false);
+                      setModelProfile(e.target.value);
+                    }
+                  }}
+                >
                   <option value="">(default)</option>
                   {modelOptions.map((n) => (
                     <option key={n} value={n}>
                       {n}
                     </option>
                   ))}
+                  <option value="__custom__">Custom (models.yaml profile name)…</option>
                 </Select>
+                {customModelProfile && (
+                  <TextInput
+                    className="mt-2"
+                    value={modelProfile}
+                    onChange={(e) => setModelProfile(e.target.value)}
+                    placeholder="profile name from models.yaml"
+                  />
+                )}
               </Field>
               <Field label="Schema name">
                 <Select value={schemaName} onChange={(e) => setSchemaName(e.target.value)}>
