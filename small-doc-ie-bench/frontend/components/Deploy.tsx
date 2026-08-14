@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Rocket, PackagePlus, X } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Rocket, PackagePlus } from "lucide-react";
 import {
   getStore,
   getFamilies,
@@ -13,8 +13,7 @@ import {
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
-import { cn } from "@/lib/cn";
-import { Button } from "./ui";
+import { Button, Sheet } from "./ui";
 import { Sizing } from "./Sizing";
 import { Catalog } from "./Catalog";
 import { PageHeader } from "./patterns/PageHeader";
@@ -117,83 +116,16 @@ export function Deploy({
         />
       )}
 
-      {/* Slide-overs: both forms stay mounted; only visibility toggles. */}
-      <div
-        className={cn(
-          "fixed inset-0 z-40 bg-black/40 transition-opacity duration-200",
-          slideOver ? "opacity-100" : "pointer-events-none opacity-0",
-        )}
-        onClick={() => setSlideOver(null)}
-        aria-hidden
-      />
-      <SlideOverPanel open={slideOver === "deploy"} onClose={() => setSlideOver(null)}>
+      {/* Slide-overs: both forms stay mounted; only visibility toggles. Each
+          Sheet carries its own backdrop -- harmless with only one ever open
+          at a time (single `slideOver` state), see ui.tsx's own note on this
+          tradeoff versus the single shared backdrop this used to hand-roll. */}
+      <Sheet open={slideOver === "deploy"} onClose={() => setSlideOver(null)}>
         <DeployForm store={store} active={active} onDeployed={() => deployments.refresh()} />
-      </SlideOverPanel>
-      <SlideOverPanel open={slideOver === "seed"} onClose={() => setSlideOver(null)}>
+      </Sheet>
+      <Sheet open={slideOver === "seed"} onClose={() => setSlideOver(null)}>
         <AddModelForm families={families.data} onSeeded={() => store.refresh()} />
-      </SlideOverPanel>
+      </Sheet>
     </div>
-  );
-}
-
-/**
- * Right-hand slide-over. Persistently mounted; slides off-screen when closed so
- * its children (a form + any in-flight ResultPanel) keep their state.
- *
- * A11y: while closed the panel is off-screen but still in the DOM, so without
- * `inert` its buttons/inputs would stay in the tab order and reachable by
- * screen readers. `inert={!open}` makes the whole subtree non-focusable and
- * a11y-hidden when closed while preserving the translate-x slide animation and
- * the persistent mount (form state / in-flight ResultPanel survive). On open we
- * move focus into the panel (standard dialog behavior).
- */
-function SlideOverPanel({
-  open,
-  onClose,
-  children,
-}: {
-  open: boolean;
-  onClose: () => void;
-  children: React.ReactNode;
-}) {
-  const closeRef = useRef<HTMLButtonElement>(null);
-  const openerRef = useRef<HTMLElement | null>(null);
-  const wasOpen = useRef(open);
-
-  useEffect(() => {
-    if (open && !wasOpen.current) {
-      // Opening: remember the trigger, move focus into the panel.
-      openerRef.current = document.activeElement as HTMLElement | null;
-      closeRef.current?.focus();
-    } else if (!open && wasOpen.current) {
-      // Closing: return focus to the trigger that opened it, not <body>.
-      openerRef.current?.focus();
-      openerRef.current = null;
-    }
-    wasOpen.current = open;
-  }, [open]);
-
-  return (
-    <aside
-      inert={!open}
-      aria-hidden={!open}
-      className={cn(
-        "fixed inset-y-0 right-0 z-50 flex w-full max-w-xl flex-col bg-background shadow-elevated transition-transform duration-200",
-        open ? "translate-x-0" : "translate-x-full",
-      )}
-    >
-      <div className="flex items-center justify-end border-b border-border px-3 py-2">
-        <button
-          ref={closeRef}
-          type="button"
-          onClick={onClose}
-          aria-label="Close panel"
-          className="grid h-8 w-8 place-items-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
-        >
-          <X className="h-4 w-4" />
-        </button>
-      </div>
-      <div className="scroll-thin flex-1 overflow-y-auto p-4">{children}</div>
-    </aside>
   );
 }
