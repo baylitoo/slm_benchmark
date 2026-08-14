@@ -54,7 +54,7 @@ import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
-import { Alert, Badge, Button, Card, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
+import { Alert, Badge, Button, Card, Checkbox, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
 import { Table, type Column } from "./patterns/Table";
 
@@ -981,30 +981,20 @@ function CreateView({
                   <p className="mb-1.5 text-xs font-medium text-foreground">Entities</p>
                   <div className="grid grid-cols-2 gap-1.5">
                     {PII_ENTITIES.map((entity) => (
-                      <label
+                      <Checkbox
                         key={entity}
-                        className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={entities.includes(entity)}
-                          onChange={() => toggleEntity(entity)}
-                          className="h-3.5 w-3.5"
-                        />
-                        {entity.replaceAll("_", " ").toLowerCase()}
-                      </label>
+                        checked={entities.includes(entity)}
+                        onChange={() => toggleEntity(entity)}
+                        label={entity.replaceAll("_", " ").toLowerCase()}
+                      />
                     ))}
                   </div>
                 </div>
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90">
-                  <input
-                    type="checkbox"
-                    checked={restorePii}
-                    onChange={(e) => setRestorePii(e.target.checked)}
-                    className="h-3.5 w-3.5"
-                  />
-                  Restore original values in the response
-                </label>
+                <Checkbox
+                  checked={restorePii}
+                  onChange={(e) => setRestorePii(e.target.checked)}
+                  label="Restore original values in the response"
+                />
                 <Field
                   label="Guard model"
                   htmlFor="agent-guard-model"
@@ -1075,24 +1065,18 @@ function CreateView({
                       </p>
                       <div className="grid gap-1.5">
                         {GUARD_TASKS.map((task) => (
-                          <label
+                          <Checkbox
                             key={task}
-                            className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90"
-                          >
-                            <input
-                              type="checkbox"
-                              checked={guardTasks.includes(task)}
-                              onChange={() =>
-                                setGuardTasks((prev) =>
-                                  prev.includes(task)
-                                    ? prev.filter((t) => t !== task)
-                                    : [...prev, task],
-                                )
-                              }
-                              className="h-3.5 w-3.5"
-                            />
-                            {task.replaceAll("_", " ")}
-                          </label>
+                            checked={guardTasks.includes(task)}
+                            onChange={() =>
+                              setGuardTasks((prev) =>
+                                prev.includes(task)
+                                  ? prev.filter((t) => t !== task)
+                                  : [...prev, task],
+                              )
+                            }
+                            label={task.replaceAll("_", " ")}
+                          />
                         ))}
                       </div>
                       <p className="mt-1 text-xs text-muted-foreground">
@@ -1102,16 +1086,11 @@ function CreateView({
                         check.
                       </p>
                     </div>
-                    <label className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90">
-                      <input
-                        type="checkbox"
-                        checked={guardFallback}
-                        onChange={(e) => setGuardFallback(e.target.checked)}
-                        className="h-3.5 w-3.5"
-                      />
-                      Degrade to regex analysis if the guard is unreachable
-                      (default: fail closed)
-                    </label>
+                    <Checkbox
+                      checked={guardFallback}
+                      onChange={(e) => setGuardFallback(e.target.checked)}
+                      label="Degrade to regex analysis if the guard is unreachable (default: fail closed)"
+                    />
                   </>
                 )}
               </div>
