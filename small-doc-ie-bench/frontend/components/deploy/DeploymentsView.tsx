@@ -32,7 +32,7 @@ import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
-import { Alert, Badge, Button, Card, Field, TextInput } from "../ui";
+import { Alert, Badge, Button, Card, Field, Segmented, TextInput } from "../ui";
 import { LiveIndicator } from "../LiveIndicator";
 import { Toolbar } from "../patterns/Toolbar";
 import { ResultLine } from "../patterns/ResultLine";
@@ -607,38 +607,6 @@ export function DeploymentsView({
       render: (r) => <PhaseChip record={r} />,
     },
     {
-      key: "rss",
-      header: "RSS",
-      sortAccessor: (r) => r.observed?.rss_bytes ?? 0,
-      render: (r) =>
-        r.observed?.rss_bytes ? (
-          <span className="font-mono tabular-nums text-xs">
-            {formatBytes(r.observed.rss_bytes)}
-          </span>
-        ) : (
-          <span className="text-muted-foreground">—</span>
-        ),
-    },
-    {
-      key: "speed",
-      header: "Speed",
-      sortAccessor: (r) => r.observed?.tokens_per_second ?? 0,
-      render: (r) => <ThroughputCell record={r} />,
-    },
-    {
-      key: "endpoint",
-      header: "Endpoint",
-      className: "max-w-[18rem]",
-      render: (r) =>
-        r.endpoint ? (
-          <span className="block truncate font-mono text-xs text-muted-foreground" title={r.endpoint}>
-            {r.endpoint}
-          </span>
-        ) : (
-          <span className="text-muted-foreground">—</span>
-        ),
-    },
-    {
       key: "actions",
       header: "",
       className: "text-right",
@@ -717,34 +685,20 @@ export function DeploymentsView({
           placeholder="Filter by name, model, runtime…"
           className="h-8 w-64 text-xs"
         />
-        <div className="inline-flex rounded-md border border-border bg-card p-0.5 text-xs">
-          {(
-            [
-              ["all", "All"],
-              ["chat", "Chat"],
-              ["encoder", "Encoders"],
-              ["embedding", "Embeddings"],
-              ["reranker", "Rerankers"],
-            ] as ["all" | "chat" | "encoder" | "embedding" | "reranker", string][]
-          ).map(([t, label]) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => {
-                setTypeFilter(t);
-                setPage(1);
-              }}
-              className={cn(
-                "rounded px-2.5 py-1 transition",
-                typeFilter === t
-                  ? "bg-muted text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        <Segmented
+          value={typeFilter}
+          onChange={(t) => {
+            setTypeFilter(t);
+            setPage(1);
+          }}
+          options={[
+            { value: "all", label: "All" },
+            { value: "chat", label: "Chat" },
+            { value: "encoder", label: "Encoders" },
+            { value: "embedding", label: "Embeddings" },
+            { value: "reranker", label: "Rerankers" },
+          ]}
+        />
         <div className="ml-auto">
           <LiveIndicator
             live={deployments.live}
@@ -787,12 +741,40 @@ export function DeploymentsView({
         }}
         renderExpanded={(r) =>
           r.spec?.name ? (
-            <DeploymentLogsPanel
-              name={r.spec.name}
-              phase={derivePhase(r)}
-              busy={busy}
-              onRepair={(port) => act(r.spec!.name!, "repair", port)}
-            />
+            <div className="space-y-3">
+              {/* RSS/Speed/Endpoint used to be always-visible columns --
+                  collapsed here so the table stops scrolling horizontally
+                  at typical widths (was 11 columns wide). */}
+              <dl className="grid gap-4 text-xs sm:grid-cols-3">
+                <div>
+                  <dt className="text-muted-foreground">RSS</dt>
+                  <dd className="mt-0.5 font-mono tabular-nums text-foreground">
+                    {r.observed?.rss_bytes ? formatBytes(r.observed.rss_bytes) : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Speed</dt>
+                  <dd className="mt-0.5 text-foreground">
+                    <ThroughputCell record={r} />
+                  </dd>
+                </div>
+                <div className="min-w-0">
+                  <dt className="text-muted-foreground">Endpoint</dt>
+                  <dd
+                    className="mt-0.5 truncate font-mono text-foreground"
+                    title={r.endpoint ?? undefined}
+                  >
+                    {r.endpoint ?? "—"}
+                  </dd>
+                </div>
+              </dl>
+              <DeploymentLogsPanel
+                name={r.spec.name}
+                phase={derivePhase(r)}
+                busy={busy}
+                onRepair={(port) => act(r.spec!.name!, "repair", port)}
+              />
+            </div>
           ) : null
         }
       />
