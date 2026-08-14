@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useBackendHealth } from "@/lib/useBackendHealth";
 import { Playground } from "./Playground";
 import { Deploy } from "./Deploy";
@@ -25,6 +25,7 @@ export function AppShell() {
   // so navigating to Deploy→Ports silently reset the Agents create form.
   const router = useRouter();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [seg0, seg1] = pathname.split("/").filter(Boolean);
   const active: SectionId = isSection(seg0) ? seg0 : "playground";
   const urlView = isSection(seg0) ? seg1 : undefined;
@@ -41,9 +42,11 @@ export function AppShell() {
   const [collapsed, setCollapsed] = useState(false);
   const health = useBackendHealth();
 
-  function onNavigate(id: SectionId, nextView?: string) {
+  function onNavigate(id: SectionId, nextView?: string, query?: Record<string, string>) {
     const view = nextView ?? views[id] ?? DEFAULT_VIEW[id];
-    router.push(view ? `/${id}/${view}` : `/${id}`);
+    const path = view ? `/${id}/${view}` : `/${id}`;
+    const qs = query ? `?${new URLSearchParams(query)}` : "";
+    router.push(`${path}${qs}`);
   }
 
   // The active section reads the URL directly (no one-render lag); hidden
@@ -99,7 +102,13 @@ export function AppShell() {
                   {id === "playground" && (
                     <Playground active={active === "playground"} onNavigate={onNavigate} />
                   )}
-                  {id === "deploy" && <Deploy active={active === "deploy"} view={viewFor(id)} />}
+                  {id === "deploy" && (
+                    <Deploy
+                      active={active === "deploy"}
+                      view={viewFor(id)}
+                      filterQuery={active === "deploy" ? (searchParams.get("q") ?? undefined) : undefined}
+                    />
+                  )}
                   {id === "agents" && (
                     <Agents view={viewFor(id)} onNavigate={onNavigate} />
                   )}

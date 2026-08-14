@@ -37,12 +37,21 @@ const ACTIVITY_POLL_MS = 15000;
  * sub-view was dropped: it rendered the same tiles already shown here, a
  * strict subset with nothing the combined page lacks.
  */
+// Narrowed to this section's two deep-link targets, same trick Playground.tsx
+// (NavigateToDeploy) and Agents.tsx (NavigateWithinAgents) use -- AppShell's
+// onNavigate(id: SectionId, view?, query?) is a valid supertype.
+type NavigateFromObservability = (
+  id: "review" | "deploy",
+  view?: string,
+  query?: Record<string, string>,
+) => void;
+
 export function Observability({
   active = true,
   onNavigate,
 }: {
   active?: boolean;
-  onNavigate?: (id: "review") => void;
+  onNavigate?: NavigateFromObservability;
 }) {
   return (
     <div>
@@ -85,7 +94,7 @@ export function Observability({
         <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
           <ReviewQueueCard active={active} onNavigate={onNavigate} />
           <OcrCacheCard active={active} />
-          <ActivityCard active={active} />
+          <ActivityCard active={active} onNavigate={onNavigate} />
         </div>
         <Card
           title="Small Document IE Benchmark"
@@ -286,7 +295,13 @@ function replicaBadge(e: ActivityEntry): { tone: "ok" | "warn" | "neutral"; labe
   return { tone: "neutral", label: "no placement" };
 }
 
-function ActivityCard({ active }: { active: boolean }) {
+function ActivityCard({
+  active,
+  onNavigate,
+}: {
+  active: boolean;
+  onNavigate?: NavigateFromObservability;
+}) {
   const activity = usePolling<ActivityView>(getActivity, ACTIVITY_POLL_MS, active);
   const entries = activity.data?.entries ?? [];
   const detail = activity.data?.detail;
@@ -318,7 +333,18 @@ function ActivityCard({ active }: { active: boolean }) {
             const replicas = replicaBadge(e);
             return (
               <div key={e.model_name} className="flex items-center justify-between gap-2 text-sm">
-                <span className="truncate font-medium text-foreground">{e.model_name}</span>
+                {onNavigate ? (
+                  <button
+                    type="button"
+                    onClick={() => onNavigate("deploy", "deployments", { q: e.model_name })}
+                    title="Open in Deployments, filtered to this model"
+                    className="truncate font-medium text-foreground hover:text-accent hover:underline"
+                  >
+                    {e.model_name}
+                  </button>
+                ) : (
+                  <span className="truncate font-medium text-foreground">{e.model_name}</span>
+                )}
                 <div className="flex shrink-0 items-center gap-2">
                   <Badge tone="info">{e.window_count} req</Badge>
                   <Badge tone={replicas.tone}>{replicas.label}</Badge>
