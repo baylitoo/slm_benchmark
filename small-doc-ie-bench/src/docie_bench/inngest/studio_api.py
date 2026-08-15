@@ -24,8 +24,9 @@ import httpx
 import inngest
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from docie_bench.extract.routing import RoutingPolicy
 from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.inngest.functions import benchmark_idempotency_key
 from docie_bench.inngest.realtime import (
@@ -475,17 +476,98 @@ async def delete_dynamic_schema_route(name: str) -> dict[str, Any]:
     return {"deleted": name}
 
 
+@router.get("/routing-policies")
+async def list_routing_policies_route() -> list[dict[str, Any]]:
+    """Named ``RoutingPolicy``s saved via the Studio -- what the Benchmark
+    tab's "Routing policy" picker can reference beyond a raw server-side
+    filesystem path. Missing DATABASE_URL degrades to an empty list, same
+    contract as ``GET /schemas/dynamic``/``GET /model-profiles``.
+    """
+    from docie_bench.studio.routing_policies import list_routing_policies
+
+    return list_routing_policies()
+
+
+@router.get("/routing-policies/{name}")
+async def get_routing_policy_route(name: str) -> dict[str, Any]:
+    from docie_bench.studio.routing_policies import get_routing_policy
+
+    policy = get_routing_policy(name)
+    if policy is None:
+        raise HTTPException(
+            status_code=404, detail=f"routing policy {name!r} not found", headers=_DOMAIN_404
+        )
+    return policy
+
+
+class RoutingPolicyCreateRequest(BaseModel):
+    # max_length matches RoutingPolicyRecord.name's String(64) column -- reject
+    # an over-length name here with a 422 instead of a DB-layer DataError (the
+    # same overflow shape #194's review caught for the routing_label column).
+    name: str = Field(min_length=1, max_length=64)
+    policy: RoutingPolicy
+
+
+@router.post("/routing-policies", status_code=201)
+async def create_routing_policy_route(payload: RoutingPolicyCreateRequest) -> dict[str, Any]:
+    """Save a ``RoutingPolicy`` under a registry name so it can be referenced
+    from a benchmark trigger afterward, instead of every run needing a
+    server-side YAML file path.
+
+    ``RoutingPolicy`` (extract.routing) is already fully validated -- FastAPI
+    rejects a malformed policy (duplicate stage names, an unknown decision
+    literal, etc.) before this handler body even runs. This route is the
+    missing "define once, reuse by name" persistence layer, not new routing
+    logic. Create-only, matching the dynamic-schema/pipeline-profile routes
+    above: 409 on an existing name, no in-place update.
+    """
+    from docie_bench.studio.routing_policies import (
+        RoutingPolicyConflictError,
+        RoutingPolicyUnavailableError,
+        create_routing_policy,
+    )
+
+    try:
+        return create_routing_policy(payload.name, payload.policy)
+    except RoutingPolicyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RoutingPolicyUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.delete("/routing-policies/{name}")
+async def delete_routing_policy_route(name: str) -> dict[str, Any]:
+    from docie_bench.studio.routing_policies import (
+        RoutingPolicyNotFoundError,
+        RoutingPolicyUnavailableError,
+        delete_routing_policy,
+    )
+
+    try:
+        delete_routing_policy(name)
+    except RoutingPolicyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+    except RoutingPolicyUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"deleted": name}
+
+
 class BenchmarkRequest(BaseModel):
     dataset: str
     split: str | None = None
     model_profile: str | None = None
     # Server-side path to a routing-policy YAML (benchmark.routing_config.
     # load_routing_policy's own format -- see configs/routing-policy.example.yaml).
-    # Mutually exclusive with model_profile, same rule the CLI's --routing-policy/
-    # --model-profile pair already enforces (cli.py) -- a policy multi-stage-routes
-    # a document through several profiles; picking one profile up front makes no
-    # sense alongside that.
+    # Mutually exclusive with model_profile and routing_policy_name below, same
+    # rule the CLI's --routing-policy/--model-profile pair already enforces
+    # (cli.py) -- a policy multi-stage-routes a document through several
+    # profiles; picking one profile up front makes no sense alongside that.
     routing_policy: str | None = None
+    # Name of a RoutingPolicy saved via POST /routing-policies -- the
+    # discoverable alternative to routing_policy's raw filesystem path.
+    # Resolved to the saved policy at worker time (inngest.functions._run_
+    # benchmark_job), not here, since resolution needs a DB session.
+    routing_policy_name: str | None = None
     schema_name: str = "invoice"
     concurrency: int = 1
     repeat: int = 1
@@ -496,11 +578,13 @@ class BenchmarkRequest(BaseModel):
 
 @router.post("/benchmark", response_model=TriggerResponse)
 async def trigger_benchmark(payload: BenchmarkRequest, tenant: TenantDependency) -> TriggerResponse:
-    if payload.routing_policy and payload.model_profile:
+    routing_fields = [payload.routing_policy, payload.routing_policy_name, payload.model_profile]
+    if sum(1 for f in routing_fields if f) > 1:
         raise HTTPException(
             status_code=422,
-            detail="routing_policy cannot be combined with model_profile -- a routing "
-            "policy already selects which profile(s) a document runs through",
+            detail="routing_policy, routing_policy_name, and model_profile are mutually "
+            "exclusive -- a routing policy already selects which profile(s) a document "
+            "runs through",
         )
     channel = f"benchmark:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)

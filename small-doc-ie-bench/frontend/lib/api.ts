@@ -77,8 +77,12 @@ export interface BenchmarkRequest {
   model_profile?: string;
   /** Server-side path to a routing-policy YAML (multi-stage fallback/escalation
    * across several profiles — see configs/routing-policy.example.yaml). Mutually
-   * exclusive with model_profile; the backend 422s a request carrying both. */
+   * exclusive with model_profile and routing_policy_name; the backend 422s a
+   * request carrying more than one. */
   routing_policy?: string;
+  /** Name of a RoutingPolicy saved via createRoutingPolicy — the discoverable
+   * alternative to routing_policy's raw filesystem path. */
+  routing_policy_name?: string;
   schema_name?: string;
   concurrency?: number;
   repeat?: number;
@@ -1242,6 +1246,47 @@ export function createDynamicSchema(spec: DynamicSchemaSpec): Promise<DynamicSch
 export function deleteDynamicSchema(name: string): Promise<{ deleted: string }> {
   return request<{ deleted: string }>(
     `/v1/studio/schemas/dynamic/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Routing policies -- named RoutingPolicys saved via the Studio, the
+// discoverable/validated alternative to a raw server-side filesystem path
+// (BenchmarkRequest.routing_policy above). The policy shape itself
+// (extract/routing.py) is rich (multi-stage rules/selectors/budgets); this
+// slice doesn't mirror every field in TypeScript. The create route accepts
+// `policy` as opaque JSON and validates it server-side against
+// RoutingPolicy.model_validate, returning a 422 with details on a bad shape.
+// ---------------------------------------------------------------------------
+
+export interface RoutingPolicySummary {
+  name: string;
+  policy: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export function listRoutingPolicies(): Promise<RoutingPolicySummary[]> {
+  return request<RoutingPolicySummary[]>("/v1/studio/routing-policies");
+}
+
+/** Save a RoutingPolicy under a registry `name`. Create-only; a 409 means
+ * that name is already taken. `policy` is validated server-side before it's
+ * stored -- pass the parsed YAML/JSON body, not a string. */
+export function createRoutingPolicy(
+  name: string,
+  policy: Record<string, unknown>,
+): Promise<RoutingPolicySummary> {
+  return request<RoutingPolicySummary>("/v1/studio/routing-policies", {
+    method: "POST",
+    body: JSON.stringify({ name, policy }),
+  });
+}
+
+export function deleteRoutingPolicy(name: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(
+    `/v1/studio/routing-policies/${encodeURIComponent(name)}`,
     { method: "DELETE" },
   );
 }

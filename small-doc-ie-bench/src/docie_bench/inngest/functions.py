@@ -466,6 +466,7 @@ def benchmark_idempotency_key(data: dict[str, Any]) -> str:
         "split",
         "model_profile",
         "routing_policy",
+        "routing_policy_name",
         "schema_name",
         "concurrency",
         "repeat",
@@ -498,16 +499,42 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
     idempotency_key = benchmark_idempotency_key(data)
     tenant_id = str(data.get("tenant_id") or "anonymous")
     routing_policy = data.get("routing_policy")
+    routing_policy_name = data.get("routing_policy_name")
+    # A saved policy has no filesystem path -- run_benchmark only accepts
+    # routing_policy_path, so a named policy is materialized to a private temp
+    # file (JSON is valid YAML, so load_routing_policy's yaml.safe_load reads it
+    # unchanged) and cleaned up in the `finally` below regardless of outcome.
+    routing_policy_temp_file: str | None = None
+    if routing_policy_name:
+        from docie_bench.studio.routing_policies import get_routing_policy
+
+        saved_policy = get_routing_policy(routing_policy_name)
+        if saved_policy is None:
+            raise ValueError(f"routing policy {routing_policy_name!r} not found")
+        fd, routing_policy_temp_file = tempfile.mkstemp(
+            prefix="routing-policy-", suffix=".json"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(saved_policy["policy"], fh)
+        routing_policy = routing_policy_temp_file
     # StudioRun.model_profile is String(128) (studio/models.py) and Postgres raises
     # DataError on an over-length insert rather than truncating (unlike sqlite, which
     # is why an unbounded label wouldn't have failed the test suite). routing_policy
     # is an unbounded raw request path -- NOT runner.py's own "routed:<policy-
     # version>" label (that's the *parsed policy's* short version field, unavailable
     # here since the YAML hasn't been loaded yet at claim time). Use just the
-    # filename, hard-capped, so a long/nested config path can never overflow the
-    # column and crash this insert (which sits outside the try/except below, so a
-    # DataError here would propagate unhandled and retry-loop identically forever).
-    routing_label = f"routed:{Path(routing_policy).name}"[:128] if routing_policy else None
+    # filename (or the registry name, for a saved policy -- more informative than
+    # a random temp filename), hard-capped, so a long/nested config path can never
+    # overflow the column and crash this insert (which sits outside the try/except
+    # below, so a DataError here would propagate unhandled and retry-loop
+    # identically forever).
+    routing_label = (
+        f"routed:{routing_policy_name}"[:128]
+        if routing_policy_name
+        else f"routed:{Path(routing_policy).name}"[:128]
+        if routing_policy
+        else None
+    )
 
     # Idempotency: claim the run row BEFORE doing work. A redelivery (same
     # event id) or a duplicate trigger (same idempotency key) short-circuits to
@@ -530,26 +557,31 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
         logger.warning("no DATABASE_URL: benchmark artifacts are not durably indexed")
 
     try:
-        result = await run_benchmark(
-            dataset_path=dataset,
-            models_config_path=MODELS_CONFIG_PATH,
-            # Mutually exclusive (studio_api.py's trigger_benchmark already 422s a
-            # request carrying both) -- routing_policy_path wins here defensively
-            # rather than trusting that guard alone, since run_benchmark itself
-            # raises ValueError on both being set, which would fail the run instead
-            # of the request.
-            model_profile=data.get("model_profile") if not routing_policy else None,
-            routing_policy_path=Path(routing_policy) if routing_policy else None,
-            concurrency=int(data.get("concurrency", 1)),
-            repeat=int(data.get("repeat", 1)),
-            schema_name=data.get("schema_name", "invoice"),
-            language=data.get("language"),
-            split=data.get("split"),
-        )
-    except Exception as exc:  # noqa: BLE001 - record failure so the run can retry
-        if store.enabled:
-            store.fail(event_id=event_id, error=str(exc))
-        raise
+        try:
+            result = await run_benchmark(
+                dataset_path=dataset,
+                models_config_path=MODELS_CONFIG_PATH,
+                # Mutually exclusive (studio_api.py's trigger_benchmark already 422s a
+                # request carrying both) -- routing_policy_path wins here defensively
+                # rather than trusting that guard alone, since run_benchmark itself
+                # raises ValueError on both being set, which would fail the run instead
+                # of the request.
+                model_profile=data.get("model_profile") if not routing_policy else None,
+                routing_policy_path=Path(routing_policy) if routing_policy else None,
+                concurrency=int(data.get("concurrency", 1)),
+                repeat=int(data.get("repeat", 1)),
+                schema_name=data.get("schema_name", "invoice"),
+                language=data.get("language"),
+                split=data.get("split"),
+            )
+        except Exception as exc:  # noqa: BLE001 - record failure so the run can retry
+            if store.enabled:
+                store.fail(event_id=event_id, error=str(exc))
+            raise
+    finally:
+        if routing_policy_temp_file:
+            with contextlib.suppress(OSError):
+                os.unlink(routing_policy_temp_file)
 
     metrics: dict[str, Any] = {}
     try:
