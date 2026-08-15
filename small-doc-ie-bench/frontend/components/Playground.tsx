@@ -558,6 +558,24 @@ function SchemaBuilderSheet({
       setError("Document type is required.");
       return;
     }
+    // Catch the empty-fields case here rather than let it round-trip: the
+    // backend correctly 422s (DynamicSchemaSpec.fields requires at least one),
+    // but that error surfaces as a raw pydantic validation blob rather than
+    // guidance a non-developer operator can act on.
+    const namedFields = fields.filter((f) => f.name.trim());
+    if (namedFields.length === 0) {
+      setError("At least one named field is required.");
+      return;
+    }
+    const emptyListField = namedFields.find(
+      (f) => f.type === "list" && !f.subFields.some((s) => s.name.trim()),
+    );
+    if (emptyListField) {
+      setError(
+        `"${emptyListField.name.trim()}" is a list field and needs at least one named sub-field.`,
+      );
+      return;
+    }
     setSubmitting(true);
     try {
       const saved = await createDynamicSchema(toSpec());
