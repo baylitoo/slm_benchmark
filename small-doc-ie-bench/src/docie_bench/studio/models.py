@@ -18,6 +18,7 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -80,6 +81,31 @@ class StudioRunArtifact(Base):
     run: Mapped[StudioRun] = relationship(back_populates="artifacts")
 
 
+class DynamicSchema(Base):
+    """A named, reusable ``DynamicSchemaSpec`` (schemas.dynamic) saved from the
+    Studio's schema builder.
+
+    Shared operator config like ``models.yaml``/``data/datasets.yaml`` -- no
+    ``tenant_id``, unlike ``StudioRun``'s per-tenant scoping. Create-only for now
+    (409 on a duplicate ``name``): no version/lifecycle field, matching the "save
+    and reuse by name" scope of this first slice -- not the full draft/published
+    versioning the original roadmap brief described. ``name`` doubles as
+    ``DynamicSchemaSpec.document_type`` (both already share the same snake_case
+    pattern), so a saved schema's own name IS the identifier extraction requests
+    reference.
+    """
+
+    __tablename__ = "dynamic_schemas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    spec_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class StudioEventOwner(Base):
     """Lightweight event id -> triggering principal binding.
 
@@ -98,4 +124,4 @@ class StudioEventOwner(Base):
     )
 
 
-__all__ = ["StudioEventOwner", "StudioRun", "StudioRunArtifact", "utcnow"]
+__all__ = ["DynamicSchema", "StudioEventOwner", "StudioRun", "StudioRunArtifact", "utcnow"]

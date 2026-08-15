@@ -35,6 +35,7 @@ from docie_bench.inngest.realtime import (
     TOPIC_STATUS,
     subscription_token,
 )
+from docie_bench.schemas.dynamic import DynamicSchemaSpec
 from docie_bench.security import TenantDependency
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 from docie_bench.studio.store import RunStoreUnavailableError, default_run_store
@@ -63,6 +64,11 @@ class ExtractRequest(BaseModel):
     content_b64: str | None = None
     filename: str | None = None
     schema_name: str = "invoice"
+    # Name of a schema saved via POST /schemas/dynamic. Wins over schema_name
+    # when present -- ExtractionService already accepts schema_mode="dynamic" +
+    # dynamic_schema inline (extract/service.py), this just resolves the spec
+    # by name server-side instead of requiring the full field list every call.
+    dynamic_schema_name: str | None = None
     # Explicit live-deployment selector (a DeploymentRecord ``spec.name``). Wins
     # over ``model_profile``; forwarded verbatim into the event data (auto-included
     # by ``model_dump(exclude_none=True)`` below) for the worker's resolver.
@@ -397,6 +403,75 @@ async def delete_pipeline_profile_route(name: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
     except ProfileWriteError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"deleted": name}
+
+
+@router.get("/schemas/dynamic")
+async def list_dynamic_schemas_route() -> list[dict[str, Any]]:
+    """Named ``DynamicSchemaSpec``s saved via the Studio's schema builder --
+    what a "Schema name" field can reference beyond ``GET /schemas``' static
+    ``SCHEMA_REGISTRY`` names. Missing DATABASE_URL degrades to an empty list,
+    same contract as ``GET /datasets``/``GET /model-profiles``.
+    """
+    from docie_bench.studio.dynamic_schemas import list_dynamic_schemas
+
+    return list_dynamic_schemas()
+
+
+@router.get("/schemas/dynamic/{name}")
+async def get_dynamic_schema_route(name: str) -> dict[str, Any]:
+    from docie_bench.studio.dynamic_schemas import get_dynamic_schema
+
+    schema = get_dynamic_schema(name)
+    if schema is None:
+        raise HTTPException(
+            status_code=404, detail=f"schema {name!r} not found", headers=_DOMAIN_404
+        )
+    return schema
+
+
+@router.post("/schemas/dynamic", status_code=201)
+async def create_dynamic_schema_route(payload: DynamicSchemaSpec) -> dict[str, Any]:
+    """Save a ``DynamicSchemaSpec`` under its own ``document_type`` so it can be
+    referenced by name afterward, instead of an extraction request needing the
+    full field list inline every time.
+
+    ``DynamicSchemaSpec`` is already fully validated (schemas.dynamic) and
+    already compiles into a working pydantic model + NuExtract template at
+    extraction time -- this route is the missing "define once, reuse by name"
+    persistence layer, not new extraction logic. Create-only, matching the
+    pipeline/ocr profile routes above: 409 on an existing document_type, no
+    in-place update (delete + recreate is cheap here since this is a real
+    table, not a text file to splice).
+    """
+    from docie_bench.studio.dynamic_schemas import (
+        DynamicSchemaConflictError,
+        DynamicSchemaUnavailableError,
+        create_dynamic_schema,
+    )
+
+    try:
+        return create_dynamic_schema(payload)
+    except DynamicSchemaConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DynamicSchemaUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.delete("/schemas/dynamic/{name}")
+async def delete_dynamic_schema_route(name: str) -> dict[str, Any]:
+    from docie_bench.studio.dynamic_schemas import (
+        DynamicSchemaNotFoundError,
+        DynamicSchemaUnavailableError,
+        delete_dynamic_schema,
+    )
+
+    try:
+        delete_dynamic_schema(name)
+    except DynamicSchemaNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+    except DynamicSchemaUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"deleted": name}
 
 

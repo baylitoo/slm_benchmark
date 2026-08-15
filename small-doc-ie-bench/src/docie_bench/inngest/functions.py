@@ -318,6 +318,21 @@ def _stamp_deployment_recency(*, explicit: str | None, profile_name: str) -> Non
 async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     """Run one extraction from event data; returns a JSON-serializable result."""
     schema_name = data.get("schema_name", "invoice")
+    schema_mode = "static"
+    dynamic_schema: dict[str, Any] | None = None
+    dynamic_schema_name = data.get("dynamic_schema_name")
+    if dynamic_schema_name:
+        # ExtractionService already accepts schema_mode="dynamic" + an inline
+        # spec (extract/service.py) -- resolve the saved spec by name here so
+        # the caller doesn't have to supply the full field list every request.
+        from docie_bench.studio.dynamic_schemas import get_dynamic_schema
+
+        saved = get_dynamic_schema(dynamic_schema_name)
+        if saved is None:
+            raise ValueError(f"dynamic schema {dynamic_schema_name!r} not found")
+        schema_mode = "dynamic"
+        dynamic_schema = saved["spec"]
+        schema_name = dynamic_schema_name
     language = data.get("language")
     profile = _resolve_profile(
         model_profile=data.get("model_profile"), deployment=data.get("deployment")
@@ -331,6 +346,8 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
             text=text,
             ocr_blocks=None,
             schema_name=schema_name,
+            schema_mode=schema_mode,
+            dynamic_schema=dynamic_schema,
             language=language,
             document_hash=hash_bytes(text.encode("utf-8")),
             metadata={"source": "inngest"},
@@ -360,6 +377,8 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
             path=tmp_path,
             ocr_backend_name=data.get("ocr_backend") or settings.default_ocr_backend,
             schema_name=schema_name,
+            schema_mode=schema_mode,
+            dynamic_schema=dynamic_schema,
             language=language,
             metadata={"source": "inngest", "filename": filename},
         )
