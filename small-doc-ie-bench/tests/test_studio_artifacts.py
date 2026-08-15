@@ -342,6 +342,87 @@ def test_benchmark_job_resolves_saved_routing_policy_by_name(tmp_path: Path, mon
         dispose_engine()
 
 
+def test_benchmark_job_deduped_redelivery_does_not_leak_the_temp_policy_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Demonstrated regression: the saved-policy temp file used to be
+    # materialized BEFORE the idempotency claim, so a redelivery/duplicate
+    # trigger (outcome == "exists") returned early at the claim check without
+    # ever reaching the try/finally that deletes it -- every deduplicated
+    # call leaked a routing-policy-*.json file in the OS temp dir, and
+    # nothing ever garbage-collects them. Materialization is now deferred
+    # until past the dedup short-circuit.
+    import glob
+    import tempfile
+
+    from docie_bench.benchmark import runner as runner_mod
+    from docie_bench.extract.routing import RoutingPolicy, RoutingRule, RuleCondition, StagePolicy
+    from docie_bench.inngest import functions as fns
+    from docie_bench.storage.db import dispose_engine, init_engine
+    from docie_bench.studio.routing_policies import create_routing_policy
+
+    init_engine(f"sqlite:///{tmp_path / 'policies.db'}")
+    try:
+        create_routing_policy(
+            "cascade-a",
+            RoutingPolicy(
+                version="v1",
+                stages=[
+                    StagePolicy(
+                        name="ollama_qwen25_1b",
+                        rules=[
+                            RoutingRule(
+                                when=RuleCondition(status="success", validation_valid=True),
+                                decision="accept",
+                                reason="cleared the quality gate",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        )
+
+        store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+        monkeypatch.setattr("docie_bench.studio.store.default_run_store", lambda: store)
+
+        async def fake_run_benchmark(**_kwargs):
+            run_dir = tmp_path / "run"
+            run_dir.mkdir(exist_ok=True)
+            (run_dir / "metrics.json").write_text(json.dumps({"summary": [{"f1": 0.5}]}))
+            (run_dir / "report.html").write_text("<html>report</html>")
+            (run_dir / "predictions.jsonl").write_text('{"pred":1}\n')
+            return runner_mod.BenchmarkResult(
+                run_dir,
+                run_dir / "predictions.jsonl",
+                run_dir / "metrics.json",
+                run_dir / "report.html",
+                run_dir / "manifest.json",
+            )
+
+        monkeypatch.setattr(runner_mod, "run_benchmark", fake_run_benchmark)
+
+        data = {
+            "dataset": "ds",
+            "tenant_id": "t1",
+            "idempotency_key": "k1",
+            "routing_policy_name": "cascade-a",
+        }
+
+        def leaked_temp_files() -> set[str]:
+            return set(glob.glob(str(Path(tempfile.gettempdir()) / "routing-policy-*.json")))
+
+        before = leaked_temp_files()
+        asyncio.run(fns._run_benchmark_job(dict(data), event_id="ev1"))
+        # Same event id -> claim() returns "exists" -> early return, before
+        # ever reaching this call's own materialize-and-cleanup pair.
+        asyncio.run(fns._run_benchmark_job(dict(data), event_id="ev1"))
+        after = leaked_temp_files()
+
+        assert after == before
+    finally:
+        dispose_engine()
+
+
 def test_benchmark_job_unknown_routing_policy_name_raises(tmp_path: Path, monkeypatch) -> None:
     from docie_bench.inngest import functions as fns
     from docie_bench.storage.db import dispose_engine, init_engine

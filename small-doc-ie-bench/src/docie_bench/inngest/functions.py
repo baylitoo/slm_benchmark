@@ -500,23 +500,23 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
     tenant_id = str(data.get("tenant_id") or "anonymous")
     routing_policy = data.get("routing_policy")
     routing_policy_name = data.get("routing_policy_name")
-    # A saved policy has no filesystem path -- run_benchmark only accepts
-    # routing_policy_path, so a named policy is materialized to a private temp
-    # file (JSON is valid YAML, so load_routing_policy's yaml.safe_load reads it
-    # unchanged) and cleaned up in the `finally` below regardless of outcome.
-    routing_policy_temp_file: str | None = None
+    # Resolved (existence-checked, not yet materialized to disk) before the
+    # idempotency claim below -- an unresolvable name fails the same way it
+    # always has, before any run row is created. The temp file itself is
+    # deferred until AFTER the dedup check (see saved_policy's second use
+    # further down): materializing it here, before knowing whether this call
+    # is a redelivery/duplicate that's about to short-circuit, leaked a temp
+    # file on every deduplicated invocation (a routine case, not an edge
+    # case -- Inngest redelivers, and the shipped UI's own double-submit
+    # protection doesn't stop a duplicate idempotency key from ever reaching
+    # here).
+    saved_policy: dict[str, Any] | None = None
     if routing_policy_name:
         from docie_bench.studio.routing_policies import get_routing_policy
 
         saved_policy = get_routing_policy(routing_policy_name)
         if saved_policy is None:
             raise ValueError(f"routing policy {routing_policy_name!r} not found")
-        fd, routing_policy_temp_file = tempfile.mkstemp(
-            prefix="routing-policy-", suffix=".json"
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(saved_policy["policy"], fh)
-        routing_policy = routing_policy_temp_file
     # StudioRun.model_profile is String(128) (studio/models.py) and Postgres raises
     # DataError on an over-length insert rather than truncating (unlike sqlite, which
     # is why an unbounded label wouldn't have failed the test suite). routing_policy
@@ -555,6 +555,24 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
             return record
     else:
         logger.warning("no DATABASE_URL: benchmark artifacts are not durably indexed")
+
+    # A saved policy has no filesystem path -- run_benchmark only accepts
+    # routing_policy_path, so it's materialized to a private temp file (JSON
+    # is valid YAML, so load_routing_policy's yaml.safe_load reads it
+    # unchanged) here, past the dedup short-circuit above, and cleaned up in
+    # the `finally` below regardless of outcome. If both routing_policy and
+    # routing_policy_name somehow reach here (unreachable through the API --
+    # studio_api.py's trigger_benchmark already 422s a request carrying more
+    # than one of routing_policy/routing_policy_name/model_profile -- but not
+    # defended against a hand-crafted event), the saved policy wins, same
+    # "trust the worker-level check, not just the request-level one" stance
+    # as model_profile vs. routing_policy below.
+    routing_policy_temp_file: str | None = None
+    if saved_policy is not None:
+        fd, routing_policy_temp_file = tempfile.mkstemp(prefix="routing-policy-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(saved_policy["policy"], fh)
+        routing_policy = routing_policy_temp_file
 
     try:
         try:
