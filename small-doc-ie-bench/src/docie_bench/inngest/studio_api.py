@@ -195,6 +195,67 @@ async def list_datasets() -> list[dict[str, Any]]:
     ]
 
 
+@router.post("/datasets/{name}/validate")
+async def validate_dataset_version(
+    name: str,
+    version: str | None = None,
+    near_duplicate_threshold: float = Query(default=0.92, ge=0.0, le=1.0),
+) -> dict[str, Any]:
+    """Run the CLI's dataset validation (`docie-bench dataset validate`/`inspect`) against
+    an already-registered dataset version, reachable from the Studio.
+
+    Mirrors `dataset_inspect` in cli.py: resolve the reference through the shared
+    `data/datasets.yaml` registry (this Studio API already reads that file directly for
+    `GET /datasets`, so this isn't a new filesystem assumption). Deliberately does NOT use
+    `resolve_dataset`'s own `verify_hash` gate (which raises and stops before validation
+    runs) -- a registered dataset can only ever fail `register_dataset_version`'s own
+    validate_dataset gate at REGISTRATION time, so the only way an already-registered
+    dataset's *content* can be invalid later is drift (files changed on disk since).
+    Passing the registry's recorded hash as `expected_hash` folds that drift check into
+    the SAME validation report as duplicate-doc_id / missing-file / cross-split-leakage,
+    instead of stopping at the first problem found.
+
+    `resolve_dataset` itself still unconditionally hashes every referenced file (even
+    with verify_hash=False) -- so a manifest referencing an ENTIRELY missing file raises
+    OSError there, before validate_dataset's own graceful per-item existence check ever
+    runs (the CLI's `dataset_validate` has this identical gap, see cli.py:363's shared
+    `except (OSError, ValueError)`). Surfaced as 422 (the registered dataset itself is
+    broken) rather than a raw 500.
+    """
+    from docie_bench.benchmark.registry import (
+        DEFAULT_REGISTRY_PATH,
+        load_registry,
+        resolve_dataset,
+        validate_dataset,
+    )
+
+    reference = f"{name}@{version}" if version else name
+    try:
+        resolved = resolve_dataset(
+            reference, registry_path=DEFAULT_REGISTRY_PATH, verify_hash=False
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    expected_hash = None
+    if resolved.version is not None:
+        record = load_registry(DEFAULT_REGISTRY_PATH).datasets.get(name)
+        entry = record.versions.get(resolved.version) if record else None
+        expected_hash = entry.dataset_hash if entry else None
+    report = validate_dataset(
+        resolved.manifest_path,
+        near_duplicate_threshold=near_duplicate_threshold,
+        expected_hash=expected_hash,
+    )
+    return {
+        "reference": resolved.reference,
+        "version": resolved.version,
+        "manifest_path": str(resolved.manifest_path),
+        **report,
+    }
+
+
 class BenchmarkRequest(BaseModel):
     dataset: str
     split: str | None = None
