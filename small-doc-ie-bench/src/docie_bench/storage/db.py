@@ -250,6 +250,10 @@ def init_engine(database_url: str | None = None) -> None:
     # Same race as serving_node above: model_activity is also new, also
     # created by every process's concurrent init_engine() at stack-up.
     ensure_model_activity_table(_engine)
+    # Same race again: dynamic_schemas is also new.
+    from docie_bench.studio.dynamic_schemas import ensure_dynamic_schema_table
+
+    ensure_dynamic_schema_table(_engine)
     Base.metadata.create_all(bind=_engine)
 
 

@@ -16,6 +16,10 @@ export interface ExtractRequest {
   content_b64?: string;
   filename?: string;
   schema_name?: string;
+  /** Name of a schema saved via POST /v1/studio/schemas/dynamic. Wins over
+   * schema_name when present -- the backend resolves the spec by name and
+   * runs the extraction in schema_mode="dynamic". */
+  dynamic_schema_name?: string;
   /** Free-text models.yaml/CLI profile name. Retained for back-compat. */
   model_profile?: string;
   /**
@@ -1154,6 +1158,58 @@ export function scaleStoreModel(name: string, replicas: number): Promise<ScaleRe
 /** Extraction schema names available for structured output (GET /v1/schemas). */
 export function listSchemas(): Promise<string[]> {
   return request<{ schemas: string[] }>("/v1/schemas").then((r) => r.schemas ?? []);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic schemas -- named DynamicSchemaSpecs saved via the Studio's schema
+// builder. The spec itself (schemas/dynamic.py) already validates and already
+// compiles into a working extraction schema; these are the "define once,
+// reuse by name" persistence routes, the missing counterpart to schema_name's
+// static SCHEMA_REGISTRY above.
+// ---------------------------------------------------------------------------
+
+export type DynamicFieldType = "string" | "date" | "number" | "money" | "list";
+
+export interface DynamicFieldSpec {
+  name: string;
+  type: DynamicFieldType;
+  description?: string | null;
+  /** Only meaningful when type === "list" -- one flat level of scalar
+   * sub-fields (line-items style). Arbitrary nesting/object fields are not
+   * exposed by this UI slice; still reachable via a hand-authored POST body. */
+  fields?: DynamicFieldSpec[];
+}
+
+export interface DynamicSchemaSpec {
+  document_type: string;
+  fields: DynamicFieldSpec[];
+}
+
+export interface DynamicSchemaSummary {
+  name: string;
+  spec: DynamicSchemaSpec;
+  created_at: string;
+  updated_at: string;
+}
+
+export function listDynamicSchemas(): Promise<DynamicSchemaSummary[]> {
+  return request<DynamicSchemaSummary[]>("/v1/studio/schemas/dynamic");
+}
+
+/** Save a DynamicSchemaSpec under its own document_type. Create-only; a 409
+ * means that document_type is already taken. */
+export function createDynamicSchema(spec: DynamicSchemaSpec): Promise<DynamicSchemaSummary> {
+  return request<DynamicSchemaSummary>("/v1/studio/schemas/dynamic", {
+    method: "POST",
+    body: JSON.stringify(spec),
+  });
+}
+
+export function deleteDynamicSchema(name: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(
+    `/v1/studio/schemas/dynamic/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
 }
 
 /** A seed download's latest progress — emitted on the realtime `progress` topic

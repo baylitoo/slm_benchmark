@@ -14,6 +14,8 @@ import {
   Trash2,
   Upload,
   AlertCircle,
+  FilePlus2,
+  Plus,
 } from "lucide-react";
 import {
   triggerExtract,
@@ -31,6 +33,8 @@ import {
   isLiveDeployment,
   fileToBase64,
   renderDocument,
+  listDynamicSchemas,
+  createDynamicSchema,
   ApiError,
   ApiUnavailable,
   ModelLoading,
@@ -40,12 +44,27 @@ import {
   type StoreEntry,
   type ModelFamily,
   type RerankResponse,
+  type DynamicSchemaSummary,
+  type DynamicSchemaSpec,
+  type DynamicFieldSpec,
+  type DynamicFieldType,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
-import { Alert, Button, Card, Field, Select, TextArea, TextInput, Badge, Spinner } from "./ui";
+import {
+  Alert,
+  Button,
+  Card,
+  Field,
+  Select,
+  Sheet,
+  TextArea,
+  TextInput,
+  Badge,
+  Spinner,
+} from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 
@@ -72,6 +91,12 @@ export function Playground({
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [schemaName, setSchemaName] = useState("invoice");
+  const [dynamicSchemaName, setDynamicSchemaName] = useState("");
+  const [schemaSheetOpen, setSchemaSheetOpen] = useState(false);
+  const dynamicSchemas = useAsync<DynamicSchemaSummary[]>(
+    "dynamic-schemas",
+    listDynamicSchemas,
+  );
   const [selectedDeployment, setSelectedDeployment] = useState<string>("");
   const [ocrBackend, setOcrBackend] = useState("");
   const [language, setLanguage] = useState("");
@@ -134,7 +159,9 @@ export function Playground({
     setError(null);
     setTrigger(null);
 
-    const payload: ExtractRequest = { schema_name: schemaName || "invoice" };
+    const payload: ExtractRequest = dynamicSchemaName
+      ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
+      : { schema_name: schemaName || "invoice" };
     // Send ONLY the deployment selector (its value is a DeploymentRecord
     // spec.name); never model_profile. Empty selection → backend default.
     if (selectedDeployment) payload.deployment = selectedDeployment;
@@ -313,13 +340,51 @@ export function Playground({
           )}
 
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Schema name">
+            <Field
+              label="Schema name"
+              hint={
+                dynamicSchemaName
+                  ? "Disabled while a saved schema is selected below."
+                  : undefined
+              }
+            >
               <TextInput
                 value={schemaName}
                 onChange={(e) => setSchemaName(e.target.value)}
                 placeholder="invoice"
+                disabled={Boolean(dynamicSchemaName)}
               />
+              <div className="mt-2 flex items-center gap-2">
+                <Select
+                  className="h-8 flex-1 text-xs"
+                  value={dynamicSchemaName}
+                  onChange={(e) => setDynamicSchemaName(e.target.value)}
+                >
+                  <option value="">(use schema name above)</option>
+                  {(dynamicSchemas.data ?? []).map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.name} (saved)
+                    </option>
+                  ))}
+                </Select>
+                <button
+                  type="button"
+                  onClick={() => setSchemaSheetOpen(true)}
+                  className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                >
+                  <FilePlus2 className="h-3 w-3" />
+                  New schema…
+                </button>
+              </div>
             </Field>
+            <SchemaBuilderSheet
+              open={schemaSheetOpen}
+              onClose={() => setSchemaSheetOpen(false)}
+              onCreated={(name) => {
+                setDynamicSchemaName(name);
+                dynamicSchemas.reload();
+              }}
+            />
             <Field
               label="Deployment"
               hint="Runtime to route this extraction to. Evicted deployments reload on request (first request waits for the model load)."
@@ -400,6 +465,253 @@ interface ChatMsg {
 // loadDeployment's own doc comment) rather than making the user notice the
 // status message and resend by hand.
 const MAX_LOAD_RETRIES = 3;
+
+// ---------------------------------------------------------------------------
+// Dynamic schema builder -- POST /v1/studio/schemas/dynamic. Deliberately the
+// smallest real form, not a drag-drop visual builder: flat fields (string/
+// date/number/money) plus one "list" type supporting ONE flat level of scalar
+// sub-fields (line-items style, e.g. invoice line_items). Arbitrary nested
+// object/multi-level-list fields aren't exposed here -- schemas/dynamic.py's
+// DynamicFieldSpec supports them, so a hand-authored POST body still can, but
+// that's real added frontend complexity for a comparatively rare shape.
+// ---------------------------------------------------------------------------
+
+interface FieldRow {
+  name: string;
+  type: DynamicFieldType;
+  description: string;
+  subFields: FieldRow[]; // only meaningful when type === "list"
+}
+
+function emptyFieldRow(): FieldRow {
+  return { name: "", type: "string", description: "", subFields: [] };
+}
+
+const SCALAR_FIELD_TYPES: DynamicFieldType[] = ["string", "date", "number", "money"];
+
+function SchemaBuilderSheet({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (name: string) => void;
+}) {
+  const [documentType, setDocumentType] = useState("");
+  const [fields, setFields] = useState<FieldRow[]>([emptyFieldRow()]);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setDocumentType("");
+      setFields([emptyFieldRow()]);
+      setError(null);
+    }
+  }, [open]);
+
+  function updateField(index: number, patch: Partial<FieldRow>) {
+    setFields((rows) => rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
+  }
+
+  function updateSubField(index: number, subIndex: number, patch: Partial<FieldRow>) {
+    setFields((rows) =>
+      rows.map((r, i) =>
+        i === index
+          ? {
+              ...r,
+              subFields: r.subFields.map((s, j) => (j === subIndex ? { ...s, ...patch } : s)),
+            }
+          : r,
+      ),
+    );
+  }
+
+  function toSpec(): DynamicSchemaSpec {
+    const toFieldSpec = (row: FieldRow): DynamicFieldSpec => ({
+      name: row.name.trim(),
+      type: row.type,
+      ...(row.description.trim() ? { description: row.description.trim() } : {}),
+      ...(row.type === "list"
+        ? {
+            fields: row.subFields
+              .filter((s) => s.name.trim())
+              .map((s) => ({
+                name: s.name.trim(),
+                type: s.type,
+                ...(s.description.trim() ? { description: s.description.trim() } : {}),
+              })),
+          }
+        : {}),
+    });
+    return {
+      document_type: documentType.trim(),
+      fields: fields.filter((f) => f.name.trim()).map(toFieldSpec),
+    };
+  }
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!documentType.trim()) {
+      setError("Document type is required.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const saved = await createDynamicSchema(toSpec());
+      onCreated(saved.name);
+      onClose();
+    } catch (err) {
+      const msg =
+        err instanceof ApiUnavailable
+          ? "Dynamic schemas aren't available on this server."
+          : err instanceof ApiError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : "Failed to save schema.";
+      setError(msg);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Sheet open={open} onClose={onClose}>
+      <form onSubmit={onSubmit} className="space-y-5">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">New schema</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            POST /v1/studio/schemas/dynamic — define a reusable extraction schema
+            once, then reference it by name from the Schema name field instead of
+            supplying the full field list every time. A "list" field supports one
+            flat level of sub-fields (e.g. invoice line items); nested/object
+            fields aren't supported by this form.
+          </p>
+        </div>
+
+        <Field label="Document type" required hint="Lower snake_case, e.g. purchase_order.">
+          <TextInput
+            value={documentType}
+            onChange={(e) => setDocumentType(e.target.value)}
+            placeholder="purchase_order"
+          />
+        </Field>
+
+        <div className="space-y-3">
+          {fields.map((field, i) => (
+            <div key={i} className="space-y-2 rounded-md border border-border p-3">
+              <div className="flex items-center gap-2">
+                <TextInput
+                  className="flex-1"
+                  value={field.name}
+                  onChange={(e) => updateField(i, { name: e.target.value })}
+                  placeholder="field_name"
+                />
+                <Select
+                  className="w-32"
+                  value={field.type}
+                  onChange={(e) => {
+                    const type = e.target.value as DynamicFieldType;
+                    updateField(i, {
+                      type,
+                      subFields: type === "list" && field.subFields.length === 0
+                        ? [emptyFieldRow()]
+                        : field.subFields,
+                    });
+                  }}
+                >
+                  <option value="string">string</option>
+                  <option value="date">date</option>
+                  <option value="number">number</option>
+                  <option value="money">money</option>
+                  <option value="list">list</option>
+                </Select>
+                <button
+                  type="button"
+                  onClick={() => setFields((rows) => rows.filter((_, idx) => idx !== i))}
+                  className="shrink-0 text-muted-foreground hover:text-red-500"
+                  aria-label="Remove field"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+              <TextInput
+                value={field.description}
+                onChange={(e) => updateField(i, { description: e.target.value })}
+                placeholder="Description (optional)"
+              />
+              {field.type === "list" && (
+                <div className="ml-4 space-y-1.5 border-l border-border pl-3">
+                  <p className="text-xs text-muted-foreground">Sub-fields (one flat level):</p>
+                  {field.subFields.map((sub, j) => (
+                    <div key={j} className="flex items-center gap-2">
+                      <TextInput
+                        className="flex-1"
+                        value={sub.name}
+                        onChange={(e) => updateSubField(i, j, { name: e.target.value })}
+                        placeholder="sub_field_name"
+                      />
+                      <Select
+                        className="w-28"
+                        value={sub.type}
+                        onChange={(e) =>
+                          updateSubField(i, j, { type: e.target.value as DynamicFieldType })
+                        }
+                      >
+                        {SCALAR_FIELD_TYPES.map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                      </Select>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateField(i, {
+                            subFields: field.subFields.filter((_, idx) => idx !== j),
+                          })
+                        }
+                        className="shrink-0 text-muted-foreground hover:text-red-500"
+                        aria-label="Remove sub-field"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateField(i, { subFields: [...field.subFields, emptyFieldRow()] })
+                    }
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    <Plus className="h-3 w-3" /> Add sub-field
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setFields((rows) => [...rows, emptyFieldRow()])}
+            className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+          >
+            <Plus className="h-3.5 w-3.5" /> Add field
+          </button>
+        </div>
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        <Button type="submit" loading={submitting}>
+          Save schema
+        </Button>
+      </form>
+    </Sheet>
+  );
+}
 
 function ChatPanel({
   deployments,
