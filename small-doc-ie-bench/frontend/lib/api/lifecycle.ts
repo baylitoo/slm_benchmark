@@ -1,0 +1,68 @@
+// Deployment lifecycle actions (PR-4). Each fires a serving/* event at the
+// single-replica serving service and returns the event ids to poll.
+
+import { request } from "./core";
+import type { LifecycleActionResponse } from "./serving";
+
+/** Cold-start a deployment (idempotent server-side; may evict LRU victims). */
+export function loadDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/load`,
+    { method: "POST" },
+  );
+}
+
+/** Evict a deployment: process killed, record + port + row kept (phase=evicted). */
+export function unloadDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/unload`,
+    { method: "POST" },
+  );
+}
+
+/** Set/clear the eviction shield. */
+export function pinDeployment(
+  name: string,
+  pinned: boolean,
+): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/pin`,
+    { method: "POST", body: JSON.stringify({ pinned }) },
+  );
+}
+
+/** Real teardown: kills the process, frees the port, deletes the row. */
+export function deleteDeployment(name: string): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Recover a stuck/failed deployment on a (re)allocated port (no delete+recreate).
+ *  `port` omitted / null = auto-reallocate a free port (steps around an orphan
+ *  still holding the old one); an explicit port is honored verbatim. */
+export function repairDeployment(
+  name: string,
+  port?: number | null,
+): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/repair`,
+    { method: "POST", body: JSON.stringify(port != null ? { port } : {}) },
+  );
+}
+
+/** A deployment's runtime log tail (GET /v1/serving/deployments/{name}/logs). */
+export interface DeploymentLogs {
+  name: string;
+  /** Reconciler one-line failure summary, if any. */
+  last_error?: string | null;
+  /** Raw stdout/stderr tail (most recent last). */
+  lines: string[];
+}
+
+export function getDeploymentLogs(name: string, lines = 200): Promise<DeploymentLogs> {
+  return request<DeploymentLogs>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}/logs?lines=${lines}`,
+  );
+}
