@@ -380,12 +380,18 @@ export interface ComparisonRow {
   baseline_only: number;
   candidate_only: number;
   confidence_interval_95: [number, number];
-  sign_test_p_value: number | null;
+  sign_test_p_value: number;
   warnings: string[];
 }
 
+// status is "warn" specifically for a judge-metric budget that would have
+// failed but is downgraded to non-blocking because the judge isn't
+// calibrated yet (reason: "judge_uncalibrated_non_blocking") -- distinct
+// from "error", which means the budget itself is broken/unmatched
+// (reason: "no_matching_comparison") and metric/dimension are absent.
 export interface ComparisonBudgetCheck {
-  status: "pass" | "fail" | "error";
+  name: string;
+  status: "pass" | "fail" | "warn" | "error";
   metric?: string;
   dimension?: string;
   reason?: string;
@@ -409,7 +415,7 @@ export interface ComparisonPayload {
   comparisons: ComparisonRow[];
   budget_checks: ComparisonBudgetCheck[];
   compatibility_errors: string[];
-  root_causes: { documents?: ComparisonRow[]; fields?: ComparisonRow[] };
+  root_causes: { documents: ComparisonRow[]; fields: ComparisonRow[] };
 }
 
 // ---------------------------------------------------------------------------

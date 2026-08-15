@@ -25,7 +25,7 @@ import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
 import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
-import { Alert, Badge, Button, Card, Field, Select, Sheet, TextInput } from "./ui";
+import { Alert, Badge, type BadgeTone, Button, Card, Field, Select, Sheet, TextInput } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
@@ -468,7 +468,14 @@ function ComparisonSheet({
           <>
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="Baseline">
-                <Select value={baselineId} onChange={(e) => setBaselineId(e.target.value)}>
+                <Select
+                  value={baselineId}
+                  onChange={(e) => {
+                    setBaselineId(e.target.value);
+                    setResult(null);
+                    setError(null);
+                  }}
+                >
                   <option value="">Select a run…</option>
                   {completed.map((r) => (
                     <option key={r.event_id} value={r.event_id}>
@@ -478,7 +485,14 @@ function ComparisonSheet({
                 </Select>
               </Field>
               <Field label="Candidate">
-                <Select value={candidateId} onChange={(e) => setCandidateId(e.target.value)}>
+                <Select
+                  value={candidateId}
+                  onChange={(e) => {
+                    setCandidateId(e.target.value);
+                    setResult(null);
+                    setError(null);
+                  }}
+                >
                   <option value="">Select a run…</option>
                   {completed.map((r) => (
                     <option key={r.event_id} value={r.event_id}>
@@ -511,19 +525,41 @@ function ComparisonSheet({
   );
 }
 
+/**
+ * pass/fail/warn/error share one tone map across the verdict badge and every
+ * budget-check badge. "warn" (a judge-metric budget downgraded to
+ * non-blocking because the judge isn't calibrated yet) and "error" (the
+ * comparison -- or a budget itself -- is broken/unmatched) must render as
+ * visibly distinct severities: error is a red "err", not the same amber
+ * "warn" a benign calibration downgrade uses.
+ */
+const RESULT_STATUS_TONE: Record<string, BadgeTone> = {
+  pass: "ok",
+  warn: "warn",
+  fail: "err",
+  error: "err",
+};
+
 function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
   const aggregate = payload.comparisons.filter((c) => c.dimension === "aggregate");
-  const verdictTone =
-    payload.verdict === "pass" ? "ok" : payload.verdict === "fail" ? "err" : "warn";
   const hasRootCauses =
-    (payload.root_causes.documents?.length ?? 0) > 0 ||
-    (payload.root_causes.fields?.length ?? 0) > 0;
+    payload.root_causes.documents.length > 0 || payload.root_causes.fields.length > 0;
 
   return (
     <div className="space-y-4 border-t border-border pt-4">
+      <p className="text-xs text-muted-foreground">
+        <span className="font-mono text-foreground/90">
+          {payload.baseline.dataset ?? payload.baseline.event_id}
+        </span>{" "}
+        vs.{" "}
+        <span className="font-mono text-foreground/90">
+          {payload.candidate.dataset ?? payload.candidate.event_id}
+        </span>
+      </p>
+
       <div className="flex items-center gap-2">
         <span className="text-xs font-medium text-muted-foreground">Verdict</span>
-        <Badge tone={verdictTone}>{payload.verdict}</Badge>
+        <Badge tone={RESULT_STATUS_TONE[payload.verdict] ?? "neutral"}>{payload.verdict}</Badge>
       </div>
 
       {payload.compatibility_errors.length > 0 && (
@@ -556,6 +592,7 @@ function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
                     {row.candidate.toFixed(3)}
                   </td>
                   <td
+                    title={`95% CI [${row.confidence_interval_95[0].toFixed(3)}, ${row.confidence_interval_95[1].toFixed(3)}], sign-test p=${row.sign_test_p_value.toFixed(3)}`}
                     className={cn(
                       "whitespace-nowrap px-2.5 py-1.5 font-mono tabular-nums font-medium",
                       row.signed_improvement > 0
@@ -587,15 +624,10 @@ function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
           <ul className="space-y-1.5">
             {payload.budget_checks.map((check, i) => (
               <li key={i} className="flex items-center gap-2 text-xs">
-                <Badge
-                  tone={
-                    check.status === "pass" ? "ok" : check.status === "fail" ? "err" : "warn"
-                  }
-                >
-                  {check.status}
-                </Badge>
+                <Badge tone={RESULT_STATUS_TONE[check.status] ?? "neutral"}>{check.status}</Badge>
                 <span className="text-muted-foreground">
-                  {check.metric ?? "?"} ({check.dimension ?? "aggregate"})
+                  <span className="font-medium text-foreground/90">{check.name}</span>
+                  {check.metric ? ` — ${check.metric} (${check.dimension ?? "aggregate"})` : ""}
                   {check.reason ? ` — ${check.reason}` : ""}
                 </span>
               </li>
@@ -606,11 +638,11 @@ function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
 
       {hasRootCauses && (
         <div className="grid gap-4 sm:grid-cols-2">
-          {(payload.root_causes.documents?.length ?? 0) > 0 && (
-            <RootCauseList title="Regressed documents" rows={payload.root_causes.documents!} />
+          {payload.root_causes.documents.length > 0 && (
+            <RootCauseList title="Regressed documents" rows={payload.root_causes.documents} />
           )}
-          {(payload.root_causes.fields?.length ?? 0) > 0 && (
-            <RootCauseList title="Regressed fields" rows={payload.root_causes.fields!} />
+          {payload.root_causes.fields.length > 0 && (
+            <RootCauseList title="Regressed fields" rows={payload.root_causes.fields} />
           )}
         </div>
       )}
@@ -626,7 +658,8 @@ function RootCauseList({ title, rows }: { title: string; rows: ComparisonRow[] }
         {rows.slice(0, 10).map((row, i) => (
           <li key={i} className="flex items-center justify-between gap-2 text-xs">
             <span className="truncate font-mono text-foreground/90">
-              {Object.values(row.group)[0] ?? row.metric}
+              {Object.values(row.group)[0]}{" "}
+              <span className="text-muted-foreground">({row.metric})</span>
             </span>
             <span className="tabular-nums text-red-500">{row.delta.toFixed(3)}</span>
           </li>
