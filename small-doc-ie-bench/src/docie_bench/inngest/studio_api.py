@@ -370,6 +370,36 @@ async def create_ocr_profile(payload: OcrProfileRequest) -> dict[str, Any]:
     return {"name": profile.name, "kind": profile.kind, "options": dict(profile.options)}
 
 
+@router.delete("/model-profiles/{name}")
+async def delete_pipeline_profile_route(name: str) -> dict[str, Any]:
+    """Remove a ``kind: pipeline``/``kind: ocr`` profile from ``configs/models.yaml``.
+
+    The missing counterpart to ``create_pipeline_profile``: a profile authored (or
+    hand-added) as pipeline/ocr can now be retired the same way it was made, without
+    hand-editing the file on the server's filesystem. Scoped to those two kinds
+    only -- never ``passthrough`` (same restriction ``delete_pipeline_profile`` itself
+    enforces): a live deployment, or another pipeline profile's `extractor`/
+    `ocr_model`, can reference a passthrough profile by name, and neither this route
+    nor ``model_profiles`` has a way to check for that at delete time. An in-place
+    UPDATE (change an existing profile's extractor/ocr_backend without delete +
+    recreate) is a still harder text-splice problem than this DELETE and stays out of
+    scope -- see ``model_profiles.add_pipeline_profile``'s own docstring for why.
+    """
+    from docie_bench.llm.model_profiles import (
+        ProfileNotFoundError,
+        ProfileWriteError,
+        delete_pipeline_profile,
+    )
+
+    try:
+        delete_pipeline_profile(MODELS_CONFIG_PATH, name=name)
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+    except ProfileWriteError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"deleted": name}
+
+
 class BenchmarkRequest(BaseModel):
     dataset: str
     split: str | None = None

@@ -160,3 +160,33 @@ def test_ocr_profile_unknown_backend_is_422(models_yaml: Path, client: TestClien
     )
 
     assert resp.status_code == 422
+
+
+def test_deletes_pipeline_profile(models_yaml: Path, client: TestClient) -> None:
+    create = client.post(
+        "/v1/studio/model-profiles/pipeline",
+        json={"name": "invoice_pipeline", "extractor": "extractor_llm", "ocr_backend": "tesseract"},
+    )
+    assert create.status_code == 201
+
+    resp = client.delete("/v1/studio/model-profiles/invoice_pipeline")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": "invoice_pipeline"}
+    names = {p["name"] for p in client.get("/v1/studio/model-profiles").json()}
+    assert "invoice_pipeline" not in names
+
+
+def test_deleting_unknown_profile_is_404(models_yaml: Path, client: TestClient) -> None:
+    resp = client.delete("/v1/studio/model-profiles/does_not_exist")
+
+    assert resp.status_code == 404
+    assert resp.headers.get("X-Docie-Error") == "not_found"
+
+
+def test_deleting_passthrough_profile_is_422(models_yaml: Path, client: TestClient) -> None:
+    resp = client.delete("/v1/studio/model-profiles/extractor_llm")
+
+    assert resp.status_code == 422
+    names = {p["name"] for p in client.get("/v1/studio/model-profiles").json()}
+    assert "extractor_llm" in names
