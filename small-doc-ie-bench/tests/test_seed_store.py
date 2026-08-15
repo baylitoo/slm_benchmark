@@ -136,3 +136,33 @@ def test_no_database_degrades_gracefully() -> None:
     assert complete_seed_run(event_id="ev1", result={}) is None
     assert fail_seed_run(event_id="ev1", error="x") is None
     assert list_seed_runs(tenant_id="t1") == []
+
+
+def test_configured_but_erroring_database_degrades_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Demonstrated regression (adversarial review of #202): claim_seed_run
+    # only handled session_scope() yielding None (DATABASE_URL unset). A
+    # CONFIGURED database that errors on the call itself (connection blip,
+    # pool exhaustion, replica lag) previously propagated straight out of
+    # claim_seed_run -- and since both seed jobs call it BEFORE the download
+    # step, a transient tracking hiccup took the whole download down with it,
+    # a real regression from pre-#202 behavior where a seed had zero DB
+    # dependency. claim/complete/fail must all degrade the same way an unset
+    # DATABASE_URL does, not just that one specific case.
+    from sqlalchemy.exc import OperationalError
+
+    import docie_bench.studio.seed_store as seed_store
+
+    def _boom(*_a, **_k):
+        raise OperationalError("SELECT 1", {}, Exception("connection reset"))
+
+    monkeypatch.setattr(seed_store, "session_scope", _boom)
+
+    outcome, row = claim_seed_run(
+        event_id="ev1", channel="seed:abc", tenant_id="t1", kind="ollama", name="qwen"
+    )
+    assert outcome == "unavailable"
+    assert row == {}
+    assert complete_seed_run(event_id="ev1", result={"name": "qwen"}) is None
+    assert fail_seed_run(event_id="ev1", error="boom") is None

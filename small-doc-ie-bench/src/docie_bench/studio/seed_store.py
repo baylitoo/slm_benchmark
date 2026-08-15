@@ -12,16 +12,19 @@ ephemeral realtime topic and a pollable-but-cleared-on-settle sidecar file.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import Any
 
 from sqlalchemy import Table, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from docie_bench.storage.db import session_scope
 from docie_bench.studio.models import SeedRun
+
+logger = logging.getLogger("docie_bench.studio.seed_store")
 
 # Arbitrary-but-stable advisory-lock key ("docie seed runs v1"), distinct from
 # every other migration's key -- see dynamic_schemas.py/routing_policies.py's
@@ -96,78 +99,112 @@ def claim_seed_run(
     ``("claimed", record)`` (Inngest is at-least-once -- a failed attempt must
     be allowed to retry).
 
-    No DATABASE_URL is a normal degraded mode for a worker job (unlike the
-    write routes in studio_api, which 503 -- there is no HTTP caller here to
-    hand an error to), not an exception: returns ``("unavailable", {})`` and
-    the caller proceeds without persistence, same as ``RunStore.enabled``
-    gating every write call site in ``_run_benchmark_job``.
+    Persistence is never allowed to fail the download it's tracking: no
+    DATABASE_URL degrades to ``("unavailable", {})`` (a worker job has no HTTP
+    caller to hand a 503 to, unlike the write routes in studio_api -- this is
+    a normal mode, not an error), and so does a CONFIGURED database that
+    errors on this call (connection blip, pool exhaustion, replica lag) --
+    caught broadly here rather than only handling the "unset" case, so a
+    transient tracking hiccup can never take the seed job down with it. The
+    caller proceeds without persistence either way, same as
+    ``RunStore.enabled`` gating every write call site in
+    ``_run_benchmark_job``.
     """
-    with session_scope() as session:
-        if session is None:
-            return "unavailable", {}
-        existing = session.get(SeedRun, event_id)
-        if existing is not None:
-            if existing.status == "completed":
-                return "exists", _to_dict(existing)
-            existing.status = "running"
-            existing.error_text = None
-            session.flush()
-            return "claimed", _to_dict(existing)
-        row = SeedRun(
-            event_id=event_id,
-            channel=channel,
-            tenant_id=tenant_id or "anonymous",
-            kind=kind,
-            reference=reference,
-            name=name,
-            status="running",
+    try:
+        with session_scope() as session:
+            if session is None:
+                return "unavailable", {}
+            existing = session.get(SeedRun, event_id)
+            if existing is not None:
+                if existing.status == "completed":
+                    return "exists", _to_dict(existing)
+                existing.status = "running"
+                existing.error_text = None
+                session.flush()
+                return "claimed", _to_dict(existing)
+            row = SeedRun(
+                event_id=event_id,
+                channel=channel,
+                tenant_id=tenant_id or "anonymous",
+                kind=kind,
+                reference=reference,
+                name=name,
+                status="running",
+            )
+            session.add(row)
+            try:
+                session.flush()
+            except IntegrityError:
+                # A duplicate trigger already owns this channel under a different
+                # event id -- do not double-run; answer with the existing row.
+                session.rollback()
+                found = session.scalars(
+                    select(SeedRun).where(SeedRun.channel == channel)
+                ).first()
+                if found is None:  # pragma: no cover - defensive; row must exist
+                    raise
+                return "exists", _to_dict(found)
+            return "claimed", _to_dict(row)
+    except SQLAlchemyError:
+        logger.warning(
+            "seed-run tracking unavailable (claim, event_id=%s): download proceeds untracked",
+            event_id,
+            exc_info=True,
         )
-        session.add(row)
-        try:
-            session.flush()
-        except IntegrityError:
-            # A duplicate trigger already owns this channel under a different
-            # event id -- do not double-run; answer with the existing row.
-            session.rollback()
-            found = session.scalars(select(SeedRun).where(SeedRun.channel == channel)).first()
-            if found is None:  # pragma: no cover - defensive; row must exist
-                raise
-            return "exists", _to_dict(found)
-        return "claimed", _to_dict(row)
+        return "unavailable", {}
 
 
 def complete_seed_run(*, event_id: str, result: dict[str, Any]) -> dict[str, Any] | None:
     """Mark a claimed run completed. ``result["name"]`` (if present) overwrites
     the row's ``name`` -- an HF seed's store name may be empty/None at claim
     time (derived from the repo mid-job), so this is where the real,
-    server-resolved name lands."""
-    with session_scope() as session:
-        if session is None:
-            return None
-        row = session.get(SeedRun, event_id)
-        if row is None:
-            return None
-        row.status = "completed"
-        row.result_json = result
-        row.error_text = None
-        resolved_name = result.get("name")
-        if isinstance(resolved_name, str) and resolved_name:
-            row.name = resolved_name
-        session.flush()
-        return _to_dict(row)
+    server-resolved name lands.
+
+    Same "never fail the work over the tracking" contract as
+    ``claim_seed_run``: an unavailable or errored database returns ``None``
+    rather than raising -- the download already succeeded and is durable
+    (blob + catalog row); a tracking failure here must not un-succeed it.
+    """
+    try:
+        with session_scope() as session:
+            if session is None:
+                return None
+            row = session.get(SeedRun, event_id)
+            if row is None:
+                return None
+            row.status = "completed"
+            row.result_json = result
+            row.error_text = None
+            resolved_name = result.get("name")
+            if isinstance(resolved_name, str) and resolved_name:
+                row.name = resolved_name
+            session.flush()
+            return _to_dict(row)
+    except SQLAlchemyError:
+        logger.warning(
+            "seed-run tracking unavailable (complete, event_id=%s)", event_id, exc_info=True
+        )
+        return None
 
 
 def fail_seed_run(*, event_id: str, error: str) -> dict[str, Any] | None:
-    with session_scope() as session:
-        if session is None:
-            return None
-        row = session.get(SeedRun, event_id)
-        if row is None:
-            return None
-        row.status = "failed"
-        row.error_text = error[:4000]
-        session.flush()
-        return _to_dict(row)
+    """Same degrade-on-any-database-trouble contract as ``complete_seed_run``."""
+    try:
+        with session_scope() as session:
+            if session is None:
+                return None
+            row = session.get(SeedRun, event_id)
+            if row is None:
+                return None
+            row.status = "failed"
+            row.error_text = error[:4000]
+            session.flush()
+            return _to_dict(row)
+    except SQLAlchemyError:
+        logger.warning(
+            "seed-run tracking unavailable (fail, event_id=%s)", event_id, exc_info=True
+        )
+        return None
 
 
 def list_seed_runs(*, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
