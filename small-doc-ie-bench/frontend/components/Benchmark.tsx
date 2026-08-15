@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Gauge, Play, Download, GitCompare } from "lucide-react";
+import { Gauge, Play, Download, GitCompare, ShieldCheck } from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
@@ -11,6 +11,7 @@ import {
   listSchemas,
   artifactUrl,
   compareRuns,
+  validateDataset,
   ApiError,
   ApiUnavailable,
   type BenchmarkRun,
@@ -20,6 +21,7 @@ import {
   type DeploymentRecord,
   type ComparisonPayload,
   type ComparisonRow,
+  type DatasetValidationReport,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
@@ -64,6 +66,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   );
 
   const [dataset, setDataset] = useState("");
+  const [validateOpen, setValidateOpen] = useState(false);
   const [modelProfile, setModelProfile] = useState("");
   // The Select below only lists live deployments -- a models.yaml profile
   // that's never been deployed (e.g. a kind="pipeline" OCR->LLM profile,
@@ -131,17 +134,38 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                   : "A dataset registered in data/datasets.yaml."
               }
             >
-              <Select value={dataset} onChange={(e) => setDataset(e.target.value)}>
-                <option value="">Select a dataset…</option>
-                {(datasets.data ?? []).map((d) => (
-                  <option key={d.name} value={d.name}>
-                    {d.name}
-                    {d.latest ? ` (${d.latest})` : ""}
-                    {d.documents != null ? ` — ${d.documents} docs` : ""}
-                  </option>
-                ))}
-              </Select>
+              <div className="flex gap-2">
+                <Select
+                  className="flex-1"
+                  value={dataset}
+                  onChange={(e) => setDataset(e.target.value)}
+                >
+                  <option value="">Select a dataset…</option>
+                  {(datasets.data ?? []).map((d) => (
+                    <option key={d.name} value={d.name}>
+                      {d.name}
+                      {d.latest ? ` (${d.latest})` : ""}
+                      {d.documents != null ? ` — ${d.documents} docs` : ""}
+                    </option>
+                  ))}
+                </Select>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={!dataset}
+                  onClick={() => setValidateOpen(true)}
+                  title="Run duplicate-doc_id / missing-file / cross-split-leakage checks"
+                >
+                  <ShieldCheck className="h-4 w-4" />
+                  Validate
+                </Button>
+              </div>
             </Field>
+            <DatasetValidateSheet
+              open={validateOpen}
+              onClose={() => setValidateOpen(false)}
+              dataset={datasets.data?.find((d) => d.name === dataset) ?? null}
+            />
             <div className="grid gap-4 sm:grid-cols-3">
               <Field
                 label="Model profile"
@@ -662,6 +686,210 @@ function RootCauseList({ title, rows }: { title: string; rows: ComparisonRow[] }
               <span className="text-muted-foreground">({row.metric})</span>
             </span>
             <span className="tabular-nums text-red-500">{row.delta.toFixed(3)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dataset validation -- POST /v1/studio/datasets/{name}/validate. Same
+// smallest-real-slice call as Comparison Lab: no upload, no leakage-threshold
+// tuning UI beyond the one param the backend already exposes, no schema
+// builder (roadmap-v2's schema-builder half has no backend persistence to
+// build a UI on top of yet -- flagged back rather than built).
+// ---------------------------------------------------------------------------
+
+function DatasetValidateSheet({
+  open,
+  onClose,
+  dataset,
+}: {
+  open: boolean;
+  onClose: () => void;
+  dataset: DatasetSummary | null;
+}) {
+  const [version, setVersion] = useState("");
+  const [result, setResult] = useState<DatasetValidationReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setVersion(dataset?.latest ?? "");
+      setResult(null);
+      setError(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, dataset?.name]);
+
+  async function onValidate() {
+    if (!dataset) return;
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      setResult(await validateDataset(dataset.name, version || undefined));
+    } catch (err) {
+      setError(
+        toUserMessage(err, {
+          unavailable: "Dataset validation isn't available on this server.",
+          fallback: "Failed to validate dataset.",
+        }),
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Sheet open={open} onClose={onClose}>
+      <div className="space-y-5">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">Validate dataset</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            POST /v1/studio/datasets/{"{name}"}/validate — duplicate doc_id, missing
+            files, cross-split leakage, and document statistics.
+          </p>
+        </div>
+
+        {!dataset ? (
+          <Alert tone="info">Select a dataset first.</Alert>
+        ) : (
+          <>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Dataset">
+                <TextInput value={dataset.name} disabled />
+              </Field>
+              <Field label="Version">
+                <Select value={version} onChange={(e) => setVersion(e.target.value)}>
+                  {dataset.versions.length === 0 && <option value="">(latest)</option>}
+                  {dataset.versions.map((v) => (
+                    <option key={v} value={v}>
+                      {v}
+                      {v === dataset.latest ? " (latest)" : ""}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+
+            <Button type="button" onClick={onValidate} loading={loading}>
+              <ShieldCheck className="h-4 w-4" />
+              {loading ? "Validating…" : "Run validation"}
+            </Button>
+          </>
+        )}
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        {result && <DatasetValidationResultView report={result} />}
+      </div>
+    </Sheet>
+  );
+}
+
+function DatasetValidationResultView({ report }: { report: DatasetValidationReport }) {
+  return (
+    <div className="space-y-4 border-t border-border pt-4">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-muted-foreground">Result</span>
+        <Badge tone={report.valid ? "ok" : "err"}>{report.valid ? "valid" : "invalid"}</Badge>
+        <span className="font-mono text-xs text-muted-foreground">{report.reference}</span>
+      </div>
+
+      {report.errors.length > 0 && (
+        <Alert tone="err">
+          <ul className="list-inside list-disc space-y-0.5">
+            {report.errors.map((e, i) => (
+              <li key={i}>{e}</li>
+            ))}
+          </ul>
+        </Alert>
+      )}
+
+      {report.warnings.length > 0 && (
+        <Alert tone="warn">
+          <ul className="list-inside list-disc space-y-0.5">
+            {report.warnings.map((w, i) => (
+              <li key={i}>{w}</li>
+            ))}
+          </ul>
+        </Alert>
+      )}
+
+      {report.statistics && (
+        <div>
+          <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">Statistics</h3>
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
+            <Stat label="Documents" value={report.statistics.documents} />
+            <Stat label="Labeled" value={report.statistics.labeled_documents} />
+            <Stat
+              label="Total size"
+              value={`${(report.statistics.total_bytes / 1024).toFixed(1)} KB`}
+            />
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            <CountBreakdown title="Splits" counts={report.statistics.splits} />
+            <CountBreakdown title="Schemas" counts={report.statistics.schemas} />
+            <CountBreakdown title="Languages" counts={report.statistics.languages} />
+          </div>
+        </div>
+      )}
+
+      {report.leakage && (
+        <div>
+          <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">
+            Cross-split leakage (threshold {report.leakage.near_duplicate_threshold})
+          </h3>
+          {report.leakage.leakage_pairs === 0 ? (
+            <p className="text-xs text-muted-foreground">No leakage detected.</p>
+          ) : (
+            <ul className="space-y-1 text-xs">
+              {[...report.leakage.exact_duplicates, ...report.leakage.near_duplicates]
+                .slice(0, 10)
+                .map((pair, i) => (
+                  <li key={i} className="flex items-center justify-between gap-2">
+                    <span className="truncate font-mono text-foreground/90">
+                      {pair.left_doc_id} ({pair.left_split}) ↔ {pair.right_doc_id} (
+                      {pair.right_split})
+                    </span>
+                    <span className="tabular-nums text-red-500">
+                      {pair.similarity != null ? `${(pair.similarity * 100).toFixed(0)}%` : "exact"}
+                    </span>
+                  </li>
+                ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="rounded-md border border-border bg-background px-3 py-2">
+      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="font-mono text-sm tabular-nums text-foreground">{value}</div>
+    </div>
+  );
+}
+
+function CountBreakdown({ title, counts }: { title: string; counts: Record<string, number> }) {
+  const entries = Object.entries(counts);
+  if (entries.length === 0) return null;
+  return (
+    <div>
+      <h4 className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        {title}
+      </h4>
+      <ul className="space-y-0.5 text-xs">
+        {entries.map(([key, count]) => (
+          <li key={key} className="flex items-center justify-between gap-2">
+            <span className="truncate font-mono text-foreground/90">{key}</span>
+            <span className="tabular-nums text-muted-foreground">{count}</span>
           </li>
         ))}
       </ul>
