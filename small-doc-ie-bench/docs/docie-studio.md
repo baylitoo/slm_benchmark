@@ -32,16 +32,25 @@ It is **additive**: the existing CLI, dashboards, and the hand-rolled
 | `web` | 3000 | DocIE Studio UI |
 | `api` | 8080 | FastAPI: `/v1/studio/*`, extraction, benchmark, reviews |
 | `inngest` | 8288 / 8289 | Dashboard+API / Connect gateway |
-| `grafana` | 3001 | Dashboards (observability profile) |
-| `prometheus` | 9090 | Metrics (observability profile) |
-| `postgres` | 5432 | App DB + `inngest` DB |
+| `grafana` | 3001 (127.0.0.1 only) | Dashboards (observability profile) |
+| `prometheus` | 9090 (127.0.0.1 only) | Metrics (observability profile) |
+| `postgres` | 5432 (127.0.0.1 only) | App DB + `inngest` DB |
 | `redis` | — | Inngest run state |
+
+`grafana`/`prometheus`/`postgres` publish to `127.0.0.1` only — reachable from
+the host machine, not the LAN — because postgres needs real credentials (see
+below), prometheus has no auth at all, and grafana runs with anonymous Viewer
+access for the Observability tab's iframe embed. See the port-publishing note
+near the end of `.env.example` if you need one of them reachable from another
+host.
 
 ## One-command setup
 
 ```bash
 cp .env.example .env
-# In .env set two hex keys (even length): `openssl rand -hex 32`
+# In .env, POSTGRES_PASSWORD is REQUIRED (no more insecure "docie" default) —
+# set a real password and keep DATABASE_URL's password in sync with it.
+# Set two hex keys (even length): `openssl rand -hex 32`
 #   INNGEST_EVENT_KEY=...
 #   INNGEST_SIGNING_KEY=...
 #   INNGEST_DEV=0
@@ -57,6 +66,14 @@ Then open:
 > **Gotcha:** `infra/postgres/init.sql` only runs on a *fresh* Postgres volume.
 > If you already have a `postgres-data` volume, create the DB once:
 > `docker compose exec postgres psql -U docie -d docie -c "CREATE DATABASE inngest;"`
+>
+> **Gotcha:** `POSTGRES_PASSWORD` also only takes effect on that same first
+> initialization. If you already have a `postgres-data` volume and are
+> setting `POSTGRES_PASSWORD` for the first time (e.g. upgrading from before
+> this was required), the running server keeps its old password until you
+> change it in place:
+> `docker compose exec postgres psql -U docie -d docie -c "ALTER USER docie WITH PASSWORD '<new-password>';"`
+> — or drop the `postgres-data` volume to reinitialize from scratch (data loss).
 
 ## The tabs
 

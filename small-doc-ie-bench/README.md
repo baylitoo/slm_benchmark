@@ -47,14 +47,20 @@ status/realtime tokens back to the UI.
 | `web` | 3000 | DocIE Studio UI |
 | `api` | 8080 | FastAPI: `/v1/studio/*`, `/v1/serving/*`, `/v1/agents/*` |
 | `inngest` | 8288 / 8289 | Dashboard+API / Connect gateway |
-| `grafana` | 3001 | Dashboards (observability profile) |
-| `prometheus` | 9090 | Metrics (observability profile) |
-| `postgres` | 5432 | App DB + `inngest` DB |
+| `grafana` | 3001 (127.0.0.1 only) | Dashboards (observability profile) |
+| `prometheus` | 9090 (127.0.0.1 only) | Metrics (observability profile) |
+| `postgres` | 5432 (127.0.0.1 only) | App DB + `inngest` DB |
 | `redis` | — | Inngest run state |
+
+`grafana`/`prometheus`/`postgres` publish to `127.0.0.1` only, not the LAN —
+postgres needs real credentials (below), prometheus has no auth, and grafana
+runs with anonymous Viewer access for the Observability tab's iframe embed.
 
 ```bash
 cp .env.example .env
-# In .env set two hex keys (even length): openssl rand -hex 32
+# In .env, POSTGRES_PASSWORD is REQUIRED (no more insecure "docie" default) —
+# set a real password and keep DATABASE_URL's password in sync with it.
+# Set two hex keys (even length): openssl rand -hex 32
 #   INNGEST_EVENT_KEY=...
 #   INNGEST_SIGNING_KEY=...
 #   INNGEST_DEV=0

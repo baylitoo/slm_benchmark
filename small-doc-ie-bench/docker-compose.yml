@@ -65,7 +65,11 @@ services:
     environment:
       INNGEST_EVENT_KEY: ${INNGEST_EVENT_KEY:?set INNGEST_EVENT_KEY in .env}
       INNGEST_SIGNING_KEY: ${INNGEST_SIGNING_KEY:?set INNGEST_SIGNING_KEY in .env}
-      INNGEST_POSTGRES_URI: postgres://docie:docie@postgres:5432/inngest
+      # Same docie user + POSTGRES_PASSWORD as the postgres service below —
+      # only the password is parameterized (the username isn't the security
+      # problem, and is also hardcoded in postgres's healthcheck/DATABASE_URL,
+      # so making it overridable here alone would half-wire it).
+      INNGEST_POSTGRES_URI: postgres://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/inngest
       INNGEST_REDIS_URI: redis://redis:6379
     depends_on:
       postgres:
@@ -324,19 +328,28 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      # Local-dev defaults, published to the host below (not container-network
-      # only) — change POSTGRES_PASSWORD (and DATABASE_URL in .env to match)
-      # before running this stack anywhere shared or networked.
+      # No baked-in default password: POSTGRES_PASSWORD is REQUIRED in .env
+      # (see .env.example) — `docker compose up` now refuses to start
+      # postgres/inngest with a clear error instead of silently accepting
+      # the old "docie" default. Keep DATABASE_URL in .env in sync with
+      # whatever you set here. (Only the password is parameterized — the
+      # "docie" username is also hardcoded in the healthcheck below and in
+      # DATABASE_URL, so it isn't worth making independently overridable.)
       POSTGRES_USER: docie
-      POSTGRES_PASSWORD: docie
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}
       POSTGRES_DB: docie
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      # Host port only for external tools; containers reach it as `postgres:5432`.
-      # Override if you already run Postgres on 5432: set POSTGRES_PORT=5433.
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Bound to loopback only (127.0.0.1): still reachable from the host
+      # machine for `psql`/migrations/debugging, but not from the LAN or
+      # internet — containers reach it as `postgres:5432` over the compose
+      # network regardless of this binding. Override if you already run
+      # Postgres on 5432: set POSTGRES_PORT=5433. If you have a real need for
+      # Postgres to be reachable from other hosts, change the host binding
+      # below explicitly and make sure POSTGRES_PASSWORD is strong first.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U docie -d docie"]
       interval: 10s
@@ -349,7 +362,14 @@ services:
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
+      # Bound to loopback only (127.0.0.1): Prometheus ships with no auth of
+      # its own, so publishing it to 0.0.0.0 hands out raw metrics + its
+      # query API to anyone on the network. Grafana reaches it via the
+      # compose network (http://prometheus:9090, see
+      # infra/grafana/provisioning/datasources/datasource.yml), NOT through
+      # this host-published port, so this binding doesn't affect the
+      # Grafana dashboard. `curl localhost:9090` still works on the host.
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     depends_on:
       - api
 
@@ -372,8 +392,18 @@ services:
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      # Host 3001 to leave 3000 for the DocIE Studio web UI.
-      - "${GRAFANA_PORT:-3001}:3000"
+      # Host 3001 to leave 3000 for the DocIE Studio web UI. Bound to
+      # loopback only (127.0.0.1): anonymous Viewer access is intentional
+      # (see GF_AUTH_ANONYMOUS_ENABLED above, needed for the Studio iframe
+      # embed) but that means anyone who can reach this port gets Grafana
+      # with no login — loopback keeps that reachable set to the host
+      # machine only, same as before for a purely local `docker compose up`.
+      # If Studio and Grafana run on different hosts, or the browser loading
+      # the Studio UI isn't on this machine, the iframe needs Grafana
+      # reachable from elsewhere — don't just flip this to 0.0.0.0; put a
+      # reverse proxy / network ACL in front of it instead, since anonymous
+      # access has no other gate.
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     depends_on:
       - prometheus
 
