@@ -731,6 +731,46 @@ export function validateDataset(
   );
 }
 
+/** A models.yaml profile (GET /v1/studio/model-profiles) — what the Benchmark
+ * tab's "Model profile" field, and a new pipeline profile's extractor/ocr_model
+ * pickers, can actually reference instead of a free-text guess. */
+export interface ModelProfileSummary {
+  name: string;
+  kind: "passthrough" | "ocr" | "pipeline";
+  vision: boolean;
+  model: string;
+}
+
+export function listModelProfiles(): Promise<ModelProfileSummary[]> {
+  return request<ModelProfileSummary[]>("/v1/studio/model-profiles");
+}
+
+export interface CreatePipelineProfileRequest {
+  name: string;
+  extractor: string;
+  ocr_backend?: string;
+  ocr_model?: string;
+  language?: string;
+}
+
+export interface PipelineProfileResult {
+  name: string;
+  kind: string;
+  options: Record<string, string>;
+}
+
+/** Author a kind="pipeline" (OCR->LLM) profile into configs/models.yaml — the
+ * missing counterpart to referencing one by name (Benchmark's "Custom" field,
+ * #183). Create-only; a 409 means the name is already taken. */
+export function createPipelineProfile(
+  payload: CreatePipelineProfileRequest,
+): Promise<PipelineProfileResult> {
+  return request<PipelineProfileResult>("/v1/studio/model-profiles/pipeline", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 /** Benchmark returns the same trigger shape as extract. */
 export function triggerBenchmark(payload: BenchmarkRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/benchmark", {

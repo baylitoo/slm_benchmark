@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
@@ -49,6 +50,12 @@ EXTRACT_EVENT = "doc/extract.requested"
 BENCHMARK_EVENT = "benchmark/run.requested"
 DEPLOY_EVENT = "serving/deploy.requested"
 SEED_EVENT = "serving/seed.requested"
+
+# Same file the gateway (serving.gateway.DEFAULT_MODELS_CONFIG) and the benchmark
+# worker (inngest.functions.MODELS_CONFIG_PATH) read -- this module's own constant
+# rather than importing theirs, matching the existing convention (each of those two
+# already duplicates the literal independently; see also serving.profile_resolver).
+MODELS_CONFIG_PATH = Path("configs/models.yaml")
 
 
 class ExtractRequest(BaseModel):
@@ -263,6 +270,66 @@ async def validate_dataset_version(
         "version": resolved.version,
         **report,
     }
+
+
+@router.get("/model-profiles")
+async def list_model_profiles() -> list[dict[str, Any]]:
+    """Profiles from ``configs/models.yaml`` -- what the Benchmark tab's "Model
+    profile" field, and a new pipeline profile's extractor/ocr_model pickers, can
+    actually reference instead of a free-text guess. Missing file degrades to an
+    empty list, same contract as ``GET /datasets``.
+    """
+    from docie_bench.llm.model_profiles import load_model_profiles
+
+    if not MODELS_CONFIG_PATH.exists():
+        return []
+    profiles = load_model_profiles(MODELS_CONFIG_PATH)
+    return [
+        {"name": p.name, "kind": p.kind, "vision": p.vision, "model": p.model}
+        for p in sorted(profiles.values(), key=lambda p: p.name)
+    ]
+
+
+class PipelineProfileRequest(BaseModel):
+    name: str
+    extractor: str
+    ocr_backend: str | None = None
+    ocr_model: str | None = None
+    language: str | None = None
+
+
+@router.post("/model-profiles/pipeline", status_code=201)
+async def create_pipeline_profile(payload: PipelineProfileRequest) -> dict[str, Any]:
+    """Author a ``kind: pipeline`` (OCR->LLM) profile into ``configs/models.yaml``.
+
+    The missing counterpart to #180-183's read-side wiring: the benchmark runner and
+    gateway could already RUN a pipeline profile, and #183 let the Benchmark tab
+    REFERENCE one by name, but nothing let an operator CREATE one without hand-editing
+    the file on the server's filesystem. Create-only -- 409 on an existing name,
+    mirroring ``AgentRegistry.create``'s conflict behavior; see
+    ``model_profiles.add_pipeline_profile`` for why an in-place update is out of scope
+    for this slice.
+    """
+    from docie_bench.llm.model_profiles import (
+        ProfileConflictError,
+        ProfileWriteError,
+        add_pipeline_profile,
+    )
+
+    try:
+        profile = add_pipeline_profile(
+            MODELS_CONFIG_PATH,
+            name=payload.name.strip(),
+            extractor=payload.extractor.strip(),
+            ocr_backend=payload.ocr_backend.strip() if payload.ocr_backend else None,
+            ocr_model=payload.ocr_model.strip() if payload.ocr_model else None,
+            language=payload.language.strip() if payload.language else None,
+        )
+    except ProfileConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ProfileWriteError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"name": profile.name, "kind": profile.kind, "options": dict(profile.options)}
 
 
 class BenchmarkRequest(BaseModel):

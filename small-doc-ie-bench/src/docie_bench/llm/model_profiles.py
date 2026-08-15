@@ -127,6 +127,141 @@ def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
     return profiles
 
 
+class ProfileWriteError(ValueError):
+    """A ``kind: pipeline`` profile could not be validated or written."""
+
+
+class ProfileConflictError(ProfileWriteError):
+    """The profile name already exists in the target models.yaml."""
+
+
+def add_pipeline_profile(
+    path: str | Path,
+    *,
+    name: str,
+    extractor: str,
+    ocr_backend: str | None = None,
+    ocr_model: str | None = None,
+    language: str | None = None,
+) -> ModelProfile:
+    """Append a ``kind: pipeline`` (OCR->LLM) profile to the models.yaml at `path`.
+
+    Text-spliced rather than a full ``yaml.safe_load``/``yaml.safe_dump`` round-trip
+    of the whole file. ``save_registry`` (benchmark/registry.py) can safely do a full
+    round-trip because its target (``data/datasets.yaml``) is machine-only data with
+    no comments; ``configs/models.yaml`` is a hand-documented file (see its own header
+    comment and the per-profile notes throughout) and a full re-dump would silently
+    discard every one of them. This locates the top-level ``profiles:`` key by text
+    search, inserts the new entry right before the next top-level (column-0,
+    non-comment) line -- or at EOF if none follows, which is this file's current shape
+    -- and writes atomically via temp file + ``os.replace``, the one part of
+    ``save_registry``'s pattern that does carry over unchanged here.
+
+    Create-only: raises ``ProfileConflictError`` if `name` already exists. Updating an
+    existing entry in place is deliberately out of scope -- text-splicing a REPLACE is
+    materially harder than an INSERT (matching the existing block's exact line range
+    without a real YAML round-trip) and isn't needed for the "author a new pipeline
+    profile" slice this exists for.
+
+    Validates the same rules ``serving.solutions.PipelineSolution`` enforces at request
+    time (kept in sync manually -- there is no shared source of truth for these), so a
+    misconfigured profile fails at authoring time rather than mid-benchmark: exactly one
+    of `ocr_backend`/`ocr_model` (never both, never neither -- the solution silently
+    prefers `ocr_model` if both are set, which would make a profile's config lie about
+    what actually runs); `extractor` must name an existing ``kind: passthrough`` profile;
+    `ocr_model` (if given) must name an existing ``kind: passthrough`` profile with
+    ``vision: true``; `ocr_backend` (if given) must be a real OCR backend name
+    (validated via ``get_ocr_backend``, the exact fail-fast check PipelineSolution
+    itself does at construction).
+    """
+    config_path = Path(path)
+    existing = load_model_profiles(config_path) if config_path.exists() else {}
+
+    name = name.strip()
+    if not name:
+        raise ProfileWriteError("name is required")
+    if name in existing:
+        raise ProfileConflictError(f"profile {name!r} already exists")
+
+    extractor = extractor.strip()
+    if not extractor:
+        raise ProfileWriteError("extractor is required")
+    if bool(ocr_backend) == bool(ocr_model):
+        raise ProfileWriteError("provide exactly one of ocr_backend or ocr_model")
+
+    extractor_profile = existing.get(extractor)
+    if extractor_profile is None:
+        raise ProfileWriteError(f"extractor profile {extractor!r} is not configured")
+    if extractor_profile.kind != "passthrough":
+        raise ProfileWriteError(f"extractor {extractor!r} must be a passthrough LLM profile")
+
+    options: dict[str, Any] = {"extractor": extractor}
+    if ocr_model:
+        vision_profile = existing.get(ocr_model)
+        if vision_profile is None:
+            raise ProfileWriteError(f"ocr_model profile {ocr_model!r} is not configured")
+        if vision_profile.kind != "passthrough" or not vision_profile.vision:
+            raise ProfileWriteError(
+                f"ocr_model {ocr_model!r} must be a passthrough profile with vision=true"
+            )
+        options["ocr_model"] = ocr_model
+    else:
+        # Local import: keep the OCR backend stack (tesseract/paddleocr) an optional
+        # dependency for callers that only need to read/parse profiles.
+        from docie_bench.ocr.factory import get_ocr_backend
+
+        try:
+            get_ocr_backend(str(ocr_backend), language=language)  # fail fast on a bad name
+        except ValueError as exc:
+            raise ProfileWriteError(str(exc)) from exc
+        options["ocr_backend"] = ocr_backend
+    if language:
+        options["language"] = language
+
+    _splice_profile(config_path, name, {"kind": "pipeline", "options": options})
+    return load_model_profiles(config_path)[name]
+
+
+def _splice_profile(path: Path, name: str, entry: dict[str, Any]) -> None:
+    """Insert one ``name: entry`` mapping under `path`'s top-level ``profiles:`` key.
+
+    See ``add_pipeline_profile`` for why this splices text instead of a full
+    safe_load/safe_dump round-trip.
+    """
+    text = path.read_text(encoding="utf-8") if path.exists() else "profiles:\n"
+    if not text.endswith("\n"):
+        text += "\n"
+    lines = text.splitlines(keepends=True)
+
+    profiles_idx = next(
+        (i for i, line in enumerate(lines) if line.rstrip("\n") == "profiles:"), None
+    )
+    if profiles_idx is None:
+        raise ProfileWriteError(f"{path} has no top-level 'profiles:' key")
+
+    insert_at = len(lines)
+    for i in range(profiles_idx + 1, len(lines)):
+        stripped = lines[i].rstrip("\n")
+        # Next top-level (column-0) key ends the profiles block; comments and blank
+        # lines don't count (they appear at column 0 throughout the file's prose).
+        if stripped and not stripped.startswith((" ", "\t", "#")):
+            insert_at = i
+            break
+
+    block_yaml = yaml.safe_dump({name: entry}, sort_keys=False, allow_unicode=True)
+    indented = "".join(
+        f"  {line}" if line.strip() else line for line in block_yaml.splitlines(keepends=True)
+    )
+    new_block = "\n" + indented
+
+    new_text = "".join(lines[:insert_at]) + new_block + "".join(lines[insert_at:])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(new_text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def load_judge_profile(path: str | Path, profile_name: str | None = None) -> ModelProfile:
     config_path = Path(path)
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
