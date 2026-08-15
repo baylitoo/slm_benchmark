@@ -771,6 +771,26 @@ export function createPipelineProfile(
   });
 }
 
+export interface CreateOcrProfileRequest {
+  name: string;
+  backend: string;
+  language?: string;
+}
+
+/** Author a kind="ocr" (OCR-only, no LLM stage) profile into configs/models.yaml
+ * — the sibling gap #188 explicitly deferred: that PR only covered kind="pipeline".
+ * The resulting profile returns a backend's raw transcribed text as the completion
+ * (no extraction stage), so it's a gateway/Playground target rather than a
+ * schema-scored benchmark model. Create-only; a 409 means the name is taken. */
+export function createOcrProfile(
+  payload: CreateOcrProfileRequest,
+): Promise<PipelineProfileResult> {
+  return request<PipelineProfileResult>("/v1/studio/model-profiles/ocr", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 /** Benchmark returns the same trigger shape as extract. */
 export function triggerBenchmark(payload: BenchmarkRequest): Promise<TriggerResponse> {
   return request<TriggerResponse>("/v1/studio/benchmark", {

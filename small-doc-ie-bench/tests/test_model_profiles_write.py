@@ -18,6 +18,7 @@ import pytest
 from docie_bench.llm.model_profiles import (
     ProfileConflictError,
     ProfileWriteError,
+    add_ocr_profile,
     add_pipeline_profile,
     load_model_profiles,
 )
@@ -231,3 +232,74 @@ def test_concurrent_write_losing_the_race_raises_a_clear_error_not_keyerror(
         add_pipeline_profile(
             models_yaml, name="racer", extractor="extractor_llm", ocr_backend="tesseract"
         )
+
+
+# ---------------------------------------------------------------------------
+# add_ocr_profile -- the narrower kind=ocr sibling (#188 explicitly deferred
+# this). Name validation (charset/reserved-word/conflict) is shared code with
+# add_pipeline_profile via _validate_new_profile_name, already exercised above,
+# so these cover only what's specific to add_ocr_profile: the happy path, the
+# options-key discriminator (OcrSolution reads "backend", not "ocr_backend"),
+# and the validation this function owns itself.
+# ---------------------------------------------------------------------------
+
+
+def test_appends_ocr_profile_with_backend_key(models_yaml: Path) -> None:
+    profile = add_ocr_profile(
+        models_yaml, name="tesseract_ocr", backend="tesseract", language="en"
+    )
+
+    assert profile.kind == "ocr"
+    assert profile.options == {"backend": "tesseract", "language": "en"}
+    assert "ocr_backend" not in profile.options  # OcrSolution reads only "backend"
+
+    reloaded = load_model_profiles(models_yaml)["tesseract_ocr"]
+    assert reloaded.kind == "ocr"
+    assert reloaded.options["backend"] == "tesseract"
+
+    from docie_bench.serving.solutions import OcrSolution
+
+    solution = OcrSolution(reloaded)
+    assert solution.backend_name == "tesseract"
+
+
+def test_ocr_profile_without_language(models_yaml: Path) -> None:
+    profile = add_ocr_profile(models_yaml, name="paddle_ocr", backend="paddleocr")
+
+    assert profile.options == {"backend": "paddleocr"}
+
+
+def test_ocr_profile_duplicate_name_raises_conflict(models_yaml: Path) -> None:
+    with pytest.raises(ProfileConflictError):
+        add_ocr_profile(models_yaml, name="ocr_only", backend="tesseract")
+
+
+def test_ocr_profile_missing_backend_raises(models_yaml: Path) -> None:
+    with pytest.raises(ProfileWriteError, match="backend is required"):
+        add_ocr_profile(models_yaml, name="p", backend="")
+
+
+def test_ocr_profile_unknown_backend_raises(models_yaml: Path) -> None:
+    with pytest.raises(ProfileWriteError, match="Unknown OCR backend"):
+        add_ocr_profile(models_yaml, name="p", backend="not-a-backend")
+
+
+def test_ocr_profile_concurrent_write_losing_the_race_raises_a_clear_error(
+    models_yaml: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import docie_bench.llm.model_profiles as model_profiles_module
+
+    real_load = model_profiles_module.load_model_profiles
+    calls = {"n": 0}
+
+    def flaky_load(path: Path) -> dict[str, object]:
+        calls["n"] += 1
+        result = real_load(path)
+        if calls["n"] == 2:
+            result.pop("racer", None)
+        return result
+
+    monkeypatch.setattr(model_profiles_module, "load_model_profiles", flaky_load)
+
+    with pytest.raises(ProfileWriteError, match="concurrent write"):
+        add_ocr_profile(models_yaml, name="racer", backend="tesseract")

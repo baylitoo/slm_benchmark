@@ -125,3 +125,38 @@ def test_both_ocr_backend_and_ocr_model_is_422(models_yaml: Path, client: TestCl
     )
 
     assert resp.status_code == 422
+
+
+def test_creates_ocr_profile(models_yaml: Path, client: TestClient) -> None:
+    resp = client.post(
+        "/v1/studio/model-profiles/ocr",
+        json={"name": "tesseract_ocr", "backend": "tesseract", "language": "en"},
+    )
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["name"] == "tesseract_ocr"
+    assert body["kind"] == "ocr"
+    assert body["options"] == {"backend": "tesseract", "language": "en"}
+
+    listed = client.get("/v1/studio/model-profiles").json()
+    ocr_entry = next(p for p in listed if p["name"] == "tesseract_ocr")
+    assert ocr_entry["kind"] == "ocr"
+
+
+def test_ocr_profile_duplicate_name_is_409(models_yaml: Path, client: TestClient) -> None:
+    resp = client.post(
+        "/v1/studio/model-profiles/ocr",
+        json={"name": "extractor_llm", "backend": "tesseract"},
+    )
+
+    assert resp.status_code == 409
+
+
+def test_ocr_profile_unknown_backend_is_422(models_yaml: Path, client: TestClient) -> None:
+    resp = client.post(
+        "/v1/studio/model-profiles/ocr",
+        json={"name": "p", "backend": "not-a-backend"},
+    )
+
+    assert resp.status_code == 422

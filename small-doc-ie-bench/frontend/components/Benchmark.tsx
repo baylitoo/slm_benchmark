@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Gauge, Play, Download, GitCompare, ShieldCheck, Workflow } from "lucide-react";
+import { Gauge, Play, Download, GitCompare, ShieldCheck, Workflow, ScanText } from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
@@ -11,6 +11,7 @@ import {
   listSchemas,
   listModelProfiles,
   createPipelineProfile,
+  createOcrProfile,
   artifactUrl,
   compareRuns,
   validateDataset,
@@ -90,6 +91,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   // "Custom reference" escape hatch for the same underlying gap.
   const [customModelProfile, setCustomModelProfile] = useState(false);
   const [pipelineSheetOpen, setPipelineSheetOpen] = useState(false);
+  const [ocrSheetOpen, setOcrSheetOpen] = useState(false);
   const [schemaName, setSchemaName] = useState("invoice");
   const [concurrency, setConcurrency] = useState("1");
   const [submitting, setSubmitting] = useState(false);
@@ -192,6 +194,11 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                 modelProfiles.reload();
               }}
             />
+            <OcrProfileSheet
+              open={ocrSheetOpen}
+              onClose={() => setOcrSheetOpen(false)}
+              onCreated={() => modelProfiles.reload()}
+            />
             <div className="grid gap-4 sm:grid-cols-3">
               <Field
                 label="Model profile"
@@ -231,14 +238,24 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                     placeholder="profile name from models.yaml"
                   />
                 )}
-                <button
-                  type="button"
-                  onClick={() => setPipelineSheetOpen(true)}
-                  className="mt-1.5 inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
-                >
-                  <Workflow className="h-3 w-3" />
-                  New pipeline (OCR→LLM) profile…
-                </button>
+                <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
+                  <button
+                    type="button"
+                    onClick={() => setPipelineSheetOpen(true)}
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                  >
+                    <Workflow className="h-3 w-3" />
+                    New pipeline (OCR→LLM) profile…
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOcrSheetOpen(true)}
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                  >
+                    <ScanText className="h-3 w-3" />
+                    New OCR-only profile…
+                  </button>
+                </div>
               </Field>
               <Field label="Schema name">
                 <Select value={schemaName} onChange={(e) => setSchemaName(e.target.value)}>
@@ -907,6 +924,119 @@ function PipelineProfileSheet({
 
         <Button type="submit" loading={submitting}>
           <Workflow className="h-4 w-4" />
+          {submitting ? "Creating…" : "Create profile"}
+        </Button>
+      </form>
+    </Sheet>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// OCR-only profile authoring -- POST /v1/studio/model-profiles/ocr. The sibling
+// gap #188 flagged and deferred: that PR only covered kind="pipeline". A
+// kind="ocr" profile has no extractor stage -- serving.solutions.OcrSolution
+// runs just an OCR backend and returns its raw transcribed text as the
+// completion, so this is a gateway/Playground target, not something to route
+// into as this tab's benchmark model (hence no onCreated auto-select the way
+// PipelineProfileSheet's does -- see the Field hint below).
+// ---------------------------------------------------------------------------
+
+function OcrProfileSheet({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (name: string) => void;
+}) {
+  const { toast } = useToast();
+
+  const [name, setName] = useState("");
+  const [backend, setBackend] = useState<string>(OCR_BACKENDS[0]);
+  const [language, setLanguage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setName("");
+      setBackend(OCR_BACKENDS[0]);
+      setLanguage("");
+      setError(null);
+    }
+  }, [open]);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!name.trim()) {
+      setError("Name is required.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const created = await createOcrProfile({
+        name: name.trim(),
+        backend,
+        ...(language.trim() ? { language: language.trim() } : {}),
+      });
+      toast({ title: "OCR profile created", description: created.name, tone: "success" });
+      onCreated(created.name);
+      onClose();
+    } catch (err) {
+      setError(
+        toUserMessage(err, {
+          unavailable: "OCR profile creation isn't available on this server.",
+          fallback: "Failed to create OCR profile.",
+        }),
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Sheet open={open} onClose={onClose}>
+      <form onSubmit={onSubmit} className="space-y-5">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">New OCR-only profile</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            POST /v1/studio/model-profiles/ocr — run a document through an OCR backend and
+            return its transcribed text as the completion, no extraction stage. Appends a{" "}
+            <code className="rounded bg-muted px-1">kind: ocr</code> entry to
+            configs/models.yaml. Useful as a gateway/Playground target; not a schema-scored
+            benchmark model on its own (pair it with an extractor via a pipeline profile
+            instead for that).
+          </p>
+        </div>
+
+        <Field label="Name" required>
+          <TextInput
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="tesseract_ocr"
+          />
+        </Field>
+
+        <Field label="OCR backend">
+          <Select value={backend} onChange={(e) => setBackend(e.target.value)}>
+            {OCR_BACKENDS.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        <Field label="Language" hint="Optional — backend-specific language hint.">
+          <TextInput value={language} onChange={(e) => setLanguage(e.target.value)} placeholder="en" />
+        </Field>
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        <Button type="submit" loading={submitting}>
+          <ScanText className="h-4 w-4" />
           {submitting ? "Creating…" : "Create profile"}
         </Button>
       </form>
