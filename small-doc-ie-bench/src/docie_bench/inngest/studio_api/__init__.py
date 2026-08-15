@@ -25,6 +25,7 @@ tests/test_studio_api_route_inventory.py). One submodule per route domain:
   - ``deploy.py``            -- deploy/seed triggers + HF Hub search/inspect
   - ``runs.py``               -- realtime token, run status/listing, comparisons,
                                  artifact download
+  - ``seeds.py``              -- durable seed-download listing (Downloads tab)
 
 ``_shared.py`` holds the constants/models/helpers every submodule needs
 (``default_run_store``, ``MODELS_CONFIG_PATH``, ``_record_event_owners``,
@@ -131,6 +132,8 @@ from .runs import (
 from .runs import (
     router as _runs_router,
 )
+from .seeds import list_seeds
+from .seeds import router as _seeds_router
 
 router = APIRouter(prefix="/v1/studio", tags=["studio"])
 for _sub_router in (
@@ -142,6 +145,7 @@ for _sub_router in (
     _benchmark_router,
     _deploy_router,
     _runs_router,
+    _seeds_router,
 ):
     router.include_router(_sub_router)
 del _sub_router
@@ -198,4 +202,5 @@ __all__ = [
     "ComparisonRequest",
     "create_comparison",
     "download_artifact",
+    "list_seeds",
 ]

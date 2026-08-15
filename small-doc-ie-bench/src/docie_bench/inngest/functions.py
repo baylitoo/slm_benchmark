@@ -1044,10 +1044,28 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
     """Seed a model from the host Ollama into the GGUF store.
 
     Event ``data``: ``reference`` (e.g. "qwen2.5:1.5b"), ``name`` (store name),
-    ``family`` (default "openai_chat"), ``channel``.
+    ``family`` (default "openai_chat"), ``channel``, ``tenant_id``.
     """
+    from docie_bench.studio.seed_store import claim_seed_run, complete_seed_run, fail_seed_run
+
     data = dict(ctx.event.data or {})
     channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    # Durable record BEFORE any download work -- see SeedRun's docstring for
+    # why this exists (the Downloads tab's only source of truth once the job
+    # settles; the realtime topic and progress sidecar are both ephemeral).
+    # "exists" means a REDELIVERY of an already-completed seed: don't
+    # re-download, answer with what's already durable.
+    outcome, claimed = claim_seed_run(
+        event_id=ctx.event.id,
+        channel=channel,
+        tenant_id=str(data.get("tenant_id") or "anonymous"),
+        kind="ollama",
+        name=str(data.get("name") or ""),
+        reference=str(data["reference"]) if data.get("reference") is not None else None,
+    )
+    if outcome == "exists":
+        return claimed.get("result") or {}
 
     await publish(channel, TOPIC_STATUS, {"state": "seeding", "reference": data.get("reference")})
     try:
@@ -1063,8 +1081,10 @@ async def seed_ollama_job(ctx: inngest.Context) -> dict[str, Any]:
             data.get("reference"),
             data.get("name"),
         )
+        fail_seed_run(event_id=ctx.event.id, error=str(exc))
         await _publish_error_safely(channel, str(exc))
         raise
+    complete_seed_run(event_id=ctx.event.id, result=result)
     # The seed already SUCCEEDED (blob transferred, index + catalog written) and
     # is durable. A post-success realtime publish sits OUTSIDE the try/except, so
     # if this publish raised it would mark the whole run failed even though the
@@ -1370,11 +1390,27 @@ async def seed_hf_job(ctx: inngest.Context) -> dict[str, Any]:
 
     Event ``data``: ``repo`` (e.g. "LiquidAI/LFM2.5-350M-Instruct-GGUF"),
     ``quant`` (e.g. "Q4_K_M"; empty = best available default), ``name``
-    (store name; empty = derived from the repo), ``family``, ``channel``.
-    Download progress streams on the channel's ``progress`` topic.
+    (store name; empty = derived from the repo), ``family``, ``channel``,
+    ``tenant_id``. Download progress streams on the channel's ``progress`` topic.
     """
+    from docie_bench.studio.seed_store import claim_seed_run, complete_seed_run, fail_seed_run
+
     data = dict(ctx.event.data or {})
     channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    # Durable record BEFORE any download work -- see seed_ollama_job's own
+    # comment for why. "exists" means a REDELIVERY of an already-completed
+    # seed: don't re-download, answer with what's already durable.
+    outcome, claimed = claim_seed_run(
+        event_id=ctx.event.id,
+        channel=channel,
+        tenant_id=str(data.get("tenant_id") or "anonymous"),
+        kind="hf",
+        name=str(data.get("name") or ""),
+        reference=str(data["repo"]) if data.get("repo") is not None else None,
+    )
+    if outcome == "exists":
+        return claimed.get("result") or {}
 
     await publish(channel, TOPIC_STATUS, {"state": "seeding", "repo": data.get("repo")})
     try:
@@ -1383,9 +1419,11 @@ async def seed_hf_job(ctx: inngest.Context) -> dict[str, Any]:
         logger.exception(
             "seed_hf_job failed (repo=%s name=%s)", data.get("repo"), data.get("name")
         )
+        fail_seed_run(event_id=ctx.event.id, error=str(exc))
         await _publish_error_safely(channel, str(exc))
         await asyncio.to_thread(clear_progress, channel)
         raise
+    complete_seed_run(event_id=ctx.event.id, result=result)
     # The download is done — drop the pollable progress sidecar so a later poll
     # sees the result, not a stale 100%.
     await asyncio.to_thread(clear_progress, channel)

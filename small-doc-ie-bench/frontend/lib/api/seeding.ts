@@ -22,6 +22,32 @@ export function seedOllama(payload: SeedOllamaRequest): Promise<TriggerResponse>
   });
 }
 
+/**
+ * A durable seed-download record (GET /v1/studio/seeds) -- the Downloads
+ * tab's source of truth. `getSeedProgress` below covers a download's LIVE
+ * percentage while it's in flight; this is what happened to it afterward
+ * (or while it's running, alongside the live progress), including the error
+ * text a failed seed's realtime publish would otherwise only ever reach a
+ * subscriber watching at that exact moment.
+ */
+export interface SeedRunSummary {
+  event_id: string;
+  channel: string;
+  kind: "ollama" | "hf";
+  reference: string | null;
+  name: string;
+  status: "running" | "completed" | "failed";
+  error: string | null;
+  result: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** This tenant's recent seed-download jobs, newest first. */
+export function listSeedRuns(): Promise<SeedRunSummary[]> {
+  return request<SeedRunSummary[]>("/v1/studio/seeds");
+}
+
 /** A seed download's latest progress — emitted on the realtime `progress` topic
  * AND persisted to a pollable sidecar so the polling fallback shows the same bar. */
 export interface SeedProgress {

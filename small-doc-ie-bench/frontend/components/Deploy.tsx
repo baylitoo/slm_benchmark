@@ -20,6 +20,7 @@ import { PageHeader } from "./patterns/PageHeader";
 import { POLL_MS } from "./deploy/shared";
 import { DeploymentsView } from "./deploy/DeploymentsView";
 import { ModelsView } from "./deploy/ModelsView";
+import { DownloadsView } from "./deploy/DownloadsView";
 import { DeployForm } from "./deploy/DeployForm";
 import { AddModelForm } from "./deploy/seed/AddModelForm";
 
@@ -79,7 +80,13 @@ export function Deploy({
               subtitle:
                 "GET /v1/serving/sizing — how many more instances fit in RAM right now.",
             }
-          : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
+          : view === "downloads"
+            ? {
+                title: "Downloads",
+                subtitle:
+                  "GET /v1/studio/seeds — ongoing and past seed jobs, with error detail for failures.",
+              }
+            : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
 
   return (
     <div>
@@ -106,6 +113,8 @@ export function Deploy({
         <ModelsView store={store} onDeploy={() => setSlideOver("deploy")} />
       ) : view === "sizing" ? (
         <Sizing active={active && view === "sizing"} />
+      ) : view === "downloads" ? (
+        <DownloadsView active={active && view === "downloads"} />
       ) : (
         <DeploymentsView
           deployments={deployments}

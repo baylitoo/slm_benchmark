@@ -259,6 +259,11 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.routing_policies import ensure_routing_policy_table
 
     ensure_routing_policy_table(_engine)
+    # Same race again: seed_runs is also new (durable index for Ollama/HF
+    # seed-download jobs, alongside dynamic_schemas/routing_policies above).
+    from docie_bench.studio.seed_store import ensure_seed_run_table
+
+    ensure_seed_run_table(_engine)
     Base.metadata.create_all(bind=_engine)
 
 
