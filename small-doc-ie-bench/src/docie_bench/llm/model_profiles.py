@@ -437,7 +437,7 @@ def delete_pipeline_profile(path: str | Path, *, name: str) -> None:
             "can be deleted through this API"
         )
 
-    _remove_profile_block(config_path, name)
+    _remove_profile_block(config_path, name, expected_kind=profile.kind)
 
     reloaded = load_model_profiles(config_path)
     if name in reloaded:
@@ -452,7 +452,7 @@ def delete_pipeline_profile(path: str | Path, *, name: str) -> None:
         )
 
 
-def _remove_profile_block(path: Path, name: str) -> None:
+def _remove_profile_block(path: Path, name: str, *, expected_kind: str) -> None:
     """Remove one ``name: ...`` entry from `path`'s top-level ``profiles:`` key.
 
     See ``delete_pipeline_profile`` for why this splices text instead of a full
@@ -478,14 +478,33 @@ def _remove_profile_block(path: Path, name: str) -> None:
     create-then-delete of the last profile in the file doesn't accumulate one extra
     blank line per cycle.
 
+    KNOWN LIMITATION, not fixed here: this only ever looks FORWARD from a profile's
+    own ``name:`` line -- it never looks backward for a comment that documents the
+    block being deleted (this file's real per-profile comments sit directly ABOVE
+    their profile, at the same indent). Deleting such a profile leaves its comment
+    orphaned in the file; the next ``add_pipeline_profile``/``add_ocr_profile`` call
+    then inserts before the next top-level key, so the stale comment can end up
+    sitting above an unrelated newly-created profile. Not data corruption (the file
+    still parses and every remaining profile still loads correctly) and deferred for
+    the same reason ``_splice_profile``'s own insertion-comment limitation is: the
+    heuristic to look backward correctly (is a preceding comment documenting THIS
+    block, the file header, or nothing) is more risk to get precisely right than the
+    bug, which is cosmetic doc-rot, not silent data loss like the kind mismatch above.
+
     Refuses (via ``ProfileWriteError``, before writing anything) rather than guesses
     if `name` doesn't appear under ``profiles:`` at the expected 2-space indent, or
-    appears more than once -- e.g. a hand-edited file with a duplicate top-level key,
-    where ``load_model_profiles`` (plain ``yaml.safe_load``) silently resolves to
-    whichever occurrence PyYAML parses last, but this text scan has no principled way
-    to know which physical block that was. Without this guard, a duplicate key could
-    let a `kind: passthrough` block get deleted out from under a caller who validated
-    a *different*, later `kind: pipeline` occurrence of the same name.
+    appears more than once as IDENTICAL TEXT. That text-identity check is not enough
+    on its own: YAML 1.1 coerces some bare scalars (``yes``/``no``/``true``/``false``/
+    ``on``/``off``/``null``/``~``) to bool/None, so an unquoted ``yes:`` and a quoted
+    ``"yes":`` are two DIFFERENT dict keys to ``load_model_profiles`` (one `True`, one
+    the string ``"yes"``) but look like the SAME single line to this regex scan --
+    `delete_pipeline_profile` validates against whichever one `load_model_profiles`
+    happened to key `existing["yes"]` as, the duplicate-count guard above sees only
+    one textual match and doesn't fire, and the wrong physical block (possibly a
+    ``kind: passthrough`` entry) gets deleted. Closed by `expected_kind`: after
+    locating the candidate block, its own ``kind:`` line must match the kind the
+    caller already validated `name` as, or this refuses to write rather than delete
+    whatever block the text scan happened to find.
     """
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=True)
@@ -527,6 +546,26 @@ def _remove_profile_block(path: Path, name: str) -> None:
         if indent <= 2:
             block_end = i
             break
+
+    # Post-condition, not a pre-condition: the located block might be the WRONG
+    # physical profile despite passing the duplicate-count guard above (see the
+    # YAML-1.1-boolean-coercion case in the docstring). A text-identical `name:`
+    # match is not proof this is the block `delete_pipeline_profile` validated --
+    # its own `kind:` must match too, or refuse rather than delete blind.
+    kind_pattern = re.compile(r"^\s*kind:\s*(\S+)\s*$")
+    found_kind: str | None = None
+    for line in lines[block_start:block_end]:
+        match = kind_pattern.match(line.rstrip())
+        if match:
+            found_kind = match.group(1).strip("'\"")
+            break
+    if found_kind != expected_kind:
+        raise ProfileWriteError(
+            f"profile {name!r}: the block found under 'profiles:' has kind="
+            f"{found_kind!r}, not the validated kind={expected_kind!r} -- likely a "
+            f"duplicate/ambiguous key in {path} (see this function's own docstring); "
+            "refusing to delete a block that doesn't match what was validated"
+        )
 
     if block_end == len(lines):
         # EOF only: nothing after the block to swallow the leading blank forward

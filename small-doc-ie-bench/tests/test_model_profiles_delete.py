@@ -216,4 +216,45 @@ def test_remove_profile_block_raises_if_name_not_found(tmp_path: Path) -> None:
     path.write_text("profiles:\n  a:\n    model: x\n", encoding="utf-8")
 
     with pytest.raises(ProfileWriteError, match="not found"):
-        _remove_profile_block(path, "b")
+        _remove_profile_block(path, "b", expected_kind="pipeline")
+
+
+def test_boolean_coerced_name_collision_refuses_rather_than_deletes_wrong_block(
+    tmp_path: Path,
+) -> None:
+    # YAML 1.1 coerces bare `yes:` to the bool key True, while `"yes":` stays the
+    # string "yes" -- two DIFFERENT dict keys to load_model_profiles, but the SAME
+    # single line of text (`  yes:`) to _remove_profile_block's regex scan. The
+    # duplicate-count guard (test_duplicate_top_level_key_refuses_to_guess above)
+    # doesn't catch this: it only ever sees ONE textual match, so it doesn't fire.
+    # delete_pipeline_profile validates name="yes" against the STRING-keyed pipeline
+    # profile, but without the kind post-condition the text scan would locate and
+    # delete the unquoted, BOOLEAN-keyed passthrough block instead -- silent,
+    # irreversible data loss of the wrong profile.
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        "profiles:\n"
+        "  yes:\n"
+        "    model: some-real-endpoint\n"
+        "    base_url: http://localhost:9999/v1\n"
+        "    api_key: local-not-used\n"
+        "\n"
+        '  "yes":\n'
+        "    kind: pipeline\n"
+        "    options:\n"
+        "      extractor: yes\n"
+        "      ocr_backend: tesseract\n",
+        encoding="utf-8",
+    )
+    # Confirms the setup: two distinct keys.
+    raw_keys = set(load_model_profiles(path))
+    assert True in raw_keys
+    assert "yes" in raw_keys
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(ProfileWriteError, match="not the validated kind"):
+        delete_pipeline_profile(path, name="yes")
+
+    # Refused before any write -- the passthrough block must survive untouched.
+    assert path.read_text(encoding="utf-8") == before
+    assert load_model_profiles(path)["yes"].kind == "pipeline"
