@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     review_claim_lease_seconds: int = Field(default=900, ge=30, le=86400)
     review_confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     review_evidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    # Whether a review task's OCR blocks (text + bounding box + page, no raster
+    # pixels) are persisted alongside it for the Evidence panel. "disabled"
+    # keeps today's behavior (no evidence, never persisted); "ocr_text" writes
+    # the blocks that were already grounded against the prediction. Page
+    # images are deliberately not an option here -- the OCR pipeline never
+    # rasterizes pages today, and adding that is a separate, larger change.
+    review_evidence_retention: Literal["disabled", "ocr_text"] = "ocr_text"
     annotation_export_dir: Path = Path("annotations")
 
     default_schema_name: str = "invoice"

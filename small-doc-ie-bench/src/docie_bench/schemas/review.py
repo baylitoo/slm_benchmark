@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from docie_bench.schemas.common import OCRBlock
+
 
 class ReviewStatus(StrEnum):
     PENDING = "pending"
@@ -59,6 +61,11 @@ class ReviewTaskCreate(BaseModel):
     disagreement_score: float | None = Field(default=None, ge=0.0, le=1.0)
     expected_learning_value: float | None = Field(default=None, ge=0.0, le=1.0)
     metadata: dict[str, str] = Field(default_factory=dict)
+    # The OCR blocks this extraction was grounded against, forwarded from
+    # ExtractionResponse.ocr_blocks. Persisted alongside the task (subject to
+    # settings.review_evidence_retention) so the Evidence panel can show the
+    # source text/bbox a field's evidence_ids point at.
+    ocr_blocks: list[OCRBlock] | None = None
 
 
 class ClaimRequest(BaseModel):
@@ -141,6 +148,10 @@ class ReviewTaskView(BaseModel):
     # value already line up with a FieldCorrection), nothing is ever applied
     # automatically. See _suggest_arithmetic_corrections.
     suggested_corrections: list[FieldCorrection] = Field(default_factory=list)
+    # Whether GET .../evidence has a persisted OCR-block layout for this task
+    # (false for tasks created before this feature, or when
+    # review_evidence_retention="disabled" at extraction time).
+    evidence_available: bool = False
 
 
 class ReviewMetricsView(BaseModel):
@@ -164,3 +175,13 @@ class AnnotationExportView(BaseModel):
     task_count: int
     annotations_path: str
     manifest_path: str
+
+
+class ReviewEvidenceView(BaseModel):
+    """OCR-block layout for one review task -- text + bounding box + page,
+    no raster pixels. A field's evidence_ids (on original_prediction /
+    latest_prediction) index into ``blocks`` by ``OCRBlock.id``."""
+
+    task_id: int
+    retention: str
+    blocks: list[OCRBlock]

@@ -81,3 +81,11 @@ class ExtractionResponse(BaseModel):
     # extraction (after any negotiation downgrade); distinguishes constrained
     # from unconstrained decoding in predictions. None for non-LLM adapters.
     response_format_style: str | None = None
+    # The OCR blocks this extraction was grounded against (empty for
+    # vision-only or manual-text extractions with no OCR step). Internal-only
+    # plumbing into the review queue (storage/audit.py), NOT part of the
+    # public /v1/extract/* response body -- `exclude=True` keeps it off
+    # model_dump()/response_model serialization while still readable as a
+    # plain attribute server-side, so ExtractionResponse's wire shape for
+    # existing callers is unchanged.
+    ocr_blocks: list[OCRBlock] | None = Field(default=None, exclude=True)

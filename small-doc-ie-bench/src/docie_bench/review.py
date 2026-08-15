@@ -13,12 +13,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.orm.exc import StaleDataError
 
-from docie_bench.schemas.extraction import schema_json
+from docie_bench.schemas.common import OCRBlock
 from docie_bench.schemas.review import (
     AnnotationExportView,
     FieldCorrection,
     ReviewCorrectionView,
     ReviewEventView,
+    ReviewEvidenceView,
     ReviewMetricsView,
     ReviewReason,
     ReviewStatus,
@@ -26,7 +27,13 @@ from docie_bench.schemas.review import (
     ReviewTaskView,
 )
 from docie_bench.settings import get_settings
-from docie_bench.storage.db import ReviewCorrection, ReviewEvent, ReviewTask, session_scope
+from docie_bench.storage.db import (
+    ReviewCorrection,
+    ReviewEvent,
+    ReviewEvidence,
+    ReviewTask,
+    session_scope,
+)
 
 
 class ReviewError(RuntimeError):
@@ -203,7 +210,11 @@ def _query_task(session: Session, task_id: int) -> ReviewTask:
     task = session.scalar(
         select(ReviewTask)
         .where(ReviewTask.id == task_id)
-        .options(selectinload(ReviewTask.corrections), selectinload(ReviewTask.events))
+        .options(
+            selectinload(ReviewTask.corrections),
+            selectinload(ReviewTask.events),
+            selectinload(ReviewTask.evidence),
+        )
     )
     if task is None:
         raise ReviewNotFoundError(f"Review task {task_id} not found")
@@ -350,6 +361,7 @@ def _task_view(task: ReviewTask, *, include_history: bool = True) -> ReviewTaskV
             and task.status in (ReviewStatus.PENDING, ReviewStatus.CLAIMED)
             else []
         ),
+        evidence_available=task.evidence is not None,
     )
 
 
@@ -384,6 +396,11 @@ def enqueue_review(payload: ReviewTaskCreate, *, force: bool = False) -> ReviewT
             status=ReviewStatus.PENDING,
             version=1,
         )
+        if payload.ocr_blocks and settings.review_evidence_retention != "disabled":
+            task.evidence = ReviewEvidence(
+                ocr_blocks_json=[block.model_dump(mode="json") for block in payload.ocr_blocks],
+                retention=settings.review_evidence_retention,
+            )
         _event(task, "enqueued", details={"force": force})
         session.add(task)
         _flush(session)
@@ -413,7 +430,11 @@ def list_reviews(
             _expire_task_claim(task, now)
         _flush(session)
 
-        statement = select(ReviewTask).order_by(ReviewTask.priority.desc(), ReviewTask.created_at)
+        statement = (
+            select(ReviewTask)
+            .options(selectinload(ReviewTask.evidence))
+            .order_by(ReviewTask.priority.desc(), ReviewTask.created_at)
+        )
         if status is not None:
             statement = statement.where(ReviewTask.status == status)
         if reviewer_id is not None:
@@ -429,6 +450,19 @@ def get_review(task_id: int) -> ReviewTaskView:
         _expire_task_claim(task, _utcnow())
         _flush(session)
         return _task_view(task)
+
+
+def get_review_evidence(task_id: int) -> ReviewEvidenceView:
+    with session_scope() as maybe_session:
+        session = _require_session(maybe_session)
+        task = _query_task(session, task_id)
+        if task.evidence is None:
+            raise ReviewNotFoundError(f"Review task {task_id} has no persisted evidence")
+        return ReviewEvidenceView(
+            task_id=task.id,
+            retention=task.evidence.retention,
+            blocks=[OCRBlock.model_validate(block) for block in task.evidence.ocr_blocks_json],
+        )
 
 
 def claim_review(
@@ -502,37 +536,47 @@ def _set_path(payload: dict[str, Any], field_path: str, value: Any) -> None:
         raise ReviewValidationError(f"Cannot apply correction to field_path={field_path!r}")
 
 
+def _path_exists(payload: Any, field_path: str) -> bool:
+    current = payload
+    for part in field_path.split("."):
+        if isinstance(current, dict):
+            if part not in current:
+                return False
+            current = current[part]
+        elif isinstance(current, list):
+            if not part.isdigit() or not 0 <= int(part) < len(current):
+                return False
+            current = current[int(part)]
+        else:
+            return False
+    return True
+
+
 def _validate_correction_paths(task: ReviewTask, corrections: list[FieldCorrection]) -> None:
-    if task.dynamic_schema_json:
-        allowed = {
-            field["name"]
-            for field in task.dynamic_schema_json.get("fields", [])
-            if isinstance(field, dict) and isinstance(field.get("name"), str)
+    """A correction path is valid iff it already resolves on
+    ``latest_prediction`` -- every declared schema field (dynamic or static)
+    is always emitted with its full field-wrapper (evidence_ids=[],
+    confidence=0.0, value=None when unseen), so any real field at any depth,
+    including through list indices (e.g. line_items.0.description.value),
+    always resolves. This also rejects typos/made-up paths without a separate
+    schema walk.
+
+    Replaces an earlier check that only allowed depth<=2 against a fixed leaf
+    allowlist ({value, amount, currency, evidence_ids, confidence}) -- that
+    couldn't express a correction into a nested object/list field at all, and
+    the Studio's schema-generated field editor needs to submit exactly those
+    paths for nested DynamicFieldSpec fields.
+    """
+    invalid = sorted(
+        {
+            correction.field_path
+            for correction in corrections
+            if not _path_exists(task.latest_prediction_json, correction.field_path)
         }
-        allowed.add("document_type")
-    else:
-        try:
-            allowed = set(schema_json(task.schema_name).get("properties", {}))
-        except ValueError as exc:
-            raise ReviewValidationError(str(exc)) from exc
-    unknown = sorted(
-        {correction.field_path.split(".", maxsplit=1)[0] for correction in corrections} - allowed
     )
-    if unknown:
-        raise ReviewValidationError(f"Correction paths contain unknown schema fields: {unknown}")
-    allowed_nested_fields = {"value", "amount", "currency", "evidence_ids", "confidence"}
-    invalid_nested = sorted(
-        correction.field_path
-        for correction in corrections
-        if len(correction.field_path.split(".")) > 2
-        or (
-            "." in correction.field_path
-            and correction.field_path.split(".", maxsplit=1)[1] not in allowed_nested_fields
-        )
-    )
-    if invalid_nested:
+    if invalid:
         raise ReviewValidationError(
-            f"Correction paths are not writable schema fields: {invalid_nested}"
+            f"Correction paths do not exist in the current prediction: {invalid}"
         )
 
 

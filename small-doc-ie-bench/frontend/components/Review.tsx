@@ -1,30 +1,26 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import {
-  ClipboardCheck,
-  Check,
-  X,
-  Undo2,
-  PlusCircle,
-  Trash2,
-} from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ClipboardCheck, Check, X, Undo2, Search } from "lucide-react";
 import {
   approveReview,
   claimReview,
   correctReview,
+  getReviewEvidence,
   listReviews,
   rejectReview,
   releaseReview,
   ApiError,
   type FieldCorrection,
+  type OCRBlock,
+  type ReviewEvidenceView,
   type ReviewStatus,
   type ReviewTaskView,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
-import { Alert, Badge, Button, Card, Field, Segmented, TextInput, type BadgeTone } from "./ui";
+import { Alert, Badge, Button, Segmented, Skeleton, TextInput, type BadgeTone } from "./ui";
 import { JsonView } from "./JsonView";
 import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
@@ -237,6 +233,377 @@ export function Review({ active = true }: { active?: boolean }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Schema-generated field editor: walks latest_prediction for wrapper objects
+// (TextField/DateField/NumberField -- {value, confidence, evidence_ids} -- or
+// MoneyField -- {amount, currency, confidence, evidence_ids}) at any depth,
+// including through list indices, so line_items.0.description.value edits
+// exactly like a top-level field. Replaces a free-text "type the dotted
+// path yourself" form -- the editor already knows every correctable path,
+// because it's reading them off the same JSON the correction eventually
+// writes back into (matches the backend's structural path validation, see
+// review.py's _validate_correction_paths).
+// ---------------------------------------------------------------------------
+
+interface FieldGroup {
+  path: string;
+  label: string;
+  kind: "scalar" | "money";
+  value: unknown;
+  amount: unknown;
+  currency: unknown;
+  confidence: number;
+  evidenceIds: string[];
+}
+
+function isFieldWrapper(node: unknown): node is Record<string, unknown> {
+  if (typeof node !== "object" || node === null || Array.isArray(node)) return false;
+  const obj = node as Record<string, unknown>;
+  return (
+    typeof obj.confidence === "number" &&
+    Array.isArray(obj.evidence_ids) &&
+    ("value" in obj || "amount" in obj)
+  );
+}
+
+function walkFieldGroups(node: unknown, path: string[] = [], label: string[] = []): FieldGroup[] {
+  if (isFieldWrapper(node)) {
+    const evidenceIds = (node.evidence_ids as unknown[]).filter(
+      (x): x is string => typeof x === "string",
+    );
+    const confidence = node.confidence as number;
+    const fullPath = path.join(".");
+    const fullLabel = label.slice(-2).join(" › ") || fullPath;
+    if ("amount" in node) {
+      return [
+        {
+          path: fullPath,
+          label: fullLabel,
+          kind: "money",
+          value: undefined,
+          amount: node.amount,
+          currency: node.currency,
+          confidence,
+          evidenceIds,
+        },
+      ];
+    }
+    return [
+      {
+        path: fullPath,
+        label: fullLabel,
+        kind: "scalar",
+        value: node.value,
+        amount: undefined,
+        currency: undefined,
+        confidence,
+        evidenceIds,
+      },
+    ];
+  }
+  if (Array.isArray(node)) {
+    return node.flatMap((item, i) =>
+      walkFieldGroups(item, [...path, String(i)], [...label, `#${i + 1}`]),
+    );
+  }
+  if (node && typeof node === "object") {
+    return Object.entries(node as Record<string, unknown>).flatMap(([key, value]) =>
+      walkFieldGroups(value, [...path, key], [...label, key]),
+    );
+  }
+  return [];
+}
+
+type EditSub = "value" | "amount" | "currency";
+
+function FieldEditor({
+  task,
+  selectedPath,
+  onSelect,
+  onSubmit,
+  busy,
+}: {
+  task: ReviewTaskView;
+  selectedPath: string | null;
+  onSelect: (group: FieldGroup) => void;
+  onSubmit: (corrections: FieldCorrection[]) => Promise<void>;
+  busy: boolean;
+}) {
+  const groups = useMemo(() => walkFieldGroups(task.latest_prediction), [task.latest_prediction]);
+  const [edits, setEdits] = useState<Record<string, string>>({});
+
+  // A submitted correction (or a claim/release) bumps task.version -- the
+  // fields it touched are now reflected in latest_prediction itself, so any
+  // in-progress edit text is stale and must be dropped, not resubmitted.
+  useEffect(() => setEdits({}), [task.id, task.version]);
+
+  const suggestionByKey = useMemo(() => {
+    const map = new Map<string, FieldCorrection>();
+    for (const s of task.suggested_corrections) map.set(s.field_path, s);
+    return map;
+  }, [task.suggested_corrections]);
+
+  function originalOf(group: FieldGroup, sub: EditSub): unknown {
+    return sub === "value" ? group.value : sub === "amount" ? group.amount : group.currency;
+  }
+
+  function editedValue(group: FieldGroup, sub: EditSub): string {
+    const key = `${group.path}.${sub}`;
+    if (key in edits) return edits[key];
+    const raw = originalOf(group, sub);
+    return raw == null ? "" : String(raw);
+  }
+
+  function setEditedValue(group: FieldGroup, sub: EditSub, raw: string) {
+    setEdits((prev) => ({ ...prev, [`${group.path}.${sub}`]: raw }));
+  }
+
+  function applySuggestion(group: FieldGroup) {
+    const sub: EditSub = group.kind === "money" ? "amount" : "value";
+    const suggestion = suggestionByKey.get(`${group.path}.${sub}`);
+    if (suggestion) setEditedValue(group, sub, String(suggestion.value));
+  }
+
+  function parseEdit(sub: EditSub, raw: string): unknown {
+    if (raw === "") return null;
+    if (sub === "currency") return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  function buildCorrections(): FieldCorrection[] {
+    const out: FieldCorrection[] = [];
+    for (const group of groups) {
+      const subs: EditSub[] = group.kind === "money" ? ["amount", "currency"] : ["value"];
+      for (const sub of subs) {
+        const key = `${group.path}.${sub}`;
+        if (!(key in edits)) continue;
+        const parsed = parseEdit(sub, edits[key]);
+        if (JSON.stringify(parsed) === JSON.stringify(originalOf(group, sub))) continue;
+        out.push({ field_path: key, value: parsed });
+      }
+    }
+    return out;
+  }
+
+  const pending = buildCorrections();
+  const claimed = task.status === "claimed";
+
+  return (
+    <div className="space-y-1.5">
+      {groups.length === 0 && (
+        <p className="text-xs text-muted-foreground">No correctable fields on this prediction.</p>
+      )}
+      {groups.map((group) => {
+        const isSelected = selectedPath === group.path;
+        const hasSuggestion =
+          claimed && suggestionByKey.has(`${group.path}.${group.kind === "money" ? "amount" : "value"}`);
+        return (
+          <div
+            key={group.path}
+            onClick={() => onSelect(group)}
+            className={`cursor-pointer rounded-md border px-3 py-2 text-sm transition ${
+              isSelected ? "border-accent bg-accent/5" : "border-border hover:border-accent/40"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate font-mono text-xs text-muted-foreground">
+                {group.label}
+              </span>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {hasSuggestion && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      applySuggestion(group);
+                    }}
+                    className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[10px] text-accent transition hover:bg-accent/20"
+                  >
+                    Apply suggestion
+                  </button>
+                )}
+                <Badge tone={group.confidence < 0.5 ? "warn" : "neutral"}>
+                  {(group.confidence * 100).toFixed(0)}%
+                </Badge>
+                {group.evidenceIds.length > 0 && (
+                  <Search className="h-3 w-3 text-muted-foreground" aria-label="Has evidence" />
+                )}
+              </div>
+            </div>
+            {group.kind === "money" ? (
+              <div className="mt-1 flex gap-2" onClick={(e) => e.stopPropagation()}>
+                <TextInput
+                  className="h-8 font-mono text-sm"
+                  value={editedValue(group, "amount")}
+                  disabled={!claimed}
+                  onChange={(e) => setEditedValue(group, "amount", e.target.value)}
+                />
+                <TextInput
+                  className="h-8 w-20 font-mono text-sm uppercase"
+                  value={editedValue(group, "currency")}
+                  disabled={!claimed}
+                  onChange={(e) => setEditedValue(group, "currency", e.target.value)}
+                />
+              </div>
+            ) : (
+              <TextInput
+                className="mt-1 h-8 font-mono text-sm"
+                value={editedValue(group, "value")}
+                disabled={!claimed}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => setEditedValue(group, "value", e.target.value)}
+              />
+            )}
+          </div>
+        );
+      })}
+      {claimed && (
+        <div className="pt-1.5">
+          <Button
+            size="sm"
+            loading={busy}
+            disabled={pending.length === 0}
+            onClick={() => void onSubmit(pending)}
+          >
+            Submit {pending.length} correction{pending.length === 1 ? "" : "s"}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Evidence panel: the OCR blocks a selected field's evidence_ids point at.
+// Blocks carry a bounding box but the Studio never persists page images
+// (see settings.review_evidence_retention) -- so instead of a real page
+// scan, this draws a synthetic layout: one box per OCR block positioned at
+// its own bbox, sized to the page's own text extents. Approximates "where on
+// the page" without ever storing a pixel of the source document. Falls back
+// to a plain highlighted text list for blocks with no bbox (manual/inferred
+// text has none).
+// ---------------------------------------------------------------------------
+
+function EvidencePanel({
+  taskId,
+  evidenceAvailable,
+  selectedEvidenceIds,
+}: {
+  taskId: number;
+  evidenceAvailable: boolean;
+  selectedEvidenceIds: string[];
+}) {
+  const [evidence, setEvidence] = useState<ReviewEvidenceView | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setEvidence(null);
+    setError(null);
+    if (!evidenceAvailable) return;
+    let cancelled = false;
+    setLoading(true);
+    getReviewEvidence(taskId)
+      .then((view) => {
+        if (!cancelled) setEvidence(view);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [taskId, evidenceAvailable]);
+
+  if (!evidenceAvailable) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        No OCR evidence was persisted for this task (a vision-only extraction has no OCR
+        step, or evidence retention was off when it ran).
+      </p>
+    );
+  }
+  if (loading) return <Skeleton className="h-40 w-full" />;
+  if (error) {
+    return <Alert tone="err">{toUserMessage(error, { fallback: "Could not load evidence." })}</Alert>;
+  }
+  if (!evidence || evidence.blocks.length === 0) {
+    return <p className="text-xs text-muted-foreground">No OCR blocks on this document.</p>;
+  }
+
+  const selected = new Set(selectedEvidenceIds);
+  const byPage = new Map<number, OCRBlock[]>();
+  for (const block of evidence.blocks) {
+    const list = byPage.get(block.page) ?? [];
+    list.push(block);
+    byPage.set(block.page, list);
+  }
+  const pages = [...byPage.keys()].sort((a, b) => a - b);
+
+  return (
+    <div className="max-h-[32rem] space-y-4 overflow-y-auto pr-1">
+      {pages.map((page) => {
+        const blocks = byPage.get(page) ?? [];
+        const withBbox = blocks.filter((b) => b.bbox);
+        return (
+          <div key={page}>
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Page {page}
+            </p>
+            {withBbox.length === 0 ? (
+              <div className="space-y-1">
+                {blocks.map((b) => (
+                  <p
+                    key={b.id}
+                    className={`rounded px-1.5 py-0.5 text-xs ${
+                      selected.has(b.id) ? "bg-accent/20 text-foreground" : "text-muted-foreground"
+                    }`}
+                  >
+                    {b.text}
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <svg
+                viewBox={`0 0 ${Math.max(...withBbox.map((b) => b.bbox!.x1))} ${Math.max(
+                  ...withBbox.map((b) => b.bbox!.y1),
+                )}`}
+                className="w-full rounded border border-border bg-muted/10"
+              >
+                {withBbox.map((b) => (
+                  <rect
+                    key={b.id}
+                    x={b.bbox!.x0}
+                    y={b.bbox!.y0}
+                    width={Math.max(b.bbox!.x1 - b.bbox!.x0, 1)}
+                    height={Math.max(b.bbox!.y1 - b.bbox!.y0, 1)}
+                    vectorEffect="non-scaling-stroke"
+                    className={
+                      selected.has(b.id)
+                        ? "fill-accent/40 stroke-accent"
+                        : "fill-foreground/5 stroke-border"
+                    }
+                    strokeWidth={selected.has(b.id) ? 1.5 : 0.5}
+                  >
+                    <title>{b.text}</title>
+                  </rect>
+                ))}
+              </svg>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function TaskDetail({
   task,
   onChanged,
@@ -248,29 +615,10 @@ function TaskDetail({
 }) {
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState<FieldCorrection[]>([]);
-  const [fieldPath, setFieldPath] = useState("");
-  const [value, setValue] = useState("");
+  const [selectedGroup, setSelectedGroup] = useState<FieldGroup | null>(null);
+  const [showRaw, setShowRaw] = useState(false);
 
-  function addPending() {
-    if (!fieldPath.trim()) return;
-    // Best-effort JSON parse so a number/bool/null corrects with the right
-    // type; falls back to the raw string, the common case (a fixed invoice
-    // number, a corrected date) doesn't need quoting.
-    let parsed: unknown = value;
-    try {
-      parsed = JSON.parse(value);
-    } catch {
-      /* not JSON -- keep it as the raw string */
-    }
-    setPending((p) => [...p, { field_path: fieldPath.trim(), value: parsed }]);
-    setFieldPath("");
-    setValue("");
-  }
-
-  function removePending(index: number) {
-    setPending((p) => p.filter((_, i) => i !== index));
-  }
+  useEffect(() => setSelectedGroup(null), [task.id]);
 
   async function run(action: () => Promise<ReviewTaskView>) {
     setBusy(true);
@@ -290,10 +638,9 @@ function TaskDetail({
     }
   }
 
-  async function submitCorrections() {
-    if (pending.length === 0) return;
-    await run(() => correctReview(task.id, task.version, pending));
-    setPending([]);
+  async function submitCorrections(corrections: FieldCorrection[]) {
+    if (corrections.length === 0) return;
+    await run(() => correctReview(task.id, task.version, corrections));
   }
 
   return (
@@ -316,37 +663,27 @@ function TaskDetail({
       <div className="grid gap-4 lg:grid-cols-2">
         <div>
           <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Original prediction
+            Fields
           </p>
-          <JsonView value={task.original_prediction} maxHeight="16rem" />
+          <FieldEditor
+            task={task}
+            selectedPath={selectedGroup?.path ?? null}
+            onSelect={setSelectedGroup}
+            onSubmit={submitCorrections}
+            busy={busy}
+          />
         </div>
         <div>
           <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Latest prediction
+            Evidence{selectedGroup ? ` — ${selectedGroup.label}` : ""}
           </p>
-          <JsonView value={task.latest_prediction} maxHeight="16rem" />
+          <EvidencePanel
+            taskId={task.id}
+            evidenceAvailable={task.evidence_available}
+            selectedEvidenceIds={selectedGroup?.evidenceIds ?? []}
+          />
         </div>
       </div>
-
-      {task.status === "claimed" && task.suggested_corrections.length > 0 && (
-        <div>
-          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Suggested corrections
-          </p>
-          <div className="flex flex-wrap gap-1.5">
-            {task.suggested_corrections.map((s, i) => (
-              <button
-                key={i}
-                type="button"
-                onClick={() => setPending((p) => [...p, s])}
-                className="rounded-full border border-accent/30 bg-accent/10 px-2.5 py-1 font-mono text-xs text-accent transition hover:bg-accent/20"
-              >
-                {s.field_path} → {JSON.stringify(s.value)}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
 
       {task.corrections.length > 0 && (
         <div>
@@ -369,67 +706,28 @@ function TaskDetail({
         </div>
       )}
 
-      {task.status === "claimed" && (
-        <Card
-          title="Add a correction"
-          subtitle="Field path + value; add several before submitting as one batch."
-          bodyClassName="space-y-3"
-        >
-          <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto]">
-            <Field label="Field path" hint="e.g. total_ttc.value">
-              <TextInput
-                value={fieldPath}
-                onChange={(e) => setFieldPath(e.target.value)}
-                placeholder="field.path"
-              />
-            </Field>
-            <Field label="Value" hint="JSON if it parses, else a raw string">
-              <TextInput
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-                placeholder='123.45 or "text"'
-              />
-            </Field>
-            <div className="flex items-end">
-              <Button
-                type="button"
-                variant="secondary"
-                size="sm"
-                onClick={addPending}
-                disabled={!fieldPath.trim()}
-              >
-                <PlusCircle className="h-3.5 w-3.5" />
-                Add
-              </Button>
-            </div>
+      <button
+        type="button"
+        onClick={() => setShowRaw((v) => !v)}
+        className="text-xs text-muted-foreground transition hover:text-foreground"
+      >
+        {showRaw ? "Hide" : "Show"} raw JSON
+      </button>
+      {showRaw && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div>
+            <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Original prediction
+            </p>
+            <JsonView value={task.original_prediction} maxHeight="16rem" />
           </div>
-
-          {pending.length > 0 && (
-            <div className="space-y-1.5">
-              {pending.map((c, i) => (
-                <div
-                  key={i}
-                  className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/20 px-3 py-1.5 text-xs"
-                >
-                  <span className="min-w-0 truncate font-mono">
-                    {c.field_path} = {JSON.stringify(c.value)}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => removePending(i)}
-                    aria-label="Remove"
-                    className="shrink-0 text-muted-foreground hover:text-foreground"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              ))}
-              <Button size="sm" loading={busy} onClick={() => void submitCorrections()}>
-                Submit {pending.length} correction{pending.length === 1 ? "" : "s"}
-              </Button>
-            </div>
-          )}
-        </Card>
+          <div>
+            <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Latest prediction
+            </p>
+            <JsonView value={task.latest_prediction} maxHeight="16rem" />
+          </div>
+        </div>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
