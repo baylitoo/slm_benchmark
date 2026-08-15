@@ -38,7 +38,7 @@ def client() -> TestClient:
 def models_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "models.yaml"
     path.write_text(FIXTURE, encoding="utf-8")
-    monkeypatch.setattr(studio_api, "MODELS_CONFIG_PATH", path)
+    monkeypatch.setattr(studio_api._shared, "MODELS_CONFIG_PATH", path)
     return path
 
 
@@ -56,7 +56,7 @@ def test_lists_profiles_from_models_yaml(models_yaml: Path, client: TestClient) 
 def test_missing_models_yaml_degrades_to_empty_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    monkeypatch.setattr(studio_api, "MODELS_CONFIG_PATH", tmp_path / "nope.yaml")
+    monkeypatch.setattr(studio_api._shared, "MODELS_CONFIG_PATH", tmp_path / "nope.yaml")
 
     resp = client.get("/v1/studio/model-profiles")
 

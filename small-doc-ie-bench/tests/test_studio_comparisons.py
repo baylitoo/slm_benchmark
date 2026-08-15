@@ -101,7 +101,7 @@ def test_build_comparison_payload_applies_budgets() -> None:
 
 
 def _client_with_store(store: RunStore, monkeypatch) -> TestClient:
-    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
     from docie_bench import security
 
     manager = TenantQuotaManager(

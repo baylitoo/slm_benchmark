@@ -491,7 +491,7 @@ def test_artifact_download_is_authenticated_and_tenant_scoped(tmp_path: Path, mo
 
     store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
     art_id = _seed_owned_run(store, tenant="tenant-a", body=b"<html>secret-a</html>")
-    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
 
     manager = TenantQuotaManager(
         api_keys={"secret-a": "tenant-a", "secret-b": "tenant-b"},
@@ -666,7 +666,7 @@ def test_download_with_missing_blob_is_404_not_500(tmp_path: Path, monkeypatch) 
     store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
     art_id = _seed_owned_run(store, tenant="tenant-a", body=b"<html>secret</html>")
     shutil.rmtree(tmp_path / "b")  # blob gone, row remains
-    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
 
     manager = TenantQuotaManager(
         api_keys={"secret-a": "tenant-a"},
@@ -754,8 +754,8 @@ def test_event_runs_proxy_is_tenant_scoped_for_extraction(tmp_path: Path, monkey
     store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
     # Extraction run: only an ownership row exists (no durable StudioRun).
     store.record_event_owner(event_id="evx", tenant_id="tenant-a")
-    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
-    monkeypatch.setattr(studio_api.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api.runs.httpx, "AsyncClient", _FakeAsyncClient)
 
     manager = TenantQuotaManager(
         api_keys={"secret-a": "tenant-a", "secret-b": "tenant-b"},
@@ -832,7 +832,7 @@ def test_benchmark_trigger_rejects_routing_policy_combined_with_model_profile(
     from docie_bench import security
 
     store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
-    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
     manager = TenantQuotaManager(
         api_keys={"secret-a": "tenant-a"},
         auth_required=True,
@@ -863,7 +863,7 @@ def test_benchmark_trigger_rotates_key_after_terminal_failure(
     from docie_bench.inngest.client import inngest_client
 
     store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
-    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
 
     captured: list[dict] = []
 
@@ -984,8 +984,8 @@ def test_deploy_and_seed_run_status_is_owned_and_tenant_scoped(
     from docie_bench.inngest.client import inngest_client
 
     store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
-    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
-    monkeypatch.setattr(studio_api.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
+    monkeypatch.setattr(studio_api.runs.httpx, "AsyncClient", _FakeAsyncClient)
 
     sent: list[str] = []
 
