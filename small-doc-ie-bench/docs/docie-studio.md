@@ -49,7 +49,7 @@ host.
 ```bash
 cp .env.example .env
 # In .env, POSTGRES_PASSWORD is REQUIRED (no more insecure "docie" default) —
-# set a real password and keep DATABASE_URL's password in sync with it.
+# set a real password; DATABASE_URL references it automatically.
 # Set two hex keys (even length): `openssl rand -hex 32`
 #   INNGEST_EVENT_KEY=...
 #   INNGEST_SIGNING_KEY=...

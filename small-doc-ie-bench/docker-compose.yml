@@ -307,7 +307,13 @@ services:
     volumes:
       - ./models:/models:ro
     ports:
-      - "8000:8000"
+      # Bound to loopback only (127.0.0.1): llama-cpp-python's OpenAI-compatible
+      # server has no auth of its own -- same risk class as prometheus above, and
+      # arguably worse (it accepts arbitrary requests and can leak prompts/
+      # completions, not just metrics). Opt-in (`--profile local-llm`), but not
+      # started-by-default doesn't mean safe-to-expose-by-default. Containers
+      # reach it as `llm-llamacpp:8000` over the compose network regardless.
+      - "127.0.0.1:${LLAMA_CPP_PORT:-8000}:8000"
     command:
       - "python"
       - "-m"
