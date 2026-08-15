@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from docie_bench import api
 from docie_bench.review import (
     ReviewConflictError,
+    ReviewNotFoundError,
     ReviewValidationError,
     claim_review,
     correct_review,
@@ -17,12 +18,14 @@ from docie_bench.review import (
     enqueue_review,
     export_annotations,
     get_review,
+    get_review_evidence,
     release_review,
     review_metrics,
     score_review_candidate,
 )
-from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation
+from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation, OCRBlock
 from docie_bench.schemas.review import FieldCorrection, ReviewStatus, ReviewTaskCreate
+from docie_bench.settings import get_settings
 from docie_bench.storage.audit import save_extraction_audit
 from docie_bench.storage.db import (
     ReviewCorrection,
@@ -205,14 +208,14 @@ def test_full_correction_approval_lifecycle_is_immutable_and_conflict_safe() -> 
             expected_version=claimed.version,
             corrections=[FieldCorrection(field_path="invoice_number.value", value="INV-1")],
         )
-    with pytest.raises(ReviewValidationError, match="unknown schema fields"):
+    with pytest.raises(ReviewValidationError, match="do not exist in the current prediction"):
         correct_review(
             task.id,
             reviewer_id="alice",
             expected_version=claimed.version,
             corrections=[FieldCorrection(field_path="invented.value", value="bad")],
         )
-    with pytest.raises(ReviewValidationError, match="not writable schema fields"):
+    with pytest.raises(ReviewValidationError, match="do not exist in the current prediction"):
         correct_review(
             task.id,
             reviewer_id="alice",
@@ -373,6 +376,38 @@ def test_extraction_audit_forwards_validation_warnings_to_the_review_task() -> N
         }
 
 
+def test_extraction_audit_forwards_ocr_blocks_but_never_serializes_them_on_the_response() -> None:
+    response = ExtractionResponse(
+        request_id="extraction-with-blocks",
+        schema_name="invoice",
+        model_profile="model-a",
+        document_hash="sha256:blocks",
+        # Low confidence -- must trigger a review reason, or enqueue_review
+        # returns None and there's no task to inspect below.
+        result={"invoice_number": {"value": "INV-1", "confidence": 0.1, "evidence_ids": ["b1"]}},
+        validation=ExtractionValidation(valid=True),
+        latency_ms=10,
+        ocr_blocks=[OCRBlock(id="b1", text="INV-1", page=1, source="pdf_text")],
+    )
+    # ocr_blocks is internal-only plumbing into the review queue -- it must
+    # never widen the public /v1/extract/* response body.
+    assert "ocr_blocks" not in response.model_dump()
+    assert "ocr_blocks" not in response.model_dump_json()
+
+    save_extraction_audit(response)
+
+    with session_scope() as session:
+        assert session is not None
+        task = (
+            session.query(ReviewTask).filter_by(source_request_id="extraction-with-blocks").one()
+        )
+        assert task.evidence is not None
+        assert task.evidence.ocr_blocks_json == [
+            {"id": "b1", "text": "INV-1", "page": 1, "bbox": None, "source": "pdf_text",
+             "confidence": None}
+        ]
+
+
 def test_reviewer_agreement_compares_latest_independent_reviewer_snapshots() -> None:
     task = enqueue_review(_payload("agreement"))
     assert task is not None
@@ -526,3 +561,106 @@ def test_review_api_exposes_lifecycle_conflicts_metrics_and_export(
         exported = client.post("/v1/reviews/exports", json={"version": "api-v1"})
         assert exported.status_code == 200
         assert exported.json()["task_count"] == 1
+
+
+def test_correction_supports_nested_paths_beyond_the_old_depth_two_limit() -> None:
+    """The Studio's schema-generated field editor emits paths like
+    line_items.0.description.value for nested DynamicFieldSpec fields -- the
+    old fixed depth-2 + leaf-allowlist validator rejected these outright.
+    """
+    payload = _payload("nested")
+    payload.original_prediction = {
+        "document_type": "invoice",
+        "line_items": [
+            {"description": {"value": "Widget", "confidence": 0.5, "evidence_ids": []}}
+        ],
+    }
+    task = enqueue_review(payload)
+    assert task is not None
+    claimed = _claim(task.id, task.version)
+
+    corrected = correct_review(
+        task.id,
+        reviewer_id="alice",
+        expected_version=claimed.version,
+        corrections=[
+            FieldCorrection(field_path="line_items.0.description.value", value="Widget Pro")
+        ],
+    )
+    assert corrected.latest_prediction["line_items"][0]["description"]["value"] == "Widget Pro"
+
+    with pytest.raises(ReviewValidationError, match="do not exist in the current prediction"):
+        correct_review(
+            task.id,
+            reviewer_id="alice",
+            expected_version=corrected.version,
+            # Index 1 doesn't exist -- only one line item was extracted.
+            corrections=[FieldCorrection(field_path="line_items.1.description.value", value="x")],
+        )
+
+
+def _payload_with_evidence(request_id: str) -> ReviewTaskCreate:
+    payload = _payload(request_id)
+    payload.ocr_blocks = [
+        OCRBlock(id="b1", text="Acme Corp", page=1, source="pdf_text"),
+        OCRBlock(id="b2", text="WRONG", page=1, source="pdf_text"),
+    ]
+    return payload
+
+
+def test_evidence_is_persisted_and_retrievable_by_default() -> None:
+    task = enqueue_review(_payload_with_evidence("evidence-1"))
+    assert task is not None
+    assert task.evidence_available is True
+
+    evidence = get_review_evidence(task.id)
+    assert evidence.retention == "ocr_text"
+    assert [block.id for block in evidence.blocks] == ["b1", "b2"]
+
+
+def test_evidence_is_not_persisted_when_retention_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_EVIDENCE_RETENTION", "disabled")
+    get_settings.cache_clear()
+    try:
+        task = enqueue_review(_payload_with_evidence("evidence-2"))
+        assert task is not None
+        assert task.evidence_available is False
+
+        with pytest.raises(ReviewNotFoundError):
+            get_review_evidence(task.id)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_evidence_route_returns_404_when_none_persisted() -> None:
+    task = enqueue_review(_payload("no-evidence"))
+    assert task is not None
+    with TestClient(api.app) as client:
+        resp = client.get(f"/v1/reviews/{task.id}/evidence")
+        assert resp.status_code == 404
+
+
+def test_evidence_route_serves_persisted_blocks() -> None:
+    with TestClient(api.app) as client:
+        created = client.post(
+            "/v1/reviews", json=_payload_with_evidence("evidence-api").model_dump(mode="json")
+        )
+        task = created.json()
+        resp = client.get(f"/v1/reviews/{task['id']}/evidence")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["retention"] == "ocr_text"
+        assert [block["id"] for block in body["blocks"]] == ["b1", "b2"]
+
+
+def test_create_review_route_rejects_oversized_ocr_block_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api.settings, "max_ocr_block_chars", 5)
+    with TestClient(api.app) as client:
+        resp = client.post(
+            "/v1/reviews", json=_payload_with_evidence("evidence-oversized").model_dump(mode="json")
+        )
+        assert resp.status_code == 413

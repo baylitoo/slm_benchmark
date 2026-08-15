@@ -15,6 +15,7 @@ from sqlalchemy import (
     Integer,
     MetaData,
     String,
+    Table,
     Text,
     UniqueConstraint,
     create_engine,
@@ -106,6 +107,9 @@ class ReviewTask(Base):
     events: Mapped[list[ReviewEvent]] = relationship(
         back_populates="task", cascade="all, delete-orphan", order_by="ReviewEvent.id"
     )
+    evidence: Mapped[ReviewEvidence | None] = relationship(
+        back_populates="task", cascade="all, delete-orphan", uselist=False
+    )
 
 
 class ReviewCorrection(Base):
@@ -144,6 +148,29 @@ class ReviewEvent(Base):
     details_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     task: Mapped[ReviewTask] = relationship(back_populates="events")
+
+
+class ReviewEvidence(Base):
+    """OCR-block layout persisted alongside a review task (see
+    settings.review_evidence_retention). One row per task -- a new table
+    rather than a column on review_task since it's optional, can be sizable
+    (every OCR block on the document), and is read separately from the task
+    itself (GET .../evidence, not part of the default queue/detail payload).
+    """
+
+    __tablename__ = "review_evidence"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("review_task.id"), unique=True, index=True
+    )
+    ocr_blocks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    retention: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC)
+    )
+
+    task: Mapped[ReviewTask] = relationship(back_populates="evidence")
 
 
 _engine = None
@@ -205,6 +232,35 @@ def ensure_review_task_validation_warnings_column(engine: Engine) -> bool:
     return added
 
 
+_REVIEW_EVIDENCE_LOCK_KEY = 0x0D0C1E09
+
+
+def ensure_review_evidence_table(engine: Engine) -> bool:
+    """Race-safe forward migration: create ``review_evidence`` if missing.
+
+    Same shape as ``ensure_seed_run_table`` (studio/seed_store.py):
+    ``CREATE TABLE IF NOT EXISTS`` under ``pg_advisory_xact_lock`` on
+    PostgreSQL, plus explicit ``if_not_exists=True`` index creation --
+    ``Base.metadata.create_all()`` alone would race every process's
+    concurrent ``init_engine`` (api, worker, N replicas) into a duplicate-
+    table/index abort on whichever one loses.
+    """
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    evidence_table = ReviewEvidence.__table__
+    assert isinstance(evidence_table, Table)  # narrow FromClause for the compiler
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"), {"key": _REVIEW_EVIDENCE_LOCK_KEY}
+            )
+        existed = sa_inspect(connection).has_table("review_evidence")
+        connection.execute(CreateTable(evidence_table, if_not_exists=True))
+        for index in evidence_table.indexes:
+            connection.execute(CreateIndex(index, if_not_exists=True))
+    return not existed
+
+
 def init_engine(database_url: str | None = None) -> None:
     global _engine, _SessionLocal
     resolved_url = database_url or get_settings().database_url
@@ -240,6 +296,9 @@ def init_engine(database_url: str | None = None) -> None:
     # arithmetic-reconciliation warning enrichment): a pre-existing table needs
     # it added explicitly, create_all only completes brand-new tables.
     ensure_review_task_validation_warnings_column(_engine)
+    # review_evidence is a NEW table (evidence-aware Review workspace), same
+    # concurrent-init_engine race as the other new tables below.
+    ensure_review_evidence_table(_engine)
     # serving_node is a NEW table, which create_all would create — but the
     # api, serving service, and N workers all run init_engine concurrently at
     # stack-up, and create_all's inspect-then-CREATE can race into a

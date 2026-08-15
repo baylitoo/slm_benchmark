@@ -673,6 +673,7 @@ class ExtractionService:
                 else None
             ),
             response_format_style=effective_style,
+            ocr_blocks=blocks or None,
         )
 
     async def _propose_schema(

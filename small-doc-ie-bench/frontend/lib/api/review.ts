@@ -83,6 +83,38 @@ export interface ReviewTaskView {
    * persisted — a one-click starting point for the correction form, not
    * applied automatically. */
   suggested_corrections: FieldCorrection[];
+  /** Whether GET .../evidence has a persisted OCR-block layout for this
+   * task (false for tasks predating this feature, or when the server's
+   * review_evidence_retention was "disabled" at extraction time). */
+  evidence_available: boolean;
+}
+
+export interface BoundingBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export interface OCRBlock {
+  id: string;
+  text: string;
+  page: number;
+  bbox: BoundingBox | null;
+  source: "pdf_text" | "tesseract" | "paddleocr" | "manual" | "unknown";
+  confidence: number | null;
+}
+
+/** GET /v1/reviews/{id}/evidence — the OCR-block layout (text + bbox + page,
+ * no raster pixels) a task's field evidence_ids index into by OCRBlock.id. */
+export interface ReviewEvidenceView {
+  task_id: number;
+  retention: string;
+  blocks: OCRBlock[];
+}
+
+export function getReviewEvidence(taskId: number): Promise<ReviewEvidenceView> {
+  return request<ReviewEvidenceView>(`/v1/reviews/${taskId}/evidence`);
 }
 
 const REVIEWER_ID = "studio-operator";

@@ -33,6 +33,7 @@ from docie_bench.review import (
     enqueue_review,
     export_annotations,
     get_review,
+    get_review_evidence,
     list_reviews,
     release_review,
     review_metrics,
@@ -47,6 +48,7 @@ from docie_bench.schemas.review import (
     CorrectionRequest,
     DecisionRequest,
     ReleaseRequest,
+    ReviewEvidenceView,
     ReviewMetricsView,
     ReviewStatus,
     ReviewTaskCreate,
@@ -388,6 +390,11 @@ def _review_http_error(exc: Exception) -> HTTPException:
 def create_review(
     payload: ReviewTaskCreate, _tenant: TenantDependency, force: bool = Query(default=False)
 ) -> ReviewTaskView | None:
+    blocks = payload.ocr_blocks or []
+    if len(blocks) > settings.max_ocr_blocks:
+        raise HTTPException(status_code=413, detail="OCR block count exceeds configured limit")
+    if any(len(block.text) > settings.max_ocr_block_chars for block in blocks):
+        raise HTTPException(status_code=413, detail="An OCR block exceeds configured limit")
     try:
         task = enqueue_review(payload, force=force)
         if task:
@@ -442,6 +449,14 @@ def export_review_annotations(
 def review_detail(task_id: int, _tenant: TenantDependency) -> ReviewTaskView:
     try:
         return get_review(task_id)
+    except Exception as exc:
+        raise _review_http_error(exc) from exc
+
+
+@app.get("/v1/reviews/{task_id}/evidence", response_model=ReviewEvidenceView)
+def review_evidence(task_id: int, _tenant: TenantDependency) -> ReviewEvidenceView:
+    try:
+        return get_review_evidence(task_id)
     except Exception as exc:
         raise _review_http_error(exc) from exc
 
