@@ -53,7 +53,7 @@ jobs:
           name: regression-comparison
           path: small-doc-ie-bench/comparison/
 
-  frontend-typecheck:
+  frontend-checks:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -67,3 +67,4 @@ jobs:
           cache-dependency-path: small-doc-ie-bench/frontend/package-lock.json
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run test
