@@ -148,6 +148,34 @@ _YAML_RESERVED_WORDS = frozenset(
 )
 
 
+def _validate_new_profile_name(name: str, existing: Mapping[str, ModelProfile]) -> str:
+    """Shared create-only name validation for ``add_pipeline_profile``/``add_ocr_profile``.
+
+    Strips, checks non-empty, charset, YAML-reserved-word (see the module comment
+    above ``_YAML_RESERVED_WORDS`` for why), and collision against `existing`. Returns
+    the stripped name on success. Both writers need exactly this and nothing more —
+    the divergence between a pipeline profile (extractor + exactly-one-of
+    ocr_backend/ocr_model) and an ocr profile (backend only, no LLM stage) starts
+    after the name is settled, so only this prefix is shared.
+    """
+    name = name.strip()
+    if not name:
+        raise ProfileWriteError("name is required")
+    if not _VALID_PROFILE_NAME.fullmatch(name):
+        raise ProfileWriteError(
+            "name must start with a letter or digit and contain only letters, "
+            "digits, '_', '.', or '-'"
+        )
+    if name.lower() in _YAML_RESERVED_WORDS:
+        raise ProfileWriteError(
+            f"name {name!r} is a YAML boolean/null literal and would not round-trip "
+            "as a string key"
+        )
+    if name in existing:
+        raise ProfileConflictError(f"profile {name!r} already exists")
+    return name
+
+
 def add_pipeline_profile(
     path: str | Path,
     *,
@@ -193,22 +221,7 @@ def add_pipeline_profile(
     """
     config_path = Path(path)
     existing = load_model_profiles(config_path) if config_path.exists() else {}
-
-    name = name.strip()
-    if not name:
-        raise ProfileWriteError("name is required")
-    if not _VALID_PROFILE_NAME.fullmatch(name):
-        raise ProfileWriteError(
-            "name must start with a letter or digit and contain only letters, "
-            "digits, '_', '.', or '-'"
-        )
-    if name.lower() in _YAML_RESERVED_WORDS:
-        raise ProfileWriteError(
-            f"name {name!r} is a YAML boolean/null literal and would not round-trip "
-            "as a string key"
-        )
-    if name in existing:
-        raise ProfileConflictError(f"profile {name!r} already exists")
+    name = _validate_new_profile_name(name, existing)
 
     extractor = extractor.strip()
     if not extractor:
@@ -252,6 +265,74 @@ def add_pipeline_profile(
         # Two concurrent writers can race the read-modify-write below (no file lock);
         # the loser's own insert can be clobbered by the winner's replace() landing
         # after it. Surface as a clear, retryable error instead of a raw KeyError/500.
+        raise ProfileWriteError(
+            f"profile {name!r} was written but is missing from {config_path} on "
+            "re-read -- likely a concurrent write to the same file; retry"
+        ) from exc
+
+
+def add_ocr_profile(
+    path: str | Path,
+    *,
+    name: str,
+    backend: str,
+    language: str | None = None,
+) -> ModelProfile:
+    """Append a ``kind: ocr`` (OCR-only, no LLM stage) profile to the models.yaml at `path`.
+
+    The narrower sibling of ``add_pipeline_profile`` -- #188 authored `kind: pipeline`
+    profiles from the Studio UI and explicitly deferred `kind: ocr` as "a related but
+    separate gap". Unlike a pipeline profile, an ocr profile has no extractor and no
+    choice between a built-in backend and a vision-model transcriber: ``serving.
+    solutions.OcrSolution`` reads only ``options.backend`` (default "tesseract") and
+    optional ``options.language``, and returns the backend's raw transcribed text as
+    the completion -- there is no JSON extraction stage. That means a ``kind: ocr``
+    profile is not a schema-scored benchmark model in its own right (the benchmark
+    runner expects a completion it can parse against an extraction schema, which
+    OCR-only output isn't); it's reachable directly through the gateway by name
+    (``/v1/chat/completions`` with ``model=<name>``), or reusable as a pipeline
+    profile's `ocr_backend` choice made durable under its own name. NOTE: no Studio
+    UI surface (Playground, Benchmark) invokes a `kind: ocr` profile yet -- creating
+    one here does not by itself make it reachable from anywhere in the Studio UI.
+
+    IMPORTANT: the options key is ``backend``, not ``ocr_backend`` -- that's
+    `PipelineSolution`'s key for the same concept. ``OcrSolution.__init__`` reads only
+    ``options.get("backend", ...)`` with no fallback, so writing ``ocr_backend`` here
+    would silently run the tesseract default instead of what the caller asked for.
+
+    Shares ``_validate_new_profile_name`` and ``_splice_profile`` with
+    ``add_pipeline_profile`` (see their docstrings for why validation is create-only
+    and the file is text-spliced rather than round-tripped); the backend-name
+    validation itself mirrors ``OcrSolution.__init__``'s own fail-fast ``get_ocr_backend``
+    call so a bad name is rejected at authoring time, not mid-request.
+    """
+    config_path = Path(path)
+    existing = load_model_profiles(config_path) if config_path.exists() else {}
+    name = _validate_new_profile_name(name, existing)
+
+    backend = backend.strip() if backend else ""
+    if not backend:
+        raise ProfileWriteError("backend is required")
+
+    # Local import: keep the OCR backend stack (tesseract/paddleocr) an optional
+    # dependency for callers that only need to read/parse profiles.
+    from docie_bench.ocr.factory import get_ocr_backend
+
+    try:
+        get_ocr_backend(backend, language=language)  # fail fast on a bad name
+    except ValueError as exc:
+        raise ProfileWriteError(str(exc)) from exc
+
+    options: dict[str, Any] = {"backend": backend}
+    if language:
+        options["language"] = language
+
+    _splice_profile(config_path, name, {"kind": "ocr", "options": options})
+    try:
+        return load_model_profiles(config_path)[name]
+    except KeyError as exc:
+        # Same concurrent-write race as add_pipeline_profile's re-read -- see its
+        # comment above for the mechanics.
         raise ProfileWriteError(
             f"profile {name!r} was written but is missing from {config_path} on "
             "re-read -- likely a concurrent write to the same file; retry"

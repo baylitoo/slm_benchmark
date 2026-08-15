@@ -332,6 +332,44 @@ async def create_pipeline_profile(payload: PipelineProfileRequest) -> dict[str, 
     return {"name": profile.name, "kind": profile.kind, "options": dict(profile.options)}
 
 
+class OcrProfileRequest(BaseModel):
+    name: str
+    backend: str
+    language: str | None = None
+
+
+@router.post("/model-profiles/ocr", status_code=201)
+async def create_ocr_profile(payload: OcrProfileRequest) -> dict[str, Any]:
+    """Author a ``kind: ocr`` (OCR-only, no LLM stage) profile into ``configs/models.yaml``.
+
+    The gap #188 explicitly flagged and deferred: that PR let an operator author a
+    ``kind: pipeline`` (OCR->LLM) profile; a ``kind: ocr`` profile is narrower --
+    ``serving.solutions.OcrSolution`` runs only an OCR backend and returns its raw
+    transcribed text as the completion, no extractor. Not a schema-scored benchmark
+    model (see ``model_profiles.add_ocr_profile`` for why); reachable directly
+    through the gateway by name, but no Studio UI surface invokes one yet. Create-only,
+    same 409/422 contract as the pipeline route above.
+    """
+    from docie_bench.llm.model_profiles import (
+        ProfileConflictError,
+        ProfileWriteError,
+        add_ocr_profile,
+    )
+
+    try:
+        profile = add_ocr_profile(
+            MODELS_CONFIG_PATH,
+            name=payload.name.strip(),
+            backend=payload.backend.strip(),
+            language=payload.language.strip() if payload.language else None,
+        )
+    except ProfileConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ProfileWriteError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"name": profile.name, "kind": profile.kind, "options": dict(profile.options)}
+
+
 class BenchmarkRequest(BaseModel):
     dataset: str
     split: str | None = None
