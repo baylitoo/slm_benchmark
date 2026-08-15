@@ -1,7 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Gauge, Play, Download, GitCompare, ShieldCheck, Workflow, ScanText } from "lucide-react";
+import {
+  Gauge,
+  Play,
+  Download,
+  GitCompare,
+  ShieldCheck,
+  Workflow,
+  ScanText,
+  Trash2,
+} from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
@@ -12,6 +21,7 @@ import {
   listModelProfiles,
   createPipelineProfile,
   createOcrProfile,
+  deletePipelineProfile,
   artifactUrl,
   compareRuns,
   validateDataset,
@@ -191,6 +201,15 @@ export function Benchmark({ view = "run" }: { view?: string }) {
               onCreated={(name) => {
                 setCustomModelProfile(true);
                 setModelProfile(name);
+                modelProfiles.reload();
+              }}
+              onDeleted={(name) => {
+                // The just-deleted profile can't be a valid selection anymore --
+                // clear it out from under the Custom field if it was the one picked.
+                if (customModelProfile && modelProfile === name) {
+                  setCustomModelProfile(false);
+                  setModelProfile("");
+                }
                 modelProfiles.reload();
               }}
             />
@@ -745,14 +764,17 @@ function RootCauseList({ title, rows }: { title: string; rows: ComparisonRow[] }
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline profile authoring -- POST /v1/studio/model-profiles/pipeline. The
-// missing counterpart to #183's "Custom (models.yaml profile name)…" escape
-// hatch above: that field lets you TARGET a kind="pipeline" profile by name,
-// this Sheet lets you CREATE one instead of hand-editing configs/models.yaml
-// on the server. Create-only, scoped strictly to the pipeline shape (name +
-// extractor + one of ocr_backend/ocr_model) -- not a general models.yaml
-// editor, and not an update/delete flow (the backend doesn't support those
-// yet either; see add_pipeline_profile's own docstring for why).
+// Pipeline profile authoring -- POST /v1/studio/model-profiles/pipeline, DELETE
+// /v1/studio/model-profiles/{name}. The missing counterpart to #183's "Custom
+// (models.yaml profile name)…" escape hatch above: that field lets you TARGET a
+// kind="pipeline" profile by name, this Sheet lets you CREATE or REMOVE one
+// instead of hand-editing configs/models.yaml on the server. Creation is scoped
+// strictly to the pipeline shape (name + extractor + one of ocr_backend/
+// ocr_model) -- not a general models.yaml editor. Deletion only ever targets
+// kind="pipeline"/"ocr" entries (the backend itself refuses passthrough); an
+// in-place UPDATE (edit extractor/ocr_backend without delete+recreate) still
+// isn't supported -- see add_pipeline_profile's own docstring for why that's a
+// harder text-splice problem than either create or delete.
 // ---------------------------------------------------------------------------
 
 const OCR_BACKENDS = ["liteparse", "tesseract", "paddleocr"] as const;
@@ -762,11 +784,13 @@ function PipelineProfileSheet({
   onClose,
   profiles,
   onCreated,
+  onDeleted,
 }: {
   open: boolean;
   onClose: () => void;
   profiles: ModelProfileSummary[];
   onCreated: (name: string) => void;
+  onDeleted: (name: string) => void;
 }) {
   const { toast } = useToast();
   const extractors = useMemo(() => profiles.filter((p) => p.kind === "passthrough"), [profiles]);
@@ -774,6 +798,35 @@ function PipelineProfileSheet({
     () => profiles.filter((p) => p.kind === "passthrough" && p.vision),
     [profiles],
   );
+  // Only these two kinds are ever deletable through this API (passthrough is
+  // refused server-side -- a live deployment or another pipeline profile's
+  // extractor/ocr_model can still reference one by name).
+  const deletable = useMemo(
+    () => profiles.filter((p) => p.kind === "pipeline" || p.kind === "ocr"),
+    [profiles],
+  );
+  const [deletingName, setDeletingName] = useState<string | null>(null);
+
+  async function onDelete(profileName: string) {
+    if (!window.confirm(`Delete profile "${profileName}"? This can't be undone.`)) return;
+    setDeletingName(profileName);
+    try {
+      await deletePipelineProfile(profileName);
+      toast({ title: `Profile ${profileName} deleted`, tone: "success" });
+      onDeleted(profileName);
+    } catch (err) {
+      toast({
+        title: "Delete failed",
+        description: toUserMessage(err, {
+          unavailable: "Profile deletion isn't available on this server.",
+          fallback: "Failed to delete profile.",
+        }),
+        tone: "error",
+      });
+    } finally {
+      setDeletingName(null);
+    }
+  }
 
   const [name, setName] = useState("");
   const [extractor, setExtractor] = useState("");
@@ -834,7 +887,37 @@ function PipelineProfileSheet({
 
   return (
     <Sheet open={open} onClose={onClose}>
-      <form onSubmit={onSubmit} className="space-y-5">
+      <div className="space-y-5">
+        {deletable.length > 0 && (
+          <div>
+            <h2 className="text-sm font-semibold text-foreground">Existing pipeline/OCR profiles</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              DELETE /v1/studio/model-profiles/&#123;name&#125; — passthrough profiles aren&apos;t
+              listed here; they can&apos;t be removed through this API.
+            </p>
+            <ul className="mt-2 divide-y divide-border rounded-md border border-border">
+              {deletable.map((p) => (
+                <li key={p.name} className="flex items-center justify-between gap-2 px-3 py-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm text-foreground">{p.name}</p>
+                    <p className="text-xs text-muted-foreground">{p.kind}</p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="danger"
+                    size="sm"
+                    disabled={deletingName === p.name}
+                    onClick={() => void onDelete(p.name)}
+                    title={`Delete ${p.name}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <form onSubmit={onSubmit} className="space-y-5">
         <div>
           <h2 className="text-sm font-semibold text-foreground">New pipeline profile</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
@@ -926,7 +1009,8 @@ function PipelineProfileSheet({
           <Workflow className="h-4 w-4" />
           {submitting ? "Creating…" : "Create profile"}
         </Button>
-      </form>
+        </form>
+      </div>
     </Sheet>
   );
 }

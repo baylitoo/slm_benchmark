@@ -83,7 +83,12 @@ def _expand_env(value: Any) -> Any:
 def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     profiles: dict[str, ModelProfile] = {}
-    for name, cfg in data.get("profiles", {}).items():
+    # `or {}`, not `.get("profiles", {})`: a `profiles:` key present with nothing
+    # under it (e.g. every profile was just deleted from the file) parses to
+    # {"profiles": None}, and `.get` returns that None verbatim since the key
+    # exists -- only `or {}` degrades it to the same empty-registry behavior as a
+    # missing `profiles:` key entirely, instead of an AttributeError on `.items()`.
+    for name, cfg in (data.get("profiles") or {}).items():
         cfg = {key: _expand_env(value) for key, value in cfg.items()}
         api_key_env = cfg.get("api_key_env")
         api_key = os.environ.get(api_key_env, "") if api_key_env else cfg.get("api_key", "")
@@ -135,6 +140,10 @@ class ProfileWriteError(ValueError):
 
 class ProfileConflictError(ProfileWriteError):
     """The profile name already exists in the target models.yaml."""
+
+
+class ProfileNotFoundError(ProfileWriteError):
+    """No profile named `name` exists in the target models.yaml."""
 
 
 _VALID_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -200,9 +209,11 @@ def add_pipeline_profile(
 
     Create-only: raises ``ProfileConflictError`` if `name` already exists. Updating an
     existing entry in place is deliberately out of scope -- text-splicing a REPLACE is
-    materially harder than an INSERT (matching the existing block's exact line range
-    without a real YAML round-trip) and isn't needed for the "author a new pipeline
-    profile" slice this exists for.
+    materially harder than either an INSERT or a DELETE (see ``delete_pipeline_profile``,
+    which *is* provided) because a REPLACE has to regenerate valid YAML for a block whose
+    existing shape (nested ``options:``, key order, any hand-added comments) isn't known
+    ahead of time, where INSERT only ever has to place well-formed YAML this function
+    itself generated and DELETE only ever has to find a block's start/end and remove it.
 
     Validates rules that are AT LEAST as strict as what ``serving.solutions.
     PipelineSolution`` enforces at request time (kept in sync manually -- there is no
@@ -388,6 +399,146 @@ def _splice_profile(path: Path, name: str, entry: dict[str, Any]) -> None:
     # concurrent callers stage into the SAME temp file before either calls replace(),
     # which can silently lose one writer's insert even though each individual
     # write_text()/replace() pair is atomic on its own.
+    tmp_path = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(new_text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def delete_pipeline_profile(path: str | Path, *, name: str) -> None:
+    """Remove an existing ``kind: pipeline`` or ``kind: ocr`` profile from the
+    models.yaml at `path`.
+
+    The DELETE counterpart to ``add_pipeline_profile``'s create-only INSERT -- not an
+    UPDATE (see that function's own docstring for why an in-place REPLACE is a harder
+    text-splice problem than either of these). Text-spliced for the same reason
+    ``add_pipeline_profile`` is: ``configs/models.yaml`` is hand-documented and a full
+    ``yaml.safe_load``/``yaml.safe_dump`` round-trip would silently discard every
+    comment in it.
+
+    ``passthrough`` profiles can't be deleted through this path: a live deployment, or
+    another pipeline profile's ``extractor``/``ocr_model``, can reference one by name,
+    and this module has no way to check for -- let alone warn about -- that at delete
+    time. Restricting to ``pipeline``/``ocr`` keeps the blast radius to profiles this
+    API itself created and fully owns the lifecycle of.
+
+    Raises ``ProfileNotFoundError`` if `name` doesn't exist, or ``ProfileWriteError``
+    if it exists but isn't a ``pipeline``/``ocr`` profile.
+    """
+    config_path = Path(path)
+    name = name.strip()
+    existing = load_model_profiles(config_path) if config_path.exists() else {}
+
+    profile = existing.get(name)
+    if profile is None:
+        raise ProfileNotFoundError(f"profile {name!r} does not exist")
+    if profile.kind not in {"pipeline", "ocr"}:
+        raise ProfileWriteError(
+            f"profile {name!r} has kind={profile.kind!r}; only pipeline/ocr profiles "
+            "can be deleted through this API"
+        )
+
+    _remove_profile_block(config_path, name)
+
+    reloaded = load_model_profiles(config_path)
+    if name in reloaded:
+        # Same lost-update race add_pipeline_profile guards against (no file lock):
+        # a concurrent writer's os.replace() landing after ours can re-introduce the
+        # block we just removed if their read-modify-write started from a copy of
+        # the file that still had it. Surface as a clear, retryable error rather
+        # than silently reporting success on a delete that didn't actually stick.
+        raise ProfileWriteError(
+            f"profile {name!r} was deleted but is still present in {config_path} on "
+            "re-read -- likely a concurrent write to the same file; retry"
+        )
+
+
+def _remove_profile_block(path: Path, name: str) -> None:
+    """Remove one ``name: ...`` entry from `path`'s top-level ``profiles:`` key.
+
+    See ``delete_pipeline_profile`` for why this splices text instead of a full
+    safe_load/safe_dump round-trip.
+
+    Deliberately uses a STRICTER block-end rule than ``_splice_profile``'s own insert-
+    side scan. That scan treats comments as non-terminating (see its KNOWN LIMITATION
+    docstring) because misplacing a *new* block relative to an existing comment is only
+    ever cosmetic. Deleting is a different risk: this file's real per-profile
+    documentation comments sit at the SAME 2-space indent as the profile keys
+    themselves (see configs/models.yaml -- e.g. the six-line comment directly above
+    ``nuextract3:``), not at column 0, so reusing the insert-side "comments don't
+    count" rule here would silently swallow a NEIGHBORING profile's documentation into
+    the deleted range whenever a comment happens to fall in the gap right after the
+    target block. The rule below instead stops at the first non-blank line that isn't
+    more indented than the profile key itself (indentation <= 2) -- whether that line
+    is the next profile's key, a comment (documenting that next profile, or the next
+    top-level section), or the next top-level section itself -- so a delete can never
+    remove a comment it doesn't unambiguously own. Blank lines are still swallowed
+    (matching the insert side) so a mid-file delete doesn't leave a stray double-blank
+    gap; only at EOF (no next sibling to swallow the leading blank forward into) does
+    this also walk backward over blank lines immediately before the block, so a
+    create-then-delete of the last profile in the file doesn't accumulate one extra
+    blank line per cycle.
+
+    Refuses (via ``ProfileWriteError``, before writing anything) rather than guesses
+    if `name` doesn't appear under ``profiles:`` at the expected 2-space indent, or
+    appears more than once -- e.g. a hand-edited file with a duplicate top-level key,
+    where ``load_model_profiles`` (plain ``yaml.safe_load``) silently resolves to
+    whichever occurrence PyYAML parses last, but this text scan has no principled way
+    to know which physical block that was. Without this guard, a duplicate key could
+    let a `kind: passthrough` block get deleted out from under a caller who validated
+    a *different*, later `kind: pipeline` occurrence of the same name.
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+
+    profiles_idx = next(
+        (i for i, line in enumerate(lines) if line.rstrip() == "profiles:"), None
+    )
+    if profiles_idx is None:
+        raise ProfileWriteError(f"{path} has no top-level 'profiles:' key")
+
+    key_pattern = re.compile(r"^  " + re.escape(name) + r":(\s|$)")
+    matches: list[int] = []
+    section_end = len(lines)
+    for i in range(profiles_idx + 1, len(lines)):
+        stripped = lines[i].rstrip()
+        # Same section-end rule as _splice_profile: next top-level (column-0) key
+        # ends the profiles block; comments and blank lines don't count there.
+        if stripped and not stripped.startswith((" ", "\t", "#")):
+            section_end = i
+            break
+        if key_pattern.match(lines[i]):
+            matches.append(i)
+
+    if not matches:
+        raise ProfileWriteError(f"profile {name!r} not found under 'profiles:' in {path}")
+    if len(matches) > 1:
+        raise ProfileWriteError(
+            f"profile {name!r} appears {len(matches)} times under 'profiles:' in "
+            f"{path}; refusing to guess which block to remove"
+        )
+    block_start = matches[0]
+
+    block_end = section_end
+    for i in range(block_start + 1, section_end):
+        line = lines[i]
+        if not line.strip():
+            continue  # blank line inside the block -- swallow, doesn't end it
+        indent = len(line) - len(line.lstrip(" "))
+        if indent <= 2:
+            block_end = i
+            break
+
+    if block_end == len(lines):
+        # EOF only: nothing after the block to swallow the leading blank forward
+        # into (the mid-file case above already does that via block_end), so walk
+        # the start back over it here instead.
+        while block_start > profiles_idx + 1 and not lines[block_start - 1].strip():
+            block_start -= 1
+
+    new_text = "".join(lines[:block_start]) + "".join(lines[block_end:])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Per-call-unique suffix -- same race this guards against in _splice_profile.
     tmp_path = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
     tmp_path.write_text(new_text, encoding="utf-8")
     tmp_path.replace(path)

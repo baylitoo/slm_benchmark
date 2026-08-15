@@ -780,8 +780,9 @@ export interface CreateOcrProfileRequest {
 /** Author a kind="ocr" (OCR-only, no LLM stage) profile into configs/models.yaml
  * — the sibling gap #188 explicitly deferred: that PR only covered kind="pipeline".
  * The resulting profile returns a backend's raw transcribed text as the completion
- * (no extraction stage), so it's a gateway/Playground target rather than a
- * schema-scored benchmark model. Create-only; a 409 means the name is taken. */
+ * (no extraction stage) — not a schema-scored benchmark model; reachable directly
+ * through the gateway by name, but no Studio UI surface invokes one yet.
+ * Create-only; a 409 means the name is taken. */
 export function createOcrProfile(
   payload: CreateOcrProfileRequest,
 ): Promise<PipelineProfileResult> {
@@ -789,6 +790,17 @@ export function createOcrProfile(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+/** Remove a kind="pipeline"/kind="ocr" profile from configs/models.yaml — the
+ * counterpart to createPipelineProfile. Backend refuses (422) for any other
+ * kind, since a passthrough profile can still be referenced by a live
+ * deployment or another pipeline profile's extractor/ocr_model. */
+export function deletePipelineProfile(name: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(
+    `/v1/studio/model-profiles/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
 }
 
 /** Benchmark returns the same trigger shape as extract. */
