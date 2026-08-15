@@ -607,6 +607,12 @@ export function DeploymentsView({
       render: (r) => <PhaseChip record={r} />,
     },
     {
+      key: "speed",
+      header: "Speed",
+      sortAccessor: (r) => r.observed?.tokens_per_second ?? -1,
+      render: (r) => <ThroughputCell record={r} />,
+    },
+    {
       key: "actions",
       header: "",
       className: "text-right",
@@ -743,19 +749,14 @@ export function DeploymentsView({
           r.spec?.name ? (
             <div className="space-y-3">
               {/* RSS/Speed/Endpoint used to be always-visible columns --
-                  collapsed here so the table stops scrolling horizontally
-                  at typical widths (was 11 columns wide). */}
-              <dl className="grid gap-4 text-xs sm:grid-cols-3">
+                  collapsed here so the table stops scrolling horizontally at
+                  typical widths (was 11 columns wide). Speed came back as a
+                  top-level column; RSS/Endpoint stay here. */}
+              <dl className="grid gap-4 text-xs sm:grid-cols-2">
                 <div>
                   <dt className="text-muted-foreground">RSS</dt>
                   <dd className="mt-0.5 font-mono tabular-nums text-foreground">
                     {r.observed?.rss_bytes ? formatBytes(r.observed.rss_bytes) : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Speed</dt>
-                  <dd className="mt-0.5 text-foreground">
-                    <ThroughputCell record={r} />
                   </dd>
                 </div>
                 <div className="min-w-0">
