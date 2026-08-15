@@ -5,6 +5,7 @@ import { API_BASE } from "@/lib/env";
 import type { Health } from "@/lib/useBackendHealth";
 import { Badge, StatusDot } from "../ui";
 import { ThemeToggle } from "../ThemeToggle";
+import { ApiKeyButton } from "./ApiKeyDialog";
 
 const GITHUB_URL = "https://github.com/baylitoo/slm_benchmark";
 
@@ -39,8 +40,9 @@ function envLabel(): string {
 
 /**
  * Sticky top bar: hamburger/collapse, logo echo + version pill on the left; env
- * pill, live status dot, theme toggle, GitHub link and account chip on the
- * right. The page title lives in the in-content PageHeader (LiteLLM pattern).
+ * pill, live status dot, API key button, theme toggle, GitHub link and account
+ * chip on the right. The page title lives in the in-content PageHeader
+ * (LiteLLM pattern).
  */
 export function TopBar({
   onToggleMobile,
@@ -90,6 +92,7 @@ export function TopBar({
           <StatusDot tone={meta.tone} pulse={health !== "offline"} />
           <span className="hidden sm:inline">{meta.label}</span>
         </span>
+        <ApiKeyButton />
         <ThemeToggle />
         <a
           href={GITHUB_URL}

@@ -5,6 +5,7 @@
 // "coming soon" state instead of crashing.
 
 import { API_BASE } from "./env";
+import { authHeader } from "./apiKey";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -484,6 +485,17 @@ function detailOf(body: unknown, fallback: string): string {
   return fallback;
 }
 
+/**
+ * 401 from `TenantQuotaManager.authenticate` (see security.py) — the server
+ * gives the same "A valid API key is required" detail whether no key was
+ * sent or a wrong one was, so we don't try to distinguish; we just point the
+ * operator at where to fix it (this Studio has no other UI for it).
+ */
+function unauthorizedError(body: unknown): ApiError {
+  const detail = detailOf(body, "A valid API key is required");
+  return new ApiError(401, `${detail} — set one from the key icon in the top bar.`);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -492,6 +504,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       headers: {
         Accept: "application/json",
         ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...authHeader(),
         ...init?.headers,
       },
     });
@@ -503,6 +516,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   const body = await readBody(res);
   if (res.ok) return body as T;
+  if (res.status === 401) throw unauthorizedError(body);
 
   // A BARE 404/501 means the route isn't built/enabled on this backend and the
   // UI degrades to its "not available" state. A 404 carrying X-Docie-Error is
@@ -1434,7 +1448,11 @@ async function openaiPost(url: string, payload: unknown): Promise<AgentChatRespo
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...authHeader(),
+      },
       body: JSON.stringify(payload),
     });
   } catch (e) {
@@ -1448,6 +1466,7 @@ async function openaiPost(url: string, payload: unknown): Promise<AgentChatRespo
     }
   }
   if (res.ok) return body as AgentChatResponse;
+  if (res.status === 401) throw unauthorizedError(body);
   const err =
     body && typeof body === "object" && "error" in body
       ? (body as { error?: { message?: string; type?: string } }).error
@@ -1503,7 +1522,11 @@ export async function chatCompletionStream(
   try {
     res = await fetch(`${API_BASE}/v1/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        ...authHeader(),
+      },
       body: JSON.stringify({ model, messages, stream: true }),
     });
   } catch (e) {
@@ -1525,6 +1548,7 @@ export async function chatCompletionStream(
   }
   if (!res.ok) {
     const body = await readBody(res);
+    if (res.status === 401) throw unauthorizedError(body);
     const err =
       body && typeof body === "object" && "error" in body
         ? (body as { error?: { message?: string; type?: string } }).error

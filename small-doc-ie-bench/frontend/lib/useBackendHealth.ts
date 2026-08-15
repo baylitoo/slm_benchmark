@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getRuntimes } from "./api";
+import { ApiError, getRuntimes } from "./api";
 
 export type Health = "checking" | "online" | "offline";
 
@@ -20,8 +20,12 @@ export function useBackendHealth(intervalMs = 10000): Health {
       try {
         await getRuntimes();
         if (!cancelled) setHealth("online");
-      } catch {
-        if (!cancelled) setHealth("offline");
+      } catch (e) {
+        // A 401 means the server answered — it just wants an API key. That's
+        // a reachable backend, not an outage: showing "Offline" here would
+        // send the operator chasing the wrong problem (see the key icon /
+        // ApiError message for the actual fix).
+        if (!cancelled) setHealth(e instanceof ApiError && e.status === 401 ? "online" : "offline");
       }
     };
 
