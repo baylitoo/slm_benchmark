@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chatCompletion, chatCompletionStream, getModels } from "./api";
+import { chatCompletion, chatCompletionStream, downloadArtifact, getModels } from "./api";
 import { setApiKey } from "./apiKey";
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -51,9 +51,10 @@ describe("request() auth header", () => {
     });
   });
 
-  // request() is one of THREE fetch call sites in this file (chatCompletion/
-  // chatCompletionStream go through openaiPost/their own fetch, not request()) --
-  // covered separately so a future refactor of either can't silently drop the
+  // request() is one of FOUR fetch call sites in this file (chatCompletion/
+  // chatCompletionStream go through openaiPost/their own fetch, downloadArtifact
+  // has its own raw fetch -- none go through request()) -- each covered
+  // separately so a future refactor of any of them can't silently drop the
   // header without a test noticing.
   it("chatCompletion (openaiPost) sends X-API-Key when a key is stored", async () => {
     setApiKey("sk-abc123");
@@ -77,5 +78,26 @@ describe("request() auth header", () => {
 
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)["X-API-Key"]).toBe("sk-abc123");
+  });
+
+  it("downloadArtifact sends X-API-Key when a key is stored", async () => {
+    setApiKey("sk-abc123");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(new Blob(["report"]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    // jsdom doesn't implement the Blob URL API -- stub just enough for
+    // downloadArtifact's create/revoke pair to run without throwing.
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, { createObjectURL: vi.fn(() => "blob:mock"), revokeObjectURL }),
+    );
+
+    await downloadArtifact("/v1/studio/artifacts/abc", "report.html");
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>)["X-API-Key"]).toBe("sk-abc123");
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock");
   });
 });
