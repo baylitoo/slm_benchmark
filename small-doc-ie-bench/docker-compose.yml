@@ -23,7 +23,13 @@ services:
     ports:
       - "${API_PORT:-8080}:8080"
     volumes:
-      - ./configs:/app/configs:ro
+      # Writable (not :ro like the other services below): the profile-authoring
+      # routes (studio_api.create_pipeline_profile/create_ocr_profile/
+      # delete_pipeline_profile_route) splice configs/models.yaml in place via
+      # tmp-file + os.replace — on a read-only mount that raises OSError
+      # (Read-only file system) and the route 500s. Only the api container
+      # writes this file; worker/serving/bench only read it, so they keep :ro.
+      - ./configs:/app/configs
       - ./data:/app/data
       - ./runs:/app/runs
       - ./annotations:/app/annotations

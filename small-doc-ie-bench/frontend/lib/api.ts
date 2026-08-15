@@ -847,6 +847,40 @@ export function artifactUrl(uri: string): string {
   return `${API_BASE}${uri}`;
 }
 
+/**
+ * Download a run artifact as `filename`, attaching the operator's X-API-Key.
+ *
+ * A plain `<a href={artifactUrl(...)}>` navigation can't carry a custom
+ * header, so with `AUTH_REQUIRED=true` the browser hits the artifact route
+ * unauthenticated and gets a 401 — the download silently fails instead of
+ * saving the file. This fetches the artifact as an authenticated request,
+ * then triggers the save via a short-lived object URL.
+ */
+export async function downloadArtifact(uri: string, filename: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(artifactUrl(uri), { headers: { ...authHeader() } });
+  } catch (e) {
+    throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
+  }
+  if (!res.ok) {
+    if (res.status === 401) throw unauthorizedError(await readBody(res));
+    throw new ApiError(res.status, detailOf(await readBody(res), `Download failed (HTTP ${res.status})`));
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Model store (Deploy tab source of truth)
 // ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ import {
   createPipelineProfile,
   createOcrProfile,
   deletePipelineProfile,
-  artifactUrl,
+  downloadArtifact,
   compareRuns,
   validateDataset,
   ApiError,
@@ -1433,21 +1433,45 @@ function MetricsTable({ summary }: { summary: Record<string, unknown>[] }) {
   );
 }
 
-/** Download links for a run's addressable artifacts. */
+/**
+ * Download buttons for a run's addressable artifacts.
+ *
+ * Not plain `<a href download>` links: with AUTH_REQUIRED=true the artifact
+ * route needs X-API-Key, which a browser navigation can't attach — the
+ * request 401s and the file never saves. `downloadArtifact` fetches with the
+ * header instead and saves the response via a short-lived object URL.
+ */
 function ArtifactLinks({ artifacts }: { artifacts: RunArtifact[] }) {
+  const { toast } = useToast();
+  const [pending, setPending] = useState<string | null>(null);
+
+  async function handleDownload(a: RunArtifact) {
+    setPending(a.id);
+    try {
+      await downloadArtifact(a.uri, a.name);
+    } catch (e) {
+      toast({ title: `Download failed: ${a.name}`, description: toUserMessage(e), tone: "error" });
+    } finally {
+      setPending(null);
+    }
+  }
+
   return (
     <div className="flex flex-wrap gap-2">
       {artifacts.map((a) => (
-        <a
+        <button
           key={a.id}
-          href={artifactUrl(a.uri)}
-          onClick={(e) => e.stopPropagation()}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium text-foreground transition hover:bg-muted"
-          download
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            void handleDownload(a);
+          }}
+          disabled={pending === a.id}
+          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium text-foreground transition hover:bg-muted disabled:opacity-60"
         >
           <Download className="h-3.5 w-3.5" />
-          {a.name}
-        </a>
+          {pending === a.id ? "Downloading…" : a.name}
+        </button>
       ))}
     </div>
   );
