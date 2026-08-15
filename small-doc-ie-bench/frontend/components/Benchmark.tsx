@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Gauge, Play, Download, GitCompare, ShieldCheck } from "lucide-react";
+import { Gauge, Play, Download, GitCompare, ShieldCheck, Workflow } from "lucide-react";
 import {
   triggerBenchmark,
   getBenchmarks,
@@ -9,6 +9,8 @@ import {
   getDeployments,
   selectableDeployments,
   listSchemas,
+  listModelProfiles,
+  createPipelineProfile,
   artifactUrl,
   compareRuns,
   validateDataset,
@@ -22,12 +24,24 @@ import {
   type ComparisonPayload,
   type ComparisonRow,
   type DatasetValidationReport,
+  type ModelProfileSummary,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
 import { cn } from "@/lib/cn";
 import { useToast } from "./Toast";
-import { Alert, Badge, type BadgeTone, Button, Card, Field, Select, Sheet, TextInput } from "./ui";
+import {
+  Alert,
+  Badge,
+  type BadgeTone,
+  Button,
+  Card,
+  Field,
+  Segmented,
+  Select,
+  Sheet,
+  TextInput,
+} from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
@@ -57,6 +71,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   const datasets = useAsync<DatasetSummary[]>("datasets", listDatasets);
   const deployments = useAsync<DeploymentRecord[]>("deployments", getDeployments);
   const schemas = useAsync<string[]>("schemas", listSchemas);
+  const modelProfiles = useAsync<ModelProfileSummary[]>("model-profiles", listModelProfiles);
   const modelOptions = useMemo(
     () =>
       selectableDeployments(deployments.data ?? [])
@@ -74,6 +89,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   // was otherwise unreachable from this tab. Mirrors Agents Create's own
   // "Custom reference" escape hatch for the same underlying gap.
   const [customModelProfile, setCustomModelProfile] = useState(false);
+  const [pipelineSheetOpen, setPipelineSheetOpen] = useState(false);
   const [schemaName, setSchemaName] = useState("invoice");
   const [concurrency, setConcurrency] = useState("1");
   const [submitting, setSubmitting] = useState(false);
@@ -166,6 +182,16 @@ export function Benchmark({ view = "run" }: { view?: string }) {
               onClose={() => setValidateOpen(false)}
               dataset={datasets.data?.find((d) => d.name === dataset) ?? null}
             />
+            <PipelineProfileSheet
+              open={pipelineSheetOpen}
+              onClose={() => setPipelineSheetOpen(false)}
+              profiles={modelProfiles.data ?? []}
+              onCreated={(name) => {
+                setCustomModelProfile(true);
+                setModelProfile(name);
+                modelProfiles.reload();
+              }}
+            />
             <div className="grid gap-4 sm:grid-cols-3">
               <Field
                 label="Model profile"
@@ -205,6 +231,14 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                     placeholder="profile name from models.yaml"
                   />
                 )}
+                <button
+                  type="button"
+                  onClick={() => setPipelineSheetOpen(true)}
+                  className="mt-1.5 inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                >
+                  <Workflow className="h-3 w-3" />
+                  New pipeline (OCR→LLM) profile…
+                </button>
               </Field>
               <Field label="Schema name">
                 <Select value={schemaName} onChange={(e) => setSchemaName(e.target.value)}>
@@ -690,6 +724,193 @@ function RootCauseList({ title, rows }: { title: string; rows: ComparisonRow[] }
         ))}
       </ul>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline profile authoring -- POST /v1/studio/model-profiles/pipeline. The
+// missing counterpart to #183's "Custom (models.yaml profile name)…" escape
+// hatch above: that field lets you TARGET a kind="pipeline" profile by name,
+// this Sheet lets you CREATE one instead of hand-editing configs/models.yaml
+// on the server. Create-only, scoped strictly to the pipeline shape (name +
+// extractor + one of ocr_backend/ocr_model) -- not a general models.yaml
+// editor, and not an update/delete flow (the backend doesn't support those
+// yet either; see add_pipeline_profile's own docstring for why).
+// ---------------------------------------------------------------------------
+
+const OCR_BACKENDS = ["liteparse", "tesseract", "paddleocr"] as const;
+
+function PipelineProfileSheet({
+  open,
+  onClose,
+  profiles,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  profiles: ModelProfileSummary[];
+  onCreated: (name: string) => void;
+}) {
+  const { toast } = useToast();
+  const extractors = useMemo(() => profiles.filter((p) => p.kind === "passthrough"), [profiles]);
+  const visionModels = useMemo(
+    () => profiles.filter((p) => p.kind === "passthrough" && p.vision),
+    [profiles],
+  );
+
+  const [name, setName] = useState("");
+  const [extractor, setExtractor] = useState("");
+  const [ocrSource, setOcrSource] = useState<"backend" | "model">("backend");
+  const [ocrBackend, setOcrBackend] = useState<string>(OCR_BACKENDS[0]);
+  const [ocrModel, setOcrModel] = useState("");
+  const [language, setLanguage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setName("");
+      setExtractor("");
+      setOcrSource("backend");
+      setOcrBackend(OCR_BACKENDS[0]);
+      setOcrModel("");
+      setLanguage("");
+      setError(null);
+    }
+  }, [open]);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!name.trim() || !extractor.trim()) {
+      setError("Name and extractor are required.");
+      return;
+    }
+    if (ocrSource === "model" && !ocrModel.trim()) {
+      setError("Pick an OCR (vision) model.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const created = await createPipelineProfile({
+        name: name.trim(),
+        extractor: extractor.trim(),
+        ...(ocrSource === "backend"
+          ? { ocr_backend: ocrBackend }
+          : { ocr_model: ocrModel.trim() }),
+        ...(language.trim() ? { language: language.trim() } : {}),
+      });
+      toast({ title: "Pipeline profile created", description: created.name, tone: "success" });
+      onCreated(created.name);
+      onClose();
+    } catch (err) {
+      setError(
+        toUserMessage(err, {
+          unavailable: "Pipeline profile creation isn't available on this server.",
+          fallback: "Failed to create pipeline profile.",
+        }),
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Sheet open={open} onClose={onClose}>
+      <form onSubmit={onSubmit} className="space-y-5">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">New pipeline profile</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            POST /v1/studio/model-profiles/pipeline — OCR a document, then extract with a
+            passthrough LLM profile. Appends a <code className="rounded bg-muted px-1">
+              kind: pipeline
+            </code>{" "}
+            entry to configs/models.yaml.
+          </p>
+        </div>
+
+        <Field label="Name" required>
+          <TextInput
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="invoice_pipeline"
+          />
+        </Field>
+
+        <Field
+          label="Extractor"
+          required
+          hint="The passthrough LLM profile that performs the structured extraction."
+        >
+          <Select value={extractor} onChange={(e) => setExtractor(e.target.value)}>
+            <option value="">Select a profile…</option>
+            {extractors.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.name}
+              </option>
+            ))}
+          </Select>
+          {extractors.length === 0 && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              No passthrough profiles found in configs/models.yaml.
+            </p>
+          )}
+        </Field>
+
+        <Field label="OCR source">
+          <Segmented
+            value={ocrSource}
+            onChange={setOcrSource}
+            options={[
+              { value: "backend", label: "Built-in backend" },
+              { value: "model", label: "Vision model (VLM)" },
+            ]}
+          />
+        </Field>
+
+        {ocrSource === "backend" ? (
+          <Field label="OCR backend">
+            <Select value={ocrBackend} onChange={(e) => setOcrBackend(e.target.value)}>
+              {OCR_BACKENDS.map((b) => (
+                <option key={b} value={b}>
+                  {b}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        ) : (
+          <Field
+            label="OCR (vision) model"
+            hint="A passthrough profile with vision=true — it transcribes the document instead of a built-in OCR engine."
+          >
+            <Select value={ocrModel} onChange={(e) => setOcrModel(e.target.value)}>
+              <option value="">Select a profile…</option>
+              {visionModels.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.name}
+                </option>
+              ))}
+            </Select>
+            {visionModels.length === 0 && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                No vision-capable passthrough profiles found.
+              </p>
+            )}
+          </Field>
+        )}
+
+        <Field label="Language" hint="Optional — OCR backend/VLM language hint.">
+          <TextInput value={language} onChange={(e) => setLanguage(e.target.value)} placeholder="en" />
+        </Field>
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        <Button type="submit" loading={submitting}>
+          <Workflow className="h-4 w-4" />
+          {submitting ? "Creating…" : "Create profile"}
+        </Button>
+      </form>
+    </Sheet>
   );
 }
 
