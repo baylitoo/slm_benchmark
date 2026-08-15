@@ -345,10 +345,10 @@ async def create_ocr_profile(payload: OcrProfileRequest) -> dict[str, Any]:
     The gap #188 explicitly flagged and deferred: that PR let an operator author a
     ``kind: pipeline`` (OCR->LLM) profile; a ``kind: ocr`` profile is narrower --
     ``serving.solutions.OcrSolution`` runs only an OCR backend and returns its raw
-    transcribed text as the completion, no extractor. Useful as a gateway/Playground
-    target, not as a schema-scored benchmark model (see ``model_profiles.
-    add_ocr_profile`` for why). Create-only, same 409/422 contract as the pipeline
-    route above.
+    transcribed text as the completion, no extractor. Not a schema-scored benchmark
+    model (see ``model_profiles.add_ocr_profile`` for why); reachable directly
+    through the gateway by name, but no Studio UI surface invokes one yet. Create-only,
+    same 409/422 contract as the pipeline route above.
     """
     from docie_bench.llm.model_profiles import (
         ProfileConflictError,

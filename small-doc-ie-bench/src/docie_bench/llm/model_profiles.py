@@ -287,10 +287,13 @@ def add_ocr_profile(
     solutions.OcrSolution`` reads only ``options.backend`` (default "tesseract") and
     optional ``options.language``, and returns the backend's raw transcribed text as
     the completion -- there is no JSON extraction stage. That means a ``kind: ocr``
-    profile is a gateway/Playground target (or a pipeline profile's `ocr_backend`
-    choice made durable/reusable under its own name), not a schema-scored benchmark
-    model in its own right; the benchmark runner expects a completion it can parse
-    against an extraction schema, which OCR-only output isn't.
+    profile is not a schema-scored benchmark model in its own right (the benchmark
+    runner expects a completion it can parse against an extraction schema, which
+    OCR-only output isn't); it's reachable directly through the gateway by name
+    (``/v1/chat/completions`` with ``model=<name>``), or reusable as a pipeline
+    profile's `ocr_backend` choice made durable under its own name. NOTE: no Studio
+    UI surface (Playground, Benchmark) invokes a `kind: ocr` profile yet -- creating
+    one here does not by itself make it reachable from anywhere in the Studio UI.
 
     IMPORTANT: the options key is ``backend``, not ``ocr_backend`` -- that's
     `PipelineSolution`'s key for the same concept. ``OcrSolution.__init__`` reads only

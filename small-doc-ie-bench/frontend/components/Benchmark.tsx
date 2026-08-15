@@ -936,9 +936,10 @@ function PipelineProfileSheet({
 // gap #188 flagged and deferred: that PR only covered kind="pipeline". A
 // kind="ocr" profile has no extractor stage -- serving.solutions.OcrSolution
 // runs just an OCR backend and returns its raw transcribed text as the
-// completion, so this is a gateway/Playground target, not something to route
-// into as this tab's benchmark model (hence no onCreated auto-select the way
-// PipelineProfileSheet's does -- see the Field hint below).
+// completion, so it isn't something to route into as this tab's benchmark model
+// (hence no onCreated auto-select the way PipelineProfileSheet's does -- see the
+// Field hint below). Reachable directly through the gateway by name; no Studio UI
+// surface (this tab included) invokes one yet -- see the Field hint below.
 // ---------------------------------------------------------------------------
 
 function OcrProfileSheet({
@@ -1005,9 +1006,9 @@ function OcrProfileSheet({
             POST /v1/studio/model-profiles/ocr — run a document through an OCR backend and
             return its transcribed text as the completion, no extraction stage. Appends a{" "}
             <code className="rounded bg-muted px-1">kind: ocr</code> entry to
-            configs/models.yaml. Useful as a gateway/Playground target; not a schema-scored
-            benchmark model on its own (pair it with an extractor via a pipeline profile
-            instead for that).
+            configs/models.yaml. Not a schema-scored benchmark model on its own (pair it
+            with an extractor via a pipeline profile instead for that) — reachable
+            directly through the gateway by name; no Studio UI surface invokes one yet.
           </p>
         </div>
 
