@@ -6,8 +6,10 @@ route added/removed/renamed. A mis-wired ``include_router()`` (a submodule's
 router built but never mounted onto the package's aggregate ``router``) fails
 loudly at import time if a name is missing, but a silently-dropped router
 object compiles fine and just serves 404 for that entire domain -- this test
-is the safety net for that failure mode. Captured from the file BEFORE the
-split; the refactor must keep this green.
+is the safety net for that failure mode. Update ``EXPECTED_STUDIO_ROUTES``
+deliberately whenever a route is genuinely added/removed/renamed (e.g.
+``GET /v1/studio/seeds`` for the Downloads tab); the point is that every
+change to this set is an intentional line in a diff, not a silent drop.
 
 Uses ``app.openapi()`` rather than walking ``app.routes`` directly: FastAPI's
 internal route-tree representation is not a flat list of ``Route`` objects in
@@ -50,6 +52,7 @@ EXPECTED_STUDIO_ROUTES = {
     ("GET", "/v1/studio/runs"),
     ("POST", "/v1/studio/comparisons"),
     ("GET", "/v1/studio/artifacts/{artifact_id}"),
+    ("GET", "/v1/studio/seeds"),
 }
 
 
@@ -62,4 +65,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 29
+    assert len(EXPECTED_STUDIO_ROUTES) == 30

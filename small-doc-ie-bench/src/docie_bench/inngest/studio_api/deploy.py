@@ -72,6 +72,10 @@ async def trigger_seed_hf(
     channel = f"seed:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
+    # Needed by seed_hf_job to scope its SeedRun row (see studio.seed_store) --
+    # every other trigger route already does this (extract/benchmark); the
+    # seed routes were the exception until the Downloads tab needed it too.
+    data["tenant_id"] = tenant.tenant_id
     ids = await send_or_503(
         inngest_client, inngest.Event(name="serving/seed-hf.requested", data=data)
     )
@@ -222,10 +226,13 @@ async def trigger_seed_ollama(
     channel = f"seed:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
+    # Needed by seed_ollama_job to scope its SeedRun row (see studio.seed_store).
+    data["tenant_id"] = tenant.tenant_id
     ids = await send_or_503(inngest_client, inngest.Event(name=_shared.SEED_EVENT, data=data))
-    # Seed has no durable StudioRun row; record ownership so the triggering
-    # principal can poll its status via /runs (no 404 regression) while a
-    # cross-tenant id stays 404 rather than leaking through the Inngest proxy.
+    # Seed has no StudioRun row (that table is benchmark-specific); record
+    # ownership so the triggering principal can poll its status via /runs (no
+    # 404 regression) while a cross-tenant id stays 404 rather than leaking
+    # through the Inngest proxy.
     _shared._record_event_owners(list(ids), tenant.tenant_id)
     return _shared.TriggerResponse(
         event_ids=list(ids), channel=channel, topics=_shared.DEFAULT_TOPICS

@@ -134,6 +134,48 @@ class RoutingPolicyRecord(Base):
     )
 
 
+class SeedRun(Base):
+    """A durable record of one seed-download job (Ollama or Hugging Face).
+
+    Seed progress itself is already tracked live via the realtime ``progress``
+    topic and a pollable sidecar file (``serving.seed_progress``) -- both are
+    ephemeral, cleared once the job settles, and were the ONLY record of a
+    download's outcome: closing the Studio's seed panel (or navigating away)
+    lost the in-flight percentage, and a failed download's error only ever
+    reached the worker's own logs, never the Studio. This table is the
+    missing durable counterpart -- one row per triggering event id, same
+    claim/complete/fail lifecycle as ``StudioRun``, so a "Downloads" tab can
+    list recent seeds (running, completed, failed) and show a failure's error
+    text after the fact, not just while a subscriber happened to be watching.
+
+    ``channel`` is the correlation key to the LIVE progress sidecar/realtime
+    topic while a seed is still running -- the two are separate concerns
+    (this row survives the job; the sidecar is deleted once it settles).
+    """
+
+    __tablename__ = "seed_runs"
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    channel: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    # "ollama" | "hf" -- which seed route triggered this.
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    # Ollama reference (e.g. "qwen2.5:1.5b") or HF repo id, whichever applies.
+    reference: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # Store entry name this seed writes/wrote.
+    name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(32), index=True, default="running")
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The job's own return value on success (family, size_bytes, catalog_registered, ...).
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class StudioEventOwner(Base):
     """Lightweight event id -> triggering principal binding.
 
@@ -155,6 +197,7 @@ class StudioEventOwner(Base):
 __all__ = [
     "DynamicSchema",
     "RoutingPolicyRecord",
+    "SeedRun",
     "StudioEventOwner",
     "StudioRun",
     "StudioRunArtifact",

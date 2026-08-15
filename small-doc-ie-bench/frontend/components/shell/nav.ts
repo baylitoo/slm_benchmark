@@ -24,6 +24,7 @@ import {
   LayoutGrid,
   PlusCircle,
   ClipboardCheck,
+  Download,
   type LucideIcon,
 } from "lucide-react";
 
@@ -57,6 +58,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { id: "deploy", label: "Catalog", icon: LayoutGrid, view: "catalog" },
       { id: "deploy", label: "Models", icon: Boxes, view: "models" },
       { id: "deploy", label: "Deployments", icon: Server, view: "deployments" },
+      { id: "deploy", label: "Downloads", icon: Download, view: "downloads" },
       { id: "deploy", label: "Sizing", icon: Gauge, view: "sizing" },
     ],
   },
