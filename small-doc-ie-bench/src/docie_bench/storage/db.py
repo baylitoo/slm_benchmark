@@ -254,6 +254,11 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.dynamic_schemas import ensure_dynamic_schema_table
 
     ensure_dynamic_schema_table(_engine)
+    # Same race again: routing_policies is also new (registry for named,
+    # reusable RoutingPolicy specs, alongside dynamic_schemas above).
+    from docie_bench.studio.routing_policies import ensure_routing_policy_table
+
+    ensure_routing_policy_table(_engine)
     Base.metadata.create_all(bind=_engine)
 
 

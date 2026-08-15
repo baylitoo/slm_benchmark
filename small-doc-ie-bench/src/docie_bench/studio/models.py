@@ -106,6 +106,34 @@ class DynamicSchema(Base):
     )
 
 
+class RoutingPolicyRecord(Base):
+    """A named, reusable ``RoutingPolicy`` (extract.routing) saved from the
+    Studio.
+
+    Same "save and reuse by name" scope as ``DynamicSchema`` above: shared
+    operator config, no ``tenant_id``, create-only (409 on a duplicate
+    ``name``). Unlike ``DynamicSchema``, ``name`` is a separate registry key
+    from the policy's own ``version`` field -- ``RoutingPolicy.version`` is a
+    free-form label the policy author already controls (e.g. to track
+    edits to a cascade's thresholds) and reusing it as the unique lookup key
+    would conflate "which policy" with "which revision of that policy",
+    forcing every version bump to also be a rename. ``spec_json`` stores the
+    validated ``RoutingPolicy.model_dump()``, not the caller's raw input, so a
+    stored row always round-trips through ``RoutingPolicy.model_validate``
+    cleanly at benchmark-trigger time.
+    """
+
+    __tablename__ = "routing_policies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    spec_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class StudioEventOwner(Base):
     """Lightweight event id -> triggering principal binding.
 
@@ -124,4 +152,11 @@ class StudioEventOwner(Base):
     )
 
 
-__all__ = ["DynamicSchema", "StudioEventOwner", "StudioRun", "StudioRunArtifact", "utcnow"]
+__all__ = [
+    "DynamicSchema",
+    "RoutingPolicyRecord",
+    "StudioEventOwner",
+    "StudioRun",
+    "StudioRunArtifact",
+    "utcnow",
+]

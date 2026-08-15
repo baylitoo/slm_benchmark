@@ -6,6 +6,7 @@ import {
   Play,
   Download,
   GitCompare,
+  Route,
   ShieldCheck,
   Workflow,
   ScanText,
@@ -25,6 +26,8 @@ import {
   downloadArtifact,
   compareRuns,
   validateDataset,
+  listRoutingPolicies,
+  createRoutingPolicy,
   ApiError,
   ApiUnavailable,
   type BenchmarkRun,
@@ -36,6 +39,7 @@ import {
   type ComparisonRow,
   type DatasetValidationReport,
   type ModelProfileSummary,
+  type RoutingPolicySummary,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
@@ -51,6 +55,7 @@ import {
   Segmented,
   Select,
   Sheet,
+  TextArea,
   TextInput,
 } from "./ui";
 import { ResultPanel } from "./ResultPanel";
@@ -83,6 +88,10 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   const deployments = useAsync<DeploymentRecord[]>("deployments", getDeployments);
   const schemas = useAsync<string[]>("schemas", listSchemas);
   const modelProfiles = useAsync<ModelProfileSummary[]>("model-profiles", listModelProfiles);
+  const routingPolicies = useAsync<RoutingPolicySummary[]>(
+    "routing-policies",
+    listRoutingPolicies,
+  );
   const modelOptions = useMemo(
     () =>
       selectableDeployments(deployments.data ?? [])
@@ -102,7 +111,14 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   const [customModelProfile, setCustomModelProfile] = useState(false);
   const [pipelineSheetOpen, setPipelineSheetOpen] = useState(false);
   const [ocrSheetOpen, setOcrSheetOpen] = useState(false);
-  const [routingPolicy, setRoutingPolicy] = useState("");
+  // A saved policy (routingPolicyName, the discoverable/validated path) is the
+  // default; customRoutingPolicy is the escape hatch for a server-side path
+  // that isn't in the registry yet -- mirrors Model profile's own Select +
+  // "Custom" pattern above.
+  const [routingPolicyName, setRoutingPolicyName] = useState("");
+  const [customRoutingPolicy, setCustomRoutingPolicy] = useState(false);
+  const [routingPolicyPath, setRoutingPolicyPath] = useState("");
+  const [routingPolicySheetOpen, setRoutingPolicySheetOpen] = useState(false);
   const [schemaName, setSchemaName] = useState("invoice");
   const [concurrency, setConcurrency] = useState("1");
   const [submitting, setSubmitting] = useState(false);
@@ -117,7 +133,10 @@ export function Benchmark({ view = "run" }: { view?: string }) {
       setError("A dataset is required to run a benchmark.");
       return;
     }
-    if (modelProfile.trim() && routingPolicy.trim()) {
+    const routingPolicySelected = customRoutingPolicy
+      ? routingPolicyPath.trim()
+      : routingPolicyName;
+    if (modelProfile.trim() && routingPolicySelected) {
       setError(
         "Model profile and routing policy are mutually exclusive -- a routing " +
           "policy already selects which profile(s) a document runs through.",
@@ -128,8 +147,10 @@ export function Benchmark({ view = "run" }: { view?: string }) {
     try {
       const res = await triggerBenchmark({
         dataset: dataset.trim(),
-        ...(routingPolicy.trim()
-          ? { routing_policy: routingPolicy.trim() }
+        ...(routingPolicySelected
+          ? customRoutingPolicy
+            ? { routing_policy: routingPolicyPath.trim() }
+            : { routing_policy_name: routingPolicyName }
           : modelProfile.trim()
             ? { model_profile: modelProfile.trim() }
             : {}),
@@ -308,20 +329,62 @@ export function Benchmark({ view = "run" }: { view?: string }) {
               </Field>
             </div>
 
+            <RoutingPolicySheet
+              open={routingPolicySheetOpen}
+              onClose={() => setRoutingPolicySheetOpen(false)}
+              onCreated={(name) => {
+                setCustomRoutingPolicy(false);
+                setRoutingPolicyName(name);
+                routingPolicies.reload();
+              }}
+            />
             <Field
               label="Routing policy (optional)"
               hint={
                 modelProfile.trim()
                   ? "Disabled while a Model profile is set above -- clear it first. A routing policy already selects which profile(s) a document runs through."
-                  : "Server-side path to a routing-policy YAML -- multi-stage fallback/escalation across several profiles (e.g. a fast model, escalating to a stronger one on low confidence). See configs/routing-policy.example.yaml. Mutually exclusive with Model profile above."
+                  : "Multi-stage fallback/escalation across several profiles (e.g. a fast model, escalating to a stronger one on low confidence). Mutually exclusive with Model profile above."
               }
             >
-              <TextInput
-                value={routingPolicy}
-                onChange={(e) => setRoutingPolicy(e.target.value)}
-                placeholder="configs/routing-policy.example.yaml"
+              <Select
+                value={customRoutingPolicy ? "__custom__" : routingPolicyName}
+                onChange={(e) => {
+                  if (e.target.value === "__custom__") {
+                    setCustomRoutingPolicy(true);
+                    setRoutingPolicyName("");
+                  } else {
+                    setCustomRoutingPolicy(false);
+                    setRoutingPolicyName(e.target.value);
+                  }
+                }}
                 disabled={Boolean(modelProfile.trim())}
-              />
+              >
+                <option value="">(none)</option>
+                {(routingPolicies.data ?? []).map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.name}
+                  </option>
+                ))}
+                <option value="__custom__">Custom (server-side YAML path)…</option>
+              </Select>
+              {customRoutingPolicy && (
+                <TextInput
+                  className="mt-2"
+                  value={routingPolicyPath}
+                  onChange={(e) => setRoutingPolicyPath(e.target.value)}
+                  placeholder="configs/routing-policy.example.yaml"
+                  disabled={Boolean(modelProfile.trim())}
+                />
+              )}
+              <button
+                type="button"
+                onClick={() => setRoutingPolicySheetOpen(true)}
+                disabled={Boolean(modelProfile.trim())}
+                className="mt-1.5 inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+              >
+                <Route className="h-3 w-3" />
+                New routing policy…
+              </button>
             </Field>
 
             {error && <Alert tone="err">{error}</Alert>}
@@ -1151,6 +1214,148 @@ function OcrProfileSheet({
         <Button type="submit" loading={submitting}>
           <ScanText className="h-4 w-4" />
           {submitting ? "Creating…" : "Create profile"}
+        </Button>
+      </form>
+    </Sheet>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Routing policy registry -- POST /v1/studio/routing-policies. RoutingPolicy
+// (extract/routing.py) is a rich multi-stage schema (rules, selectors,
+// budgets); this slice doesn't build a field-by-field visual editor for it --
+// that's a much larger surface than the "save and reuse by name" gap this
+// closes (a raw server-side filesystem path with no discoverability). A JSON
+// textarea, validated server-side against RoutingPolicy.model_validate on
+// submit, is the smallest real slice: paste/edit, get back a precise 422 on a
+// bad shape instead of a benchmark run failing later with an opaque error.
+// ---------------------------------------------------------------------------
+
+const ROUTING_POLICY_TEMPLATE = `{
+  "version": "cpu-cascade-1",
+  "stages": [
+    {
+      "name": "ollama_qwen25_1b",
+      "rules": [
+        {
+          "when": { "status": "success", "validation_valid": true, "min_confidence": 0.85 },
+          "decision": "accept",
+          "reason": "small fast model cleared the quality gate"
+        }
+      ],
+      "default_decision": "fallback",
+      "default_reason": "small model below the confidence gate"
+    },
+    {
+      "name": "ollama_nuextract_3b",
+      "rules": [
+        {
+          "when": { "status": "success", "validation_valid": true },
+          "decision": "accept",
+          "reason": "NuExtract returned a valid extraction"
+        }
+      ],
+      "default_decision": "escalate",
+      "default_reason": "NuExtract failed validation"
+    }
+  ],
+  "budget": { "max_stages": 2, "max_latency_ms": 600000 },
+  "exhausted_decision": "escalate",
+  "exhausted_reason": "no stage produced an accepted extraction"
+}`;
+
+function RoutingPolicySheet({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (name: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [policyText, setPolicyText] = useState(ROUTING_POLICY_TEMPLATE);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setName("");
+      setPolicyText(ROUTING_POLICY_TEMPLATE);
+      setError(null);
+    }
+  }, [open]);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!name.trim()) {
+      setError("Name is required.");
+      return;
+    }
+    let policy: Record<string, unknown>;
+    try {
+      policy = JSON.parse(policyText);
+    } catch (parseErr) {
+      setError(
+        `Invalid JSON: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+      );
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const created = await createRoutingPolicy(name.trim(), policy);
+      onCreated(created.name);
+      onClose();
+    } catch (err) {
+      setError(
+        toUserMessage(err, {
+          unavailable: "Routing policy creation isn't available on this server.",
+          fallback: "Failed to create routing policy.",
+        }),
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Sheet open={open} onClose={onClose}>
+      <form onSubmit={onSubmit} className="space-y-5">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">New routing policy</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            POST /v1/studio/routing-policies — save a multi-stage fallback/escalation policy
+            under a name so a benchmark run can reference it directly, instead of a
+            server-side YAML file path. See{" "}
+            <code className="rounded bg-muted px-1">configs/routing-policy.example.yaml</code>{" "}
+            for the full field reference; each stage name must match a profile in
+            models.yaml.
+          </p>
+        </div>
+
+        <Field label="Name" required hint="Registry key -- separate from the policy's own version field below.">
+          <TextInput
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="cpu-cascade"
+          />
+        </Field>
+
+        <Field label="Policy (JSON)" required>
+          <TextArea
+            value={policyText}
+            onChange={(e) => setPolicyText(e.target.value)}
+            rows={16}
+            className="font-mono text-xs"
+          />
+        </Field>
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        <Button type="submit" loading={submitting}>
+          <Route className="h-4 w-4" />
+          {submitting ? "Creating…" : "Create policy"}
         </Button>
       </form>
     </Sheet>

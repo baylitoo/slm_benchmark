@@ -252,6 +252,202 @@ def test_idempotency_key_differs_by_routing_policy(monkeypatch) -> None:
     assert key_a != key_b
 
 
+def test_idempotency_key_differs_by_routing_policy_name() -> None:
+    # Same collision shape as test_idempotency_key_differs_by_routing_policy
+    # above, for the new routing_policy_name dimension the registry adds.
+    from docie_bench.inngest.functions import benchmark_idempotency_key
+
+    key_a = benchmark_idempotency_key({"dataset": "invoices", "routing_policy_name": "cascade-a"})
+    key_b = benchmark_idempotency_key({"dataset": "invoices", "routing_policy_name": "cascade-b"})
+
+    assert key_a != key_b
+
+
+def test_benchmark_job_resolves_saved_routing_policy_by_name(tmp_path: Path, monkeypatch) -> None:
+    from docie_bench.benchmark import runner as runner_mod
+    from docie_bench.extract.routing import RoutingPolicy, RoutingRule, RuleCondition, StagePolicy
+    from docie_bench.inngest import functions as fns
+    from docie_bench.storage.db import dispose_engine, init_engine
+    from docie_bench.studio.routing_policies import create_routing_policy
+
+    init_engine(f"sqlite:///{tmp_path / 'policies.db'}")
+    try:
+        create_routing_policy(
+            "cascade-a",
+            RoutingPolicy(
+                version="v1",
+                stages=[
+                    StagePolicy(
+                        name="ollama_qwen25_1b",
+                        rules=[
+                            RoutingRule(
+                                when=RuleCondition(status="success", validation_valid=True),
+                                decision="accept",
+                                reason="cleared the quality gate",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        )
+
+        store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+        monkeypatch.setattr("docie_bench.studio.store.default_run_store", lambda: store)
+
+        captured: dict = {}
+
+        async def fake_run_benchmark(**kwargs):
+            captured.update(kwargs)
+            # Real run_benchmark reads routing_policy_path while it's still
+            # live -- read (and parse) it here too, since the temp file is
+            # cleaned up once _run_benchmark_job returns below.
+            resolved_path = kwargs["routing_policy_path"]
+            captured["routing_policy_content"] = json.loads(Path(resolved_path).read_text())
+            run_dir = tmp_path / "run"
+            run_dir.mkdir(exist_ok=True)
+            (run_dir / "metrics.json").write_text(json.dumps({"summary": [{"f1": 0.5}]}))
+            (run_dir / "report.html").write_text("<html>report</html>")
+            (run_dir / "predictions.jsonl").write_text('{"pred":1}\n')
+            return runner_mod.BenchmarkResult(
+                run_dir,
+                run_dir / "predictions.jsonl",
+                run_dir / "metrics.json",
+                run_dir / "report.html",
+                run_dir / "manifest.json",
+            )
+
+        monkeypatch.setattr(runner_mod, "run_benchmark", fake_run_benchmark)
+
+        data = {
+            "dataset": "ds",
+            "tenant_id": "t1",
+            "idempotency_key": "k1",
+            "routing_policy_name": "cascade-a",
+        }
+        asyncio.run(fns._run_benchmark_job(dict(data), event_id="ev1"))
+
+        # The saved policy was materialized to a temp file and passed through
+        # as routing_policy_path -- confirm it round-trips.
+        loaded = RoutingPolicy.model_validate(captured["routing_policy_content"])
+        assert loaded.stages[0].name == "ollama_qwen25_1b"
+        assert captured["model_profile"] is None
+        # Temp file is cleaned up once the job finishes.
+        assert not Path(captured["routing_policy_path"]).exists()
+
+        record = store.get_run("ev1", tenant_id="t1")
+        assert record is not None
+        # Registry name, not a random temp filename -- more informative.
+        assert record["model_profile"] == "routed:cascade-a"
+    finally:
+        dispose_engine()
+
+
+def test_benchmark_job_deduped_redelivery_does_not_leak_the_temp_policy_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Demonstrated regression: the saved-policy temp file used to be
+    # materialized BEFORE the idempotency claim, so a redelivery/duplicate
+    # trigger (outcome == "exists") returned early at the claim check without
+    # ever reaching the try/finally that deletes it -- every deduplicated
+    # call leaked a routing-policy-*.json file in the OS temp dir, and
+    # nothing ever garbage-collects them. Materialization is now deferred
+    # until past the dedup short-circuit.
+    import glob
+    import tempfile
+
+    from docie_bench.benchmark import runner as runner_mod
+    from docie_bench.extract.routing import RoutingPolicy, RoutingRule, RuleCondition, StagePolicy
+    from docie_bench.inngest import functions as fns
+    from docie_bench.storage.db import dispose_engine, init_engine
+    from docie_bench.studio.routing_policies import create_routing_policy
+
+    init_engine(f"sqlite:///{tmp_path / 'policies.db'}")
+    try:
+        create_routing_policy(
+            "cascade-a",
+            RoutingPolicy(
+                version="v1",
+                stages=[
+                    StagePolicy(
+                        name="ollama_qwen25_1b",
+                        rules=[
+                            RoutingRule(
+                                when=RuleCondition(status="success", validation_valid=True),
+                                decision="accept",
+                                reason="cleared the quality gate",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        )
+
+        store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+        monkeypatch.setattr("docie_bench.studio.store.default_run_store", lambda: store)
+
+        async def fake_run_benchmark(**_kwargs):
+            run_dir = tmp_path / "run"
+            run_dir.mkdir(exist_ok=True)
+            (run_dir / "metrics.json").write_text(json.dumps({"summary": [{"f1": 0.5}]}))
+            (run_dir / "report.html").write_text("<html>report</html>")
+            (run_dir / "predictions.jsonl").write_text('{"pred":1}\n')
+            return runner_mod.BenchmarkResult(
+                run_dir,
+                run_dir / "predictions.jsonl",
+                run_dir / "metrics.json",
+                run_dir / "report.html",
+                run_dir / "manifest.json",
+            )
+
+        monkeypatch.setattr(runner_mod, "run_benchmark", fake_run_benchmark)
+
+        data = {
+            "dataset": "ds",
+            "tenant_id": "t1",
+            "idempotency_key": "k1",
+            "routing_policy_name": "cascade-a",
+        }
+
+        def leaked_temp_files() -> set[str]:
+            return set(glob.glob(str(Path(tempfile.gettempdir()) / "routing-policy-*.json")))
+
+        before = leaked_temp_files()
+        asyncio.run(fns._run_benchmark_job(dict(data), event_id="ev1"))
+        # Same event id -> claim() returns "exists" -> early return, before
+        # ever reaching this call's own materialize-and-cleanup pair.
+        asyncio.run(fns._run_benchmark_job(dict(data), event_id="ev1"))
+        after = leaked_temp_files()
+
+        assert after == before
+    finally:
+        dispose_engine()
+
+
+def test_benchmark_job_unknown_routing_policy_name_raises(tmp_path: Path, monkeypatch) -> None:
+    from docie_bench.inngest import functions as fns
+    from docie_bench.storage.db import dispose_engine, init_engine
+
+    init_engine(f"sqlite:///{tmp_path / 'policies.db'}")
+    try:
+        store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+        monkeypatch.setattr("docie_bench.studio.store.default_run_store", lambda: store)
+
+        with pytest.raises(ValueError, match="not found"):
+            asyncio.run(
+                fns._run_benchmark_job(
+                    {
+                        "dataset": "ds",
+                        "tenant_id": "t1",
+                        "idempotency_key": "k1",
+                        "routing_policy_name": "does_not_exist",
+                    },
+                    event_id="ev1",
+                )
+            )
+    finally:
+        dispose_engine()
+
+
 def test_benchmark_job_records_failure_for_retry(tmp_path: Path, monkeypatch) -> None:
     from docie_bench.benchmark import runner as runner_mod
     from docie_bench.inngest import functions as fns
