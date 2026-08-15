@@ -108,6 +108,27 @@ def test_missing_name_raises(models_yaml: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "name", ["has space", "has/slash", "has:colon", "", "-leading-dash", "über"]
+)
+def test_invalid_name_charset_raises(models_yaml: Path, name: str) -> None:
+    with pytest.raises(ProfileWriteError):
+        add_pipeline_profile(
+            models_yaml, name=name, extractor="extractor_llm", ocr_backend="tesseract"
+        )
+
+
+@pytest.mark.parametrize("name", ["yes", "No", "TRUE", "off", "null", "~"])
+def test_yaml_boolean_like_name_raises(models_yaml: Path, name: str) -> None:
+    # PyYAML's implicit resolver coerces these to bool/None, not str -- silently
+    # defeating the duplicate-name check (a second write with the same "name" a
+    # human would type would key differently in load_model_profiles and not collide).
+    with pytest.raises(ProfileWriteError):
+        add_pipeline_profile(
+            models_yaml, name=name, extractor="extractor_llm", ocr_backend="tesseract"
+        )
+
+
+@pytest.mark.parametrize(
     ("ocr_backend", "ocr_model"),
     [(None, None), ("tesseract", "vision_llm")],
 )
@@ -165,3 +186,48 @@ def test_missing_file_creates_profiles_block(tmp_path: Path) -> None:
         # No extractor exists yet in a brand-new file -- still exercises the
         # "file doesn't exist" branch of both load and splice before failing.
         add_pipeline_profile(path, name="p", extractor="nope", ocr_backend="tesseract")
+
+
+def test_splice_profile_creates_profiles_header_for_a_brand_new_file(tmp_path: Path) -> None:
+    # add_pipeline_profile can never actually reach this branch of _splice_profile:
+    # a missing file means existing={}, so the extractor lookup always fails first
+    # (see test_missing_file_creates_profiles_block above). Exercised directly so the
+    # branch itself -- not just its unreachability through the one caller -- is proven
+    # to produce valid YAML.
+    from docie_bench.llm.model_profiles import _splice_profile
+
+    path = tmp_path / "fresh.yaml"
+    _splice_profile(path, "p", {"kind": "pipeline", "options": {"extractor": "e"}})
+
+    reloaded = load_model_profiles(path)
+    assert reloaded["p"].kind == "pipeline"
+    assert reloaded["p"].options == {"extractor": "e"}
+
+
+def test_concurrent_write_losing_the_race_raises_a_clear_error_not_keyerror(
+    models_yaml: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two callers racing add_pipeline_profile for DIFFERENT names against the same
+    # file, with no lock, can have one writer's insert clobbered by the other's
+    # os.replace landing after it -- the loser's own name is then missing on re-read.
+    # Simulated directly (rather than an actual thread race, which would be flaky)
+    # by monkeypatching the post-splice re-read to omit the just-written name, exactly
+    # what a lost update looks like from add_pipeline_profile's point of view.
+    import docie_bench.llm.model_profiles as model_profiles_module
+
+    real_load = model_profiles_module.load_model_profiles
+    calls = {"n": 0}
+
+    def flaky_load(path: Path) -> dict[str, object]:
+        calls["n"] += 1
+        result = real_load(path)
+        if calls["n"] == 2:
+            result.pop("racer", None)
+        return result
+
+    monkeypatch.setattr(model_profiles_module, "load_model_profiles", flaky_load)
+
+    with pytest.raises(ProfileWriteError, match="concurrent write"):
+        add_pipeline_profile(
+            models_yaml, name="racer", extractor="extractor_llm", ocr_backend="tesseract"
+        )

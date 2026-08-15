@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,6 +137,17 @@ class ProfileConflictError(ProfileWriteError):
     """The profile name already exists in the target models.yaml."""
 
 
+_VALID_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# YAML 1.1 (PyYAML's implicit resolver) coerces these bare scalars to bool/null, not
+# str -- load_model_profiles would key the parsed profile by True/False/None instead
+# of the string a caller typed, silently defeating the "name already exists" check
+# below (a second, distinct `name:` entry would splice in right alongside the first).
+# Case-insensitive: yes/Yes/YES all resolve the same way.
+_YAML_RESERVED_WORDS = frozenset(
+    {"y", "n", "yes", "no", "true", "false", "on", "off", "null", "~"}
+)
+
+
 def add_pipeline_profile(
     path: str | Path,
     *,
@@ -163,16 +176,20 @@ def add_pipeline_profile(
     without a real YAML round-trip) and isn't needed for the "author a new pipeline
     profile" slice this exists for.
 
-    Validates the same rules ``serving.solutions.PipelineSolution`` enforces at request
-    time (kept in sync manually -- there is no shared source of truth for these), so a
-    misconfigured profile fails at authoring time rather than mid-benchmark: exactly one
-    of `ocr_backend`/`ocr_model` (never both, never neither -- the solution silently
-    prefers `ocr_model` if both are set, which would make a profile's config lie about
-    what actually runs); `extractor` must name an existing ``kind: passthrough`` profile;
-    `ocr_model` (if given) must name an existing ``kind: passthrough`` profile with
-    ``vision: true``; `ocr_backend` (if given) must be a real OCR backend name
-    (validated via ``get_ocr_backend``, the exact fail-fast check PipelineSolution
-    itself does at construction).
+    Validates rules that are AT LEAST as strict as what ``serving.solutions.
+    PipelineSolution`` enforces at request time (kept in sync manually -- there is no
+    shared source of truth for these), so a misconfigured profile fails at authoring
+    time rather than mid-benchmark: exactly one of `ocr_backend`/`ocr_model` (never
+    both, never neither -- the solution silently prefers `ocr_model` if both are set,
+    which would make a profile's config lie about what actually runs); `extractor` must
+    name an existing ``kind: passthrough`` profile; `ocr_model` (if given) must name an
+    existing ``kind: passthrough`` profile with ``vision: true``; `ocr_backend` (if
+    given) must be a real OCR backend name (validated via ``get_ocr_backend``, the
+    exact fail-fast check PipelineSolution itself does at construction). NOTE: the
+    ``vision: true`` requirement on `ocr_model` is intentionally STRICTER than
+    PipelineSolution's own runtime check, which does not currently verify `.vision` --
+    this rejects some `ocr_model` choices that would in fact run today via a
+    hand-edited entry. Erring stricter at write-time, not a parity bug.
     """
     config_path = Path(path)
     existing = load_model_profiles(config_path) if config_path.exists() else {}
@@ -180,6 +197,16 @@ def add_pipeline_profile(
     name = name.strip()
     if not name:
         raise ProfileWriteError("name is required")
+    if not _VALID_PROFILE_NAME.fullmatch(name):
+        raise ProfileWriteError(
+            "name must start with a letter or digit and contain only letters, "
+            "digits, '_', '.', or '-'"
+        )
+    if name.lower() in _YAML_RESERVED_WORDS:
+        raise ProfileWriteError(
+            f"name {name!r} is a YAML boolean/null literal and would not round-trip "
+            "as a string key"
+        )
     if name in existing:
         raise ProfileConflictError(f"profile {name!r} already exists")
 
@@ -219,7 +246,16 @@ def add_pipeline_profile(
         options["language"] = language
 
     _splice_profile(config_path, name, {"kind": "pipeline", "options": options})
-    return load_model_profiles(config_path)[name]
+    try:
+        return load_model_profiles(config_path)[name]
+    except KeyError as exc:
+        # Two concurrent writers can race the read-modify-write below (no file lock);
+        # the loser's own insert can be clobbered by the winner's replace() landing
+        # after it. Surface as a clear, retryable error instead of a raw KeyError/500.
+        raise ProfileWriteError(
+            f"profile {name!r} was written but is missing from {config_path} on "
+            "re-read -- likely a concurrent write to the same file; retry"
+        ) from exc
 
 
 def _splice_profile(path: Path, name: str, entry: dict[str, Any]) -> None:
@@ -227,6 +263,16 @@ def _splice_profile(path: Path, name: str, entry: dict[str, Any]) -> None:
 
     See ``add_pipeline_profile`` for why this splices text instead of a full
     safe_load/safe_dump round-trip.
+
+    KNOWN LIMITATION, not fixed here: comments don't count as block-enders (so the
+    search continues past them looking for the next real top-level key), which means
+    a comment written to document the section AFTER `profiles:` (e.g. "# end of
+    profiles, judge config below") can end up sitting ABOVE the newly-inserted entry
+    instead of below it -- still valid, correctly-nested YAML, just a misplaced
+    comment. Narrowing this (stop at the first top-level comment unless it's
+    immediately followed by more indented profile content) is a real improvement but
+    is deferred -- low frequency, cosmetic only, and getting the heuristic exactly
+    right is more risk than this fix is worth right now.
     """
     text = path.read_text(encoding="utf-8") if path.exists() else "profiles:\n"
     if not text.endswith("\n"):
@@ -234,14 +280,14 @@ def _splice_profile(path: Path, name: str, entry: dict[str, Any]) -> None:
     lines = text.splitlines(keepends=True)
 
     profiles_idx = next(
-        (i for i, line in enumerate(lines) if line.rstrip("\n") == "profiles:"), None
+        (i for i, line in enumerate(lines) if line.rstrip() == "profiles:"), None
     )
     if profiles_idx is None:
         raise ProfileWriteError(f"{path} has no top-level 'profiles:' key")
 
     insert_at = len(lines)
     for i in range(profiles_idx + 1, len(lines)):
-        stripped = lines[i].rstrip("\n")
+        stripped = lines[i].rstrip()
         # Next top-level (column-0) key ends the profiles block; comments and blank
         # lines don't count (they appear at column 0 throughout the file's prose).
         if stripped and not stripped.startswith((" ", "\t", "#")):
@@ -257,7 +303,11 @@ def _splice_profile(path: Path, name: str, entry: dict[str, Any]) -> None:
     new_text = "".join(lines[:insert_at]) + new_block + "".join(lines[insert_at:])
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    # Per-call-unique suffix: a fixed name (e.g. "models.yaml.tmp") would let two
+    # concurrent callers stage into the SAME temp file before either calls replace(),
+    # which can silently lose one writer's insert even though each individual
+    # write_text()/replace() pair is atomic on its own.
+    tmp_path = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
     tmp_path.write_text(new_text, encoding="utf-8")
     tmp_path.replace(path)
 
