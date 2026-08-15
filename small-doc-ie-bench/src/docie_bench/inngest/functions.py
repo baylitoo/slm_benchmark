@@ -446,6 +446,7 @@ def benchmark_idempotency_key(data: dict[str, Any]) -> str:
         "dataset",
         "split",
         "model_profile",
+        "routing_policy",
         "schema_name",
         "concurrency",
         "repeat",
@@ -478,6 +479,16 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
     idempotency_key = benchmark_idempotency_key(data)
     tenant_id = str(data.get("tenant_id") or "anonymous")
     routing_policy = data.get("routing_policy")
+    # StudioRun.model_profile is String(128) (studio/models.py) and Postgres raises
+    # DataError on an over-length insert rather than truncating (unlike sqlite, which
+    # is why an unbounded label wouldn't have failed the test suite). routing_policy
+    # is an unbounded raw request path -- NOT runner.py's own "routed:<policy-
+    # version>" label (that's the *parsed policy's* short version field, unavailable
+    # here since the YAML hasn't been loaded yet at claim time). Use just the
+    # filename, hard-capped, so a long/nested config path can never overflow the
+    # column and crash this insert (which sits outside the try/except below, so a
+    # DataError here would propagate unhandled and retry-loop identically forever).
+    routing_label = f"routed:{Path(routing_policy).name}"[:128] if routing_policy else None
 
     # Idempotency: claim the run row BEFORE doing work. A redelivery (same
     # event id) or a duplicate trigger (same idempotency key) short-circuits to
@@ -489,11 +500,8 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
             tenant_id=tenant_id,
             dataset=str(dataset),
             # A routed run has no single model_profile -- label it so the run
-            # index/Results list shows something informative rather than a blank,
-            # mirroring runner.py's own "routed:<policy-version>" convention.
-            model_profile=(
-                f"routed:{routing_policy}" if routing_policy else data.get("model_profile")
-            ),
+            # index/Results list shows something informative rather than a blank.
+            model_profile=routing_label or data.get("model_profile"),
             schema_name=data.get("schema_name", "invoice"),
         )
         if outcome == "exists":

@@ -310,12 +310,17 @@ export function Benchmark({ view = "run" }: { view?: string }) {
 
             <Field
               label="Routing policy (optional)"
-              hint="Server-side path to a routing-policy YAML -- multi-stage fallback/escalation across several profiles (e.g. a fast model, escalating to a stronger one on low confidence). See configs/routing-policy.example.yaml. Mutually exclusive with Model profile above."
+              hint={
+                modelProfile.trim()
+                  ? "Disabled while a Model profile is set above -- clear it first. A routing policy already selects which profile(s) a document runs through."
+                  : "Server-side path to a routing-policy YAML -- multi-stage fallback/escalation across several profiles (e.g. a fast model, escalating to a stronger one on low confidence). See configs/routing-policy.example.yaml. Mutually exclusive with Model profile above."
+              }
             >
               <TextInput
                 value={routingPolicy}
                 onChange={(e) => setRoutingPolicy(e.target.value)}
                 placeholder="configs/routing-policy.example.yaml"
+                disabled={Boolean(modelProfile.trim())}
               />
             </Field>
 

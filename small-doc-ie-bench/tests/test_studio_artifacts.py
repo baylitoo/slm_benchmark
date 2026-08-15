@@ -224,7 +224,32 @@ def test_benchmark_job_forwards_routing_policy_and_suppresses_model_profile(
     # than a blank model_profile.
     record = store.get_run("ev1", tenant_id="t1")
     assert record is not None
-    assert record["model_profile"] == "routed:configs/routing-policy.example.yaml"
+    # Filename only (not the full path) -- see functions.py's own comment: bounded
+    # so a long/nested config path can never overflow StudioRun.model_profile's
+    # String(128) column and crash the claim insert.
+    assert record["model_profile"] == "routed:routing-policy.example.yaml"
+
+
+def test_idempotency_key_differs_by_routing_policy(monkeypatch) -> None:
+    # Demonstrated regression: routing_policy was a new request dimension this
+    # feature added but never threaded into the dedup key's own field list --
+    # two different policies against the same dataset (no model_profile, no
+    # explicit idempotency_key) collided on one key. A completed run under
+    # policy A then made store.claim() return policy A's stored record for a
+    # policy-B request instead of ever running it -- silent wrong data, not a
+    # crash, since a completed run's key only rotates on terminal FAILURE
+    # (store.effective_idempotency_key), and the shipped UI never supplies an
+    # explicit idempotency_key to route around this.
+    from docie_bench.inngest.functions import benchmark_idempotency_key
+
+    key_a = benchmark_idempotency_key(
+        {"dataset": "invoices", "routing_policy": "configs/policy-a.yaml"}
+    )
+    key_b = benchmark_idempotency_key(
+        {"dataset": "invoices", "routing_policy": "configs/policy-b.yaml"}
+    )
+
+    assert key_a != key_b
 
 
 def test_benchmark_job_records_failure_for_retry(tmp_path: Path, monkeypatch) -> None:
