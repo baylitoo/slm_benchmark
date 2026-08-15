@@ -204,16 +204,21 @@ async def validate_dataset_version(
     """Run the CLI's dataset validation (`docie-bench dataset validate`/`inspect`) against
     an already-registered dataset version, reachable from the Studio.
 
-    Mirrors `dataset_inspect` in cli.py: resolve the reference through the shared
-    `data/datasets.yaml` registry (this Studio API already reads that file directly for
-    `GET /datasets`, so this isn't a new filesystem assumption). Deliberately does NOT use
+    Resolves the reference through the shared `data/datasets.yaml` registry (this Studio
+    API already reads that file directly for `GET /datasets`, so this isn't a new
+    filesystem assumption). Unlike either CLI command, this deliberately does NOT use
     `resolve_dataset`'s own `verify_hash` gate (which raises and stops before validation
-    runs) -- a registered dataset can only ever fail `register_dataset_version`'s own
-    validate_dataset gate at REGISTRATION time, so the only way an already-registered
-    dataset's *content* can be invalid later is drift (files changed on disk since).
-    Passing the registry's recorded hash as `expected_hash` folds that drift check into
-    the SAME validation report as duplicate-doc_id / missing-file / cross-split-leakage,
-    instead of stopping at the first problem found.
+    runs) -- passing the registry's recorded hash as `expected_hash` instead lets a pure
+    drift case (files changed on disk since registration, nothing else wrong) surface
+    inside the SAME report as leakage/statistics, rather than a bare error.
+
+    This does NOT mean drift and structural problems always merge into one report:
+    `validate_dataset` (registry.py) early-returns as soon as any duplicate-doc_id /
+    missing-file / unsupported-suffix error exists, before it ever reaches the hash
+    comparison -- same short-circuit it's always had. If a dataset has both a structural
+    error and real drift, only the structural error is reported; the hash is never
+    checked in that case. See
+    test_validate_endpoint_reports_corruption_introduced_after_registration.
 
     `resolve_dataset` itself still unconditionally hashes every referenced file (even
     with verify_hash=False) -- so a manifest referencing an ENTIRELY missing file raises
@@ -249,9 +254,13 @@ async def validate_dataset_version(
         expected_hash=expected_hash,
     )
     return {
+        # No manifest_path here: an absolute server-side filesystem path, unlike every
+        # other artifact this Studio API exposes (see download_artifact's own explicit
+        # principle -- resolved via id -> DB row -> shared blob store, never a
+        # worker-local path). The CLI's dataset_inspect prints it because it IS the
+        # local tool; a network API shouldn't.
         "reference": resolved.reference,
         "version": resolved.version,
-        "manifest_path": str(resolved.manifest_path),
         **report,
     }
 

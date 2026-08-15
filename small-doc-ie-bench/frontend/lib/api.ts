@@ -708,7 +708,6 @@ export interface DatasetStatistics {
 export interface DatasetValidationReport {
   reference: string;
   version: string | null;
-  manifest_path: string;
   valid: boolean;
   errors: string[];
   warnings: string[];

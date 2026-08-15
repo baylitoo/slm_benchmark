@@ -69,7 +69,13 @@ def test_validate_endpoint_reports_corruption_introduced_after_registration(
     # only way an already-registered dataset can be invalid later is corruption
     # introduced to the manifest on disk afterward (duplicated here, pointing at the
     # SAME still-existing file -- see the next test for the missing-file case, which
-    # takes a different code path).
+    # takes a different code path). Appending the row ALSO drifts the dataset's hash
+    # away from the registered entry -- this is deliberately both a structural error
+    # AND real drift at once, to pin validate_dataset's own short-circuit: it returns
+    # on the structural error before ever reaching the hash comparison, so a caller
+    # only sees "Duplicate doc_id", never a hash-mismatch alongside it. That's
+    # validate_dataset's existing behavior (registry.py), not something the route
+    # changes -- see the route's own docstring.
     manifest = _write_manifest(tmp_path / "dataset", [("a", "test", "Invoice A")])
     registry_path = tmp_path / "datasets.yaml"
     registry.register_dataset_version(
@@ -87,6 +93,8 @@ def test_validate_endpoint_reports_corruption_introduced_after_registration(
     body = resp.json()
     assert body["valid"] is False
     assert any("Duplicate doc_id" in e for e in body["errors"])
+    assert not any("hash mismatch" in e for e in body["errors"])
+    assert "statistics" not in body
 
 
 def test_validate_endpoint_surfaces_a_missing_referenced_file_as_422_not_500(
