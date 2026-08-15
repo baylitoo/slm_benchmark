@@ -48,7 +48,7 @@ export class ModelLoading extends Error {
   }
 }
 
-export function isUnavailableStatus(status: number): boolean {
+function isUnavailableStatus(status: number): boolean {
   return status === 404 || status === 501;
 }
 
