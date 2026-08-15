@@ -177,6 +177,81 @@ def test_benchmark_job_runs_once_on_double_fire(tmp_path: Path, monkeypatch) -> 
     assert {"metrics.json", "report.html", "predictions.jsonl"} <= names
 
 
+def test_benchmark_job_forwards_routing_policy_and_suppresses_model_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # run_benchmark itself raises ValueError if routing_policy_path AND
+    # model_profile are both set (mutually exclusive -- a policy already selects
+    # which profile(s) a document runs through). The worker must not pass both
+    # through even if a stray model_profile is present in the event data.
+    from docie_bench.benchmark import runner as runner_mod
+    from docie_bench.inngest import functions as fns
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    monkeypatch.setattr("docie_bench.studio.store.default_run_store", lambda: store)
+
+    captured: dict = {}
+
+    async def fake_run_benchmark(**kwargs):
+        captured.update(kwargs)
+        run_dir = tmp_path / "run"
+        run_dir.mkdir(exist_ok=True)
+        (run_dir / "metrics.json").write_text(json.dumps({"summary": [{"f1": 0.5}]}))
+        (run_dir / "report.html").write_text("<html>report</html>")
+        (run_dir / "predictions.jsonl").write_text('{"pred":1}\n')
+        return runner_mod.BenchmarkResult(
+            run_dir,
+            run_dir / "predictions.jsonl",
+            run_dir / "metrics.json",
+            run_dir / "report.html",
+            run_dir / "manifest.json",
+        )
+
+    monkeypatch.setattr(runner_mod, "run_benchmark", fake_run_benchmark)
+
+    data = {
+        "dataset": "ds",
+        "tenant_id": "t1",
+        "idempotency_key": "k1",
+        "routing_policy": "configs/routing-policy.example.yaml",
+        "model_profile": "stray_profile",  # must NOT reach run_benchmark
+    }
+    asyncio.run(fns._run_benchmark_job(dict(data), event_id="ev1"))
+
+    assert captured["routing_policy_path"] == Path("configs/routing-policy.example.yaml")
+    assert captured["model_profile"] is None
+    # Run-index provenance shows something informative for a routed run rather
+    # than a blank model_profile.
+    record = store.get_run("ev1", tenant_id="t1")
+    assert record is not None
+    # Filename only (not the full path) -- see functions.py's own comment: bounded
+    # so a long/nested config path can never overflow StudioRun.model_profile's
+    # String(128) column and crash the claim insert.
+    assert record["model_profile"] == "routed:routing-policy.example.yaml"
+
+
+def test_idempotency_key_differs_by_routing_policy(monkeypatch) -> None:
+    # Demonstrated regression: routing_policy was a new request dimension this
+    # feature added but never threaded into the dedup key's own field list --
+    # two different policies against the same dataset (no model_profile, no
+    # explicit idempotency_key) collided on one key. A completed run under
+    # policy A then made store.claim() return policy A's stored record for a
+    # policy-B request instead of ever running it -- silent wrong data, not a
+    # crash, since a completed run's key only rotates on terminal FAILURE
+    # (store.effective_idempotency_key), and the shipped UI never supplies an
+    # explicit idempotency_key to route around this.
+    from docie_bench.inngest.functions import benchmark_idempotency_key
+
+    key_a = benchmark_idempotency_key(
+        {"dataset": "invoices", "routing_policy": "configs/policy-a.yaml"}
+    )
+    key_b = benchmark_idempotency_key(
+        {"dataset": "invoices", "routing_policy": "configs/policy-b.yaml"}
+    )
+
+    assert key_a != key_b
+
+
 def test_benchmark_job_records_failure_for_retry(tmp_path: Path, monkeypatch) -> None:
     from docie_bench.benchmark import runner as runner_mod
     from docie_bench.inngest import functions as fns
@@ -553,6 +628,36 @@ def test_effective_key_does_not_over_match_sibling_client_keys(tmp_path: Path) -
     resolved = store.effective_idempotency_key(base)
     assert resolved != base + "bar"
     assert resolved.startswith(base + ":r")
+
+
+def test_benchmark_trigger_rejects_routing_policy_combined_with_model_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from docie_bench import security
+
+    store, _ = _make_store(tmp_path / "s.db", tmp_path / "b")
+    monkeypatch.setattr(studio_api, "default_run_store", lambda: store)
+    manager = TenantQuotaManager(
+        api_keys={"secret-a": "tenant-a"},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=10,
+    )
+    monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
+    client = TestClient(api.app)
+
+    resp = client.post(
+        "/v1/studio/benchmark",
+        json={
+            "dataset": "invoices",
+            "routing_policy": "configs/routing-policy.example.yaml",
+            "model_profile": "some_profile",
+        },
+        headers={"X-API-Key": "secret-a"},
+    )
+
+    assert resp.status_code == 422
 
 
 def test_benchmark_trigger_rotates_key_after_terminal_failure(

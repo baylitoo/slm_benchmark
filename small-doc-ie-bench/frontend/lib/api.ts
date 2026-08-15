@@ -71,6 +71,10 @@ export interface BenchmarkRequest {
   dataset: string; // required server-side (POST /v1/studio/benchmark)
   split?: string;
   model_profile?: string;
+  /** Server-side path to a routing-policy YAML (multi-stage fallback/escalation
+   * across several profiles — see configs/routing-policy.example.yaml). Mutually
+   * exclusive with model_profile; the backend 422s a request carrying both. */
+  routing_policy?: string;
   schema_name?: string;
   concurrency?: number;
   repeat?: number;

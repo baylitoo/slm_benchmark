@@ -102,6 +102,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   const [customModelProfile, setCustomModelProfile] = useState(false);
   const [pipelineSheetOpen, setPipelineSheetOpen] = useState(false);
   const [ocrSheetOpen, setOcrSheetOpen] = useState(false);
+  const [routingPolicy, setRoutingPolicy] = useState("");
   const [schemaName, setSchemaName] = useState("invoice");
   const [concurrency, setConcurrency] = useState("1");
   const [submitting, setSubmitting] = useState(false);
@@ -116,11 +117,22 @@ export function Benchmark({ view = "run" }: { view?: string }) {
       setError("A dataset is required to run a benchmark.");
       return;
     }
+    if (modelProfile.trim() && routingPolicy.trim()) {
+      setError(
+        "Model profile and routing policy are mutually exclusive -- a routing " +
+          "policy already selects which profile(s) a document runs through.",
+      );
+      return;
+    }
     setSubmitting(true);
     try {
       const res = await triggerBenchmark({
         dataset: dataset.trim(),
-        ...(modelProfile.trim() ? { model_profile: modelProfile.trim() } : {}),
+        ...(routingPolicy.trim()
+          ? { routing_policy: routingPolicy.trim() }
+          : modelProfile.trim()
+            ? { model_profile: modelProfile.trim() }
+            : {}),
         ...(schemaName.trim() ? { schema_name: schemaName.trim() } : {}),
         ...(concurrency.trim() ? { concurrency: Number(concurrency) } : {}),
       });
@@ -295,6 +307,22 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                 />
               </Field>
             </div>
+
+            <Field
+              label="Routing policy (optional)"
+              hint={
+                modelProfile.trim()
+                  ? "Disabled while a Model profile is set above -- clear it first. A routing policy already selects which profile(s) a document runs through."
+                  : "Server-side path to a routing-policy YAML -- multi-stage fallback/escalation across several profiles (e.g. a fast model, escalating to a stronger one on low confidence). See configs/routing-policy.example.yaml. Mutually exclusive with Model profile above."
+              }
+            >
+              <TextInput
+                value={routingPolicy}
+                onChange={(e) => setRoutingPolicy(e.target.value)}
+                placeholder="configs/routing-policy.example.yaml"
+                disabled={Boolean(modelProfile.trim())}
+              />
+            </Field>
 
             {error && <Alert tone="err">{error}</Alert>}
 
