@@ -8,6 +8,7 @@
 // only, not a session — localStorage is deliberately enough here.
 
 import { useEffect, useState } from "react";
+import { mutate } from "swr";
 
 const STORAGE_KEY = "docie:api-key";
 // Fired on same-tab writes so other mounted components (e.g. the TopBar
@@ -38,6 +39,13 @@ export function setApiKey(key: string | null): void {
     // Ignore write failures (quota / disabled storage) — nothing to persist to.
   }
   window.dispatchEvent(new Event(CHANGE_EVENT));
+  // Without this, every panel's stale 401 error (rendered before the key was
+  // entered) sits there unchanged until the next unrelated SWR trigger
+  // (revalidate-on-focus, a manual reload) happens to fire -- the operator
+  // gets no feedback that saving actually worked. `mutate(() => true, ...)`
+  // is SWR's own documented pattern for "revalidate every cache key" (all
+  // `useAsync` calls share the default cache -- no SWRConfig in this app).
+  void mutate(() => true, undefined, { revalidate: true });
 }
 
 /** `{ "X-API-Key": ... }` when a key is stored, else `{}` — spread into fetch headers. */
