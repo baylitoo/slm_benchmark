@@ -477,6 +477,7 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
     store = default_run_store()
     idempotency_key = benchmark_idempotency_key(data)
     tenant_id = str(data.get("tenant_id") or "anonymous")
+    routing_policy = data.get("routing_policy")
 
     # Idempotency: claim the run row BEFORE doing work. A redelivery (same
     # event id) or a duplicate trigger (same idempotency key) short-circuits to
@@ -487,7 +488,12 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
             idempotency_key=idempotency_key,
             tenant_id=tenant_id,
             dataset=str(dataset),
-            model_profile=data.get("model_profile"),
+            # A routed run has no single model_profile -- label it so the run
+            # index/Results list shows something informative rather than a blank,
+            # mirroring runner.py's own "routed:<policy-version>" convention.
+            model_profile=(
+                f"routed:{routing_policy}" if routing_policy else data.get("model_profile")
+            ),
             schema_name=data.get("schema_name", "invoice"),
         )
         if outcome == "exists":
@@ -500,7 +506,13 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
         result = await run_benchmark(
             dataset_path=dataset,
             models_config_path=MODELS_CONFIG_PATH,
-            model_profile=data.get("model_profile"),
+            # Mutually exclusive (studio_api.py's trigger_benchmark already 422s a
+            # request carrying both) -- routing_policy_path wins here defensively
+            # rather than trusting that guard alone, since run_benchmark itself
+            # raises ValueError on both being set, which would fail the run instead
+            # of the request.
+            model_profile=data.get("model_profile") if not routing_policy else None,
+            routing_policy_path=Path(routing_policy) if routing_policy else None,
             concurrency=int(data.get("concurrency", 1)),
             repeat=int(data.get("repeat", 1)),
             schema_name=data.get("schema_name", "invoice"),

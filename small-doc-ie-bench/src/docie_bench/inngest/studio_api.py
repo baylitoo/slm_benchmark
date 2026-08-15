@@ -404,6 +404,13 @@ class BenchmarkRequest(BaseModel):
     dataset: str
     split: str | None = None
     model_profile: str | None = None
+    # Server-side path to a routing-policy YAML (benchmark.routing_config.
+    # load_routing_policy's own format -- see configs/routing-policy.example.yaml).
+    # Mutually exclusive with model_profile, same rule the CLI's --routing-policy/
+    # --model-profile pair already enforces (cli.py) -- a policy multi-stage-routes
+    # a document through several profiles; picking one profile up front makes no
+    # sense alongside that.
+    routing_policy: str | None = None
     schema_name: str = "invoice"
     concurrency: int = 1
     repeat: int = 1
@@ -414,6 +421,12 @@ class BenchmarkRequest(BaseModel):
 
 @router.post("/benchmark", response_model=TriggerResponse)
 async def trigger_benchmark(payload: BenchmarkRequest, tenant: TenantDependency) -> TriggerResponse:
+    if payload.routing_policy and payload.model_profile:
+        raise HTTPException(
+            status_code=422,
+            detail="routing_policy cannot be combined with model_profile -- a routing "
+            "policy already selects which profile(s) a document runs through",
+        )
     channel = f"benchmark:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel
