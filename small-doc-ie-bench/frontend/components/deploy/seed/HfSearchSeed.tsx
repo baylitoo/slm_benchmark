@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Rocket, Boxes, ShieldAlert } from "lucide-react";
 import {
+  formatBytes,
   searchHf,
   inspectHf,
   seedHf,
@@ -39,6 +40,18 @@ function verdictLabel(verdict: string | undefined): string {
   return verdict === "needs_family" ? "needs a family" : (verdict ?? "unknown");
 }
 
+function readinessTone(readiness: HfInspect["readiness"]): BadgeTone {
+  return readiness === "ready" ? "ok" : readiness === "blocked" ? "err" : "warn";
+}
+
+function readinessLabel(readiness: HfInspect["readiness"]): string {
+  return readiness === "ready"
+    ? "ready to deploy"
+    : readiness === "blocked"
+      ? "blocked"
+      : "review required";
+}
+
 export function HfSearchSeed({
   families,
   onSeeded,
@@ -66,6 +79,28 @@ export function HfSearchSeed({
   // ongoing download is never silently dropped from view.
   const [seedActive, setSeedActive] = useState(false);
   const [seedingRepo, setSeedingRepo] = useState<string | null>(null);
+
+  const artifact = useMemo(() => {
+    const options = inspect?.artifact_options ?? [];
+    return (
+      options.find((option) => option.quant === quant) ??
+      options.find((option) => option.recommended) ??
+      options[0]
+    );
+  }, [inspect, quant]);
+  const selectedFit = artifact?.fits_node ?? inspect?.fits_node;
+  const activeBlockers = (inspect?.blockers ?? []).filter((blocker) => {
+    if (blocker.code === "insufficient_memory") return selectedFit === false;
+    if (blocker.code === "remote_code_approval_required") {
+      return family !== "transformers_trust_remote_code";
+    }
+    return true;
+  });
+  const effectiveReadiness: HfInspect["readiness"] = activeBlockers.length
+    ? "blocked"
+    : (inspect?.warnings?.length ?? 0) > 0
+      ? "caution"
+      : "ready";
 
   function confirmLeaveSeed(): boolean {
     if (!seedActive || !seedingRepo) return true;
@@ -118,7 +153,7 @@ export function HfSearchSeed({
       setInspect(v);
       setName(v.suggested_name ?? "");
       setFamily(v.family ?? "");
-      setQuant(v.quants?.includes("Q4_K_M") ? "Q4_K_M" : (v.quants?.[0] ?? ""));
+      setQuant(v.recommended_quant ?? v.quants?.[0] ?? "");
     } catch (err) {
       setInspect({ repo, verdict: "unsupported", reason: errText(err, "Inspect failed.") });
     } finally {
@@ -150,6 +185,7 @@ export function HfSearchSeed({
   }
 
   const unsupported = inspect?.verdict === "unsupported";
+  const hardBlocked = unsupported || activeBlockers.length > 0;
 
   return (
     <Card
@@ -228,17 +264,41 @@ export function HfSearchSeed({
               <div className="space-y-3">
                 <p className="truncate text-sm font-medium text-foreground">{inspect.repo}</p>
                 <div className="flex flex-wrap items-center gap-1.5">
+                  {inspect.readiness && (
+                    <Badge tone={readinessTone(effectiveReadiness)}>
+                      {readinessLabel(effectiveReadiness)}
+                    </Badge>
+                  )}
                   <Badge tone={verdictTone(inspect.verdict)}>{verdictLabel(inspect.verdict)}</Badge>
                   {inspect.architecture && (
                     <Badge tone="neutral">arch: {inspect.architecture}</Badge>
                   )}
+                  {inspect.runtime && <Badge tone="info">{inspect.runtime}</Badge>}
                   {inspect.has_mmproj && <Badge tone="info">vision · mmproj</Badge>}
                 </div>
                 {inspect.reason && (
                   <p className="text-xs text-muted-foreground">{inspect.reason}</p>
                 )}
-                {inspect.runtime_note && (
+                {inspect.runtime_note && !(inspect.warnings?.length ?? 0) && (
                   <Alert tone="warn">Runtime: {inspect.runtime_note}</Alert>
+                )}
+                {activeBlockers.length > 0 && (
+                  <Alert tone="err">
+                    {activeBlockers.map((blocker) => (
+                      <span key={blocker.code} className="block">
+                        {blocker.message}
+                      </span>
+                    ))}
+                  </Alert>
+                )}
+                {(inspect.warnings?.length ?? 0) > 0 && (
+                  <Alert tone="warn">
+                    {inspect.warnings!.map((warning) => (
+                      <span key={warning.code} className="block">
+                        {warning.message}
+                      </span>
+                    ))}
+                  </Alert>
                 )}
                 {inspect.needs_trust_remote_code && (
                   <p className="flex items-start gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-400">
@@ -254,6 +314,33 @@ export function HfSearchSeed({
 
                 {!unsupported && (
                   <>
+                    {artifact && (
+                      <div className="grid grid-cols-2 gap-2 rounded-md border border-border bg-card p-3 text-xs sm:grid-cols-4">
+                        <PreflightMetric
+                          label="Download"
+                          value={formatBytes(artifact.download_size_bytes)}
+                        />
+                        <PreflightMetric
+                          label={`RAM · ${inspect.context_length?.toLocaleString() ?? "?"} ctx`}
+                          value={formatBytes(artifact.estimated_ram_bytes)}
+                        />
+                        <PreflightMetric
+                          label="Node budget"
+                          value={formatBytes(artifact.node_available_bytes)}
+                        />
+                        <PreflightMetric
+                          label="Fit"
+                          value={
+                            selectedFit === true
+                              ? "Fits"
+                              : selectedFit === false
+                                ? "Does not fit"
+                                : "Unknown"
+                          }
+                          tone={selectedFit === true ? "ok" : selectedFit === false ? "err" : undefined}
+                        />
+                      </div>
+                    )}
                     <div className="grid gap-3 sm:grid-cols-2">
                       <Field label="Store name">
                         <TextInput value={name} onChange={(e) => setName(e.target.value)} />
@@ -264,31 +351,69 @@ export function HfSearchSeed({
                         </Select>
                       </Field>
                     </div>
-                    {(inspect.quants?.length ?? 0) > 0 && (
-                      <Field label="Quantization">
+                    {(inspect.artifact_options?.filter((option) => option.quant).length ?? 0) > 0 && (
+                      <Field
+                        label="Quantization"
+                        hint="Each choice updates the download, RAM, and fit estimate above."
+                      >
                         <div className="flex flex-wrap gap-1.5">
-                          {inspect.quants!.map((q) => (
+                          {inspect.artifact_options!
+                            .filter((option) => option.quant)
+                            .map((option) => (
                             <button
-                              key={q}
+                              key={option.filename ?? option.label}
                               type="button"
-                              onClick={() => setQuant(q)}
+                              onClick={() => setQuant(option.quant ?? "")}
                               className={cn(
                                 "rounded-md border px-2 py-1 text-xs transition",
-                                quant === q
+                                quant === option.quant
                                   ? "border-accent bg-accent/10 text-accent"
                                   : "border-border hover:bg-muted",
                               )}
                             >
-                              {q}
+                              {option.label}
+                              {option.fits_node === true
+                                ? " · fits"
+                                : option.fits_node === false
+                                  ? " · too large"
+                                  : ""}
                             </button>
                           ))}
                         </div>
                       </Field>
                     )}
+                    {(artifact?.required_files.length ?? 0) > 0 && (
+                      <details className="rounded-md border border-border px-3 py-2 text-xs">
+                        <summary className="cursor-pointer font-medium text-foreground">
+                          Required files ({artifact!.required_files.length})
+                        </summary>
+                        <ul className="mt-2 space-y-1 text-muted-foreground">
+                          {artifact!.required_files.map((file) => (
+                            <li key={`${file.role}:${file.filename}`} className="flex justify-between gap-3">
+                              <span className="min-w-0 truncate" title={file.filename}>
+                                {file.role}: {file.filename}
+                              </span>
+                              <span className="shrink-0 font-mono">
+                                {formatBytes(file.size_bytes)}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                    {(inspect.recommendations?.length ?? 0) > 0 && (
+                      <Alert tone="info">
+                        {inspect.recommendations!.map((recommendation) => (
+                          <span key={recommendation} className="block">
+                            {recommendation}
+                          </span>
+                        ))}
+                      </Alert>
+                    )}
                     <Button
                       type="button"
                       loading={submitting}
-                      disabled={!family}
+                      disabled={!family || hardBlocked}
                       onClick={() => void onSeed()}
                     >
                       <Rocket className="h-4 w-4" />
@@ -323,5 +448,30 @@ export function HfSearchSeed({
         </div>
       )}
     </Card>
+  );
+}
+
+function PreflightMetric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone?: "ok" | "err";
+}) {
+  return (
+    <div>
+      <p className="text-muted-foreground">{label}</p>
+      <p
+        className={cn(
+          "mt-0.5 font-medium text-foreground",
+          tone === "ok" && "text-emerald-600 dark:text-emerald-400",
+          tone === "err" && "text-rose-600 dark:text-rose-400",
+        )}
+      >
+        {value}
+      </p>
+    </div>
   );
 }

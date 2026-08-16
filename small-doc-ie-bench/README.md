@@ -114,6 +114,12 @@ consistent operational workflow. It supports vLLM, llama.cpp, Ollama, and
 OpenAI-compatible remote endpoints, with a content-addressed model registry,
 resource planning, and a persistent local deployment supervisor.
 
+Before downloading a Hugging Face model, Studio runs a compatibility preflight.
+It identifies the architecture, serving family and runtime, selects the preferred
+quant, lists every required artifact, estimates download and RAM requirements,
+and compares that estimate with the serving node's current deployable budget.
+Blocked models stay undownloaded; alternate quants show their own fit verdicts.
+
 ```bash
 docie runtime list
 docie model pull ./path/to/model-manifest.json
@@ -569,6 +575,8 @@ Do not select by leaderboard alone. Select by field-level accuracy under constra
 - `POST /v1/rerank` — relevance-score a query against a document list, from a
   `reranker`-family deployment (e.g. LFM2.5-ColBERT-350M).
 - `POST /v1/benchmarks/run`
+- `GET /v1/studio/hf/inspect?repo=…&context_length=8192` — model compatibility,
+  artifact, RAM, and live-node fit preflight without downloading weights.
 - `POST /v1/reviews`
 - `GET /v1/reviews`
 - `GET /v1/reviews/metrics`

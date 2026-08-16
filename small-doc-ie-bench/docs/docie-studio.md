@@ -80,9 +80,10 @@ Then open:
 1. **Playground** — paste text or upload a file (PDF/image, sent as base64),
    pick a schema + model profile, run an extraction, and watch the result stream
    in live (realtime hook, with polling fallback). Fully wired.
-2. **Deploy** — litellm-style model/runtime/deployment tables + a one-click
-   deploy action. *(Backend `/v1/serving/*` + `model/deploy.requested` in
-   progress; the UI degrades gracefully until they land.)*
+2. **Deploy** — model/runtime/deployment tables, Hugging Face browsing, and a
+   compatibility preflight before download. The preflight resolves the runtime
+   and family, recommends a quant, lists required files, estimates RAM, and
+   checks the live serving-node budget.
 3. **Benchmark** — trigger a dataset benchmark run and view metrics. Trigger is
    wired (`POST /v1/studio/benchmark`); the results list (`GET /v1/studio/runs`)
    renders the metrics table and links each run's downloadable artifacts
@@ -96,6 +97,7 @@ Then open:
 |---|---|---|
 | POST | `/v1/studio/extract` | fire `doc/extract.requested`; returns `{event_ids, channel, topics}` |
 | POST | `/v1/studio/benchmark` | fire `benchmark/run.requested` (needs `dataset`) |
+| GET | `/v1/studio/hf/inspect?repo=&context_length=` | compatibility, artifact, RAM, and node-fit preflight without downloading weights |
 | GET | `/v1/studio/realtime-token?channel=&topics=` | mint a realtime subscription token (501 if unavailable) |
 | GET | `/v1/studio/runs/{event_id}` | durable benchmark record (metrics + artifact URIs), else proxy Inngest run status |
 | GET | `/v1/studio/runs?limit=` | list this tenant's durable benchmark runs |
