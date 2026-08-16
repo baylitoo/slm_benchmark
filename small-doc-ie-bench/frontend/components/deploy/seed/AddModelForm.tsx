@@ -18,9 +18,11 @@ type SeedMode = "search" | "hf" | "collection" | "encoder" | "ollama";
 
 export function AddModelForm({
   families,
+  existingStoreNames,
   onSeeded,
 }: {
   families: ModelFamily[] | null;
+  existingStoreNames: string[];
   onSeeded: () => void;
 }) {
   const [mode, setMode] = useState<SeedMode>("search");
@@ -54,19 +56,39 @@ export function AddModelForm({
       {/* All modes stay mounted so an in-flight download's ResultPanel survives
           switching modes (same rationale as the slide-over itself). */}
       <div hidden={mode !== "search"}>
-        <HfSearchSeed families={families} onSeeded={onSeeded} />
+        <HfSearchSeed
+          families={families}
+          existingStoreNames={existingStoreNames}
+          onSeeded={onSeeded}
+        />
       </div>
       <div hidden={mode !== "hf"}>
-        <HfSeedForm families={families} onSeeded={onSeeded} />
+        <HfSeedForm
+          families={families}
+          existingStoreNames={existingStoreNames}
+          onSeeded={onSeeded}
+        />
       </div>
       <div hidden={mode !== "collection"}>
-        <HfCollectionSeed families={families} onSeeded={onSeeded} />
+        <HfCollectionSeed
+          families={families}
+          existingStoreNames={existingStoreNames}
+          onSeeded={onSeeded}
+        />
       </div>
       <div hidden={mode !== "encoder"}>
-        <EncoderSeedForm families={families} onSeeded={onSeeded} />
+        <EncoderSeedForm
+          families={families}
+          existingStoreNames={existingStoreNames}
+          onSeeded={onSeeded}
+        />
       </div>
       <div hidden={mode !== "ollama"}>
-        <SeedForm families={families} onSeeded={onSeeded} />
+        <SeedForm
+          families={families}
+          existingStoreNames={existingStoreNames}
+          onSeeded={onSeeded}
+        />
       </div>
     </div>
   );

@@ -15,11 +15,12 @@ vi.mock("@/lib/api", async (importOriginal) => {
   };
 });
 
-function renderSearch() {
+function renderSearch(existingStoreNames: string[] = []) {
   return render(
     <ToastProvider>
       <HfSearchSeed
         families={[{ name: "openai_chat" }]}
+        existingStoreNames={existingStoreNames}
         onSeeded={vi.fn()}
       />
     </ToastProvider>,
@@ -143,6 +144,7 @@ describe("HfSearchSeed preflight", () => {
               trust_remote_code: true,
             },
           ]}
+          existingStoreNames={[]}
           onSeeded={vi.fn()}
         />
       </ToastProvider>,
@@ -157,5 +159,35 @@ describe("HfSearchSeed preflight", () => {
       "transformers_trust_remote_code",
     );
     expect(screen.getByRole("button", { name: /Download & seed/ })).toBeEnabled();
+  });
+
+  it("asks before reusing an existing store name", async () => {
+    vi.mocked(api.searchHf).mockResolvedValue([{ id: "owner/model-GGUF" }]);
+    vi.mocked(api.inspectHf).mockResolvedValue({
+      repo: "owner/model-GGUF",
+      verdict: "supported",
+      readiness: "ready",
+      family: "openai_chat",
+      reason: "supported",
+      suggested_name: "model",
+    });
+    vi.mocked(api.seedHf).mockResolvedValue({
+      event_ids: ["event-1"],
+      channel: "seed:model",
+      topics: ["status", "result", "error"],
+    });
+
+    renderSearch(["model"]);
+    await userEvent.type(screen.getByPlaceholderText(/Search models/), "model");
+    await userEvent.click(screen.getByRole("button", { name: "Search" }));
+    await userEvent.click(await screen.findByText("owner/model-GGUF"));
+    await userEvent.click(screen.getByRole("button", { name: /Download & seed/ }));
+
+    expect(screen.getByRole("dialog", { name: "This store name already exists" })).toBeVisible();
+    expect(screen.getByText("No new files will be downloaded or replaced.")).toBeVisible();
+    expect(api.seedHf).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Use existing model" }));
+    expect(api.seedHf).toHaveBeenCalledOnce();
   });
 });

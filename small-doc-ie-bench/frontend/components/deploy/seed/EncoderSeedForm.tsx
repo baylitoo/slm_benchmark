@@ -7,6 +7,10 @@ import { useToast } from "../../Toast";
 import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { errText } from "../shared";
+import {
+  ExistingModelsDialog,
+  existingStoreNames as findExistingNames,
+} from "./ExistingModelsDialog";
 
 // Encoders (analyzer families — safetensors, not GGUF) are SEEDED into the
 // store like any other model: the snapshot downloads once (live progress),
@@ -15,9 +19,11 @@ import { errText } from "../shared";
 // added on the backend shows up here with no UI change.
 export function EncoderSeedForm({
   families,
+  existingStoreNames,
   onSeeded,
 }: {
   families: ModelFamily[] | null;
+  existingStoreNames: string[];
   onSeeded: () => void;
 }) {
   const { toast } = useToast();
@@ -31,27 +37,27 @@ export function EncoderSeedForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+  const [confirmExisting, setConfirmExisting] = useState(false);
+  const conflicts = findExistingNames(existingStoreNames, [name]);
 
   // Default to the first analyzer family the backend reports.
   useEffect(() => {
     if (!family && analyzerFamilies.length > 0) setFamily(analyzerFamilies[0].name);
   }, [analyzerFamilies, family]);
 
-  async function onSeed(e: React.FormEvent) {
-    e.preventDefault();
+  async function startSeed() {
     setError(null);
     setTrigger(null);
-    if (!repo.trim() || !name.trim()) {
-      setError("Repo and store name are both required.");
-      return;
-    }
     setSubmitting(true);
     try {
       const res = await seedHf({ repo: repo.trim(), name: name.trim(), family });
       setTrigger(res);
       toast({
-        title: "Encoder download started",
-        description: `${name.trim()} — snapshot into the store, then Deploy it.`,
+        title: conflicts.length > 0 ? "Using existing encoder" : "Encoder download started",
+        description:
+          conflicts.length > 0
+            ? name.trim()
+            : `${name.trim()} — snapshot into the store, then Deploy it.`,
         tone: "success",
       });
       onSeeded();
@@ -62,6 +68,19 @@ export function EncoderSeedForm({
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function onSeed(e: React.FormEvent) {
+    e.preventDefault();
+    if (!repo.trim() || !name.trim()) {
+      setError("Repo and store name are both required.");
+      return;
+    }
+    if (conflicts.length > 0) {
+      setConfirmExisting(true);
+      return;
+    }
+    void startSeed();
   }
 
   return (
@@ -129,6 +148,15 @@ export function EncoderSeedForm({
           <ResultPanel trigger={trigger} noun="seed" />
         </div>
       )}
+      <ExistingModelsDialog
+        names={conflicts}
+        open={confirmExisting}
+        onClose={() => setConfirmExisting(false)}
+        onContinue={() => {
+          setConfirmExisting(false);
+          void startSeed();
+        }}
+      />
     </Card>
   );
 }

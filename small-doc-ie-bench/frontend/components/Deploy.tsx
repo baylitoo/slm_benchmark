@@ -108,7 +108,11 @@ export function Deploy({
       />
 
       {view === "catalog" ? (
-        <Catalog families={families.data} onSeeded={() => store.refresh()} />
+        <Catalog
+          families={families.data}
+          existingStoreNames={(store.data ?? []).map((entry) => entry.name)}
+          onSeeded={() => store.refresh()}
+        />
       ) : view === "models" ? (
         <ModelsView store={store} onDeploy={() => setSlideOver("deploy")} />
       ) : view === "sizing" ? (
@@ -133,7 +137,11 @@ export function Deploy({
         <DeployForm store={store} active={active} onDeployed={() => deployments.refresh()} />
       </Sheet>
       <Sheet open={slideOver === "seed"} onClose={() => setSlideOver(null)}>
-        <AddModelForm families={families.data} onSeeded={() => store.refresh()} />
+        <AddModelForm
+          families={families.data}
+          existingStoreNames={(store.data ?? []).map((entry) => entry.name)}
+          onSeeded={() => store.refresh()}
+        />
       </Sheet>
     </div>
   );

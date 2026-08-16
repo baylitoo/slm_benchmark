@@ -15,6 +15,10 @@ import { useToast } from "../../Toast";
 import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { errText, FamilyOptions } from "../shared";
+import {
+  ExistingModelsDialog,
+  existingStoreNames as findExistingNames,
+} from "./ExistingModelsDialog";
 
 function isEmbeddingFamily(families: ModelFamily[] | null, name: string): boolean {
   return (families ?? []).some((f) => f.name === name && f.embedding);
@@ -22,9 +26,11 @@ function isEmbeddingFamily(families: ModelFamily[] | null, name: string): boolea
 
 export function HfSeedForm({
   families,
+  existingStoreNames,
   onSeeded,
 }: {
   families: ModelFamily[] | null;
+  existingStoreNames: string[];
   onSeeded: () => void;
 }) {
   const { toast } = useToast();
@@ -37,6 +43,8 @@ export function HfSeedForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+  const [confirmExisting, setConfirmExisting] = useState(false);
+  const conflicts = findExistingNames(existingStoreNames, [name]);
 
   const quants = useMemo(
     () =>
@@ -66,14 +74,10 @@ export function HfSeedForm({
     }
   }
 
-  async function onSeed(e: React.FormEvent) {
-    e.preventDefault();
+  async function startSeed() {
     setError(null);
     setTrigger(null);
-    if (!repoView) {
-      void inspect();
-      return;
-    }
+    if (!repoView) return;
     setSubmitting(true);
     try {
       const res = await seedHf({
@@ -84,7 +88,7 @@ export function HfSeedForm({
       });
       setTrigger(res);
       toast({
-        title: "Download started",
+        title: conflicts.length > 0 ? "Using existing model" : "Download started",
         description: `${repoView.repo}${quant ? ` · ${quant}` : ""}`,
         tone: "success",
       });
@@ -96,6 +100,19 @@ export function HfSeedForm({
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function onSeed(e: React.FormEvent) {
+    e.preventDefault();
+    if (!repoView) {
+      void inspect();
+      return;
+    }
+    if (conflicts.length > 0) {
+      setConfirmExisting(true);
+      return;
+    }
+    void startSeed();
   }
 
   return (
@@ -191,6 +208,15 @@ export function HfSeedForm({
           <ResultPanel trigger={trigger} noun="seed" />
         </div>
       )}
+      <ExistingModelsDialog
+        names={conflicts}
+        open={confirmExisting}
+        onClose={() => setConfirmExisting(false)}
+        onContinue={() => {
+          setConfirmExisting(false);
+          void startSeed();
+        }}
+      />
     </Card>
   );
 }

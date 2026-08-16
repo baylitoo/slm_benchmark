@@ -8,6 +8,10 @@ import { useToast } from "../../Toast";
 import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { FamilyOptions } from "../shared";
+import {
+  ExistingModelsDialog,
+  existingStoreNames as findExistingNames,
+} from "./ExistingModelsDialog";
 
 // ---------------------------------------------------------------------------
 // Seed form (populate the store from a local Ollama reference)
@@ -15,9 +19,11 @@ import { FamilyOptions } from "../shared";
 
 export function SeedForm({
   families,
+  existingStoreNames,
   onSeeded,
 }: {
   families: ModelFamily[] | null;
+  existingStoreNames: string[];
   onSeeded: () => void;
 }) {
   const { toast } = useToast();
@@ -28,6 +34,8 @@ export function SeedForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+  const [confirmExisting, setConfirmExisting] = useState(false);
+  const conflicts = findExistingNames(existingStoreNames, [name]);
 
   // Vision families (e.g. nuextract3) are served by llama-server with a projector;
   // surface an explicit mmproj input so a GGUF pull without a projector layer is
@@ -38,14 +46,9 @@ export function SeedForm({
   );
   const needsMmproj = selectedFamily?.needs_mmproj === true;
 
-  async function onSeed(e: React.FormEvent) {
-    e.preventDefault();
+  async function startSeed() {
     setError(null);
     setTrigger(null);
-    if (!reference.trim() || !name.trim()) {
-      setError("Reference and store name are both required.");
-      return;
-    }
     setSubmitting(true);
     try {
       const res = await seedOllama({
@@ -55,7 +58,11 @@ export function SeedForm({
         ...(mmproj.trim() ? { mmproj: mmproj.trim() } : {}),
       });
       setTrigger(res);
-      toast({ title: "Seeding started", description: name.trim(), tone: "success" });
+      toast({
+        title: conflicts.length > 0 ? "Using existing model" : "Seeding started",
+        description: name.trim(),
+        tone: "success",
+      });
       onSeeded();
     } catch (err) {
       const msg = toUserMessage(err, {
@@ -67,6 +74,19 @@ export function SeedForm({
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function onSeed(e: React.FormEvent) {
+    e.preventDefault();
+    if (!reference.trim() || !name.trim()) {
+      setError("Reference and store name are both required.");
+      return;
+    }
+    if (conflicts.length > 0) {
+      setConfirmExisting(true);
+      return;
+    }
+    void startSeed();
   }
 
   const familyOptions = families && families.length > 0
@@ -134,6 +154,15 @@ export function SeedForm({
           <ResultPanel trigger={trigger} noun="seed" />
         </div>
       )}
+      <ExistingModelsDialog
+        names={conflicts}
+        open={confirmExisting}
+        onClose={() => setConfirmExisting(false)}
+        onContinue={() => {
+          setConfirmExisting(false);
+          void startSeed();
+        }}
+      />
     </Card>
   );
 }

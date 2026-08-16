@@ -12,12 +12,19 @@ import { useToast } from "../../Toast";
 import { Alert, Badge, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { errText, FamilyOptions } from "../shared";
+import {
+  defaultStoreName,
+  ExistingModelsDialog,
+  existingStoreNames as findExistingNames,
+} from "./ExistingModelsDialog";
 
 export function HfCollectionSeed({
   families,
+  existingStoreNames,
   onSeeded,
 }: {
   families: ModelFamily[] | null;
+  existingStoreNames: string[];
   onSeeded: () => void;
 }) {
   const { toast } = useToast();
@@ -31,6 +38,12 @@ export function HfCollectionSeed({
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [triggers, setTriggers] = useState<{ repo: string; trigger: TriggerResponse }[]>([]);
+  const [confirmExisting, setConfirmExisting] = useState(false);
+  const selectedRepos = models.filter((model) => selected.has(model));
+  const conflicts = findExistingNames(
+    existingStoreNames,
+    selectedRepos.map(defaultStoreName),
+  );
 
   async function load() {
     setError(null);
@@ -62,12 +75,12 @@ export function HfCollectionSeed({
     });
   }
 
-  async function seedSelected() {
+  async function startSeedSelected() {
     setError(null);
     setSubmitting(true);
     const fired: { repo: string; trigger: TriggerResponse }[] = [];
     try {
-      for (const repo of models.filter((m) => selected.has(m))) {
+      for (const repo of selectedRepos) {
         const trigger = await seedHf({
           repo,
           quant: quant || null,
@@ -91,6 +104,14 @@ export function HfCollectionSeed({
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function seedSelected() {
+    if (conflicts.length > 0) {
+      setConfirmExisting(true);
+      return;
+    }
+    void startSeedSelected();
   }
 
   return (
@@ -157,7 +178,7 @@ export function HfCollectionSeed({
               type="button"
               loading={submitting}
               disabled={selected.size === 0}
-              onClick={() => void seedSelected()}
+              onClick={seedSelected}
             >
               <Plus className="h-4 w-4" />
               Seed {selected.size} model(s)
@@ -178,6 +199,15 @@ export function HfCollectionSeed({
           </details>
         ))}
       </div>
+      <ExistingModelsDialog
+        names={conflicts}
+        open={confirmExisting}
+        onClose={() => setConfirmExisting(false)}
+        onContinue={() => {
+          setConfirmExisting(false);
+          void startSeedSelected();
+        }}
+      />
     </Card>
   );
 }
