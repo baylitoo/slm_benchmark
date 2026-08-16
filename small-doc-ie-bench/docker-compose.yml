@@ -363,7 +363,20 @@ services:
       # below explicitly and make sure POSTGRES_PASSWORD is strong first.
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U docie -d docie"]
+      # `/docker-entrypoint-initdb.d` only runs while initializing an empty
+      # data directory. A restored/pre-existing volume (or a deployment host
+      # that cannot retain the repo-relative init.sql bind mount) can therefore
+      # have the main `docie` database but not Inngest's dedicated database.
+      # Repair that state before declaring Postgres healthy so `inngest` never
+      # starts against a database that does not exist. The check is idempotent:
+      # `createdb` only runs when the catalog lookup finds no `inngest` DB.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U docie -d docie &&
+          (psql -U docie -d postgres -tAc
+          "SELECT 1 FROM pg_database WHERE datname = 'inngest'" | grep -qx 1 ||
+          createdb -U docie inngest)
       interval: 10s
       timeout: 5s
       retries: 5
