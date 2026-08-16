@@ -64,8 +64,47 @@ cp .env.example .env
 #   INNGEST_EVENT_KEY=...
 #   INNGEST_SIGNING_KEY=...
 #   INNGEST_DEV=0
-make studio            # == docker compose up -d --build postgres redis inngest worker api web
+make studio            # full local-serving stack: api + serving + worker + web + dependencies
 ```
+
+### Selective deployment
+
+The Python image has a lightweight `api-runtime` target used by `api`, `worker`,
+and `bench`, plus two local-serving targets. `serving-runtime-prebuilt` (the
+default) copies the runtime from llama.cpp's official server-only image;
+`serving-runtime-source` performs the slower local clone and C++ compilation.
+Deploy only the segments you need with the `SEGMENTS` flag; Compose starts
+their infrastructure dependencies automatically:
+
+```bash
+make deploy SEGMENTS=api                    # direct API + required infrastructure
+make deploy SEGMENTS="api worker web"       # Studio backed by remote model profiles
+make deploy                                 # full local-serving Studio
+make deploy-down SEGMENTS="api worker web"
+```
+
+If local GGUF serving is needed but encoder/PII deployments are not, set
+`DOCIE_SERVING_EXTRAS=ocr` before building. The backward-compatible default is
+`ocr,encoders`; omitting `encoders` avoids installing CPU PyTorch and GLiNER in
+the serving image.
+
+To control llama-server acquisition:
+
+```bash
+# Fast default: no local llama.cpp compilation
+LLAMA_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server make deploy
+
+# Custom source build for a pinned commit/tag
+DOCIE_LLAMA_SERVER_TARGET=serving-runtime-source LLAMA_REF=<commit> make deploy
+```
+
+Pin `LLAMA_SERVER_IMAGE` to a tag or digest in production. The source target
+already invokes only CMake's `llama-server` target; use it when upstream's
+prebuilt CPU server does not contain a required architecture change.
+
+The root `.dockerignore` also excludes datasets, virtual environments, caches,
+model files, runs, and frontend artifacts from the Python build context. These
+remain available at runtime through the existing Compose volume mounts.
 
 Open **http://localhost:3000** for the Studio, **http://localhost:8288** for the
 Inngest dashboard (the worker shows under *Apps*).

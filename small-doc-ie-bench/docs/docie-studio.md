@@ -56,7 +56,7 @@ cp .env.example .env
 #   INNGEST_DEV=0
 # And point OPENAI_COMPAT_BASE_URL at an LLM reachable from the worker container.
 
-make studio            # == docker compose up -d --build postgres redis inngest worker api web
+make studio            # full local-serving stack: api + serving + worker + web + dependencies
 ```
 
 Then open:

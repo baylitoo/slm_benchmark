@@ -1,4 +1,10 @@
 # syntax=docker/dockerfile:1
+
+# Fast path: reuse llama.cpp's official CPU server-only image. Override with a
+# pinned tag/digest for reproducible builds. The image exposes llama-server and
+# its shared libraries under /app (the upstream server-image contract).
+ARG LLAMA_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server
+
 # Build a portable, statically-linked llama-server (CPU) once. This stage has no
 # dependency on the app source, so it caches across code changes and only
 # rebuilds if these lines change. GGML_NATIVE=OFF keeps the binary portable
@@ -43,7 +49,13 @@ RUN if [ -n "${LLAMA_REF}" ]; then \
       -DGGML_NATIVE=OFF \
  && cmake --build /src/build --target llama-server -j "${LLAMA_BUILD_JOBS}"
 
-FROM python:3.11-slim-bookworm
+FROM ${LLAMA_SERVER_IMAGE} AS llama-prebuilt
+
+# Upstream's official server image is Ubuntu 24.04 and currently requires
+# glibc >= 2.38. Debian Trixie supplies a compatible glibc while retaining the
+# project's Python 3.11 runtime; Bookworm's glibc 2.36 cannot load the prebuilt
+# server libraries.
+FROM python:3.11-slim-trixie AS app-runtime
 
 # NOTE: no PIP_NO_CACHE_DIR — the dependency layer below uses a BuildKit cache
 # mount for /root/.cache/pip, so wheels (torch is ~200MB even CPU-only) are
@@ -55,23 +67,21 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    build-essential \
     libmagic1 \
     poppler-utils \
     tesseract-ocr \
     tesseract-ocr-eng \
     tesseract-ocr-fra \
+    libssl3t64 \
+    libstdc++6 \
     libgomp1 \
   && rm -rf /var/lib/apt/lists/*
 
-# llama-server for the local "deploy" path (serve_store_model). Used by the
-# worker; harmless in the api image.
-COPY --from=llama-builder /src/build/bin/llama-server /usr/local/bin/llama-server
-
 # PIP_EXTRAS lets one service opt into heavier optional groups without
-# bloating every image built from this file: the `serving` service passes
-# "ocr,encoders" (torch + gliner for encoder deployments), everything else
-# keeps the light default.
+# bloating every image built from this file. The `serving` service defaults to
+# "ocr,encoders" (torch + GLiNER for encoder deployments), but deployments can
+# set DOCIE_SERVING_EXTRAS=ocr to omit that heavy feature; other services keep
+# the light default.
 ARG PIP_EXTRAS=ocr
 
 # ── Dependency layer ─────────────────────────────────────────────────────────
@@ -103,3 +113,23 @@ RUN pip install --no-deps -e .
 COPY configs ./configs
 
 EXPOSE 8080
+
+# Lightweight target for API, workload-worker, and benchmark deployments.
+# Crucially, this target does not depend on llama-builder, so BuildKit skips the
+# llama.cpp clone/compile entirely when a deployment does not include the local
+# model-serving segment.
+FROM app-runtime AS api-runtime
+
+# Custom-build path: compile the requested LLAMA_REF locally. This remains
+# available for architecture patches or build flags not present upstream.
+FROM app-runtime AS serving-runtime-source
+COPY --from=llama-builder /src/build/bin/llama-server /usr/local/bin/llama-server
+
+# Default serving path: copy the official server-only runtime instead of
+# cloning and compiling llama.cpp. The shared libraries live beside the small
+# launcher, matching the upstream image layout.
+FROM app-runtime AS serving-runtime-prebuilt
+COPY --from=llama-prebuilt /app /opt/llama.cpp
+ENV LD_LIBRARY_PATH=/opt/llama.cpp
+RUN ln -s /opt/llama.cpp/llama-server /usr/local/bin/llama-server \
+ && llama-server --version
