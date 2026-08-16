@@ -26,6 +26,7 @@ import { Table, type Column } from "./patterns/Table";
 import { Toolbar } from "./patterns/Toolbar";
 import { ResultLine } from "./patterns/ResultLine";
 import { errText, FamilyOptions } from "./deploy/shared";
+import { defaultStoreName } from "./deploy/seed/ExistingModelsDialog";
 
 // ---------------------------------------------------------------------------
 // Support tier — verdict + resolved family → a display badge. Mirrors the
@@ -199,9 +200,11 @@ const DEBOUNCE_MS = 350;
 
 export function Catalog({
   families,
+  existingStoreNames,
   onSeeded,
 }: {
   families: ModelFamily[] | null;
+  existingStoreNames: string[];
   onSeeded?: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -499,6 +502,7 @@ export function Catalog({
         <SeedDialog
           card={seedCard}
           families={families}
+          alreadyExists={existingStoreNames.includes(defaultStoreName(seedCard.id))}
           onClose={() => setSeedCard(null)}
           onSeeded={onSeeded}
         />
@@ -516,11 +520,13 @@ export function Catalog({
 function SeedDialog({
   card,
   families,
+  alreadyExists,
   onClose,
   onSeeded,
 }: {
   card: CatalogCard;
   families: ModelFamily[] | null;
+  alreadyExists: boolean;
   onClose: () => void;
   onSeeded?: () => void;
 }) {
@@ -543,7 +549,7 @@ function SeedDialog({
         family,
       });
       toast({
-        title: "Download started",
+        title: alreadyExists ? "Using existing model" : "Download started",
         description: `${card.id} — continues in the background (appears under Models when done).`,
         tone: "success",
       });
@@ -573,7 +579,7 @@ function SeedDialog({
           </Button>
           <Button size="sm" loading={busy} disabled={!family} onClick={() => void submit()}>
             <Rocket className="h-3.5 w-3.5" />
-            Download &amp; seed
+            {alreadyExists ? "Use existing model" : "Download & seed"}
           </Button>
         </>
       }
@@ -590,6 +596,13 @@ function SeedDialog({
       {card.runtime_note && (
         <Alert tone="warn" className="mb-3">
           {card.runtime_note}
+        </Alert>
+      )}
+
+      {alreadyExists && (
+        <Alert tone="warn" className="mb-3">
+          <strong>{defaultStoreName(card.id)}</strong> is already in the model store. Continuing
+          will reuse it; no files will be downloaded or replaced.
         </Alert>
       )}
 

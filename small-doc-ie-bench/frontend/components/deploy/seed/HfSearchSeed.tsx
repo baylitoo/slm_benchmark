@@ -27,6 +27,10 @@ import {
 } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
 import { errText, FamilyOptions } from "../shared";
+import {
+  ExistingModelsDialog,
+  existingStoreNames as findExistingNames,
+} from "./ExistingModelsDialog";
 
 // Browse-and-deploy: search the Hub, and for a picked repo show a pre-flight
 // SUPPORT VERDICT (architecture → family, read without downloading) that drives
@@ -54,9 +58,11 @@ function readinessLabel(readiness: HfInspect["readiness"]): string {
 
 export function HfSearchSeed({
   families,
+  existingStoreNames,
   onSeeded,
 }: {
   families: ModelFamily[] | null;
+  existingStoreNames: string[];
   onSeeded: () => void;
 }) {
   const { toast } = useToast();
@@ -79,6 +85,8 @@ export function HfSearchSeed({
   // ongoing download is never silently dropped from view.
   const [seedActive, setSeedActive] = useState(false);
   const [seedingRepo, setSeedingRepo] = useState<string | null>(null);
+  const [confirmExisting, setConfirmExisting] = useState(false);
+  const conflicts = findExistingNames(existingStoreNames, [name]);
 
   const artifact = useMemo(() => {
     const options = inspect?.artifact_options ?? [];
@@ -161,7 +169,7 @@ export function HfSearchSeed({
     }
   }
 
-  async function onSeed() {
+  async function startSeed() {
     if (!selected || !family) return;
     setSubmitting(true);
     try {
@@ -173,15 +181,27 @@ export function HfSearchSeed({
         family,
       });
       setTrigger(res);
-      setSeedActive(true);
+      setSeedActive(conflicts.length === 0);
       setSeedingRepo(selected);
-      toast({ title: "Download started", description: selected, tone: "success" });
+      toast({
+        title: conflicts.length > 0 ? "Using existing model" : "Download started",
+        description: selected,
+        tone: "success",
+      });
       onSeeded();
     } catch (err) {
       toast({ title: "Seed failed", description: errText(err, "Seed failed."), tone: "error" });
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function onSeed() {
+    if (conflicts.length > 0) {
+      setConfirmExisting(true);
+      return;
+    }
+    void startSeed();
   }
 
   const unsupported = inspect?.verdict === "unsupported";
@@ -414,7 +434,7 @@ export function HfSearchSeed({
                       type="button"
                       loading={submitting}
                       disabled={!family || hardBlocked}
-                      onClick={() => void onSeed()}
+                      onClick={onSeed}
                     >
                       <Rocket className="h-4 w-4" />
                       Download &amp; seed
@@ -447,6 +467,15 @@ export function HfSearchSeed({
           </div>
         </div>
       )}
+      <ExistingModelsDialog
+        names={conflicts}
+        open={confirmExisting}
+        onClose={() => setConfirmExisting(false)}
+        onContinue={() => {
+          setConfirmExisting(false);
+          void startSeed();
+        }}
+      />
     </Card>
   );
 }
