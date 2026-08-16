@@ -116,33 +116,36 @@ async def hf_repo_ggufs(repo: Annotated[str, Query(min_length=3)]) -> dict[str, 
 
 
 def _node_available_bytes() -> int | None:
-    """Deploy budget for a NEW model on this node: ``free - safety_margin``.
+    """Deploy budget for a new model after margin and in-flight reservations.
 
-    The exact quantity the reconciler's fit-check withholds a restart against
-    ("free minus the safety margin leaves N available"), so a catalog "fits this
-    node" badge can't disagree with what actually gets denied at deploy. Best-
-    effort + DB-optional: any gap (no snapshot, DB down) returns None → the badge
-    reads "unknown", never a false "fits". The projector/loading refinements are
-    a live-state concern the per-repo inspect + deploy path handle; this is a
-    browse-time signal against a coarse size estimate."""
+    Uses the same sizing engine as the deployment fit gate, including RAM still
+    owed to models that are loading. A missing, stale, or unreachable snapshot
+    returns None, so preflight says "unknown" rather than manufacturing a fit.
+    """
+    from docie_bench.inngest.serving_api import _gate_snapshot_staleness
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
-    from docie_bench.serving.sizing import safety_margin_bytes
+    from docie_bench.serving.resources import FootprintStore
+    from docie_bench.serving.sizing import compute_sizing
     from docie_bench.settings import get_settings
 
     try:
-        snapshot = ModelCatalog().get_node_snapshot()
+        catalog = ModelCatalog()
+        snapshot, _detail = _gate_snapshot_staleness(catalog.get_node_snapshot())
+        if snapshot is None:
+            return None
+        report = compute_sizing(
+            catalog.list(),
+            snapshot,
+            catalog.list_placements(),
+            footprints=FootprintStore(),
+            margin_fraction=get_settings().serving_sizing_margin_fraction,
+        )
     except CatalogUnavailableError:
         return None
     except Exception:  # noqa: BLE001 - a DB hiccup must not fail the search
         return None
-    if not snapshot:
-        return None
-    free = snapshot.get("free_bytes")
-    total = snapshot.get("total_bytes")
-    if not isinstance(free, int) or not isinstance(total, int):
-        return None
-    margin = safety_margin_bytes(total, get_settings().serving_sizing_margin_fraction)
-    return max(free - margin, 0)
+    available = report.free_effective_bytes
+    return max(available, 0) if available is not None else None
 
 
 @router.get("/hf/search")
@@ -183,7 +186,10 @@ async def hf_search(
 
 
 @router.get("/hf/inspect")
-async def hf_inspect(repo: Annotated[str, Query(min_length=3)]) -> dict[str, Any]:
+async def hf_inspect(
+    repo: Annotated[str, Query(min_length=3)],
+    context_length: Annotated[int, Query(ge=128, le=1_048_576)] = DEFAULT_DEPLOY_CONTEXT_LENGTH,
+) -> dict[str, Any]:
     """Pre-flight support verdict for a repo — detects the architecture from the
     Hub's metadata (no download) and resolves it to a family + verdict
     (supported / needs_family / unsupported). Backs a Deploy button that
@@ -192,7 +198,12 @@ async def hf_inspect(repo: Annotated[str, Query(min_length=3)]) -> dict[str, Any
 
     try:
         async with httpx.AsyncClient() as client:
-            return await inspect_repo(repo, client=client)
+            return await inspect_repo(
+                repo,
+                client=client,
+                context_length=context_length,
+                node_available_bytes=_node_available_bytes(),
+            )
     except HfHubError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

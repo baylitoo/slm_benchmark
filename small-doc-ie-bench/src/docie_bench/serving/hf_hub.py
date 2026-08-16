@@ -33,6 +33,8 @@ from typing import Any
 
 import httpx
 
+from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
 HF_BASE = "https://huggingface.co"
 
 # Preferred default quants when the caller doesn't specify one: a pragmatic
@@ -190,6 +192,141 @@ def pick_mmproj(files: list[HfGgufFile]) -> HfGgufFile | None:
     return sorted(mmprojs, key=lambda f: f.size_bytes or 0, reverse=True)[0]
 
 
+def _known_total(files: list[HfGgufFile]) -> int | None:
+    """Exact total when every required file has a Hub size."""
+    if not files or any(file.size_bytes is None for file in files):
+        return None
+    return sum(file.size_bytes or 0 for file in files)
+
+
+def _human_size(size_bytes: int) -> str:
+    value = float(max(size_bytes, 0))
+    for unit in ("bytes", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "bytes" else f"{int(value)} bytes"
+        value /= 1024
+    return f"{size_bytes} bytes"
+
+
+def _required_file(file: HfGgufFile, role: str) -> dict[str, Any]:
+    return {"filename": file.filename, "role": role, "size_bytes": file.size_bytes}
+
+
+def _runtime_for_family(family: str | None, *, has_gguf: bool) -> str | None:
+    """Resolve the concrete local runtime implied by a family verdict."""
+    if family is None:
+        return "llama.cpp" if has_gguf else None
+    from docie_bench.serving.model_store import FAMILIES
+
+    contract = FAMILIES.get(family)
+    if contract is None:
+        return "llama.cpp" if has_gguf else None
+    if contract.analyzer:
+        return "encoder"
+    if contract.transformers_runtime:
+        return "transformers"
+    return "llama.cpp"
+
+
+def _artifact_option(
+    *,
+    kind: str,
+    label: str,
+    quant: str | None,
+    files: list[tuple[HfGgufFile, str]],
+    context_length: int,
+    recommended: bool,
+) -> dict[str, Any]:
+    """One selectable artifact plan with exact download and RAM estimates."""
+    from docie_bench.serving.resources import predict_footprint_bytes
+
+    required = [file for file, _role in files]
+    download_size = _known_total(required)
+    model = next((file for file, role in files if role in {"model", "weights"}), None)
+    projector = next((file for file, role in files if role == "vision_projector"), None)
+    # A snapshot can contain several weight shards; price the complete required
+    # snapshot rather than only its first safetensors file.
+    model_size = (
+        download_size
+        if kind == "snapshot"
+        else (model.size_bytes if model is not None else download_size)
+    )
+    mmproj_size = projector.size_bytes if projector is not None else 0
+    estimate = None
+    if model_size is not None and (projector is None or mmproj_size is not None):
+        estimate = predict_footprint_bytes(
+            model_size,
+            context_length=context_length,
+            mmproj_bytes=mmproj_size or 0,
+        )
+    return {
+        "kind": kind,
+        "label": label,
+        "quant": quant,
+        "filename": model.filename if model is not None else None,
+        "required_files": [_required_file(file, role) for file, role in files],
+        "download_size_bytes": download_size,
+        "estimated_ram_bytes": estimate,
+        "recommended": recommended,
+    }
+
+
+def _artifact_options(
+    *,
+    ggufs: list[HfGgufFile],
+    snapshot_files: list[HfGgufFile],
+    include_mmproj: bool,
+    context_length: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Build selectable artifact plans and return the recommended quant."""
+    if ggufs:
+        candidates = [file for file in ggufs if not file.is_mmproj and not file.is_multipart]
+        try:
+            preferred = pick_gguf(ggufs, None)
+        except HfHubError:
+            preferred = None
+        projector = pick_mmproj(ggufs) if include_mmproj else None
+        options: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            # Seed requests select by quant, and pick_gguf chooses the first
+            # matching file. Mirror that here so the estimate describes the
+            # artifact that will actually be downloaded.
+            key = candidate.quant or candidate.filename
+            if key in seen:
+                continue
+            seen.add(key)
+            files = [(candidate, "model")]
+            if projector is not None:
+                files.append((projector, "vision_projector"))
+            options.append(
+                _artifact_option(
+                    kind="gguf",
+                    label=candidate.quant or candidate.filename,
+                    quant=candidate.quant,
+                    files=files,
+                    context_length=context_length,
+                    recommended=candidate == preferred,
+                )
+            )
+        return options, preferred.quant if preferred is not None else None
+
+    if snapshot_files:
+        option = _artifact_option(
+            kind="snapshot",
+            label="safetensors snapshot",
+            quant=None,
+            files=[
+                (file, "weights" if file.filename.endswith(".safetensors") else "support")
+                for file in snapshot_files
+            ],
+            context_length=context_length,
+            recommended=True,
+        )
+        return [option], None
+    return [], None
+
+
 async def download_file(
     repo: str,
     filename: str,
@@ -324,6 +461,26 @@ def _is_snapshot_file(filename: str) -> bool:
     return suffix not in _SNAPSHOT_SKIP_SUFFIXES
 
 
+def _snapshot_files_from_siblings(siblings: list[dict[str, Any]]) -> list[HfGgufFile]:
+    """Snapshot files from an already-fetched model-info response."""
+    files: list[HfGgufFile] = []
+    for sibling in siblings:
+        filename = str(sibling.get("rfilename") or "")
+        if not filename or not _is_snapshot_file(filename):
+            continue
+        size = sibling.get("size")
+        files.append(
+            HfGgufFile(
+                filename=filename,
+                size_bytes=int(size) if isinstance(size, (int, float)) else None,
+                quant=None,
+                is_mmproj=False,
+                is_multipart=False,
+            )
+        )
+    return files
+
+
 async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[HfGgufFile]:
     """The repo's safetensors-checkpoint files (weights + config + tokenizer).
 
@@ -348,26 +505,11 @@ async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[H
     if response.status_code >= 400:
         raise HfHubError(f"Hub returned HTTP {response.status_code} for {repo!r}")
     payload = response.json()
-    files: list[HfGgufFile] = []
-    has_safetensors = False
-    for sibling in payload.get("siblings", []):
-        if not isinstance(sibling, dict):
-            continue
-        filename = str(sibling.get("rfilename") or "")
-        if not filename or not _is_snapshot_file(filename):
-            continue
-        if filename.lower().endswith(".safetensors"):
-            has_safetensors = True
-        size = sibling.get("size")
-        files.append(
-            HfGgufFile(
-                filename=filename,
-                size_bytes=int(size) if isinstance(size, (int, float)) else None,
-                quant=None,
-                is_mmproj=False,
-                is_multipart=False,
-            )
-        )
+    siblings = [s for s in payload.get("siblings", []) if isinstance(s, dict)]
+    files = _snapshot_files_from_siblings(siblings)
+    has_safetensors = any(
+        file.filename.lower().endswith(".safetensors") for file in files
+    )
     if not has_safetensors:
         raise HfHubError(
             f"repo {repo!r} ships no safetensors weights — not an encoder checkpoint"
@@ -594,7 +736,13 @@ def _size_est_bytes(params: int | None, *, has_gguf: bool) -> int | None:
     return int(params * (0.6 if has_gguf else 2.0))
 
 
-async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
+async def inspect_repo(
+    repo: str,
+    *,
+    client: httpx.AsyncClient,
+    context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
+    node_available_bytes: int | None = None,
+) -> dict[str, Any]:
     """Pre-flight support detection for a repo — WITHOUT downloading weights.
 
     Reads the architecture from the Hub's parsed metadata (the ``gguf`` block
@@ -603,9 +751,10 @@ async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any
     detects modality signals (GGUF / safetensors / mmproj), and resolves them to
     a family + a verdict via :mod:`docie_bench.serving.arch_registry`.
 
-    Returns a dict the Studio renders into a Deploy button state:
-    ``{repo, architecture, verdict, family, reason, has_gguf, has_safetensors,
-    has_mmproj, quants, suggested_name}``.
+    In addition to the architecture verdict, the response is an actionable
+    deployment preflight: concrete runtime, required files, recommended quant,
+    exact known download size, predicted RAM at ``context_length``, live-node
+    fit, blockers, warnings, and operator recommendations.
     """
     from docie_bench.serving.arch_registry import resolve_family
 
@@ -656,11 +805,117 @@ async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any
         has_mmproj=has_mmproj,
         repo_id=repo,
     )
+    snapshot_files = _snapshot_files_from_siblings(siblings) if not has_gguf else []
+    from docie_bench.serving.model_store import FAMILIES
+
+    contract = FAMILIES.get(result.family or "")
+    options, recommended_quant = _artifact_options(
+        ggufs=ggufs,
+        snapshot_files=snapshot_files,
+        include_mmproj=bool(contract and contract.needs_mmproj),
+        context_length=context_length,
+    )
+    for option in options:
+        estimate = option["estimated_ram_bytes"]
+        option["node_available_bytes"] = node_available_bytes
+        option["fits_node"] = (
+            estimate <= node_available_bytes
+            if isinstance(estimate, int) and isinstance(node_available_bytes, int)
+            else None
+        )
+    selected = next((option for option in options if option["recommended"]), None)
+    if selected is None and options:
+        selected = options[0]
+
+    blockers: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    recommendations: list[str] = []
+    if result.verdict == "unsupported":
+        blockers.append({"code": "unsupported", "message": result.reason})
+    elif result.verdict == "needs_family":
+        blockers.append({"code": "family_required", "message": result.reason})
+    if not options:
+        multipart = any(file.is_multipart and not file.is_mmproj for file in ggufs)
+        message = (
+            "Only multipart GGUF artifacts are available; this store currently requires "
+            "a single-file GGUF."
+            if multipart
+            else "No downloadable serving artifact could be selected from this repository."
+        )
+        blockers.append({"code": "no_servable_artifact", "message": message})
+    if selected is not None:
+        if selected["estimated_ram_bytes"] is None:
+            warnings.append(
+                {
+                    "code": "ram_unknown",
+                    "message": (
+                        "One or more required file sizes are unavailable, so RAM "
+                        "cannot be estimated."
+                    ),
+                }
+            )
+        elif node_available_bytes is None:
+            warnings.append(
+                {
+                    "code": "capacity_unknown",
+                    "message": (
+                        "No live serving-node capacity snapshot is available; fit is unknown."
+                    ),
+                }
+            )
+        elif selected["fits_node"] is False:
+            deficit = selected["estimated_ram_bytes"] - node_available_bytes
+            blockers.append(
+                {
+                    "code": "insufficient_memory",
+                    "message": (
+                        f"The recommended artifact needs about {_human_size(deficit)} more than "
+                        "the current deployable RAM budget."
+                    ),
+                }
+            )
+    if result.runtime_note:
+        warnings.append({"code": "runtime_caveat", "message": result.runtime_note})
+    runtime = _runtime_for_family(result.family, has_gguf=has_gguf)
+    if runtime == "transformers":
+        recommendations.append(
+            "Prefer a GGUF conversion of this model when available; it generally "
+            "uses much less RAM on CPU."
+        )
+    if needs_trust_remote_code:
+        blockers.append(
+            {
+                "code": "remote_code_approval_required",
+                "message": (
+                    "This checkpoint requires executing repository Python code on the serving node."
+                ),
+            }
+        )
+        recommendations.append(
+            "Review the repository code, then explicitly select "
+            "transformers_trust_remote_code only if it is trusted."
+        )
+    if recommended_quant:
+        recommendations.append(
+            f"{recommended_quant} is the preferred available CPU quantization for the "
+            "initial deployment."
+        )
+    fitting_alternatives = [
+        option for option in options if option is not selected and option.get("fits_node") is True
+    ]
+    if selected is not None and selected.get("fits_node") is False and fitting_alternatives:
+        labels = ", ".join(str(option["label"]) for option in fitting_alternatives[:3])
+        recommendations.append(f"Choose a smaller artifact that fits this node: {labels}.")
+
+    readiness = "blocked" if blockers else "caution" if warnings else "ready"
     return {
         "repo": repo,
+        "revision": payload.get("sha"),
         "architecture": architecture,
         "verdict": result.verdict,
+        "readiness": readiness,
         "family": result.family,
+        "runtime": runtime,
         "reason": result.reason,
         "runtime_note": result.runtime_note,
         "has_gguf": has_gguf,
@@ -673,6 +928,21 @@ async def inspect_repo(repo: str, *, client: httpx.AsyncClient) -> dict[str, Any
         "quants": sorted(
             {g.quant for g in ggufs if g.quant and not g.is_mmproj and not g.is_multipart}
         ),
+        "recommended_quant": recommended_quant,
+        "context_length": context_length,
+        "node_available_bytes": node_available_bytes,
+        "fits_node": selected.get("fits_node") if selected is not None else None,
+        "download_size_bytes": (
+            selected.get("download_size_bytes") if selected is not None else None
+        ),
+        "estimated_ram_bytes": (
+            selected.get("estimated_ram_bytes") if selected is not None else None
+        ),
+        "required_files": selected.get("required_files", []) if selected is not None else [],
+        "artifact_options": options,
+        "blockers": blockers,
+        "warnings": warnings,
+        "recommendations": recommendations,
         "suggested_name": default_store_name(repo),
     }
 

@@ -143,11 +143,12 @@ Storage/lifecycle-wise, a transformers model is a **safetensors snapshot** in th
 store — the same directory-entry path the encoders already use — so seed,
 deploy, sizing and the fit gate all treat it like any other store model.
 
-## Where this is going: pre-flight support detection
+## Pre-flight support detection
 
-Today onboarding is try-and-see. The target is **HuggingFace-like browsing with a
-Deploy button that already knows whether we support the model** — determined
-from the repo's files, before any download.
+Studio provides **HuggingFace-like browsing with a deploy decision that already
+knows whether we support the model**. `GET /v1/studio/hf/inspect?repo=…` reads
+Hub metadata without downloading weights and returns both the architecture
+verdict and an actionable deployment plan.
 
 ### What we can read WITHOUT downloading the model
 
@@ -182,17 +183,24 @@ and is machine-readable.
 
 ### The support verdict + Deploy UX
 
-A pre-flight `inspect` (e.g. `GET /v1/serving/hf/inspect?repo=…`) returns:
+A pre-flight inspect returns:
 
 - the detected architecture + modality (vision? embedding? encoder?),
 - the matched family (or "no family — needs onboarding"),
+- the concrete runtime (`llama.cpp`, `transformers`, or `encoder`),
 - a verdict: **supported** (deploy now), **needs-family** (arch known to
   llama.cpp but no contract yet — a small PR), **unsupported** (runtime can't
   serve it),
-- the practical checks (quant available, mmproj present, single-file).
+- the preferred quant plus every selectable single-file artifact,
+- the exact known download set, including a required vision projector or all
+  safetensors snapshot files,
+- predicted RAM at the requested deployment context (8192 by default),
+- fit against the serving node's live deployable budget,
+- structured blockers, warnings, and recommendations.
 
-The Studio then browses HF search results and renders a **Deploy** button whose
-state comes from that verdict — green "Deploy" for supported, "Needs a family"
-with the reason otherwise. Onboarding stops being try-and-see: the platform
-tells you up front what it can serve, and adding support is an explicit,
-reviewed family addition rather than a surprise at load time.
+Each quant carries its own download, memory, and fit estimate. If the preferred
+quant does not fit but a smaller one does, selecting it immediately clears the
+memory blocker. Multipart-only repos, missing projectors, unknown families, and
+unsupported repositories are stopped before a multi-gigabyte download begins.
+Capacity stays explicitly unknown when the serving reconciler has not published
+a node snapshot; preflight never turns a missing measurement into a false fit.

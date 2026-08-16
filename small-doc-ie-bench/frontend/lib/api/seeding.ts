@@ -113,10 +113,14 @@ export interface HfSearchCard {
 /** Pre-flight support verdict for a repo (GET /v1/studio/hf/inspect). */
 export interface HfInspect {
   repo: string;
+  revision?: string | null;
   architecture?: string | null;
   /** "supported" | "needs_family" | "unsupported". */
   verdict: string;
+  /** Deploy-time outcome after artifacts, RAM, and node capacity are considered. */
+  readiness?: "ready" | "caution" | "blocked";
   family?: string | null;
+  runtime?: "llama.cpp" | "transformers" | "encoder" | null;
   reason?: string;
   /** A runtime-support caveat (e.g. "needs a recent llama-server"), if any. */
   runtime_note?: string | null;
@@ -127,7 +131,42 @@ export interface HfInspect {
    * node (config auto_map) — deploy via the transformers_trust_remote_code family. */
   needs_trust_remote_code?: boolean;
   quants?: string[];
+  recommended_quant?: string | null;
+  context_length?: number;
+  node_available_bytes?: number | null;
+  fits_node?: boolean | null;
+  download_size_bytes?: number | null;
+  estimated_ram_bytes?: number | null;
+  required_files?: HfPreflightFile[];
+  artifact_options?: HfArtifactOption[];
+  blockers?: HfPreflightMessage[];
+  warnings?: HfPreflightMessage[];
+  recommendations?: string[];
   suggested_name?: string;
+}
+
+export interface HfPreflightFile {
+  filename: string;
+  role: "model" | "vision_projector" | "weights" | "support";
+  size_bytes?: number | null;
+}
+
+export interface HfPreflightMessage {
+  code: string;
+  message: string;
+}
+
+export interface HfArtifactOption {
+  kind: "gguf" | "snapshot";
+  label: string;
+  quant?: string | null;
+  filename?: string | null;
+  required_files: HfPreflightFile[];
+  download_size_bytes?: number | null;
+  estimated_ram_bytes?: number | null;
+  node_available_bytes?: number | null;
+  fits_node?: boolean | null;
+  recommended: boolean;
 }
 
 /** Search the Hub for deployable models (server-side proxy). */
@@ -212,8 +251,10 @@ export function searchCatalog(params: CatalogSearchParams = {}): Promise<Catalog
 }
 
 /** Pre-flight support verdict + suggested family for a repo (no download). */
-export function inspectHf(repo: string): Promise<HfInspect> {
-  return request<HfInspect>(`/v1/studio/hf/inspect?repo=${encodeURIComponent(repo)}`);
+export function inspectHf(repo: string, contextLength?: number): Promise<HfInspect> {
+  const q = new URLSearchParams({ repo });
+  if (contextLength != null) q.set("context_length", String(contextLength));
+  return request<HfInspect>(`/v1/studio/hf/inspect?${q.toString()}`);
 }
 
 /** Live GGUF/quant listing of a Hub repo (server-side proxy, HF_TOKEN aware). */

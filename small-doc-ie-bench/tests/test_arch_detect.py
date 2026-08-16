@@ -201,6 +201,82 @@ async def test_inspect_gguf_arch_from_gguf_block() -> None:
     assert result["family"] == "vision_ocr"
     assert result["has_mmproj"] is True
     assert result["quants"] == ["Q4_K_M"]
+    assert result["runtime"] == "llama.cpp"
+    assert result["recommended_quant"] == "Q4_K_M"
+    assert result["download_size_bytes"] == 2_800_000_000
+    assert result["estimated_ram_bytes"] == 3_873_741_824
+    assert [file["role"] for file in result["required_files"]] == [
+        "model",
+        "vision_projector",
+    ]
+
+
+async def test_inspect_quant_options_have_exact_fit_estimates() -> None:
+    payload = {
+        "gguf": {"architecture": "qwen2"},
+        "siblings": [
+            {"rfilename": "model-Q4_K_M.gguf", "size": 2_000_000_000},
+            {"rfilename": "model-Q4_K_S.gguf", "size": 500_000_000},
+            {"rfilename": "model-F16.gguf", "size": 4_000_000_000},
+        ],
+    }
+    async with httpx.AsyncClient(transport=_transport(payload)) as client:
+        result = await inspect_repo(
+            "owner/model-GGUF",
+            client=client,
+            node_available_bytes=1_800_000_000,
+        )
+
+    assert result["recommended_quant"] == "Q4_K_M"
+    assert result["fits_node"] is False
+    assert result["readiness"] == "blocked"
+    assert "insufficient_memory" in {item["code"] for item in result["blockers"]}
+    by_quant = {option["quant"]: option for option in result["artifact_options"]}
+    assert by_quant["Q4_K_M"]["fits_node"] is False
+    assert by_quant["Q4_K_S"]["fits_node"] is True
+    assert any("Q4_K_S" in text for text in result["recommendations"])
+
+
+async def test_inspect_snapshot_prices_all_required_files() -> None:
+    payload = {
+        "siblings": [
+            {"rfilename": "model-00001-of-00002.safetensors", "size": 900_000_000},
+            {"rfilename": "model-00002-of-00002.safetensors", "size": 800_000_000},
+            {"rfilename": "config.json", "size": 2_000},
+            {"rfilename": "tokenizer.json", "size": 30_000},
+            {"rfilename": "model.onnx", "size": 2_000_000_000},
+        ],
+    }
+    config = {"model_type": "some-new-lm"}
+    async with httpx.AsyncClient(transport=_transport(payload, config=config)) as client:
+        result = await inspect_repo(
+            "owner/new-lm",
+            client=client,
+            node_available_bytes=4_000_000_000,
+        )
+
+    assert result["runtime"] == "transformers"
+    assert result["download_size_bytes"] == 1_700_032_000
+    assert result["estimated_ram_bytes"] == 2_773_773_824
+    assert result["fits_node"] is True
+    assert result["readiness"] == "caution"  # last-resort runtime caveat
+    assert "model.onnx" not in {file["filename"] for file in result["required_files"]}
+
+
+async def test_inspect_multipart_only_repo_is_blocked_before_download() -> None:
+    payload = {
+        "gguf": {"architecture": "qwen2"},
+        "siblings": [
+            {"rfilename": "model-Q4_K_M-00001-of-00002.gguf", "size": 1_000_000_000},
+            {"rfilename": "model-Q4_K_M-00002-of-00002.gguf", "size": 900_000_000},
+        ],
+    }
+    async with httpx.AsyncClient(transport=_transport(payload)) as client:
+        result = await inspect_repo("owner/multipart-GGUF", client=client)
+
+    assert result["readiness"] == "blocked"
+    assert result["artifact_options"] == []
+    assert "no_servable_artifact" in {item["code"] for item in result["blockers"]}
 
 
 async def test_inspect_falls_back_to_config_json() -> None:
@@ -253,6 +329,8 @@ async def test_inspect_auto_map_flags_trust_remote_code() -> None:
         result = await inspect_repo("sahilchachra/Unlimited-OCR", client=client)
     assert result["family"] == "transformers"
     assert result["needs_trust_remote_code"] is True
+    assert result["readiness"] == "blocked"
+    assert "remote_code_approval_required" in {item["code"] for item in result["blockers"]}
 
 
 async def test_inspect_gguf_never_flags_trust() -> None:
@@ -287,8 +365,12 @@ async def test_search_models_returns_light_cards() -> None:
         return httpx.Response(
             200,
             json=[
-                {"id": "LiquidAI/LFM2.5-350M-GGUF", "downloads": 42000, "likes": 85,
-                 "tags": ["gguf", "text-generation"]},
+                {
+                    "id": "LiquidAI/LFM2.5-350M-GGUF",
+                    "downloads": 42000,
+                    "likes": 85,
+                    "tags": ["gguf", "text-generation"],
+                },
                 {"modelId": "owner/via-modelId-GGUF", "downloads": 10},  # id fallback
                 {"nope": 1},  # dropped (no id)
             ],
@@ -385,9 +467,9 @@ def test_annotate_fits_marks_fit_over_budget_and_unknown() -> None:
     from docie_bench.inngest.studio_api import _annotate_fits
 
     cards = [
-        {"id": "a", "size_est_bytes": 1_000_000_000},   # fits
-        {"id": "b", "size_est_bytes": 9_000_000_000},   # over budget
-        {"id": "c", "size_est_bytes": None},            # unknown size
+        {"id": "a", "size_est_bytes": 1_000_000_000},  # fits
+        {"id": "b", "size_est_bytes": 9_000_000_000},  # over budget
+        {"id": "c", "size_est_bytes": None},  # unknown size
     ]
     out = _annotate_fits(cards, budget=3_000_000_000)
     fits = {c["id"]: c["fits_node"] for c in out}
@@ -401,3 +483,26 @@ def test_annotate_fits_unknown_budget_is_none() -> None:
     (card,) = _annotate_fits([{"id": "a", "size_est_bytes": 1_000_000_000}], budget=None)
     assert card["fits_node"] is None  # no snapshot -> never a false "fits"
     assert card["node_available_bytes"] is None
+
+
+async def test_hf_inspect_route_passes_context_and_live_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from docie_bench.inngest.studio_api import deploy
+    from docie_bench.serving import hf_hub
+
+    seen: dict[str, object] = {}
+
+    async def fake_inspect(repo: str, **kwargs: object) -> dict[str, object]:
+        seen.update({"repo": repo, **kwargs})
+        return {"repo": repo, "readiness": "ready"}
+
+    monkeypatch.setattr(deploy, "_node_available_bytes", lambda: 3_000_000_000)
+    monkeypatch.setattr(hf_hub, "inspect_repo", fake_inspect)
+
+    result = await deploy.hf_inspect("owner/model", context_length=16_384)
+
+    assert result["readiness"] == "ready"
+    assert seen["repo"] == "owner/model"
+    assert seen["context_length"] == 16_384
+    assert seen["node_available_bytes"] == 3_000_000_000
