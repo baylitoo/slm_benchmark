@@ -114,6 +114,35 @@ async def test_json_schema_empty_content_downgrades_to_json_object() -> None:
     assert client.last_response_format_style == "json_object"
 
 
+async def test_chat_json_applies_no_think_without_assistant_prefill() -> None:
+    import json
+
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.read().decode("utf-8")))
+        return _completion('{"document_type":"invoice"}')
+
+    client = await _client(
+        _profile(response_format_style="nuextract3_think"), handler
+    )
+    try:
+        await client.chat_json(
+            system_prompt="system",
+            user_prompt="user",
+            schema_name="invoice",
+            schema={"type": "object"},
+            chat_template_kwargs={"enable_thinking": False},
+        )
+    finally:
+        await client.aclose()
+
+    payload = sent[0]
+    assert "template" in payload["chat_template_kwargs"]
+    assert payload["chat_template_kwargs"]["enable_thinking"] is False
+    assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+
+
 def _grammar_error() -> httpx.Response:
     # Mirrors this project's Ollama: a hard HTTP 400 (not empty 200) when a
     # strong response_format style cannot be compiled into a sampler grammar.

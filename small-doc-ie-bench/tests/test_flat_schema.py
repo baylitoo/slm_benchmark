@@ -40,6 +40,15 @@ def test_flat_schema_forbids_extra_keys() -> None:
     assert flat_schema_json("invoice").get("additionalProperties") is False
 
 
+@pytest.mark.parametrize("name", ["invoice", "identity_card"])
+def test_flat_schema_requires_every_typed_root_field(name: str) -> None:
+    # Pydantic's optional defaults otherwise leave the root without a required
+    # list, allowing strict grammar decoding to stop immediately at `{}`. Every
+    # typed key must be emitted; absent scalar values remain valid as null.
+    schema = flat_schema_json(name)
+    assert schema["required"] == list(schema["properties"])
+
+
 def test_unknown_schema_raises() -> None:
     with pytest.raises(ValueError, match="Unknown schema_name"):
         flat_schema_json("not-a-schema")

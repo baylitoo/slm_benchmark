@@ -18,6 +18,8 @@ from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
 from docie_bench.llm.openai_client import OpenAICompatibleClient
 from docie_bench.llm.prompts import (
+    OCR_TRANSCRIPTION_SYSTEM_PROMPT,
+    OCR_TRANSCRIPTION_USER_PROMPT,
     SCHEMA_PROPOSER_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
@@ -33,12 +35,7 @@ from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 from docie_bench.schemas.extraction import schema_json
 from docie_bench.security import redact_fields
-
-# Shared verbatim with the gateway's own VLM-as-OCR step (serving.solutions.
-# PipelineSolution._vlm_ocr) -- same prompt, same timeout floor, same model,
-# same task, whether the pipeline is exercised via Studio or the benchmark
-# CLI; duplicating either would risk the two silently drifting apart.
-from docie_bench.serving.solutions import _PIPELINE_UPSTREAM_TIMEOUT_S, _VLM_OCR_PROMPT
+from docie_bench.serving.solutions import _PIPELINE_UPSTREAM_TIMEOUT_S
 from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
 
@@ -231,6 +228,7 @@ class ExtractionService:
         profile: ModelProfile,
         proposer_profile: ModelProfile | None = None,
         profiles: Mapping[str, ModelProfile] | None = None,
+        disable_thinking: bool = False,
     ) -> None:
         self.profile = profile
         self.proposer_profile = proposer_profile
@@ -239,6 +237,7 @@ class ExtractionService:
         # already loads the full profile map for routing, so this just
         # threads it through instead of loading it again.
         self.profiles = profiles or {}
+        self.disable_thinking = disable_thinking
 
     async def extract_from_text(
         self,
@@ -459,7 +458,10 @@ class ExtractionService:
         )
 
         extractor_service = ExtractionService(
-            extractor, proposer_profile=self.proposer_profile, profiles=self.profiles
+            extractor,
+            proposer_profile=self.proposer_profile,
+            profiles=self.profiles,
+            disable_thinking=self.disable_thinking or bool(options.get("no_think")),
         )
         response = await extractor_service.extract_from_text(
             text=None,
@@ -495,15 +497,22 @@ class ExtractionService:
         images = load_document_images(
             path, max_pages=vision.vision_max_pages, pdf_dpi=vision.vision_pdf_dpi
         )
-        content: list[dict[str, Any]] = [{"type": "text", "text": _VLM_OCR_PROMPT}]
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": OCR_TRANSCRIPTION_USER_PROMPT}
+        ]
         content += [
             {"type": "image_url", "image_url": {"url": image.data_url()}} for image in images
         ]
         request = {
             "model": vision.model,
-            "messages": [{"role": "user", "content": content}],
+            "messages": [
+                {"role": "system", "content": OCR_TRANSCRIPTION_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
             "temperature": 0,
         }
+        if self.disable_thinking or bool(self.profile.options.get("no_think")):
+            request["chat_template_kwargs"] = {"enable_thinking": False}
         async with httpx.AsyncClient() as client:
             try:
                 resp = await client.post(
@@ -619,6 +628,9 @@ class ExtractionService:
                 schema_name=schema_name,
                 schema=schema,
                 image_urls=[image.data_url() for image in images] if images else None,
+                chat_template_kwargs=(
+                    {"enable_thinking": False} if self.disable_thinking else None
+                ),
             )
             effective_style = getattr(client, "last_response_format_style", None)
         finally:

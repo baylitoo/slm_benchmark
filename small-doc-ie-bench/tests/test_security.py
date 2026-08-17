@@ -239,3 +239,25 @@ def test_document_instructions_remain_inside_untrusted_prompt_boundaries() -> No
     assert "BEGIN UNTRUSTED OCR EVIDENCE" in proposer_prompt
     assert "<document>" in nuextract_prompt
     assert "</document>" in nuextract_prompt
+
+
+def test_document_pipeline_prompts_have_complete_contracts() -> None:
+    from docie_bench.llm.prompts import (
+        OCR_PIPELINE_SYSTEM_PROMPT,
+        OCR_TRANSCRIPTION_SYSTEM_PROMPT,
+        SYSTEM_PROMPT,
+        VISION_SYSTEM_PROMPT,
+    )
+
+    for prompt in (
+        OCR_TRANSCRIPTION_SYSTEM_PROMPT,
+        OCR_PIPELINE_SYSTEM_PROMPT,
+        SYSTEM_PROMPT,
+        VISION_SYSTEM_PROMPT,
+    ):
+        assert "Role:" in prompt
+        assert "Security:" in prompt
+        assert "Task:" in prompt
+        assert "Output contract:" in prompt
+    assert "Evidence:" in SYSTEM_PROMPT
+    assert "Evidence:" in VISION_SYSTEM_PROMPT

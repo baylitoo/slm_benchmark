@@ -9,7 +9,11 @@ deployment being unloaded and reloaded on another port.
 
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import httpx
@@ -22,6 +26,8 @@ from docie_bench.agents.guard import (
     moderation_flags,
 )
 from docie_bench.agents.spec import AgentSpec
+from docie_bench.extract.service import ExtractionService
+from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
@@ -29,10 +35,9 @@ from docie_bench.serving.profile_resolver import (
 )
 from docie_bench.serving.solutions import (
     SolutionError,
+    _extract_document,
     apply_no_think,
     build_solution,
-    prefill_json_object,
-    repair_prefilled_content,
 )
 
 PROXY_MODES = ("placeholder", "block", "detect")
@@ -89,14 +94,14 @@ def _resolve_ocr_mode(options: dict[str, Any]) -> str:
     return "ocr_extract" if options.get("extractor") else "ocr"
 
 
-def _resolve_flat_schema(schema_name: str) -> dict[str, Any]:
-    """Resolve either a built-in or saved dynamic schema to grammar JSON."""
-    from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
-    from docie_bench.schemas.extraction import flat_schema_json, flatten_schema_json
+def _resolve_extraction_schema(schema_name: str) -> tuple[str, dict[str, Any] | None]:
+    """Return ExtractionService's schema mode and optional saved specification."""
+    from docie_bench.schemas.extraction import schema_json
     from docie_bench.studio.dynamic_schemas import get_dynamic_schema
 
     try:
-        return flat_schema_json(schema_name)
+        schema_json(schema_name)
+        return "static", None
     except ValueError as exc:
         saved = get_dynamic_schema(schema_name)
         if saved is None:
@@ -105,167 +110,112 @@ def _resolve_flat_schema(schema_name: str) -> dict[str, Any]:
                 status_code=400,
                 error_type="invalid_request_error",
             ) from exc
-        spec = DynamicSchemaSpec.model_validate(saved["spec"])
-        model = DynamicTemplateBuilder.build_model(spec)
-        return flatten_schema_json(model.model_json_schema())
+        return "dynamic", saved["spec"]
 
 
-def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
-    """Constrain the completion to the named extraction schema via OpenAI
-    ``response_format`` (llama.cpp compiles it to a GBNF grammar). Shared by the
-    OCR→LLM (over OCR text) and vision (over the image) paths.
+def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
+    """Restore the Agent endpoint's flat value contract after shared validation.
 
-    Uses the FLATTENED schema (flat_schema_json): the raw schema's per-field
-    ``{value, evidence_ids, confidence}`` wrapper + a negative-lookahead regex on
-    the money/number fields make llama.cpp fail to compile the grammar. The flat
-    form (values only, no lookahead, additionalProperties:false) compiles, so the
-    strict grammar actually applies — a clean ``{field: value | null}`` with no
-    extra or duplicate keys, instead of falling back to shapeless json_object."""
-    json_schema = _resolve_flat_schema(schema_name)
-    body["response_format"] = {
-        "type": "json_schema",
-        "json_schema": {"name": schema_name, "schema": json_schema, "strict": True},
+    Playground keeps evidence/confidence wrappers for review and audit. Agent
+    consumers historically receive direct field values, so unwrap those fields
+    only at the final API boundary while retaining the richer internal result.
+    """
+    if isinstance(value, list):
+        return [_flatten_agent_result(item, root=False) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if "value" in value and set(value) <= {"value", "evidence_ids", "confidence"}:
+        return _flatten_agent_result(value.get("value"), root=False)
+    omitted = {"evidence_ids", "confidence"}
+    if root:
+        omitted.update({"document_type", "extraction_notes"})
+    return {
+        key: _flatten_agent_result(item, root=False)
+        for key, item in value.items()
+        if key not in omitted
     }
 
 
-def _schema_instruction(schema_name: str) -> str | None:
-    """Name the exact typed fields to populate and forbid the free-text dump.
-
-    The response_format grammar constrains the SHAPE but does not tell the model
-    to put each value in its OWN field — a small model otherwise routes the whole
-    document into a catch-all (observed: an entire invoice inside
-    ``extraction_notes``). Fields come from the FLATTENED schema, where the meta
-    ``document_type``/``extraction_notes`` are already omitted, so the prompt
-    names exactly what the grammar accepts. Also the fallback signal when the
-    grammar can't compile (json_object) — without it a vision model just echoes
-    the prompt (``{"OCR": true}``)."""
-    try:
-        properties = _resolve_flat_schema(schema_name).get("properties")
-    except AgentError:
-        return None
-    if not isinstance(properties, dict) or not properties:
-        return None
-    fields = ", ".join(properties)
-    return (
-        "Extract the document's data into a single JSON object. Populate each of "
-        f"these typed fields directly: {fields}. Put every value in its OWN field "
-        "(the total in the total field, the invoice number in the number field, "
-        "and so on); use null only when a field is genuinely absent. Do NOT "
-        "summarize the document or dump values into a notes/remarks field — the "
-        "output must validate against the strict schema. Output only the JSON "
-        "object: no prose, no markdown."
-    )
-
-
-def _is_empty_completion(completion: dict[str, Any]) -> bool:
-    """True when every choice's message content is empty/whitespace-only.
-
-    The small-Ollama-and-friends defect this whole ladder exists for: a
-    strong response_format style compiles fine server-side but the model
-    emits nothing. openai_client.chat_json's ladder already treats an empty
-    200 as downgradable; this mirrors that check for the agent forward path,
-    which previously only reacted to an explicit HTTP 400."""
-    choices = completion.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return True
-    for choice in choices:
-        message = choice.get("message") if isinstance(choice, dict) else None
-        content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, str) and content.strip():
-            return False
-        if isinstance(content, list) and content:
-            return False
-    return True
-
-
-async def _post_chat_with_schema(
-    upstream: ModelProfile,
-    body: dict[str, Any],
-    schema_name: str | None,
+async def _complete_structured_document(
     *,
-    http_client: httpx.AsyncClient,
+    spec: AgentSpec,
+    body: dict[str, Any],
+    profile: ModelProfile,
+    profiles: dict[str, ModelProfile],
+    schema_name: str,
+    ocr_backend_name: str,
+    language: str | None,
+    disable_thinking: bool,
+    mode: str,
+    output_model: str,
 ) -> dict[str, Any]:
-    """Forward a chat request, delivering ``schema_name`` as ``response_format``
-    but resilient to a backend that cannot compile a deep schema's grammar,
-    or one that compiles it fine and returns nothing.
+    """Run an Agent document through the same extraction path as Playground.
 
-    llama.cpp turns a strict json_schema into a GBNF grammar; a large nested
-    schema (``$defs``/``$ref``/``anyOf`` — e.g. the invoice schema) makes it
-    fail with 'failed to parse grammar' (HTTP 400). The extraction client
-    survives this via its style ladder; the agent forward gets the same one
-    here: strict json_schema -> json_object (valid-JSON, no schema grammar) ->
-    no constraint. A grammar/response_format 400 downgrades, and so does a
-    200 with empty content (the small-Ollama-and-friends defect
-    openai_client.chat_json's ladder already guards against — this path
-    forwards through _post_chat directly, so it needs its own check). Any
-    other error propagates."""
-    if not schema_name:
-        return await _post_chat(upstream, dict(body), http_client=http_client)
+    This preserves OCR blocks and their evidence ids, uses the shared prompt and
+    response-format negotiation, and performs the same grounding/validation pass
+    before adapting the result back to an OpenAI chat completion.
+    """
+    schema_mode, dynamic_schema = _resolve_extraction_schema(schema_name)
+    raw, suffix = _extract_document(body)
+    with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        handle.write(raw)
+        path = Path(handle.name)
+    try:
+        response = await ExtractionService(
+            profile,
+            profiles=profiles,
+            disable_thinking=disable_thinking,
+        ).extract_from_file(
+            path=path,
+            ocr_backend_name=ocr_backend_name,
+            schema_name=schema_name,
+            schema_mode=schema_mode,
+            dynamic_schema=dynamic_schema,
+            language=language,
+            metadata={"agent": spec.name},
+        )
+    except ModelGatewayError as exc:
+        raise AgentError(
+            str(exc),
+            status_code=exc.status_code or 502,
+            error_type="upstream_error",
+        ) from exc
+    except ValueError as exc:
+        raise AgentError(
+            str(exc), status_code=400, error_type="invalid_request_error"
+        ) from exc
+    finally:
+        path.unlink(missing_ok=True)
 
-    # Name the target fields in the prompt (every attempt), so the model knows
-    # WHAT to extract even when the schema grammar is dropped — see
-    # _schema_instruction.
-    guided = dict(body)
-    instruction = _schema_instruction(schema_name)
-    if instruction:
-        guided["messages"] = [
-            {"role": "system", "content": instruction},
-            *(guided.get("messages") or []),
-        ]
-
-    strict = dict(guided)
-    _inject_response_format(strict, schema_name)  # unknown schema -> AgentError (propagates)
-    # Ladder, strongest first:
-    #  1. grammar + JSON prefill — suppresses a reasoning model's <think> ramble.
-    #  2. grammar, NO prefill — some models fail grammar-SAMPLER init when the
-    #     assistant turn is prefilled ("Failed to initialize samplers"); keep the
-    #     schema, drop the prefill (a non-reasoning extractor answers directly).
-    #  3. json_object + prefill — valid JSON, no schema grammar.
-    #  4. plain.
-    attempts = (
-        prefill_json_object(dict(strict)),
-        strict,
-        prefill_json_object({**guided, "response_format": {"type": "json_object"}}),
-        dict(guided),
-    )
-
-    last_error: AgentError | None = None
-    for index, attempt in enumerate(attempts):
-        is_last = index == len(attempts) - 1
-        try:
-            completion = await _post_chat(upstream, attempt, http_client=http_client)
-        except AgentError as exc:
-            downgradable = exc.status_code == 400 and any(
-                token in str(exc).lower()
-                for token in (
-                    "grammar",
-                    "response_format",
-                    "json_schema",
-                    "json schema",
-                    "sampler",  # "Failed to initialize samplers" — prefill+grammar
-                )
-            )
-            if not is_last and downgradable:
-                last_error = exc
-                continue
-            raise
-        repaired = repair_prefilled_content(completion)
-        if _is_empty_completion(repaired):
-            empty_error = AgentError(
-                f"backing model {upstream.model!r} returned empty content",
-                status_code=502,
-                error_type="upstream_empty_content",
-            )
-            if not is_last:
-                last_error = empty_error
-                continue
-            # Even the unconstrained final rung came back empty -- there is no
-            # weaker style left to try. Raise rather than hand back an empty
-            # "successful" completion (the exact class of silent-non-answer
-            # bug the whole ladder exists to avoid elsewhere in this codebase).
-            raise empty_error
-        return repaired
-    raise last_error  # pragma: no cover - unreachable: is_last always returns/raises above
+    usage = response.usage.model_dump(exclude_none=True) if response.usage else {}
+    usage.setdefault("prompt_tokens", 0)
+    usage.setdefault("completion_tokens", 0)
+    usage.setdefault("total_tokens", 0)
+    agent_result = _flatten_agent_result(response.result)
+    return {
+        "id": f"chatcmpl-agent-{response.request_id}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": output_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(agent_result, ensure_ascii=False),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage,
+        "docie_agent": {
+            "agent": spec.name,
+            "kind": spec.kind,
+            "mode": mode,
+            "validation": response.validation.model_dump(),
+            "response_format_style": response.response_format_style,
+        },
+    }
 
 
 async def _complete_ocr(
@@ -274,9 +224,8 @@ async def _complete_ocr(
     options = dict(spec.options)
     mode = _resolve_ocr_mode(options)
 
-    # Vision → structured: the image goes straight to a vision deployment, which
-    # grammar-generates JSON. No OCR, no solution adapter — just a schema-injected
-    # forward (llama.cpp GBNF does the structuring).
+    # Schema-backed vision extraction uses the exact Playground pipeline:
+    # document ingestion -> shared prompts/client -> grounding/validation.
     if mode == "vision":
         vision_selector = options.get("vision_model")
         if not vision_selector:
@@ -286,6 +235,20 @@ async def _complete_ocr(
                 error_type="invalid_agent_config",
             )
         upstream = _resolve_backing(str(vision_selector))
+        schema_name = options.get("schema")
+        if schema_name:
+            return await _complete_structured_document(
+                spec=spec,
+                body=body,
+                profile=upstream,
+                profiles={upstream.name: upstream},
+                schema_name=str(schema_name),
+                ocr_backend_name="vision",
+                language=options.get("language"),
+                disable_thinking=bool(options.get("no_think")),
+                mode=mode,
+                output_model=upstream.model,
+            )
         base = dict(body)
         if spec.system_prompt:
             base["messages"] = [
@@ -294,16 +257,7 @@ async def _complete_ocr(
             ]
         if options.get("no_think"):
             apply_no_think(base)
-        schema_name = options.get("schema")
-        # Prefill + repair are managed per-attempt inside _post_chat_with_schema
-        # (it tries grammar+prefill, then grammar WITHOUT prefill for models whose
-        # sampler init fails on a prefilled turn) — not here.
-        completion = await _post_chat_with_schema(
-            upstream,
-            base,
-            str(schema_name) if schema_name else None,
-            http_client=http_client,
-        )
+        completion = await _post_chat(upstream, base, http_client=http_client)
         completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind, "mode": mode}
         return completion
 
@@ -334,20 +288,30 @@ async def _complete_ocr(
             ocr_vision = _resolve_backing(str(ocr_model_sel))
             profiles[ocr_vision.name] = ocr_vision
             solution_options["ocr_model"] = ocr_vision.name
-        # An optional schema makes the OCR→LLM extraction reliably structured —
-        # the same grammar constraint the vision path uses, over OCR text. The
-        # field-naming instruction rides too (as it does on the vision path): the
-        # grammar shapes the object, this makes the model populate the TYPED
-        # fields instead of dumping the document into a notes field.
+        # A schema selects the shared Playground extraction path. Schema-less
+        # agents retain the generic OpenAI-compatible pipeline adapter below.
         schema_name = options.get("schema")
         if schema_name:
-            _inject_response_format(body, str(schema_name))
-            instruction = _schema_instruction(str(schema_name))
-            if instruction:
-                body["messages"] = [
-                    {"role": "system", "content": instruction},
-                    *(body.get("messages") or []),
-                ]
+            pipeline_profile = ModelProfile(
+                name=spec.name,
+                model=spec.name,
+                base_url="",
+                api_key="local-not-used",
+                kind=kind,
+                options=solution_options,
+            )
+            return await _complete_structured_document(
+                spec=spec,
+                body=body,
+                profile=pipeline_profile,
+                profiles=profiles,
+                schema_name=str(schema_name),
+                ocr_backend_name=str(options.get("backend", "tesseract")),
+                language=options.get("language"),
+                disable_thinking=bool(options.get("no_think")),
+                mode=mode,
+                output_model=extractor.model,
+            )
     else:
         kind = "ocr"
         solution_options = {
