@@ -23,6 +23,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { Card, Badge } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
+import { T } from "@/lib/i18n";
 
 const REVIEW_POLL_MS = 10000;
 const OCR_CACHE_POLL_MS = 15000;
@@ -120,10 +121,7 @@ export function Observability({
             />
           </div>
           <p className="mt-2 px-1 text-xs text-muted-foreground">
-            Blank panel? Grafana needs anonymous Viewer access and embedding
-            enabled — set on the grafana service in docker-compose.yml
-            (GF_AUTH_ANONYMOUS_ENABLED, GF_SECURITY_ALLOW_EMBEDDING). Rebuild
-            the grafana container after changing them.
+            <T>Blank panel? Grafana needs anonymous Viewer access and embedding enabled — set on the grafana service in docker-compose.yml (GF_AUTH_ANONYMOUS_ENABLED, GF_SECURITY_ALLOW_EMBEDDING). Rebuild the grafana container after changing them.</T>
           </p>
         </Card>
       </div>
@@ -153,7 +151,7 @@ function ReviewQueueCard({
             onClick={() => onNavigate("review")}
             className="text-xs font-medium text-accent hover:underline"
           >
-            Open queue →
+            <T>Open queue →</T>
           </button>
         )
       }
@@ -168,7 +166,7 @@ function ReviewQueueCard({
           Couldn&apos;t load review metrics. Is the API reachable?
         </p>
       ) : metrics.loading ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <p className="text-sm text-muted-foreground"><T>Loading…</T></p>
       ) : (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -236,7 +234,7 @@ function OcrCacheCard({ active }: { active: boolean }) {
           Couldn&apos;t load OCR cache stats. Is the API reachable?
         </p>
       ) : stats.loading ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <p className="text-sm text-muted-foreground"><T>Loading…</T></p>
       ) : data && !data.enabled ? (
         <p className="text-sm text-muted-foreground">
           Disabled — set OCR_CACHE_ENABLED=true to cache OCR results across runs.
@@ -321,14 +319,12 @@ function ActivityCard({
           Couldn&apos;t load activity. Is the API reachable?
         </p>
       ) : activity.loading ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <p className="text-sm text-muted-foreground"><T>Loading…</T></p>
       ) : detail ? (
         <p className="text-sm text-muted-foreground">{detail}</p>
       ) : entries.length === 0 ? (
         <p className="text-sm text-muted-foreground">
-          No store: model requests tracked yet — activity is recorded when a
-          request routes through a store: reference (chat/embeddings/rerank/
-          extract), not on every deployment.
+          <T>No store: model requests tracked yet — activity is recorded when a request routes through a store: reference (chat/embeddings/rerank/extract), not on every deployment.</T>
         </p>
       ) : (
         <div className="space-y-2">

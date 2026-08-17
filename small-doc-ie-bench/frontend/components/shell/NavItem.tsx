@@ -2,6 +2,7 @@
 
 import { cn } from "@/lib/cn";
 import type { NavItem as NavItemData } from "./nav";
+import { useI18n } from "@/lib/i18n";
 
 /**
  * A single sidebar nav row: icon + label. Active = soft indigo pill.
@@ -18,13 +19,14 @@ export function NavItem({
   collapsed: boolean;
   onClick: () => void;
 }) {
+  const { t } = useI18n();
   const Icon = item.icon;
   return (
     <button
       type="button"
       onClick={onClick}
       aria-current={active ? "page" : undefined}
-      title={collapsed ? item.label : undefined}
+      title={collapsed ? t(item.label) : undefined}
       className={cn(
         "flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-sm transition",
         collapsed && "justify-center px-0",
@@ -34,7 +36,7 @@ export function NavItem({
       )}
     >
       <Icon className="h-4 w-4 shrink-0" />
-      {!collapsed && <span className="min-w-0 truncate">{item.label}</span>}
+      {!collapsed && <span className="min-w-0 truncate">{t(item.label)}</span>}
     </button>
   );
 }

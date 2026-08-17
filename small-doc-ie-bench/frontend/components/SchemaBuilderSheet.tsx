@@ -11,6 +11,7 @@ import {
   type DynamicSchemaSpec,
 } from "@/lib/api";
 import { Alert, Button, Field, Select, Sheet, TextInput } from "./ui";
+import { T, useI18n } from "@/lib/i18n";
 
 interface FieldRow {
   name: string;
@@ -34,6 +35,7 @@ export function SchemaBuilderSheet({
   onClose: () => void;
   onCreated: (name: string) => void;
 }) {
+  const { t } = useI18n();
   const [documentType, setDocumentType] = useState("");
   const [fields, setFields] = useState<FieldRow[]>([emptyFieldRow()]);
   const [submitting, setSubmitting] = useState(false);
@@ -138,11 +140,9 @@ export function SchemaBuilderSheet({
     <Sheet open={open} onClose={onClose}>
       <form onSubmit={onSubmit} className="space-y-5">
         <div>
-          <h2 className="text-sm font-semibold text-foreground">New schema</h2>
+          <h2 className="text-sm font-semibold text-foreground"><T>New schema</T></h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Define a reusable extraction schema once, then select it anywhere structured
-            output is configured. A list field supports one flat level of sub-fields;
-            nested objects are not exposed by this form.
+            <T>Define a reusable extraction schema once, then select it anywhere structured output is configured. A list field supports one flat level of sub-fields; nested objects are not exposed by this form.</T>
           </p>
         </div>
 
@@ -167,7 +167,7 @@ export function SchemaBuilderSheet({
                 <Select
                   className="w-32"
                   value={field.type}
-                  aria-label={`Type for ${field.name || `field ${index + 1}`}`}
+                  aria-label={t("Type for {field}", { field: field.name || `field ${index + 1}` })}
                   onChange={(event) => {
                     const type = event.target.value as DynamicFieldType;
                     updateField(index, {
@@ -191,7 +191,7 @@ export function SchemaBuilderSheet({
                     setFields((rows) => rows.filter((_, rowIndex) => rowIndex !== index))
                   }
                   className="shrink-0 text-muted-foreground hover:text-red-500"
-                  aria-label="Remove field"
+                  aria-label={t("Remove field")}
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>
@@ -206,7 +206,7 @@ export function SchemaBuilderSheet({
               {field.type === "list" && (
                 <div className="ml-4 space-y-1.5 border-l border-border pl-3">
                   <p className="text-xs text-muted-foreground">
-                    Sub-fields (one flat level):
+                    <T>Sub-fields (one flat level):</T>
                   </p>
                   {field.subFields.map((sub, subIndex) => (
                     <div key={subIndex} className="flex items-center gap-2">
@@ -244,7 +244,7 @@ export function SchemaBuilderSheet({
                           })
                         }
                         className="shrink-0 text-muted-foreground hover:text-red-500"
-                        aria-label="Remove sub-field"
+                        aria-label={t("Remove sub-field")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -270,7 +270,7 @@ export function SchemaBuilderSheet({
             onClick={() => setFields((rows) => [...rows, emptyFieldRow()])}
             className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
           >
-            <Plus className="h-3.5 w-3.5" /> Add field
+            <Plus className="h-3.5 w-3.5" /> <T>Add field</T>
           </button>
         </div>
 

@@ -2,11 +2,13 @@
 
 import { formatBytes, type SeedProgress } from "@/lib/api";
 import { JsonView } from "./JsonView";
+import { useI18n } from "@/lib/i18n";
 
 /** Structured download progress renders as a bar; anything else as JSON.
  * Shared by the realtime stream and the polling fallback so both show the
  * identical percentage bar. */
 export function ProgressView({ value }: { value: unknown }) {
+  const { t } = useI18n();
   const p = value as SeedProgress | null;
   if (!p || typeof p !== "object" || typeof p.percent !== "number") {
     return <JsonView value={value} maxHeight="8rem" />;
@@ -17,8 +19,8 @@ export function ProgressView({ value }: { value: unknown }) {
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span className="truncate">
           {p.stage === "download-mmproj" || p.stage === "download-snapshot"
-            ? "Vision projector"
-            : "Model"}
+            ? t("Vision projector")
+            : t("Model")}
           {p.file ? ` · ${p.file}` : ""}
         </span>
         <span className="shrink-0 pl-2 font-medium text-foreground">

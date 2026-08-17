@@ -14,6 +14,7 @@ import {
   type TriggerResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { T } from "@/lib/i18n";
 import { useToast } from "../../Toast";
 import {
   Alert,
@@ -234,7 +235,7 @@ export function HfSearchSeed({
               onChange={(e) => setGgufOnly(e.target.checked)}
               className="h-3.5 w-3.5"
             />
-            GGUF only (uncheck to include encoder / transformers safetensors checkpoints)
+            <T>GGUF only (uncheck to include encoder / transformers safetensors checkpoints)</T>
           </label>
           <Select
             value={parameterRange}
@@ -262,7 +263,7 @@ export function HfSearchSeed({
           {/* Results list */}
           <div className="scroll-thin max-h-[26rem] space-y-1.5 overflow-y-auto pr-1">
             {results.length === 0 && (
-              <p className="text-sm text-muted-foreground">No models found.</p>
+              <p className="text-sm text-muted-foreground"><T>No models found.</T></p>
             )}
             {results.map((r) => (
               <button
@@ -290,7 +291,7 @@ export function HfSearchSeed({
           <div className="rounded-md border border-border bg-muted/20 p-3">
             {!selected ? (
               <p className="text-sm text-muted-foreground">
-                Pick a model to see its support verdict and deploy it.
+                <T>Pick a model to see its support verdict and deploy it.</T>
               </p>
             ) : inspecting ? (
               <p className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -340,10 +341,8 @@ export function HfSearchSeed({
                   <p className="flex items-start gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-400">
                     <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     <span>
-                      <strong>Runs custom code.</strong> This checkpoint executes the
-                      repo&apos;s own Python on the serving node. To load it, select the{" "}
-                      <code>transformers_trust_remote_code</code> family below — a
-                      deliberate choice, never the default. Only deploy code you trust.
+                      <strong><T>Runs custom code.</T></strong>{" "}
+                      <T>This checkpoint executes the repo's own Python on the serving node. To load it, select the transformers_trust_remote_code family below — a deliberate choice, never the default. Only deploy code you trust.</T>
                     </span>
                   </p>
                 )}
@@ -461,8 +460,7 @@ export function HfSearchSeed({
                     </Button>
                     {inspect.verdict === "needs_family" && (
                       <p className="text-xs text-amber-600 dark:text-amber-400">
-                        No confirmed family for this architecture — pick one and try, or add a
-                        family contract for it.
+                        <T>No confirmed family for this architecture — pick one and try, or add a family contract for it.</T>
                       </p>
                     )}
                   </>

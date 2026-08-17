@@ -6,6 +6,7 @@ import { seedHf, type ModelFamily, type TriggerResponse } from "@/lib/api";
 import { useToast } from "../../Toast";
 import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
+import { T } from "@/lib/i18n";
 import { errText } from "../shared";
 import {
   ExistingModelsDialog,
@@ -115,7 +116,7 @@ export function EncoderSeedForm({
           >
             {analyzerFamilies.length === 0 ? (
               <p className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                No analyzer family available on this backend.
+                <T>No analyzer family available on this backend.</T>
               </p>
             ) : (
               <Select value={family} onChange={(e) => setFamily(e.target.value)}>
@@ -137,9 +138,7 @@ export function EncoderSeedForm({
           Download & seed
         </Button>
         <p className="text-xs text-muted-foreground">
-          The checkpoint snapshot downloads once into the store with live
-          progress; deploying it afterwards is instant (no network at boot).
-          Requires the encoders extra on the serving node.
+          <T>The checkpoint snapshot downloads once into the store with live progress; deploying it afterwards is instant (no network at boot). Requires the encoders extra on the serving node.</T>
         </p>
       </form>
 

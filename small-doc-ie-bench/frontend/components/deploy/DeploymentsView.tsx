@@ -30,6 +30,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
+import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
 import { Alert, Badge, Button, Card, Field, Segmented, TextInput } from "../ui";
@@ -867,7 +868,7 @@ function RepairControls({
 
   return (
     <div className="rounded-md border border-border bg-muted/20 p-3">
-      <p className="mb-2 text-xs font-medium text-foreground">Repair</p>
+      <p className="mb-2 text-xs font-medium text-foreground"><T>Repair</T></p>
       <p className="mb-2 text-xs text-muted-foreground">
         {phase === "failed"
           ? "This deployment is stuck. Reallocate its port (recommended — steps around a port an orphan process still holds) or move it to a specific one. No delete/recreate; the config is kept."

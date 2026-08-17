@@ -47,6 +47,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
+import { T, useI18n } from "@/lib/i18n";
 import { useToast } from "./Toast";
 import {
   Alert,
@@ -368,7 +369,7 @@ export function Playground({
                   className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
                 >
                   <FilePlus2 className="h-3 w-3" />
-                  New schema…
+                  <T>New schema…</T>
                 </button>
               </div>
             </Field>
@@ -418,7 +419,7 @@ export function Playground({
             </Button>
             {extractNoModel && (
               <p className="text-xs text-muted-foreground">
-                Deploy a chat model before running an extraction.
+                <T>Deploy a chat model before running an extraction.</T>
               </p>
             )}
           </div>
@@ -435,7 +436,7 @@ export function Playground({
           <ResultPanel trigger={trigger} noun="extraction" />
         ) : (
           <p className="text-sm text-muted-foreground">
-            Run an extraction to see live progress and the resulting JSON here.
+            <T>Run an extraction to see live progress and the resulting JSON here.</T>
           </p>
         )}
       </Card>
@@ -470,6 +471,7 @@ function ChatPanel({
   selectable: DeploymentRecord[];
   onNavigate?: NavigateToDeploy;
 }) {
+  const { t } = useI18n();
   // Chat owns its OWN selection: it only offers LIVE deployments, so sharing
   // the Extract-side selection (which legitimately includes evicted
   // auto-reload targets) would let the select DISPLAY one model while the
@@ -553,7 +555,7 @@ function ChatPanel({
         );
       };
       await chatCompletionStream(model, payload, appendToken);
-      if (!content) setMsgs([...next, { role: "assistant", content: "(empty response)" }]);
+      if (!content) setMsgs([...next, { role: "assistant", content: t("(empty response)") }]);
     } catch (e) {
       if (e instanceof ModelLoading) {
         const willRetry = retryCount < MAX_LOAD_RETRIES;
@@ -562,8 +564,8 @@ function ChatPanel({
           {
             role: "status",
             content: willRetry
-              ? `${e.message} Retrying automatically…`
-              : `${e.message} Still starting — send your message again in a bit.`,
+              ? `${e.message} ${t("Retrying automatically…")}`
+              : `${e.message} ${t("Still starting — send your message again in a bit.")}`,
           },
         ]);
         if (willRetry) {
@@ -615,8 +617,7 @@ function ChatPanel({
         <div className="scroll-thin max-h-[50vh] min-h-40 space-y-3 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
           {msgs.length === 0 && (
             <p className="text-sm text-muted-foreground">
-              Ask anything — the request goes straight to the deployment through
-              the OpenAI-compatible surface.
+              <T>Ask anything — the request goes straight to the deployment through the OpenAI-compatible surface.</T>
             </p>
           )}
           {msgs.map((m, i) =>
@@ -647,7 +648,7 @@ function ChatPanel({
           )}
           {busy && (
             <p className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Spinner /> Waiting for the model…
+              <Spinner /> <T>Waiting for the model…</T>
             </p>
           )}
           <div ref={bottomRef} />
@@ -892,10 +893,10 @@ function VisionPanel({
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <FileText className="h-4 w-4 shrink-0" />
                 <span className="truncate">{file.name}</span>
-                <span className="ml-auto shrink-0 text-xs">PDF · page 1 shown; all pages sent</span>
+                <span className="ml-auto shrink-0 text-xs"><T>PDF · page 1 shown; all pages sent</T></span>
               </div>
               <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>Render quality</span>
+                <span><T>Render quality</T></span>
                 <Select
                   value={String(dpi)}
                   onChange={(e) => setDpi(Number(e.target.value))}
@@ -906,7 +907,7 @@ function VisionPanel({
                   <option value="300">300 DPI — sharpest, heaviest</option>
                 </Select>
                 <span className="text-muted-foreground/80">
-                  higher = sharper text, larger request
+                  <T>higher = sharper text, larger request</T>
                 </span>
               </label>
             </div>
@@ -945,11 +946,11 @@ function VisionPanel({
 
         <div>
           <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Answer
+            <T>Answer</T>
           </p>
           {busy ? (
             <p className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Spinner /> The vision model is reading the image… (CPU vision is slow)
+              <Spinner /> <T>The vision model is reading the image… (CPU vision is slow)</T>
             </p>
           ) : answer != null ? (
             <pre className="scroll-thin max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-sm leading-relaxed text-foreground/90">
@@ -957,7 +958,7 @@ function VisionPanel({
             </pre>
           ) : (
             <p className="text-sm text-muted-foreground">
-              Pick a vision deployment, upload an image, and run to see the answer.
+              <T>Pick a vision deployment, upload an image, and run to see the answer.</T>
             </p>
           )}
         </div>
@@ -1093,7 +1094,7 @@ function EmbedPanel({
             </div>
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground">
-                Text A vector (first 12 dims)
+                <T>Text A vector (first 12 dims)</T>
               </p>
               <pre className="scroll-thin overflow-x-auto rounded-md border border-border bg-card p-3 text-xs text-foreground/90">
                 [{result.a.slice(0, 12).map((v) => v.toFixed(4)).join(", ")}
@@ -1101,7 +1102,7 @@ function EmbedPanel({
               </pre>
             </div>
             <p className="text-xs text-muted-foreground">
-              Both vectors were computed by the selected deployment.
+              <T>Both vectors were computed by the selected deployment.</T>
             </p>
           </div>
         )}
@@ -1236,8 +1237,7 @@ function RerankPanel({
               </div>
             ))}
             <p className="text-xs text-muted-foreground">
-              Sorted by relevance_score, highest first — the same order a retrieval pipeline
-              would keep.
+              <T>Sorted by relevance_score, highest first — the same order a retrieval pipeline would keep.</T>
             </p>
           </div>
         )}
@@ -1263,14 +1263,15 @@ function EmptyModelState({
   noun: "chat" | "vision" | "embedding" | "reranker";
   onNavigate?: NavigateToDeploy;
 }) {
+  const { t } = useI18n();
   return (
     <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-amber-700 dark:text-amber-400">
       <div className="flex items-start gap-2">
         <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
         <div>
-          <p className="text-sm font-medium">No {noun} model deployed yet.</p>
+          <p className="text-sm font-medium">{t("No {noun} model deployed yet.", { noun: t(noun) })}</p>
           <p className="mt-0.5 text-xs text-amber-700/90 dark:text-amber-400/90">
-            Deploy one from Models → Search Hugging Face.
+            <T>Deploy one from Models → Search Hugging Face.</T>
           </p>
         </div>
       </div>
@@ -1324,8 +1325,7 @@ function DeploymentSelect({
   if (deployments.error && !deployments.data) {
     return (
       <Alert tone="warn">
-        Deployments unavailable — is the serving API up? The server default will
-        be used.
+        <T>Deployments unavailable — is the serving API up? The server default will be used.</T>
       </Alert>
     );
   }
