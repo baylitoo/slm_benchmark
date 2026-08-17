@@ -595,14 +595,17 @@ async def search_models(
     pipeline_tag: str | None = None,
     author: str | None = None,
     library: str | None = None,
+    num_parameters: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search the Hub for models (server-side proxy, HF_TOKEN aware).
 
     Enriched, catalog-oriented cards. ``query`` may be empty — an empty query
     with ``sort="trending"`` (or ``recent``/``likes``) returns a discovery feed
     (top trending / newest / most-liked). ``pipeline_tag``/``author``/``library``
-    are Hub-side facets. ``expand[]`` pulls each card's architecture + parameter
-    count inline, so every card carries a PRELIMINARY support verdict
+    are Hub-side facets. ``num_parameters`` uses the Hub's native range syntax
+    (for example ``min:1B,max:3B``), so filtering happens before ``limit`` is
+    applied. ``expand[]`` pulls each card's architecture + parameter count
+    inline, so every card carries a PRELIMINARY support verdict
     (``resolve_family``) without a per-repo fetch — ``/hf/inspect`` remains the
     authoritative check (it also reads the projector, which the list omits).
     """
@@ -623,6 +626,8 @@ async def search_models(
         params.append(("author", author))
     if library:
         params.append(("library", library))
+    if num_parameters:
+        params.append(("num_parameters", num_parameters))
     params.extend(("expand[]", field) for field in _CATALOG_EXPAND)
 
     try:

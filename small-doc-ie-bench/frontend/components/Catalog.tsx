@@ -11,6 +11,7 @@ import {
   Clock,
 } from "lucide-react";
 import {
+  HF_PARAMETER_RANGES,
   searchCatalog,
   seedHf,
   formatBytes,
@@ -213,6 +214,7 @@ export function Catalog({
   const [pipeline, setPipeline] = useState("");
   const [ggufOnly, setGgufOnly] = useState(true);
   const [author, setAuthor] = useState("");
+  const [parameterRange, setParameterRange] = useState("");
   const [familyFilter, setFamilyFilter] = useState(""); // client-side, "" = all
   const [seedCard, setSeedCard] = useState<CatalogCard | null>(null);
 
@@ -224,13 +226,16 @@ export function Catalog({
 
   // Key encodes every server-side param INCLUDING the (possibly empty) query,
   // so the first paint fires a real request: empty query + a sort = top models.
-  const key = `catalog:${sort}:${pipeline}:${ggufOnly}:${author.trim()}:${debounced}:${LIMIT}`;
+  const key =
+    `catalog:${sort}:${pipeline}:${ggufOnly}:${author.trim()}:` +
+    `${parameterRange}:${debounced}:${LIMIT}`;
   const { data, error, loading, reload } = useAsync<CatalogCard[]>(key, () =>
     searchCatalog({
       query: debounced,
       sort,
       pipeline_tag: pipeline || null,
       author: author.trim() || null,
+      num_parameters: parameterRange || null,
       gguf_only: ggufOnly,
       limit: LIMIT,
     }),
@@ -258,6 +263,7 @@ export function Catalog({
     pipeline !== "" ||
     !ggufOnly ||
     author !== "" ||
+    parameterRange !== "" ||
     familyFilter !== "";
 
   function resetFilters() {
@@ -266,6 +272,7 @@ export function Catalog({
     setPipeline("");
     setGgufOnly(true);
     setAuthor("");
+    setParameterRange("");
     setFamilyFilter("");
   }
 
@@ -462,6 +469,18 @@ export function Catalog({
           {familyOptions.map((f) => (
             <option key={f} value={f}>
               {f}
+            </option>
+          ))}
+        </Select>
+        <Select
+          value={parameterRange}
+          onChange={(e) => setParameterRange(e.target.value)}
+          className="h-8 w-40 text-xs"
+          aria-label="Model parameters"
+        >
+          {HF_PARAMETER_RANGES.map((range) => (
+            <option key={range.value} value={range.value}>
+              {range.label}
             </option>
           ))}
         </Select>
