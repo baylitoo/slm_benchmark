@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -194,6 +194,92 @@ def flatten_schema_json(root: dict) -> dict:
             # null/empty values as the representation for genuinely absent data.
             result["required"] = list(props)
     return result if isinstance(result, dict) else {}
+
+
+def rehydrate_extraction_result(payload: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
+    """Restore validation wrappers around a flat model-facing extraction.
+
+    Structured decoders receive :func:`flatten_schema_json` because llama.cpp
+    cannot compile the rich Pydantic schema.  Grounding and validation still
+    operate on the rich ``{value, evidence_ids, confidence}`` representation.
+    This transform bridges those two contracts and is deliberately idempotent,
+    so it also accepts rich output from an unconstrained fallback or a native
+    extraction template.
+    """
+    defs = root.get("$defs", {})
+
+    def resolve(node: object) -> object:
+        seen = 0
+        while isinstance(node, dict) and "$ref" in node and seen < 100:
+            node = defs.get(str(node["$ref"]).rsplit("/", 1)[-1], {})
+            seen += 1
+        return node
+
+    def select_union(node: dict[str, Any], value: Any) -> object:
+        for key in ("anyOf", "oneOf"):
+            choices = node.get(key)
+            if not isinstance(choices, list):
+                continue
+            if value is None:
+                return next(
+                    (
+                        choice
+                        for choice in choices
+                        if isinstance(resolve(choice), dict)
+                        and resolve(choice).get("type") == "null"
+                    ),
+                    choices[0] if choices else {},
+                )
+            return next(
+                (
+                    choice
+                    for choice in choices
+                    if not (
+                        isinstance(resolve(choice), dict)
+                        and resolve(choice).get("type") == "null"
+                    )
+                ),
+                choices[0] if choices else {},
+            )
+        return node
+
+    def transform(value: Any, schema_node: object) -> Any:
+        schema_node = resolve(schema_node)
+        if not isinstance(schema_node, dict):
+            return value
+        schema_node = resolve(select_union(schema_node, value))
+        if value is None or not isinstance(schema_node, dict):
+            return value
+
+        properties = schema_node.get("properties")
+        if isinstance(properties, dict) and properties.keys() & _WRAPPER_MARKERS:
+            if "value" in properties:
+                if isinstance(value, dict) and (
+                    "value" in value or value.keys() & _WRAPPER_MARKERS
+                ):
+                    result = dict(value)
+                    if "value" in result:
+                        result["value"] = transform(result["value"], properties["value"])
+                    return result
+                return {"value": transform(value, properties["value"])}
+            if isinstance(value, dict):
+                return {
+                    key: transform(item, properties.get(key, {}))
+                    for key, item in value.items()
+                }
+            return value
+
+        if isinstance(value, list) and "items" in schema_node:
+            return [transform(item, schema_node["items"]) for item in value]
+        if isinstance(value, dict) and isinstance(properties, dict):
+            return {
+                key: transform(item, properties.get(key, {}))
+                for key, item in value.items()
+            }
+        return value
+
+    result = transform(payload, root)
+    return result if isinstance(result, dict) else payload
 
 
 def _collapse_union(items: list) -> list:
