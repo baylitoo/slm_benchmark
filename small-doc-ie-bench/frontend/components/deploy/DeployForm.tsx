@@ -63,6 +63,7 @@ export function DeployForm({
   const [port, setPort] = useState("");
   const [portDirty, setPortDirty] = useState(false);
   const [contextLength, setContextLength] = useState("8192");
+  const [maxTokens, setMaxTokens] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -122,6 +123,7 @@ export function DeployForm({
         // authoritatively (and the page-load-race stale value never ships).
         ...(portDirty && port.trim() ? { port: Number(port) } : {}),
         ...(contextLength.trim() ? { context_length: Number(contextLength) } : {}),
+        ...(maxTokens.trim() ? { max_tokens: Number(maxTokens) } : {}),
       };
       const res = await deployModel(payload);
       setTrigger(res);
@@ -220,7 +222,7 @@ export function DeployForm({
           </button>
           {showAdvanced && (
             <div className="mt-3 animate-fade-in space-y-4">
-              <div className="grid gap-4 sm:grid-cols-3">
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <Field label="Deployment name" hint="Optional alias.">
                   <TextInput
                     value={name}
@@ -262,6 +264,18 @@ export function DeployForm({
                     value={contextLength}
                     onChange={(e) => setContextLength(e.target.value)}
                     placeholder="8192"
+                  />
+                </Field>
+                <Field
+                  label="Default max output tokens"
+                  hint="Optional. Agents inherit this unless they or a request override it."
+                >
+                  <TextInput
+                    type="number"
+                    min={1}
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(e.target.value)}
+                    placeholder="family default"
                   />
                 </Field>
               </div>

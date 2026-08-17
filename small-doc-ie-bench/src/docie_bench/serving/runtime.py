@@ -72,6 +72,10 @@ class RuntimeLaunchSpec:
     dtype: str = "auto"
     quantization: str | None = None
     context_length: int | None = None
+    # Default completion budget exposed by the deployment. This is routing /
+    # generation metadata, not a llama-server process flag; callers may still
+    # override it per request.
+    max_tokens: int | None = None
     cpu_threads: int | None = None
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float | None = None
@@ -90,6 +94,8 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("port must be between 1 and 65535")
         if self.context_length is not None and self.context_length < 1:
             raise RuntimeConfigurationError("context_length must be positive")
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise RuntimeConfigurationError("max_tokens must be positive")
         if self.cpu_threads is not None and self.cpu_threads < 1:
             raise RuntimeConfigurationError("cpu_threads must be positive")
         if self.tensor_parallel_size < 1:

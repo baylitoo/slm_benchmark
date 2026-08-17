@@ -8,7 +8,7 @@ from typing import Annotated, Any
 import httpx
 import inngest
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
@@ -31,6 +31,9 @@ class DeployRequest(BaseModel):
     # — the SAME constant the sizing engine prices uncalibrated fits at, so the
     # fit table and a default deploy consume the same KV budget.
     context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH
+    # Default output budget inherited by Playground/Agents through the live
+    # deployment profile. It does not change the runtime context window.
+    max_tokens: int | None = Field(default=None, ge=1, le=131_072)
     replicas: int = 1
 
 

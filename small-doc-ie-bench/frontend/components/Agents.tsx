@@ -704,6 +704,9 @@ function CreateView({
   // Suppress a reasoning model's think channel (enable_thinking=false) so it
   // emits the answer directly instead of rambling past the token budget.
   const [noThink, setNoThink] = useState(false);
+  // Blank inherits the backing deployment/profile default. A caller may still
+  // override this per OpenAI request with max_tokens.
+  const [maxTokens, setMaxTokens] = useState("");
   // Staged document-extraction mode: plain OCR | OCR→LLM | vision→structured.
   const [ocrMode, setOcrMode] = useState<"ocr" | "ocr_extract" | "vision">("ocr");
   const [visionModel, setVisionModel] = useState("");
@@ -747,6 +750,7 @@ function CreateView({
     if (Array.isArray(options.entities)) setEntities(options.entities.map(String));
     if (typeof options.mode === "string") setMode(options.mode);
     if (typeof options.backend === "string") setOcrBackend(options.backend);
+    if (typeof options.max_tokens === "number") setMaxTokens(String(options.max_tokens));
   }, [prefill]);
 
   // Load an existing agent's full config for editing (name + template locked).
@@ -775,6 +779,7 @@ function CreateView({
     setOcrExtractor(typeof o.extractor === "string" ? o.extractor : "");
     setOcrModel(typeof o.ocr_model === "string" ? o.ocr_model : "");
     setNoThink(o.no_think === true);
+    setMaxTokens(typeof o.max_tokens === "number" ? String(o.max_tokens) : "");
     setVisionModel(typeof o.vision_model === "string" ? o.vision_model : "");
     setSchemaName(typeof o.schema === "string" ? o.schema : "");
     // Back-compat: an agent saved before `mode` derives it — extractor → the
@@ -822,6 +827,7 @@ function CreateView({
                   vision_model: visionModel || null,
                   schema: schemaName || null,
                   no_think: noThink,
+                  max_tokens: maxTokens.trim() ? Number(maxTokens) : null,
                 }
               : ocrMode === "ocr_extract"
                 ? {
@@ -834,6 +840,7 @@ function CreateView({
                     extractor: ocrExtractor || null,
                     schema: schemaName || null,
                     no_think: noThink,
+                    max_tokens: maxTokens.trim() ? Number(maxTokens) : null,
                   }
                 : {
                     mode: "ocr",
@@ -1302,22 +1309,38 @@ function CreateView({
                 {/* Reasoning models ramble past the token budget and never reach
                     the grammar answer — let the operator turn thinking off. */}
                 {ocrMode !== "ocr" && (
-                  <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground/90">
-                    <input
-                      type="checkbox"
-                      checked={noThink}
-                      onChange={(e) => setNoThink(e.target.checked)}
-                      className="mt-0.5 h-3.5 w-3.5"
-                    />
-                    <span>
-                      Disable thinking (reasoning models)
-                      <span className="block text-muted-foreground">
-                        Sends enable_thinking=false so the model emits the answer
-                        directly instead of a long think channel. No effect on models
-                        without one.
+                  <>
+                    <Field
+                      label="Max output tokens"
+                      htmlFor="agent-max-tokens"
+                      hint="Optional. Request max_tokens overrides this; blank inherits the deployment default."
+                    >
+                      <TextInput
+                        id="agent-max-tokens"
+                        type="number"
+                        min={1}
+                        max={131072}
+                        value={maxTokens}
+                        onChange={(e) => setMaxTokens(e.target.value)}
+                        placeholder="deployment default"
+                      />
+                    </Field>
+                    <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground/90">
+                      <input
+                        type="checkbox"
+                        checked={noThink}
+                        onChange={(e) => setNoThink(e.target.checked)}
+                        className="mt-0.5 h-3.5 w-3.5"
+                      />
+                      <span>
+                        Disable thinking (reasoning models)
+                        <span className="block text-muted-foreground">
+                          Uses native reasoning controls when supported and an
+                          assistant JSON continuation for templates that ignore them.
+                        </span>
                       </span>
-                    </span>
-                  </label>
+                    </label>
+                  </>
                 )}
 
                 {ocrMode === "vision" && (
