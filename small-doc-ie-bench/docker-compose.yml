@@ -7,6 +7,13 @@ services:
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
     environment:
+      # Construct the container-network URL here instead of relying on a
+      # DATABASE_URL value that itself references ${POSTGRES_PASSWORD} in an
+      # env file. Deployment platforms such as Coolify may write that nested
+      # reference literally or collapse it, leaving psycopg to fall back to a
+      # nonexistent container-local Unix socket. `environment` overrides the
+      # env_file value, so every Compose deployment gets the correct host.
+      DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
       # Pinned (not left to .env): every service MUST resolve the shared
       # serving state to the same mounted path. A missing .env line would
       # silently fall back to a container-local $HOME path — the volume then
@@ -168,6 +175,7 @@ services:
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
+      DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
       # Registers ONLY the lifecycle functions (deploy/seed/delete) under the
       # dedicated docie-serving Inngest app + runs the reconciler, so a
       # serving/* event can only land on this replica.
@@ -229,6 +237,7 @@ services:
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
     environment:
+      DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
       # Registers ONLY extraction/benchmark/GC — no lifecycle functions, no
       # reconciler, never spawns a runtime process.
       DOCIE_WORKER_ROLE: worker
@@ -285,6 +294,8 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.api
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
     profiles: ["tools"]
     depends_on:
       api:

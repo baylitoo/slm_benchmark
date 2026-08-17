@@ -233,6 +233,7 @@ def ensure_review_task_validation_warnings_column(engine: Engine) -> bool:
 
 
 _REVIEW_EVIDENCE_LOCK_KEY = 0x0D0C1E09
+_SCHEMA_INIT_LOCK_KEY = 0x0D0C1E00
 
 
 def ensure_review_evidence_table(engine: Engine) -> bool:
@@ -273,12 +274,27 @@ def init_engine(database_url: str | None = None) -> None:
 
     _engine = create_engine(resolved_url, pool_pre_ping=True)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
-    # Explicit forward migration BEFORE create_all: create_all never ALTERs an
-    # existing table, so a model_placement that predates the PR-1 observed
+
+    # Establish the dependency-ordered base schema before additive migrations.
+    # This is load-bearing on a fresh PostgreSQL database: review_evidence has a
+    # foreign key to review_task, so creating it individually before create_all
+    # fails with UndefinedTable. api/serving/worker all initialize concurrently;
+    # serialize create_all with a transaction-scoped advisory lock so its usual
+    # inspect-then-CREATE sequence cannot race between processes. SQLAlchemy then
+    # orders parent tables before their dependants within the locked transaction.
+    with _engine.begin() as connection:
+        if _engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _SCHEMA_INIT_LOCK_KEY},
+            )
+        Base.metadata.create_all(bind=connection)
+
+    # Explicit forward migrations run AFTER create_all: create_all never ALTERs
+    # an existing table, so a model_placement that predates the PR-1 observed
     # columns must gain them here or the reconciler's first publish throws
-    # UndefinedColumn (the documented size_bytes hazard, handled explicitly for
-    # the placement table instead of trusted to create_all). No-op on fresh
-    # databases (create_all then creates the table complete).
+    # UndefinedColumn. On a fresh database create_all made the complete current
+    # schema above, so every migration below is an idempotent no-op.
     from docie_bench.serving.catalog import (
         ensure_model_activity_table,
         ensure_placement_observed_columns,
@@ -323,7 +339,6 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.seed_store import ensure_seed_run_table
 
     ensure_seed_run_table(_engine)
-    Base.metadata.create_all(bind=_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:
