@@ -125,9 +125,12 @@ def flat_schema_json(schema_name: str) -> dict:
     shape, so a model emits extra + duplicate keys.
 
     This resolves ``$ref``s, UNWRAPS each field to its plain value, and strips the
-    grammar-breaking constraints, while KEEPING ``required`` and
-    ``additionalProperties: false`` — so the compiled grammar yields a clean flat
-    ``{field: value | null}`` object with no extra or duplicate keys.
+    grammar-breaking constraints, while REQUIRING every top-level typed field and
+    keeping ``additionalProperties: false`` — so the compiled grammar yields a
+    clean flat ``{field: value | null}`` object with no missing, extra, or
+    duplicate keys. Optional scalar fields remain nullable and optional list
+    fields can be empty; requiring their keys prevents the grammar from accepting
+    an empty ``{}`` as a successful extraction.
     """
     return flatten_schema_json(schema_json(schema_name))
 
@@ -184,9 +187,12 @@ def flatten_schema_json(root: dict) -> dict:
         if isinstance(props, dict):
             for meta in _GRAMMAR_OMIT_FIELDS:
                 props.pop(meta, None)
-        required = result.get("required")
-        if isinstance(required, list):
-            result["required"] = [r for r in required if r not in _GRAMMAR_OMIT_FIELDS]
+            # Pydantic omits ``required`` for fields with defaults, even when the
+            # field's value type is nullable. That makes the strict llama.cpp
+            # grammar accept ``{}``, which a small extractor can choose as the
+            # shortest valid answer. Require the typed keys while preserving
+            # null/empty values as the representation for genuinely absent data.
+            result["required"] = list(props)
     return result if isinstance(result, dict) else {}
 
 

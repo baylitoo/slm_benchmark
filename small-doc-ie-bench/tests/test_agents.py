@@ -191,7 +191,9 @@ def test_inject_response_format_builds_json_schema() -> None:
     assert rf["type"] == "json_schema"
     assert rf["json_schema"]["name"] == "invoice"
     assert rf["json_schema"]["strict"] is True
-    assert isinstance(rf["json_schema"]["schema"], dict)
+    schema = rf["json_schema"]["schema"]
+    assert isinstance(schema, dict)
+    assert schema["required"] == list(schema["properties"])
 
 
 def test_inject_response_format_builds_saved_dynamic_schema(
