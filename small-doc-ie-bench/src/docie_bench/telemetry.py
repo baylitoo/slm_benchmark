@@ -1,6 +1,64 @@
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Histogram
+import os
+import warnings
+from pathlib import Path
+
+
+def _prepare_multiprocess_dir() -> Path | None:
+    """Create Prometheus' mmap directory before importing the client.
+
+    ``prometheus_client`` selects its value implementation at import time. If
+    multiprocess mode points at a missing directory, the first labelled metric
+    raises ``FileNotFoundError`` and can turn an otherwise successful request
+    into a 500. A bad observability path must not break application traffic, so
+    an unusable directory disables multiprocess mode and falls back to the
+    normal in-process registry.
+    """
+    raw = os.environ.get("PROMETHEUS_MULTIPROC_DIR", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warnings.warn(
+            f"Cannot prepare PROMETHEUS_MULTIPROC_DIR={raw!r}; "
+            f"using single-process metrics instead: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+        return None
+    return path
+
+
+PROMETHEUS_MULTIPROC_PATH = _prepare_multiprocess_dir()
+
+# Import after the directory bootstrap: the client chooses multiprocess vs
+# in-process storage while importing prometheus_client.values.
+from prometheus_client import (  # noqa: E402
+    CONTENT_TYPE_LATEST as _CONTENT_TYPE_LATEST,
+)
+from prometheus_client import (  # noqa: E402
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+    multiprocess,
+)
+
+CONTENT_TYPE_LATEST = _CONTENT_TYPE_LATEST
+
+
+def generate_metrics() -> bytes:
+    """Render metrics from the correct registry for the configured mode."""
+    if PROMETHEUS_MULTIPROC_PATH is None:
+        return generate_latest()
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    return generate_latest(registry)
 
 EXTRACTION_REQUESTS = Counter(
     "docie_extraction_requests_total",

@@ -10,7 +10,6 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from docie_bench.agents.api import router as agents_router
 from docie_bench.chat_api import router as chat_router
@@ -75,8 +74,10 @@ from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 from docie_bench.storage.db import get_session_factory, init_engine
 from docie_bench.telemetry import (
+    CONTENT_TYPE_LATEST,
     REVIEW_ACTIONS,
     REVIEW_QUEUE_DEPTH,
+    generate_metrics,
 )
 
 settings = get_settings()
@@ -274,7 +275,7 @@ def readyz() -> dict[str, str]:
 
 @app.get("/metrics")
 def metrics() -> Response:
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return Response(generate_metrics(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/v1/schemas")
