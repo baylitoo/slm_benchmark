@@ -328,6 +328,7 @@ class OpenAICompatibleClient:
                                 "docie_from_style": style,
                                 "docie_to_style": ladder[position + 1],
                                 "docie_reason": "grammar_compilation_error",
+                                "docie_upstream_error": resp.text[:1000],
                             },
                         )
                         continue
@@ -410,6 +411,9 @@ class OpenAICompatibleClient:
                     if not isinstance(parsed, dict):
                         raise InvalidModelResponseError("Model returned JSON that is not an object")
                 except (json.JSONDecodeError, InvalidModelResponseError) as exc:
+                    invalid_reason = (
+                        "empty_content" if not cleaned.strip() else "unparseable_content"
+                    )
                     last_invalid = (
                         exc
                         if isinstance(exc, InvalidModelResponseError)
@@ -429,6 +433,9 @@ class OpenAICompatibleClient:
                             "docie_from_style": style,
                             "docie_to_style": ladder[position + 1],
                             "docie_reason": "empty_or_unparseable_content",
+                            "docie_invalid_reason": invalid_reason,
+                            "docie_finish_reason": finish_reason,
+                            "docie_content_chars": len(content),
                         },
                     )
                     continue

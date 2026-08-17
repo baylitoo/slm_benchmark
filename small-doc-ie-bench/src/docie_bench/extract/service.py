@@ -33,7 +33,11 @@ from docie_bench.ocr.base import text_to_blocks
 from docie_bench.ocr.service import processor_from_settings
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
-from docie_bench.schemas.extraction import schema_json
+from docie_bench.schemas.extraction import (
+    flatten_schema_json,
+    rehydrate_extraction_result,
+    schema_json,
+)
 from docie_bench.security import redact_fields
 from docie_bench.serving.solutions import _PIPELINE_UPSTREAM_TIMEOUT_S
 from docie_bench.settings import get_settings
@@ -586,6 +590,11 @@ class ExtractionService:
             schema = schema_json(schema_name)
         else:
             raise ValueError("schema_mode must be 'static' or 'dynamic'")
+        # Keep two explicit contracts. The rich Pydantic schema is the internal
+        # validation/audit shape. The compact value schema is what the model
+        # sees and what structured decoders compile; the rich schema contains
+        # regexes and wrapper defaults that llama.cpp cannot turn into GBNF.
+        generation_schema = flatten_schema_json(schema)
         if self.profile.prompt_profile == "nuextract3":
             # NuExtract3 gets the template out-of-band via chat_template_kwargs
             # (the `nuextract3` response style), so the prompt carries only the
@@ -599,7 +608,7 @@ class ExtractionService:
             system_prompt = VISION_SYSTEM_PROMPT
             user_prompt = build_vision_user_prompt(
                 schema_name=schema_name,
-                schema=schema,
+                schema=generation_schema,
                 page_count=len(images),
                 language=language,
                 metadata=metadata,
@@ -615,7 +624,7 @@ class ExtractionService:
             system_prompt = SYSTEM_PROMPT
             user_prompt = build_user_prompt(
                 schema_name=schema_name,
-                schema=schema,
+                schema=generation_schema,
                 blocks=blocks,
                 language=language,
                 metadata=metadata,
@@ -626,7 +635,7 @@ class ExtractionService:
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 schema_name=schema_name,
-                schema=schema,
+                schema=generation_schema,
                 image_urls=[image.data_url() for image in images] if images else None,
                 chat_template_kwargs=(
                     {"enable_thinking": False} if self.disable_thinking else None
@@ -638,6 +647,7 @@ class ExtractionService:
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
+        raw = rehydrate_extraction_result(raw, schema)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
         if derived_subtotal:
