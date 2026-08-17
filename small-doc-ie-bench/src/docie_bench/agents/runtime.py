@@ -89,6 +89,27 @@ def _resolve_ocr_mode(options: dict[str, Any]) -> str:
     return "ocr_extract" if options.get("extractor") else "ocr"
 
 
+def _resolve_flat_schema(schema_name: str) -> dict[str, Any]:
+    """Resolve either a built-in or saved dynamic schema to grammar JSON."""
+    from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
+    from docie_bench.schemas.extraction import flat_schema_json, flatten_schema_json
+    from docie_bench.studio.dynamic_schemas import get_dynamic_schema
+
+    try:
+        return flat_schema_json(schema_name)
+    except ValueError as exc:
+        saved = get_dynamic_schema(schema_name)
+        if saved is None:
+            raise AgentError(
+                f"Unknown schema_name={schema_name!r}",
+                status_code=400,
+                error_type="invalid_request_error",
+            ) from exc
+        spec = DynamicSchemaSpec.model_validate(saved["spec"])
+        model = DynamicTemplateBuilder.build_model(spec)
+        return flatten_schema_json(model.model_json_schema())
+
+
 def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
     """Constrain the completion to the named extraction schema via OpenAI
     ``response_format`` (llama.cpp compiles it to a GBNF grammar). Shared by the
@@ -100,14 +121,7 @@ def _inject_response_format(body: dict[str, Any], schema_name: str) -> None:
     form (values only, no lookahead, additionalProperties:false) compiles, so the
     strict grammar actually applies — a clean ``{field: value | null}`` with no
     extra or duplicate keys, instead of falling back to shapeless json_object."""
-    from docie_bench.schemas.extraction import flat_schema_json
-
-    try:
-        json_schema = flat_schema_json(schema_name)
-    except ValueError as exc:
-        raise AgentError(
-            str(exc), status_code=400, error_type="invalid_request_error"
-        ) from exc
+    json_schema = _resolve_flat_schema(schema_name)
     body["response_format"] = {
         "type": "json_schema",
         "json_schema": {"name": schema_name, "schema": json_schema, "strict": True},
@@ -125,11 +139,9 @@ def _schema_instruction(schema_name: str) -> str | None:
     names exactly what the grammar accepts. Also the fallback signal when the
     grammar can't compile (json_object) — without it a vision model just echoes
     the prompt (``{"OCR": true}``)."""
-    from docie_bench.schemas.extraction import flat_schema_json
-
     try:
-        properties = flat_schema_json(schema_name).get("properties")
-    except ValueError:
+        properties = _resolve_flat_schema(schema_name).get("properties")
+    except AgentError:
         return None
     if not isinstance(properties, dict) or not properties:
         return None

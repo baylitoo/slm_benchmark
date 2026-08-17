@@ -129,7 +129,15 @@ def flat_schema_json(schema_name: str) -> dict:
     ``additionalProperties: false`` — so the compiled grammar yields a clean flat
     ``{field: value | null}`` object with no extra or duplicate keys.
     """
-    root = schema_json(schema_name)
+    return flatten_schema_json(schema_json(schema_name))
+
+
+def flatten_schema_json(root: dict) -> dict:
+    """Flatten an extraction model's JSON schema for a grammar target.
+
+    Unlike :func:`flat_schema_json`, this accepts an already-built schema. It is
+    used for saved dynamic schemas whose Pydantic model is created at runtime.
+    """
     defs = root.get("$defs", {})
 
     def resolve(node: object) -> object:

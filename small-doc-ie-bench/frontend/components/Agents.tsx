@@ -24,6 +24,7 @@ import {
   Eye,
   Sparkles,
   FileText,
+  FilePlus2,
 } from "lucide-react";
 import {
   ApiError,
@@ -39,6 +40,7 @@ import {
   getDeployments,
   getStore,
   isLiveDeployment,
+  listDynamicSchemas,
   listSchemas,
   renderDocument,
   selectableDeployments,
@@ -48,6 +50,7 @@ import {
   type AgentKind,
   type AgentTemplate,
   type AgentView,
+  type DynamicSchemaSummary,
   type StoreEntry,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
@@ -57,6 +60,7 @@ import { useToast } from "./Toast";
 import { Alert, Badge, Button, Card, Checkbox, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
 import { Table, type Column } from "./patterns/Table";
+import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
 
 // The three document-extraction stages an "ocr" agent can run. Persisted as
 // options.mode; the UI is a picker over these.
@@ -714,6 +718,7 @@ function CreateView({
   const [ocrMode, setOcrMode] = useState<"ocr" | "ocr_extract" | "vision">("ocr");
   const [visionModel, setVisionModel] = useState("");
   const [schemaName, setSchemaName] = useState("");
+  const [schemaSheetOpen, setSchemaSheetOpen] = useState(false);
 
   // Vision deployments (store family flagged vision) — the model picker for the
   // vision→structured stage.
@@ -723,8 +728,23 @@ function CreateView({
       .map((d) => d.spec?.name)
       .filter((n): n is string => !!n && visionSet.has(n));
   }, [deployments.data, store.data]);
-  // Extraction schemas available for structured output (GET /v1/schemas).
+  // Built-in and operator-created schemas available for structured output.
   const schemas = useAsync<string[]>("schemas", listSchemas);
+  const dynamicSchemas = useAsync<DynamicSchemaSummary[]>(
+    "agent-dynamic-schemas",
+    listDynamicSchemas,
+  );
+  const dynamicSchemaNames = useMemo(
+    () => new Set((dynamicSchemas.data ?? []).map((schema) => schema.name)),
+    [dynamicSchemas.data],
+  );
+  const schemaOptions = useMemo(
+    () =>
+      Array.from(
+        new Set([...(schemas.data ?? []), ...dynamicSchemaNames]),
+      ).sort((left, right) => left.localeCompare(right)),
+    [dynamicSchemaNames, schemas.data],
+  );
 
   const template = templates.find((t) => t.id === templateId) ?? null;
   const kind: AgentKind = template?.kind ?? "custom";
@@ -1238,30 +1258,54 @@ function CreateView({
 
                 {/* Output schema — structured stages */}
                 {ocrMode !== "ocr" && (
-                  <Field
-                    label="Output schema"
-                    htmlFor="agent-schema"
-                    hint={
-                      ocrMode === "vision"
-                        ? "Grammar-constrains the JSON (llama.cpp GBNF)."
-                        : "Optional — constrains the LLM to this schema."
-                    }
-                  >
-                    <Select
-                      id="agent-schema"
-                      value={schemaName}
-                      onChange={(e) => setSchemaName(e.target.value)}
+                  <>
+                    <Field
+                      label="Output schema"
+                      htmlFor="agent-schema"
+                      hint={
+                        ocrMode === "vision"
+                          ? "Grammar-constrains the JSON (llama.cpp GBNF)."
+                          : "Optional — constrains the LLM to this schema."
+                      }
                     >
-                      <option value="">
-                        {ocrMode === "vision" ? "Free text (no schema)" : "None — model decides"}
-                      </option>
-                      {(schemas.data ?? []).map((s) => (
-                        <option key={s} value={s}>
-                          {s}
-                        </option>
-                      ))}
-                    </Select>
-                  </Field>
+                      <div className="flex items-center gap-2">
+                        <Select
+                          id="agent-schema"
+                          className="flex-1"
+                          value={schemaName}
+                          onChange={(e) => setSchemaName(e.target.value)}
+                        >
+                          <option value="">
+                            {ocrMode === "vision"
+                              ? "Free text (no schema)"
+                              : "None — model decides"}
+                          </option>
+                          {schemaOptions.map((schema) => (
+                            <option key={schema} value={schema}>
+                              {schema}
+                              {dynamicSchemaNames.has(schema) ? " (saved)" : ""}
+                            </option>
+                          ))}
+                        </Select>
+                        <button
+                          type="button"
+                          onClick={() => setSchemaSheetOpen(true)}
+                          className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                        >
+                          <FilePlus2 className="h-3 w-3" />
+                          New schema…
+                        </button>
+                      </div>
+                    </Field>
+                    <SchemaBuilderSheet
+                      open={schemaSheetOpen}
+                      onClose={() => setSchemaSheetOpen(false)}
+                      onCreated={(name) => {
+                        setSchemaName(name);
+                        dynamicSchemas.reload();
+                      }}
+                    />
+                  </>
                 )}
 
                 {/* Reasoning models ramble past the token budget and never reach
