@@ -102,16 +102,16 @@ def _strip_json_prefill(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def apply_no_think(body: dict[str, Any]) -> dict[str, Any]:
     """Add the reasoning-off signal to a chat request (in place + returned).
 
-    Qwen3/3.5 and similar honor ``chat_template_kwargs.enable_thinking=false``
-    (via llama-server ``--jinja``): the model skips its reasoning channel and
-    emits the answer directly. Without it a reasoning model used as an OCR or
-    extraction step burns the whole token budget on a <think> ramble and never
-    reaches the grammar-constrained answer (observed: a 0.8B emitting 5.7k
-    reasoning tokens and an empty ``content``). Templates that ignore the flag
-    are unaffected, so it is safe to send whenever the operator opts in."""
+    Template-aware models honor ``chat_template_kwargs.enable_thinking=false``;
+    current llama-server also honors the request-level
+    ``reasoning_effort=none``. Send both because dynamic-reasoning models such
+    as LFM can ignore the template flag while spending the entire token budget
+    in a hidden reasoning channel. Other OpenAI-compatible local runtimes
+    ignore these optional controls."""
     kwargs = dict(body.get("chat_template_kwargs") or {})
     kwargs["enable_thinking"] = False
     body["chat_template_kwargs"] = kwargs
+    body["reasoning_effort"] = "none"
     return body
 
 _DATA_URI_SUFFIX = {

@@ -293,10 +293,12 @@ def test_apply_no_think_sets_flag_and_merges() -> None:
     body: dict = {"messages": []}
     apply_no_think(body)
     assert body["chat_template_kwargs"]["enable_thinking"] is False
+    assert body["reasoning_effort"] == "none"
     # merges with pre-existing chat_template_kwargs.
     body2 = {"chat_template_kwargs": {"foo": 1}}
     apply_no_think(body2)
     assert body2["chat_template_kwargs"] == {"foo": 1, "enable_thinking": False}
+    assert body2["reasoning_effort"] == "none"
 
 
 async def test_pipeline_no_think_rides_ocr_and_extractor(
@@ -337,6 +339,8 @@ async def test_pipeline_no_think_rides_ocr_and_extractor(
         )
     assert seen["vlm"]["chat_template_kwargs"]["enable_thinking"] is False
     assert seen["ext"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert seen["vlm"]["reasoning_effort"] == "none"
+    assert seen["ext"]["reasoning_effort"] == "none"
 
 
 def test_prefill_and_repair_helpers() -> None:
