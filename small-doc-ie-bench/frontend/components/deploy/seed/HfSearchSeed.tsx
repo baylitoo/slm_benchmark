@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { Rocket, Boxes, ShieldAlert } from "lucide-react";
 import {
   formatBytes,
+  HF_PARAMETER_RANGES,
   searchHf,
   inspectHf,
   seedHf,
@@ -68,6 +69,7 @@ export function HfSearchSeed({
   const { toast } = useToast();
   const [query, setQuery] = useState("");
   const [ggufOnly, setGgufOnly] = useState(true);
+  const [parameterRange, setParameterRange] = useState("");
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<HfSearchCard[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -140,7 +142,7 @@ export function HfSearchSeed({
     resetSelection();
     setSearching(true);
     try {
-      setResults(await searchHf(query.trim(), ggufOnly));
+      setResults(await searchHf(query.trim(), ggufOnly, parameterRange || undefined));
     } catch (err) {
       setError(errText(err, "Search failed."));
     } finally {
@@ -224,15 +226,29 @@ export function HfSearchSeed({
             Search
           </Button>
         </div>
-        <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
-          <input
-            type="checkbox"
-            checked={ggufOnly}
-            onChange={(e) => setGgufOnly(e.target.checked)}
-            className="h-3.5 w-3.5"
-          />
-          GGUF only (uncheck to include encoder / transformers safetensors checkpoints)
-        </label>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={ggufOnly}
+              onChange={(e) => setGgufOnly(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            GGUF only (uncheck to include encoder / transformers safetensors checkpoints)
+          </label>
+          <Select
+            value={parameterRange}
+            onChange={(e) => setParameterRange(e.target.value)}
+            className="h-8 w-40 text-xs"
+            aria-label="Model parameters"
+          >
+            {HF_PARAMETER_RANGES.map((range) => (
+              <option key={range.value} value={range.value}>
+                {range.label}
+              </option>
+            ))}
+          </Select>
+        </div>
       </form>
 
       {error && (
@@ -366,7 +382,11 @@ export function HfSearchSeed({
                         <TextInput value={name} onChange={(e) => setName(e.target.value)} />
                       </Field>
                       <Field label="Family" hint="Suggested from the architecture — override if needed.">
-                        <Select value={family} onChange={(e) => setFamily(e.target.value)}>
+                        <Select
+                          value={family}
+                          onChange={(e) => setFamily(e.target.value)}
+                          aria-label="Model family"
+                        >
                           <FamilyOptions families={families} />
                         </Select>
                       </Field>

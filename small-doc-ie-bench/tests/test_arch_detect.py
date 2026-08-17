@@ -384,6 +384,20 @@ async def test_search_models_returns_light_cards() -> None:
     assert cards[0]["downloads"] == 42000 and cards[0]["likes"] == 85
 
 
+async def test_search_models_forwards_parameter_range() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("num_parameters") == "min:1B,max:3B"
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        cards = await search_models(
+            "qwen",
+            client=client,
+            num_parameters="min:1B,max:3B",
+        )
+    assert cards == []
+
+
 async def test_search_enriches_card_with_family_and_params() -> None:
     # expand[] pulls arch + param count inline, so the card carries a PRELIM
     # verdict (resolve_family) and a size — no per-repo inspect round-trip.

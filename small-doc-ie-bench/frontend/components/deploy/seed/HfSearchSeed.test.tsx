@@ -34,6 +34,20 @@ describe("HfSearchSeed preflight", () => {
     vi.mocked(api.seedHf).mockReset();
   });
 
+  it("sends the selected parameter range to Hub search", async () => {
+    vi.mocked(api.searchHf).mockResolvedValue([]);
+
+    renderSearch();
+    await userEvent.type(screen.getByPlaceholderText(/Search models/), "qwen");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Model parameters" }),
+      "min:1B,max:3B",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(api.searchHf).toHaveBeenCalledWith("qwen", true, "min:1B,max:3B");
+  });
+
   it("shows exact estimates and lets a smaller fitting quant unblock seeding", async () => {
     vi.mocked(api.searchHf).mockResolvedValue([{ id: "owner/model-GGUF" }]);
     vi.mocked(api.inspectHf).mockResolvedValue({
@@ -155,7 +169,7 @@ describe("HfSearchSeed preflight", () => {
 
     expect(screen.getByRole("button", { name: /Download & seed/ })).toBeDisabled();
     await userEvent.selectOptions(
-      screen.getByRole("combobox"),
+      screen.getByRole("combobox", { name: "Model family" }),
       "transformers_trust_remote_code",
     );
     expect(screen.getByRole("button", { name: /Download & seed/ })).toBeEnabled();

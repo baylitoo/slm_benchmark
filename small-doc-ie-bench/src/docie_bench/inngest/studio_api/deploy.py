@@ -156,14 +156,25 @@ async def hf_search(
     sort: Annotated[str, Query(pattern="^(trending|downloads|likes|recent)$")] = "downloads",
     pipeline_tag: Annotated[str, Query()] = "",
     author: Annotated[str, Query()] = "",
+    num_parameters: Annotated[
+        str,
+        Query(
+            pattern=(
+                r"^(?:|min:\d+(?:\.\d+)?[KMBT](?:,max:\d+(?:\.\d+)?[KMBT])?"
+                r"|max:\d+(?:\.\d+)?[KMBT])$"
+            )
+        ),
+    ] = "",
 ) -> list[dict[str, Any]]:
     """Search the Hub for deployable models (server-side proxy).
 
     Enriched, catalog-oriented cards: each carries an inline PRELIMINARY support
     verdict (architecture -> family, no download). ``query`` may be empty — with
     ``sort=trending`` (or ``recent``/``likes``) that returns a discovery feed.
-    ``pipeline_tag``/``author`` are Hub-side facets. ``/hf/inspect`` remains the
-    authoritative per-repo check (it reads the projector the list omits)."""
+    ``pipeline_tag``/``author`` are Hub-side facets. ``num_parameters`` accepts
+    the Hub's native range syntax (for example ``min:1B,max:3B``).
+    ``/hf/inspect`` remains the authoritative per-repo check (it reads the
+    projector the list omits)."""
     from docie_bench.serving.hf_hub import HfHubError, search_models
 
     try:
@@ -176,6 +187,7 @@ async def hf_search(
                 sort=sort,
                 pipeline_tag=pipeline_tag or None,
                 author=author or None,
+                num_parameters=num_parameters or None,
             )
     except HfHubError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

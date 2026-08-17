@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chatCompletion, chatCompletionStream, downloadArtifact, getModels } from "./api";
+import {
+  chatCompletion,
+  chatCompletionStream,
+  downloadArtifact,
+  getModels,
+  searchCatalog,
+} from "./api";
 import { setApiKey } from "./apiKey";
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -99,5 +105,21 @@ describe("request() auth header", () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)["X-API-Key"]).toBe("sk-abc123");
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock");
+  });
+});
+
+describe("Hugging Face catalog query", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("serializes the Hub parameter-count range", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, []));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await searchCatalog({ query: "qwen", num_parameters: "min:1B,max:3B" });
+
+    const url = new URL(String(fetchMock.mock.calls[0][0]));
+    expect(url.searchParams.get("num_parameters")).toBe("min:1B,max:3B");
   });
 });

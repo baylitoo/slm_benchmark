@@ -110,6 +110,19 @@ export interface HfSearchCard {
   tags?: string[];
 }
 
+/** Hub-native parameter-count ranges shared by both model search surfaces. */
+export const HF_PARAMETER_RANGES = [
+  { value: "", label: "Any parameters" },
+  { value: "max:500M", label: "Up to 500M" },
+  { value: "min:500M,max:1B", label: "500M–1B" },
+  { value: "min:1B,max:3B", label: "1B–3B" },
+  { value: "min:3B,max:7B", label: "3B–7B" },
+  { value: "min:7B,max:15B", label: "7B–15B" },
+  { value: "min:15B,max:35B", label: "15B–35B" },
+  { value: "min:35B,max:70B", label: "35B–70B" },
+  { value: "min:70B", label: "70B+" },
+] as const;
+
 /** Pre-flight support verdict for a repo (GET /v1/studio/hf/inspect). */
 export interface HfInspect {
   repo: string;
@@ -170,10 +183,14 @@ export interface HfArtifactOption {
 }
 
 /** Search the Hub for deployable models (server-side proxy). */
-export function searchHf(query: string, gguf = true): Promise<HfSearchCard[]> {
-  return request<HfSearchCard[]>(
-    `/v1/studio/hf/search?query=${encodeURIComponent(query)}&gguf_only=${gguf}`,
-  );
+export function searchHf(
+  query: string,
+  gguf = true,
+  numParameters?: string,
+): Promise<HfSearchCard[]> {
+  const q = new URLSearchParams({ query, gguf_only: String(gguf) });
+  if (numParameters) q.set("num_parameters", numParameters);
+  return request<HfSearchCard[]>(`/v1/studio/hf/search?${q.toString()}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +246,7 @@ export interface CatalogSearchParams {
   sort?: CatalogSort;
   pipeline_tag?: string | null;
   author?: string | null;
+  num_parameters?: string | null;
   gguf_only?: boolean;
   limit?: number;
 }
@@ -245,6 +263,7 @@ export function searchCatalog(params: CatalogSearchParams = {}): Promise<Catalog
   if (params.sort) q.set("sort", params.sort);
   if (params.pipeline_tag) q.set("pipeline_tag", params.pipeline_tag);
   if (params.author) q.set("author", params.author);
+  if (params.num_parameters) q.set("num_parameters", params.num_parameters);
   q.set("gguf_only", String(params.gguf_only ?? true));
   if (params.limit != null) q.set("limit", String(params.limit));
   return request<CatalogCard[]>(`/v1/studio/hf/search?${q.toString()}`);
