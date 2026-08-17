@@ -249,7 +249,7 @@ class OpenAICompatibleClient:
             {"role": "user", "content": user_content},
         ]
 
-        def build_payload(style: str) -> dict[str, Any]:
+        def build_payload(style: str, *, force_disable_reasoning: bool = False) -> dict[str, Any]:
             response_format, extra_body = build_response_format(style, schema_name, schema)
             payload: dict[str, Any] = {
                 "model": self.profile.model,
@@ -267,6 +267,13 @@ class OpenAICompatibleClient:
                 merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
                 merged_template_kwargs.update(chat_template_kwargs)
                 payload["chat_template_kwargs"] = merged_template_kwargs
+            if force_disable_reasoning:
+                merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
+                merged_template_kwargs["enable_thinking"] = False
+                payload["chat_template_kwargs"] = merged_template_kwargs
+                payload["reasoning_effort"] = "none"
+            elif (payload.get("chat_template_kwargs") or {}).get("enable_thinking") is False:
+                payload["reasoning_effort"] = "none"
             return payload
 
         logger.debug(
@@ -292,14 +299,22 @@ class OpenAICompatibleClient:
 
         async def operation() -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
             # Walk the negotiation ladder: HTTP/transport failures raise (so the
-            # gateway's transient retry keeps working), but an empty or
-            # unparseable 200 downgrades to the next weaker style instead of
-            # retrying the same one — this is the fix for the empty-content bug.
+            # gateway's transient retry keeps working), while an ordinary empty
+            # or unparseable 200 downgrades to the next weaker style. A response
+            # that exhausted its output budget gets a distinct recovery below.
             last_invalid: InvalidModelResponseError | None = None
-            for position, style in enumerate(ladder):
-                is_last_rung = position == len(ladder) - 1
+            # A length-truncated response with no visible content is not a
+            # response-format failure: llama-server may have spent the entire
+            # budget in reasoning_content. Insert one same-style, reasoning-off
+            # recovery before considering any weaker schema style.
+            attempts = [(style, False) for style in ladder]
+            for position, (style, force_disable_reasoning) in enumerate(attempts):
+                is_last_rung = position == len(attempts) - 1
                 t0 = _time.perf_counter()
-                resp = await self._client.post("/chat/completions", json=build_payload(style))
+                request_payload = build_payload(
+                    style, force_disable_reasoning=force_disable_reasoning
+                )
+                resp = await self._client.post("/chat/completions", json=request_payload)
                 llm_latency_ms = int((_time.perf_counter() - t0) * 1000)
 
                 if resp.status_code >= 400:
@@ -326,7 +341,7 @@ class OpenAICompatibleClient:
                                 "docie_model": self.profile.model,
                                 "docie_schema_name": schema_name,
                                 "docie_from_style": style,
-                                "docie_to_style": ladder[position + 1],
+                                "docie_to_style": attempts[position + 1][0],
                                 "docie_reason": "grammar_compilation_error",
                                 "docie_upstream_error": resp.text[:1000],
                             },
@@ -347,7 +362,8 @@ class OpenAICompatibleClient:
                         "Model endpoint returned invalid JSON"
                     ) from exc
                 try:
-                    content = data["choices"][0]["message"]["content"]
+                    message = data["choices"][0]["message"]
+                    content = message["content"]
                 except (KeyError, IndexError, TypeError) as exc:
                     raise InvalidModelResponseError(
                         f"Unexpected LLM response shape: {data}"
@@ -365,6 +381,10 @@ class OpenAICompatibleClient:
                     content = fix_mojibake(content)
 
                 finish_reason = data.get("choices", [{}])[0].get("finish_reason")
+                reasoning_content = message.get("reasoning_content")
+                reasoning_chars = (
+                    len(reasoning_content) if isinstance(reasoning_content, str) else 0
+                )
                 logger.debug(
                     "llm_response",
                     extra={
@@ -378,39 +398,64 @@ class OpenAICompatibleClient:
                             else {}
                         ),
                         "docie_finish_reason": finish_reason,
+                        "docie_reasoning_chars": reasoning_chars,
                         "docie_usage": data.get("usage"),
                         "docie_llm_latency_ms": llm_latency_ms,
                     },
                 )
-                if (
-                    finish_reason == "length"
-                    and "<think>" in content
-                    and "</think>" not in content
-                ):
-                    # max_tokens is identical across every rung (build_payload
-                    # above), so a different response_format style will not
-                    # fix a token-budget problem -- walking the rest of the
-                    # ladder here would just burn N-1 more real round-trips
-                    # before failing on the last rung anyway (the model will
-                    # very likely truncate again). finish_reason == "length"
-                    # corroborates the unclosed-<think> heuristic that
-                    # _clean_content also acts on (that one still bails safely
-                    # if this stronger, cheaper-to-check-here signal is
-                    # absent). Fail fast with an actionable message instead.
-                    raise InvalidModelResponseError(
-                        f"Generation was cut off by max_tokens "
-                        f"({self.profile.max_tokens}) while {self.profile.model!r} was "
-                        "still reasoning (an unclosed <think> block) -- there is no "
-                        "answer to extract. Raise max_tokens, or disable extended "
-                        "thinking for this profile (no_think / a non-reasoning "
-                        "response_format_style)."
-                    )
                 cleaned = _clean_content(content)
                 try:
                     parsed = json.loads(cleaned)
                     if not isinstance(parsed, dict):
                         raise InvalidModelResponseError("Model returned JSON that is not an object")
                 except (json.JSONDecodeError, InvalidModelResponseError) as exc:
+                    unclosed_think = "<think>" in content and "</think>" not in content
+                    output_budget_exhausted = finish_reason == "length" and (
+                        not cleaned.strip() or unclosed_think
+                    )
+                    if output_budget_exhausted:
+                        reasoning_already_disabled = (
+                            force_disable_reasoning
+                            or request_payload.get("reasoning_effort") == "none"
+                        )
+                        if not reasoning_already_disabled:
+                            attempts.insert(position + 1, (style, True))
+                            logger.warning(
+                                "structured-output reasoning recovery",
+                                extra={
+                                    "docie_step": "reasoning_recovery",
+                                    "docie_model_profile": self.profile.name,
+                                    "docie_model": self.profile.model,
+                                    "docie_schema_name": schema_name,
+                                    "docie_response_format_style": style,
+                                    "docie_reason": "output_budget_exhausted",
+                                    "docie_action": "disable_reasoning",
+                                    "docie_reasoning_chars": reasoning_chars,
+                                    "docie_completion_tokens": (data.get("usage") or {}).get(
+                                        "completion_tokens"
+                                    ),
+                                },
+                            )
+                            continue
+                        logger.error(
+                            "structured-output reasoning recovery exhausted",
+                            extra={
+                                "docie_step": "reasoning_recovery_exhausted",
+                                "docie_model_profile": self.profile.name,
+                                "docie_model": self.profile.model,
+                                "docie_schema_name": schema_name,
+                                "docie_response_format_style": style,
+                                "docie_reason": "output_budget_exhausted",
+                                "docie_reasoning_chars": reasoning_chars,
+                                "docie_completion_tokens": (data.get("usage") or {}).get(
+                                    "completion_tokens"
+                                ),
+                            },
+                        )
+                        raise InvalidModelResponseError(
+                            f"Generation exhausted max_tokens ({self.profile.max_tokens}) "
+                            "with no usable answer even after reasoning was disabled"
+                        ) from exc
                     invalid_reason = (
                         "empty_content" if not cleaned.strip() else "unparseable_content"
                     )
@@ -431,7 +476,7 @@ class OpenAICompatibleClient:
                             "docie_model": self.profile.model,
                             "docie_schema_name": schema_name,
                             "docie_from_style": style,
-                            "docie_to_style": ladder[position + 1],
+                            "docie_to_style": attempts[position + 1][0],
                             "docie_reason": "empty_or_unparseable_content",
                             "docie_invalid_reason": invalid_reason,
                             "docie_finish_reason": finish_reason,

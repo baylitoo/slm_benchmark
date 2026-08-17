@@ -324,17 +324,18 @@ async def test_singleton_style_does_not_downgrade_and_raises() -> None:
     assert client.last_response_format_style is None
 
 
-async def test_truncated_think_with_finish_reason_length_fails_fast() -> None:
-    # max_tokens is the same on every rung (build_payload), so if the model
-    # truncates mid-reasoning on one style it will almost certainly truncate
-    # on the others too -- walking the whole ladder would just burn real
-    # round-trips before failing anyway. finish_reason == "length" plus an
-    # unclosed <think> must raise on the FIRST attempt, no downgrade.
-    calls = 0
+async def test_truncated_think_with_finish_reason_recovers_without_reasoning() -> None:
+    # A token-budget failure is not a response-format failure. Retry the same
+    # schema once with both llama-server reasoning-off controls, then parse it.
+    requests: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
+        import json
+
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload.get("reasoning_effort") == "none":
+            return _completion('{"invoice_number": "INV-1"}')
         return httpx.Response(
             200,
             json={
@@ -355,12 +356,46 @@ async def test_truncated_think_with_finish_reason_length_fails_fast() -> None:
 
     client = await _client(_profile(capability_discovery="disabled"), handler)
     try:
-        with pytest.raises(InvalidModelResponseError, match="max_tokens"):
+        result = await _chat(client)
+    finally:
+        await client.aclose()
+    assert result == {"invoice_number": "INV-1"}
+    assert len(requests) == 2
+    assert requests[0].get("reasoning_effort") is None
+    assert requests[1]["reasoning_effort"] == "none"
+    assert requests[1]["chat_template_kwargs"]["enable_thinking"] is False
+    assert requests[0]["response_format"] == requests[1]["response_format"]
+
+
+async def test_empty_length_fails_after_single_reasoning_off_recovery() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "", "reasoning_content": "still thinking"},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 900, "total_tokens": 901},
+            },
+        )
+
+    client = await _client(_profile(capability_discovery="disabled"), handler)
+    try:
+        with pytest.raises(InvalidModelResponseError, match="reasoning was disabled"):
             await _chat(client)
     finally:
         await client.aclose()
-    # No ladder downgrade: this fails fast on the very first rung.
-    assert calls == 1
+    assert len(requests) == 2
+    assert requests[1]["reasoning_effort"] == "none"
+    assert requests[0]["response_format"] == requests[1]["response_format"]
 
 
 async def test_truncated_think_without_length_finish_reason_still_downgrades() -> None:
