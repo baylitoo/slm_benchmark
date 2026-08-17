@@ -61,7 +61,8 @@ def test_anonymize_shares_placeholders_across_calls() -> None:
     mapping: dict[str, str] = {}
     first, _ = pii.anonymize("a jean@acme.fr", pii.analyze("a jean@acme.fr"), placeholders=mapping)
     second, _ = pii.anonymize("b jean@acme.fr", pii.analyze("b jean@acme.fr"), placeholders=mapping)
-    assert "[EMAIL_1]" in first and "[EMAIL_1]" in second
+    assert "[EMAIL_1]" in first
+    assert "[EMAIL_1]" in second
 
 
 # ── registry ─────────────────────────────────────────────────────────────────
@@ -111,7 +112,7 @@ UPSTREAM = ModelProfile(
 )
 
 
-@pytest.fixture()
+@pytest.fixture
 def api(tmp_path, monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
     monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
 
@@ -175,218 +176,31 @@ def test_resolve_ocr_mode_derives_and_honors_explicit() -> None:
     assert _resolve_ocr_mode({"mode": "bogus"}) == "ocr"  # unknown → derive
 
 
-def test_inject_response_format_unknown_schema_raises() -> None:
-    from docie_bench.agents.runtime import AgentError, _inject_response_format
-
-    with pytest.raises(AgentError):
-        _inject_response_format({}, "not-a-real-schema")
-
-
-def test_inject_response_format_builds_json_schema() -> None:
-    from docie_bench.agents.runtime import _inject_response_format
-
-    body: dict = {}
-    _inject_response_format(body, "invoice")
-    rf = body["response_format"]
-    assert rf["type"] == "json_schema"
-    assert rf["json_schema"]["name"] == "invoice"
-    assert rf["json_schema"]["strict"] is True
-    schema = rf["json_schema"]["schema"]
-    assert isinstance(schema, dict)
-    assert schema["required"] == list(schema["properties"])
-
-
-def test_inject_response_format_builds_saved_dynamic_schema(
-    monkeypatch: pytest.MonkeyPatch,
+def test_ocr_agent_vision_mode_uses_shared_extraction_pipeline(
+    api, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from docie_bench.agents.runtime import _inject_response_format
-    from docie_bench.studio import dynamic_schemas
+    from docie_bench.extract.service import ExtractionService
+    from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation
 
-    monkeypatch.setattr(
-        dynamic_schemas,
-        "get_dynamic_schema",
-        lambda name: {
-            "name": name,
-            "spec": {
-                "document_type": name,
-                "fields": [
-                    {"name": "full_name", "type": "string"},
-                    {
-                        "name": "addresses",
-                        "type": "list",
-                        "fields": [{"name": "city", "type": "string"}],
-                    },
-                ],
-            },
-        },
-    )
+    client, _captured = api
+    extracted: list[dict] = []
 
-    body: dict = {}
-    _inject_response_format(body, "contact_record")
-
-    response_format = body["response_format"]
-    schema = response_format["json_schema"]["schema"]
-    assert response_format["json_schema"]["name"] == "contact_record"
-    assert set(schema["properties"]) == {"full_name", "addresses"}
-    assert "evidence_ids" not in json.dumps(schema)
-
-
-def _completion(model: str, content: str = "{}") -> dict:
-    return {
-        "id": "c",
-        "object": "chat.completion",
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
-    }
-
-
-async def test_schema_fallback_downgrades_on_grammar_400() -> None:
-    # llama.cpp fails to compile a deep schema's grammar (400 "failed to parse
-    # grammar"); the vision forward downgrades json_schema -> json_object.
-    from docie_bench.agents.runtime import _post_chat_with_schema
-
-    seen: list[dict | None] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        seen.append(body.get("response_format"))
-        rf = body.get("response_format") or {}
-        if rf.get("type") == "json_schema":
-            return httpx.Response(
-                400,
-                json={"error": {"message": "failed to parse grammar"}},
-            )
-        return httpx.Response(200, json=_completion(body["model"]))
-
-    msgs = {"messages": [{"role": "user", "content": "x"}]}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await _post_chat_with_schema(
-            UPSTREAM, msgs, "invoice", http_client=client
+    async def fake_extract(self: ExtractionService, **kwargs: object) -> ExtractionResponse:
+        path = kwargs["path"]
+        assert hasattr(path, "read_bytes")
+        extracted.append({"profile": self.profile, "bytes": path.read_bytes(), **kwargs})
+        return ExtractionResponse(
+            request_id="shared-path",
+            schema_name="invoice",
+            model_profile=self.profile.name,
+            document_hash="sha256:test",
+            result={"document_type": "invoice", "invoice_number": None},
+            validation=ExtractionValidation(valid=True),
+            latency_ms=1,
+            response_format_style="openai_json_schema",
         )
-    # Ladder: grammar+prefill, grammar (no prefill), then json_object.
-    assert [s and s["type"] for s in seen] == ["json_schema", "json_schema", "json_object"]
-    assert result["choices"][0]["message"]["content"] == "{}"
 
-
-async def test_schema_fallback_grammar_without_prefill_on_sampler_400() -> None:
-    # Some models fail grammar-SAMPLER init only when the assistant turn is
-    # prefilled ("Failed to initialize samplers"). The ladder then retries the
-    # SAME grammar without the prefill — keeping schema enforcement — before
-    # dropping to json_object. Verified live on lfm2.5-vl-1.6b-extract.
-    from docie_bench.agents.runtime import _post_chat_with_schema
-
-    seen: list[dict] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        seen.append(body)
-        prefilled = (body.get("messages") or [])[-1:] == [{"role": "assistant", "content": "{"}]
-        if body.get("response_format", {}).get("type") == "json_schema" and prefilled:
-            return httpx.Response(
-                400, json={"error": {"message": "Failed to initialize samplers: std::exception"}}
-            )
-        return httpx.Response(200, json=_completion(body["model"]))
-
-    msgs = {"messages": [{"role": "user", "content": "x"}]}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
-    # 1st = grammar + prefill (400 sampler), 2nd = grammar WITHOUT prefill (200).
-    assert seen[0]["response_format"]["type"] == "json_schema"
-    assert seen[0]["messages"][-1] == {"role": "assistant", "content": "{"}
-    assert seen[1]["response_format"]["type"] == "json_schema"  # grammar KEPT
-    assert seen[1]["messages"][-1] != {"role": "assistant", "content": "{"}  # no prefill
-    assert len(seen) == 2  # no need to reach json_object
-
-
-async def test_schema_instruction_names_fields_in_prompt() -> None:
-    # The schema's fields must ride in the PROMPT (a system message), so the model
-    # knows what to extract even under json_object — not just echo "OCR" garbage.
-    from docie_bench.agents.runtime import _post_chat_with_schema
-
-    sent: list[dict] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        sent.append(json.loads(request.content))
-        return httpx.Response(200, json=_completion(json.loads(request.content)["model"]))
-
-    msgs = {"messages": [{"role": "user", "content": "x"}]}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
-
-    first = sent[0]["messages"][0]
-    assert first["role"] == "system"
-    assert "invoice_number" in first["content"]  # real invoice fields named
-    assert "total_ttc" in first["content"]
-
-
-async def test_schema_fallback_reraises_non_grammar_400() -> None:
-    # A 400 that is NOT a grammar/response_format problem must NOT be swallowed.
-    from docie_bench.agents.runtime import AgentError, _post_chat_with_schema
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"error": {"message": "context length exceeded"}})
-
-    msgs = {"messages": [{"role": "user", "content": "x"}]}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(AgentError) as exc:
-            await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
-    assert exc.value.status_code == 400
-    assert "context length" in str(exc.value)
-
-
-async def test_schema_fallback_downgrades_on_empty_200_content() -> None:
-    # The small-Ollama-and-friends defect: a strong response_format style
-    # compiles fine (200, not 400) but the model emits nothing. Before this
-    # fix, the agent forward accepted that as a "successful" empty
-    # completion on the very first attempt -- openai_client.chat_json's
-    # ladder already treats this as downgradable; the agent path needs its
-    # own check since it forwards through _post_chat directly.
-    from docie_bench.agents.runtime import _post_chat_with_schema
-
-    seen: list[dict | None] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        rf = body.get("response_format")
-        seen.append(rf)
-        if rf and rf.get("type") == "json_schema":
-            return httpx.Response(200, json=_completion(body["model"], content=""))
-        return httpx.Response(200, json=_completion(body["model"], content='{"ok":true}'))
-
-    msgs = {"messages": [{"role": "user", "content": "x"}]}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
-    # Both json_schema attempts (prefill, no-prefill) came back empty ->
-    # downgraded to json_object, which answered.
-    assert [s and s["type"] for s in seen] == ["json_schema", "json_schema", "json_object"]
-    assert result["choices"][0]["message"]["content"] == '{"ok":true}'
-
-
-async def test_schema_fallback_raises_when_every_rung_is_empty() -> None:
-    # Even the unconstrained final rung came back empty: there is no weaker
-    # style left, so this must raise rather than hand back an empty
-    # "successful" completion.
-    from docie_bench.agents.runtime import AgentError, _post_chat_with_schema
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        return httpx.Response(200, json=_completion(body["model"], content=""))
-
-    msgs = {"messages": [{"role": "user", "content": "x"}]}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(AgentError) as exc:
-            await _post_chat_with_schema(UPSTREAM, msgs, "invoice", http_client=client)
-    assert "empty content" in str(exc.value)
-
-
-def test_ocr_agent_vision_mode_forwards_image_with_schema(api) -> None:
-    client, captured = api
+    monkeypatch.setattr(ExtractionService, "extract_from_file", fake_extract)
     created = client.post(
         "/v1/agents",
         json={
@@ -413,22 +227,128 @@ def test_ocr_agent_vision_mode_forwards_image_with_schema(api) -> None:
         },
     )
     assert resp.status_code == 200, resp.text
-    sent = json.loads(captured[-1].content)
-    # Forwarded to the VISION deployment, not the agent name.
-    assert sent["model"] == "gemma-vl"
-    # Schema injected as response_format (GBNF structuring).
-    assert sent["response_format"]["json_schema"]["name"] == "invoice"
-    # The image reaches the model untouched (no OCR step).
-    # The schema-constrained call prefills an assistant "{" (suppresses a
-    # reasoning ramble); the image rides the user turn just before it.
-    assert sent["messages"][-1] == {"role": "assistant", "content": "{"}
-    assert any(
-        isinstance(part, dict) and part.get("type") == "image_url"
-        for message in sent["messages"]
-        if isinstance(message.get("content"), list)
-        for part in message["content"]
+    assert len(extracted) == 1
+    assert extracted[0]["bytes"] == b"\x00\x00\x00"
+    assert extracted[0]["ocr_backend_name"] == "vision"
+    assert extracted[0]["schema_name"] == "invoice"
+    payload = resp.json()
+    assert payload["model"] == "gemma-vl"
+    assert json.loads(payload["choices"][0]["message"]["content"])["invoice_number"] is None
+    assert payload["docie_agent"]["mode"] == "vision"
+    assert payload["docie_agent"]["validation"]["valid"] is True
+
+
+def test_ocr_extract_agent_uses_shared_extraction_pipeline(
+    api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.extract.service import ExtractionService
+    from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation
+
+    client, _captured = api
+    extracted: list[dict] = []
+
+    async def fake_extract(self: ExtractionService, **kwargs: object) -> ExtractionResponse:
+        extracted.append(
+            {
+                "profile": self.profile,
+                "profiles": self.profiles,
+                "disable_thinking": self.disable_thinking,
+                **kwargs,
+            }
+        )
+        return ExtractionResponse(
+            request_id="shared-ocr-path",
+            schema_name="invoice",
+            model_profile=self.profile.name,
+            document_hash="sha256:test",
+            result={"document_type": "invoice", "invoice_number": {"value": "INV-7"}},
+            validation=ExtractionValidation(valid=True),
+            latency_ms=1,
+            response_format_style="json_object",
+        )
+
+    monkeypatch.setattr(ExtractionService, "extract_from_file", fake_extract)
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "doc-ocr-extract",
+            "kind": "ocr",
+            "options": {
+                "mode": "ocr_extract",
+                "extractor": "lfm2.5",
+                "backend": "liteparse",
+                "schema": "invoice",
+                "no_think": True,
+            },
+        },
     )
-    assert resp.json()["docie_agent"]["mode"] == "vision"
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/v1/agents/doc-ocr-extract/chat/completions",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "extract structured data"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(extracted) == 1
+    call = extracted[0]
+    assert call["profile"].kind == "pipeline"
+    assert call["profile"].options["extractor"] == "lfm2.5"
+    assert "lfm2.5" in call["profiles"]
+    assert call["ocr_backend_name"] == "liteparse"
+    assert call["disable_thinking"] is True
+    payload = resp.json()
+    assert payload["model"] == "lfm2.5"
+    content = json.loads(payload["choices"][0]["message"]["content"])
+    assert content["invoice_number"] == "INV-7"
+
+
+def test_shared_extraction_result_keeps_agent_flat_contract() -> None:
+    from docie_bench.agents.runtime import _flatten_agent_result
+
+    assert _flatten_agent_result(
+        {
+            "document_type": "invoice",
+            "invoice_number": {
+                "value": "INV-7",
+                "evidence_ids": ["p1-b2"],
+                "confidence": 0.9,
+            },
+            "total_ttc": {
+                "amount": "12.50",
+                "currency": "EUR",
+                "evidence_ids": ["p1-b9"],
+                "confidence": 0.8,
+            },
+            "line_items": [
+                {
+                    "description": {
+                        "value": "Service",
+                        "evidence_ids": ["p1-b5"],
+                        "confidence": 0.7,
+                    }
+                }
+            ],
+            "extraction_notes": [],
+        }
+    ) == {
+        "invoice_number": "INV-7",
+        "total_ttc": {"amount": "12.50", "currency": "EUR"},
+        "line_items": [{"description": "Service"}],
+    }
 
 
 def test_templates_listed(api) -> None:

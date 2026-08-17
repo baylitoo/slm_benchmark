@@ -230,6 +230,7 @@ class OpenAICompatibleClient:
         schema_name: str,
         schema: dict[str, Any],
         image_urls: list[str] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         import time as _time
 
@@ -262,6 +263,10 @@ class OpenAICompatibleClient:
             if self.profile.stop_sequences:
                 payload["stop"] = list(self.profile.stop_sequences)
             payload.update(extra_body)
+            if chat_template_kwargs:
+                merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
+                merged_template_kwargs.update(chat_template_kwargs)
+                payload["chat_template_kwargs"] = merged_template_kwargs
             return payload
 
         logger.debug(

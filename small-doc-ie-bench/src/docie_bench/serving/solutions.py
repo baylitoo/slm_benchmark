@@ -26,17 +26,14 @@ import httpx
 
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
+from docie_bench.llm.prompts import (
+    OCR_PIPELINE_SYSTEM_PROMPT,
+    OCR_TRANSCRIPTION_SYSTEM_PROMPT,
+    OCR_TRANSCRIPTION_USER_PROMPT,
+)
 from docie_bench.ocr.factory import get_ocr_backend
 from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
-
-# OCR instruction for a VLM used as the pipeline's OCR step (image -> text). It
-# must transcribe, NOT summarise or answer — the extractor does the reasoning.
-_VLM_OCR_PROMPT = (
-    "Transcribe ALL text in this document image, verbatim and in reading order. "
-    "Output only the transcribed text — no commentary, no markdown, no analysis."
-)
-
 
 # Document extraction (OCR text -> JSON, or image -> text) on a CPU box is slow:
 # a multi-page invoice easily generates 1k+ grammar-constrained tokens at single
@@ -278,8 +275,16 @@ class PipelineSolution:
         llm_request: dict[str, Any] = {
             **request,
             "model": self.extractor.model,
-            "messages": _inject_ocr_text(request.get("messages") or [], text),
+            "messages": [
+                {"role": "system", "content": OCR_PIPELINE_SYSTEM_PROMPT},
+                *_inject_ocr_text(request.get("messages") or [], text),
+            ],
         }
+        llm_request.setdefault("temperature", self.extractor.temperature)
+        llm_request.setdefault("top_p", self.extractor.top_p)
+        llm_request.setdefault("max_tokens", self.extractor.max_tokens)
+        if self.extractor.stop_sequences:
+            llm_request.setdefault("stop", list(self.extractor.stop_sequences))
         llm_request.pop("stream", None)  # the gateway re-streams the final completion
         if self.no_think:
             apply_no_think(llm_request)
@@ -347,13 +352,18 @@ class PipelineSolution:
             raise SolutionError(
                 str(exc), status_code=400, error_type="invalid_request_error"
             ) from exc
-        content: list[dict[str, Any]] = [{"type": "text", "text": _VLM_OCR_PROMPT}]
-        content += [
+        ocr_parts: list[dict[str, Any]] = [
+            {"type": "text", "text": OCR_TRANSCRIPTION_USER_PROMPT}
+        ]
+        ocr_parts += [
             {"type": "image_url", "image_url": {"url": image.data_url()}} for image in images
         ]
         ocr_request: dict[str, Any] = {
             "model": vision.model,
-            "messages": [{"role": "user", "content": content}],
+            "messages": [
+                {"role": "system", "content": OCR_TRANSCRIPTION_SYSTEM_PROMPT},
+                {"role": "user", "content": ocr_parts},
+            ],
             "temperature": 0,
         }
         if self.no_think:

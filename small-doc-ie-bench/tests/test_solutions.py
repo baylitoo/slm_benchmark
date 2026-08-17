@@ -244,8 +244,11 @@ async def test_pipeline_vlm_ocr_then_llm_fixes_mojibake(
     # OCR step went to the vision deployment carrying the RASTERIZED PNG page
     # image (never the original document URI — the whole point of the fix).
     assert seen["ocr"]["model"] == "up-vlm"
-    ocr_content = seen["ocr"]["messages"][0]["content"]
+    assert seen["ocr"]["messages"][0]["role"] == "system"
+    assert "OCR transcription engine" in seen["ocr"]["messages"][0]["content"]
+    ocr_content = seen["ocr"]["messages"][1]["content"]
     assert ocr_content[0]["type"] == "text"  # the OCR instruction
+    assert "Transcribe all visible text" in ocr_content[0]["text"]
     image_urls = [p["image_url"]["url"] for p in ocr_content if p.get("type") == "image_url"]
     assert image_urls == [
         DocumentImage(page=1, media_type="image/png", data=b"PNGBYTES").data_url()

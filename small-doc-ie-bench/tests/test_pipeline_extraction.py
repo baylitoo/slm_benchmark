@@ -251,8 +251,11 @@ async def test_pipeline_vlm_ocr_transcribes_then_delegates_to_extractor(
     assert len(http_client.calls) == 1
     sent = http_client.calls[0]["json"]
     assert sent["model"] == "vision-model"
-    content = sent["messages"][0]["content"]
+    assert sent["messages"][0]["role"] == "system"
+    assert "OCR transcription engine" in sent["messages"][0]["content"]
+    content = sent["messages"][1]["content"]
     assert content[0]["type"] == "text"
+    assert "Transcribe all visible text" in content[0]["text"]
     assert "Transcribe" in content[0]["text"]
     assert content[1]["type"] == "image_url"
     # The vision model's transcription became the extractor's input text --
