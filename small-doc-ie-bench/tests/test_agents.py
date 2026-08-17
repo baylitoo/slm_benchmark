@@ -194,6 +194,41 @@ def test_inject_response_format_builds_json_schema() -> None:
     assert isinstance(rf["json_schema"]["schema"], dict)
 
 
+def test_inject_response_format_builds_saved_dynamic_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from docie_bench.agents.runtime import _inject_response_format
+    from docie_bench.studio import dynamic_schemas
+
+    monkeypatch.setattr(
+        dynamic_schemas,
+        "get_dynamic_schema",
+        lambda name: {
+            "name": name,
+            "spec": {
+                "document_type": name,
+                "fields": [
+                    {"name": "full_name", "type": "string"},
+                    {
+                        "name": "addresses",
+                        "type": "list",
+                        "fields": [{"name": "city", "type": "string"}],
+                    },
+                ],
+            },
+        },
+    )
+
+    body: dict = {}
+    _inject_response_format(body, "contact_record")
+
+    response_format = body["response_format"]
+    schema = response_format["json_schema"]["schema"]
+    assert response_format["json_schema"]["name"] == "contact_record"
+    assert set(schema["properties"]) == {"full_name", "addresses"}
+    assert "evidence_ids" not in json.dumps(schema)
+
+
 def _completion(model: str, content: str = "{}") -> dict:
     return {
         "id": "c",
