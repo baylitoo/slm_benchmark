@@ -435,6 +435,17 @@ export const FR_MESSAGES: Record<string, string> = {
   "Stage a deployment mix — the server sizes it with the same footprint math and margin used at deploy time.": "Préparez un ensemble de déploiements — le serveur le dimensionne avec le même calcul d’empreinte et la même marge qu’au déploiement.",
   "Instances": "Instances",
   "Context length": "Longueur de contexte",
+  "Context window": "Fenêtre de contexte",
+  "Edit deployment": "Modifier le déploiement",
+  "Edit deployment runtime settings": "Modifier les paramètres d’exécution du déploiement",
+  "Apply and restart": "Appliquer et redémarrer",
+  "Deployment update requested": "Mise à jour du déploiement demandée",
+  "A running deployment restarts on the same port. Requests may be briefly unavailable while the model reloads.":
+    "Un déploiement actif redémarre sur le même port. Les requêtes peuvent être brièvement indisponibles pendant le rechargement du modèle.",
+  "Cannot exceed the model's supported context. Larger windows reserve more RAM.":
+    "Ne peut pas dépasser le contexte pris en charge par le modèle. Les fenêtres plus grandes réservent davantage de mémoire vive.",
+  "Optional. Blank restores the model-family default; agents and requests can override it.":
+    "Facultatif. Une valeur vide restaure la valeur par défaut de la famille du modèle ; les agents et les requêtes peuvent la remplacer.",
   "Default max output tokens": "Nombre maximal de jetons de sortie par défaut",
   "Max output tokens": "Nombre maximal de jetons de sortie",
   "Optional. Agents inherit this unless they or a request override it.":

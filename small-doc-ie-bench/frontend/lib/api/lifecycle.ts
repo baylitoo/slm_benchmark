@@ -52,6 +52,24 @@ export function repairDeployment(
   );
 }
 
+export interface DeploymentUpdate {
+  context_length: number;
+  /** Null clears the deployment override and restores the family default. */
+  max_tokens: number | null;
+}
+
+/** Replace editable launch defaults in place. A hot runtime is restarted on
+ * its existing port; a stopped/offloaded deployment remains stopped. */
+export function updateDeployment(
+  name: string,
+  update: DeploymentUpdate,
+): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/deployments/${encodeURIComponent(name)}`,
+    { method: "PATCH", body: JSON.stringify(update) },
+  );
+}
+
 /** A deployment's runtime log tail (GET /v1/serving/deployments/{name}/logs). */
 export interface DeploymentLogs {
   name: string;

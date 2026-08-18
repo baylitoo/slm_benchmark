@@ -251,9 +251,15 @@ class PersistentSupervisor:
     def deploy(self, spec: DeploymentSpec) -> DeploymentRecord:
         with self._lock:
             current = self._records.get(spec.name)
-            if current is not None and current.spec.launch != spec.launch:
+            previous = current
+            launch_changed = current is not None and current.spec.launch != spec.launch
+            if launch_changed:
                 if current.pid is not None:
                     self.adapters[current.spec.launch.runtime].shutdown(current.pid)
+                # Runtime state cannot survive a changed launch, but record
+                # identity can: edit/repair must retain the operator's pin and
+                # managed/offloaded policy while starting with a fresh process
+                # and restart budget.
                 current = None
             self._records[spec.name] = DeploymentRecord(
                 spec=spec,
@@ -267,9 +273,9 @@ class PersistentSupervisor:
                 last_error=current.last_error if current else None,
                 updated_at=self._clock(),
                 pid_create_time=current.pid_create_time if current else None,
-                activation=current.activation if current else Activation.MANUAL,
-                pinned=current.pinned if current else False,
-                last_served=current.last_served if current else None,
+                activation=previous.activation if previous else Activation.MANUAL,
+                pinned=previous.pinned if previous else False,
+                last_served=previous.last_served if previous else None,
                 loaded_at=current.loaded_at if current else None,
             )
             self._save()

@@ -8,6 +8,7 @@ import {
   Layers,
   Pin,
   PinOff,
+  Pencil,
   RefreshCw,
   Trash2,
 } from "lucide-react";
@@ -19,6 +20,7 @@ import {
   deleteDeployment,
   scaleStoreModel,
   repairDeployment,
+  updateDeployment,
   getDeploymentLogs,
   deploymentModelType,
   formatBytes,
@@ -33,7 +35,7 @@ import { cn } from "@/lib/cn";
 import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
-import { Alert, Badge, Button, Card, Field, Segmented, TextInput } from "../ui";
+import { Alert, Badge, Button, Card, Dialog, Field, Segmented, TextInput } from "../ui";
 import { LiveIndicator } from "../LiveIndicator";
 import { Toolbar } from "../patterns/Toolbar";
 import { ResultLine } from "../patterns/ResultLine";
@@ -421,6 +423,63 @@ export function DeploymentsView({
   // One in-flight lifecycle action at a time, keyed "name:action" so exactly
   // the pressed button shows its spinner.
   const [busy, setBusy] = useState<string | null>(null);
+  const [editing, setEditing] = useState<DeploymentRecord | null>(null);
+  const [editContextLength, setEditContextLength] = useState("");
+  const [editMaxTokens, setEditMaxTokens] = useState("");
+  const [editError, setEditError] = useState<string | null>(null);
+
+  function openEditor(record: DeploymentRecord) {
+    setEditing(record);
+    setEditContextLength(String(record.spec?.launch?.context_length ?? 8192));
+    setEditMaxTokens(
+      record.spec?.launch?.max_tokens != null
+        ? String(record.spec.launch.max_tokens)
+        : "",
+    );
+    setEditError(null);
+  }
+
+  async function saveDeployment() {
+    const name = editing?.spec?.name;
+    if (!name) return;
+    const contextLength = Number(editContextLength);
+    const maxTokens = editMaxTokens.trim() ? Number(editMaxTokens) : null;
+    if (!Number.isInteger(contextLength) || contextLength < 128 || contextLength > 1_048_576) {
+      setEditError("Context window must be an integer between 128 and 1,048,576 tokens.");
+      return;
+    }
+    if (
+      maxTokens != null &&
+      (!Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 131_072)
+    ) {
+      setEditError("Max output tokens must be an integer between 1 and 131,072.");
+      return;
+    }
+    setBusy(`${name}:edit`);
+    setEditError(null);
+    try {
+      await updateDeployment(name, {
+        context_length: contextLength,
+        max_tokens: maxTokens,
+      });
+      toast({
+        title: "Deployment update requested",
+        description: `${name} · ${contextLength.toLocaleString()} token context`,
+        tone: "success",
+      });
+      setEditing(null);
+      deployments.refresh();
+    } catch (err) {
+      setEditError(
+        toUserMessage(err, {
+          unavailable: "Deployment editing isn't available on this server.",
+          fallback: "Could not update the deployment.",
+        }),
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
 
   async function act(name: string, action: LifecycleAction, port?: number | null) {
     if (
@@ -642,6 +701,15 @@ export function DeploymentsView({
             <Button
               size="sm"
               variant="ghost"
+              disabled={busy !== null}
+              title="Edit deployment runtime settings"
+              onClick={() => openEditor(r)}
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
               loading={busy === `${name}:pin` || busy === `${name}:unpin`}
               disabled={busy !== null}
               title={
@@ -780,6 +848,85 @@ export function DeploymentsView({
           ) : null
         }
       />
+
+      <Dialog
+        open={editing !== null}
+        onClose={() => {
+          if (busy?.endsWith(":edit")) return;
+          setEditing(null);
+          setEditError(null);
+        }}
+        title="Edit deployment"
+        subtitle={editing?.spec?.name}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => setEditing(null)}
+              disabled={busy?.endsWith(":edit")}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={saveDeployment}
+              loading={busy === `${editing?.spec?.name}:edit`}
+            >
+              Apply and restart
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <Alert tone="warn">
+            <T>A running deployment restarts on the same port. Requests may be briefly unavailable while the model reloads.</T>
+          </Alert>
+          <dl className="grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <dt className="text-muted-foreground"><T>Model</T></dt>
+              <dd className="mt-0.5 truncate font-mono text-foreground">
+                {editing?.spec?.launch?.alias ?? editing?.spec?.launch?.model ?? "—"}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground"><T>Runtime</T></dt>
+              <dd className="mt-0.5 font-mono text-foreground">
+                {editing?.spec?.launch?.runtime ?? "—"}
+              </dd>
+            </div>
+          </dl>
+          <Field
+            label="Context window"
+            htmlFor="edit-deployment-context"
+            hint="Cannot exceed the model's supported context. Larger windows reserve more RAM."
+          >
+            <TextInput
+              id="edit-deployment-context"
+              type="number"
+              min={128}
+              max={1_048_576}
+              step={128}
+              value={editContextLength}
+              onChange={(e) => setEditContextLength(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Default max output tokens"
+            htmlFor="edit-deployment-max-tokens"
+            hint="Optional. Blank restores the model-family default; agents and requests can override it."
+          >
+            <TextInput
+              id="edit-deployment-max-tokens"
+              type="number"
+              min={1}
+              max={131_072}
+              value={editMaxTokens}
+              onChange={(e) => setEditMaxTokens(e.target.value)}
+              placeholder="family default"
+            />
+          </Field>
+          {editError && <Alert tone="err">{editError}</Alert>}
+        </div>
+      </Dialog>
     </div>
   );
 }
