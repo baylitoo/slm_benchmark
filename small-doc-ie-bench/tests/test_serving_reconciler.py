@@ -637,6 +637,7 @@ def test_role_partition_is_disjoint_and_complete() -> None:
         "serving-load",
         "serving-unload",
         "serving-repair",
+        "serving-reconfigure",
         "serving-pin",
     }
     assert worker_ids == {"doc-extract", "benchmark-run", "studio-runs-gc"}

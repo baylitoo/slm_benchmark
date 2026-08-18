@@ -100,7 +100,7 @@ export interface DeploymentRecord {
       host?: string;
       port?: number;
       context_length?: number;
-      max_tokens?: number;
+      max_tokens?: number | null;
       [k: string]: unknown;
     };
     desired_state?: string;

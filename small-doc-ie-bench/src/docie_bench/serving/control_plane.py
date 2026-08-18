@@ -246,6 +246,14 @@ class Supervisor(Protocol):
 
     def repair(self, name: str, *, port: int | None) -> Result: ...
 
+    def reconfigure(
+        self,
+        name: str,
+        *,
+        context_length: int,
+        max_tokens: int | None,
+    ) -> Result: ...
+
     def pin(self, name: str, *, pinned: bool) -> Result: ...
 
 
@@ -477,6 +485,27 @@ class ControlPlane:
         """
         result = await asyncio.to_thread(
             self.supervisor.repair, _required(name, "deployment"), port=port
+        )
+        return to_data(await _resolve(result))
+
+    async def reconfigure(
+        self,
+        name: str,
+        *,
+        context_length: int,
+        max_tokens: int | None,
+    ) -> object:
+        """Replace editable launch defaults while preserving deployment identity.
+
+        A running deployment is restarted on its existing port. A stopped or
+        managed/offloaded deployment keeps its desired state and is only
+        updated on disk, so editing configuration never unexpectedly loads it.
+        """
+        result = await asyncio.to_thread(
+            self.supervisor.reconfigure,
+            _required(name, "deployment"),
+            context_length=context_length,
+            max_tokens=max_tokens,
         )
         return to_data(await _resolve(result))
 
@@ -1042,6 +1071,62 @@ class _DefaultSupervisor:
         )
         # Keep store:<name> resolvable after the port move (endpoint changed).
         record_placement(name, result)
+        return result
+
+    def reconfigure(
+        self,
+        name: str,
+        *,
+        context_length: int,
+        max_tokens: int | None,
+    ) -> object:
+        """Apply editable launch defaults to an existing deployment in place.
+
+        The launch equality check in ``PersistentSupervisor.deploy`` performs
+        the actual process replacement. Reusing the existing ``DeploymentSpec``
+        preserves restart policy and desired state; only the two operator-facing
+        defaults change. Running deployments wait for the replacement to become
+        ready, while stopped/offloaded deployments remain stopped.
+        """
+        from docie_bench.serving.runtime import LifecycleState
+        from docie_bench.serving.supervisor import DesiredState
+
+        record = self.backend.get(name)
+        old_spec = record.spec
+        old_launch = old_spec.launch
+        launch = replace(
+            old_launch,
+            context_length=context_length,
+            max_tokens=max_tokens,
+        )
+        spec = replace(old_spec, launch=launch)
+        try:
+            result = self.backend.deploy(spec)
+            if spec.desired_state == DesiredState.RUNNING:
+                result = self.backend.await_ready(spec.name)
+                if result.state == LifecycleState.FAILED:
+                    raise RuntimeError(
+                        result.last_error
+                        or f"deployment {name!r} rejected the updated launch settings"
+                    )
+        except Exception:
+            # Context support varies by model, and a larger KV cache may also
+            # exceed current RAM. A failed edit must not strand a previously
+            # healthy deployment on the rejected launch: restore its exact old
+            # spec and bring it back to the state it had before the edit.
+            logger.exception(
+                "deployment %r rejected reconfiguration; restoring previous launch",
+                name,
+            )
+            rollback = self.backend.deploy(old_spec)
+            if old_spec.desired_state == DesiredState.RUNNING:
+                rollback = self.backend.await_ready(old_spec.name)
+            record_placement(str(old_launch.alias or name), rollback)
+            raise
+
+        # The placement key is the deployment record name; the routed model id
+        # is the shared alias for scaled replicas, or the record name otherwise.
+        record_placement(str(old_launch.alias or name), result)
         return result
 
     def stop(self, name: str) -> object:
