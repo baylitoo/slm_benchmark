@@ -69,6 +69,32 @@ def test_authentication_and_quotas_are_isolated_per_tenant() -> None:
     manager.acquire(tenant_a, now=71)
 
 
+def test_authenticated_reads_do_not_consume_inference_quota() -> None:
+    manager = TenantQuotaManager(
+        api_keys={"a": "tenant-a"},
+        auth_required=True,
+        requests_per_window=1,
+        read_requests_per_window=2,
+        window_seconds=60,
+        max_concurrent=2,
+    )
+    tenant = manager.authenticate("a")
+
+    for now in (10, 11):
+        manager.acquire(tenant, quota="read", now=now)
+        manager.release(tenant)
+    with pytest.raises(HTTPException) as read_limited:
+        manager.acquire(tenant, quota="read", now=12)
+    assert read_limited.value.detail == "Tenant read request rate limit exceeded"
+
+    # The read bucket being full does not block real work.
+    manager.acquire(tenant, quota="request", now=12)
+    manager.release(tenant)
+    with pytest.raises(HTTPException) as request_limited:
+        manager.acquire(tenant, quota="request", now=13)
+    assert request_limited.value.detail == "Tenant request rate limit exceeded"
+
+
 def test_auth_off_keeps_anonymous_throttling(monkeypatch: pytest.MonkeyPatch) -> None:
     """Turning auth off must NOT turn off request bounding.
 
@@ -86,6 +112,7 @@ def test_auth_off_keeps_anonymous_throttling(monkeypatch: pytest.MonkeyPatch) ->
         api_keys=SimpleNamespace(get_secret_value=lambda: ""),
         auth_required=False,
         rate_limit_requests=1,
+        tenant_read_rate_limit_requests=10,
         rate_limit_window_seconds=60,
         tenant_max_concurrent_requests=1,
         anonymous_rate_limit_requests=3,

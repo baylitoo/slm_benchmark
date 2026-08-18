@@ -35,7 +35,12 @@ class Settings(BaseSettings):
     # any networked deployment must populate API_KEYS and leave this on.
     auth_required: bool = True
     api_keys: SecretStr = Field(default=SecretStr(""))
+    # GET/HEAD traffic has its own budget because the authenticated Studio
+    # continuously polls several control-plane views. Counting those reads
+    # against inference/mutations makes the default 60/min quota self-deny
+    # during ordinary use (Deployments alone can issue ~45 reads/minute).
     rate_limit_requests: int = Field(default=60, ge=0)
+    tenant_read_rate_limit_requests: int = Field(default=600, ge=0)
     rate_limit_window_seconds: int = Field(default=60, ge=1)
     tenant_max_concurrent_requests: int = Field(default=4, ge=0)
     # Limits for UNAUTHENTICATED callers (auth_required=false), bucketed per

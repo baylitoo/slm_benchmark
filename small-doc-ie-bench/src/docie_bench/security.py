@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, Header, HTTPException, Request, UploadFile
 
@@ -64,6 +64,7 @@ class TenantQuotaManager:
         api_keys: dict[str, str],
         auth_required: bool,
         requests_per_window: int,
+        read_requests_per_window: int | None = None,
         window_seconds: int,
         max_concurrent: int,
         anonymous_requests_per_window: int = 0,
@@ -72,6 +73,13 @@ class TenantQuotaManager:
         self.api_keys = api_keys
         self.auth_required = auth_required
         self.requests_per_window = requests_per_window
+        # ``None`` preserves the old one-budget behaviour for direct callers;
+        # the application factory always supplies the dedicated read limit.
+        self.read_requests_per_window = (
+            requests_per_window
+            if read_requests_per_window is None
+            else read_requests_per_window
+        )
         self.window_seconds = window_seconds
         self.max_concurrent = max_concurrent
         # Anonymous (auth-off) callers get their OWN limits, bucketed per client
@@ -100,17 +108,35 @@ class TenantQuotaManager:
         bucket = f"anon:{client_host}" if client_host else "anonymous"
         return TenantContext(tenant_id=bucket, authenticated=False)
 
-    def _limits_for(self, context: TenantContext) -> tuple[int, int]:
+    def _limits_for(
+        self,
+        context: TenantContext,
+        quota: Literal["request", "read"],
+    ) -> tuple[int, int]:
         if context.authenticated:
-            return self.requests_per_window, self.max_concurrent
+            rate = (
+                self.read_requests_per_window
+                if quota == "read"
+                else self.requests_per_window
+            )
+            return rate, self.max_concurrent
         return self.anonymous_requests_per_window, self.anonymous_max_concurrent
 
-    def acquire(self, context: TenantContext, *, now: float | None = None) -> None:
+    def acquire(
+        self,
+        context: TenantContext,
+        *,
+        quota: Literal["request", "read"] = "request",
+        now: float | None = None,
+    ) -> None:
         current = time.monotonic() if now is None else now
-        requests_per_window, max_concurrent = self._limits_for(context)
+        requests_per_window, max_concurrent = self._limits_for(context, quota)
         with self._lock:
             self._prune_locked()
-            requests = self._requests[context.tenant_id]
+            # Separate histories are the essential boundary: Studio polling
+            # must not consume (or be blocked by) the inference/mutation budget.
+            rate_bucket = f"{context.tenant_id}:{quota}"
+            requests = self._requests[rate_bucket]
             cutoff = current - self.window_seconds
             while requests and requests[0] <= cutoff:
                 requests.popleft()
@@ -122,7 +148,11 @@ class TenantQuotaManager:
             if requests_per_window > 0 and len(requests) >= requests_per_window:
                 raise HTTPException(
                     status_code=429,
-                    detail="Tenant request rate limit exceeded",
+                    detail=(
+                        "Tenant read request rate limit exceeded"
+                        if quota == "read"
+                        else "Tenant request rate limit exceeded"
+                    ),
                     headers={"Retry-After": str(self.window_seconds)},
                 )
             requests.append(current)
@@ -240,6 +270,7 @@ def get_quota_manager() -> TenantQuotaManager:
         api_keys=parse_api_keys(settings.api_keys.get_secret_value()),
         auth_required=settings.auth_required,
         requests_per_window=settings.rate_limit_requests,
+        read_requests_per_window=settings.tenant_read_rate_limit_requests,
         window_seconds=settings.rate_limit_window_seconds,
         max_concurrent=settings.tenant_max_concurrent_requests,
         anonymous_requests_per_window=settings.anonymous_rate_limit_requests,
@@ -255,7 +286,10 @@ async def tenant_guard(
     manager = get_quota_manager()
     client_host = request.client.host if request.client else None
     context = manager.authenticate(x_api_key, client_host)
-    manager.acquire(context)
+    # Safe control-plane reads and polling use a deliberately larger, separate
+    # budget. Authentication and concurrency limits still apply to all methods.
+    quota = "read" if request.method in {"GET", "HEAD", "OPTIONS"} else "request"
+    manager.acquire(context, quota=quota)
     try:
         yield context
     finally:
