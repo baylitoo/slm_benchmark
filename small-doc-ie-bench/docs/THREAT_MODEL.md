@@ -35,6 +35,7 @@ Production deployments should set at least:
 AUTH_REQUIRED=true
 API_KEYS={"long-random-key-a":"tenant-a","long-random-key-b":"tenant-b"}
 RATE_LIMIT_REQUESTS=60
+TENANT_READ_RATE_LIMIT_REQUESTS=600
 RATE_LIMIT_WINDOW_SECONDS=60
 TENANT_MAX_CONCURRENT_REQUESTS=4
 MAX_UPLOAD_MB=25
@@ -45,6 +46,11 @@ REDACTED_RESPONSE_FIELDS=
 LOG_DOCUMENT_CONTENT=false
 ENABLE_BENCHMARK_API=false
 ```
+
+Authenticated safe reads (GET/HEAD) and inference/mutations use independent
+rate buckets. This lets the Studio poll live control-plane state without
+spending the tenant's inference budget. Authentication and the shared
+concurrency ceiling still apply to every request.
 
 Terminate TLS before the API, keep API keys in a secret manager, isolate the model/OCR
 services on a private network, and use an external distributed rate limiter when running more
