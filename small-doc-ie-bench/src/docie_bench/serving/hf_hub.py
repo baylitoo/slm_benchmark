@@ -662,15 +662,18 @@ async def search_models(
             or pipe == "image-text-to-text"
             or "image-text-to-text" in tags
         )
+        card_data = item.get("cardData") if isinstance(item.get("cardData"), dict) else {}
         verdict = resolve_family(
             architecture,
             has_gguf=has_gguf,
             has_safetensors=has_safetensors,
             has_mmproj=has_mmproj,
             repo_id=str(repo_id),
+            tags=tuple(tags),
+            pipeline_tag=str(pipe) if pipe else None,
+            base_model=_extract_base_model(card_data),
         )
         params_count = _param_count(item.get("safetensors"))
-        card_data = item.get("cardData") if isinstance(item.get("cardData"), dict) else {}
         cards.append(
             {
                 "id": str(repo_id),
@@ -803,12 +806,18 @@ async def inspect_repo(
         if not has_gguf:
             needs_trust_remote_code = cfg_trust
 
+    tags = [str(t) for t in (payload.get("tags") or []) if isinstance(t, str)]
+    pipe = payload.get("pipeline_tag")
+    card_data = payload.get("cardData") if isinstance(payload.get("cardData"), dict) else {}
     result = resolve_family(
         architecture,
         has_gguf=has_gguf,
         has_safetensors=has_safetensors,
         has_mmproj=has_mmproj,
         repo_id=repo,
+        tags=tuple(tags),
+        pipeline_tag=str(pipe) if pipe else None,
+        base_model=_extract_base_model(card_data),
     )
     snapshot_files = _snapshot_files_from_siblings(siblings) if not has_gguf else []
     from docie_bench.serving.model_store import FAMILIES
@@ -964,6 +973,25 @@ def _extract_architecture(payload: dict[str, Any]) -> str | None:
         archs = config.get("architectures")
         if isinstance(archs, list) and archs:
             return str(archs[0])
+    return None
+
+
+def _extract_base_model(card_data: dict[str, Any] | None) -> str | None:
+    """The Hub model card's ``base_model`` provenance field, if recorded.
+
+    Finetune/quant lineage (e.g. a GGUF requant of ``numind/NuExtract-3.0``)
+    -- feeds ``resolve_family``'s "confirmed" tier, which survives a repo
+    rename that would defeat a name-substring check. The field is either a
+    single repo id string or a list of them (multi-base merges); only the
+    first is used, since ``resolve_family`` only checks for one lineage.
+    """
+    if not isinstance(card_data, dict):
+        return None
+    base_model = card_data.get("base_model")
+    if isinstance(base_model, str):
+        return base_model
+    if isinstance(base_model, list) and base_model and isinstance(base_model[0], str):
+        return base_model[0]
     return None
 
 

@@ -18,6 +18,7 @@ Granularity of the verdict:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 # Architecture (lowercase, as reported by GGUF `general.architecture` or a
 # config's `model_type`) -> family name. Multimodal archs map to a vision
@@ -154,26 +155,74 @@ class SupportVerdict:
     runtime_note: str | None = None
 
 
-def _is_reranker(repo_id: str | None) -> bool:
+Confidence = Literal["confirmed", "guessed"]
+
+
+@dataclass(frozen=True)
+class RepoSignals:
+    """Everything the name/tag-based heuristics below need, bundled so each
+    one takes a single object instead of a growing parameter list.
+    ``tags``/``pipeline_tag``/``base_model`` come straight off the Hub API
+    payload hf_hub.py already fetches (search + inspect_repo) — curated Hub
+    metadata, not something parsed out of the repo id string."""
+
+    arch: str  # normalized: lowercase, stripped
+    repo_id: str | None
+    tags: tuple[str, ...] = ()
+    pipeline_tag: str | None = None
+    base_model: str | None = None
+
+
+def _reranker_confidence(signals: RepoSignals) -> Confidence | None:
     """Rerankers / late-interaction retrievers are repurposed backbones —
     LFM2.5-ColBERT-350M reports arch ``lfm2`` (identical to the chat family),
     a BERT cross-encoder reports ``bert`` (identical to the embedding family).
-    The arch alone can't tell a reranker apart from a chat/embedding model on
-    the same backbone, so — same pattern as NuExtract3 — it is caught by name
-    before the generic arch lookup runs."""
-    if not repo_id:
-        return False
-    name = repo_id.lower()
-    return any(kw in name for kw in ("colbert", "rerank", "cross-encoder", "crossencoder"))
+    The arch alone can't disambiguate, so this leans on Hub-curated signals
+    first, with the repo id string as a last-resort, LOW-confidence fallback:
+
+    * ``"confirmed"`` — ``pipeline_tag == "text-ranking"`` (HF's own
+      reranker/cross-encoder task tag — not ``"sentence-similarity"``, which
+      embedding models also use and would false-positive here) or an
+      explicit ``"reranker"``/``"cross-encoder"``/``"colbert"`` tag.
+    * ``"guessed"`` — none of the above, but the repo id contains one of
+      those keywords. Kept as a fallback (some repos carry no task
+      metadata at all), but too fragile to auto-``"supported"`` on its own:
+      a false positive (the keyword inside an unrelated compound word) or a
+      false negative (a renamed derivative with no keyword) are both live
+      risks for a bare substring match.
+    """
+    if signals.pipeline_tag == "text-ranking":
+        return "confirmed"
+    tag_set = {t.lower() for t in signals.tags}
+    if tag_set & {"reranker", "cross-encoder", "colbert"}:
+        return "confirmed"
+    if signals.repo_id and any(
+        kw in signals.repo_id.lower()
+        for kw in ("colbert", "rerank", "cross-encoder", "crossencoder")
+    ):
+        return "guessed"
+    return None
 
 
-def _is_nuextract3(arch: str, repo_id: str | None) -> bool:
+def _nuextract3_confidence(signals: RepoSignals) -> Confidence | None:
     """NuExtract3 shares the qwen3.5-VL backbone (arch ``qwen35``) with generic
-    Qwen3.5 text/VL models but needs a DIFFERENT serving contract (the extraction
-    template rides ``chat_template_kwargs``, not ``response_format``). The arch
-    alone can't tell them apart, so the flagship is detected by name; an
-    unmatched ``qwen35`` falls through to the generic text/vision handling."""
-    return arch == "qwen35" and bool(repo_id) and "nuextract" in repo_id.lower()
+    Qwen3.5 text/VL models but needs a DIFFERENT serving contract (the
+    extraction template rides ``chat_template_kwargs``, not
+    ``response_format``). Restricted to that backbone either way:
+
+    * ``"confirmed"`` — ``cardData.base_model`` traces lineage back to a
+      NuExtract release. Hub-recorded finetune/quantization provenance,
+      survives a rename that would defeat a repo-id substring check.
+    * ``"guessed"`` — only the repo id contains ``"nuextract"``. Fragile
+      fallback for repos with no ``base_model`` recorded.
+    """
+    if signals.arch != "qwen35":
+        return None
+    if signals.base_model and "nuextract" in signals.base_model.lower():
+        return "confirmed"
+    if signals.repo_id and "nuextract" in signals.repo_id.lower():
+        return "guessed"
+    return None
 
 
 def resolve_family(
@@ -183,6 +232,9 @@ def resolve_family(
     has_safetensors: bool,
     has_mmproj: bool,
     repo_id: str | None = None,
+    tags: tuple[str, ...] = (),
+    pipeline_tag: str | None = None,
+    base_model: str | None = None,
 ) -> SupportVerdict:
     """Map a detected architecture (+ repo shape) to a family and a verdict.
 
@@ -190,11 +242,17 @@ def resolve_family(
     servable GGUF (safetensors-only) does the LAST-RESORT transformers family
     apply — the "no servable GGUF" hard gate (see ``_transformers_verdict``).
 
-    ``repo_id`` disambiguates archs shared by models with different serving
-    contracts (NuExtract3 vs a generic Qwen3.5-VL, both ``qwen35``).
+    ``repo_id``/``tags``/``pipeline_tag``/``base_model`` disambiguate archs
+    shared by models with different serving contracts (NuExtract3 vs a
+    generic Qwen3.5-VL, both ``qwen35``; a reranker vs a plain chat/embedding
+    model on the same backbone) — see ``RepoSignals`` and
+    ``_reranker_confidence``/``_nuextract3_confidence``.
     """
     arch = architecture.strip().lower() if architecture else ""
     runtime_note = RUNTIME_NOTES.get(arch)
+    signals = RepoSignals(
+        arch=arch, repo_id=repo_id, tags=tags, pipeline_tag=pipeline_tag, base_model=base_model
+    )
 
     # Encoder analyzers are detected by the gliner marker, not a base arch
     # (GLiNER2's base is mdeberta but that is NOT what we serve it as). These
@@ -223,25 +281,34 @@ def resolve_family(
             "no GGUF and no readable architecture — not a servable repo",
         )
 
-    # No servable GGUF in THIS repo: even a llama.cpp-supported arch cannot be
-    # served here via llama-server (it needs a .gguf file). If weights are
-    # present, redirect to the transformers last resort (with the memory note
-    # nudging the operator to a GGUF repo); otherwise it is not servable here.
-    if not has_gguf:
-        if has_safetensors:
-            return _transformers_verdict(architecture=arch, has_mmproj=has_mmproj)
+    # NuExtract3 and reranker are both caught by Hub-metadata/name signals
+    # before the has_gguf gate below — both are llama-server-only capabilities
+    # (the qwen3.5-VL chat_template_kwargs extraction contract / the
+    # --reranking pooling mode) with no transformers-runtime equivalent, so a
+    # no-GGUF repo of either must not silently fall through into the generic
+    # "transformers last resort" chat verdict below, which would misrepresent
+    # what the repo actually is (e.g. a ColBERT late-interaction retriever
+    # served as if it were a plain chat model). A "guessed" (name-only, low
+    # confidence) match never auto-"supported"s regardless of GGUF/mmproj —
+    # it always needs the operator's confirmation.
+    nuextract3_confidence = _nuextract3_confidence(signals)
+    if nuextract3_confidence == "guessed":
         return SupportVerdict(
-            "unsupported",
-            None,
-            f"architecture {architecture!r} detected but the repo ships neither a "
-            "GGUF nor safetensors weights — nothing servable here",
+            "needs_family",
+            "nuextract3",
+            f"repo id contains \"nuextract\" ({architecture!r} backbone) — a "
+            "low-confidence guess from the name alone (no base_model lineage "
+            "confirms it); confirm the family before deploying",
         )
-
-    # NuExtract3 (qwen3.5-VL + chat_template_kwargs extraction contract), caught
-    # by name BEFORE the generic qwen35 handling — which would otherwise serve it
-    # as a plain vision model (lfm2_vl) and silently drop its template. It is
-    # vision, so a missing projector is a needs_family, not a text mis-serve.
-    if _is_nuextract3(arch, repo_id):
+    if nuextract3_confidence == "confirmed":
+        if not has_gguf:
+            return SupportVerdict(
+                "needs_family",
+                "nuextract3",
+                f"base_model lineage indicates NuExtract3 ({architecture!r} backbone), "
+                "but no GGUF is present — NuExtract3 is served via llama-server and "
+                "needs a GGUF file; find a GGUF repo of this model.",
+            )
         if not has_mmproj:
             return SupportVerdict(
                 "needs_family",
@@ -254,17 +321,45 @@ def resolve_family(
             "supported", "nuextract3", f"NuExtract3 ({architecture!r} extraction contract)"
         )
 
-    # Reranker (LFM2.5-ColBERT-350M, a BERT cross-encoder, ...), caught by name
-    # BEFORE the generic arch lookup — which would otherwise serve it as a plain
-    # chat or embedding model on the shared backbone and silently drop its
-    # actual task (query+documents -> relevance scores, not a chat/embed model).
-    if _is_reranker(repo_id):
+    reranker_confidence = _reranker_confidence(signals)
+    if reranker_confidence == "guessed":
+        return SupportVerdict(
+            "needs_family",
+            "reranker",
+            f"repo id suggests a reranker/cross-encoder ({architecture!r} backbone) — "
+            "a low-confidence guess from the name alone (no pipeline_tag/tags confirm "
+            "it); confirm the family before deploying",
+        )
+    if reranker_confidence == "confirmed":
+        if not has_gguf:
+            return SupportVerdict(
+                "needs_family",
+                "reranker",
+                f"Hub metadata indicates a reranker/cross-encoder ({architecture!r} "
+                "backbone), but no GGUF is present — reranking is served via "
+                "llama-server's --reranking mode and needs a GGUF file; find a GGUF "
+                "repo of this model.",
+            )
         return SupportVerdict(
             "supported",
             "reranker",
-            f"repo name indicates a reranker/cross-encoder ({architecture!r} backbone) "
-            "→ reranker",
+            f"Hub metadata indicates a reranker/cross-encoder ({architecture!r} "
+            "backbone) → reranker",
             runtime_note=runtime_note,
+        )
+
+    # No servable GGUF in THIS repo: even a llama.cpp-supported arch cannot be
+    # served here via llama-server (it needs a .gguf file). If weights are
+    # present, redirect to the transformers last resort (with the memory note
+    # nudging the operator to a GGUF repo); otherwise it is not servable here.
+    if not has_gguf:
+        if has_safetensors:
+            return _transformers_verdict(architecture=arch, has_mmproj=has_mmproj)
+        return SupportVerdict(
+            "unsupported",
+            None,
+            f"architecture {architecture!r} detected but the repo ships neither a "
+            "GGUF nor safetensors weights — nothing servable here",
         )
 
     family = ARCH_TO_FAMILY.get(arch)
