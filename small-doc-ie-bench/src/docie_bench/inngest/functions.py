@@ -53,6 +53,7 @@ MODELS_CONFIG_PATH = Path("configs/models.yaml")
 LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
 REPAIR_EVENT = "serving/repair.requested"
+RECONFIGURE_EVENT = "serving/reconfigure.requested"
 PIN_EVENT = "serving/pin.requested"
 
 # Poll cadence for the worker-side await of a serving-side load (the worker
@@ -957,6 +958,40 @@ async def repair_deployment_job(ctx: inngest.Context) -> Any:
     return result
 
 
+async def _run_reconfigure(data: dict[str, Any]) -> Any:
+    """Replace editable defaults on an existing deployment."""
+    cp = _serving_control_plane()
+    raw_context = data.get("context_length")
+    if raw_context is None:
+        raise ValueError("reconfigure event must include 'context_length'")
+    raw_max_tokens = data.get("max_tokens")
+    return await cp.reconfigure(
+        _required_name(data, "reconfigure"),
+        context_length=int(raw_context),
+        max_tokens=int(raw_max_tokens) if raw_max_tokens is not None else None,
+    )
+
+
+@serving_client.create_function(
+    fn_id="serving-reconfigure",
+    trigger=inngest.TriggerEvent(event=RECONFIGURE_EVENT),
+)
+async def reconfigure_deployment_job(ctx: inngest.Context) -> Any:
+    """Persist deployment defaults and restart the runtime when it is hot."""
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(channel, TOPIC_STATUS, {"state": "reconfiguring", "name": data.get("name")})
+    try:
+        result = await ctx.step.run("reconfigure", lambda: _run_reconfigure(data))
+    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
+        logger.exception("reconfigure_deployment_job failed (name=%s)", data.get("name"))
+        await _publish_error_safely(channel, str(exc))
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result
+
+
 async def _run_pin(data: dict[str, Any]) -> Any:
     cp = _serving_control_plane()
     return await cp.pin(_required_name(data, "pin"), pinned=bool(data.get("pinned", True)))
@@ -1555,6 +1590,7 @@ serving_functions = [
     load_deployment_job,
     unload_deployment_job,
     repair_deployment_job,
+    reconfigure_deployment_job,
     pin_deployment_job,
 ]
 
@@ -1615,11 +1651,13 @@ __all__ = [
     "load_deployment_job",
     "unload_deployment_job",
     "repair_deployment_job",
+    "reconfigure_deployment_job",
     "pin_deployment_job",
     "gc_studio_runs_job",
     "benchmark_idempotency_key",
     "LOAD_EVENT",
     "UNLOAD_EVENT",
     "REPAIR_EVENT",
+    "RECONFIGURE_EVENT",
     "PIN_EVENT",
 ]
