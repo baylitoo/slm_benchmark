@@ -50,6 +50,7 @@ DELETE_EVENT = "serving/delete.requested"
 LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
 REPAIR_EVENT = "serving/repair.requested"
+RECONFIGURE_EVENT = "serving/reconfigure.requested"
 PIN_EVENT = "serving/pin.requested"
 # Scaling reuses the ordinary single-deploy job (deploy_model_job) — the scale
 # endpoint just fans out one deploy event per new replica name.
@@ -793,6 +794,35 @@ async def repair_deployment(
     del tenant
     extra = {"port": request.port} if request.port is not None else None
     return await _fire_lifecycle_event(name, event=REPAIR_EVENT, prefix="repair", extra=extra)
+
+
+class ReconfigureRequest(BaseModel):
+    """Editable defaults for an existing deployment.
+
+    The context window is a runtime allocation and therefore requires a
+    process restart when the deployment is hot. ``max_tokens=None`` clears a
+    deployment-specific output cap and restores the model-family default.
+    """
+
+    context_length: int = Field(ge=128, le=1_048_576)
+    max_tokens: int | None = Field(default=None, ge=1, le=131_072)
+
+
+@router.patch("/deployments/{name}")
+async def reconfigure_deployment(
+    name: str, request: ReconfigureRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    """Edit a deployment in place and restart it when currently running."""
+    del tenant
+    return await _fire_lifecycle_event(
+        name,
+        event=RECONFIGURE_EVENT,
+        prefix="reconfigure",
+        extra={
+            "context_length": request.context_length,
+            "max_tokens": request.max_tokens,
+        },
+    )
 
 
 class PinRequest(BaseModel):
