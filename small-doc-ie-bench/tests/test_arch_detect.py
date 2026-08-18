@@ -61,16 +61,19 @@ def test_unknown_arch_with_mmproj_suggests_vision() -> None:
     assert v.verdict == "needs_family" and v.family == "lfm2_vl"
 
 
-def test_qwen35_nuextract3_by_name() -> None:
-    # NuExtract3 shares the qwen35 backbone but needs its own contract — detected
-    # by NAME (not arch). With a projector → nuextract3; without → needs_family
-    # (a missing projector, not a text mis-serve).
+def test_qwen35_nuextract3_confirmed_by_base_model_lineage() -> None:
+    # NuExtract3 shares the qwen35 backbone but needs its own contract.
+    # "confirmed" tier: cardData.base_model traces lineage back to NuExtract,
+    # regardless of what the repo itself is named. With a projector →
+    # nuextract3; without → needs_family (a missing projector, not a text
+    # mis-serve).
     v = resolve_family(
         "qwen35",
         has_gguf=True,
         has_safetensors=False,
         has_mmproj=True,
-        repo_id="numind/NuExtract3-GGUF",
+        repo_id="some-org/quantized-extraction-model-GGUF",
+        base_model="numind/NuExtract-3.0-8B",
     )
     assert v.verdict == "supported"
     assert v.family == "nuextract3"
@@ -79,11 +82,44 @@ def test_qwen35_nuextract3_by_name() -> None:
         has_gguf=True,
         has_safetensors=False,
         has_mmproj=False,
-        repo_id="numind/NuExtract3-GGUF",
+        repo_id="some-org/quantized-extraction-model-GGUF",
+        base_model="numind/NuExtract-3.0-8B",
     )
     assert t.verdict == "needs_family"
     assert t.family == "nuextract3"
     assert "mmproj" in t.reason
+
+
+def test_qwen35_nuextract3_guessed_by_name_only_needs_confirmation() -> None:
+    # No base_model lineage recorded -- only "nuextract" in the repo id. Too
+    # fragile to auto-"supported": needs_family regardless of GGUF/mmproj.
+    v = resolve_family(
+        "qwen35",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=True,
+        repo_id="numind/NuExtract3-GGUF",
+    )
+    assert v.verdict == "needs_family"
+    assert v.family == "nuextract3"
+    assert "low-confidence" in v.reason
+
+
+def test_nuextract3_confirmed_without_gguf_is_needs_family_not_transformers_last_resort() -> None:
+    # A "confirmed" NuExtract3 (base_model lineage) with no GGUF must not
+    # silently fall through to the generic transformers "last resort" chat
+    # verdict -- that would misrepresent the repo's actual extraction contract.
+    v = resolve_family(
+        "qwen35",
+        has_gguf=False,
+        has_safetensors=True,
+        has_mmproj=False,
+        repo_id="some-org/nuextract-finetune-safetensors",
+        base_model="numind/NuExtract-3.0-8B",
+    )
+    assert v.verdict == "needs_family"
+    assert v.family == "nuextract3"
+    assert "GGUF" in v.reason
 
 
 def test_qwen35_generic_text_is_chat_not_nuextract3() -> None:
@@ -119,33 +155,88 @@ def test_resolve_gliner_marker() -> None:
     assert v.verdict == "supported" and v.family == "encoder_gliner2"
 
 
-def test_lfm2_colbert_reranker_by_name() -> None:
+def test_lfm2_colbert_reranker_confirmed_by_pipeline_tag() -> None:
     # LFM2.5-ColBERT-350M reports arch "lfm2" — identical to the chat family's
-    # backbone. Caught by NAME so it lands on "reranker", not "lfm2" (chat).
+    # backbone. HF's own "text-ranking" pipeline_tag confirms it → "reranker",
+    # not "lfm2" (chat).
     v = resolve_family(
         "lfm2",
         has_gguf=True,
         has_safetensors=False,
         has_mmproj=False,
         repo_id="LiquidAI/LFM2.5-ColBERT-350M-GGUF",
+        pipeline_tag="text-ranking",
     )
     assert v.verdict == "supported"
     assert v.family == "reranker"
 
 
-def test_bert_cross_encoder_reranker_by_name() -> None:
+def test_bert_cross_encoder_reranker_confirmed_by_tag() -> None:
     # A BERT cross-encoder reports arch "bert" — identical to the embedding
-    # family's backbone. Caught by NAME so it lands on "reranker", not
-    # "embedding".
+    # family's backbone. An explicit "cross-encoder" Hub tag confirms it →
+    # "reranker", not "embedding".
     v = resolve_family(
         "bert",
         has_gguf=True,
         has_safetensors=False,
         has_mmproj=False,
         repo_id="mixedbread-ai/mxbai-rerank-base-v2-GGUF",
+        tags=("cross-encoder", "sentence-transformers"),
     )
     assert v.verdict == "supported"
     assert v.family == "reranker"
+
+
+def test_reranker_guessed_by_name_only_needs_confirmation() -> None:
+    # mixedbread-ai/mxbai-edge-colbert-v0-32m: a ColBERT late-interaction
+    # retriever, arch "modernbert", no GGUF, no pipeline_tag/tags recorded --
+    # only "colbert" in the repo id. Before this fix, that name-only signal
+    # was checked AFTER the has_gguf gate, so this repo silently fell through
+    # to the generic transformers "last resort" chat verdict. Now it's caught,
+    # but a name-only match is too fragile to auto-"supported" -- needs the
+    # operator's confirmation regardless of GGUF/mmproj.
+    v = resolve_family(
+        "modernbert",
+        has_gguf=False,
+        has_safetensors=True,
+        has_mmproj=False,
+        repo_id="mixedbread-ai/mxbai-edge-colbert-v0-32m",
+    )
+    assert v.verdict == "needs_family"
+    assert v.family == "reranker"
+    assert "low-confidence" in v.reason
+
+
+def test_reranker_confirmed_without_gguf_is_needs_family_not_transformers_last_resort() -> None:
+    # Same repo, but WITH a confirming signal (pipeline_tag) -- now it's
+    # "confirmed", so the no-GGUF verdict is specific: GGUF is required for
+    # llama-server's --reranking mode, not a generic low-confidence caveat.
+    v = resolve_family(
+        "modernbert",
+        has_gguf=False,
+        has_safetensors=True,
+        has_mmproj=False,
+        repo_id="mixedbread-ai/mxbai-edge-colbert-v0-32m",
+        pipeline_tag="text-ranking",
+    )
+    assert v.verdict == "needs_family"
+    assert v.family == "reranker"
+    assert "GGUF" in v.reason
+
+
+def test_sentence_similarity_pipeline_tag_does_not_confirm_reranker() -> None:
+    # "sentence-similarity" is also used by plain embedding models -- it must
+    # NOT count as reranker-confirming (that would misclassify embeddings).
+    v = resolve_family(
+        "bert",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="some-org/plain-embedding-model-GGUF",
+        pipeline_tag="sentence-similarity",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "embedding"
 
 
 def test_lfm2_generic_chat_is_not_reranker() -> None:
@@ -209,6 +300,25 @@ async def test_inspect_gguf_arch_from_gguf_block() -> None:
         "model",
         "vision_projector",
     ]
+
+
+async def test_inspect_threads_hub_metadata_into_reranker_confidence() -> None:
+    # The exact reported bug: a ColBERT reranker (arch modernbert, no GGUF)
+    # must not silently resolve to the generic transformers "last resort".
+    # inspect_repo fetches tags/pipeline_tag/cardData itself -- this proves
+    # they actually reach resolve_family, not just that resolve_family
+    # handles them in isolation.
+    payload = {
+        "config": {"model_type": "modernbert"},
+        "pipeline_tag": "text-ranking",
+        "tags": ["sentence-transformers", "colbert"],
+        "siblings": [{"rfilename": "model.safetensors", "size": 128_000_000}],
+    }
+    async with httpx.AsyncClient(transport=_transport(payload)) as client:
+        result = await inspect_repo("mixedbread-ai/mxbai-edge-colbert-v0-32m", client=client)
+    assert result["verdict"] == "needs_family"
+    assert result["family"] == "reranker"
+    assert "GGUF" in result["reason"]
 
 
 async def test_inspect_quant_options_have_exact_fit_estimates() -> None:
