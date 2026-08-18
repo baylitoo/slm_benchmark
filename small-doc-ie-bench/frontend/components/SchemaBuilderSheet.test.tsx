@@ -34,4 +34,20 @@ describe("SchemaBuilderSheet", () => {
     expect(onCreated).toHaveBeenCalledWith("purchase_order");
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it("does not nest its <form> inside an ancestor <form> (Sheet portals to document.body)", () => {
+    // Reproduces the real bug: Playground wraps its whole page in its own
+    // <form>, and opens this sheet from inside it. HTML forbids a <form>
+    // descendant of a <form> -- without Sheet's portal, this sheet's own
+    // <form> would land right inside the outer one.
+    const { container } = render(
+      <form data-testid="outer-form">
+        <SchemaBuilderSheet open onClose={() => {}} onCreated={() => {}} />
+      </form>,
+    );
+    const outerForm = container.querySelector('[data-testid="outer-form"]');
+    const innerForm = screen.getByRole("button", { name: "Save schema" }).closest("form");
+    expect(innerForm).not.toBeNull();
+    expect(outerForm?.contains(innerForm)).toBe(false);
+  });
 });
