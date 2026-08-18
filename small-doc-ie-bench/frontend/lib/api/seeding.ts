@@ -110,18 +110,39 @@ export interface HfSearchCard {
   tags?: string[];
 }
 
-/** Hub-native parameter-count ranges shared by both model search surfaces. */
-export const HF_PARAMETER_RANGES = [
-  { value: "", label: "Any parameters" },
-  { value: "max:500M", label: "Up to 500M" },
-  { value: "min:500M,max:1B", label: "500M–1B" },
-  { value: "min:1B,max:3B", label: "1B–3B" },
-  { value: "min:3B,max:7B", label: "3B–7B" },
-  { value: "min:7B,max:15B", label: "7B–15B" },
-  { value: "min:15B,max:35B", label: "15B–35B" },
-  { value: "min:35B,max:70B", label: "35B–70B" },
-  { value: "min:70B", label: "70B+" },
-] as const;
+/** Hub-native parameter-count breakpoints (log-scale), shared by both model
+ * search surfaces' RangeSlider (see components/ui.tsx). Index 0 means "no
+ * floor"; the last index means "no ceiling" -- resolveParameterRangeFilter
+ * drops the corresponding bound when a handle sits at that extreme. */
+export const PARAMETER_RANGE_STEPS: { value: number; label: string }[] = [
+  { value: 0, label: "0" },
+  { value: 500_000_000, label: "500M" },
+  { value: 1_000_000_000, label: "1B" },
+  { value: 3_000_000_000, label: "3B" },
+  { value: 7_000_000_000, label: "7B" },
+  { value: 15_000_000_000, label: "15B" },
+  { value: 35_000_000_000, label: "35B" },
+  { value: 70_000_000_000, label: "70B" },
+  { value: Infinity, label: "70B+" },
+];
+
+function formatParamCount(value: number): string {
+  return value >= 1_000_000_000
+    ? `${Math.round(value / 1_000_000_000)}B`
+    : `${Math.round(value / 1_000_000)}M`;
+}
+
+/** Hub's native num_parameters range syntax (e.g. "min:1B,max:35B") for a
+ * pair of RangeSlider indices, or "" for the full range (no filter). */
+export function resolveParameterRangeFilter(loIndex: number, hiIndex: number): string {
+  if (loIndex <= 0 && hiIndex >= PARAMETER_RANGE_STEPS.length - 1) return "";
+  const lo = PARAMETER_RANGE_STEPS[loIndex].value;
+  const hi = PARAMETER_RANGE_STEPS[hiIndex].value;
+  const parts: string[] = [];
+  if (lo > 0) parts.push(`min:${formatParamCount(lo)}`);
+  if (hi !== Infinity) parts.push(`max:${formatParamCount(hi)}`);
+  return parts.join(",");
+}
 
 /** Pre-flight support verdict for a repo (GET /v1/studio/hf/inspect). */
 export interface HfInspect {
