@@ -26,6 +26,7 @@ import { PageHeader } from "./patterns/PageHeader";
 import { Toolbar } from "./patterns/Toolbar";
 import { ResultLine } from "./patterns/ResultLine";
 import { Table, type Column } from "./patterns/Table";
+import { T } from "@/lib/i18n";
 
 const POLL_MS = 8000;
 
@@ -395,7 +396,7 @@ function FieldEditor({
   return (
     <div className="space-y-1.5">
       {groups.length === 0 && (
-        <p className="text-xs text-muted-foreground">No correctable fields on this prediction.</p>
+        <p className="text-xs text-muted-foreground"><T>No correctable fields on this prediction.</T></p>
       )}
       {groups.map((group) => {
         const isSelected = selectedPath === group.path;
@@ -423,7 +424,7 @@ function FieldEditor({
                     }}
                     className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[10px] text-accent transition hover:bg-accent/20"
                   >
-                    Apply suggestion
+                    <T>Apply suggestion</T>
                   </button>
                 )}
                 <Badge tone={group.confidence < 0.5 ? "warn" : "neutral"}>
@@ -525,8 +526,7 @@ function EvidencePanel({
   if (!evidenceAvailable) {
     return (
       <p className="text-xs text-muted-foreground">
-        No OCR evidence was persisted for this task (a vision-only extraction has no OCR
-        step, or evidence retention was off when it ran).
+        <T>No OCR evidence was persisted for this task (a vision-only extraction has no OCR step, or evidence retention was off when it ran).</T>
       </p>
     );
   }
@@ -535,7 +535,7 @@ function EvidencePanel({
     return <Alert tone="err">{toUserMessage(error, { fallback: "Could not load evidence." })}</Alert>;
   }
   if (!evidence || evidence.blocks.length === 0) {
-    return <p className="text-xs text-muted-foreground">No OCR blocks on this document.</p>;
+    return <p className="text-xs text-muted-foreground"><T>No OCR blocks on this document.</T></p>;
   }
 
   const selected = new Set(selectedEvidenceIds);
@@ -663,7 +663,7 @@ function TaskDetail({
       <div className="grid gap-4 lg:grid-cols-2">
         <div>
           <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Fields
+            <T>Fields</T>
           </p>
           <FieldEditor
             task={task}
@@ -688,7 +688,7 @@ function TaskDetail({
       {task.corrections.length > 0 && (
         <div>
           <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Correction history
+            <T>Correction history</T>
           </p>
           <div className="space-y-1.5">
             {task.corrections.map((c) => (
@@ -717,13 +717,13 @@ function TaskDetail({
         <div className="grid gap-4 lg:grid-cols-2">
           <div>
             <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Original prediction
+              <T>Original prediction</T>
             </p>
             <JsonView value={task.original_prediction} maxHeight="16rem" />
           </div>
           <div>
             <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Latest prediction
+              <T>Latest prediction</T>
             </p>
             <JsonView value={task.latest_prediction} maxHeight="16rem" />
           </div>

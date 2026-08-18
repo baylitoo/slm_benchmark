@@ -25,6 +25,7 @@ import {
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
+import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
 import { Alert, Badge, Button, Card, Select, TextInput } from "./ui";
 import { LiveIndicator } from "./LiveIndicator";
@@ -127,7 +128,7 @@ function CapacityBar({ data }: { data: SizingView | null }) {
     >
       {!segments ? (
         <p className="text-sm text-muted-foreground">
-          No capacity reading yet — the bar appears once the server publishes one.
+          <T>No capacity reading yet — the bar appears once the server publishes one.</T>
         </p>
       ) : (
         <div>
@@ -502,7 +503,7 @@ function WhatIf({ data }: { data: SizingView | null }) {
       <div className="space-y-3">
         {staged.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            Nothing staged. Add a model to see whether a mix would fit.
+            <T>Nothing staged. Add a model to see whether a mix would fit.</T>
           </p>
         )}
         {staged.map((row, index) => (

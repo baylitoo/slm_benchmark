@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { JsonView } from "./JsonView";
 import { ProgressView } from "./ProgressBar";
+import { T, useI18n } from "@/lib/i18n";
 import { Alert, Badge } from "./ui";
 
 /** Best-effort human error out of an Inngest run's output/error shape. */
@@ -37,6 +38,7 @@ export function PollingResult({
   noun?: string;
   onSettled?: () => void;
 }) {
+  const { t } = useI18n();
   const [runs, setRuns] = useState<InngestRun[] | null>(null);
   const [progress, setProgress] = useState<SeedProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -128,15 +130,18 @@ export function PollingResult({
           <div className="space-y-2">
             <ProgressView value={progress} />
             <p className="text-xs text-muted-foreground">
-              Downloading — continues in the background if you navigate away.
+              <T>Downloading — continues in the background if you navigate away.</T>
             </p>
           </div>
         ) : (
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
             {primary?.status
-              ? `${noun} is ${String(primary.status).toLowerCase()} — this can take a while for a large download.`
-              : "Waiting for the run to start…"}
+              ? t("{noun} is {status} — this can take a while for a large download.", {
+                  noun: t(noun),
+                  status: String(primary.status).toLowerCase(),
+                })
+              : t("Waiting for the run to start…")}
           </p>
         )}
       </div>

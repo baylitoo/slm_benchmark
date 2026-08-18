@@ -11,6 +11,7 @@ import { getRealtimeToken, type RealtimeToken } from "@/lib/api";
 import { JsonView } from "./JsonView";
 import { PollingResult } from "./PollingResult";
 import { ProgressView } from "./ProgressBar";
+import { T, useI18n } from "@/lib/i18n";
 import { Alert, Badge, type BadgeTone } from "./ui";
 
 // If the subscription connects but NO message (status/progress heartbeat or a
@@ -75,6 +76,7 @@ export function RealtimeResult({
   noun?: string;
   onSettled?: () => void;
 }) {
+  const { t } = useI18n();
   const refreshToken = useMemo(
     () => async () =>
       (await getRealtimeToken(channel, topics)) as unknown as AnyToken,
@@ -180,7 +182,7 @@ export function RealtimeResult({
         ) : fallbackActive ? (
           <PollingResult eventId={eventId} channel={channel} noun={noun} />
         ) : (
-          <p className="text-sm text-muted-foreground">Waiting for the {noun}…</p>
+          <p className="text-sm text-muted-foreground">{t("Waiting for the {noun}…", { noun: t(noun) })}</p>
         )}
       </Section>
     </div>
@@ -191,7 +193,7 @@ function Section({ label, children }: { label: string; children: React.ReactNode
   return (
     <div>
       <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        {label}
+        <T>{label}</T>
       </p>
       {children}
     </div>

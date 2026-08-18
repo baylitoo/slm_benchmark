@@ -44,6 +44,7 @@ import {
 import { useAsync } from "@/lib/useAsync";
 import { toUserMessage } from "@/lib/errors";
 import { cn } from "@/lib/cn";
+import { T } from "@/lib/i18n";
 import { useToast } from "./Toast";
 import {
   Alert,
@@ -218,7 +219,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                   title="Run duplicate-doc_id / missing-file / cross-split-leakage checks"
                 >
                   <ShieldCheck className="h-4 w-4" />
-                  Validate
+                  <T>Validate</T>
                 </Button>
               </div>
             </Field>
@@ -297,7 +298,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                     className="inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
                   >
                     <Workflow className="h-3 w-3" />
-                    New pipeline (OCR→LLM) profile…
+                    <T>New pipeline (OCR→LLM) profile…</T>
                   </button>
                   <button
                     type="button"
@@ -305,7 +306,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                     className="inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
                   >
                     <ScanText className="h-3 w-3" />
-                    New OCR-only profile…
+                    <T>New OCR-only profile…</T>
                   </button>
                 </div>
               </Field>
@@ -383,7 +384,7 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                 className="mt-1.5 inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
               >
                 <Route className="h-3 w-3" />
-                New routing policy…
+                <T>New routing policy…</T>
               </button>
             </Field>
 
@@ -507,7 +508,7 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
         actions={
           <Button type="button" variant="secondary" onClick={() => setCompareOpen(true)}>
             <GitCompare className="h-4 w-4" />
-            Compare runs
+            <T>Compare runs</T>
           </Button>
         }
       />
@@ -567,7 +568,7 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
             <MetricsTable summary={summary} />
           ) : (
             <p className="text-xs text-muted-foreground">
-              No <code className="rounded bg-muted px-1">metrics.json</code> for this run.
+              <T>No metrics.json for this run.</T>
             </p>
           );
         }}
@@ -640,10 +641,9 @@ function ComparisonSheet({
     <Sheet open={open} onClose={onClose}>
       <div className="space-y-5">
         <div>
-          <h2 className="text-sm font-semibold text-foreground">Compare runs</h2>
+          <h2 className="text-sm font-semibold text-foreground"><T>Compare runs</T></h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            POST /v1/studio/comparisons — deltas, confidence intervals and a budget
-            verdict between two completed runs.
+            <T>POST /v1/studio/comparisons — deltas, confidence intervals and a budget verdict between two completed runs.</T>
           </p>
         </div>
 
@@ -743,7 +743,7 @@ function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
       </p>
 
       <div className="flex items-center gap-2">
-        <span className="text-xs font-medium text-muted-foreground">Verdict</span>
+        <span className="text-xs font-medium text-muted-foreground"><T>Verdict</T></span>
         <Badge tone={RESULT_STATUS_TONE[payload.verdict] ?? "neutral"}>{payload.verdict}</Badge>
       </div>
 
@@ -756,12 +756,12 @@ function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
           <table className="w-full text-left text-xs">
             <thead className="bg-muted/60 uppercase tracking-wide text-muted-foreground">
               <tr>
-                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Metric</th>
-                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Baseline</th>
-                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Candidate</th>
-                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Delta</th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium"><T>Metric</T></th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium"><T>Baseline</T></th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium"><T>Candidate</T></th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium"><T>Delta</T></th>
                 <th className="whitespace-nowrap px-2.5 py-2 font-medium">n</th>
-                <th className="whitespace-nowrap px-2.5 py-2 font-medium">Flags</th>
+                <th className="whitespace-nowrap px-2.5 py-2 font-medium"><T>Flags</T></th>
               </tr>
             </thead>
             <tbody>
@@ -805,7 +805,7 @@ function ComparisonResultView({ payload }: { payload: ComparisonPayload }) {
 
       {payload.budget_checks.length > 0 && (
         <div>
-          <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">Budget checks</h3>
+          <h3 className="mb-1.5 text-xs font-medium text-muted-foreground"><T>Budget checks</T></h3>
           <ul className="space-y-1.5">
             {payload.budget_checks.map((check, i) => (
               <li key={i} className="flex items-center gap-2 text-xs">
@@ -981,10 +981,9 @@ function PipelineProfileSheet({
       <div className="space-y-5">
         {deletable.length > 0 && (
           <div>
-            <h2 className="text-sm font-semibold text-foreground">Existing pipeline/OCR profiles</h2>
+            <h2 className="text-sm font-semibold text-foreground"><T>Existing pipeline/OCR profiles</T></h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              DELETE /v1/studio/model-profiles/&#123;name&#125; — passthrough profiles aren&apos;t
-              listed here; they can&apos;t be removed through this API.
+              <T>DELETE /v1/studio/model-profiles/{name} — passthrough profiles aren't listed here; they can't be removed through this API.</T>
             </p>
             <ul className="mt-2 divide-y divide-border rounded-md border border-border">
               {deletable.map((p) => (
@@ -1010,13 +1009,9 @@ function PipelineProfileSheet({
         )}
         <form onSubmit={onSubmit} className="space-y-5">
         <div>
-          <h2 className="text-sm font-semibold text-foreground">New pipeline profile</h2>
+          <h2 className="text-sm font-semibold text-foreground"><T>New pipeline profile</T></h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            POST /v1/studio/model-profiles/pipeline — OCR a document, then extract with a
-            passthrough LLM profile. Appends a <code className="rounded bg-muted px-1">
-              kind: pipeline
-            </code>{" "}
-            entry to configs/models.yaml.
+            <T>POST /v1/studio/model-profiles/pipeline — OCR a document, then extract with a passthrough LLM profile. Appends a kind: pipeline entry to configs/models.yaml.</T>
           </p>
         </div>
 
@@ -1043,7 +1038,7 @@ function PipelineProfileSheet({
           </Select>
           {extractors.length === 0 && (
             <p className="mt-1 text-xs text-muted-foreground">
-              No passthrough profiles found in configs/models.yaml.
+              <T>No passthrough profiles found in configs/models.yaml.</T>
             </p>
           )}
         </Field>
@@ -1084,7 +1079,7 @@ function PipelineProfileSheet({
             </Select>
             {visionModels.length === 0 && (
               <p className="mt-1 text-xs text-muted-foreground">
-                No vision-capable passthrough profiles found.
+                <T>No vision-capable passthrough profiles found.</T>
               </p>
             )}
           </Field>
@@ -1176,14 +1171,9 @@ function OcrProfileSheet({
     <Sheet open={open} onClose={onClose}>
       <form onSubmit={onSubmit} className="space-y-5">
         <div>
-          <h2 className="text-sm font-semibold text-foreground">New OCR-only profile</h2>
+          <h2 className="text-sm font-semibold text-foreground"><T>New OCR-only profile</T></h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            POST /v1/studio/model-profiles/ocr — run a document through an OCR backend and
-            return its transcribed text as the completion, no extraction stage. Appends a{" "}
-            <code className="rounded bg-muted px-1">kind: ocr</code> entry to
-            configs/models.yaml. Not a schema-scored benchmark model on its own (pair it
-            with an extractor via a pipeline profile instead for that) — reachable
-            directly through the gateway by name; no Studio UI surface invokes one yet.
+            <T>POST /v1/studio/model-profiles/ocr — run a document through an OCR backend and return its transcribed text as the completion, no extraction stage. Appends a kind: ocr entry to configs/models.yaml. Not a schema-scored benchmark model on its own (pair it with an extractor via a pipeline profile instead for that) — reachable directly through the gateway by name; no Studio UI surface invokes one yet.</T>
           </p>
         </div>
 
@@ -1323,14 +1313,9 @@ function RoutingPolicySheet({
     <Sheet open={open} onClose={onClose}>
       <form onSubmit={onSubmit} className="space-y-5">
         <div>
-          <h2 className="text-sm font-semibold text-foreground">New routing policy</h2>
+          <h2 className="text-sm font-semibold text-foreground"><T>New routing policy</T></h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            POST /v1/studio/routing-policies — save a multi-stage fallback/escalation policy
-            under a name so a benchmark run can reference it directly, instead of a
-            server-side YAML file path. See{" "}
-            <code className="rounded bg-muted px-1">configs/routing-policy.example.yaml</code>{" "}
-            for the full field reference; each stage name must match a profile in
-            models.yaml.
+            <T>POST /v1/studio/routing-policies — save a multi-stage fallback/escalation policy under a name so a benchmark run can reference it directly, instead of a server-side YAML file path. See configs/routing-policy.example.yaml for the full field reference; each stage name must match a profile in models.yaml.</T>
           </p>
         </div>
 
@@ -1416,7 +1401,7 @@ function DatasetValidateSheet({
     <Sheet open={open} onClose={onClose}>
       <div className="space-y-5">
         <div>
-          <h2 className="text-sm font-semibold text-foreground">Validate dataset</h2>
+          <h2 className="text-sm font-semibold text-foreground"><T>Validate dataset</T></h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
             POST /v1/studio/datasets/{"{name}"}/validate — duplicate doc_id, missing
             files, cross-split leakage, and document statistics.
@@ -1463,7 +1448,7 @@ function DatasetValidationResultView({ report }: { report: DatasetValidationRepo
   return (
     <div className="space-y-4 border-t border-border pt-4">
       <div className="flex items-center gap-2">
-        <span className="text-xs font-medium text-muted-foreground">Result</span>
+        <span className="text-xs font-medium text-muted-foreground"><T>Result</T></span>
         <Badge tone={report.valid ? "ok" : "err"}>{report.valid ? "valid" : "invalid"}</Badge>
         <span className="font-mono text-xs text-muted-foreground">{report.reference}</span>
       </div>
@@ -1490,7 +1475,7 @@ function DatasetValidationResultView({ report }: { report: DatasetValidationRepo
 
       {report.statistics && (
         <div>
-          <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">Statistics</h3>
+          <h3 className="mb-1.5 text-xs font-medium text-muted-foreground"><T>Statistics</T></h3>
           <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
             <Stat label="Documents" value={report.statistics.documents} />
             <Stat label="Labeled" value={report.statistics.labeled_documents} />
@@ -1513,7 +1498,7 @@ function DatasetValidationResultView({ report }: { report: DatasetValidationRepo
             Cross-split leakage (threshold {report.leakage.near_duplicate_threshold})
           </h3>
           {report.leakage.leakage_pairs === 0 ? (
-            <p className="text-xs text-muted-foreground">No leakage detected.</p>
+            <p className="text-xs text-muted-foreground"><T>No leakage detected.</T></p>
           ) : (
             <ul className="space-y-1 text-xs">
               {[...report.leakage.exact_duplicates, ...report.leakage.near_duplicates]
@@ -1575,7 +1560,7 @@ function ResultsSummary({
   loading: boolean;
 }) {
   if (loading && !runs) {
-    return <p className="text-sm text-muted-foreground">Loading runs…</p>;
+    return <p className="text-sm text-muted-foreground"><T>Loading runs…</T></p>;
   }
   const recent = (runs ?? []).slice(0, 6);
   if (recent.length === 0) {

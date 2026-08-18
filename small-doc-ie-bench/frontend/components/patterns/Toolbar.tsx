@@ -3,6 +3,7 @@
 import type { ReactNode } from "react";
 import { SlidersHorizontal, RotateCcw } from "lucide-react";
 import { Button } from "../ui";
+import { useI18n } from "@/lib/i18n";
 
 /**
  * Filter row: a "Filters" label affordance, the filter controls, and a Reset
@@ -18,11 +19,12 @@ export function Toolbar({
   onReset?: () => void;
   resetDisabled?: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <div className="mb-3 flex flex-wrap items-center gap-2">
       <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-muted-foreground">
         <SlidersHorizontal className="h-3.5 w-3.5" />
-        Filters
+        {t("Filters")}
       </span>
       {children}
       {onReset && (

@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { ApiUnavailable } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { useI18n, useTranslatedNode, useTranslatedOptions } from "@/lib/i18n";
 
 // ---------------------------------------------------------------------------
 // Card
@@ -35,6 +36,7 @@ export function Card({
   className?: string;
   bodyClassName?: string;
 }) {
+  const tx = useTranslatedNode();
   return (
     <section
       className={cn(
@@ -53,11 +55,11 @@ export function Card({
             <div className="min-w-0">
               {title && (
                 <h2 className="truncate text-sm font-semibold text-foreground">
-                  {title}
+                  {tx(title)}
                 </h2>
               )}
               {subtitle && (
-                <p className="mt-0.5 text-xs text-muted-foreground">{subtitle}</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">{tx(subtitle)}</p>
               )}
             </div>
           </div>
@@ -102,18 +104,32 @@ export const Button = forwardRef<
     loading?: boolean;
   }
 >(function Button(
-  { children, className, variant = "primary", size = "md", loading, disabled, ...props },
+  {
+    children,
+    className,
+    variant = "primary",
+    size = "md",
+    loading,
+    disabled,
+    title,
+    "aria-label": ariaLabel,
+    ...props
+  },
   ref,
 ) {
+  const tx = useTranslatedNode();
+  const { t } = useI18n();
   return (
     <button
       ref={ref}
       disabled={disabled || loading}
+      title={typeof title === "string" ? t(title) : title}
+      aria-label={typeof ariaLabel === "string" ? t(ariaLabel) : ariaLabel}
       className={cn(BTN_BASE, BTN_VARIANTS[variant], BTN_SIZES[size], className)}
       {...props}
     >
       {loading && <Loader2 className="h-4 w-4 animate-spin" />}
-      {children}
+      {tx(children)}
     </button>
   );
 });
@@ -124,11 +140,12 @@ export function IconButton({
   children,
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
+  const { t } = useI18n();
   return (
     <button
       type="button"
-      aria-label={label}
-      title={label}
+      aria-label={t(label)}
+      title={t(label)}
       className={cn(
         "grid h-9 w-9 place-items-center rounded-md border border-border bg-card text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-50",
         className,
@@ -159,17 +176,18 @@ export function Field({
   children: React.ReactNode;
   className?: string;
 }) {
+  const { t } = useI18n();
   return (
     <div className={cn("block", className)}>
       <label
         htmlFor={htmlFor}
         className="mb-1.5 flex items-center gap-1 text-xs font-medium text-foreground"
       >
-        {label}
+        {t(label)}
         {required && <span className="text-rose-500">*</span>}
       </label>
       {children}
-      {hint && <p className="mt-1 text-xs text-muted-foreground">{hint}</p>}
+      {hint && <p className="mt-1 text-xs text-muted-foreground">{t(hint)}</p>}
     </div>
   );
 }
@@ -180,20 +198,32 @@ const INPUT_BASE =
 export const TextInput = forwardRef<
   HTMLInputElement,
   React.InputHTMLAttributes<HTMLInputElement>
->(function TextInput({ className, ...props }, ref) {
+>(function TextInput({ className, placeholder, title, "aria-label": ariaLabel, ...props }, ref) {
+  const { t } = useI18n();
   return (
-    <input ref={ref} className={cn(INPUT_BASE, "h-10", className)} {...props} />
+    <input
+      ref={ref}
+      className={cn(INPUT_BASE, "h-10", className)}
+      placeholder={typeof placeholder === "string" ? t(placeholder) : placeholder}
+      title={typeof title === "string" ? t(title) : title}
+      aria-label={typeof ariaLabel === "string" ? t(ariaLabel) : ariaLabel}
+      {...props}
+    />
   );
 });
 
 export const TextArea = forwardRef<
   HTMLTextAreaElement,
   React.TextareaHTMLAttributes<HTMLTextAreaElement>
->(function TextArea({ className, ...props }, ref) {
+>(function TextArea({ className, placeholder, title, "aria-label": ariaLabel, ...props }, ref) {
+  const { t } = useI18n();
   return (
     <textarea
       ref={ref}
       className={cn(INPUT_BASE, "resize-y py-2 leading-relaxed", className)}
+      placeholder={typeof placeholder === "string" ? t(placeholder) : placeholder}
+      title={typeof title === "string" ? t(title) : title}
+      aria-label={typeof ariaLabel === "string" ? t(ariaLabel) : ariaLabel}
       {...props}
     />
   );
@@ -202,7 +232,9 @@ export const TextArea = forwardRef<
 export const Select = forwardRef<
   HTMLSelectElement,
   React.SelectHTMLAttributes<HTMLSelectElement>
->(function Select({ className, children, ...props }, ref) {
+>(function Select({ className, children, title, "aria-label": ariaLabel, ...props }, ref) {
+  const { t } = useI18n();
+  const translateOptions = useTranslatedOptions();
   return (
     <select
       ref={ref}
@@ -213,9 +245,11 @@ export const Select = forwardRef<
         backgroundRepeat: "no-repeat",
         backgroundPosition: "right 0.6rem center",
       }}
+      title={typeof title === "string" ? t(title) : title}
+      aria-label={typeof ariaLabel === "string" ? t(ariaLabel) : ariaLabel}
       {...props}
     >
-      {children}
+      {translateOptions(children)}
     </select>
   );
 });
@@ -243,6 +277,7 @@ export function Badge({
   tone?: BadgeTone;
   className?: string;
 }) {
+  const tx = useTranslatedNode();
   return (
     <span
       className={cn(
@@ -251,7 +286,7 @@ export function Badge({
         className,
       )}
     >
-      {children}
+      {tx(children)}
     </span>
   );
 }
@@ -273,6 +308,7 @@ export function StatusDot({
   pulse?: boolean;
   className?: string;
 }) {
+  const { t } = useI18n();
   return (
     <span
       className={cn(
@@ -314,15 +350,16 @@ export function EmptyState({
   description?: string;
   icon?: React.ReactNode;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex flex-col items-center justify-center rounded-md border border-dashed border-border bg-muted/20 px-6 py-12 text-center">
       <span className="mb-3 grid h-11 w-11 place-items-center rounded-full border border-border bg-card text-muted-foreground">
         {icon ?? <Inbox className="h-5 w-5" />}
       </span>
-      <p className="text-sm font-medium text-foreground">{title}</p>
+      <p className="text-sm font-medium text-foreground">{t(title)}</p>
       {description && (
         <p className="mx-auto mt-1 max-w-sm text-xs text-muted-foreground">
-          {description}
+          {t(description)}
         </p>
       )}
     </div>
@@ -375,6 +412,7 @@ export function Alert({
   className?: string;
 }) {
   const Icon = ALERT_ICONS[tone];
+  const tx = useTranslatedNode();
   return (
     <p
       role={tone === "err" ? "alert" : undefined}
@@ -385,7 +423,7 @@ export function Alert({
       )}
     >
       <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-      <span className="min-w-0">{children}</span>
+      <span className="min-w-0">{tx(children)}</span>
     </p>
   );
 }
@@ -409,6 +447,7 @@ export function Segmented<T extends string>({
   }[];
   className?: string;
 }) {
+  const tx = useTranslatedNode();
   return (
     <div
       className={cn(
@@ -433,7 +472,7 @@ export function Segmented<T extends string>({
             )}
           >
             {Icon && <Icon className="h-3.5 w-3.5" />}
-            {opt.label}
+            {tx(opt.label)}
           </button>
         );
       })}
@@ -456,6 +495,7 @@ export const Checkbox = forwardRef<
     className?: string;
   }
 >(function Checkbox({ label, hint, className, ...props }, ref) {
+  const tx = useTranslatedNode();
   return (
     <label
       className={cn(
@@ -470,8 +510,8 @@ export const Checkbox = forwardRef<
         {...props}
       />
       <span>
-        {label}
-        {hint && <span className="block text-muted-foreground">{hint}</span>}
+        {tx(label)}
+        {hint && <span className="block text-muted-foreground">{tx(hint)}</span>}
       </span>
     </label>
   );
@@ -498,6 +538,8 @@ export function Dialog({
   footer?: React.ReactNode;
   className?: string;
 }) {
+  const tx = useTranslatedNode();
+  const { t } = useI18n();
   const closeRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -521,7 +563,7 @@ export function Dialog({
       <div
         role="dialog"
         aria-modal="true"
-        aria-label={typeof title === "string" ? title : undefined}
+        aria-label={typeof title === "string" ? t(title) : undefined}
         className={cn(
           "relative z-10 w-full max-w-md rounded-lg border border-border bg-card p-5 shadow-elevated",
           className,
@@ -529,10 +571,10 @@ export function Dialog({
       >
         <div className="mb-3 flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+            <h3 className="text-sm font-semibold text-foreground">{tx(title)}</h3>
             {subtitle && (
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                {subtitle}
+                {tx(subtitle)}
               </p>
             )}
           </div>
@@ -540,7 +582,7 @@ export function Dialog({
             ref={closeRef}
             type="button"
             onClick={onClose}
-            aria-label="Close"
+            aria-label={t("Close")}
             className="-m-1 grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
           >
             <X className="h-4 w-4" />
@@ -574,6 +616,7 @@ export function Sheet({
   onClose: () => void;
   children: React.ReactNode;
 }) {
+  const { t } = useI18n();
   const closeRef = useRef<HTMLButtonElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const wasOpen = useRef(open);
@@ -612,7 +655,7 @@ export function Sheet({
             ref={closeRef}
             type="button"
             onClick={onClose}
-            aria-label="Close panel"
+            aria-label={t("Close panel")}
             className="grid h-8 w-8 place-items-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
           >
             <X className="h-4 w-4" />

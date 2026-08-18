@@ -1,6 +1,7 @@
 "use client";
 
 import { AlertTriangle } from "lucide-react";
+import { T, useI18n } from "@/lib/i18n";
 import { Button, Dialog } from "../../ui";
 
 export function defaultStoreName(repo: string): string {
@@ -28,13 +29,16 @@ export function ExistingModelsDialog({
   onClose: () => void;
   onContinue: () => void;
 }) {
+  const { t } = useI18n();
   const one = names.length === 1;
   return (
     <Dialog
       open={open}
       onClose={onClose}
       title={
-        one ? "This store name already exists" : `${names.length} store names already exist`
+        one
+          ? t("This store name already exists")
+          : t("{count} store names already exist", { count: names.length })
       }
       footer={
         <>
@@ -42,7 +46,7 @@ export function ExistingModelsDialog({
             Go back
           </Button>
           <Button type="button" onClick={onContinue}>
-            Use existing {one ? "model" : "models"}
+            {t(one ? "Use existing model" : "Use existing models")}
           </Button>
         </>
       }
@@ -52,12 +56,12 @@ export function ExistingModelsDialog({
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />
           <div className="min-w-0">
             <p className="text-sm font-medium text-foreground">
-              No new files will be downloaded or replaced.
+              <T>No new files will be downloaded or replaced.</T>
             </p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Continuing will keep the model already stored under{" "}
-              {one ? "this name" : "these names"}. Go back if you meant to download a
-              different model or quantization.
+              {t("Continuing will keep the model already stored under {names}. Go back if you meant to download a different model or quantization.", {
+                names: t(one ? "this name" : "these names"),
+              })}
             </p>
           </div>
         </div>

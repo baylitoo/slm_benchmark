@@ -11,6 +11,7 @@ import {
   type TriggerResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { T } from "@/lib/i18n";
 import { useToast } from "../../Toast";
 import { Alert, Button, Card, Field, Select, TextInput } from "../../ui";
 import { ResultPanel } from "../../ResultPanel";
@@ -170,8 +171,7 @@ export function HfSeedForm({
               </div>
               {hasMmproj && (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  This repo ships a vision projector (mmproj) — downloaded
-                  automatically for families that need one.
+                  <T>This repo ships a vision projector (mmproj) — downloaded automatically for families that need one.</T>
                 </p>
               )}
             </div>

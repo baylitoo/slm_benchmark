@@ -21,6 +21,7 @@ import {
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
+import { useI18n } from "@/lib/i18n";
 import { Alert, Badge, Button, Checkbox, Dialog, Field, Segmented, Select, TextInput } from "./ui";
 import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
@@ -90,16 +91,17 @@ function tierOf(card: CatalogCard): Tier {
 }
 
 function TierBadge({ tier }: { tier: Tier }) {
+  const { t } = useI18n();
   const meta = TIER_META[tier];
   return (
     <span
-      title={meta.hint}
+      title={t(meta.hint)}
       className={cn(
         "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-xs font-medium",
         meta.className,
       )}
     >
-      {meta.label}
+      {t(meta.label)}
     </span>
   );
 }
@@ -110,6 +112,7 @@ function TierBadge({ tier }: { tier: Tier }) {
  * node snapshot) renders NOTHING, so a missing judgment never reads as "fits".
  */
 function FitBadge({ card }: { card: CatalogCard }) {
+  const { t } = useI18n();
   if (card.fits_node == null) return null;
   const budget =
     card.node_available_bytes != null
@@ -117,7 +120,7 @@ function FitBadge({ card }: { card: CatalogCard }) {
       : undefined;
   return (
     <Badge tone={card.fits_node ? "ok" : "err"} className={budget ? "cursor-help" : undefined}>
-      <span title={budget}>{card.fits_node ? "Fits" : "Too big"}</span>
+      <span title={budget}>{t(card.fits_node ? "Fits" : "Too big")}</span>
     </Badge>
   );
 }

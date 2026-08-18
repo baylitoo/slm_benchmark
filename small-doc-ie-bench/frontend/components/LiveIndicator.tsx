@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { useI18n } from "@/lib/i18n";
 import { useSectionActive } from "./shell/SectionActivity";
 import { StatusDot } from "./ui";
 
@@ -32,6 +33,7 @@ export function LiveIndicator({
   lastUpdated: number | null;
   onRefresh: () => void;
 }) {
+  const { t } = useI18n();
   const sectionActive = useSectionActive();
   const [, force] = useState(0);
   useEffect(() => {
@@ -62,18 +64,18 @@ export function LiveIndicator({
     <div className="flex items-center gap-2">
       <span
         className="flex items-center gap-1.5 rounded-full border border-border bg-muted px-2.5 py-1 text-xs text-muted-foreground"
-        title={live ? "Auto-refresh is active" : "Auto-refresh paused (tab hidden or inactive)"}
+        title={t(live ? "Auto-refresh is active" : "Auto-refresh paused (tab hidden or inactive)")}
       >
         <StatusDot tone={live ? "ok" : "neutral"} pulse={live} />
-        {live ? "Live" : "Paused"}
+        {t(live ? "Live" : "Paused")}
         <span className="text-muted-foreground/60">·</span>
         <span className="tabular-nums">{timeAgo(lastUpdated)}</span>
       </span>
       <button
         type="button"
         onClick={onRefresh}
-        aria-label="Refresh now"
-        title="Refresh now"
+        aria-label={t("Refresh now")}
+        title={t("Refresh now")}
         className="grid h-7 w-7 place-items-center rounded-lg border border-border bg-muted text-muted-foreground transition hover:text-foreground"
       >
         <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
