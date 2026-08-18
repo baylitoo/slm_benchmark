@@ -4,6 +4,7 @@ import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { ComingSoon, EmptyState, Skeleton } from "../ui";
+import { useI18n } from "@/lib/i18n";
 
 export interface Column<T> {
   key: string;
@@ -48,6 +49,7 @@ export function Table<T>({
   expandedKey?: string | null;
   onRowClick?: (row: T) => void;
 }) {
+  const { t } = useI18n();
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>("asc");
 
@@ -115,7 +117,7 @@ export function Table<T>({
                       onClick={() => toggleSort(col)}
                       className="inline-flex items-center gap-1 uppercase hover:text-foreground"
                     >
-                      {col.header}
+                      {t(col.header)}
                       {isSorted ? (
                         sortDir === "asc" ? (
                           <ChevronUp className="h-3 w-3" />
@@ -127,7 +129,7 @@ export function Table<T>({
                       )}
                     </button>
                   ) : (
-                    col.header
+                    t(col.header)
                   )}
                 </th>
               );

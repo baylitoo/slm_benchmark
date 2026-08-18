@@ -11,6 +11,7 @@ import {
 } from "react";
 import { CheckCircle2, Info, X, XCircle, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { useI18n } from "@/lib/i18n";
 
 export type ToastTone = "success" | "error" | "info" | "warn";
 
@@ -56,6 +57,7 @@ const TONE_STYLES: Record<ToastTone, string> = {
 };
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
+  const { t: translate } = useI18n();
   const [toasts, setToasts] = useState<Toast[]>([]);
   const nextId = useRef(1);
   const timers = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
@@ -95,7 +97,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
       <div
         className="pointer-events-none fixed bottom-4 right-4 z-50 flex w-full max-w-sm flex-col gap-2"
         role="region"
-        aria-label="Notifications"
+        aria-label={translate("Notifications")}
         aria-live="polite"
       >
         {toasts.map((t) => {
@@ -108,17 +110,17 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
             >
               <Icon className={cn("mt-0.5 h-5 w-5 shrink-0", TONE_STYLES[t.tone])} />
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-foreground">{t.title}</p>
+                <p className="text-sm font-medium text-foreground">{translate(t.title)}</p>
                 {t.description && (
                   <p className="mt-0.5 break-words text-xs text-muted-foreground">
-                    {t.description}
+                    {translate(t.description)}
                   </p>
                 )}
               </div>
               <button
                 type="button"
                 onClick={() => dismiss(t.id)}
-                aria-label="Dismiss notification"
+                aria-label={translate("Dismiss notification")}
                 className="-m-1 rounded-md p-1 text-muted-foreground transition hover:text-foreground"
               >
                 <X className="h-4 w-4" />

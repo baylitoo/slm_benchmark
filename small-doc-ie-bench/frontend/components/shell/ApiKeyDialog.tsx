@@ -11,8 +11,10 @@ import { useState } from "react";
 import { KeyRound } from "lucide-react";
 import { getApiKey, setApiKey, useHasApiKey } from "@/lib/apiKey";
 import { Button, Dialog, Field, StatusDot, TextInput } from "../ui";
+import { useI18n } from "@/lib/i18n";
 
 export function ApiKeyButton() {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const hasKey = useHasApiKey();
@@ -38,8 +40,8 @@ export function ApiKeyButton() {
       <button
         type="button"
         onClick={openDialog}
-        aria-label="API key"
-        title={hasKey ? "API key set" : "No API key set"}
+        aria-label={t("API key")}
+        title={t(hasKey ? "API key set" : "No API key set")}
         className="relative grid h-9 w-9 place-items-center rounded-md border border-border bg-card text-muted-foreground transition hover:bg-muted hover:text-foreground"
       >
         <KeyRound className="h-4 w-4" />

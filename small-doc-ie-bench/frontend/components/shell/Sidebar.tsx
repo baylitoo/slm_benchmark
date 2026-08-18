@@ -8,6 +8,7 @@ import { cn } from "@/lib/cn";
 import { Badge, StatusDot } from "../ui";
 import { NavItem } from "./NavItem";
 import { NAV_GROUPS, type NavItem as NavItemData, type SectionId } from "./nav";
+import { useI18n } from "@/lib/i18n";
 
 const HEALTH_META: Record<Health, { tone: "ok" | "warn" | "err"; label: string }> = {
   checking: { tone: "warn", label: "Connecting" },
@@ -47,6 +48,7 @@ export function Sidebar({
   onCloseMobile: () => void;
   health: Health;
 }) {
+  const { t } = useI18n();
   // Which groups are expanded (presentation only). All open by default.
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const isOpen = (heading: string) => openGroups[heading] !== false;
@@ -101,7 +103,7 @@ export function Sidebar({
         <button
           type="button"
           onClick={onCloseMobile}
-          aria-label="Close navigation"
+          aria-label={t("Close navigation")}
           className="ml-auto rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground lg:hidden"
         >
           <X className="h-4 w-4" />
@@ -109,7 +111,7 @@ export function Sidebar({
       </div>
 
       {/* Grouped nav */}
-      <nav className="scroll-thin flex-1 space-y-1 overflow-y-auto px-2 py-3" aria-label="Primary">
+      <nav className="scroll-thin flex-1 space-y-1 overflow-y-auto px-2 py-3" aria-label={t("Primary")}>
         {NAV_GROUPS.map((group) => {
           const open = isOpen(group.heading);
           return (
@@ -120,7 +122,7 @@ export function Sidebar({
                   onClick={() => toggleGroup(group.heading)}
                   className="flex w-full items-center justify-between px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground"
                 >
-                  {group.heading}
+                  {t(group.heading)}
                   <ChevronDown
                     className={cn(
                       "h-3.5 w-3.5 transition-transform",
@@ -154,11 +156,11 @@ export function Sidebar({
       <button
         type="button"
         onClick={onToggleCollapse}
-        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        aria-label={t(collapsed ? "Expand sidebar" : "Collapse sidebar")}
         className="hidden items-center gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground hover:bg-muted hover:text-foreground lg:flex"
       >
         <ChevronsLeft className={cn("h-4 w-4 transition-transform", collapsed && "rotate-180")} />
-        {!collapsed && <span>Collapse</span>}
+        {!collapsed && <span>{t("Collapse")}</span>}
       </button>
 
       {/* Backend health footer */}
@@ -167,7 +169,7 @@ export function Sidebar({
           <StatusDot tone={meta.tone} pulse={health !== "offline"} />
           {!collapsed && (
             <div className="min-w-0">
-              <p className="truncate text-xs font-medium text-foreground">{meta.label}</p>
+              <p className="truncate text-xs font-medium text-foreground">{t(meta.label)}</p>
               <p className="truncate text-[11px] text-muted-foreground" title={API_BASE}>
                 {API_BASE.replace(/^https?:\/\//, "")}
               </p>

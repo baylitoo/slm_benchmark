@@ -20,6 +20,7 @@ import {
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
+import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
 import {
@@ -175,7 +176,7 @@ export function DeployForm({
         {/* Runtime picker — scoped to the selected model's backends */}
         {selected && (
           <div className="animate-fade-in">
-            <p className="mb-1.5 text-xs font-medium text-foreground">Runtime</p>
+            <p className="mb-1.5 text-xs font-medium text-foreground"><T>Runtime</T></p>
             <div
               role="radiogroup"
               aria-label="Runtime"
@@ -218,7 +219,7 @@ export function DeployForm({
             ) : (
               <ChevronRight className="h-3.5 w-3.5" />
             )}
-            Advanced options
+            <T>Advanced options</T>
           </button>
           {showAdvanced && (
             <div className="mt-3 animate-fade-in space-y-4">

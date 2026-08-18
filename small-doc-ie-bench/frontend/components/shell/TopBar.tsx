@@ -5,7 +5,9 @@ import { API_BASE } from "@/lib/env";
 import type { Health } from "@/lib/useBackendHealth";
 import { Badge, StatusDot } from "../ui";
 import { ThemeToggle } from "../ThemeToggle";
+import { LanguageToggle } from "../LanguageToggle";
 import { ApiKeyButton } from "./ApiKeyDialog";
+import { useI18n } from "@/lib/i18n";
 
 const GITHUB_URL = "https://github.com/baylitoo/slm_benchmark";
 
@@ -53,6 +55,7 @@ export function TopBar({
   onToggleCollapse: () => void;
   health: Health;
 }) {
+  const { t } = useI18n();
   const meta = HEALTH_META[health];
   return (
     <header className="sticky top-0 z-20 flex h-14 items-center justify-between gap-3 border-b border-border bg-card px-4">
@@ -60,7 +63,7 @@ export function TopBar({
         <button
           type="button"
           onClick={onToggleMobile}
-          aria-label="Open navigation"
+          aria-label={t("Open navigation")}
           className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground lg:hidden"
         >
           <Menu className="h-5 w-5" />
@@ -68,7 +71,7 @@ export function TopBar({
         <button
           type="button"
           onClick={onToggleCollapse}
-          aria-label="Toggle sidebar"
+          aria-label={t("Toggle sidebar")}
           className="hidden rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground lg:inline-flex"
         >
           <PanelLeft className="h-5 w-5" />
@@ -87,18 +90,19 @@ export function TopBar({
         </Badge>
         <span
           className="flex items-center gap-1.5 text-xs text-muted-foreground"
-          title={meta.label}
+          title={t(meta.label)}
         >
           <StatusDot tone={meta.tone} pulse={health !== "offline"} />
-          <span className="hidden sm:inline">{meta.label}</span>
+          <span className="hidden sm:inline">{t(meta.label)}</span>
         </span>
         <ApiKeyButton />
+        <LanguageToggle />
         <ThemeToggle />
         <a
           href={GITHUB_URL}
           target="_blank"
           rel="noreferrer"
-          aria-label="GitHub repository"
+          aria-label={t("GitHub repository")}
           className="grid h-9 w-9 place-items-center rounded-md border border-border bg-card text-muted-foreground transition hover:bg-muted hover:text-foreground"
         >
           <GithubMark className="h-4 w-4" />
@@ -107,7 +111,7 @@ export function TopBar({
           <span className="grid h-8 w-8 place-items-center rounded-full bg-accent/10 text-xs font-semibold text-accent">
             DS
           </span>
-          <span className="hidden text-sm font-medium text-foreground md:inline">Operator</span>
+          <span className="hidden text-sm font-medium text-foreground md:inline">{t("Operator")}</span>
         </span>
       </div>
     </header>

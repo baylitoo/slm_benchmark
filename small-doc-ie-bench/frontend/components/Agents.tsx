@@ -54,6 +54,7 @@ import {
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
+import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "./Toast";
 import { Alert, Badge, Button, Card, Checkbox, ComingSoon, Field, Select, Skeleton, TextArea, TextInput } from "./ui";
@@ -175,7 +176,7 @@ export function Agents({
             }}
           >
             <PlusCircle className="h-4 w-4" />
-            New agent
+            <T>New agent</T>
           </Button>
         }
       />
@@ -246,7 +247,7 @@ function TemplatesView({
               {template.description}
             </p>
             <Button size="sm" className="mt-4 w-full" onClick={() => onUse(template)}>
-              Use template
+              <T>Use template</T>
             </Button>
           </Card>
         ))}
@@ -260,12 +261,11 @@ function TemplatesView({
         <div className="space-y-2">
           <CopyLine label="base_url" value={agentBaseUrl()} />
           <p className="text-xs text-muted-foreground">
-            <code className="rounded bg-muted px-1">GET /models</code> lists the enabled
-            agents; <code className="rounded bg-muted px-1">POST /chat/completions</code>{" "}
-            routes by the <code className="rounded bg-muted px-1">model</code> field (the
-            agent name). Auth: <code className="rounded bg-muted px-1">x-api-key</code> or a
-            standard <code className="rounded bg-muted px-1">Authorization: Bearer</code>{" "}
-            key.
+            <code className="rounded bg-muted px-1">GET /models</code>{" "}<T>lists the enabled agents;</T>{" "}
+            <code className="rounded bg-muted px-1">POST /chat/completions</code>{" "}<T>routes by the</T>{" "}
+            <code className="rounded bg-muted px-1">model</code>{" "}<T>field (the agent name). Auth:</T>{" "}
+            <code className="rounded bg-muted px-1">x-api-key</code>{" "}<T>or a standard</T>{" "}
+            <code className="rounded bg-muted px-1">Authorization: Bearer</code>{" "}<T>key.</T>
           </p>
         </div>
       </Card>
@@ -347,7 +347,7 @@ function InstancesView({
       header: "Backing model",
       render: (a) => (
         <span className="text-xs text-foreground/80">
-          {a.model_profile || <span className="text-muted-foreground">studio default</span>}
+          {a.model_profile || <span className="text-muted-foreground"><T>studio default</T></span>}
         </span>
       ),
     },
@@ -380,7 +380,7 @@ function InstancesView({
             }}
           >
             <Pencil className="h-3.5 w-3.5" />
-            Edit
+            <T>Edit</T>
           </Button>
           <Button
             variant="secondary"
@@ -498,7 +498,7 @@ function TryPanel({ agent }: { agent: AgentView }) {
 
   return (
     <div className="rounded-md border border-border bg-card p-3">
-      <p className="mb-2 text-xs font-medium text-foreground">Try it</p>
+      <p className="mb-2 text-xs font-medium text-foreground"><T>Try it</T></p>
       <div className="space-y-2">
         {isOcr ? (
           <input
@@ -517,8 +517,7 @@ function TryPanel({ agent }: { agent: AgentView }) {
           </Button>
           {running && (
             <span className="text-xs text-muted-foreground">
-              An evicted backing deployment auto-reloads on first request — that
-              wait is the model load.
+              <T>An evicted backing deployment auto-reloads on first request — that wait is the model load.</T>
             </span>
           )}
         </div>
@@ -548,14 +547,14 @@ function TryPanel({ agent }: { agent: AgentView }) {
               </p>
             )}
             <div>
-              <p className="mb-1 text-xs font-medium text-muted-foreground">Response</p>
+              <p className="mb-1 text-xs font-medium text-muted-foreground"><T>Response</T></p>
               <pre className="scroll-thin max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed text-foreground/90">
                 {typeof content === "string" ? content : JSON.stringify(result, null, 2)}
               </pre>
             </div>
             <details>
               <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-                Raw completion JSON
+                <T>Raw completion JSON</T>
               </summary>
               <pre className="scroll-thin mt-1 max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs text-foreground/90">
                 {JSON.stringify(result, null, 2)}
@@ -581,7 +580,7 @@ function AgentDetails({ agent }: { agent: AgentView }) {
       <TryPanel agent={agent} />
       <div>
         <div className="mb-1 flex items-center justify-between">
-          <p className="text-xs font-medium text-muted-foreground">From your platform</p>
+          <p className="text-xs font-medium text-muted-foreground"><T>From your platform</T></p>
           <CopyButton value={curl} label="Copy curl" />
         </div>
         <pre className="scroll-thin overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed text-foreground/90">
@@ -590,7 +589,7 @@ function AgentDetails({ agent }: { agent: AgentView }) {
       </div>
       {agent.system_prompt && (
         <div>
-          <p className="mb-1 text-xs font-medium text-muted-foreground">System prompt</p>
+          <p className="mb-1 text-xs font-medium text-muted-foreground"><T>System prompt</T></p>
           <p className="rounded-md border border-border bg-muted/40 p-3 text-xs text-foreground/90">
             {agent.system_prompt}
           </p>
@@ -598,7 +597,7 @@ function AgentDetails({ agent }: { agent: AgentView }) {
       )}
       {agent.options && Object.keys(agent.options).length > 0 && (
         <div>
-          <p className="mb-1 text-xs font-medium text-muted-foreground">Options</p>
+          <p className="mb-1 text-xs font-medium text-muted-foreground"><T>Options</T></p>
           <pre className="scroll-thin overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs text-foreground/90">
             {JSON.stringify(agent.options, null, 2)}
           </pre>
@@ -964,7 +963,7 @@ function CreateView({
                 )}
                 {chatDeployments.length === 0 && (
                   <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
-                    No chat deployment is routable yet — deploy one first
+                    <T>No chat deployment is routable yet — deploy one first.</T>
                     (Serving → Models / Deployments).
                   </p>
                 )}
@@ -1001,7 +1000,7 @@ function CreateView({
                   </Select>
                 </Field>
                 <div>
-                  <p className="mb-1.5 text-xs font-medium text-foreground">Entities</p>
+                  <p className="mb-1.5 text-xs font-medium text-foreground"><T>Entities</T></p>
                   <div className="grid grid-cols-2 gap-1.5">
                     {PII_ENTITIES.map((entity) => (
                       <Checkbox
@@ -1041,7 +1040,7 @@ function CreateView({
                   {seededUndeployedEncoders.length > 0 && (
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">
                       <span className="text-xs text-muted-foreground">
-                        Deploy a seeded encoder:
+                        <T>Deploy a seeded encoder:</T>
                       </span>
                       {seededUndeployedEncoders.map((n) => (
                         <Button
@@ -1062,9 +1061,7 @@ function CreateView({
                   {encoderDeployments.length === 0 &&
                     seededUndeployedEncoders.length === 0 && (
                       <p className="mt-1 text-xs text-muted-foreground">
-                        No analyzer model available — add one under Serving →
-                        Models → Add model → Encoder, then it appears here to
-                        deploy.
+                        <T>No analyzer model available — add one under Serving → Models → Add model → Encoder, then it appears here to deploy.</T>
                       </p>
                     )}
                 </Field>
@@ -1084,7 +1081,7 @@ function CreateView({
                     </Field>
                     <div>
                       <p className="mb-1.5 text-xs font-medium text-foreground">
-                        Moderation tasks
+                        <T>Moderation tasks</T>
                       </p>
                       <div className="grid gap-1.5">
                         {GUARD_TASKS.map((task) => (
@@ -1103,10 +1100,7 @@ function CreateView({
                         ))}
                       </div>
                       <p className="mt-1 text-xs text-muted-foreground">
-                        Needs a GLiNER2 guardrails checkpoint (e.g.
-                        fastino/GLiNER2-Guardrails-PII-Multi). In Block mode a
-                        non-benign verdict refuses the request before any PII
-                        check.
+                        <T>Needs a GLiNER2 guardrails checkpoint (e.g. fastino/GLiNER2-Guardrails-PII-Multi). In Block mode a non-benign verdict refuses the request before any PII check.</T>
                       </p>
                     </div>
                     <Checkbox
@@ -1141,9 +1135,9 @@ function CreateView({
                       )}
                     >
                       <span className="flex items-center gap-2 text-sm font-medium text-foreground">
-                        {m.icon} {m.label}
+                        {m.icon} <T>{m.label}</T>
                       </span>
-                      <span className="text-xs text-muted-foreground">{m.desc}</span>
+                      <span className="text-xs text-muted-foreground"><T>{m.desc}</T></span>
                     </button>
                   ))}
                 </div>
@@ -1191,7 +1185,7 @@ function CreateView({
                     </Select>
                     {visionModels.length === 0 && (
                       <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
-                        No vision model deployed — deploy one from Models first.
+                        <T>No vision model deployed — deploy one from Models first.</T>
                       </p>
                     )}
                   </Field>
@@ -1234,7 +1228,7 @@ function CreateView({
                           className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
                         >
                           <FilePlus2 className="h-3 w-3" />
-                          New schema…
+                          <T>New schema…</T>
                         </button>
                       </div>
                     </Field>
@@ -1333,10 +1327,9 @@ function CreateView({
                         className="mt-0.5 h-3.5 w-3.5"
                       />
                       <span>
-                        Disable thinking (reasoning models)
+                        <T>Disable thinking (reasoning models)</T>
                         <span className="block text-muted-foreground">
-                          Uses native reasoning controls when supported and an
-                          assistant JSON continuation for templates that ignore them.
+                          <T>Uses native reasoning controls when supported and an assistant JSON continuation for templates that ignore them.</T>
                         </span>
                       </span>
                     </label>
@@ -1346,9 +1339,7 @@ function CreateView({
                 {ocrMode === "vision" && (
                   <p className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
                     <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    Structured output needs a model whose runtime enforces a schema
-                    (llama.cpp GBNF / vLLM). A NuExtract model here runs via generic
-                    grammar, not its bespoke chat-template path.
+                    <T>Structured output needs a model whose runtime enforces a schema (llama.cpp GBNF / vLLM). A NuExtract model here runs via generic grammar, not its bespoke chat-template path.</T>
                   </p>
                 )}
               </div>
