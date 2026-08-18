@@ -1,7 +1,8 @@
 // Theme-aware presentational primitives shared across the app.
 // Dependency-light: Tailwind + lucide-react + a `cn()` helper.
 
-import { forwardRef, useEffect, useRef } from "react";
+import { forwardRef, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Loader2,
   Inbox,
@@ -683,6 +684,17 @@ export function Dialog({
 // keeps the off-screen subtree out of the tab order and hidden from screen
 // readers without tearing it down; focus moves into the panel on open and
 // back to the trigger element on close, standard dialog behavior.
+//
+// Portaled to document.body: a Sheet is rendered wherever its trigger lives
+// in the tree (e.g. Playground's own extraction <form>), but its content is
+// free to be anything, including another <form> (SchemaBuilderSheet's "New
+// schema" form) -- HTML forbids a <form> descendant of a <form>, which a
+// non-portaled Sheet would silently violate. The portal detaches the actual
+// DOM placement from the React tree position while children keep their state
+// (a portal doesn't unmount/remount, only changes where it's attached).
+// `mounted` gates the very first SSR/hydration paint, when `document` isn't
+// available yet -- it flips true on mount and stays true for the rest of the
+// component's life, so this doesn't affect the "persistently mounted" design.
 // ---------------------------------------------------------------------------
 
 export function Sheet({
@@ -698,6 +710,9 @@ export function Sheet({
   const closeRef = useRef<HTMLButtonElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const wasOpen = useRef(open);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => setMounted(true), []);
 
   useEffect(() => {
     if (open && !wasOpen.current) {
@@ -710,7 +725,9 @@ export function Sheet({
     wasOpen.current = open;
   }, [open]);
 
-  return (
+  if (!mounted) return null;
+
+  return createPortal(
     <>
       <div
         className={cn(
@@ -741,6 +758,7 @@ export function Sheet({
         </div>
         <div className="scroll-thin flex-1 overflow-y-auto p-4">{children}</div>
       </aside>
-    </>
+    </>,
+    document.body,
   );
 }
