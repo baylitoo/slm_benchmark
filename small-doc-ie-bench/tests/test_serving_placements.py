@@ -111,7 +111,13 @@ _SERVE_RECORD: dict[str, Any] = {
 
 class _FakeServeControlPlane:
     async def serve(
-        self, model: str, *, name: str | None, runtime: str | None, replicas: int
+        self,
+        model: str,
+        *,
+        name: str | None,
+        runtime: str | None,
+        replicas: int,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         return _SERVE_RECORD
 

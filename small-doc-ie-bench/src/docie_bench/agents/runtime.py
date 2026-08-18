@@ -94,6 +94,20 @@ def _resolve_ocr_mode(options: dict[str, Any]) -> str:
     return "ocr_extract" if options.get("extractor") else "ocr"
 
 
+def _generation_max_tokens(body: dict[str, Any], options: dict[str, Any]) -> int | None:
+    """Resolve request > agent > deployment/profile generation precedence."""
+    raw = body.get("max_tokens", options.get("max_tokens"))
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= 131_072:
+        raise AgentError(
+            "max_tokens must be an integer between 1 and 131072",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    return raw
+
+
 def _resolve_extraction_schema(schema_name: str) -> tuple[str, dict[str, Any] | None]:
     """Return ExtractionService's schema mode and optional saved specification."""
     from docie_bench.schemas.extraction import schema_json
@@ -148,6 +162,7 @@ async def _complete_structured_document(
     disable_thinking: bool,
     mode: str,
     output_model: str,
+    max_tokens: int | None,
 ) -> dict[str, Any]:
     """Run an Agent document through the same extraction path as Playground.
 
@@ -165,6 +180,7 @@ async def _complete_structured_document(
             profile,
             profiles=profiles,
             disable_thinking=disable_thinking,
+            max_tokens=max_tokens,
         ).extract_from_file(
             path=path,
             ocr_backend_name=ocr_backend_name,
@@ -223,6 +239,7 @@ async def _complete_ocr(
 ) -> dict[str, Any]:
     options = dict(spec.options)
     mode = _resolve_ocr_mode(options)
+    max_tokens = _generation_max_tokens(body, options)
 
     # Schema-backed vision extraction uses the exact Playground pipeline:
     # document ingestion -> shared prompts/client -> grounding/validation.
@@ -248,8 +265,11 @@ async def _complete_ocr(
                 disable_thinking=bool(options.get("no_think")),
                 mode=mode,
                 output_model=upstream.model,
+                max_tokens=max_tokens,
             )
         base = dict(body)
+        if max_tokens is not None:
+            base.setdefault("max_tokens", max_tokens)
         if spec.system_prompt:
             base["messages"] = [
                 {"role": "system", "content": spec.system_prompt},
@@ -311,6 +331,7 @@ async def _complete_ocr(
                 disable_thinking=bool(options.get("no_think")),
                 mode=mode,
                 output_model=extractor.model,
+                max_tokens=max_tokens,
             )
     else:
         kind = "ocr"
@@ -326,9 +347,12 @@ async def _complete_ocr(
         kind=kind,
         options=solution_options,
     )
+    generation_body = dict(body)
+    if max_tokens is not None:
+        generation_body.setdefault("max_tokens", max_tokens)
     try:
         solution = build_solution(profile, profiles=profiles, http_client=http_client)
-        completion = await solution.complete(body)
+        completion = await solution.complete(generation_body)
     except SolutionError as exc:
         raise AgentError(
             exc.message, status_code=exc.status_code, error_type=exc.error_type

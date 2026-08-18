@@ -435,6 +435,14 @@ export const FR_MESSAGES: Record<string, string> = {
   "Stage a deployment mix — the server sizes it with the same footprint math and margin used at deploy time.": "Préparez un ensemble de déploiements — le serveur le dimensionne avec le même calcul d’empreinte et la même marge qu’au déploiement.",
   "Instances": "Instances",
   "Context length": "Longueur de contexte",
+  "Default max output tokens": "Nombre maximal de jetons de sortie par défaut",
+  "Max output tokens": "Nombre maximal de jetons de sortie",
+  "Optional. Agents inherit this unless they or a request override it.":
+    "Facultatif. Les agents héritent de cette valeur sauf s'ils ou une requête la remplacent.",
+  "Optional. Request max_tokens overrides this; blank inherits the deployment default.":
+    "Facultatif. Le paramètre max_tokens de la requête remplace cette valeur ; vide, l'agent hérite de la valeur du déploiement.",
+  "Uses native reasoning controls when supported and an assistant JSON continuation for templates that ignore them.":
+    "Utilise les contrôles de raisonnement natifs lorsqu'ils sont pris en charge et une continuation JSON assistant pour les modèles qui les ignorent.",
   "Remove row": "Supprimer la ligne",
   "Nothing staged. Add a model to see whether a mix would fit.": "Aucun modèle préparé. Ajoutez-en un pour vérifier si l’ensemble tient en mémoire.",
 

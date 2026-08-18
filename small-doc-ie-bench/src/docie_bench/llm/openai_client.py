@@ -231,6 +231,8 @@ class OpenAICompatibleClient:
         schema: dict[str, Any],
         image_urls: list[str] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+        assistant_prefill: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         import time as _time
 
@@ -244,19 +246,30 @@ class OpenAICompatibleClient:
             user_content.extend(
                 {"type": "image_url", "image_url": {"url": image_url}} for image_url in image_urls
             )
-        messages = [
+        base_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
+        output_budget = max_tokens if max_tokens is not None else self.profile.max_tokens
+        if output_budget < 1:
+            raise ValueError("max_tokens must be positive")
 
-        def build_payload(style: str, *, force_disable_reasoning: bool = False) -> dict[str, Any]:
+        def build_payload(
+            style: str,
+            *,
+            force_disable_reasoning: bool = False,
+            use_prefill: bool = False,
+        ) -> dict[str, Any]:
             response_format, extra_body = build_response_format(style, schema_name, schema)
+            messages = list(base_messages)
+            if use_prefill and assistant_prefill is not None:
+                messages.append({"role": "assistant", "content": assistant_prefill})
             payload: dict[str, Any] = {
                 "model": self.profile.model,
                 "messages": messages,
                 "temperature": self.profile.temperature,
                 "top_p": self.profile.top_p,
-                "max_tokens": self.profile.max_tokens,
+                "max_tokens": output_budget,
             }
             if response_format is not None:
                 payload["response_format"] = response_format
@@ -285,6 +298,8 @@ class OpenAICompatibleClient:
                 "docie_schema_name": schema_name,
                 "docie_response_format_style": declared_style,
                 "docie_response_format_ladder": list(ladder),
+                "docie_max_tokens": output_budget,
+                "docie_assistant_prefill": assistant_prefill is not None,
                 **(
                     {
                         "docie_system_prompt": system_prompt,
@@ -307,17 +322,44 @@ class OpenAICompatibleClient:
             # response-format failure: llama-server may have spent the entire
             # budget in reasoning_content. Insert one same-style, reasoning-off
             # recovery before considering any weaker schema style.
-            attempts = [(style, False) for style in ladder]
-            for position, (style, force_disable_reasoning) in enumerate(attempts):
+            attempts = [(style, False, assistant_prefill is not None) for style in ladder]
+            for position, (style, force_disable_reasoning, use_prefill) in enumerate(attempts):
                 is_last_rung = position == len(attempts) - 1
                 t0 = _time.perf_counter()
                 request_payload = build_payload(
-                    style, force_disable_reasoning=force_disable_reasoning
+                    style,
+                    force_disable_reasoning=force_disable_reasoning,
+                    use_prefill=use_prefill,
                 )
                 resp = await self._client.post("/chat/completions", json=request_payload)
                 llm_latency_ms = int((_time.perf_counter() - t0) * 1000)
 
                 if resp.status_code >= 400:
+                    # llama.cpp can reject a JSON grammar when the final
+                    # assistant turn is a continuation. Preserve the schema and
+                    # retry the same style once without prefill; if that model
+                    # then spends its budget reasoning, the next ladder rung gets
+                    # another prefilled attempt.
+                    if (
+                        resp.status_code == 400
+                        and use_prefill
+                        and _is_grammar_compilation_error(resp.text)
+                    ):
+                        attempts.insert(position + 1, (style, force_disable_reasoning, False))
+                        logger.warning(
+                            "structured-output prefill downgrade",
+                            extra={
+                                "docie_step": "assistant_prefill_downgrade",
+                                "docie_model_profile": self.profile.name,
+                                "docie_model": self.profile.model,
+                                "docie_schema_name": schema_name,
+                                "docie_response_format_style": style,
+                                "docie_reason": "grammar_compilation_error",
+                                "docie_action": "retry_without_prefill",
+                                "docie_upstream_error": resp.text[:1000],
+                            },
+                        )
+                        continue
                     # Some backends reject a strong response_format style with a
                     # hard HTTP 400 (grammar/schema failed to compile) instead of
                     # returning empty 200 content. For a downgradable generic
@@ -375,6 +417,13 @@ class OpenAICompatibleClient:
                 if not isinstance(content, str):
                     raise InvalidModelResponseError("Model response content must be text")
 
+                # OpenAI-compatible servers differ on assistant continuation:
+                # some return the assembled message, others return only the
+                # generated suffix. Restore the prefix before JSON parsing.
+                if use_prefill and assistant_prefill and content.strip():
+                    if not content.lstrip().startswith(assistant_prefill.lstrip()):
+                        content = assistant_prefill + content
+
                 # Repair model-emitted UTF-8 mojibake (accented OCR/extraction on
                 # small models) before parsing, so field values read correctly.
                 if get_settings().fix_mojibake:
@@ -419,7 +468,7 @@ class OpenAICompatibleClient:
                             or request_payload.get("reasoning_effort") == "none"
                         )
                         if not reasoning_already_disabled:
-                            attempts.insert(position + 1, (style, True))
+                            attempts.insert(position + 1, (style, True, use_prefill))
                             logger.warning(
                                 "structured-output reasoning recovery",
                                 extra={
@@ -452,8 +501,22 @@ class OpenAICompatibleClient:
                                 ),
                             },
                         )
+                        if assistant_prefill is not None and not use_prefill and not is_last_rung:
+                            logger.warning(
+                                "structured-output prefill recovery",
+                                extra={
+                                    "docie_step": "assistant_prefill_recovery",
+                                    "docie_model_profile": self.profile.name,
+                                    "docie_model": self.profile.model,
+                                    "docie_schema_name": schema_name,
+                                    "docie_response_format_style": style,
+                                    "docie_reason": "reasoning_exhausted_without_prefill",
+                                    "docie_action": "try_next_style_with_prefill",
+                                },
+                            )
+                            continue
                         raise InvalidModelResponseError(
-                            f"Generation exhausted max_tokens ({self.profile.max_tokens}) "
+                            f"Generation exhausted max_tokens ({output_budget}) "
                             "with no usable answer even after reasoning was disabled"
                         ) from exc
                     invalid_reason = (

@@ -264,6 +264,7 @@ def _synthesize_profile(
             model=served_id,
             base_url=base_url,
             kind="passthrough",
+            max_tokens=launch.max_tokens or match.max_tokens,
         )
 
     traits = _family_traits(record.spec.name)
@@ -283,7 +284,7 @@ def _synthesize_profile(
         vision=traits.vision,
         stop_sequences=traits.stop_sequences,
         temperature=traits.temperature,
-        max_tokens=traits.max_tokens,
+        max_tokens=launch.max_tokens or traits.max_tokens,
         timeout_seconds=traits.timeout_seconds,
     )
 

@@ -12,6 +12,7 @@ export interface DeployRequest {
   name?: string;
   port?: number;
   context_length?: number;
+  max_tokens?: number;
   replicas?: number;
   [k: string]: unknown;
 }
@@ -99,6 +100,7 @@ export interface DeploymentRecord {
       host?: string;
       port?: number;
       context_length?: number;
+      max_tokens?: number;
       [k: string]: unknown;
     };
     desired_state?: string;

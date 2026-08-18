@@ -726,6 +726,9 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             name=data.get("name"),
             runtime=runtime,
             replicas=int(data.get("replicas", 1)),
+            max_tokens=(
+                int(data["max_tokens"]) if data.get("max_tokens") is not None else None
+            ),
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -742,6 +745,9 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             model,
             port=int(raw_port) if raw_port is not None else None,
             context_length=int(data.get("context_length", DEFAULT_DEPLOY_CONTEXT_LENGTH)),
+            max_tokens=(
+                int(data["max_tokens"]) if data.get("max_tokens") is not None else None
+            ),
             # Scale: a distinct record name for another replica of `model`
             # (control_plane.serve_store_model looks the weights up by `model`).
             deployment_name=str(raw_dep_name) if raw_dep_name else None,

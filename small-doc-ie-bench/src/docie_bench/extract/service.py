@@ -233,6 +233,7 @@ class ExtractionService:
         proposer_profile: ModelProfile | None = None,
         profiles: Mapping[str, ModelProfile] | None = None,
         disable_thinking: bool = False,
+        max_tokens: int | None = None,
     ) -> None:
         self.profile = profile
         self.proposer_profile = proposer_profile
@@ -242,6 +243,7 @@ class ExtractionService:
         # threads it through instead of loading it again.
         self.profiles = profiles or {}
         self.disable_thinking = disable_thinking
+        self.max_tokens = max_tokens
 
     async def extract_from_text(
         self,
@@ -466,6 +468,7 @@ class ExtractionService:
             proposer_profile=self.proposer_profile,
             profiles=self.profiles,
             disable_thinking=self.disable_thinking or bool(options.get("no_think")),
+            max_tokens=self.max_tokens,
         )
         response = await extractor_service.extract_from_text(
             text=None,
@@ -639,6 +642,17 @@ class ExtractionService:
                 image_urls=[image.data_url() for image in images] if images else None,
                 chat_template_kwargs=(
                     {"enable_thinking": False} if self.disable_thinking else None
+                ),
+                max_tokens=self.max_tokens,
+                # LFM2.5's bundled template opens <think> unconditionally and
+                # ignores enable_thinking/reasoning_effort. Continuing an
+                # assistant JSON turn bypasses that generation prompt while
+                # retaining the kwargs for templates that do honor them.
+                assistant_prefill=(
+                    "{"
+                    if self.disable_thinking
+                    and self.profile.prompt_profile == "strict_extraction_v1"
+                    else None
                 ),
             )
             effective_style = getattr(client, "last_response_format_style", None)

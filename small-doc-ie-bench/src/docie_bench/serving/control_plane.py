@@ -222,6 +222,7 @@ class Supervisor(Protocol):
         name: str | None,
         runtime: str | None,
         replicas: int,
+        max_tokens: int | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -230,6 +231,7 @@ class Supervisor(Protocol):
         *,
         port: int | None,
         context_length: int,
+        max_tokens: int | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -361,6 +363,7 @@ class ControlPlane:
         name: str | None = None,
         runtime: str | None = None,
         replicas: int = 1,
+        max_tokens: int | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -369,12 +372,17 @@ class ControlPlane:
         # whole load (design doc fix #4). Argument validation stays eager so
         # bad input raises before a thread is spawned; _resolve keeps the
         # awaitable-backend contract for async test fakes.
+        kwargs: dict[str, Any] = {
+            "name": _optional(name),
+            "runtime": _optional(runtime),
+            "replicas": _replicas(replicas),
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
-            name=_optional(name),
-            runtime=_optional(runtime),
-            replicas=_replicas(replicas),
+            **kwargs,
         )
         return to_data(await _resolve(result))
 
@@ -384,6 +392,7 @@ class ControlPlane:
         *,
         port: int | None = None,
         context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
+        max_tokens: int | None = None,
         deployment_name: str | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
@@ -393,13 +402,18 @@ class ControlPlane:
         # flowing on the scale-1 worker while a large GGUF loads.
         # ``deployment_name`` (scale) names the record while ``name`` stays the
         # store-entry lookup — see serve_store_model.
+        kwargs = {
+            "port": port,
+            "context_length": context_length,
+            "deployment_name": deployment_name,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
                 _required(name, "model"),
-                port=port,
-                context_length=context_length,
-                deployment_name=deployment_name,
+                **kwargs,
             )
         )
 
@@ -801,6 +815,7 @@ class _DefaultSupervisor:
         name: str | None,
         runtime: str | None,
         replicas: int,
+        max_tokens: int | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -820,7 +835,12 @@ class _DefaultSupervisor:
         # allocate a local port, and don't await/reallocate (it binds nothing here).
         if runtime_kind == RuntimeKind.REMOTE:
             launch = reachable_launch(
-                RuntimeLaunchSpec(runtime=runtime_kind, model=model, alias=deployment_name),
+                RuntimeLaunchSpec(
+                    runtime=runtime_kind,
+                    model=model,
+                    alias=deployment_name,
+                    max_tokens=max_tokens,
+                ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
             )
@@ -838,6 +858,7 @@ class _DefaultSupervisor:
                     model=model,
                     alias=deployment_name,
                     port=chosen,
+                    max_tokens=max_tokens,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -865,6 +886,7 @@ class _DefaultSupervisor:
         *,
         port: int | None = None,
         context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
+        max_tokens: int | None = None,
         deployment_name: str | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
@@ -933,6 +955,7 @@ class _DefaultSupervisor:
                     alias=entry.name,
                     port=chosen,
                     context_length=context_length,
+                    max_tokens=max_tokens,
                     extra_args=launch_extra_args,
                 ),
                 bind_host=bind_host,
