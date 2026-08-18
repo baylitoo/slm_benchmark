@@ -4,7 +4,8 @@ import { useMemo, useState } from "react";
 import { Rocket, Boxes, ShieldAlert } from "lucide-react";
 import {
   formatBytes,
-  HF_PARAMETER_RANGES,
+  PARAMETER_RANGE_STEPS,
+  resolveParameterRangeFilter,
   searchHf,
   inspectHf,
   seedHf,
@@ -23,6 +24,7 @@ import {
   Button,
   Card,
   Field,
+  RangeSlider,
   Select,
   Spinner,
   TextInput,
@@ -70,7 +72,10 @@ export function HfSearchSeed({
   const { toast } = useToast();
   const [query, setQuery] = useState("");
   const [ggufOnly, setGgufOnly] = useState(true);
-  const [parameterRange, setParameterRange] = useState("");
+  const paramMax = PARAMETER_RANGE_STEPS.length - 1;
+  const [paramLoIndex, setParamLoIndex] = useState(0);
+  const [paramHiIndex, setParamHiIndex] = useState(paramMax);
+  const parameterRange = resolveParameterRangeFilter(paramLoIndex, paramHiIndex);
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<HfSearchCard[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -237,18 +242,21 @@ export function HfSearchSeed({
             />
             <T>GGUF only (uncheck to include encoder / transformers safetensors checkpoints)</T>
           </label>
-          <Select
-            value={parameterRange}
-            onChange={(e) => setParameterRange(e.target.value)}
-            className="h-8 w-40 text-xs"
-            aria-label="Model parameters"
-          >
-            {HF_PARAMETER_RANGES.map((range) => (
-              <option key={range.value} value={range.value}>
-                {range.label}
-              </option>
-            ))}
-          </Select>
+          <div className="w-56 rounded-md border border-border bg-card px-2.5 py-1.5">
+            <p className="mb-1 text-[10px] font-medium text-muted-foreground">
+              <T>Parameters</T>
+            </p>
+            <RangeSlider
+              steps={PARAMETER_RANGE_STEPS.map((s) => s.label)}
+              loIndex={paramLoIndex}
+              hiIndex={paramHiIndex}
+              onChange={(lo, hi) => {
+                setParamLoIndex(lo);
+                setParamHiIndex(hi);
+              }}
+              ariaLabel="Model parameters"
+            />
+          </div>
         </div>
       </form>
 

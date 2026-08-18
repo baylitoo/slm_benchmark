@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HfSearchSeed } from "./HfSearchSeed";
@@ -39,10 +39,14 @@ describe("HfSearchSeed preflight", () => {
 
     renderSearch();
     await userEvent.type(screen.getByPlaceholderText(/Search models/), "qwen");
-    await userEvent.selectOptions(
-      screen.getByRole("combobox", { name: "Model parameters" }),
-      "min:1B,max:3B",
-    );
+    // PARAMETER_RANGE_STEPS: [0, 500M, 1B, 3B, 7B, 15B, 35B, 70B, 70B+] --
+    // index 2 = 1B, index 3 = 3B.
+    fireEvent.change(screen.getByRole("slider", { name: "Model parameters — minimum" }), {
+      target: { value: "2" },
+    });
+    fireEvent.change(screen.getByRole("slider", { name: "Model parameters — maximum" }), {
+      target: { value: "3" },
+    });
     await userEvent.click(screen.getByRole("button", { name: "Search" }));
 
     expect(api.searchHf).toHaveBeenCalledWith("qwen", true, "min:1B,max:3B");

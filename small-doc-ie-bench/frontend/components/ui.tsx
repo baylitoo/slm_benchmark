@@ -518,6 +518,84 @@ export const Checkbox = forwardRef<
 });
 
 // ---------------------------------------------------------------------------
+// RangeSlider — a dual-handle, step-indexed range slider (Hugging Face's own
+// "Parameters" filter is the reference: log-scaled ticks, two draggable
+// handles snapping to them). Generic over the caller's own step labels —
+// this component only knows indices into `steps`, the caller maps an index
+// to whatever unit it represents (params count, price, date, ...).
+//
+// Two native <input type="range"> overlaid in one relative container is the
+// standard accessible dual-range technique: each input keeps full native
+// keyboard/touch support, and giving the INPUT `pointer-events: none` while
+// re-enabling it only on `::-webkit-slider-thumb`/`::-moz-range-thumb` (see
+// globals.css's `.range-slider-input` rules) means both thumbs stay
+// independently draggable anywhere along the track, with no z-index fight
+// over which input "wins" a click.
+// ---------------------------------------------------------------------------
+
+export function RangeSlider({
+  steps,
+  loIndex,
+  hiIndex,
+  onChange,
+  ariaLabel,
+  className,
+}: {
+  steps: string[];
+  loIndex: number;
+  hiIndex: number;
+  onChange: (loIndex: number, hiIndex: number) => void;
+  ariaLabel: string;
+  className?: string;
+}) {
+  const max = steps.length - 1;
+  const loPct = max === 0 ? 0 : (loIndex / max) * 100;
+  const hiPct = max === 0 ? 100 : (hiIndex / max) * 100;
+
+  return (
+    <div className={cn("w-full", className)}>
+      <div className="relative h-4">
+        <div className="absolute top-1/2 h-1 w-full -translate-y-1/2 rounded-full bg-border" />
+        <div
+          className="absolute top-1/2 h-1 -translate-y-1/2 rounded-full bg-accent"
+          style={{ left: `${loPct}%`, width: `${Math.max(hiPct - loPct, 0)}%` }}
+        />
+        <input
+          type="range"
+          className="range-slider-input"
+          min={0}
+          max={max}
+          step={1}
+          value={loIndex}
+          onChange={(e) => onChange(Math.min(Number(e.target.value), hiIndex), hiIndex)}
+          aria-label={`${ariaLabel} — minimum`}
+        />
+        <input
+          type="range"
+          className="range-slider-input"
+          min={0}
+          max={max}
+          step={1}
+          value={hiIndex}
+          onChange={(e) => onChange(loIndex, Math.max(Number(e.target.value), loIndex))}
+          aria-label={`${ariaLabel} — maximum`}
+        />
+      </div>
+      <div className="mt-1 flex justify-between text-[10px] tabular-nums text-muted-foreground">
+        {steps.map((label, i) => (
+          <span
+            key={label}
+            className={i === loIndex || i === hiIndex ? "font-semibold text-foreground" : undefined}
+          >
+            {label}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Dialog — centered modal (generalizes Catalog's SeedDialog).
 // ---------------------------------------------------------------------------
 

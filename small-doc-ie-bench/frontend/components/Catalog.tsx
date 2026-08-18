@@ -11,7 +11,8 @@ import {
   Clock,
 } from "lucide-react";
 import {
-  HF_PARAMETER_RANGES,
+  PARAMETER_RANGE_STEPS,
+  resolveParameterRangeFilter,
   searchCatalog,
   seedHf,
   formatBytes,
@@ -22,7 +23,18 @@ import {
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { useI18n } from "@/lib/i18n";
-import { Alert, Badge, Button, Checkbox, Dialog, Field, Segmented, Select, TextInput } from "./ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  Checkbox,
+  Dialog,
+  Field,
+  RangeSlider,
+  Segmented,
+  Select,
+  TextInput,
+} from "./ui";
 import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
 import { Toolbar } from "./patterns/Toolbar";
@@ -217,7 +229,10 @@ export function Catalog({
   const [pipeline, setPipeline] = useState("");
   const [ggufOnly, setGgufOnly] = useState(true);
   const [author, setAuthor] = useState("");
-  const [parameterRange, setParameterRange] = useState("");
+  const paramMax = PARAMETER_RANGE_STEPS.length - 1;
+  const [paramLoIndex, setParamLoIndex] = useState(0);
+  const [paramHiIndex, setParamHiIndex] = useState(paramMax);
+  const parameterRange = resolveParameterRangeFilter(paramLoIndex, paramHiIndex);
   const [familyFilter, setFamilyFilter] = useState(""); // client-side, "" = all
   const [seedCard, setSeedCard] = useState<CatalogCard | null>(null);
 
@@ -275,7 +290,8 @@ export function Catalog({
     setPipeline("");
     setGgufOnly(true);
     setAuthor("");
-    setParameterRange("");
+    setParamLoIndex(0);
+    setParamHiIndex(paramMax);
     setFamilyFilter("");
   }
 
@@ -475,18 +491,19 @@ export function Catalog({
             </option>
           ))}
         </Select>
-        <Select
-          value={parameterRange}
-          onChange={(e) => setParameterRange(e.target.value)}
-          className="h-8 w-40 text-xs"
-          aria-label="Model parameters"
-        >
-          {HF_PARAMETER_RANGES.map((range) => (
-            <option key={range.value} value={range.value}>
-              {range.label}
-            </option>
-          ))}
-        </Select>
+        <div className="w-56 rounded-md border border-border bg-card px-2.5 py-1.5">
+          <p className="mb-1 text-[10px] font-medium text-muted-foreground">Parameters</p>
+          <RangeSlider
+            steps={PARAMETER_RANGE_STEPS.map((s) => s.label)}
+            loIndex={paramLoIndex}
+            hiIndex={paramHiIndex}
+            onChange={(lo, hi) => {
+              setParamLoIndex(lo);
+              setParamHiIndex(hi);
+            }}
+            ariaLabel="Model parameters"
+          />
+        </div>
         <TextInput
           value={author}
           onChange={(e) => setAuthor(e.target.value)}
