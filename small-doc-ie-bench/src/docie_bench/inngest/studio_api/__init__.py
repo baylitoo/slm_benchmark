@@ -57,6 +57,8 @@ from ._shared import (
     _annotate_fits,
     _record_event_owners,
 )
+from .batch import BATCH_EVENT, BatchExtractRequest
+from .batch import router as _batch_router
 from .benchmark import BenchmarkRequest, trigger_benchmark
 from .benchmark import router as _benchmark_router
 from .datasets import (
@@ -146,6 +148,7 @@ for _sub_router in (
     _deploy_router,
     _runs_router,
     _seeds_router,
+    _batch_router,
 ):
     router.include_router(_sub_router)
 del _sub_router
