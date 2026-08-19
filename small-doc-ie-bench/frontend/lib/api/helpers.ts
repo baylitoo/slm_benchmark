@@ -58,14 +58,18 @@ export function embeddingDeploymentNames(
 
 /**
  * Deployment names that are reranker models: a store entry whose family is
- * flagged `reranker`. Mirrors embeddingDeploymentNames exactly.
+ * flagged `reranker` OR `multi_vector`. Both answer on /v1/rerank — a GGUF
+ * cross-encoder/ColBERT via llama-server --reranking, a safetensors ColBERT
+ * via the multi-vector runtime — so for "what can this deployment be USED
+ * for" (the Playground Rerank tab, the Deployments type filter) they are the
+ * same thing. Mirrors embeddingDeploymentNames exactly.
  */
 export function rerankerDeploymentNames(
   store: StoreEntry[] | null | undefined,
   families: ModelFamily[] | null | undefined,
 ): Set<string> {
   const rerankerFamilies = new Set(
-    (families ?? []).filter((f) => f.reranker).map((f) => f.name),
+    (families ?? []).filter((f) => f.reranker || f.multi_vector).map((f) => f.name),
   );
   return new Set(
     (store ?? [])

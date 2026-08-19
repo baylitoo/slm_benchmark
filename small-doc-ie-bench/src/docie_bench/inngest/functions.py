@@ -671,6 +671,7 @@ _ENGINE_BY_RUNTIME: dict[str, str] = {
     "llamacpp": "llama-server",
     "ollama": "ollama",
     "encoder": "encoder",
+    "multi_vector": "multi_vector",
 }
 
 
@@ -1295,10 +1296,11 @@ async def _run_seed_hf(
 
     # Snapshot families are a multi-file safetensors SNAPSHOT, not a GGUF —
     # download the whole tree and register it as a directory entry so the
-    # runtime loads it locally (no network at deploy time). Two kinds share the
-    # exact same progress/registration machinery: analyzer (encoder) checkpoints
-    # and the LAST-RESORT transformers/AutoModel path (no GGUF for this model).
-    if contract.analyzer or contract.transformers_runtime:
+    # runtime loads it locally (no network at deploy time). Every
+    # ``FamilyContract.snapshot`` family shares the exact same progress/
+    # registration machinery: analyzer (encoder) checkpoints, the LAST-RESORT
+    # transformers/AutoModel path, and multi-vector (ColBERT) retrievers.
+    if contract.snapshot:
         async with _seed_lock(name):
             with contextlib.suppress(ModelStoreError):
                 done = store.entry(name)

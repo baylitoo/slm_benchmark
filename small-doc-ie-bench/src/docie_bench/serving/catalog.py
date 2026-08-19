@@ -477,6 +477,10 @@ def available_backends(family: str) -> list[str]:
     # runtime (no GGUF exists for them), never llama.cpp/Ollama.
     if contract is not None and contract.transformers_runtime:
         return ["transformers"]
+    # Multi-vector (ColBERT) retrievers are served ONLY by the multi-vector
+    # runtime (a safetensors snapshot, no GGUF), never llama.cpp/Ollama.
+    if contract is not None and contract.multi_vector:
+        return ["multi_vector"]
     backends = ["llama-server"]
     if contract is not None and contract.ollama_faithful:
         backends.append("ollama")

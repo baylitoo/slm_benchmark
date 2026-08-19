@@ -171,19 +171,50 @@ class RepoSignals:
     tags: tuple[str, ...] = ()
     pipeline_tag: str | None = None
     base_model: str | None = None
+    library_name: str | None = None
+
+
+def _multi_vector_confidence(signals: RepoSignals) -> Confidence | None:
+    """Multi-vector / late-interaction retrievers (ColBERT, PyLate) — one
+    embedding vector PER TOKEN, scored query-vs-document with MaxSim, versus a
+    dense embedding model's single pooled vector. Same backbone archs as
+    embedding models (``modernbert``/``bert``), so arch can't tell them apart;
+    and — the trap — the Hub tags them ``pipeline_tag: "sentence-similarity"``
+    exactly like plain dense embedding models, so pipeline_tag can't either.
+    Verified live against mixedbread-ai/mxbai-edge-colbert-v0-32m: pipeline_tag
+    "sentence-similarity", library_name "PyLate", tags include "ColBERT" and
+    "multi-vector".
+
+    * ``"confirmed"`` — ``library_name == "PyLate"`` (the late-interaction
+      training framework these checkpoints ship in — the strongest signal),
+      or an explicit ``"colbert"`` / ``"multi-vector"`` / ``"pylate"`` /
+      ``"late-interaction"`` Hub tag.
+    * ``"guessed"`` — only the repo id contains ``"colbert"``. Fragile
+      fallback; needs the operator's confirmation.
+    """
+    if signals.library_name and signals.library_name.lower() == "pylate":
+        return "confirmed"
+    tag_set = {t.lower() for t in signals.tags}
+    if tag_set & {"colbert", "multi-vector", "pylate", "late-interaction"}:
+        return "confirmed"
+    if signals.repo_id and "colbert" in signals.repo_id.lower():
+        return "guessed"
+    return None
 
 
 def _reranker_confidence(signals: RepoSignals) -> Confidence | None:
-    """Rerankers / late-interaction retrievers are repurposed backbones —
-    LFM2.5-ColBERT-350M reports arch ``lfm2`` (identical to the chat family),
-    a BERT cross-encoder reports ``bert`` (identical to the embedding family).
-    The arch alone can't disambiguate, so this leans on Hub-curated signals
-    first, with the repo id string as a last-resort, LOW-confidence fallback:
+    """Cross-encoder rerankers are repurposed backbones — a BERT cross-encoder
+    reports arch ``bert`` (identical to the embedding family). The arch alone
+    can't disambiguate, so this leans on Hub-curated signals first, with the
+    repo id string as a last-resort, LOW-confidence fallback. (Late-interaction
+    / ColBERT signals are handled by ``_multi_vector_confidence``, which runs
+    first in ``resolve_family`` — that's a different serving contract even
+    when it happens to ship as a GGUF.)
 
     * ``"confirmed"`` — ``pipeline_tag == "text-ranking"`` (HF's own
       reranker/cross-encoder task tag — not ``"sentence-similarity"``, which
       embedding models also use and would false-positive here) or an
-      explicit ``"reranker"``/``"cross-encoder"``/``"colbert"`` tag.
+      explicit ``"reranker"``/``"cross-encoder"`` tag.
     * ``"guessed"`` — none of the above, but the repo id contains one of
       those keywords. Kept as a fallback (some repos carry no task
       metadata at all), but too fragile to auto-``"supported"`` on its own:
@@ -194,11 +225,10 @@ def _reranker_confidence(signals: RepoSignals) -> Confidence | None:
     if signals.pipeline_tag == "text-ranking":
         return "confirmed"
     tag_set = {t.lower() for t in signals.tags}
-    if tag_set & {"reranker", "cross-encoder", "colbert"}:
+    if tag_set & {"reranker", "cross-encoder"}:
         return "confirmed"
     if signals.repo_id and any(
-        kw in signals.repo_id.lower()
-        for kw in ("colbert", "rerank", "cross-encoder", "crossencoder")
+        kw in signals.repo_id.lower() for kw in ("rerank", "cross-encoder", "crossencoder")
     ):
         return "guessed"
     return None
@@ -235,6 +265,7 @@ def resolve_family(
     tags: tuple[str, ...] = (),
     pipeline_tag: str | None = None,
     base_model: str | None = None,
+    library_name: str | None = None,
 ) -> SupportVerdict:
     """Map a detected architecture (+ repo shape) to a family and a verdict.
 
@@ -242,16 +273,21 @@ def resolve_family(
     servable GGUF (safetensors-only) does the LAST-RESORT transformers family
     apply — the "no servable GGUF" hard gate (see ``_transformers_verdict``).
 
-    ``repo_id``/``tags``/``pipeline_tag``/``base_model`` disambiguate archs
-    shared by models with different serving contracts (NuExtract3 vs a
-    generic Qwen3.5-VL, both ``qwen35``; a reranker vs a plain chat/embedding
-    model on the same backbone) — see ``RepoSignals`` and
-    ``_reranker_confidence``/``_nuextract3_confidence``.
+    ``repo_id``/``tags``/``pipeline_tag``/``base_model``/``library_name``
+    disambiguate archs shared by models with different serving contracts
+    (NuExtract3 vs a generic Qwen3.5-VL, both ``qwen35``; a ColBERT retriever
+    or cross-encoder reranker vs a plain chat/embedding model on the same
+    backbone) — see ``RepoSignals`` and the ``_*_confidence`` helpers.
     """
     arch = architecture.strip().lower() if architecture else ""
     runtime_note = RUNTIME_NOTES.get(arch)
     signals = RepoSignals(
-        arch=arch, repo_id=repo_id, tags=tags, pipeline_tag=pipeline_tag, base_model=base_model
+        arch=arch,
+        repo_id=repo_id,
+        tags=tags,
+        pipeline_tag=pipeline_tag,
+        base_model=base_model,
+        library_name=library_name,
     )
 
     # Encoder analyzers are detected by the gliner marker, not a base arch
@@ -321,7 +357,53 @@ def resolve_family(
             "supported", "nuextract3", f"NuExtract3 ({architecture!r} extraction contract)"
         )
 
+    # Multi-vector / late-interaction (ColBERT, PyLate) — one task that ships in
+    # two incompatible artifact shapes, so it resolves to two different families
+    # by what the repo actually contains: a GGUF is served by llama-server
+    # --reranking (family ``reranker``, e.g. LFM2.5-ColBERT-350M-GGUF); a
+    # safetensors-only checkpoint (e.g. mixedbread-ai/mxbai-edge-colbert-v0-32m)
+    # by the multi-vector runtime (family ``multi_vector``). Both answer on
+    # /v1/rerank. Checked BEFORE the cross-encoder reranker branch below since
+    # its signals are more specific.
+    multi_vector_confidence = _multi_vector_confidence(signals)
     reranker_confidence = _reranker_confidence(signals)
+    # A name-only ColBERT guess must not outrank a CONFIRMED cross-encoder
+    # signal (e.g. LFM2.5-ColBERT-350M-GGUF carries pipeline_tag "text-ranking"):
+    # the confirmed Hub metadata wins, so fall through to the reranker branch.
+    if multi_vector_confidence == "guessed" and reranker_confidence != "confirmed":
+        return SupportVerdict(
+            "needs_family",
+            "multi_vector" if not has_gguf and has_safetensors else "reranker",
+            f"repo id suggests a ColBERT / late-interaction retriever ({architecture!r} "
+            "backbone) — a low-confidence guess from the name alone (no library_name/"
+            "tags confirm it); confirm the family before deploying",
+        )
+    if multi_vector_confidence == "confirmed":
+        if has_gguf:
+            return SupportVerdict(
+                "supported",
+                "reranker",
+                f"Hub metadata indicates a ColBERT / late-interaction retriever "
+                f"({architecture!r} backbone) with a GGUF → reranker (llama-server "
+                "--reranking)",
+                runtime_note=runtime_note,
+            )
+        if has_safetensors:
+            return SupportVerdict(
+                "supported",
+                "multi_vector",
+                f"Hub metadata indicates a ColBERT / late-interaction retriever "
+                f"({architecture!r} backbone), safetensors-only → multi_vector "
+                "(sentence-transformers MultiVectorEncoder, MaxSim scoring)",
+            )
+        return SupportVerdict(
+            "unsupported",
+            None,
+            f"Hub metadata indicates a ColBERT / late-interaction retriever "
+            f"({architecture!r} backbone) but the repo ships neither a GGUF nor "
+            "safetensors weights — nothing servable here",
+        )
+
     if reranker_confidence == "guessed":
         return SupportVerdict(
             "needs_family",
@@ -332,6 +414,10 @@ def resolve_family(
         )
     if reranker_confidence == "confirmed":
         if not has_gguf:
+            # A cross-encoder without a GGUF: llama-server --reranking needs one,
+            # and a safetensors cross-encoder runtime (sentence-transformers
+            # CrossEncoder) is not wired up yet — honest needs_family, not a
+            # silent fall-through to the generic transformers chat verdict.
             return SupportVerdict(
                 "needs_family",
                 "reranker",

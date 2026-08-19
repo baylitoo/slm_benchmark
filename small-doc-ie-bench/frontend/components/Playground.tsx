@@ -1153,7 +1153,7 @@ function RerankPanel({
 
   async function run() {
     if (!model) {
-      setError("No live reranker deployment — deploy a reranker model (family: reranker).");
+      setError("No live reranker deployment — deploy a reranker model (family: reranker or multi_vector).");
       return;
     }
     const documents = docs.split("\n").map((d) => d.trim()).filter(Boolean);
@@ -1192,7 +1192,7 @@ function RerankPanel({
       <div className="space-y-4">
         <Field
           label="Reranker deployment"
-          hint="Deploy a reranker GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF) with family 'reranker'."
+          hint="Deploy a reranker: a GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF, family 'reranker') or a safetensors ColBERT (e.g. mixedbread-ai/mxbai-edge-colbert-v0-32m, family 'multi_vector')."
         >
           {names.length === 0 ? (
             <EmptyModelState noun="reranker" onNavigate={onNavigate} />

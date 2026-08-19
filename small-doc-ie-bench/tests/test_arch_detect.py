@@ -187,14 +187,87 @@ def test_bert_cross_encoder_reranker_confirmed_by_tag() -> None:
     assert v.family == "reranker"
 
 
-def test_reranker_guessed_by_name_only_needs_confirmation() -> None:
-    # mixedbread-ai/mxbai-edge-colbert-v0-32m: a ColBERT late-interaction
-    # retriever, arch "modernbert", no GGUF, no pipeline_tag/tags recorded --
-    # only "colbert" in the repo id. Before this fix, that name-only signal
-    # was checked AFTER the has_gguf gate, so this repo silently fell through
-    # to the generic transformers "last resort" chat verdict. Now it's caught,
-    # but a name-only match is too fragile to auto-"supported" -- needs the
-    # operator's confirmation regardless of GGUF/mmproj.
+# -- multi_vector (ColBERT / PyLate late-interaction retrievers) --------------
+#
+# One task, two incompatible artifact shapes → two families by what the repo
+# actually contains: a GGUF is llama-server --reranking (``reranker``), a
+# safetensors-only checkpoint is sentence-transformers MultiVectorEncoder
+# (``multi_vector``). Both answer on /v1/rerank.
+
+
+def test_mxbai_edge_colbert_real_hub_metadata_resolves_to_multi_vector() -> None:
+    # The EXACT metadata the Hub returns for mixedbread-ai/mxbai-edge-colbert-
+    # v0-32m (fetched live 2026-08-19): pipeline_tag is "sentence-similarity"
+    # (indistinguishable from a plain embedding model -- so pipeline_tag alone
+    # can never confirm this), library_name is "PyLate", tags carry "ColBERT"
+    # and "multi-vector". No GGUF, safetensors present. This is the repo that
+    # started the whole multi-vector effort -- it must land on multi_vector,
+    # supported, with no operator override needed.
+    v = resolve_family(
+        "modernbert",
+        has_gguf=False,
+        has_safetensors=True,
+        has_mmproj=False,
+        repo_id="mixedbread-ai/mxbai-edge-colbert-v0-32m",
+        pipeline_tag="sentence-similarity",
+        tags=(
+            "PyLate", "onnx", "safetensors", "modernbert", "feature-extraction",
+            "ColBERT", "multi-vector", "sentence-transformers", "sentence-similarity",
+        ),
+        library_name="PyLate",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "multi_vector"
+
+
+def test_library_name_pylate_alone_confirms_multi_vector() -> None:
+    # library_name is the strongest signal -- the late-interaction training
+    # framework itself. Confirms even with no tags and a generic pipeline_tag.
+    v = resolve_family(
+        "modernbert",
+        has_gguf=False,
+        has_safetensors=True,
+        has_mmproj=False,
+        repo_id="some-org/renamed-retriever-no-keyword",
+        pipeline_tag="sentence-similarity",
+        library_name="PyLate",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "multi_vector"
+
+
+def test_multi_vector_tag_alone_confirms_multi_vector() -> None:
+    v = resolve_family(
+        "modernbert",
+        has_gguf=False,
+        has_safetensors=True,
+        has_mmproj=False,
+        repo_id="some-org/renamed-retriever-no-keyword",
+        tags=("multi-vector",),
+    )
+    assert v.verdict == "supported"
+    assert v.family == "multi_vector"
+
+
+def test_confirmed_colbert_with_a_gguf_is_llamacpp_reranker_not_multi_vector() -> None:
+    # Same task, GGUF artifact → served by llama-server --reranking. The
+    # multi-vector runtime is only for the safetensors shape.
+    v = resolve_family(
+        "lfm2",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="LiquidAI/LFM2.5-ColBERT-350M-GGUF",
+        tags=("colbert",),
+    )
+    assert v.verdict == "supported"
+    assert v.family == "reranker"
+
+
+def test_colbert_guessed_by_name_only_needs_confirmation() -> None:
+    # Only "colbert" in the repo id, no library_name/tags -- too fragile to
+    # auto-"supported". Suggests multi_vector (safetensors, no GGUF) but as
+    # needs_family, awaiting the operator's confirmation.
     v = resolve_family(
         "modernbert",
         has_gguf=False,
@@ -203,20 +276,51 @@ def test_reranker_guessed_by_name_only_needs_confirmation() -> None:
         repo_id="mixedbread-ai/mxbai-edge-colbert-v0-32m",
     )
     assert v.verdict == "needs_family"
-    assert v.family == "reranker"
+    assert v.family == "multi_vector"
     assert "low-confidence" in v.reason
 
 
-def test_reranker_confirmed_without_gguf_is_needs_family_not_transformers_last_resort() -> None:
-    # Same repo, but WITH a confirming signal (pipeline_tag) -- now it's
-    # "confirmed", so the no-GGUF verdict is specific: GGUF is required for
-    # llama-server's --reranking mode, not a generic low-confidence caveat.
+def test_confirmed_cross_encoder_signal_outranks_a_colbert_name_guess() -> None:
+    # A confirmed pipeline_tag must beat a name-only guess: LFM2.5-ColBERT-
+    # 350M-GGUF has "colbert" in its id (guessed multi-vector) AND a confirmed
+    # "text-ranking" pipeline_tag. The confirmed Hub metadata wins → supported
+    # reranker, not a needs_family guess.
     v = resolve_family(
-        "modernbert",
+        "lfm2",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="LiquidAI/LFM2.5-ColBERT-350M-GGUF",
+        pipeline_tag="text-ranking",
+    )
+    assert v.verdict == "supported"
+    assert v.family == "reranker"
+
+
+def test_multi_vector_family_is_a_snapshot_family() -> None:
+    # multi_vector shares the safetensors-snapshot seed/store/deploy path with
+    # analyzer + transformers -- FamilyContract.snapshot is the single gate
+    # every one of those branches keys on.
+    assert FAMILIES["multi_vector"].snapshot is True
+    assert FAMILIES["multi_vector"].multi_vector is True
+    assert FAMILIES["reranker"].snapshot is False
+    assert FAMILIES["encoder_gliner"].snapshot is True
+    assert FAMILIES["transformers"].snapshot is True
+    assert FAMILIES["openai_chat"].snapshot is False
+
+
+def test_cross_encoder_confirmed_without_gguf_still_needs_a_gguf() -> None:
+    # A confirmed CROSS-ENCODER (not ColBERT) with no GGUF: llama-server
+    # --reranking needs one, and a safetensors cross-encoder runtime is not
+    # wired up yet -- honest needs_family, not multi_vector (that's the
+    # late-interaction runtime, wrong scoring model for a cross-encoder) and
+    # not the generic transformers chat verdict.
+    v = resolve_family(
+        "bert",
         has_gguf=False,
         has_safetensors=True,
         has_mmproj=False,
-        repo_id="mixedbread-ai/mxbai-edge-colbert-v0-32m",
+        repo_id="some-org/plain-cross-encoder",
         pipeline_tag="text-ranking",
     )
     assert v.verdict == "needs_family"
@@ -302,23 +406,26 @@ async def test_inspect_gguf_arch_from_gguf_block() -> None:
     ]
 
 
-async def test_inspect_threads_hub_metadata_into_reranker_confidence() -> None:
-    # The exact reported bug: a ColBERT reranker (arch modernbert, no GGUF)
-    # must not silently resolve to the generic transformers "last resort".
-    # inspect_repo fetches tags/pipeline_tag/cardData itself -- this proves
-    # they actually reach resolve_family, not just that resolve_family
-    # handles them in isolation.
+async def test_inspect_threads_hub_metadata_into_multi_vector_verdict() -> None:
+    # The exact repo that started this: a ColBERT retriever (arch modernbert,
+    # no GGUF) must not silently resolve to the generic transformers "last
+    # resort" chat verdict. inspect_repo fetches tags/pipeline_tag/library_name
+    # itself -- this proves they actually reach resolve_family end-to-end (in
+    # particular library_name, the strongest signal, which the payload's
+    # "sentence-similarity" pipeline_tag alone would never confirm). Payload
+    # mirrors the real Hub response shape for this repo.
     payload = {
         "config": {"model_type": "modernbert"},
-        "pipeline_tag": "text-ranking",
-        "tags": ["sentence-transformers", "colbert"],
+        "pipeline_tag": "sentence-similarity",
+        "library_name": "PyLate",
+        "tags": ["PyLate", "safetensors", "modernbert", "ColBERT", "multi-vector"],
         "siblings": [{"rfilename": "model.safetensors", "size": 128_000_000}],
     }
     async with httpx.AsyncClient(transport=_transport(payload)) as client:
         result = await inspect_repo("mixedbread-ai/mxbai-edge-colbert-v0-32m", client=client)
-    assert result["verdict"] == "needs_family"
-    assert result["family"] == "reranker"
-    assert "GGUF" in result["reason"]
+    assert result["verdict"] == "supported"
+    assert result["family"] == "multi_vector"
+    assert result["runtime"] == "multi_vector"
 
 
 async def test_inspect_quant_options_have_exact_fit_estimates() -> None:
