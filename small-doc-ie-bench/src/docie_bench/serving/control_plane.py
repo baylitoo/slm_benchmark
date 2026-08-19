@@ -969,6 +969,12 @@ class _DefaultSupervisor:
             launch_extra_args = (
                 ("--trust-remote-code",) if contract.trust_remote_code else ()
             )
+        elif contract.multi_vector:
+            # A ColBERT / late-interaction snapshot served by the MULTI-VECTOR
+            # runtime (sentence-transformers MultiVectorEncoder), answered on
+            # /v1/rerank. The snapshot dir is the model; no extra flags.
+            runtime_kind = RuntimeKind.MULTI_VECTOR
+            launch_extra_args = ()
         else:
             runtime_kind = RuntimeKind.LLAMACPP
             launch_extra_args = store.family_launch_args(name)

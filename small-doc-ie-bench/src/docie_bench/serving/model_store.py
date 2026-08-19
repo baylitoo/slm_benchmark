@@ -94,6 +94,13 @@ class FamilyContract:
     # repo's Python on the serving node (SECURITY: off by default).
     transformers_runtime: bool = False
     trust_remote_code: bool = False
+    # A multi-vector / late-interaction retriever (ColBERT, PyLate) served by
+    # the MULTI-VECTOR runtime (sentence-transformers >= 6's
+    # MultiVectorEncoder), NOT llama.cpp: a safetensors snapshot, answered on
+    # /v1/rerank with MaxSim scoring over per-token embeddings. Distinct from
+    # ``reranker`` (a GGUF served by llama-server --reranking): same API
+    # surface, different runtime and artifact shape.
+    multi_vector: bool = False
     stop_sequences: tuple[str, ...] = ()
     # Generation defaults inherited by a family-synthesized profile (a store deploy
     # whose served id matches no models.yaml profile). These are the single source
@@ -106,6 +113,20 @@ class FamilyContract:
     # Can Ollama serve this family *faithfully* (respecting its template)?
     # False for CHAT_TEMPLATE_KWARGS families: Ollama drops chat_template_kwargs.
     ollama_faithful: bool = True
+
+    @property
+    def snapshot(self) -> bool:
+        """Is this a multi-file safetensors SNAPSHOT family (stored as a
+        directory, served by a Python runtime via ``from_pretrained``) rather
+        than a single-GGUF llama.cpp family?
+
+        The one place that answers "snapshot or GGUF?" -- every seed/store/
+        deploy branch that used to spell out ``analyzer or transformers_runtime``
+        keys on this instead, so adding a new snapshot family (multi_vector was
+        the third) means one flag here, not a widened disjunction at every
+        call site.
+        """
+        return self.analyzer or self.transformers_runtime or self.multi_vector
 
 
 # Known families. Adding a new model is "drop the GGUF + pick (or add) a family".
@@ -237,6 +258,23 @@ FAMILIES: dict[str, FamilyContract] = {
         prompt_profile="strict_extraction_v1",
         llama_server_args=("--reranking", "--embedding", "--pooling", "rank"),
         reranker=True,
+        ollama_faithful=False,
+    ),
+    # Multi-vector / late-interaction retrievers (ColBERT, PyLate checkpoints:
+    # mixedbread-ai/mxbai-edge-colbert-*, lightonai/LateOn, colbert-ir/
+    # colbertv2.0, ...) served by the MULTI-VECTOR runtime -- sentence-
+    # transformers >= 6's MultiVectorEncoder (encode_query / encode_document /
+    # similarity, MaxSim by default) -- NOT llama.cpp. Same /v1/rerank surface
+    # as ``reranker`` above, but a safetensors SNAPSHOT (multi-file directory,
+    # loaded via from_pretrained), not a GGUF: the two families exist precisely
+    # because the same task ships in two incompatible artifact shapes. No
+    # template/schema (a retriever, not an extractor); no llama-server args.
+    "multi_vector": FamilyContract(
+        name="multi_vector",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,  # unused on the rerank path
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        multi_vector=True,
         ollama_faithful=False,
     ),
     # Encoder analyzers (safetensors checkpoints served by the encoder runtime,
@@ -588,20 +626,21 @@ class ModelStore:
         """Register a safetensors checkpoint DIRECTORY (weights + config +
         tokenizer/processor) as a store entry.
 
-        Two snapshot families share this path: analyzer (GLiNER/GLiNER2)
-        checkpoints served by the encoder runtime, and the LAST-RESORT
-        transformers/AutoModel path. Both are multi-file safetensors, not single
-        GGUFs, so ``model_path`` points at the snapshot DIRECTORY
-        (``<root>/<name>/snapshot``) loaded via ``from_pretrained(<path>)`` — no
-        network at deploy time. The whole tree is transferred into a ``.tmp``
-        sibling and renamed atomically, so a half-copied snapshot never appears
-        under the canonical name.
+        Every ``FamilyContract.snapshot`` family shares this path: analyzer
+        (GLiNER/GLiNER2) checkpoints served by the encoder runtime, the
+        LAST-RESORT transformers/AutoModel path, and multi-vector (ColBERT)
+        retrievers served by the multi-vector runtime. All are multi-file
+        safetensors, not single GGUFs, so ``model_path`` points at the snapshot
+        DIRECTORY (``<root>/<name>/snapshot``) loaded via
+        ``from_pretrained(<path>)`` — no network at deploy time. The whole tree
+        is transferred into a ``.tmp`` sibling and renamed atomically, so a
+        half-copied snapshot never appears under the canonical name.
         """
         contract = get_family(family)
-        if not (contract.analyzer or contract.transformers_runtime):
+        if not contract.snapshot:
             raise ModelStoreError(
-                f"add_snapshot is for snapshot families (analyzer / transformers); "
-                f"{family!r} is not one"
+                f"add_snapshot is for snapshot families (analyzer / transformers / "
+                f"multi_vector); {family!r} is not one"
             )
         src = Path(snapshot_dir)
         if not src.is_dir():

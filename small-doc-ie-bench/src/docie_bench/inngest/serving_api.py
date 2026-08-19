@@ -933,6 +933,7 @@ async def list_families() -> Any:
             "needs_mmproj": fam.needs_mmproj,
             "embedding": fam.embedding,
             "reranker": fam.reranker,
+            "multi_vector": fam.multi_vector,
             "analyzer": fam.analyzer,
             "encoder_backend": fam.encoder_backend,
             "transformers_runtime": fam.transformers_runtime,

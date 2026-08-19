@@ -162,7 +162,7 @@ export const FR_MESSAGES: Record<string, string> = {
   "Text B": "Texte B",
   "Text A vector (first 12 dims)": "Vecteur du texte A (12 premières dimensions)",
   "Both vectors were computed by the selected deployment.": "Les deux vecteurs ont été calculés par le déploiement sélectionné.",
-  "No live reranker deployment — deploy a reranker model (family: reranker).": "Aucun reranker actif — déployez un modèle de reclassement (famille : reranker).",
+  "No live reranker deployment — deploy a reranker model (family: reranker or multi_vector).": "Aucun reranker actif — déployez un modèle de reclassement (famille : reranker ou multi_vector).",
   "Add at least one document to rank, one per line.": "Ajoutez au moins un document à classer, un par ligne.",
   "Rerank request failed.": "Échec de la requête de reclassement.",
   "A query and a list of documents in, relevance-ranked out — the retrieval second stage, computed on-node.": "Une requête et une liste de documents en entrée, un classement par pertinence en sortie — la seconde étape de recherche, calculée sur le nœud.",
@@ -677,7 +677,7 @@ export const FR_MESSAGES: Record<string, string> = {
   "Repo": "Dépôt",
   "URL or owner/slug-hash, e.g. LiquidAI/lfm25-collection-hash": "URL ou owner/slug-hash, p. ex. LiquidAI/lfm25-collection-hash",
   "Deploy an embedding GGUF (e.g. LiquidAI/LFM2.5-Embedding-350M-GGUF) with family 'embedding'.": "Déployez un GGUF de plongement (p. ex. LiquidAI/LFM2.5-Embedding-350M-GGUF) avec la famille « embedding ».",
-  "Deploy a reranker GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF) with family 'reranker'.": "Déployez un GGUF de reclassement (p. ex. LiquidAI/LFM2.5-ColBERT-350M-GGUF) avec la famille « reranker ».",
+  "Deploy a reranker: a GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF, family 'reranker') or a safetensors ColBERT (e.g. mixedbread-ai/mxbai-edge-colbert-v0-32m, family 'multi_vector').": "Déployez un reranker : un GGUF (p. ex. LiquidAI/LFM2.5-ColBERT-350M-GGUF, famille « reranker ») ou un ColBERT safetensors (p. ex. mixedbread-ai/mxbai-edge-colbert-v0-32m, famille « multi_vector »).",
 };
 
 /** A small set of UI messages contain user/model names and cannot be exact keys. */

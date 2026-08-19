@@ -225,6 +225,8 @@ def _runtime_for_family(family: str | None, *, has_gguf: bool) -> str | None:
         return "encoder"
     if contract.transformers_runtime:
         return "transformers"
+    if contract.multi_vector:
+        return "multi_vector"
     return "llama.cpp"
 
 
@@ -672,6 +674,7 @@ async def search_models(
             tags=tuple(tags),
             pipeline_tag=str(pipe) if pipe else None,
             base_model=_extract_base_model(card_data),
+            library_name=str(item["library_name"]) if item.get("library_name") else None,
         )
         params_count = _param_count(item.get("safetensors"))
         cards.append(
@@ -818,6 +821,7 @@ async def inspect_repo(
         tags=tuple(tags),
         pipeline_tag=str(pipe) if pipe else None,
         base_model=_extract_base_model(card_data),
+        library_name=str(payload["library_name"]) if payload.get("library_name") else None,
     )
     snapshot_files = _snapshot_files_from_siblings(siblings) if not has_gguf else []
     from docie_bench.serving.model_store import FAMILIES

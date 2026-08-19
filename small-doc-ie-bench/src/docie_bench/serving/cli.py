@@ -285,6 +285,32 @@ def create_app(
             port=port,
         )
 
+    @app.command("multi-vector")
+    def multi_vector(
+        host: str = typer.Option("127.0.0.1", help="Bind address."),
+        port: int = typer.Option(
+            8092, min=1, max=65535, help="Port for the multi-vector rerank endpoint."
+        ),
+        model: str = typer.Option(
+            ...,
+            help="ColBERT / PyLate snapshot dir served via sentence-transformers "
+            "MultiVectorEncoder (late-interaction, MaxSim scoring).",
+        ),
+    ) -> None:
+        """Serve a multi-vector (ColBERT) retriever on /v1/rerank.
+
+        Query + documents in, MaxSim relevance scores out -- the same rerank
+        surface llama-server --reranking exposes for GGUF rerankers, here for
+        the safetensors late-interaction shape. Requires sentence-transformers
+        >= 6 (the `encoders` extra).
+        """
+        import uvicorn
+
+        from docie_bench.multi_vector_server.server import create_multi_vector_app
+
+        typer.echo(f"docie multi-vector [{model}] -> http://{host}:{port}/v1")
+        uvicorn.run(create_multi_vector_app(model_id=model), host=host, port=port)
+
     return app
 
 

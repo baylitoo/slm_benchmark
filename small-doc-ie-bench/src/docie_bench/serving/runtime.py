@@ -27,6 +27,7 @@ class RuntimeKind(StrEnum):
     REMOTE = "remote"
     ENCODER = "encoder"
     TRANSFORMERS = "transformers"
+    MULTI_VECTOR = "multi_vector"
 
 
 class LifecycleState(StrEnum):
@@ -729,6 +730,83 @@ class TransformersRuntime(RuntimeAdapter):
         )
 
 
+class MultiVectorRuntime(RuntimeAdapter):
+    """Launch ``docie multi-vector`` — the /v1/rerank shim over a
+    sentence-transformers ``MultiVectorEncoder`` (ColBERT / PyLate late-
+    interaction retriever; see ``docie_bench.multi_vector_server``).
+
+    ``spec.model`` is a local safetensors snapshot directory (seeded like an
+    encoder). MaxSim scoring over per-token embeddings runs in-process via
+    ``encode_query`` / ``encode_document`` / ``similarity``. Everything else —
+    port allocation, deployment record, health probing (``/healthz``),
+    reconciler overlay, load/unload/delete lifecycle — is inherited unchanged.
+    """
+
+    kind = RuntimeKind.MULTI_VECTOR
+    executable_names = ("docie", "docie-serving")
+    health_path = "/healthz"
+    features = frozenset()
+
+    def resolve_executable(self, spec: RuntimeLaunchSpec) -> str | None:
+        # The console script may be off PATH inside a container; the current
+        # interpreter can always launch the CLI module instead (build_command),
+        # so this runtime never reads as "not installed".
+        return super().resolve_executable(spec) or sys.executable
+
+    def detect_version(self, executable: str) -> str | None:
+        # The meaningful version is sentence-transformers', not the CLI's.
+        try:
+            return f"sentence-transformers {importlib.metadata.version('sentence-transformers')}"
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    def probe(self, spec: RuntimeLaunchSpec) -> RuntimeCapabilities:
+        capabilities = super().probe(spec)
+        # Fail the deploy at probe time with the actionable reason, not after a
+        # spawn whose child dies on ImportError. MultiVectorEncoder landed in
+        # sentence-transformers 6.0 — an older install has the package but not
+        # the class, so check for the class itself, not just the module.
+        reason: str | None = None
+        if importlib.util.find_spec("sentence_transformers") is None:
+            reason = (
+                "sentence-transformers is not installed on the serving node "
+                "(pip install 'small-doc-ie-bench[encoders]')"
+            )
+        else:
+            try:
+                installed = importlib.metadata.version("sentence-transformers")
+                if int(installed.split(".", 1)[0]) < 6:
+                    reason = (
+                        f"sentence-transformers {installed} is too old — MultiVectorEncoder "
+                        "needs >= 6.0 (pip install 'small-doc-ie-bench[encoders]')"
+                    )
+            except (importlib.metadata.PackageNotFoundError, ValueError):
+                reason = "could not read the installed sentence-transformers version"
+        if reason is not None:
+            return replace(
+                capabilities, compatible=False, reasons=(*capabilities.reasons, reason)
+            )
+        return capabilities
+
+    def build_command(self, spec: RuntimeLaunchSpec) -> tuple[str, ...]:
+        self.validate(spec)
+        # Base lookup (no interpreter fallback): a found console script runs
+        # directly; otherwise launch the CLI module with this interpreter.
+        found = RuntimeAdapter.resolve_executable(self, spec)
+        base = (found,) if found else (sys.executable, "-m", "docie_bench.serving.cli")
+        return (
+            *base,
+            "multi-vector",
+            "--model",
+            spec.model,
+            "--host",
+            spec.host,
+            "--port",
+            str(spec.port),
+            *spec.extra_args,
+        )
+
+
 def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
     return {
         RuntimeKind.VLLM: VLLMRuntime(),
@@ -737,6 +815,7 @@ def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
         RuntimeKind.REMOTE: RemoteRuntime(),
         RuntimeKind.ENCODER: EncoderRuntime(),
         RuntimeKind.TRANSFORMERS: TransformersRuntime(),
+        RuntimeKind.MULTI_VECTOR: MultiVectorRuntime(),
     }
 
 
