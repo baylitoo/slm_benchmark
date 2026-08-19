@@ -47,7 +47,10 @@ paddle = [
 ]
 encoders = [
   "gliner>=0.2.13",
-  "gliner2[local]"
+  "gliner2[local]",
+  # Multi-vector (ColBERT / PyLate) reranking: MultiVectorEncoder landed in
+  # 6.0. Co-resolves with gliner (transformers>=5.0,<5.14) — verified.
+  "sentence-transformers>=6.0"
 ]
 dev = [
   "pytest>=8.3.2",
