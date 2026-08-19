@@ -382,9 +382,13 @@ async def embeddings(request: Request) -> Any:
 
 @router.post("/v1/rerank")
 async def rerank(request: Request) -> Any:
-    """Rerank documents against a query over a reranker deployment (llama-server
-    --reranking + --embedding --pooling rank — llama.cpp requires both flags
-    together; --reranking alone leaves the endpoint unable to score).
+    """Rerank documents against a query over a reranker deployment.
+
+    Two families answer this surface with one wire contract: ``reranker`` (a
+    GGUF, llama-server --reranking + --embedding --pooling rank — llama.cpp
+    requires both flags together) and ``multi_vector`` (a safetensors ColBERT
+    / PyLate checkpoint, the sentence-transformers MultiVectorEncoder runtime,
+    MaxSim scoring). The proxy forwards identically to either.
 
     Body: ``model`` (deployment/profile), ``query``, ``documents`` (list of
     strings), optional ``top_n``. Forwarded verbatim to the upstream's
@@ -452,7 +456,9 @@ async def rerank(request: Request) -> Any:
     if upstream.status_code >= 400:
         return _openai_error(
             f"upstream returned {upstream.status_code}: {upstream.text[:300]} "
-            "(is this deployment a reranker, served with --reranking --embedding --pooling rank?)",
+            "(is this deployment a reranker? family 'reranker' = llama-server "
+            "--reranking --embedding --pooling rank; family 'multi_vector' = the "
+            "sentence-transformers MultiVectorEncoder runtime)",
             status_code=upstream.status_code,
             error_type="upstream_error",
         )
