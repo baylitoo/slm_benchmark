@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 import inngest
 
+from docie_bench.extract.routing import RoutingPolicy, RoutingResult, live_routing_audit
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.client import inngest_client, serving_client
 from docie_bench.inngest.realtime import (
@@ -316,6 +317,47 @@ def _stamp_deployment_recency(*, explicit: str | None, profile_name: str) -> Non
     recency.stamp_served_profile(profile_name, deployment=explicit)
 
 
+def _resolve_executor(data: dict[str, Any]) -> tuple[Any, str | None]:
+    """The thing that runs this event's extraction: a single-model service, or
+    a router over a saved routing policy's stages -- ``(executor, policy_name)``.
+
+    The worker-side twin of api.py's ``resolve_extraction_executor``: same
+    contract (``routing_policy`` names a policy saved via
+    /v1/studio/routing-policies; mutually exclusive with a model selector; every
+    stage resolved UP FRONT so a cold escalation target fails at event time,
+    not on the document that finally needed it), resolved through THIS side's
+    ``_resolve_profile`` so a stage may be a live deployment or a ``store:``
+    ref exactly like a single-model event's selector.
+    """
+    routing_policy = data.get("routing_policy")
+    if not routing_policy:
+        return (
+            ExtractionService(
+                _resolve_profile(
+                    model_profile=data.get("model_profile"), deployment=data.get("deployment")
+                )
+            ),
+            None,
+        )
+    if data.get("model_profile") or data.get("deployment"):
+        raise ValueError(
+            "'routing_policy' is mutually exclusive with 'model_profile'/'deployment': "
+            "a policy names its model profiles per stage"
+        )
+    from docie_bench.benchmark.routing_config import build_extraction_router
+    from docie_bench.studio.routing_policies import get_routing_policy
+
+    record = get_routing_policy(routing_policy)
+    if record is None:
+        raise ValueError(
+            f"routing policy {routing_policy!r} not found -- save one via "
+            "POST /v1/studio/routing-policies (or pick it in the Studio)"
+        )
+    policy = RoutingPolicy.model_validate(record["policy"])
+    profiles = {stage.name: _resolve_profile(model_profile=stage.name) for stage in policy.stages}
+    return build_extraction_router(policy, profiles), routing_policy
+
+
 async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     """Run one extraction from event data; returns a JSON-serializable result."""
     schema_name = data.get("schema_name", "invoice")
@@ -335,15 +377,41 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
         dynamic_schema = saved["spec"]
         schema_name = dynamic_schema_name
     language = data.get("language")
-    profile = _resolve_profile(
-        model_profile=data.get("model_profile"), deployment=data.get("deployment")
-    )
-    service = ExtractionService(profile)
+    executor, routing_policy = _resolve_executor(data)
+
+    def _finish(outcome: Any) -> dict[str, Any]:
+        # A router returns a RoutingResult; unwrap it into the same
+        # ExtractionResponse the single-model path returns, with the audit
+        # (per-stage output stripped) on ``routing`` -- identical shape to
+        # the sync /v1/extract/* routes, via the shared helper.
+        if isinstance(outcome, RoutingResult):
+            # A RoutingResult only comes from a router, only built with a policy.
+            assert routing_policy is not None, "a RoutingResult implies a routing_policy"
+            if outcome.response is None:
+                raise ValueError(
+                    f"routing policy {routing_policy!r} produced no extraction: "
+                    f"{outcome.audit.terminal_reason} "
+                    f"(decision={outcome.audit.terminal_decision.value}, "
+                    f"attempts={outcome.audit.attempts})"
+                )
+            response = outcome.response.model_copy(
+                update={"routing": live_routing_audit(outcome, policy_name=routing_policy)}
+            )
+        else:
+            response = outcome
+        _record_observability(response, tenant_id)
+        # Recency: stamp the profile that actually ANSWERED (a router's winning
+        # stage), so an escalation target used only for hard documents still
+        # reads as active instead of becoming the first idle-eviction victim.
+        _stamp_deployment_recency(
+            explicit=data.get("deployment"), profile_name=response.model_profile
+        )
+        return response.model_dump(mode="json")
 
     tenant_id = data.get("tenant_id")
     text = data.get("text")
     if text is not None:
-        response = await service.extract_from_text(
+        outcome = await executor.extract_from_text(
             text=text,
             ocr_blocks=None,
             schema_name=schema_name,
@@ -353,11 +421,7 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
             document_hash=hash_bytes(text.encode("utf-8")),
             metadata={"source": "inngest"},
         )
-        _record_observability(response, tenant_id)
-        _stamp_deployment_recency(
-            explicit=data.get("deployment"), profile_name=profile.name
-        )
-        return response.model_dump(mode="json")
+        return _finish(outcome)
 
     content_b64 = data.get("content_b64")
     if not content_b64:
@@ -374,7 +438,7 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
         tmp.write(raw)
         tmp_path = Path(tmp.name)
     try:
-        response = await service.extract_from_file(
+        outcome = await executor.extract_from_file(
             path=tmp_path,
             ocr_backend_name=data.get("ocr_backend") or settings.default_ocr_backend,
             schema_name=schema_name,
@@ -385,9 +449,7 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
         )
     finally:
         tmp_path.unlink(missing_ok=True)
-    _record_observability(response, tenant_id)
-    _stamp_deployment_recency(explicit=data.get("deployment"), profile_name=profile.name)
-    return response.model_dump(mode="json")
+    return _finish(outcome)
 
 
 @inngest_client.create_function(
