@@ -12,7 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from docie_bench.agents.api import router as agents_router
+from docie_bench.benchmark.routing_config import build_extraction_router
 from docie_bench.chat_api import router as chat_router
+from docie_bench.extract.routing import (
+    ExtractionRouter,
+    RoutingPolicy,
+    RoutingResult,
+    live_routing_audit,
+)
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.serving_api import router as serving_router
 from docie_bench.inngest.serving_api import trigger_deployment_load
@@ -73,6 +80,10 @@ from docie_bench.serving.profile_resolver import (
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 from docie_bench.storage.db import get_session_factory, init_engine
+from docie_bench.studio.routing_policies import (
+    RoutingPolicyUnavailableError,
+    get_routing_policy,
+)
 from docie_bench.telemetry import (
     CONTENT_TYPE_LATEST,
     REVIEW_ACTIONS,
@@ -218,6 +229,95 @@ async def resolve_profile(profile_name: str | None) -> ModelProfile:
     return profile
 
 
+async def resolve_extraction_executor(
+    *,
+    model_profile: str | None,
+    routing_policy: str | None,
+    proposer_profile: ModelProfile | None = None,
+) -> ExtractionService | ExtractionRouter:
+    """The thing that runs this extraction: a single-model service, or a router
+    over a saved routing policy's stages.
+
+    ``routing_policy`` names a policy saved via POST /v1/studio/routing-policies
+    (the same registry the Benchmark tab picks from -- this is what makes those
+    policies USABLE on a real document instead of only evaluable in a
+    benchmark). Each stage's profile resolves through the SAME
+    ``resolve_profile`` a single-model request uses, so ``store:`` refs,
+    load-on-demand 202s and the worker-loopback guard all apply per stage.
+    Every stage is resolved UP FRONT: a policy whose escalation target is cold
+    fails fast at request time (or fires its load and answers 202), rather than
+    mid-route on the document that finally needed it.
+
+    Both return types expose the same ``extract_from_text`` /
+    ``extract_from_file`` names, so call sites don't branch on which they got.
+    """
+    if routing_policy and model_profile:
+        raise HTTPException(
+            status_code=400,
+            detail="'routing_policy' and 'model_profile' are mutually exclusive: a "
+            "policy names its model profiles per stage",
+        )
+    if not routing_policy:
+        return ExtractionService(
+            await resolve_profile(model_profile), proposer_profile=proposer_profile
+        )
+    try:
+        record = get_routing_policy(routing_policy)
+    except RoutingPolicyUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"routing policy {routing_policy!r} not found -- save one via "
+            "POST /v1/studio/routing-policies (or pick it in the Studio)",
+        )
+    policy = RoutingPolicy.model_validate(record["policy"])
+    profiles = {
+        stage.name: await resolve_profile(stage.name) for stage in policy.stages
+    }
+    return build_extraction_router(policy, profiles)
+
+
+def _finalize_outcome(
+    outcome: ExtractionResponse | RoutingResult, *, routing_policy: str | None
+) -> ExtractionResponse:
+    """A route's outcome as an ExtractionResponse. A RoutingResult can only
+    have come from a router, which is only built when ``routing_policy`` was
+    given -- so the policy name is guaranteed set on that branch; assert the
+    invariant rather than let it be a silent ``None`` in the audit."""
+    if not isinstance(outcome, RoutingResult):
+        return outcome
+    assert routing_policy is not None, "a RoutingResult implies a routing_policy"
+    return _finalize_routed(outcome, routing_policy=routing_policy)
+
+
+def _finalize_routed(
+    result: RoutingResult, *, routing_policy: str
+) -> ExtractionResponse:
+    """Unwrap a router's result into the ExtractionResponse the live routes
+    return, carrying the audit in the response's ``routing`` field.
+
+    A router can legitimately produce NO response (every stage errored, or the
+    budget ran out before any stage answered) -- that's a 502 with the
+    terminal reason, not a 500. The audit is shaped by ``live_routing_audit``
+    (per-stage ``output`` stripped, policy name added) -- the same helper the
+    Studio worker path uses, so both surfaces return the identical shape.
+    """
+    if result.response is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"routing policy {routing_policy!r} produced no extraction: "
+                f"{result.audit.terminal_reason} "
+                f"(decision={result.audit.terminal_decision.value}, "
+                f"attempts={result.audit.attempts})"
+            ),
+        )
+    return result.response.model_copy(
+        update={"routing": live_routing_audit(result, policy_name=routing_policy)}
+    )
+
+
 def validate_text_request(payload: ExtractTextRequest) -> None:
     if payload.text is not None and len(payload.text) > settings.max_text_chars:
         raise HTTPException(status_code=413, detail="Text content exceeds configured limit")
@@ -297,14 +397,17 @@ async def extract_text(
     tenant: TenantDependency,
 ) -> ExtractionResponse:
     validate_text_request(payload)
-    profile = await resolve_profile(payload.model_profile)
     proposer_profile = (
         await resolve_profile(payload.schema_proposer_profile)
         if payload.schema_proposer_profile
         else None
     )
-    service = ExtractionService(profile, proposer_profile=proposer_profile)
-    response = await service.extract_from_text(
+    executor = await resolve_extraction_executor(
+        model_profile=payload.model_profile,
+        routing_policy=payload.routing_policy,
+        proposer_profile=proposer_profile,
+    )
+    outcome = await executor.extract_from_text(
         text=payload.text,
         ocr_blocks=payload.ocr_blocks,
         schema_name=payload.schema_name,
@@ -315,6 +418,7 @@ async def extract_text(
         or (hash_bytes(payload.text.encode("utf-8")) if payload.text else None),
         metadata=payload.metadata,
     )
+    response = _finalize_outcome(outcome, routing_policy=payload.routing_policy)
     return finalize_response(response, tenant_id=tenant.tenant_id)
 
 
@@ -325,6 +429,7 @@ async def extract_file(
     tenant: TenantDependency,
     schema_name: Annotated[str, Form()] = "invoice",
     model_profile: Annotated[str | None, Form()] = None,
+    routing_policy: Annotated[str | None, Form()] = None,
     ocr_backend: Annotated[str | None, Form()] = None,
     language: Annotated[str | None, Form()] = None,
 ) -> ExtractionResponse:
@@ -334,13 +439,14 @@ async def extract_file(
         allowed_mime_types=settings.allowed_mime_types,
     )
 
-    profile = await resolve_profile(model_profile)
-    service = ExtractionService(profile)
+    executor = await resolve_extraction_executor(
+        model_profile=model_profile, routing_policy=routing_policy
+    )
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(body)
         tmp_path = Path(tmp.name)
     try:
-        response = await service.extract_from_file(
+        outcome = await executor.extract_from_file(
             path=tmp_path,
             ocr_backend_name=ocr_backend or settings.default_ocr_backend,
             schema_name=schema_name,
@@ -353,6 +459,7 @@ async def extract_file(
         )
     finally:
         tmp_path.unlink(missing_ok=True)
+    response = _finalize_outcome(outcome, routing_policy=routing_policy)
     return finalize_response(response, tenant_id=tenant.tenant_id)
 
 

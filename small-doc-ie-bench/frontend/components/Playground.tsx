@@ -33,6 +33,7 @@ import {
   fileToBase64,
   renderDocument,
   listDynamicSchemas,
+  listRoutingPolicies,
   ApiError,
   ApiUnavailable,
   ModelLoading,
@@ -43,6 +44,7 @@ import {
   type ModelFamily,
   type RerankResponse,
   type DynamicSchemaSummary,
+  type RoutingPolicySummary,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -54,6 +56,7 @@ import {
   Button,
   Card,
   Field,
+  Segmented,
   Select,
   TextArea,
   TextInput,
@@ -93,7 +96,16 @@ export function Playground({
     "dynamic-schemas",
     listDynamicSchemas,
   );
+  const routingPolicies = useAsync<RoutingPolicySummary[]>(
+    "routing-policies",
+    listRoutingPolicies,
+  );
   const [selectedDeployment, setSelectedDeployment] = useState<string>("");
+  // "single" routes to one deployment; "policy" runs a saved routing policy
+  // (cheap stage first, escalate on the policy's own confidence rules). The
+  // toggle makes the two structurally exclusive -- the backend rejects both.
+  const [modelSource, setModelSource] = useState<"single" | "policy">("single");
+  const [selectedPolicy, setSelectedPolicy] = useState<string>("");
   const [ocrBackend, setOcrBackend] = useState("");
   const [language, setLanguage] = useState("");
 
@@ -158,9 +170,19 @@ export function Playground({
     const payload: ExtractRequest = dynamicSchemaName
       ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
       : { schema_name: schemaName || "invoice" };
-    // Send ONLY the deployment selector (its value is a DeploymentRecord
-    // spec.name); never model_profile. Empty selection → backend default.
-    if (selectedDeployment) payload.deployment = selectedDeployment;
+    // Exactly ONE model selector goes out (they're mutually exclusive
+    // server-side): a saved routing policy, OR the deployment selector
+    // (its value is a DeploymentRecord spec.name; never model_profile).
+    // Empty single-model selection → backend default.
+    if (modelSource === "policy") {
+      if (!selectedPolicy) {
+        setError("Pick a routing policy, or switch back to a single model.");
+        return;
+      }
+      payload.routing_policy = selectedPolicy;
+    } else if (selectedDeployment) {
+      payload.deployment = selectedDeployment;
+    }
     if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
     if (language.trim()) payload.language = language.trim();
 
@@ -382,17 +404,50 @@ export function Playground({
               }}
             />
             <Field
-              label="Deployment"
-              hint="Runtime to route this extraction to. Evicted deployments reload on request (first request waits for the model load)."
+              label="Model"
+              hint={
+                modelSource === "policy"
+                  ? "A saved routing policy: the document goes to the first stage and escalates to later stages on the policy's confidence/validity rules and budgets. The result carries the routing audit."
+                  : "Runtime to route this extraction to. Evicted deployments reload on request (first request waits for the model load)."
+              }
             >
-              <DeploymentSelect
-                deployments={deployments}
-                selectable={selectable}
-                value={selectedDeployment}
-                onChange={setSelectedDeployment}
-                emptyNoun="chat"
-                onNavigate={onNavigate}
-              />
+              <div className="space-y-2">
+                <Segmented
+                  value={modelSource}
+                  onChange={setModelSource}
+                  options={[
+                    { value: "single", label: "Single model" },
+                    { value: "policy", label: "Routing policy" },
+                  ]}
+                />
+                {modelSource === "policy" ? (
+                  <Select
+                    value={selectedPolicy}
+                    onChange={(e) => setSelectedPolicy(e.target.value)}
+                    aria-label="Routing policy"
+                  >
+                    <option value="">
+                      {routingPolicies.data && routingPolicies.data.length === 0
+                        ? "(no saved policies — create one in Benchmark)"
+                        : "(pick a policy)"}
+                    </option>
+                    {(routingPolicies.data ?? []).map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </Select>
+                ) : (
+                  <DeploymentSelect
+                    deployments={deployments}
+                    selectable={selectable}
+                    value={selectedDeployment}
+                    onChange={setSelectedDeployment}
+                    emptyNoun="chat"
+                    onNavigate={onNavigate}
+                  />
+                )}
+              </div>
             </Field>
             <Field label="OCR backend" hint="Optional — for file uploads.">
               <TextInput
