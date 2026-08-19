@@ -61,6 +61,7 @@ import {
 } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
+import { BatchView } from "./benchmark/BatchView";
 import { Toolbar } from "./patterns/Toolbar";
 import { ResultLine } from "./patterns/ResultLine";
 import { Pager } from "./patterns/Pager";
@@ -175,6 +176,9 @@ export function Benchmark({ view = "run" }: { view?: string }) {
 
   if (view === "results") {
     return <ResultsView runs={runs} />;
+  }
+  if (view === "batch") {
+    return <BatchView />;
   }
 
   // ── Run console ─────────────────────────────────────────────────────────
