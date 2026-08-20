@@ -1,12 +1,23 @@
 SHELL := /usr/bin/env bash
 DATASET ?= sample@1.0.0
 MODEL_PROFILE ?= local_llamacpp
+# Space-separated Compose services to deploy. Compose automatically includes
+# their dependencies, so SEGMENTS=api also brings up postgres/redis/inngest.
+# Excluding `serving` avoids even pulling/copying llama.cpp; remote-model Studio
+# users can use SEGMENTS="api worker web".
+SEGMENTS ?= api serving worker web
 
-.PHONY: build up-infra up-api up-local-llm down logs test lint format bench smoke \
+.PHONY: build deploy deploy-down up-infra up-api up-local-llm down logs test lint format bench smoke \
 	studio studio-down studio-logs studio-smoke worker-dev
 
 build:
 	docker compose build
+
+deploy:
+	docker compose up -d --build $(SEGMENTS)
+
+deploy-down:
+	docker compose stop $(SEGMENTS)
 
 up-infra:
 	docker compose up -d postgres
@@ -49,7 +60,7 @@ smoke:
 
 # One command: bring up the full studio stack (db, redis, inngest, worker, api, web).
 studio:
-	docker compose up -d --build postgres redis inngest worker api web
+	docker compose up -d --build api serving worker web
 
 studio-down:
 	docker compose down

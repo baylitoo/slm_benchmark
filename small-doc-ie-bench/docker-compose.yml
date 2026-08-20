@@ -5,6 +5,7 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
+      target: api-runtime
     env_file: .env
     environment:
       # Construct the container-network URL here instead of relying on a
@@ -162,11 +163,16 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
+      # Default: reuse llama.cpp's official prebuilt server-only image. Set
+      # DOCIE_LLAMA_SERVER_TARGET=serving-runtime-source to compile LLAMA_REF
+      # locally when a custom upstream commit/build is required.
+      target: ${DOCIE_LLAMA_SERVER_TARGET:-serving-runtime-prebuilt}
       args:
         # Encoder deployments (runtime: "encoder", e.g. the GLiNER PII guard)
         # spawn inside THIS container — it needs the analyzer library. Other
         # services keep the light "ocr" default.
-        PIP_EXTRAS: "ocr,encoders"
+        PIP_EXTRAS: ${DOCIE_SERVING_EXTRAS:-ocr,encoders}
+        LLAMA_SERVER_IMAGE: ${LLAMA_SERVER_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
         # llama.cpp pin: the serving container holds the llama-server that
         # actually serves deployed models. Set LLAMA_REF in .env to a commit/
         # tag to rebuild llama.cpp at that pin (reproducible + picks up new
@@ -235,6 +241,7 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
+      target: api-runtime
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
@@ -293,6 +300,7 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
+      target: api-runtime
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
