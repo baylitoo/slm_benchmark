@@ -80,21 +80,26 @@ describe("Dialog", () => {
 });
 
 describe("Sheet", () => {
+  // Sheet is portaled to document.body (see ui.tsx) so a <form> inside it
+  // never nests inside whatever <form> its trigger happens to sit in --
+  // queries here go through `document`/`screen`, not RTL's `container`
+  // (which only covers the render target div, not the portaled subtree).
+
   it("stays mounted but inert while closed", () => {
-    const { container } = render(
+    render(
       <Sheet open={false} onClose={() => {}}>
         <p>panel content</p>
       </Sheet>,
     );
     expect(screen.getByText("panel content")).toBeInTheDocument();
-    const aside = container.querySelector("aside");
+    const aside = document.body.querySelector("aside");
     expect(aside).toHaveAttribute("inert");
     expect(aside).toHaveAttribute("aria-hidden", "true");
     expect(aside).toHaveClass("translate-x-full");
   });
 
   it("clears inert and slides in when opened", () => {
-    const { container, rerender } = render(
+    const { rerender } = render(
       <Sheet open={false} onClose={() => {}}>
         <p>panel content</p>
       </Sheet>,
@@ -104,7 +109,7 @@ describe("Sheet", () => {
         <p>panel content</p>
       </Sheet>,
     );
-    const aside = container.querySelector("aside");
+    const aside = document.body.querySelector("aside");
     expect(aside).not.toHaveAttribute("inert");
     expect(aside).toHaveAttribute("aria-hidden", "false");
     expect(aside).toHaveClass("translate-x-0");
@@ -127,12 +132,12 @@ describe("Sheet", () => {
   it("calls onClose when the backdrop is clicked", async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
-    const { container } = render(
+    render(
       <Sheet open onClose={onClose}>
         <p>panel content</p>
       </Sheet>,
     );
-    const backdrop = container.querySelector("[aria-hidden].fixed.inset-0");
+    const backdrop = document.body.querySelector("[aria-hidden].fixed.inset-0");
     expect(backdrop).not.toBeNull();
     await user.click(backdrop as Element);
     expect(onClose).toHaveBeenCalledTimes(1);
