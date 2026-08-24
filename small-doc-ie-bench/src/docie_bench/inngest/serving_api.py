@@ -931,6 +931,7 @@ async def list_families() -> Any:
             "name": fam.name,
             "vision": fam.vision,
             "needs_mmproj": fam.needs_mmproj,
+            "tools": fam.tools,
             "embedding": fam.embedding,
             "reranker": fam.reranker,
             "multi_vector": fam.multi_vector,

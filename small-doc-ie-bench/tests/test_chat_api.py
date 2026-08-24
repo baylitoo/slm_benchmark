@@ -43,6 +43,35 @@ def api(monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
             return httpx.Response(
                 200, headers={"content-type": "text/event-stream"}, content=_sse_chunks()
             )
+        if body.get("tools"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "c2",
+                    "object": "chat.completion",
+                    "model": body["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_invoice_total",
+                                            "arguments": '{"invoice_id": "INV-7"}',
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                },
+            )
         last = body["messages"][-1]["content"]
         return httpx.Response(
             200,
@@ -330,3 +359,74 @@ def test_chat_store_model_genuinely_unseeded_still_404s(api_store, monkeypatch) 
     )
     assert response.status_code == 404
     assert response.json()["error"]["type"] == "model_not_found"
+
+
+def test_chat_forwards_tools_and_preserves_tool_calls(api) -> None:
+    """OpenAI tool calling end to end through the proxy: `tools`/`tool_choice`
+    reach the upstream verbatim, and the upstream's `tool_calls` response --
+    content null, finish_reason "tool_calls" -- comes back unmangled. Pins the
+    two places that COULD have broken it: the forward body (built via
+    dict(body), so unknown keys must survive) and fix_completion_content
+    (which must skip a null content and never touch tool_calls)."""
+    client, captured = api
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_invoice_total",
+                "description": "Total for an invoice id",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"invoice_id": {"type": "string"}},
+                    "required": ["invoice_id"],
+                },
+            },
+        }
+    ]
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "total of INV-7?"}],
+            "tools": tools,
+            "tool_choice": "auto",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    sent = json.loads(captured[-1].content)
+    assert sent["tools"] == tools
+    assert sent["tool_choice"] == "auto"
+
+    choice = resp.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    (call,) = choice["message"]["tool_calls"]
+    assert call["function"]["name"] == "get_invoice_total"
+    assert json.loads(call["function"]["arguments"]) == {"invoice_id": "INV-7"}
+
+
+def test_chat_forwards_tool_role_messages(api) -> None:
+    """Round 2 of a tool exchange: the assistant tool_calls message and the
+    `role: "tool"` result message forward verbatim -- the proxy must not
+    validate or reshape the message list."""
+    client, captured = api
+    messages = [
+        {"role": "user", "content": "total of INV-7?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_invoice_total", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "5400.00 EUR"},
+    ]
+    resp = client.post(
+        "/v1/chat/completions", json={"model": "lfm2.5-350m", "messages": messages}
+    )
+    assert resp.status_code == 200, resp.text
+    assert json.loads(captured[-1].content)["messages"] == messages

@@ -163,6 +163,8 @@ export interface ModelFamily {
   name: string;
   vision?: boolean;
   needs_mmproj?: boolean;
+  /** True when the family serves OpenAI tool calling (llama-server --jinja). */
+  tools?: boolean;
   /** True for embedding families — served with --embedding, used via /v1/embeddings. */
   embedding?: boolean;
   /** True for reranker families — served with --reranking --embedding --pooling
