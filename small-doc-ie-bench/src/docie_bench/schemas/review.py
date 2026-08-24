@@ -24,6 +24,7 @@ class ReviewReason(BaseModel):
         "arithmetic_mismatch",
         "model_disagreement",
         "learning_value",
+        "routing_escalated",
         "manual",
     ]
     score: float = Field(ge=0.0)
@@ -60,6 +61,12 @@ class ReviewTaskCreate(BaseModel):
     dynamic_schema: dict[str, Any] | None = None
     disagreement_score: float | None = Field(default=None, ge=0.0, le=1.0)
     expected_learning_value: float | None = Field(default=None, ge=0.0, le=1.0)
+    # The live routing audit (ExtractionResponse.routing) when this extraction
+    # ran through a saved routing policy -- attempts / terminal_decision /
+    # budget_exhausted feed the routing_escalated review signal: a document
+    # that burned the escalation ladder and STILL came back is exactly what a
+    # human should look at. None for single-model extractions.
+    routing: dict[str, Any] | None = None
     metadata: dict[str, str] = Field(default_factory=dict)
     # The OCR blocks this extraction was grounded against, forwarded from
     # ExtractionResponse.ocr_blocks. Persisted alongside the task (subject to
