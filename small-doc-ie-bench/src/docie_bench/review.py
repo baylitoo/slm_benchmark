@@ -143,6 +143,30 @@ def score_review_candidate(
                 ),
             )
         )
+    routing = payload.routing or {}
+    attempts = int(routing.get("attempts") or 0)
+    if attempts > 1 or routing.get("budget_exhausted"):
+        # The document already consumed the routing policy's escalation ladder.
+        # Terminal failure (budget gone / nothing accepted) is a certain review;
+        # an accepted-after-escalation doc is a moderate signal -- the cheap
+        # stage's answer was rejected by the policy's own rules, so the strong
+        # stage's answer deserves a human eye more than a first-try accept.
+        exhausted = bool(routing.get("budget_exhausted")) or (
+            routing.get("terminal_decision") not in (None, "accept")
+        )
+        policy = routing.get("policy") or "policy"
+        reasons.append(
+            ReviewReason(
+                code="routing_escalated",
+                score=1.0 if exhausted else 0.5,
+                detail=(
+                    f"Routing policy {policy!r}: {attempts} attempt(s), "
+                    f"terminal={routing.get('terminal_decision')}"
+                    + (", budget exhausted" if routing.get("budget_exhausted") else "")
+                ),
+            )
+        )
+
     if payload.disagreement_score:
         reasons.append(
             ReviewReason(
@@ -168,6 +192,7 @@ def score_review_candidate(
         "arithmetic_mismatch": 20.0,
         "model_disagreement": 30.0,
         "learning_value": 15.0,
+        "routing_escalated": 25.0,
     }
     priority = sum(weights[reason.code] * reason.score for reason in reasons)
     return round(priority, 4), reasons

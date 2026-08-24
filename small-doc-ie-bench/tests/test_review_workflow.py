@@ -664,3 +664,91 @@ def test_create_review_route_rejects_oversized_ocr_block_text(
             "/v1/reviews", json=_payload_with_evidence("evidence-oversized").model_dump(mode="json")
         )
         assert resp.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# Routing-policy integration (#231 follow-up): a document that consumed the
+# escalation ladder is a review signal in its own right.
+# ---------------------------------------------------------------------------
+
+
+def _routed_payload(routing: dict, request_id: str = "routed-1") -> ReviewTaskCreate:
+    # A CLEAN extraction (valid, confident, evidence-grounded) so any review
+    # admission comes from the routing signal alone.
+    return ReviewTaskCreate(
+        source_request_id=request_id,
+        schema_name="invoice",
+        model_profile="strong",
+        validation_valid=True,
+        original_prediction={
+            "invoice_number": {"value": "INV-1", "confidence": 0.99, "evidence_ids": ["b1"]}
+        },
+        routing=routing,
+    )
+
+
+def test_accepted_after_escalation_is_a_moderate_review_signal() -> None:
+    priority, reasons = score_review_candidate(
+        _routed_payload(
+            {"policy": "cheap-then-strong", "attempts": 2, "terminal_decision": "accept"}
+        )
+    )
+    assert [r.code for r in reasons] == ["routing_escalated"]
+    assert reasons[0].score == 0.5
+    assert "cheap-then-strong" in reasons[0].detail
+    assert priority == 12.5  # 25.0 weight * 0.5
+
+
+def test_budget_exhausted_or_non_accept_terminal_is_a_certain_review() -> None:
+    for routing in (
+        {"policy": "p", "attempts": 2, "terminal_decision": "accept", "budget_exhausted": True},
+        {"policy": "p", "attempts": 3, "terminal_decision": "fail"},
+    ):
+        _, reasons = score_review_candidate(_routed_payload(routing))
+        assert reasons[0].code == "routing_escalated"
+        assert reasons[0].score == 1.0
+
+
+def test_first_stage_accept_through_a_policy_is_not_flagged() -> None:
+    # attempts == 1: the cheap stage answered confidently. Running through a
+    # policy must not by itself admit every document to review.
+    priority, reasons = score_review_candidate(
+        _routed_payload({"policy": "p", "attempts": 1, "terminal_decision": "accept"})
+    )
+    assert reasons == []
+    assert priority == 0
+    # And a single-model extraction (routing=None) is equally unaffected.
+    clean = _routed_payload({}, request_id="routed-none")
+    clean.routing = None
+    assert score_review_candidate(clean) == (0, [])
+
+
+def test_extraction_audit_forwards_the_routing_audit_to_review_scoring() -> None:
+    # End to end through the live pipeline seam: an ExtractionResponse whose
+    # `routing` shows escalation -> save_extraction_audit -> the enqueued task
+    # carries the routing_escalated reason. This is the wire that makes #231's
+    # audit actionable instead of informational.
+    save_extraction_audit(
+        ExtractionResponse(
+            request_id="routed-e2e",
+            schema_name="invoice",
+            model_profile="strong",
+            document_hash="sha256:routed",
+            result={
+                "invoice_number": {"value": "INV-9", "confidence": 0.95, "evidence_ids": ["b1"]}
+            },
+            validation=ExtractionValidation(valid=True),
+            latency_ms=10,
+            routing={
+                "policy": "cheap-then-strong",
+                "attempts": 2,
+                "terminal_decision": "accept",
+                "budget_exhausted": False,
+            },
+        )
+    )
+    with session_scope() as session:
+        assert session is not None
+        task = session.query(ReviewTask).filter_by(source_request_id="routed-e2e").one()
+        codes = {reason["code"] for reason in task.priority_reasons_json}
+        assert codes == {"routing_escalated"}

@@ -41,6 +41,7 @@ def save_extraction_audit(response: ExtractionResponse, *, tenant_id: str | None
                 validation_warnings=response.validation.warnings,
                 dynamic_schema=response.dynamic_schema,
                 ocr_blocks=response.ocr_blocks,
+                routing=response.routing,
             )
         )
 
