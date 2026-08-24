@@ -21,6 +21,7 @@ import { POLL_MS } from "./deploy/shared";
 import { DeploymentsView } from "./deploy/DeploymentsView";
 import { ModelsView } from "./deploy/ModelsView";
 import { DownloadsView } from "./deploy/DownloadsView";
+import { McpView } from "./deploy/McpView";
 import { DeployForm } from "./deploy/DeployForm";
 import { AddModelForm } from "./deploy/seed/AddModelForm";
 
@@ -86,7 +87,13 @@ export function Deploy({
                 subtitle:
                   "GET /v1/studio/seeds — ongoing and past seed jobs, with error detail for failures.",
               }
-            : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
+            : view === "mcp"
+              ? {
+                  title: "MCP Tools",
+                  subtitle:
+                    "GET /v1/mcp/catalog — tool servers chat models can call; enable, test, and pick them in the Playground.",
+                }
+              : { title: "Deployments", subtitle: "GET /v1/serving/deployments — live serving runtimes." };
 
   return (
     <div>
@@ -119,6 +126,8 @@ export function Deploy({
         <Sizing active={active && view === "sizing"} />
       ) : view === "downloads" ? (
         <DownloadsView active={active && view === "downloads"} />
+      ) : view === "mcp" ? (
+        <McpView active={active && view === "mcp"} />
       ) : (
         <DeploymentsView
           deployments={deployments}

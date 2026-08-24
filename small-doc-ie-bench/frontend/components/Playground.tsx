@@ -20,6 +20,8 @@ import {
   triggerExtract,
   chatCompletion,
   chatCompletionStream,
+  listMcpServers,
+  type McpRegisteredServer,
   embed,
   rerank,
   embeddingDeploymentNames,
@@ -558,6 +560,8 @@ function ChatPanel({
   }, [chatNames, liveNames, model]);
 
   const [system, setSystem] = useState("");
+  const mcpServers = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
+  const [selectedMcp, setSelectedMcp] = useState<string[]>([]);
   const [input, setInput] = useState("");
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [busy, setBusy] = useState(false);
@@ -600,6 +604,13 @@ function ChatPanel({
     retryCount: number,
   ) {
     try {
+      if (selectedMcp.length > 0) {
+        // Tool exchange runs server-side; the final answer arrives in one piece.
+        const res = await chatCompletion(model, payload, selectedMcp);
+        const answer = res.choices?.[0]?.message?.content ?? "";
+        setMsgs([...next, { role: "assistant", content: answer || t("(empty response)") }]);
+        return;
+      }
       let content = "";
       const appendToken = (token: string) => {
         content += token;
@@ -668,6 +679,43 @@ function ChatPanel({
             />
           </Field>
         </div>
+
+        {(mcpServers.data ?? []).length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              <T>Tools:</T>
+            </span>
+            {(mcpServers.data ?? []).map((server) => {
+              const on = selectedMcp.includes(server.name);
+              return (
+                <button
+                  key={server.name}
+                  type="button"
+                  aria-pressed={on}
+                  disabled={busy}
+                  onClick={() =>
+                    setSelectedMcp((prev) =>
+                      on ? prev.filter((n) => n !== server.name) : [...prev, server.name],
+                    )
+                  }
+                  className={cn(
+                    "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+                    on
+                      ? "border-accent bg-accent text-accent-foreground"
+                      : "border-border bg-card text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {server.name}
+                </button>
+              );
+            })}
+            {selectedMcp.length > 0 && (
+              <span className="text-xs text-muted-foreground">
+                <T>tool answers arrive unstreamed</T>
+              </span>
+            )}
+          </div>
+        )}
 
         <div className="scroll-thin max-h-[50vh] min-h-40 space-y-3 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
           {msgs.length === 0 && (
