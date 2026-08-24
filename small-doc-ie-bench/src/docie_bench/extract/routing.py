@@ -246,6 +246,26 @@ class RoutingResult(BaseModel):
     audit: RoutingAudit
 
 
+def live_routing_audit(result: RoutingResult, *, policy_name: str) -> dict[str, Any]:
+    """The audit as it should ride a LIVE extraction response's ``routing``.
+
+    The router stamps every stage's raw extraction (``StageAudit.output``) into
+    the audit -- right for the benchmark, which scores every attempt. On a live
+    surface that leaks the LOSING stages' extraction of a confidential document
+    the caller never asked for (the winner's is already ``response.result``),
+    so ``output`` is dropped per stage and the policy's saved name is added.
+    Everything a caller needs to understand the routing stays: which stage
+    answered, why, each attempt's decision/confidence/latency/tokens/cost.
+    Shared by the sync API routes and the Studio worker so both surfaces
+    return the identical shape.
+    """
+    audit = result.audit.model_dump(mode="json")
+    audit["policy"] = policy_name
+    for stage in audit.get("stages", []):
+        stage.pop("output", None)
+    return audit
+
+
 class ExtractionRouter:
     def __init__(self, *, stages: list[ExtractionStage], policy: RoutingPolicy) -> None:
         self.policy = policy

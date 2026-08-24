@@ -20,6 +20,14 @@ export interface ExtractRequest {
    * it wins over `model_profile`. The Playground sends only this field.
    */
   deployment?: string;
+  /**
+   * A saved routing policy (POST /v1/studio/routing-policies) to run this
+   * extraction through instead of a single model: first stage, escalate on
+   * the policy's own confidence/validity rules and budgets. Mutually
+   * exclusive with deployment/model_profile. The result's `routing` carries
+   * the audit (which stage answered and why, per-attempt cost).
+   */
+  routing_policy?: string;
   ocr_backend?: string;
   language?: string;
 }

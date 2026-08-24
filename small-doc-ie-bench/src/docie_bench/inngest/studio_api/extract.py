@@ -32,6 +32,13 @@ class ExtractRequest(BaseModel):
     # by ``model_dump(exclude_none=True)`` below) for the worker's resolver.
     deployment: str | None = None
     model_profile: str | None = None
+    # A saved routing policy (POST /routing-policies) to run this extraction
+    # through INSTEAD of a single model: first stage, escalate on the policy's
+    # own confidence/validity rules and budgets. Mutually exclusive with
+    # deployment/model_profile (a policy names its profiles per stage). The
+    # result's ``routing`` carries the audit. Forwarded into the event data
+    # like every other field; the worker builds the router.
+    routing_policy: str | None = None
     ocr_backend: str | None = None
     language: str | None = None
 
@@ -42,6 +49,30 @@ async def trigger_extract(
 ) -> _shared.TriggerResponse:
     if not payload.text and not payload.content_b64:
         raise HTTPException(status_code=422, detail="Provide either 'text' or 'content_b64'")
+    if payload.routing_policy:
+        # Fail fast at the API edge: a bad selector should be a 4xx NOW, not a
+        # failed Inngest run the caller only discovers by polling. The worker
+        # re-checks (it is the source of truth), this just saves the round-trip.
+        if payload.model_profile or payload.deployment:
+            raise HTTPException(
+                status_code=400,
+                detail="'routing_policy' is mutually exclusive with 'model_profile'/"
+                "'deployment': a policy names its model profiles per stage",
+            )
+        from docie_bench.studio.routing_policies import (
+            RoutingPolicyUnavailableError,
+            get_routing_policy,
+        )
+
+        try:
+            if get_routing_policy(payload.routing_policy) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"routing policy {payload.routing_policy!r} not found -- save "
+                    "one via POST /v1/studio/routing-policies (or pick it in the Studio)",
+                )
+        except RoutingPolicyUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     channel = f"extract:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel

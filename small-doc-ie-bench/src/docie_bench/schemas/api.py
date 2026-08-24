@@ -15,6 +15,14 @@ class ExtractTextRequest(BaseModel):
     dynamic_schema: dict[str, Any] | None = None
     schema_proposer_profile: str | None = None
     model_profile: str | None = None
+    # A saved routing policy (POST /v1/studio/routing-policies) to run this
+    # extraction through INSTEAD of a single model_profile: the document goes
+    # to the policy's first stage and escalates to later stages on the
+    # policy's own confidence/validity rules and budgets. Mutually exclusive
+    # with model_profile (a policy names its profiles per stage). The
+    # response's ``routing`` field carries the audit -- which stage answered
+    # and why, cost, and every attempt.
+    routing_policy: str | None = None
     language: str | None = None
     document_id: str | None = None
     document_hash: str | None = None

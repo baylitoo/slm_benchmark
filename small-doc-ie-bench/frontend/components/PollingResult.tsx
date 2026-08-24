@@ -10,6 +10,7 @@ import {
   type SeedProgress,
 } from "@/lib/api";
 import { JsonView } from "./JsonView";
+import { RoutingSummary } from "./RoutingSummary";
 import { ProgressView } from "./ProgressBar";
 import { T, useI18n } from "@/lib/i18n";
 import { Alert, Badge } from "./ui";
@@ -121,7 +122,10 @@ export function PollingResult({
             download progress; when it drops, polling can only report the
             coarse run status — so show THAT clearly instead of JSON. */}
         {completed && primary?.output !== undefined ? (
-          <JsonView value={primary.output} />
+          <div className="space-y-2">
+            <RoutingSummary result={primary.output} />
+            <JsonView value={primary.output} />
+          </div>
         ) : failed ? (
           <Alert tone="err">The {noun} failed{failMsg ? `: ${failMsg}` : "."}</Alert>
         ) : progress && typeof progress.percent === "number" ? (

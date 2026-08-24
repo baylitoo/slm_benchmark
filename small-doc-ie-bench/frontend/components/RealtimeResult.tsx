@@ -9,6 +9,7 @@ import type { Realtime } from "@inngest/realtime";
 import { Radio } from "lucide-react";
 import { getRealtimeToken, type RealtimeToken } from "@/lib/api";
 import { JsonView } from "./JsonView";
+import { RoutingSummary } from "./RoutingSummary";
 import { PollingResult } from "./PollingResult";
 import { ProgressView } from "./ProgressBar";
 import { T, useI18n } from "@/lib/i18n";
@@ -178,7 +179,10 @@ export function RealtimeResult({
 
       <Section label={noun}>
         {result !== undefined ? (
-          <JsonView value={result} />
+          <div className="space-y-2">
+            <RoutingSummary result={result} />
+            <JsonView value={result} />
+          </div>
         ) : fallbackActive ? (
           <PollingResult eventId={eventId} channel={channel} noun={noun} />
         ) : (
