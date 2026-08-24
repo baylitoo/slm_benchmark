@@ -51,6 +51,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
+import { Markdown } from "./Markdown";
 import { T, useI18n } from "@/lib/i18n";
 import { useToast } from "./Toast";
 import {
@@ -738,13 +739,13 @@ function ChatPanel({
               >
                 <div
                   className={cn(
-                    "max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",
+                    "max-w-[85%] rounded-lg px-3 py-2 text-sm",
                     m.role === "user"
-                      ? "bg-accent text-accent-foreground"
+                      ? "whitespace-pre-wrap bg-accent text-accent-foreground"
                       : "border border-border bg-card text-foreground",
                   )}
                 >
-                  {m.content}
+                  {m.role === "assistant" ? <Markdown text={m.content} /> : m.content}
                 </div>
               </div>
             ),
@@ -1056,9 +1057,9 @@ function VisionPanel({
               <Spinner /> <T>The vision model is reading the image… (CPU vision is slow)</T>
             </p>
           ) : answer != null ? (
-            <pre className="scroll-thin max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-sm leading-relaxed text-foreground/90">
-              {answer}
-            </pre>
+            <div className="scroll-thin max-h-[28rem] overflow-auto rounded-md border border-border bg-muted/40 p-3 leading-relaxed text-foreground/90">
+              <Markdown text={answer} />
+            </div>
           ) : (
             <p className="text-sm text-muted-foreground">
               <T>Pick a vision deployment, upload an image, and run to see the answer.</T>
