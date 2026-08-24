@@ -705,6 +705,9 @@ _BATCH_PER_DOC_KEYS = (
     "dynamic_schema_name",
     "deployment",
     "model_profile",
+    # #231's worker-side _resolve_executor reads this key: every document of
+    # the batch runs through the saved policy's escalation ladder.
+    "routing_policy",
     "ocr_backend",
     "language",
     "tenant_id",
@@ -829,6 +832,70 @@ def _batch_write_results(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]
     return stored
 
 
+async def _deliver_batch_webhook(data: dict[str, Any], record: dict[str, Any]) -> None:
+    """POST the settled batch summary to the caller's ``callback_url``.
+
+    Best-effort with 3 attempts (2s/8s backoff): a dead receiver must NEVER
+    fail (or retry) the batch itself -- results are already durable, the
+    webhook is a courtesy signal. With ``callback_secret`` set the exact body
+    bytes are HMAC-SHA256-signed into ``X-DocIE-Signature`` (hex) so the
+    receiver can authenticate the sender. The payload carries RELATIVE result
+    URIs -- the api's public base URL is deployment-specific knowledge the
+    worker does not have; the receiver prefixes its own.
+    """
+    callback_url = data.get("callback_url")
+    if not callback_url:
+        return
+    import hashlib
+    import hmac as hmac_mod
+
+    event_id = str(record.get("event_id") or data.get("event_id") or "")
+    payload = {
+        "event": "batch.settled",
+        "event_id": event_id,
+        "name": record.get("name"),
+        "status": record.get("status"),
+        "schema_name": record.get("schema_name"),
+        "total_items": record.get("total_items"),
+        "done_items": record.get("done_items"),
+        "failed_items": record.get("failed_items"),
+        "error": record.get("error"),
+        "results": {
+            "jsonl": f"/v1/studio/batches/{event_id}/results.jsonl",
+            "csv": f"/v1/studio/batches/{event_id}/results.csv",
+            "detail": f"/v1/studio/batches/{event_id}",
+        },
+    }
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    secret = data.get("callback_secret")
+    if secret:
+        headers["X-DocIE-Signature"] = hmac_mod.new(
+            str(secret).encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+    delays = (0.0, 2.0, 8.0)
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    str(callback_url), content=body, headers=headers, timeout=10.0
+                )
+            if response.status_code < 400:
+                return
+            last_error = f"HTTP {response.status_code}"
+        except httpx.HTTPError as exc:
+            last_error = str(exc)
+        logger.warning(
+            "batch webhook attempt %d/%d to %s failed: %s",
+            attempt,
+            len(delays),
+            callback_url,
+            last_error,
+        )
+
+
 @inngest_client.create_function(
     fn_id="batch-extract",
     trigger=inngest.TriggerEvent(event="doc/batch.requested"),
@@ -866,7 +933,24 @@ async def batch_extract_job(ctx: inngest.Context) -> dict[str, Any]:
     inputs: list[dict[str, Any]] = [
         dict(i) for i in (raw_inputs if isinstance(raw_inputs, list) else []) if isinstance(i, dict)
     ]
-    selector = data.get("deployment") or data.get("model_profile")
+    routing_policy = data.get("routing_policy")
+    selector = (
+        f"policy:{routing_policy}"
+        if routing_policy
+        else data.get("deployment") or data.get("model_profile")
+    )
+    selectors = {
+        key: data[key]
+        for key in (
+            "deployment",
+            "model_profile",
+            "routing_policy",
+            "ocr_backend",
+            "language",
+            "dynamic_schema_name",
+        )
+        if data.get(key)
+    }
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "total": len(inputs)})
     try:
@@ -879,6 +963,9 @@ async def batch_extract_job(ctx: inngest.Context) -> dict[str, Any]:
                 schema_name=str(data.get("schema_name") or "invoice"),
                 model_selector=str(selector) if selector else None,
                 filenames=[str(i["filename"]) for i in inputs],
+                input_relkeys=[str(i["relkey"]) if i.get("relkey") else None for i in inputs],
+                selectors=selectors or None,
+                callback_url=str(data["callback_url"]) if data.get("callback_url") else None,
             )
 
         outcome, record = await ctx.step.run("claim", _claim)
@@ -921,12 +1008,26 @@ async def batch_extract_job(ctx: inngest.Context) -> dict[str, Any]:
             return settle_batch_run(event_id=event_id, status="completed", artifacts=artifacts)
 
         result = await ctx.step.run("settle", _settle)
+
+        async def _notify() -> None:
+            fallback = {"event_id": event_id, "status": "completed"}
+            await _deliver_batch_webhook(data, result or fallback)
+
+        # Its own memoized step AFTER settle: results are durable before any
+        # receiver hears about them, and a fn-level retry never re-notifies.
+        await ctx.step.run("notify", _notify)
     except BatchStoreUnavailableError as exc:
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
         raise
     except Exception as exc:  # noqa: BLE001 - whole-run failure: record it, surface it, re-raise
-        settle_batch_run(event_id=event_id, status="failed", error=str(exc))
+        failed_record = settle_batch_run(event_id=event_id, status="failed", error=str(exc))
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+        # A failure is exactly what a webhook consumer wants to hear about.
+        # Direct call (no step): the fn is about to re-raise, and the helper
+        # itself never raises.
+        await _deliver_batch_webhook(
+            data, failed_record or {"event_id": event_id, "status": "failed", "error": str(exc)}
+        )
         raise
     await publish(channel, TOPIC_RESULT, result)
     return result or {}

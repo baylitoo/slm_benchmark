@@ -25,8 +25,16 @@ export interface BatchExtractRequest {
   /** Live-deployment selector (a DeploymentRecord spec.name). */
   deployment?: string;
   model_profile?: string;
+  /** A saved routing policy: every document runs the policy's escalation
+   * ladder. Mutually exclusive with deployment/model_profile. */
+  routing_policy?: string;
   ocr_backend?: string;
   language?: string;
+  /** Optional completion webhook: the worker POSTs the settled run summary
+   * (status, counts, result URIs) here. With callback_secret, the body is
+   * HMAC-SHA256-signed into X-DocIE-Signature. */
+  callback_url?: string;
+  callback_secret?: string;
 }
 
 export function triggerBatchExtract(payload: BatchExtractRequest): Promise<TriggerResponse> {
@@ -97,4 +105,24 @@ export function downloadBatchResults(
 ): Promise<void> {
   const uri = `/v1/studio/batches/${encodeURIComponent(batch.event_id)}/results.${fmt}`;
   return downloadArtifact(uri, `${batch.name || "batch"}.${fmt}`);
+}
+
+/** Optional model override for a retry — e.g. re-run failures with a
+ * stronger model or a policy. Empty = the original batch's selectors. */
+export interface RetryFailedRequest {
+  deployment?: string;
+  model_profile?: string;
+  routing_policy?: string;
+}
+
+/** Re-run ONLY a settled batch's failed documents, as a new batch (the
+ * documents are re-read server-side from durable storage — no re-upload). */
+export function retryBatchFailed(
+  eventId: string,
+  override: RetryFailedRequest = {},
+): Promise<TriggerResponse> {
+  return request<TriggerResponse>(
+    `/v1/studio/batches/${encodeURIComponent(eventId)}/retry-failed`,
+    { method: "POST", body: JSON.stringify(override) },
+  );
 }

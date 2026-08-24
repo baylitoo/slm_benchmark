@@ -62,6 +62,34 @@ def ensure_batch_tables(engine: Engine) -> bool:
             connection.execute(CreateTable(table, if_not_exists=True))
             for index in table.indexes:
                 connection.execute(CreateIndex(index, if_not_exists=True))
+        # Forward migration for tables created by the PRE-column shape (#232
+        # shipped without these): CREATE TABLE IF NOT EXISTS never ALTERs, so a
+        # deployed database needs the columns added explicitly -- same pattern
+        # as ensure_review_task_validation_warnings_column. Nullable, no
+        # rewrite. postgres: ADD COLUMN IF NOT EXISTS (already serialized by
+        # the advisory lock above); sqlite: inspect-then-ALTER.
+        wanted = {
+            "batch_runs": (("callback_url", "VARCHAR(1000)"), ("selectors_json", "JSON")),
+            "batch_items": (("input_relkey", "VARCHAR(500)"),),
+        }
+        for table_name, columns in wanted.items():
+            if engine.dialect.name == "postgresql":
+                for column, ddl_type in columns:
+                    connection.execute(
+                        sa_text(
+                            f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS "
+                            f"{column} {ddl_type}"
+                        )
+                    )
+            else:
+                present = {
+                    col["name"] for col in sa_inspect(connection).get_columns(table_name)
+                }
+                for column, ddl_type in columns:
+                    if column not in present:
+                        connection.execute(
+                            sa_text(f"ALTER TABLE {table_name} ADD COLUMN {column} {ddl_type}")
+                        )
     return not existed
 
 
@@ -77,6 +105,7 @@ def _item_to_dict(item: BatchItem) -> dict[str, Any]:
     return {
         "position": item.position,
         "filename": item.filename,
+        "input_relkey": item.input_relkey,
         "status": item.status,
         "result": item.result_json,
         "error": item.error_text,
@@ -99,6 +128,8 @@ def _run_to_dict(run: BatchRun, *, include_items: bool) -> dict[str, Any]:
         "failed_items": run.failed_items,
         "error": run.error_text,
         "artifacts": run.artifacts_json or [],
+        "callback_url": run.callback_url,
+        "selectors": run.selectors_json or {},
         "created_at": _isoformat(run.created_at),
         "updated_at": _isoformat(run.updated_at),
     }
@@ -116,6 +147,9 @@ def claim_batch_run(
     schema_name: str,
     model_selector: str | None,
     filenames: list[str],
+    input_relkeys: list[str | None] | None = None,
+    selectors: dict[str, Any] | None = None,
+    callback_url: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Reserve the run row + one PENDING item per document, BEFORE any
     extraction. Same redelivery contract as the other stores: same
@@ -149,10 +183,13 @@ def claim_batch_run(
                 model_selector=model_selector,
                 status="running",
                 total_items=len(filenames),
+                callback_url=callback_url,
+                selectors_json=selectors,
             )
+            relkeys = input_relkeys or [None] * len(filenames)
             row.items = [
-                BatchItem(position=i, filename=fn, status="pending")
-                for i, fn in enumerate(filenames)
+                BatchItem(position=i, filename=fn, status="pending", input_relkey=rk)
+                for i, (fn, rk) in enumerate(zip(filenames, relkeys, strict=True))
             ]
             session.add(row)
             try:

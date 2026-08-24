@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
+import { SWRConfig } from "swr";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BatchView } from "@/components/benchmark/BatchView";
@@ -13,6 +14,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listBatches: vi.fn(),
     getBatch: vi.fn(),
     getDeployments: vi.fn(),
+    listRoutingPolicies: vi.fn(),
+    retryBatchFailed: vi.fn(),
     triggerBatchExtract: vi.fn(),
     downloadBatchResults: vi.fn(),
     // fileToBase64 reads a File via FileReader; stub it to a deterministic
@@ -43,10 +46,16 @@ function makeBatch(overrides: Partial<BatchRunSummary> = {}): BatchRunSummary {
 }
 
 function renderView() {
+  // Fresh SWR cache per render: useAsync is SWR-backed with string keys, and
+  // SWR's default cache is module-global -- without this, the first test's
+  // fetch result (e.g. routing-policies = []) is served to every later test
+  // regardless of its mocks.
   return render(
-    <ToastProvider>
-      <BatchView />
-    </ToastProvider>,
+    <SWRConfig value={{ provider: () => new Map() }}>
+      <ToastProvider>
+        <BatchView />
+      </ToastProvider>
+    </SWRConfig>,
   );
 }
 
@@ -60,6 +69,12 @@ describe("BatchView", () => {
       topics: [],
     });
     vi.mocked(api.downloadBatchResults).mockReset().mockResolvedValue(undefined);
+    vi.mocked(api.listRoutingPolicies).mockReset().mockResolvedValue([]);
+    vi.mocked(api.retryBatchFailed).mockReset().mockResolvedValue({
+      event_ids: ["ev-r"],
+      channel: "batch:r",
+      topics: [],
+    });
   });
 
   it("sends a single .zip as zip_b64", async () => {
@@ -130,5 +145,38 @@ describe("BatchView", () => {
       expect.objectContaining({ event_id: "ev-2", name: "done one" }),
       "jsonl",
     );
+  });
+
+  it("maps a policy: selection to routing_policy, never deployment", async () => {
+    vi.mocked(api.listRoutingPolicies).mockResolvedValue([
+      { name: "cheap-then-strong" } as never,
+    ]);
+    renderView();
+    const input = screen.getByLabelText("Batch documents") as HTMLInputElement;
+    await userEvent.upload(input, new File(["a"], "a.pdf", { type: "application/pdf" }));
+    await userEvent.selectOptions(
+      await screen.findByLabelText("Model"),
+      "policy:cheap-then-strong",
+    );
+    await userEvent.click(screen.getByRole("button", { name: /Start batch/ }));
+
+    await waitFor(() => expect(api.triggerBatchExtract).toHaveBeenCalledTimes(1));
+    const payload = vi.mocked(api.triggerBatchExtract).mock.calls[0][0];
+    expect(payload.routing_policy).toBe("cheap-then-strong");
+    expect(payload.deployment).toBeUndefined();
+  });
+
+  it("offers Retry failed only on settled batches with failures", async () => {
+    vi.mocked(api.listBatches).mockResolvedValue([
+      makeBatch(), // running WITH failures -> no retry button yet
+      makeBatch({ event_id: "ev-3", name: "settled ok", status: "completed", failed_items: 0 }),
+      makeBatch({ event_id: "ev-4", name: "settled bad", status: "completed", failed_items: 2 }),
+    ]);
+    renderView();
+    const retry = await screen.findByRole("button", { name: /Retry failed/ });
+    expect(screen.getAllByRole("button", { name: /Retry failed/ })).toHaveLength(1);
+
+    await userEvent.click(retry);
+    expect(api.retryBatchFailed).toHaveBeenCalledWith("ev-4");
   });
 });

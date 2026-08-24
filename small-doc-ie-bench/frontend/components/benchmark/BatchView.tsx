@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import { AlertCircle, Download, FileStack, Upload } from "lucide-react";
+import { AlertCircle, Download, FileStack, RotateCcw, Upload } from "lucide-react";
 import {
   ApiError,
   ApiUnavailable,
@@ -10,6 +10,8 @@ import {
   getBatch,
   getDeployments,
   listBatches,
+  listRoutingPolicies,
+  retryBatchFailed,
   selectableDeployments,
   triggerBatchExtract,
   type BatchDocumentInput,
@@ -17,6 +19,7 @@ import {
   type BatchRunDetail,
   type BatchRunSummary,
   type DeploymentRecord,
+  type RoutingPolicySummary,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -153,6 +156,10 @@ export function BatchView({ active = true }: { active?: boolean }) {
   const { toast } = useToast();
   const batches = usePolling<BatchRunSummary[]>(listBatches, POLL_MS, active);
   const deployments = useAsync<DeploymentRecord[]>("batch-deployments", getDeployments);
+  const routingPolicies = useAsync<RoutingPolicySummary[]>(
+    "routing-policies",
+    listRoutingPolicies,
+  );
   const [expanded, setExpanded] = useState<string | null>(null);
 
   // -- submit form ---------------------------------------------------------
@@ -192,11 +199,17 @@ export function BatchView({ active = true }: { active?: boolean }) {
               files.map(async (f) => ({ filename: f.name, content_b64: await fileToBase64(f) })),
             )) as BatchDocumentInput[],
           };
+      // One select carries both selector kinds: a "policy:" prefix marks a
+      // saved routing policy (mirrors the Agents form); anything else is a
+      // deployment name. Exactly one reaches the API -- they are mutually
+      // exclusive server-side.
+      const isPolicy = deployment.startsWith("policy:");
       const res = await triggerBatchExtract({
         ...payload,
         name: name.trim() || undefined,
         schema_name: schemaName.trim() || "invoice",
-        deployment: deployment || undefined,
+        deployment: !isPolicy && deployment ? deployment : undefined,
+        routing_policy: isPolicy ? deployment.slice("policy:".length) : undefined,
       });
       toast({ title: "Batch started", description: res.channel, tone: "success" });
       setFiles([]);
@@ -216,6 +229,24 @@ export function BatchView({ active = true }: { active?: boolean }) {
       toast({ title: "Batch failed to start", description: msg, tone: "error" });
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function retryFailed(r: BatchRunSummary) {
+    try {
+      const res = await retryBatchFailed(r.event_id);
+      toast({
+        title: `Retrying ${r.failed_items} failed document${r.failed_items === 1 ? "" : "s"}`,
+        description: res.channel,
+        tone: "success",
+      });
+      batches.refresh();
+    } catch (err) {
+      toast({
+        title: "Retry failed to start",
+        description: err instanceof Error ? err.message : "Retry failed.",
+        tone: "error",
+      });
     }
   }
 
@@ -264,17 +295,30 @@ export function BatchView({ active = true }: { active?: boolean }) {
       key: "results",
       header: "",
       className: "text-right",
-      render: (r) =>
-        r.artifacts.length > 0 ? (
-          <div className="flex justify-end gap-1" onClick={(e) => e.stopPropagation()}>
-            <Button size="sm" variant="ghost" onClick={() => void download(r, "jsonl")} title="Lossless per-document results">
-              <Download className="h-3.5 w-3.5" /> JSONL
+      render: (r) => (
+        <div className="flex justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+          {r.status !== "running" && r.failed_items > 0 && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => void retryFailed(r)}
+              title="Re-run only the failed documents (no re-upload; optionally pick a stronger model via the API)"
+            >
+              <RotateCcw className="h-3.5 w-3.5" /> Retry failed
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => void download(r, "csv")} title="Flattened for a spreadsheet">
-              <Download className="h-3.5 w-3.5" /> CSV
-            </Button>
-          </div>
-        ) : null,
+          )}
+          {r.artifacts.length > 0 && (
+            <>
+              <Button size="sm" variant="ghost" onClick={() => void download(r, "jsonl")} title="Lossless per-document results">
+                <Download className="h-3.5 w-3.5" /> JSONL
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => void download(r, "csv")} title="Flattened for a spreadsheet">
+                <Download className="h-3.5 w-3.5" /> CSV
+              </Button>
+            </>
+          )}
+        </div>
+      ),
     },
   ];
 
@@ -321,14 +365,23 @@ export function BatchView({ active = true }: { active?: boolean }) {
           <Field label="Schema" required>
             <TextInput value={schemaName} onChange={(e) => setSchemaName(e.target.value)} placeholder="invoice" />
           </Field>
-          <Field label="Deployment" hint="Applies to every document. Empty = backend default.">
-            <Select value={deployment} onChange={(e) => setDeployment(e.target.value)} aria-label="Deployment">
+          <Field label="Model" hint="A deployment or a saved routing policy — applies to every document. Empty = backend default.">
+            <Select value={deployment} onChange={(e) => setDeployment(e.target.value)} aria-label="Model">
               <option value="">(default)</option>
-              {deploymentNames.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
+              <optgroup label="Deployments">
+                {deploymentNames.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Routing policies">
+                {(routingPolicies.data ?? []).map((p) => (
+                  <option key={p.name} value={`policy:${p.name}`}>
+                    policy: {p.name}
+                  </option>
+                ))}
+              </optgroup>
             </Select>
           </Field>
           {error && (

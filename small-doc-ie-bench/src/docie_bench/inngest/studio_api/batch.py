@@ -79,8 +79,20 @@ class BatchExtractRequest(BaseModel):
     dynamic_schema_name: str | None = None
     deployment: str | None = None
     model_profile: str | None = None
+    # A saved routing policy (POST /v1/studio/routing-policies): every document
+    # runs through the policy's escalation ladder instead of a single model.
+    # Mutually exclusive with deployment/model_profile.
+    routing_policy: str | None = None
     ocr_backend: str | None = None
     language: str | None = None
+    # Optional completion webhook: when the batch settles, the worker POSTs the
+    # run summary (status, counts, result-download URIs) to this URL. With
+    # ``callback_secret`` set, the body is HMAC-SHA256-signed into an
+    # ``X-DocIE-Signature`` header so the receiver can authenticate the caller.
+    # http(s) only; delivered best-effort with retries -- a dead receiver never
+    # fails the batch.
+    callback_url: str | None = Field(default=None, max_length=1000)
+    callback_secret: str | None = Field(default=None, max_length=200)
 
 
 def _decode_b64(payload: str, *, what: str) -> bytes:
@@ -148,9 +160,33 @@ def _collect_documents(payload: BatchExtractRequest) -> list[tuple[str, bytes]]:
 async def trigger_batch_extract(
     payload: BatchExtractRequest, tenant: TenantDependency
 ) -> _shared.TriggerResponse:
-    if payload.deployment and payload.model_profile:
+    selectors = [payload.deployment, payload.model_profile, payload.routing_policy]
+    if sum(1 for sel in selectors if sel) > 1:
         raise HTTPException(
-            status_code=400, detail="'deployment' and 'model_profile' are mutually exclusive"
+            status_code=400,
+            detail="'deployment', 'model_profile' and 'routing_policy' are mutually "
+            "exclusive: pick exactly one (a policy names its profiles per stage)",
+        )
+    if payload.routing_policy:
+        # Fail fast at the edge (mirrors /extract): a bad policy name is a 4xx
+        # NOW, not a failed Inngest run discovered by polling.
+        from docie_bench.studio.routing_policies import (
+            RoutingPolicyUnavailableError,
+            get_routing_policy,
+        )
+
+        try:
+            if get_routing_policy(payload.routing_policy) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"routing policy {payload.routing_policy!r} not found -- save "
+                    "one via POST /v1/studio/routing-policies (or pick it in the Studio)",
+                )
+        except RoutingPolicyUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if payload.callback_url and not payload.callback_url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=422, detail="'callback_url' must be an http(s) URL"
         )
     docs = _collect_documents(payload)
 
@@ -182,7 +218,16 @@ async def trigger_batch_extract(
         "schema_name": payload.schema_name,
         "inputs": inputs,
     }
-    for key in ("dynamic_schema_name", "deployment", "model_profile", "ocr_backend", "language"):
+    for key in (
+        "dynamic_schema_name",
+        "deployment",
+        "model_profile",
+        "routing_policy",
+        "ocr_backend",
+        "language",
+        "callback_url",
+        "callback_secret",
+    ):
         value = getattr(payload, key)
         if value:
             data[key] = value
@@ -213,6 +258,97 @@ async def get_batch(event_id: str, tenant: TenantDependency) -> dict[str, Any]:
     if run is None:
         raise HTTPException(status_code=404, detail=f"batch {event_id!r} not found")
     return run
+
+
+class RetryFailedRequest(BaseModel):
+    """Optional model override for the retry -- e.g. re-run the failures with a
+    STRONGER model or a routing policy than the original batch used. Empty
+    body = the original selectors."""
+
+    deployment: str | None = None
+    model_profile: str | None = None
+    routing_policy: str | None = None
+
+
+@router.post("/batches/{event_id}/retry-failed", response_model=_shared.TriggerResponse)
+async def retry_failed_items(
+    event_id: str, payload: RetryFailedRequest, tenant: TenantDependency
+) -> _shared.TriggerResponse:
+    """Re-run ONLY a settled batch's failed documents, as a new batch.
+
+    The per-item state makes this cheap: failed items are identified by
+    position, their documents re-read from the blob store via the
+    ``input_relkey`` persisted at claim time -- no re-upload. A NEW batch keeps
+    the semantics simple (the original stays as the durable record of what
+    happened; the retry is its own run, named after it). Selectors default to
+    the original submission's (``selectors_json``) and can be overridden --
+    the classic move being "retry the failures with the stronger model".
+    """
+    override = [payload.deployment, payload.model_profile, payload.routing_policy]
+    if sum(1 for sel in override if sel) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="'deployment', 'model_profile' and 'routing_policy' are mutually exclusive",
+        )
+    try:
+        run = get_batch_run(event_id, tenant_id=tenant.tenant_id)
+    except BatchStoreUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"batch {event_id!r} not found")
+    if run["status"] == "running":
+        raise HTTPException(
+            status_code=409, detail="batch is still running -- retry once it settles"
+        )
+    failed = [item for item in run.get("items", []) if item["status"] == "failed"]
+    if not failed:
+        raise HTTPException(status_code=400, detail="batch has no failed items to retry")
+    missing = [item["filename"] for item in failed if not item.get("input_relkey")]
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "these failed documents predate durable input storage and cannot be "
+                f"retried without a re-upload: {', '.join(missing[:5])}"
+            ),
+        )
+    blobs = default_blob_store()
+    gone = [item["filename"] for item in failed if not blobs.exists(str(item["input_relkey"]))]
+    if gone:
+        raise HTTPException(
+            status_code=410,
+            detail=f"input documents no longer in the store: {', '.join(gone[:5])}",
+        )
+
+    selectors = dict(run.get("selectors") or {})
+    if any(override):
+        for key in ("deployment", "model_profile", "routing_policy"):
+            selectors.pop(key, None)
+        for key, value in (
+            ("deployment", payload.deployment),
+            ("model_profile", payload.model_profile),
+            ("routing_policy", payload.routing_policy),
+        ):
+            if value:
+                selectors[key] = value
+
+    channel = f"batch:{uuid.uuid4().hex}"
+    data: dict[str, Any] = {
+        "channel": channel,
+        "tenant_id": tenant.tenant_id,
+        "name": f"retry: {run['name']}",
+        "schema_name": run["schema_name"],
+        "retry_of": event_id,
+        "inputs": [
+            {"filename": item["filename"], "relkey": item["input_relkey"]} for item in failed
+        ],
+        **{key: value for key, value in selectors.items() if value},
+    }
+    ids = await send_or_503(inngest_client, inngest.Event(name=BATCH_EVENT, data=data))
+    _shared._record_event_owners(list(ids), tenant.tenant_id)
+    return _shared.TriggerResponse(
+        event_ids=list(ids), channel=channel, topics=_shared.DEFAULT_TOPICS
+    )
 
 
 def _results_artifact(run: dict[str, Any], suffix: str) -> dict[str, Any] | None:

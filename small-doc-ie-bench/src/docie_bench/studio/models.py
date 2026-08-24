@@ -230,6 +230,15 @@ class BatchRun(Base):
     # Artifact refs (JSONL + CSV of every item's result) once the batch settles;
     # ``[{"name","artifact_id","uri","media_type","size_bytes"}, ...]``.
     artifacts_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    # Optional completion webhook: POSTed the settled run summary once the
+    # batch reaches a terminal state (see functions._deliver_batch_webhook).
+    callback_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # The ORIGINAL model/schema selectors as submitted (deployment /
+    # model_profile / routing_policy / ocr_backend / language /
+    # dynamic_schema_name) -- what "retry failed only" re-fires with, since
+    # ``model_selector`` above is a display string that lost which KIND of
+    # selector it was.
+    selectors_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
@@ -257,6 +266,12 @@ class BatchItem(Base):
     )
     position: Mapped[int] = mapped_column(Integer)
     filename: Mapped[str] = mapped_column(String(300))
+    # The document's key in the shared ArtifactBlobStore (written at claim).
+    # Load-bearing twice: "retry failed only" re-reads the SAME durable bytes
+    # without a re-upload, and RunStore.gc's orphan sweep consults it so batch
+    # inputs are never reclaimed as orphans (they are referenced by no
+    # StudioRunArtifact row). Nullable only for rows that predate the column.
+    input_relkey: Mapped[str | None] = mapped_column(String(500), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True, default="pending")
     result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
