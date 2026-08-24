@@ -532,6 +532,29 @@ class RunStore:
             # set the mark-and-sweep must never touch (guard 1: content-addressed
             # sharing across runs).
             referenced = set(session.scalars(select(StudioRunArtifact.relkey)).all())
+            # Batch extraction shares this SAME blob store but references blobs
+            # from its own tables, not StudioRunArtifact -- without this, every
+            # batch's input documents (BatchItem.input_relkey) and results files
+            # (BatchRun.artifacts_json) read as orphans and are reclaimed after
+            # the grace window: silent data loss, and "retry failed only" loses
+            # the documents it needs. artifacts_json is JSON, so its relkeys are
+            # extracted in Python rather than SQL.
+            from docie_bench.studio.models import BatchItem, BatchRun
+
+            referenced.update(
+                relkey
+                for relkey in session.scalars(
+                    select(BatchItem.input_relkey).where(BatchItem.input_relkey.is_not(None))
+                ).all()
+                if relkey
+            )
+            for artifacts in session.scalars(
+                select(BatchRun.artifacts_json).where(BatchRun.artifacts_json.is_not(None))
+            ).all():
+                for artifact in artifacts or []:
+                    relkey = artifact.get("relkey") if isinstance(artifact, dict) else None
+                    if relkey:
+                        referenced.add(str(relkey))
 
         # Row-driven reclamation first: these are provably dead (their run is gone),
         # so they are reclaimed regardless of age.

@@ -540,3 +540,300 @@ def test_download_results_is_tenant_scoped_and_409_before_settle(
         == 404
     )
     assert client.get("/v1/studio/batches/dl-1/results.xlsx", headers=_hdr()).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# P2 follow-ups: retry-failed, webhooks, routing_policy on batch, GC retain.
+# ---------------------------------------------------------------------------
+
+
+def test_migration_adds_new_columns_to_a_pre_upgrade_database(tmp_path: Path) -> None:
+    # Simulate a database created by #232's shape (no input_relkey /
+    # callback_url / selectors_json) via raw SQL, then run the migration:
+    # CREATE TABLE IF NOT EXISTS alone would silently leave the columns
+    # missing and the first claim would throw OperationalError.
+    from sqlalchemy import create_engine, inspect, text
+
+    from docie_bench.studio.batch_store import ensure_batch_tables
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE batch_runs (event_id VARCHAR(128) PRIMARY KEY, "
+            "channel VARCHAR(128), tenant_id VARCHAR(128), name VARCHAR(200), "
+            "schema_name VARCHAR(64), model_selector VARCHAR(200), status VARCHAR(32), "
+            "total_items INTEGER, done_items INTEGER, failed_items INTEGER, "
+            "error_text TEXT, artifacts_json JSON, created_at DATETIME, updated_at DATETIME)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE batch_items (id INTEGER PRIMARY KEY, run_event_id VARCHAR(128), "
+            "position INTEGER, filename VARCHAR(300), status VARCHAR(32), "
+            "result_json JSON, error_text TEXT, latency_ms INTEGER, updated_at DATETIME)"
+        ))
+    ensure_batch_tables(engine)
+    runs_cols = {c["name"] for c in inspect(engine).get_columns("batch_runs")}
+    items_cols = {c["name"] for c in inspect(engine).get_columns("batch_items")}
+    assert {"callback_url", "selectors_json"} <= runs_cols
+    assert "input_relkey" in items_cols
+    # And it stays idempotent.
+    ensure_batch_tables(engine)
+
+
+def test_gc_never_reclaims_batch_inputs_or_results(batch_database) -> None:
+    # THE data-loss bug this PR fixes: batch blobs live in the same store as
+    # benchmark artifacts but are referenced only by batch tables, which the
+    # orphan sweep ignored -- after the grace window every batch's inputs AND
+    # results were deleted. grace=0 makes any unreferenced blob immediately
+    # sweepable, so survival here proves the retain set now sees batch refs.
+    from docie_bench.storage.db import get_session_factory
+    from docie_bench.studio.store import RunStore
+
+    input_blob = batch_database.put(name="doc.pdf", content=b"DOC", media_type="application/pdf")
+    claim_batch_run(
+        event_id="gc-1", channel="batch:gc", tenant_id=TENANT_A, name="n",
+        schema_name="invoice", model_selector=None, filenames=["doc.pdf"],
+        input_relkeys=[input_blob.relkey],
+    )
+    result_artifacts = functions._batch_write_results(
+        [{"position": 0, "filename": "doc.pdf", "status": "done", "result": {"result": {}}}]
+    )
+    settle_batch_run(event_id="gc-1", status="completed", artifacts=result_artifacts)
+    orphan = batch_database.put(
+        name="orphan.bin", content=b"junk", media_type="application/octet-stream"
+    )
+
+    stats = RunStore(get_session_factory(), batch_database).gc(
+        max_age_days=365, max_runs=10_000, orphan_grace_hours=0
+    )
+
+    assert batch_database.exists(input_blob.relkey), "batch INPUT swept as orphan"
+    for artifact in result_artifacts:
+        assert batch_database.exists(artifact["relkey"]), "batch RESULT swept as orphan"
+    assert not batch_database.exists(orphan.relkey), "true orphan must still be swept"
+    assert stats["deleted_blobs"] >= 1
+
+
+def test_trigger_validates_and_forwards_routing_policy_and_callback(
+    client: TestClient, captured_events: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "docie_bench.studio.routing_policies.get_routing_policy",
+        lambda name: {"name": name, "policy": {}} if name == "cheap-then-strong" else None,
+    )
+    docs = [{"filename": "a.pdf", "content_b64": base64.b64encode(b"A").decode()}]
+    # exclusivity now covers the policy too
+    both = client.post(
+        "/v1/studio/extract/batch",
+        json={"documents": docs, "routing_policy": "cheap-then-strong", "deployment": "d"},
+        headers=_hdr(),
+    )
+    assert both.status_code == 400
+    assert "mutually exclusive" in both.json()["detail"]
+    # unknown policy fails at the edge, nothing enqueued
+    missing = client.post(
+        "/v1/studio/extract/batch",
+        json={"documents": docs, "routing_policy": "nope"},
+        headers=_hdr(),
+    )
+    assert missing.status_code == 404
+    # bad webhook scheme
+    bad_url = client.post(
+        "/v1/studio/extract/batch",
+        json={"documents": docs, "callback_url": "ftp://x"},
+        headers=_hdr(),
+    )
+    assert bad_url.status_code == 422
+    assert captured_events == []
+    # happy path forwards everything
+    ok = client.post(
+        "/v1/studio/extract/batch",
+        json={
+            "documents": docs,
+            "routing_policy": "cheap-then-strong",
+            "callback_url": "https://hooks.example/done",
+            "callback_secret": "s3cret",
+        },
+        headers=_hdr(),
+    )
+    assert ok.status_code == 200, ok.text
+    data = captured_events[0]["data"]
+    assert data["routing_policy"] == "cheap-then-strong"
+    assert data["callback_url"] == "https://hooks.example/done"
+    assert data["callback_secret"] == "s3cret"  # noqa: S105 - test fixture value
+
+
+@pytest.mark.asyncio
+async def test_per_document_step_forwards_routing_policy(
+    monkeypatch: pytest.MonkeyPatch, batch_database
+) -> None:
+    # _BATCH_PER_DOC_KEYS is the contract: routing_policy must reach
+    # _run_extraction's data, where #231's _resolve_executor picks it up.
+    seen: list[dict[str, Any]] = []
+
+    async def fake_run(data: dict[str, Any]) -> dict[str, Any]:
+        seen.append(data)
+        return {
+            "request_id": "r",
+            "schema_name": "invoice",
+            "model_profile": "strong",
+            "result": {},
+        }
+
+    monkeypatch.setattr(functions, "_run_extraction", fake_run)
+    claim_batch_run(
+        event_id="rp-1", channel="batch:rp", tenant_id=TENANT_A, name="n",
+        schema_name="invoice", model_selector="policy:x", filenames=["a.pdf"],
+    )
+    key = batch_database.put(name="a.pdf", content=b"A", media_type="application/pdf").relkey
+    await functions._batch_extract_one(
+        {"event_id": "rp-1", "schema_name": "invoice", "routing_policy": "x"},
+        {"filename": "a.pdf", "relkey": key},
+        0,
+    )
+    assert seen[0]["routing_policy"] == "x"
+    assert "deployment" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_webhook_signs_posts_and_retries_without_ever_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+    import hmac as hmac_mod
+
+    calls: list[dict[str, Any]] = []
+    responses = [500, 200]  # first attempt fails, retry succeeds
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, *, content, headers, timeout):
+            calls.append({"url": url, "content": content, "headers": headers})
+            import httpx as _httpx
+
+            return _httpx.Response(responses[min(len(calls) - 1, len(responses) - 1)])
+
+    monkeypatch.setattr(functions.httpx, "AsyncClient", _FakeClient)
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(functions.asyncio, "sleep", no_sleep)
+
+    record = {
+        "event_id": "wh-1", "name": "n", "status": "completed",
+        "total_items": 2, "done_items": 2, "failed_items": 0,
+    }
+    fake_secret = "not-a-real-secret"  # noqa: S105 - test fixture
+    data = {"callback_url": "https://hooks.example/done", "callback_secret": fake_secret}
+    await functions._deliver_batch_webhook(data, record)
+
+    assert len(calls) == 2  # 500 then 200: retried, then stopped
+    body = calls[0]["content"]
+    expected_sig = hmac_mod.new(fake_secret.encode(), body, hashlib.sha256).hexdigest()
+    assert calls[0]["headers"]["X-DocIE-Signature"] == expected_sig
+    payload = json.loads(body)
+    assert payload["event"] == "batch.settled"
+    assert payload["results"]["jsonl"] == "/v1/studio/batches/wh-1/results.jsonl"
+
+    # All attempts fail -> gives up silently, NEVER raises (results are durable;
+    # the webhook is a courtesy).
+    calls.clear()
+    responses[:] = [500, 500, 500]
+    await functions._deliver_batch_webhook(data, record)
+    assert len(calls) == 3
+
+    # No callback_url -> no traffic at all.
+    calls.clear()
+    await functions._deliver_batch_webhook({}, record)
+    assert calls == []
+
+
+def _seed_settled_batch_with_failures(blobs, *, event_id: str = "rt-1") -> str:
+    ok_key = blobs.put(name="ok.pdf", content=b"OK", media_type="application/pdf").relkey
+    bad_key = blobs.put(name="bad.pdf", content=b"BAD", media_type="application/pdf").relkey
+    claim_batch_run(
+        event_id=event_id, channel=f"batch:{event_id}", tenant_id=TENANT_A, name="q3",
+        schema_name="invoice", model_selector="cheap", filenames=["ok.pdf", "bad.pdf"],
+        input_relkeys=[ok_key, bad_key],
+        selectors={"model_profile": "cheap", "language": "fr"},
+    )
+    record_batch_item(event_id=event_id, position=0, status="done", result={})
+    record_batch_item(event_id=event_id, position=1, status="failed", error="boom")
+    settle_batch_run(event_id=event_id, status="completed")
+    return bad_key
+
+
+def test_retry_failed_refires_only_failures_with_original_selectors(
+    client: TestClient, captured_events: list[dict[str, Any]], batch_database
+) -> None:
+    bad_key = _seed_settled_batch_with_failures(batch_database)
+    resp = client.post("/v1/studio/batches/rt-1/retry-failed", json={}, headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    data = captured_events[0]["data"]
+    assert data["name"] == "retry: q3"
+    assert data["retry_of"] == "rt-1"
+    assert data["inputs"] == [{"filename": "bad.pdf", "relkey": bad_key}]  # ONLY the failure
+    assert data["model_profile"] == "cheap"  # original selectors carried
+    assert data["language"] == "fr"
+
+
+def test_retry_failed_supports_a_stronger_model_override(
+    client: TestClient, captured_events: list[dict[str, Any]], batch_database
+) -> None:
+    _seed_settled_batch_with_failures(batch_database, event_id="rt-2")
+    resp = client.post(
+        "/v1/studio/batches/rt-2/retry-failed",
+        json={"routing_policy": "cheap-then-strong"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    data = captured_events[0]["data"]
+    # The override REPLACES the original model selector entirely...
+    assert data["routing_policy"] == "cheap-then-strong"
+    assert "model_profile" not in data
+    # ...but non-model selectors survive.
+    assert data["language"] == "fr"
+
+
+def test_retry_failed_guards(client: TestClient, captured_events, batch_database) -> None:
+    # running -> 409
+    claim_batch_run(
+        event_id="rt-run", channel="batch:rt-run", tenant_id=TENANT_A, name="n",
+        schema_name="invoice", model_selector=None, filenames=["a.pdf"], input_relkeys=["k"],
+    )
+    resp = client.post("/v1/studio/batches/rt-run/retry-failed", json={}, headers=_hdr())
+    assert resp.status_code == 409
+    # no failures -> 400
+    claim_batch_run(
+        event_id="rt-clean", channel="batch:rt-clean", tenant_id=TENANT_A, name="n",
+        schema_name="invoice", model_selector=None, filenames=["a.pdf"], input_relkeys=["k"],
+    )
+    record_batch_item(event_id="rt-clean", position=0, status="done", result={})
+    settle_batch_run(event_id="rt-clean", status="completed")
+    resp = client.post("/v1/studio/batches/rt-clean/retry-failed", json={}, headers=_hdr())
+    assert resp.status_code == 400
+    # pre-upgrade rows (no input_relkey) -> 409 naming the files
+    claim_batch_run(
+        event_id="rt-old", channel="batch:rt-old", tenant_id=TENANT_A, name="n",
+        schema_name="invoice", model_selector=None, filenames=["legacy.pdf"],
+    )
+    record_batch_item(event_id="rt-old", position=0, status="failed", error="x")
+    settle_batch_run(event_id="rt-old", status="completed")
+    old = client.post("/v1/studio/batches/rt-old/retry-failed", json={}, headers=_hdr())
+    assert old.status_code == 409
+    assert "legacy.pdf" in old.json()["detail"]
+    # blob deleted since -> 410
+    gone_key = _seed_settled_batch_with_failures(batch_database, event_id="rt-gone")
+    batch_database.delete(gone_key)
+    resp = client.post("/v1/studio/batches/rt-gone/retry-failed", json={}, headers=_hdr())
+    assert resp.status_code == 410
+    # foreign tenant -> 404
+    _seed_settled_batch_with_failures(batch_database, event_id="rt-t")
+    resp = client.post("/v1/studio/batches/rt-t/retry-failed", json={}, headers=_hdr("key-b"))
+    assert resp.status_code == 404
+    assert captured_events == []  # every guard fired before any event
