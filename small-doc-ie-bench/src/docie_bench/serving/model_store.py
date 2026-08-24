@@ -69,6 +69,15 @@ class FamilyContract:
     llama_server_args: tuple[str, ...] = ()
     needs_mmproj: bool = False
     vision: bool = False
+    # OpenAI tool calling (`tools`/`tool_choice` -> `tool_calls`). llama-server
+    # only renders tools through its jinja engine, so this is True ONLY for
+    # families whose launch args carry --jinja AND whose contract is
+    # conversational (an extraction contract like nuextract3 has --jinja but
+    # tool calling is meaningless there). The chat proxy forwards tools
+    # verbatim either way -- this flag is the HONEST capability signal the
+    # families API exposes, so a caller can tell "tools ignored by a
+    # non-jinja launch" apart from "model chose not to call".
+    tools: bool = False
     # An embedding model: served with llama-server's --embedding pooling, and
     # answered on /v1/embeddings — never chat/extraction. Deployments of an
     # embedding family are typed "embedding" and routed by the embeddings API.
@@ -160,6 +169,15 @@ FAMILIES: dict[str, FamilyContract] = {
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",
+        # --jinja: llama-server renders the GGUF's own chat template through
+        # its jinja engine -- REQUIRED for native tool calling (without it a
+        # `tools` request 200s with a plain completion, silently ignoring the
+        # tools). Also the llama.cpp-recommended default for chat models.
+        # Behavior note: this changes template rendering for existing
+        # openai_chat deployments from the legacy path to the GGUF's own
+        # template -- the honest rendering, but a change.
+        llama_server_args=("--jinja",),
+        tools=True,
         default_temperature=0.0,
         ollama_faithful=True,
     ),
@@ -177,6 +195,7 @@ FAMILIES: dict[str, FamilyContract] = {
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",
         llama_server_args=("--jinja",),
+        tools=True,
         needs_mmproj=False,
         vision=False,
         default_temperature=0.0,  # extraction-deterministic (Liquid's 0.1 is a chat rec)
