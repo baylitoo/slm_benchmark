@@ -1,0 +1,88 @@
+"""Static catalog of first-party MCP servers; enabling an entry materializes
+a stdio registry entry in configs/mcp-servers.json (see mcp_tools).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class CatalogParam:
+    name: str
+    env_var: str
+    description: str
+    required: bool = False
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    name: str
+    title: str
+    description: str
+    module: str
+    tools: tuple[str, ...]
+    params: tuple[CatalogParam, ...] = field(default_factory=tuple)
+
+
+CATALOG: dict[str, CatalogEntry] = {
+    entry.name: entry
+    for entry in (
+        CatalogEntry(
+            name="calculator",
+            title="Calculator",
+            description=(
+                "Exact arithmetic: evaluate expressions and verify sums. Aimed "
+                "squarely at the totals small models miscompute — the model "
+                "reads the line items, the tool does the math."
+            ),
+            module="docie_bench.mcp_servers.calculator",
+            tools=("calc", "sum_check"),
+        ),
+        CatalogEntry(
+            name="dates",
+            title="Dates",
+            description=(
+                "Parse dates in any common format to ISO 8601, compute exact "
+                "day differences, and tell the model today's date."
+            ),
+            module="docie_bench.mcp_servers.dates",
+            tools=("parse_date", "date_diff", "today"),
+        ),
+        CatalogEntry(
+            name="web-fetch",
+            title="Web fetch",
+            description=(
+                "HTTP GET restricted to an operator-set host allowlist (deny "
+                "by default, redirects never followed). Lets the model ground "
+                "an answer in a page you explicitly allow."
+            ),
+            module="docie_bench.mcp_servers.web_fetch",
+            tools=("fetch",),
+            params=(
+                CatalogParam(
+                    name="allowed_hosts",
+                    env_var="DOCIE_MCP_FETCH_ALLOWED_HOSTS",
+                    description=(
+                        "Comma-separated hostnames the fetch tool may reach "
+                        "('*' allows every host). Empty = every fetch refused."
+                    ),
+                ),
+            ),
+        ),
+    )
+}
+
+
+def registry_entry_for(entry: CatalogEntry, params: dict[str, str]) -> dict[str, object]:
+    env = {
+        param.env_var: params[param.name] for param in entry.params if params.get(param.name)
+    }
+    record: dict[str, object] = {
+        "transport": "stdio",
+        "command": ["python", "-m", entry.module],
+        "catalog": entry.name,
+    }
+    if env:
+        record["env"] = env
+    return record

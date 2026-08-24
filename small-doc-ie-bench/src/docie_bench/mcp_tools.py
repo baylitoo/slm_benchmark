@@ -136,6 +136,36 @@ def load_mcp_registry(path: Path | None = None) -> dict[str, MCPServerSpec]:
     return registry
 
 
+def save_registry_entry(name: str, record: dict[str, Any], path: Path | None = None) -> None:
+    """Atomic read-modify-write of one server entry; preserves hand-written entries."""
+    config_path = path if path is not None else get_settings().mcp_servers_config
+    raw: dict[str, Any] = {"servers": {}}
+    if config_path.exists():
+        parsed = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict) and isinstance(parsed.get("servers"), dict):
+            raw = parsed
+    raw.setdefault("servers", {})[name] = record
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(config_path)
+
+
+def remove_registry_entry(name: str, path: Path | None = None) -> bool:
+    config_path = path if path is not None else get_settings().mcp_servers_config
+    if not config_path.exists():
+        return False
+    parsed = json.loads(config_path.read_text(encoding="utf-8"))
+    servers = parsed.get("servers") if isinstance(parsed, dict) else None
+    if not isinstance(servers, dict) or name not in servers:
+        return False
+    del servers[name]
+    tmp = config_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(parsed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(config_path)
+    return True
+
+
 async def open_mcp_sessions(
     stack: AsyncExitStack, specs: list[MCPServerSpec]
 ) -> dict[str, ClientSession]:

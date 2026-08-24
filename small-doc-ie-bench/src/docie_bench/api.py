@@ -26,6 +26,7 @@ from docie_bench.inngest.serving_api import trigger_deployment_load
 from docie_bench.inngest.studio_api import router as studio_router
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.logging_config import configure_logging
+from docie_bench.mcp_api import router as mcp_router
 from docie_bench.orchestrator.api import configure_orchestrator
 from docie_bench.orchestrator.api import router as orchestrator_router
 from docie_bench.orchestrator.service import OrchestratorService
@@ -113,6 +114,8 @@ app.include_router(agents_router)
 # Generic OpenAI chat over the serving stack (Playground "Chat" + platform
 # surface): POST /v1/chat/completions with model = deployment/profile.
 app.include_router(chat_router)
+# MCP catalog + registry management (browse/enable/disable/test).
+app.include_router(mcp_router)
 
 # Allow the DocIE Studio frontend (separate origin) to call the API from the
 # browser. Defaults to the local Studio UI origins; override via
