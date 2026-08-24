@@ -173,8 +173,15 @@ export function agentChat(
 export function chatCompletion(
   model: string,
   messages: { role: string; content: unknown }[],
+  mcpServers?: string[],
 ): Promise<AgentChatResponse> {
-  return openaiPost(`${API_BASE}/v1/chat/completions`, { model, messages });
+  return openaiPost(`${API_BASE}/v1/chat/completions`, {
+    model,
+    messages,
+    // Named MCP servers: the backend advertises their tools, runs the tool
+    // exchange, and returns the final completion (non-streaming only).
+    ...(mcpServers && mcpServers.length > 0 ? { mcp_servers: mcpServers } : {}),
+  });
 }
 
 /**

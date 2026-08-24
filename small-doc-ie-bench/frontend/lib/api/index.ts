@@ -29,6 +29,7 @@
 //   - batch.ts            -- batch extraction (N docs, one durable job).
 //   - seeding.ts          -- Ollama/HF seeding, HF Hub search/inspect,
 //                            catalog browser.
+//   - mcp.ts              -- MCP tool-server catalog + registry management.
 //   - review.ts           -- human review queue workflow.
 //   - agents.ts           -- agent CRUD + OpenAI-compatible chat calls.
 //   - helpers.ts          -- deployment-derived classification, embed/
@@ -52,6 +53,7 @@ export * from "./benchmark";
 export * from "./schemas";
 export * from "./seeding";
 export * from "./batch";
+export * from "./mcp";
 export * from "./review";
 export * from "./agents";
 export * from "./helpers";
