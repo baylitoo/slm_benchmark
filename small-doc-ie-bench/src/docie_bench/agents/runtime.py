@@ -26,6 +26,13 @@ from docie_bench.agents.guard import (
     moderation_flags,
 )
 from docie_bench.agents.spec import AgentSpec
+from docie_bench.benchmark.routing_config import build_extraction_router
+from docie_bench.extract.routing import (
+    ExtractionRouter,
+    RoutingPolicy,
+    RoutingResult,
+    live_routing_audit,
+)
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
@@ -38,6 +45,10 @@ from docie_bench.serving.solutions import (
     _extract_document,
     apply_no_think,
     build_solution,
+)
+from docie_bench.studio.routing_policies import (
+    RoutingPolicyUnavailableError,
+    get_routing_policy,
 )
 
 PROXY_MODES = ("placeholder", "block", "detect")
@@ -83,6 +94,12 @@ async def complete_agent(
 
 
 OCR_MODES = ("ocr", "ocr_extract", "vision")
+
+# ``options.extractor`` selector convention: ``policy:<name>`` runs a SAVED
+# routing policy (POST /v1/studio/routing-policies) as the extraction step
+# instead of a single model — the same registry the live extract routes and
+# the Benchmark tab resolve by name.
+_POLICY_PREFIX = "policy:"
 
 
 def _resolve_ocr_mode(options: dict[str, Any]) -> str:
@@ -154,8 +171,8 @@ async def _complete_structured_document(
     *,
     spec: AgentSpec,
     body: dict[str, Any],
-    profile: ModelProfile,
-    profiles: dict[str, ModelProfile],
+    profile: ModelProfile | None = None,
+    profiles: dict[str, ModelProfile] | None = None,
     schema_name: str,
     ocr_backend_name: str,
     language: str | None,
@@ -163,25 +180,44 @@ async def _complete_structured_document(
     mode: str,
     output_model: str,
     max_tokens: int | None,
+    executor: ExtractionService | ExtractionRouter | None = None,
+    policy_name: str | None = None,
 ) -> dict[str, Any]:
     """Run an Agent document through the same extraction path as Playground.
 
     This preserves OCR blocks and their evidence ids, uses the shared prompt and
     response-format negotiation, and performs the same grounding/validation pass
     before adapting the result back to an OpenAI chat completion.
+
+    ``executor`` is anything exposing ``extract_from_file`` — when ``None``
+    (every single-model caller), an ``ExtractionService`` is built from
+    ``profile``/``profiles`` exactly as before. A ``policy:<name>`` extractor
+    passes a prebuilt ``ExtractionRouter`` plus ``policy_name`` instead; its
+    ``RoutingResult`` outcome is unwrapped here and the sanitized
+    ``live_routing_audit`` (per-stage ``output`` stripped — a live surface must
+    not leak the losing stages' extraction of a confidential document) rides
+    the completion's ``docie_agent.routing``. Router caveats: each stage
+    re-runs OCR through its own ``extract_from_file``, which the
+    content-addressed OCR cache absorbs — no special handling needed; and
+    ``disable_thinking``/``max_tokens`` do NOT reach router stages, because
+    ``build_extraction_router`` constructs each stage's service without
+    threading them (documented limitation, not hacked around here).
     """
     schema_mode, dynamic_schema = _resolve_extraction_schema(schema_name)
     raw, suffix = _extract_document(body)
     with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
         handle.write(raw)
         path = Path(handle.name)
-    try:
-        response = await ExtractionService(
+    if executor is None:
+        assert profile is not None, "either an executor or a profile is required"
+        executor = ExtractionService(
             profile,
-            profiles=profiles,
+            profiles=profiles or {},
             disable_thinking=disable_thinking,
             max_tokens=max_tokens,
-        ).extract_from_file(
+        )
+    try:
+        outcome = await executor.extract_from_file(
             path=path,
             ocr_backend_name=ocr_backend_name,
             schema_name=schema_name,
@@ -203,11 +239,40 @@ async def _complete_structured_document(
     finally:
         path.unlink(missing_ok=True)
 
+    routing_audit: dict[str, Any] | None = None
+    if isinstance(outcome, RoutingResult):
+        assert policy_name is not None, "a RoutingResult implies a policy_name"
+        if outcome.response is None:
+            # Every stage errored or the budget ran out before any stage
+            # answered — an honest upstream failure with the router's own
+            # terminal reason, not a 500.
+            raise AgentError(
+                f"routing policy {policy_name!r} produced no extraction: "
+                f"{outcome.audit.terminal_reason} "
+                f"(decision={outcome.audit.terminal_decision.value}, "
+                f"attempts={outcome.audit.attempts})",
+                status_code=502,
+                error_type="upstream_error",
+            )
+        routing_audit = live_routing_audit(outcome, policy_name=policy_name)
+        response = outcome.response
+    else:
+        response = outcome
+
     usage = response.usage.model_dump(exclude_none=True) if response.usage else {}
     usage.setdefault("prompt_tokens", 0)
     usage.setdefault("completion_tokens", 0)
     usage.setdefault("total_tokens", 0)
     agent_result = _flatten_agent_result(response.result)
+    docie_agent: dict[str, Any] = {
+        "agent": spec.name,
+        "kind": spec.kind,
+        "mode": mode,
+        "validation": response.validation.model_dump(),
+        "response_format_style": response.response_format_style,
+    }
+    if routing_audit is not None:
+        docie_agent["routing"] = routing_audit
     return {
         "id": f"chatcmpl-agent-{response.request_id}",
         "object": "chat.completion",
@@ -224,13 +289,7 @@ async def _complete_structured_document(
             }
         ],
         "usage": usage,
-        "docie_agent": {
-            "agent": spec.name,
-            "kind": spec.kind,
-            "mode": mode,
-            "validation": response.validation.model_dump(),
-            "response_format_style": response.response_format_style,
-        },
+        "docie_agent": docie_agent,
     }
 
 
@@ -291,7 +350,37 @@ async def _complete_ocr(
                 status_code=500,
                 error_type="invalid_agent_config",
             )
-        extractor = _resolve_backing(str(extractor_name))
+        extractor_selector = str(extractor_name)
+        # ``policy:<name>``: the extraction step is a SAVED routing policy —
+        # a confidence-gated cascade across model profiles — instead of one
+        # model. Runs through the shared structured path with a prebuilt
+        # router as the executor.
+        if extractor_selector.startswith(_POLICY_PREFIX):
+            policy_name = extractor_selector[len(_POLICY_PREFIX):]
+            schema_name = options.get("schema")
+            if not schema_name:
+                raise AgentError(
+                    f"agent {spec.name!r} uses extractor {extractor_selector!r} but has "
+                    "no options.schema — a routing-policy extractor runs the "
+                    "structured extraction path, which needs an output schema",
+                    status_code=500,
+                    error_type="invalid_agent_config",
+                )
+            router = _build_policy_router(spec, policy_name)
+            return await _complete_structured_document(
+                spec=spec,
+                body=body,
+                schema_name=str(schema_name),
+                ocr_backend_name=str(options.get("backend", "tesseract")),
+                language=options.get("language"),
+                disable_thinking=bool(options.get("no_think")),
+                mode=mode,
+                output_model=extractor_selector,
+                max_tokens=max_tokens,
+                executor=router,
+                policy_name=policy_name,
+            )
+        extractor = _resolve_backing(extractor_selector)
         profiles[extractor.name] = extractor
         kind = "pipeline"
         solution_options: dict[str, Any] = {
@@ -554,6 +643,34 @@ async def _complete_custom(
     completion = await _forward_chat(spec, dict(body), http_client=http_client)
     completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind}
     return completion
+
+
+def _build_policy_router(spec: AgentSpec, policy_name: str) -> ExtractionRouter:
+    """A saved routing policy as this agent's extraction executor.
+
+    Every stage profile is resolved UP FRONT through ``_resolve_backing`` —
+    the same reasoning as api.py's ``resolve_extraction_executor``: the
+    passthrough-kind guard applies to every stage, and a policy whose cold
+    escalation target can't resolve fails at request time, not mid-route on
+    the one document that finally needed it.
+    """
+    try:
+        record = get_routing_policy(policy_name)
+    except RoutingPolicyUnavailableError as exc:
+        raise AgentError(
+            str(exc), status_code=503, error_type="routing_policy_unavailable"
+        ) from exc
+    if record is None:
+        raise AgentError(
+            f"agent {spec.name!r} references unknown routing policy "
+            f"{policy_name!r} — save one via POST /v1/studio/routing-policies "
+            "(or pick it in the Studio)",
+            status_code=400,
+            error_type="invalid_agent_config",
+        )
+    policy = RoutingPolicy.model_validate(record["policy"])
+    profiles = {stage.name: _resolve_backing(stage.name) for stage in policy.stages}
+    return build_extraction_router(policy, profiles)
 
 
 def _resolve_backing(selector: str | None) -> ModelProfile:

@@ -41,6 +41,7 @@ import {
   getStore,
   isLiveDeployment,
   listDynamicSchemas,
+  listRoutingPolicies,
   listSchemas,
   selectableDeployments,
   updateAgent,
@@ -50,6 +51,7 @@ import {
   type AgentTemplate,
   type AgentView,
   type DynamicSchemaSummary,
+  type RoutingPolicySummary,
   type StoreEntry,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
@@ -720,6 +722,13 @@ function CreateView({
       .map((d) => d.spec?.name)
       .filter((n): n is string => !!n && visionSet.has(n));
   }, [deployments.data, store.data]);
+  // Saved routing policies — a policy can BE the OCR→extract step's extractor
+  // (options.extractor = "policy:<name>"), running its confidence-gated
+  // cascade instead of a single model. Shared SWR key with Benchmark/Playground.
+  const routingPolicies = useAsync<RoutingPolicySummary[]>(
+    "routing-policies",
+    listRoutingPolicies,
+  );
   // Built-in and operator-created schemas available for structured output.
   const schemas = useAsync<string[]>("schemas", listSchemas);
   const dynamicSchemas = useAsync<DynamicSchemaSummary[]>(
@@ -1147,19 +1156,28 @@ function CreateView({
                   <Field
                     label="Extractor model"
                     htmlFor="agent-ocr-extractor"
-                    hint="A chat deployment (e.g. NuExtract) that turns the OCR text into JSON."
+                    hint="A chat deployment (e.g. NuExtract) that turns the OCR text into JSON — or a saved routing policy, which escalates across its stage models by confidence (a policy requires an output schema)."
                   >
                     <Select
                       id="agent-ocr-extractor"
                       value={ocrExtractor}
                       onChange={(e) => setOcrExtractor(e.target.value)}
                     >
-                      <option value="">Select a chat model…</option>
-                      {chatDeployments.map((n) => (
-                        <option key={n} value={n}>
-                          {n}
-                        </option>
-                      ))}
+                      <option value="">Select a chat model or policy…</option>
+                      <optgroup label="Chat deployments">
+                        {chatDeployments.map((n) => (
+                          <option key={n} value={n}>
+                            {n}
+                          </option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Routing policies">
+                        {(routingPolicies.data ?? []).map((p) => (
+                          <option key={"policy:" + p.name} value={"policy:" + p.name}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </optgroup>
                     </Select>
                   </Field>
                 )}

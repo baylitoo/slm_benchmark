@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -267,7 +268,10 @@ def live_routing_audit(result: RoutingResult, *, policy_name: str) -> dict[str, 
 
 
 class ExtractionRouter:
-    def __init__(self, *, stages: list[ExtractionStage], policy: RoutingPolicy) -> None:
+    # Sequence, not list: list is invariant, so a caller's concrete
+    # list[ExtractionServiceStage] (routing_config.build_extraction_router)
+    # would not be assignable to list[ExtractionStage].
+    def __init__(self, *, stages: Sequence[ExtractionStage], policy: RoutingPolicy) -> None:
         self.policy = policy
         registered_names = [stage.name for stage in stages]
         if len(registered_names) != len(set(registered_names)):

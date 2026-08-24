@@ -38,6 +38,12 @@ class AgentSpec(BaseModel):
           passthrough LLM profile) and an optional ``schema`` (a name in the
           extraction SCHEMA_REGISTRY) → OCR the image, then the LLM extracts
           structured JSON (grammar-constrained when ``schema`` is set).
+          ``extractor`` also accepts ``policy:<name>``, naming a saved routing
+          policy (POST /v1/studio/routing-policies): the extraction step then
+          runs the policy's confidence-gated cascade across model profiles
+          instead of a single model, the sanitized routing audit rides the
+          completion's ``docie_agent.routing``, and ``schema`` becomes
+          required (the policy runs the structured extraction path).
         - ``mode="vision"`` (vision → structured): ``vision_model`` (a vision
           deployment selector) and ``schema`` → the image goes straight to the
           vision model, which grammar-generates JSON via ``response_format``
