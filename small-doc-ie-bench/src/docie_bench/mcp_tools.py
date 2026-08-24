@@ -1,0 +1,345 @@
+"""MCP servers as tool sources for served chat models.
+
+A chat request to ``POST /v1/chat/completions`` can name registered MCP
+servers (``"mcp_servers": ["calculator"]``); the serving side then runs the
+whole agentic exchange that an OpenAI-tools caller would otherwise have to
+drive by hand:
+
+1. connect to each named server and ``list_tools`` — every MCP tool carries a
+   JSON Schema (``input_schema``) that maps 1:1 onto an OpenAI function
+   schema, so the conversion is mechanical;
+2. advertise those functions to the model through the standard ``tools``
+   field (llama-server renders them via ``--jinja`` — the ``tools`` family
+   capability);
+3. when the model answers with ``tool_calls``, execute each against its MCP
+   server, append the results as ``role: "tool"`` messages, and re-ask;
+4. loop (bounded) until the model produces a plain answer, which is returned
+   as an ordinary chat completion with usage summed across every round.
+
+Security model: only servers named in the registry file
+(``settings.mcp_servers_config``) are reachable — a caller picks servers BY
+NAME and can never supply its own URL or command line through the API. The
+``mcp`` SDK is an optional dependency (``pip install docie-bench[mcp]``);
+without it, requests that ask for MCP tools get a clear 501 instead of an
+ImportError, and everything else is untouched.
+
+Caller-owned tools compose: if the request also carries its own ``tools``,
+both sets are advertised together, and the moment the model calls ANY
+caller-owned tool the completion is returned as-is — executing a function the
+caller (not this process) implements is the caller's job. Only rounds whose
+tool calls are ALL MCP-owned are executed server-side.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from docie_bench.settings import get_settings
+
+if TYPE_CHECKING:
+    from mcp.client.session import ClientSession
+
+logger = logging.getLogger(__name__)
+
+# Qualifier between server and tool name in the advertised function name
+# ("calculator__add"): two servers exporting the same tool name stay
+# distinguishable, and a returned tool_call routes back to the right server
+# without any extra bookkeeping in the completion itself.
+TOOL_SEPARATOR = "__"
+
+_TRANSPORTS = ("streamable-http", "stdio")
+
+
+class MCPConfigError(ValueError):
+    """The MCP server registry file is missing, malformed, or names an
+    unknown transport."""
+
+
+class MCPUnavailableError(RuntimeError):
+    """The optional ``mcp`` SDK is not installed in this environment."""
+
+
+@dataclass(frozen=True)
+class MCPServerSpec:
+    """One registry entry: how to reach a named MCP server.
+
+    ``streamable-http`` talks to a remote server at ``url`` (optionally with
+    auth ``headers``); ``stdio`` spawns ``command`` locally and speaks over
+    its pipes. Both come exclusively from the operator-owned registry file —
+    never from request bodies.
+    """
+
+    name: str
+    transport: str
+    url: str | None = None
+    headers: Mapping[str, str] = field(default_factory=dict)
+    command: tuple[str, ...] = ()
+    env: Mapping[str, str] = field(default_factory=dict)
+
+
+def _require_mcp() -> None:
+    try:
+        import mcp  # noqa: F401 - availability probe only
+    except ImportError as exc:
+        raise MCPUnavailableError(
+            "MCP tool support needs the optional 'mcp' package — "
+            "install with: pip install 'docie-bench[mcp]'"
+        ) from exc
+
+
+def load_mcp_registry(path: Path | None = None) -> dict[str, MCPServerSpec]:
+    """Parse the registry file into named server specs.
+
+    A missing file is an EMPTY registry, not an error — MCP support is
+    opt-in, and the useful failure ("server 'x' is not registered") happens
+    at request time with the names the caller actually asked for.
+    """
+    config_path = path if path is not None else get_settings().mcp_servers_config
+    if not config_path.exists():
+        return {}
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise MCPConfigError(f"{config_path} is not valid JSON: {exc}") from exc
+    servers = raw.get("servers") if isinstance(raw, dict) else None
+    if not isinstance(servers, dict):
+        raise MCPConfigError(f"{config_path} must be an object with a 'servers' object")
+    registry: dict[str, MCPServerSpec] = {}
+    for name, entry in servers.items():
+        if not isinstance(entry, dict):
+            raise MCPConfigError(f"server {name!r}: entry must be an object")
+        transport = entry.get("transport")
+        if transport not in _TRANSPORTS:
+            raise MCPConfigError(
+                f"server {name!r}: 'transport' must be one of {', '.join(_TRANSPORTS)}"
+            )
+        url = entry.get("url")
+        command = entry.get("command")
+        if transport == "streamable-http" and not (isinstance(url, str) and url):
+            raise MCPConfigError(f"server {name!r}: streamable-http needs a 'url'")
+        if transport == "stdio" and not (isinstance(command, list) and command):
+            raise MCPConfigError(f"server {name!r}: stdio needs a non-empty 'command' list")
+        registry[str(name)] = MCPServerSpec(
+            name=str(name),
+            transport=str(transport),
+            url=str(url) if isinstance(url, str) else None,
+            headers=dict(entry.get("headers") or {}),
+            command=tuple(str(part) for part in (command or [])),
+            env=dict(entry.get("env") or {}),
+        )
+    return registry
+
+
+async def open_mcp_sessions(
+    stack: AsyncExitStack, specs: list[MCPServerSpec]
+) -> dict[str, ClientSession]:
+    """Connect + initialize a ClientSession per spec, all owned by ``stack``.
+
+    Sessions live for one chat request: connection setup rides the request's
+    latency budget, and there is no pooled-session lifecycle to invalidate
+    when an operator edits the registry file.
+    """
+    _require_mcp()
+    from mcp.client.session import ClientSession
+
+    settings = get_settings()
+    sessions: dict[str, ClientSession] = {}
+    for spec in specs:
+        if spec.transport == "streamable-http":
+            from mcp.client.streamable_http import (  # type: ignore[attr-defined]
+                create_mcp_http_client,
+                streamable_http_client,
+            )
+
+            http_client = (
+                create_mcp_http_client(headers=dict(spec.headers)) if spec.headers else None
+            )
+            read, write = await stack.enter_async_context(
+                streamable_http_client(str(spec.url), http_client=http_client)
+            )
+        else:
+            from mcp.client.stdio import StdioServerParameters, stdio_client
+
+            params = StdioServerParameters(
+                command=spec.command[0],
+                args=list(spec.command[1:]),
+                env=dict(spec.env) or None,
+            )
+            read, write = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(
+            ClientSession(
+                read,
+                write,
+                read_timeout_seconds=settings.mcp_tool_timeout_seconds,
+            )
+        )
+        await session.initialize()
+        sessions[spec.name] = session
+    return sessions
+
+
+async def collect_openai_tools(
+    sessions: Mapping[str, ClientSession],
+) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]]]:
+    """``list_tools`` every session and convert to OpenAI function schemas.
+
+    Returns the advertisable ``tools`` array plus the routing map
+    ``qualified name -> (server, tool)`` the executor needs to send a
+    returned tool_call back to the right server.
+    """
+    tools: list[dict[str, Any]] = []
+    mapping: dict[str, tuple[str, str]] = {}
+    for server_name, session in sessions.items():
+        listed = await session.list_tools()
+        for tool in listed.tools:
+            qualified = f"{server_name}{TOOL_SEPARATOR}{tool.name}"
+            mapping[qualified] = (server_name, tool.name)
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": qualified,
+                        "description": tool.description or "",
+                        # MCP input_schema IS JSON Schema — the exact contract
+                        # OpenAI 'parameters' expects. Passed through verbatim.
+                        "parameters": tool.input_schema
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+    return tools, mapping
+
+
+async def execute_tool_call(
+    sessions: Mapping[str, ClientSession],
+    mapping: Mapping[str, tuple[str, str]],
+    qualified_name: str,
+    arguments: Any,
+) -> str:
+    """Run one model-emitted tool call against its MCP server.
+
+    Always returns TEXT for the ``role: "tool"`` message — including on
+    failure. A tool error is information the model should reason about
+    ("error: ...") on the next round, not an exception that kills the chat
+    request after the upstream already burned tokens on it.
+    """
+    server_name, tool_name = mapping[qualified_name]
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments) if arguments.strip() else {}
+        except ValueError:
+            return f"error: tool arguments were not valid JSON: {arguments[:200]}"
+    else:
+        parsed = dict(arguments or {})
+    if not isinstance(parsed, dict):
+        return f"error: tool arguments must be a JSON object, got: {str(parsed)[:200]}"
+    try:
+        result = await sessions[server_name].call_tool(tool_name, parsed)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the model as text, never raised
+        logger.warning("MCP tool %s failed: %s", qualified_name, exc)
+        return f"error: MCP tool call failed: {exc}"
+    parts: list[str] = []
+    for content in result.content:
+        text = getattr(content, "text", None)
+        if text is not None:
+            parts.append(str(text))
+        else:
+            parts.append(json.dumps(content.model_dump(exclude_none=True), ensure_ascii=False))
+    text_out = "\n".join(parts)
+    if result.is_error:
+        return f"error: {text_out or 'tool reported an error with no message'}"
+    return text_out
+
+
+def _accumulate_usage(totals: dict[str, int], usage: Any) -> None:
+    if not isinstance(usage, dict):
+        return
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            totals[key] += value
+
+
+async def run_tool_loop(
+    post: Callable[[dict[str, Any]], Awaitable[Any]],
+    body: Mapping[str, Any],
+    sessions: Mapping[str, ClientSession],
+    mapping: Mapping[str, tuple[str, str]],
+    mcp_tools: list[dict[str, Any]],
+    max_iterations: int | None = None,
+) -> Any:
+    """Drive the model↔tools exchange until a plain answer (or the bound).
+
+    ``post`` is the caller's "one upstream completion" function; anything it
+    returns that is not a dict (an error response) passes straight through.
+    Returns the final completion dict with ``usage`` summed across rounds,
+    the error object from ``post``, or ``None`` when ``max_iterations``
+    rounds all ended in tool calls — the route maps that to an explicit 502
+    rather than silently returning a half-finished exchange.
+    """
+    limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
+    forward = dict(body)
+    messages = [dict(m) if isinstance(m, dict) else m for m in (forward.get("messages") or [])]
+    caller_tools = list(forward.get("tools") or [])
+    caller_tool_names = {
+        str(t.get("function", {}).get("name"))
+        for t in caller_tools
+        if isinstance(t, dict) and isinstance(t.get("function"), dict)
+    }
+    forward["tools"] = caller_tools + mcp_tools
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for _ in range(limit):
+        forward["messages"] = messages
+        completion = await post(forward)
+        if not isinstance(completion, dict):
+            return completion
+        _accumulate_usage(totals, completion.get("usage"))
+        choices = completion.get("choices")
+        message = (
+            choices[0].get("message")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else None
+        )
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        names = [
+            str(call.get("function", {}).get("name", ""))
+            for call in (calls or [])
+            if isinstance(call, dict)
+        ]
+        all_mcp = bool(names) and all(name in mapping for name in names)
+        if not all_mcp:
+            # Plain answer, or at least one caller-owned/unknown tool call:
+            # this completion belongs to the caller. Unknown names ride the
+            # same path deliberately — hallucinated tool names are the
+            # caller's signal, not something to swallow server-side. But a
+            # hallucinated name is only "caller-owned" fiction if the caller
+            # advertised tools at all; log the anomaly either way.
+            for name in names:
+                if name and name not in mapping and name not in caller_tool_names:
+                    logger.warning("model called unknown tool %r — returning to caller", name)
+            if any(totals.values()):
+                completion = {**completion, "usage": dict(totals)}
+            return completion
+        assert message is not None  # all_mcp implies a message with tool_calls
+        messages.append(message)
+        for call in calls or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            result_text = await execute_tool_call(
+                sessions, mapping, str(function.get("name")), function.get("arguments")
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "content": result_text,
+                }
+            )
+    return None

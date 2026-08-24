@@ -52,7 +52,14 @@ encoders = [
   # 6.0. Co-resolves with gliner (transformers>=5.0,<5.14) — verified.
   "sentence-transformers>=6.0"
 ]
+mcp = [
+  # MCP tool sources for served chat models (src/docie_bench/mcp_tools.py).
+  # v2 layout required: mcp.client.session / mcp.client.streamable_http /
+  # mcp.shared.memory — v1.x (FastMCP-era) does not fit.
+  "mcp>=2.0.0"
+]
 dev = [
+  "mcp>=2.0.0",
   "pytest>=8.3.2",
   "pytest-asyncio>=0.23.8",
   "pytest-timeout>=2.3.1",

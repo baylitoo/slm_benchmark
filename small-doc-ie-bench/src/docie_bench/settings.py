@@ -101,6 +101,19 @@ class Settings(BaseSettings):
     ocr_language: str | None = None
     runs_dir: Path = Path("runs")
 
+    # MCP tool sources for served chat models (docie_bench.mcp_tools): the
+    # operator-owned registry of reachable MCP servers. Callers of
+    # /v1/chat/completions pick servers from this file BY NAME via the
+    # request's "mcp_servers" field — a request can never supply its own URL
+    # or command line. A missing file simply means "no servers registered".
+    mcp_servers_config: Path = Path("configs/mcp-servers.json")
+    # Upper bound on model<->tool rounds per chat request: a model stuck
+    # re-calling tools forever must terminate deterministically (502) instead
+    # of burning upstream tokens unbounded.
+    mcp_max_tool_iterations: int = Field(default=8, ge=1, le=64)
+    # Per-response read timeout for MCP client sessions (list_tools/call_tool).
+    mcp_tool_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+
     # Durable, addressable artifact store for Studio benchmark runs. Must resolve
     # to the SAME location on every replica that reads it (a shared volume or an
     # S3/MinIO mount) — the worker writes here and the api/web replicas read back

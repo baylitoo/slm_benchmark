@@ -199,6 +199,16 @@ async def chat_completions(request: Request) -> Any:
         )
 
     wants_stream = bool(body.get("stream"))
+    mcp_server_names = body.get("mcp_servers")
+    if mcp_server_names is not None and (
+        not isinstance(mcp_server_names, list)
+        or not all(isinstance(name, str) and name for name in mcp_server_names)
+    ):
+        return _openai_error(
+            "'mcp_servers' must be a list of registered MCP server names",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
     forward = dict(body)
     forward["model"] = profile.model
     url = f"{profile.base_url}/chat/completions"
@@ -208,15 +218,58 @@ async def chat_completions(request: Request) -> Any:
     }
     client: httpx.AsyncClient = _client()
 
+    if mcp_server_names:
+        # The serving side drives the whole model<->tools exchange, so the
+        # response the caller gets is the FINAL answer — a token stream of
+        # intermediate tool_calls rounds has no meaningful SSE shape here.
+        if wants_stream:
+            return _openai_error(
+                "'mcp_servers' does not support 'stream': the server runs the "
+                "tool exchange and returns the final completion",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
+        return await _chat_with_mcp_tools(
+            client, url, headers, forward, profile, [str(n) for n in mcp_server_names]
+        )
+
     if wants_stream:
         return await _stream_chat_completions(
             client, url, headers, forward, profile.timeout_seconds, profile.name
         )
 
-    forward.pop("stream", None)
+    completion = await _post_upstream(client, url, headers, forward, profile)
+    if isinstance(completion, JSONResponse):
+        return completion
+    # PR-4 recency: this surface serves traffic too — stamp last_served like
+    # api.py's extract path, or a deployment driven only through chat reads
+    # as idle forever and becomes the first idle-TTL/LRU eviction victim.
+    recency.stamp_served_profile(profile.name)
+    # Repair model-emitted UTF-8 mojibake in the answer (accented OCR/description
+    # on small vision models — the Playground Vision path lands here).
+    if get_settings().fix_mojibake:
+        completion = fix_completion_content(completion)
+    return completion
+
+
+async def _post_upstream(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forward: dict[str, Any],
+    profile: ModelProfile,
+) -> dict[str, Any] | JSONResponse:
+    """One non-streaming upstream completion, errors mapped to OpenAI shape.
+
+    Shared by the plain chat path and every round of the MCP tool loop —
+    same forwarding, same error taxonomy, regardless of which path posts.
+    """
+    body = dict(forward)
+    body.pop("stream", None)
+    body.pop("mcp_servers", None)
     try:
         upstream = await client.post(
-            url, json=forward, headers=headers, timeout=profile.timeout_seconds
+            url, json=body, headers=headers, timeout=profile.timeout_seconds
         )
     except httpx.RequestError as exc:
         return _openai_error(
@@ -238,15 +291,116 @@ async def chat_completions(request: Request) -> Any:
             status_code=502,
             error_type="upstream_error",
         )
-    # PR-4 recency: this surface serves traffic too — stamp last_served like
-    # api.py's extract path, or a deployment driven only through chat reads
-    # as idle forever and becomes the first idle-TTL/LRU eviction victim.
+    if not isinstance(completion, dict):
+        return _openai_error(
+            "upstream returned a non-object completion",
+            status_code=502,
+            error_type="upstream_error",
+        )
+    return completion
+
+
+async def _chat_with_mcp_tools(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forward: dict[str, Any],
+    profile: ModelProfile,
+    server_names: list[str],
+) -> Any:
+    """Serve one chat request with MCP tools: connect, advertise, loop.
+
+    Registry-only security: every requested name must exist in
+    ``settings.mcp_servers_config`` — the request can never point the server
+    at an arbitrary URL or command. The ``mcp`` SDK being absent is a clean
+    501 (the extra is optional), not an ImportError.
+    """
+    from contextlib import AsyncExitStack
+
+    from docie_bench import mcp_tools as mcp_mod
+
+    try:
+        registry = mcp_mod.load_mcp_registry()
+    except mcp_mod.MCPConfigError as exc:
+        return _openai_error(str(exc), status_code=500, error_type="mcp_config_error")
+    unknown = [name for name in server_names if name not in registry]
+    if unknown:
+        return _openai_error(
+            f"unregistered MCP server(s): {', '.join(unknown)} — register them in "
+            f"{get_settings().mcp_servers_config} (see GET /v1/mcp/servers)",
+            status_code=400,
+            error_type="mcp_server_not_registered",
+        )
+    try:
+        mcp_mod._require_mcp()
+    except mcp_mod.MCPUnavailableError as exc:
+        return _openai_error(str(exc), status_code=501, error_type="mcp_unavailable")
+    specs = [registry[name] for name in server_names]
+
+    async def post(body: dict[str, Any]) -> dict[str, Any] | JSONResponse:
+        return await _post_upstream(client, url, headers, body, profile)
+
+    try:
+        async with AsyncExitStack() as stack:
+            try:
+                sessions = await mcp_mod.open_mcp_sessions(stack, specs)
+                tools, mapping = await mcp_mod.collect_openai_tools(sessions)
+            except Exception as exc:  # noqa: BLE001 - connect/handshake failure is a gateway error
+                return _openai_error(
+                    f"could not connect to MCP server(s): {exc}",
+                    status_code=502,
+                    error_type="mcp_server_unreachable",
+                )
+            completion = await mcp_mod.run_tool_loop(post, forward, sessions, mapping, tools)
+    except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
+        return _openai_error(
+            f"MCP session error: {exc}",
+            status_code=502,
+            error_type="mcp_server_unreachable",
+        )
+    if completion is None:
+        return _openai_error(
+            f"model kept calling tools for {get_settings().mcp_max_tool_iterations} "
+            "rounds without a final answer — raise mcp_max_tool_iterations or "
+            "simplify the request",
+            status_code=502,
+            error_type="mcp_tool_loop_exhausted",
+        )
+    if isinstance(completion, JSONResponse):
+        return completion
     recency.stamp_served_profile(profile.name)
-    # Repair model-emitted UTF-8 mojibake in the answer (accented OCR/description
-    # on small vision models — the Playground Vision path lands here).
     if get_settings().fix_mojibake:
         completion = fix_completion_content(completion)
     return completion
+
+
+@router.get("/v1/mcp/servers")
+async def list_mcp_servers() -> Any:
+    """The registered MCP servers a chat request may name in ``mcp_servers``.
+
+    Secrets never leave: header/env VALUES are redacted to their key names —
+    this endpoint exists so a caller (or the Studio) can discover what to
+    put in ``mcp_servers``, not to export operator credentials.
+    """
+    from docie_bench import mcp_tools as mcp_mod
+
+    try:
+        registry = mcp_mod.load_mcp_registry()
+    except mcp_mod.MCPConfigError as exc:
+        return _openai_error(str(exc), status_code=500, error_type="mcp_config_error")
+    return {
+        "servers": [
+            {
+                "name": spec.name,
+                "transport": spec.transport,
+                "url": spec.url,
+                "command": list(spec.command) or None,
+                "headers": sorted(spec.headers) or None,
+                "env": sorted(spec.env) or None,
+            }
+            for spec in registry.values()
+        ]
+    }
 
 
 async def _stream_chat_completions(
