@@ -25,6 +25,7 @@ import {
   PlusCircle,
   ClipboardCheck,
   Download,
+  FileStack,
   type LucideIcon,
 } from "lucide-react";
 
@@ -78,6 +79,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: "benchmark", label: "Run", icon: Play, view: "run" },
       { id: "benchmark", label: "Results", icon: History, view: "results" },
+      { id: "benchmark", label: "Batch", icon: FileStack, view: "batch" },
     ],
   },
   {

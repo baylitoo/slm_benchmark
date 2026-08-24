@@ -26,6 +26,7 @@
 //                            comparisons.
 //   - schemas.ts          -- static schema listing + named dynamic-schema
 //                            and routing-policy registries.
+//   - batch.ts            -- batch extraction (N docs, one durable job).
 //   - seeding.ts          -- Ollama/HF seeding, HF Hub search/inspect,
 //                            catalog browser.
 //   - review.ts           -- human review queue workflow.
@@ -50,6 +51,7 @@ export * from "./modelProfiles";
 export * from "./benchmark";
 export * from "./schemas";
 export * from "./seeding";
+export * from "./batch";
 export * from "./review";
 export * from "./agents";
 export * from "./helpers";

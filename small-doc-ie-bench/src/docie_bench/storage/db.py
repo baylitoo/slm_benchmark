@@ -339,6 +339,12 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.seed_store import ensure_seed_run_table
 
     ensure_seed_run_table(_engine)
+    # Same race again: batch_runs + batch_items are new (durable per-document
+    # state for batch extraction). create_all above already ordered the child
+    # FK after its parent; this is the idempotent race-safe belt-and-braces.
+    from docie_bench.studio.batch_store import ensure_batch_tables
+
+    ensure_batch_tables(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:

@@ -53,6 +53,11 @@ EXPECTED_STUDIO_ROUTES = {
     ("POST", "/v1/studio/comparisons"),
     ("GET", "/v1/studio/artifacts/{artifact_id}"),
     ("GET", "/v1/studio/seeds"),
+    # Batch extraction (N documents, one durable job, per-document state).
+    ("POST", "/v1/studio/extract/batch"),
+    ("GET", "/v1/studio/batches"),
+    ("GET", "/v1/studio/batches/{event_id}"),
+    ("GET", "/v1/studio/batches/{event_id}/results.{fmt}"),
 }
 
 
@@ -65,4 +70,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 30
+    assert len(EXPECTED_STUDIO_ROUTES) == 34

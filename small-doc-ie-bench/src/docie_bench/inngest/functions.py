@@ -15,6 +15,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -688,6 +689,247 @@ async def _run_benchmark_job(data: dict[str, Any], *, event_id: str) -> dict[str
         blob = store.blobs.put(name=name, content=source.read_bytes(), media_type=media_type)
         stored.append((name, blob))
     return store.complete(event_id=event_id, metrics=metrics, artifacts=stored)
+
+
+# ---------------------------------------------------------------------------
+# Batch extraction: N documents, one durable job, per-document steps.
+# ---------------------------------------------------------------------------
+
+_BATCH_RESULT_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("results.jsonl", "application/x-ndjson"),
+    ("results.csv", "text/csv"),
+)
+
+_BATCH_PER_DOC_KEYS = (
+    "schema_name",
+    "dynamic_schema_name",
+    "deployment",
+    "model_profile",
+    "ocr_backend",
+    "language",
+    "tenant_id",
+)
+
+
+async def _batch_extract_one(
+    data: dict[str, Any], item: dict[str, Any], position: int
+) -> dict[str, Any]:
+    """Extract ONE batch document; never raises. Returns the per-item outcome
+    dict that is both memoized by the step AND persisted via record_batch_item
+    -- a bad PDF records ``failed`` with its error and the batch continues.
+    Reuses ``_run_extraction`` per document so model resolution, dynamic
+    schemas, observability and recency are inherited, not duplicated.
+
+    Async because step bodies run ON the worker's event loop here (see
+    ``extract_document``: ``step.run("extract", lambda: _run_extraction(data))``
+    hands Inngest a coroutine) -- an ``asyncio.run`` inside a step would
+    raise "cannot be called from a running event loop"."""
+    from docie_bench.studio.batch_store import record_batch_item
+    from docie_bench.studio.store import default_blob_store
+
+    event_id = str(data["event_id"])
+    started = time.perf_counter()
+    try:
+        content = default_blob_store().read(str(item["relkey"]))
+        per_doc = {k: v for k, v in data.items() if k in _BATCH_PER_DOC_KEYS}
+        per_doc["content_b64"] = base64.b64encode(content).decode("ascii")
+        per_doc["filename"] = item["filename"]
+        response = await _run_extraction(per_doc)
+        latency = int((time.perf_counter() - started) * 1000)
+        record_batch_item(
+            event_id=event_id,
+            position=position,
+            status="done",
+            result=response,
+            latency_ms=latency,
+        )
+        return {
+            "position": position,
+            "filename": item["filename"],
+            "status": "done",
+            "result": response,
+            "latency_ms": latency,
+        }
+    except Exception as exc:  # noqa: BLE001 - one bad document must not kill the batch
+        latency = int((time.perf_counter() - started) * 1000)
+        error = f"{type(exc).__name__}: {exc}"
+        record_batch_item(
+            event_id=event_id,
+            position=position,
+            status="failed",
+            error=error,
+            latency_ms=latency,
+        )
+        return {
+            "position": position,
+            "filename": item["filename"],
+            "status": "failed",
+            "error": error,
+            "latency_ms": latency,
+        }
+
+
+def _flatten_batch_row(outcome: dict[str, Any], columns: list[str]) -> dict[str, Any]:
+    """One CSV row for one document. Top-level extraction fields flatten to
+    ``field.value`` / ``field.amount``+``field.currency`` (the wrapper
+    shape); nested/list fields become JSON text. Practical for a spreadsheet;
+    lossless only in the JSONL. Appends any new column names to ``columns``."""
+    base_cols = ("position", "filename", "status", "error", "latency_ms")
+    row: dict[str, Any] = {c: outcome.get(c) for c in base_cols}
+    result = outcome.get("result") or {}
+    row["model_profile"] = result.get("model_profile")
+    for field, node in (result.get("result") or {}).items():
+        keys: tuple[str, ...]
+        if isinstance(node, dict) and "amount" in node:
+            row[f"{field}.amount"] = node.get("amount")
+            row[f"{field}.currency"] = node.get("currency")
+            keys = (f"{field}.amount", f"{field}.currency")
+        elif isinstance(node, dict) and "value" in node:
+            row[f"{field}.value"] = node.get("value")
+            keys = (f"{field}.value",)
+        else:
+            row[field] = json.dumps(node, ensure_ascii=False) if node is not None else None
+            keys = (field,)
+        for k in keys:
+            if k not in columns:
+                columns.append(k)
+    return row
+
+
+def _batch_write_results(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Materialize every item's outcome as JSONL + CSV into the shared blob
+    store; returns the artifact refs the batch row records."""
+    import csv
+    import io
+
+    from docie_bench.studio.store import default_blob_store
+
+    jsonl = "".join(json.dumps(o, ensure_ascii=False, sort_keys=True) + "\n" for o in outcomes)
+    columns: list[str] = ["position", "filename", "status", "error", "latency_ms", "model_profile"]
+    flat_rows = [_flatten_batch_row(o, columns) for o in outcomes]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(flat_rows)
+
+    blobs = default_blob_store()
+    stored: list[dict[str, Any]] = []
+    payloads = (jsonl.encode("utf-8"), buf.getvalue().encode("utf-8"))
+    for (name, media_type), content in zip(_BATCH_RESULT_ARTIFACTS, payloads, strict=True):
+        blob = blobs.put(name=name, content=content, media_type=media_type)
+        stored.append(
+            {
+                "name": name,
+                "relkey": blob.relkey,
+                "media_type": media_type,
+                "size_bytes": blob.size_bytes,
+                "sha256": blob.sha256,
+            }
+        )
+    return stored
+
+
+@inngest_client.create_function(
+    fn_id="batch-extract",
+    trigger=inngest.TriggerEvent(event="doc/batch.requested"),
+)
+async def batch_extract_job(ctx: inngest.Context) -> dict[str, Any]:
+    """Extract N documents as one durable job with per-document steps.
+
+    Event ``data``: ``inputs`` (``[{filename, relkey, size_bytes}]`` -- blob
+    keys, never bytes; the trigger route stashed the documents in the shared
+    ArtifactBlobStore), plus the same schema/model selectors as a single
+    extraction, applied to every document, and ``channel``/``tenant_id``/
+    ``name``.
+
+    Durability: the run row + one PENDING item per document are claimed
+    BEFORE any work (redelivery of a completed batch is a no-op; a retry of
+    a running one keeps the item progress it already made). Each document is
+    its own memoized step -- a crash on document 150 resumes at 150. A
+    document's failure is caught INSIDE its step (``_batch_extract_one``
+    never raises): it records ``failed`` and the batch continues, so the
+    run's terminal status is ``completed`` with ``failed_items > 0``, not a
+    dead job. Only a whole-run error (claim failed, deployment never came
+    up) marks the run ``failed``.
+    """
+    from docie_bench.studio.batch_store import (
+        BatchStoreUnavailableError,
+        claim_batch_run,
+        settle_batch_run,
+    )
+
+    data = dict(ctx.event.data or {})
+    event_id = str(ctx.event.id)
+    data["event_id"] = event_id
+    channel = str(data.get("channel") or f"batch:{event_id}")
+    raw_inputs = data.get("inputs")
+    inputs: list[dict[str, Any]] = [
+        dict(i) for i in (raw_inputs if isinstance(raw_inputs, list) else []) if isinstance(i, dict)
+    ]
+    selector = data.get("deployment") or data.get("model_profile")
+
+    await publish(channel, TOPIC_STATUS, {"state": "started", "total": len(inputs)})
+    try:
+        async def _claim() -> tuple[str, dict[str, Any]]:
+            return claim_batch_run(
+                event_id=event_id,
+                channel=channel,
+                tenant_id=str(data.get("tenant_id") or "anonymous"),
+                name=str(data.get("name") or f"batch of {len(inputs)}"),
+                schema_name=str(data.get("schema_name") or "invoice"),
+                model_selector=str(selector) if selector else None,
+                filenames=[str(i["filename"]) for i in inputs],
+            )
+
+        outcome, record = await ctx.step.run("claim", _claim)
+        if outcome == "exists":
+            await publish(channel, TOPIC_RESULT, record)
+            return record
+        # Bring the (single) target deployment up ONCE for the whole batch,
+        # not per document -- same cold-start orchestration as one extraction.
+        await _ensure_deployment_live(ctx.step, data, channel)
+
+        outcomes: list[dict[str, Any]] = []
+        for position, item in enumerate(inputs):
+
+            async def _one(
+                item: dict[str, Any] = item, position: int = position
+            ) -> dict[str, Any]:
+                return await _batch_extract_one(data, item, position)
+
+            one = await ctx.step.run(f"doc-{position}", _one)
+            outcomes.append(one)
+            done = sum(1 for o in outcomes if o["status"] == "done")
+            await publish(
+                channel,
+                TOPIC_PROGRESS,
+                {
+                    "total": len(inputs),
+                    "done": done,
+                    "failed": len(outcomes) - done,
+                    "current": item["filename"],
+                    "percent": round(100 * len(outcomes) / max(len(inputs), 1), 1),
+                },
+            )
+
+        async def _write() -> list[dict[str, Any]]:
+            return _batch_write_results(outcomes)
+
+        artifacts = await ctx.step.run("write-results", _write)
+
+        async def _settle() -> dict[str, Any] | None:
+            return settle_batch_run(event_id=event_id, status="completed", artifacts=artifacts)
+
+        result = await ctx.step.run("settle", _settle)
+    except BatchStoreUnavailableError as exc:
+        await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+        raise
+    except Exception as exc:  # noqa: BLE001 - whole-run failure: record it, surface it, re-raise
+        settle_batch_run(event_id=event_id, status="failed", error=str(exc))
+        await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result or {}
 
 
 @inngest_client.create_function(
