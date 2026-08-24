@@ -430,3 +430,110 @@ def test_chat_forwards_tool_role_messages(api) -> None:
     )
     assert resp.status_code == 200, resp.text
     assert json.loads(captured[-1].content)["messages"] == messages
+
+
+def test_chat_mcp_with_stream_is_400(api) -> None:
+    # The server drives the tool exchange, so only the FINAL completion has a
+    # meaningful shape -- streaming intermediate rounds is refused up front.
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 400
+    assert "stream" in resp.json()["error"]["message"]
+
+
+def test_chat_mcp_field_must_be_a_string_list(api) -> None:
+    client, _ = api
+    for bad in ("calc", [1, 2], [""], {"name": "calc"}):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lfm2.5-350m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "mcp_servers": bad,
+            },
+        )
+        assert resp.status_code == 400, bad
+
+
+def test_chat_mcp_unregistered_server_is_400(api, monkeypatch) -> None:
+    # Registry-only security: a request picks servers BY NAME from the
+    # operator's config -- it can never introduce its own server.
+    from docie_bench import mcp_tools
+
+    monkeypatch.setattr(mcp_tools, "load_mcp_registry", lambda path=None: {})
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["calc"],
+        },
+    )
+    assert resp.status_code == 400
+    assert "unregistered MCP server" in resp.json()["error"]["message"]
+
+
+def test_chat_mcp_sdk_missing_is_501(api, monkeypatch) -> None:
+    # The mcp package is an optional extra: absent SDK answers a clear 501
+    # with the install command, never an ImportError 500.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec, MCPUnavailableError
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+
+    def raiser() -> None:
+        raise MCPUnavailableError("MCP tool support needs the optional 'mcp' package")
+
+    monkeypatch.setattr(mcp_tools, "_require_mcp", raiser)
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["calc"],
+        },
+    )
+    assert resp.status_code == 501
+    assert "'mcp' package" in resp.json()["error"]["message"]
+
+
+def test_mcp_servers_listing_redacts_secret_values(api, monkeypatch) -> None:
+    # Discovery endpoint: names + transports out, header/env VALUES never.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "docs": MCPServerSpec(
+                name="docs",
+                transport="streamable-http",
+                url="http://mcp.internal/mcp",
+                headers={"Authorization": "Bearer topsecret"},
+            )
+        },
+    )
+    client, _ = api
+    resp = client.get("/v1/mcp/servers")
+    assert resp.status_code == 200
+    (entry,) = resp.json()["servers"]
+    assert entry["name"] == "docs"
+    assert entry["headers"] == ["Authorization"]
+    assert "topsecret" not in resp.text

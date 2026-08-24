@@ -1,0 +1,15 @@
+{
+  "//": "MCP server registry for served chat models. Copy to configs/mcp-servers.json (or point settings.mcp_servers_config elsewhere). Callers reference servers BY NAME via the chat request's 'mcp_servers' field; only servers listed here are reachable. Transports: 'streamable-http' (remote server at 'url', optional auth 'headers') or 'stdio' (spawn 'command' locally, optional 'env'). Requires the optional dependency: pip install 'docie-bench[mcp]'.",
+  "servers": {
+    "docs-search": {
+      "transport": "streamable-http",
+      "url": "http://mcp-docs.internal:8080/mcp",
+      "headers": { "Authorization": "Bearer replace-me" }
+    },
+    "filesystem": {
+      "transport": "stdio",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data/shared"],
+      "env": {}
+    }
+  }
+}
