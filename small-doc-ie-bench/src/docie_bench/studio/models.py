@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -283,9 +284,61 @@ class BatchItem(Base):
     run: Mapped[BatchRun] = relationship(back_populates="items")
 
 
+class BatchSchedule(Base):
+    """A saved, recurring batch-extraction config: re-run the documents of a
+    previously-run batch on an interval.
+
+    The input source is a SOURCE BATCH's durably stored documents
+    (``BatchItem.input_relkey`` in the shared blob store), not a re-upload --
+    the same re-materialization seam ``retry-failed`` uses. Each firing is a
+    normal ``doc/batch.requested`` event, so a scheduled run is an ordinary
+    ``BatchRun`` with per-item state, results, retry-failed, the works.
+
+    ``next_run_at`` is the whole scheduling mechanism: a once-a-minute cron
+    (``functions.batch_schedule_tick_job``) scans for ``enabled`` rows with
+    ``next_run_at <= now``, fires the batch event, and advances ``next_run_at``
+    by the interval. ``last_error`` records a tick that could NOT fire (source
+    batch deleted, input blobs swept) -- the tick still advances ``next_run_at``
+    so a broken schedule surfaces its error once per interval instead of
+    hot-looping every minute.
+    """
+
+    __tablename__ = "batch_schedules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    name: Mapped[str] = mapped_column(String(200))
+    # The batch whose stored input documents every firing re-runs.
+    source_event_id: Mapped[str] = mapped_column(String(128), index=True)
+    schema_name: Mapped[str] = mapped_column(String(64))
+    # Selectors each firing carries (deployment / model_profile / routing_policy
+    # / ocr_backend / language / dynamic_schema_name) -- same shape as
+    # ``BatchRun.selectors_json``, defaulted from the source batch at create.
+    selectors_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # "hourly" | "daily" | "weekly" | "every_n_minutes" (with the minute count
+    # in ``every_n_minutes``, floor-limited -- see schedule_store.interval_delta).
+    interval: Mapped[str] = mapped_column(String(32))
+    every_n_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    next_run_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_run_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # The batch event the last firing produced -- the join key to its BatchRun.
+    last_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 __all__ = [
     "BatchItem",
     "BatchRun",
+    "BatchSchedule",
     "DynamicSchema",
     "RoutingPolicyRecord",
     "SeedRun",

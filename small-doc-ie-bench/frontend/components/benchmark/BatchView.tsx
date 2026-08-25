@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import { AlertCircle, Download, FileStack, RotateCcw, Upload } from "lucide-react";
+import { AlertCircle, CalendarClock, Download, FileStack, RotateCcw, Upload } from "lucide-react";
 import {
   ApiError,
   ApiUnavailable,
@@ -29,6 +29,7 @@ import { PageHeader } from "../patterns/PageHeader";
 import { ResultLine } from "../patterns/ResultLine";
 import { Table, type Column } from "../patterns/Table";
 import { JsonView } from "../JsonView";
+import { BatchSchedules } from "./BatchSchedules";
 
 // ---------------------------------------------------------------------------
 // Batch view — "extract from MY invoices": N documents through one schema +
@@ -161,6 +162,9 @@ export function BatchView({ active = true }: { active?: boolean }) {
     listRoutingPolicies,
   );
   const [expanded, setExpanded] = useState<string | null>(null);
+  // A settled batch picked for "Schedule re-run…" — handed to the Schedules
+  // section below, which opens its create form prefilled from it.
+  const [scheduleSource, setScheduleSource] = useState<BatchRunSummary | null>(null);
 
   // -- submit form ---------------------------------------------------------
   const [name, setName] = useState("");
@@ -297,6 +301,16 @@ export function BatchView({ active = true }: { active?: boolean }) {
       className: "text-right",
       render: (r) => (
         <div className="flex justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+          {r.status !== "running" && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setScheduleSource(r)}
+              title="Re-run this batch's documents on a recurring schedule (no re-upload)"
+            >
+              <CalendarClock className="h-3.5 w-3.5" /> Schedule
+            </Button>
+          )}
           {r.status !== "running" && r.failed_items > 0 && (
             <Button
               size="sm"
@@ -410,6 +424,12 @@ export function BatchView({ active = true }: { active?: boolean }) {
         expandedKey={expanded}
         onRowClick={(r) => setExpanded((cur) => (cur === r.event_id ? null : r.event_id))}
         renderExpanded={(r) => <BatchDetail eventId={r.event_id} />}
+      />
+
+      <BatchSchedules
+        source={scheduleSource}
+        onSourceHandled={() => setScheduleSource(null)}
+        active={active}
       />
     </div>
   );

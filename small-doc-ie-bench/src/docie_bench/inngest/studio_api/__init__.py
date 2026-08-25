@@ -59,6 +59,18 @@ from ._shared import (
 )
 from .batch import BATCH_EVENT, BatchExtractRequest
 from .batch import router as _batch_router
+from .batch_schedules import (
+    BatchScheduleCreateRequest,
+    BatchSchedulePatchRequest,
+    create_batch_schedule,
+    delete_batch_schedule,
+    list_batch_schedules,
+    patch_batch_schedule,
+    run_batch_schedule_now,
+)
+from .batch_schedules import (
+    router as _batch_schedules_router,
+)
 from .benchmark import BenchmarkRequest, trigger_benchmark
 from .benchmark import router as _benchmark_router
 from .datasets import (
@@ -149,6 +161,7 @@ for _sub_router in (
     _runs_router,
     _seeds_router,
     _batch_router,
+    _batch_schedules_router,
 ):
     router.include_router(_sub_router)
 del _sub_router
@@ -206,4 +219,11 @@ __all__ = [
     "create_comparison",
     "download_artifact",
     "list_seeds",
+    "BatchScheduleCreateRequest",
+    "BatchSchedulePatchRequest",
+    "create_batch_schedule",
+    "list_batch_schedules",
+    "patch_batch_schedule",
+    "delete_batch_schedule",
+    "run_batch_schedule_now",
 ]
