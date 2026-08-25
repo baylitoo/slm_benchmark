@@ -73,6 +73,8 @@ def api(monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
                 },
             )
         last = body["messages"][-1]["content"]
+        if last == "explode":
+            return httpx.Response(500, text="upstream kaboom")
         return httpx.Response(
             200,
             json={
@@ -86,6 +88,7 @@ def api(monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
                         "finish_reason": "stop",
                     }
                 ],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
             },
         )
 
@@ -511,6 +514,130 @@ def test_chat_mcp_sdk_missing_is_501(api, monkeypatch) -> None:
     )
     assert resp.status_code == 501
     assert "'mcp' package" in resp.json()["error"]["message"]
+
+
+# ── usage ledger: every resolved request writes one durable row ─────────────
+
+
+@pytest.fixture
+def usage_db(tmp_path):
+    from docie_bench.storage.db import dispose_engine, init_engine
+
+    init_engine(f"sqlite:///{tmp_path / 'usage.db'}")
+    yield
+    dispose_engine()
+
+
+def _usage_rows():
+    from sqlalchemy import select
+
+    from docie_bench.storage.db import session_scope
+    from docie_bench.studio.models import UsageRecord
+
+    with session_scope() as session:
+        assert session is not None
+        return session.scalars(select(UsageRecord).order_by(UsageRecord.id)).all()
+
+
+def test_chat_success_writes_usage_row_with_tokens(api, usage_db) -> None:
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, response.text
+    (row,) = _usage_rows()
+    assert row.deployment == "lfm2.5-350m"
+    assert row.surface == "chat"
+    assert row.status == "ok"
+    # Lifted from the upstream completion's usage block, in hand at the seam.
+    assert row.prompt_tokens == 7
+    assert row.completion_tokens == 3
+    assert row.latency_ms >= 0
+    # The authenticated principal's id (an unauthenticated caller gets its
+    # per-client anon bucket, e.g. "anon:testclient" -- never empty).
+    assert row.tenant_id
+
+
+def test_chat_upstream_error_writes_error_usage_row(api, usage_db) -> None:
+    # An upstream 5xx is still a request against the deployment: it must be
+    # counted (status=error, no tokens), not silently missing from the ledger.
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "explode"}]},
+    )
+    assert response.status_code == 500
+    (row,) = _usage_rows()
+    assert row.status == "error"
+    assert row.surface == "chat"
+    assert row.prompt_tokens is None
+    assert row.completion_tokens is None
+
+
+def test_chat_stream_writes_usage_row_without_tokens(api, usage_db) -> None:
+    # The stream proxy relays raw SSE bytes and never parses a usage block:
+    # the request + latency still land in the ledger, tokens stay None.
+    client, _ = api
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())  # drain the stream
+    (row,) = _usage_rows()
+    assert row.status == "ok"
+    assert row.surface == "chat"
+    assert row.prompt_tokens is None
+    assert row.completion_tokens is None
+
+
+def test_chat_usage_ledger_down_never_fails_the_chat(api, monkeypatch) -> None:
+    # The never-raise contract: a database that errors on the insert (blip,
+    # pool exhaustion, gone entirely) must not turn a served completion into
+    # a 500 -- the ledger degrades, the chat answers.
+    from sqlalchemy.exc import OperationalError
+
+    from docie_bench.studio import usage_store
+
+    def broken_session_scope():
+        raise OperationalError("insert", None, Exception("database is down"))
+
+    monkeypatch.setattr(usage_store, "session_scope", broken_session_scope)
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "echo: hi"
+
+
+def test_chat_without_database_still_answers(api) -> None:
+    # No DATABASE_URL at all: recording degrades to a no-op, the surface is
+    # unaffected.
+    from docie_bench.storage.db import dispose_engine
+    from docie_bench.studio.usage_store import record_usage
+
+    dispose_engine()  # ensure no engine leaks in from an earlier test
+
+    assert (
+        record_usage(
+            deployment="lfm2.5-350m", surface="chat", tenant_id="anonymous", latency_ms=1
+        )
+        is False
+    )
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_mcp_servers_listing_redacts_secret_values(api, monkeypatch) -> None:

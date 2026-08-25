@@ -345,6 +345,11 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.batch_store import ensure_batch_tables
 
     ensure_batch_tables(_engine)
+    # Same race again: usage_records is new (per-deployment usage ledger behind
+    # GET /v1/studio/usage).
+    from docie_bench.studio.usage_store import ensure_usage_record_table
+
+    ensure_usage_record_table(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:

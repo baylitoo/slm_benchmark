@@ -176,6 +176,44 @@ class SeedRun(Base):
     )
 
 
+class UsageRecord(Base):
+    """One serving request against one deployment/profile -- the durable usage
+    ledger behind ``GET /v1/studio/usage`` (the Observability tab's Usage
+    section).
+
+    Raw rows on purpose: one insert per request, aggregation happens at read
+    time (``usage_store.usage_summary``). Pre-aggregating on write would need
+    an upsert per request (a lock hotspot on the busiest deployment) to save a
+    GROUP BY over a bounded window; the read path is a polling dashboard, not
+    a hot loop. Prometheus counters (telemetry.py) stay the real-time signal;
+    this table is the queryable, per-tenant, restart-surviving record those
+    counters can't be.
+
+    ``deployment`` is the RESOLVED profile name (deployment name, models.yaml
+    profile, or ``store:<name>``) -- same identifier ``recency.stamp_served_
+    profile`` receives, so the Usage table lines up with the rest of the
+    serving views. ``prompt_tokens``/``completion_tokens`` are nullable: a
+    streamed chat proxies raw SSE bytes and never parses a usage block, and
+    an errored request has none -- the request still counts.
+    """
+
+    __tablename__ = "usage_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    deployment: Mapped[str] = mapped_column(String(200), index=True)
+    # chat | extract | embed | rerank | agent -- which serving surface answered.
+    surface: Mapped[str] = mapped_column(String(16), index=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer)
+    # ok | error -- whether the surface answered the caller successfully.
+    status: Mapped[str] = mapped_column(String(16), default="ok")
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
 class StudioEventOwner(Base):
     """Lightweight event id -> triggering principal binding.
 
@@ -292,5 +330,6 @@ __all__ = [
     "StudioEventOwner",
     "StudioRun",
     "StudioRunArtifact",
+    "UsageRecord",
     "utcnow",
 ]
