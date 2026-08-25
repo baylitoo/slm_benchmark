@@ -11,6 +11,7 @@ import {
   Play,
   Send,
   Sparkles,
+  Swords,
   Trash2,
   Upload,
   AlertCircle,
@@ -70,7 +71,7 @@ import { PageHeader } from "./patterns/PageHeader";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
 
 type InputMode = "text" | "file";
-type PlaygroundMode = "extract" | "chat" | "vision" | "embed" | "rerank";
+type PlaygroundMode = "extract" | "chat" | "vision" | "embed" | "rerank" | "arena";
 
 // Deep-link callback threaded from AppShell so first-run empty states can send
 // the user straight to Models to deploy a model. Optional everywhere: when it
@@ -237,7 +238,9 @@ export function Playground({
         subtitle={
           mode === "chat"
             ? "Chat directly with any live deployment."
-            : mode === "vision"
+            : mode === "arena"
+              ? "Send one prompt to two deployments side by side and compare their answers."
+              : mode === "vision"
               ? "Send an image to a vision deployment (OCR / description) — free-text answer."
               : mode === "embed"
                 ? "Compute embeddings with your deployed models (RAG-ready)."
@@ -251,6 +254,7 @@ export function Playground({
               [
                 ["extract", "Extract", Sparkles],
                 ["chat", "Chat", MessageSquare],
+                ["arena", "Arena", Swords],
                 ["vision", "Vision", ImageIcon],
                 ["embed", "Embed", Fingerprint],
                 ["rerank", "Rerank", ListOrdered],
@@ -279,6 +283,9 @@ export function Playground({
           extraction stream or a chat history survives switching modes. */}
       <div hidden={mode !== "chat"}>
         <ChatPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
+      </div>
+      <div hidden={mode !== "arena"}>
+        <ArenaPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
       </div>
       <div hidden={mode !== "vision"}>
         <VisionPanel
@@ -787,6 +794,362 @@ function ChatPanel({
             disabled={msgs.length === 0 || busy}
             onClick={() => {
               setMsgs([]);
+              setError(null);
+            }}
+            title="Clear the conversation"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Arena mode — one prompt, two deployments, answers streamed side by side.
+// Both sides receive the exact same message list (system + shared history +
+// the new prompt) concurrently. Multi-turn: every turn stores BOTH answers,
+// and a per-turn "Continue from" control picks which side's answer feeds the
+// next turn as assistant history (default: left) — the conversation stays
+// coherent while still exposing where the two models diverge.
+// ---------------------------------------------------------------------------
+
+type ArenaSide = 0 | 1;
+
+interface ArenaAnswer {
+  /** Deployment this side used when the turn was sent (the picker may change later). */
+  model: string;
+  content: string;
+  status: "streaming" | "loading" | "done" | "error";
+  error?: string;
+  elapsedMs: number;
+}
+
+interface ArenaTurn {
+  prompt: string;
+  /** [left, right] */
+  answers: [ArenaAnswer, ArenaAnswer];
+  /** Which side's answer feeds later turns as assistant history. */
+  historySide: ArenaSide;
+}
+
+function formatElapsed(ms: number): string {
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+// Exported for tests: rendered by Playground with its polled deployment state.
+export function ArenaPanel({
+  deployments,
+  selectable,
+  onNavigate,
+}: {
+  deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
+  selectable: DeploymentRecord[];
+  onNavigate?: NavigateToDeploy;
+}) {
+  const { t } = useI18n();
+  const chatNames = useMemo(
+    () => selectable.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [selectable],
+  );
+  const liveNames = useMemo(
+    () =>
+      selectable
+        .filter(isLiveDeployment)
+        .map((d) => d.spec?.name ?? "")
+        .filter(Boolean),
+    [selectable],
+  );
+
+  // Two independent selections, one per side. Same live-first preference as
+  // Chat, and the right side defaults to a DIFFERENT model when one exists —
+  // comparing a model against itself is allowed, just not the default.
+  const [modelA, setModelA] = useState("");
+  const [modelB, setModelB] = useState("");
+  useEffect(() => {
+    if (chatNames.length === 0) {
+      if (modelA !== "") setModelA("");
+      if (modelB !== "") setModelB("");
+      return;
+    }
+    const preferred = [
+      ...liveNames,
+      ...chatNames.filter((n) => !liveNames.includes(n)),
+    ];
+    if (!chatNames.includes(modelA)) setModelA(preferred[0]);
+    if (!chatNames.includes(modelB)) setModelB(preferred[1] ?? preferred[0]);
+  }, [chatNames, liveNames, modelA, modelB]);
+
+  const [system, setSystem] = useState("");
+  const [input, setInput] = useState("");
+  const [turns, setTurns] = useState<ArenaTurn[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [turns, busy]);
+
+  function patchAnswer(turnIndex: number, side: ArenaSide, patch: Partial<ArenaAnswer>) {
+    setTurns((prev) =>
+      prev.map((turn, i) =>
+        i === turnIndex
+          ? {
+              ...turn,
+              answers: turn.answers.map((a, j) =>
+                j === side ? { ...a, ...patch } : a,
+              ) as [ArenaAnswer, ArenaAnswer],
+            }
+          : turn,
+      ),
+    );
+  }
+
+  async function runSide(
+    turnIndex: number,
+    side: ArenaSide,
+    model: string,
+    payload: { role: string; content: unknown }[],
+    retryCount = 0,
+  ): Promise<void> {
+    const started = performance.now();
+    try {
+      let content = "";
+      await chatCompletionStream(model, payload, (token) => {
+        content += token;
+        patchAnswer(turnIndex, side, {
+          content,
+          status: "streaming",
+          elapsedMs: performance.now() - started,
+        });
+      });
+      patchAnswer(turnIndex, side, {
+        content: content || t("(empty response)"),
+        status: "done",
+        elapsedMs: performance.now() - started,
+      });
+    } catch (e) {
+      if (e instanceof ModelLoading && retryCount < MAX_LOAD_RETRIES) {
+        // Same bounded cold-start retry as Chat: the backend's load trigger
+        // is idempotent, so re-sending after the ETA is safe. The elapsed
+        // clock restarts per attempt — it measures the answering attempt,
+        // not the cold-start wait.
+        patchAnswer(turnIndex, side, { status: "loading" });
+        const waitMs = Math.min(Math.max(e.etaSeconds, 2), 30) * 1000;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        return runSide(turnIndex, side, model, payload, retryCount + 1);
+      }
+      const msg =
+        e instanceof ModelLoading
+          ? `${e.message} ${t("Still starting — send your message again in a bit.")}`
+          : e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+            ? e.message
+            : "Chat request failed.";
+      patchAnswer(turnIndex, side, {
+        status: "error",
+        error: msg,
+        elapsedMs: performance.now() - started,
+      });
+    }
+  }
+
+  // Shared history: each finished turn contributes its user prompt plus ONE
+  // assistant answer — the side picked by that turn's "Continue from" control,
+  // falling back to the other side when the picked one failed. A turn where
+  // both sides failed contributes nothing (it never happened, history-wise).
+  function historyMessages(): { role: string; content: string }[] {
+    const out: { role: string; content: string }[] = [];
+    for (const turn of turns) {
+      const picked = turn.answers[turn.historySide];
+      const other = turn.answers[turn.historySide === 0 ? 1 : 0];
+      const answer =
+        picked.status === "done" ? picked : other.status === "done" ? other : null;
+      if (!answer) continue;
+      out.push({ role: "user", content: turn.prompt });
+      out.push({ role: "assistant", content: answer.content });
+    }
+    return out;
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    if (!modelA || !modelB) {
+      setError("No deployment selected — deploy a model under Serving → Models first.");
+      return;
+    }
+    setError(null);
+    const payload = [
+      ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
+      ...historyMessages(),
+      { role: "user", content: text },
+    ];
+    const turnIndex = turns.length;
+    const blank = (model: string): ArenaAnswer => ({
+      model,
+      content: "",
+      status: "streaming",
+      elapsedMs: 0,
+    });
+    setTurns((prev) => [
+      ...prev,
+      { prompt: text, historySide: 0, answers: [blank(modelA), blank(modelB)] },
+    ]);
+    setInput("");
+    setBusy(true);
+    // Both sides get the exact same payload, concurrently. Each side settles
+    // on its own — one failing never cancels the other.
+    await Promise.all([
+      runSide(turnIndex, 0, modelA, payload),
+      runSide(turnIndex, 1, modelB, payload),
+    ]);
+    setBusy(false);
+  }
+
+  return (
+    <Card
+      icon={<Swords className="h-5 w-5" />}
+      title="Arena"
+      subtitle="One prompt, two deployments — the same conversation runs against both, answers stream side by side."
+    >
+      <div className="space-y-4">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Left model" hint="Feeds the shared history by default.">
+            <DeploymentSelect
+              deployments={deployments}
+              selectable={selectable}
+              value={modelA}
+              onChange={setModelA}
+              emptyNoun="chat"
+              onNavigate={onNavigate}
+              disabled={busy}
+            />
+          </Field>
+          <Field label="Right model">
+            <DeploymentSelect
+              deployments={deployments}
+              selectable={selectable}
+              value={modelB}
+              onChange={setModelB}
+              emptyNoun="chat"
+              onNavigate={onNavigate}
+              disabled={busy}
+            />
+          </Field>
+        </div>
+        <Field label="System prompt" hint="Optional — applied to both sides.">
+          <TextInput
+            value={system}
+            onChange={(e) => setSystem(e.target.value)}
+            placeholder="You are…"
+          />
+        </Field>
+
+        <div className="scroll-thin max-h-[55vh] min-h-40 space-y-4 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
+          {turns.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              <T>Send one prompt to both deployments and compare the answers side by side.</T>
+            </p>
+          )}
+          {turns.map((turn, i) => (
+            <div key={i} className="space-y-2">
+              <div className="flex justify-end">
+                <div className="max-w-[85%] whitespace-pre-wrap rounded-lg bg-accent px-3 py-2 text-sm text-accent-foreground">
+                  {turn.prompt}
+                </div>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {turn.answers.map((a, side) => (
+                  <div
+                    key={side}
+                    className="flex flex-col rounded-lg border border-border bg-card"
+                  >
+                    <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
+                      <span className="truncate text-xs font-medium text-foreground">
+                        {a.model}
+                      </span>
+                      {turn.historySide === side && <Badge tone="info">history</Badge>}
+                      <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
+                        {a.status === "loading" ? <Spinner /> : formatElapsed(a.elapsedMs)}
+                      </span>
+                    </div>
+                    <div className="px-3 py-2 text-sm">
+                      {a.status === "error" ? (
+                        <p className="text-red-600 dark:text-red-400">{a.error}</p>
+                      ) : a.status === "loading" ? (
+                        <p className="flex items-center gap-2 text-xs italic text-muted-foreground">
+                          <Spinner /> <T>Model is loading — retrying automatically…</T>
+                        </p>
+                      ) : (
+                        <div className="whitespace-pre-wrap text-foreground/90">
+                          {a.content || (a.status === "streaming" ? "…" : "")}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <span className="text-xs text-muted-foreground">
+                  <T>Continue from</T>
+                </span>
+                <Segmented
+                  value={turn.historySide === 0 ? "left" : "right"}
+                  onChange={(v) =>
+                    setTurns((prev) =>
+                      prev.map((tt, j) =>
+                        j === i ? { ...tt, historySide: v === "left" ? 0 : 1 } : tt,
+                      ),
+                    )
+                  }
+                  options={[
+                    { value: "left", label: "Left" },
+                    { value: "right", label: "Right" },
+                  ]}
+                />
+              </div>
+            </div>
+          ))}
+          {busy && (
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Spinner /> <T>Waiting for the models…</T>
+            </p>
+          )}
+          <div ref={bottomRef} />
+        </div>
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        <div className="flex items-end gap-2">
+          <TextArea
+            rows={2}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            placeholder="Type a message for both models (Enter to send, Shift+Enter for a new line)…"
+          />
+          <Button
+            type="button"
+            loading={busy}
+            disabled={chatNames.length === 0}
+            onClick={() => void send()}
+          >
+            <Send className="h-4 w-4" />
+            Send
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={turns.length === 0 || busy}
+            onClick={() => {
+              setTurns([]);
               setError(null);
             }}
             title="Clear the conversation"
