@@ -1033,6 +1033,102 @@ async def batch_extract_job(ctx: inngest.Context) -> dict[str, Any]:
     return result or {}
 
 
+# ---------------------------------------------------------------------------
+# Batch schedules: recurring batch extraction, driven by a once-a-minute cron.
+# ---------------------------------------------------------------------------
+
+
+def _record_scheduled_event_owners(event_ids: list[str], tenant_id: str) -> None:
+    """Bind a cron-fired batch event to the schedule's tenant, best-effort.
+
+    The worker-side twin of ``studio_api._shared._record_event_owners`` (the
+    trigger routes' helper): without it a scheduled run's event id would be
+    the one batch the tenant-scoped ``/runs/{event_id}`` proxy rejects.
+    """
+    from docie_bench.studio.store import RunStoreUnavailableError, default_run_store
+
+    store = default_run_store()
+    if not store.enabled:
+        return
+    try:
+        for event_id in event_ids:
+            store.record_event_owner(event_id=event_id, tenant_id=tenant_id)
+    except RunStoreUnavailableError:
+        pass
+
+
+async def _run_batch_schedule_tick() -> dict[str, int]:
+    """One scan of due batch schedules; fires each as a NORMAL batch event.
+
+    Per due schedule: re-materialize the source batch's documents from the
+    shared blob store (``schedule_store.scheduled_batch_event_data`` -- the
+    same input_relkey seam retry-failed uses), send ``doc/batch.requested``,
+    and advance ``next_run_at`` one interval past now. A schedule that cannot
+    fire (source batch deleted, blobs swept) records ``last_error`` and STILL
+    advances -- once-per-interval error surfacing, never a per-minute retry
+    loop. Only a failed SEND leaves ``next_run_at`` untouched, so the next
+    tick retries once the Inngest server is back. Every outcome is per
+    schedule: one broken row never blocks the rest of the scan.
+    """
+    from docie_bench.studio import schedule_store
+
+    due = schedule_store.due_schedules()
+    fired = 0
+    skipped = 0
+    send_errors = 0
+    for schedule in due:
+        schedule_id = str(schedule["id"])
+        data, error = schedule_store.scheduled_batch_event_data(schedule)
+        if data is None:
+            logger.warning("batch schedule %s cannot fire: %s", schedule_id, error)
+            schedule_store.mark_fired(schedule_id, error=error)
+            skipped += 1
+            continue
+        try:
+            ids = await inngest_client.send(
+                inngest.Event(name="doc/batch.requested", data=data)
+            )
+        except Exception:  # noqa: BLE001 - one dead send must not break the scan
+            logger.warning(
+                "batch schedule %s: event send failed; next tick retries",
+                schedule_id,
+                exc_info=True,
+            )
+            send_errors += 1
+            continue
+        event_ids = [str(i) for i in ids]
+        _record_scheduled_event_owners(event_ids, str(schedule["tenant_id"]))
+        schedule_store.mark_fired(
+            schedule_id, event_id=event_ids[0] if event_ids else None
+        )
+        fired += 1
+    if due:
+        logger.info(
+            "batch-schedule tick: due=%d fired=%d skipped=%d send_errors=%d",
+            len(due),
+            fired,
+            skipped,
+            send_errors,
+        )
+    return {"due": len(due), "fired": fired, "skipped": skipped, "send_errors": send_errors}
+
+
+@inngest_client.create_function(
+    fn_id="batch-schedule-tick",
+    trigger=inngest.TriggerCron(cron="* * * * *"),
+)
+async def batch_schedule_tick_job(ctx: inngest.Context) -> dict[str, int]:
+    """Once-a-minute scan for due batch schedules (see ``BatchSchedule``).
+
+    The whole scheduling mechanism is this cron + the ``next_run_at`` column:
+    no per-schedule Inngest state to keep in sync with CRUD, and a schedule
+    created/edited/deleted through the API is live on the very next tick.
+    Idempotent per tick -- firing advances ``next_run_at`` before the next
+    scan can see the row again, and a no-due tick is a no-op.
+    """
+    return await ctx.step.run("tick", _run_batch_schedule_tick)
+
+
 @inngest_client.create_function(
     fn_id="benchmark-run",
     trigger=inngest.TriggerEvent(event="benchmark/run.requested"),
@@ -1985,6 +2081,12 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
 # the single replica keeps the write topology trivial.
 worker_functions = [
     extract_document,
+    # Registration gap fix: batch_extract_job existed since #232 but was never
+    # added here, so no Connect sync ever registered `batch-extract` and a
+    # fired `doc/batch.requested` had no handler. The schedule cron
+    # fires exactly that event, so the gap is load-bearing now.
+    batch_extract_job,
+    batch_schedule_tick_job,
     run_benchmark_job,
     gc_studio_runs_job,
 ]
@@ -2050,6 +2152,8 @@ __all__ = [
     "functions_for_role",
     "apps_for_role",
     "extract_document",
+    "batch_extract_job",
+    "batch_schedule_tick_job",
     "run_benchmark_job",
     "deploy_model_job",
     "seed_ollama_job",

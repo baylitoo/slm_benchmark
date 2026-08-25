@@ -59,6 +59,12 @@ EXPECTED_STUDIO_ROUTES = {
     ("GET", "/v1/studio/batches/{event_id}"),
     ("GET", "/v1/studio/batches/{event_id}/results.{fmt}"),
     ("POST", "/v1/studio/batches/{event_id}/retry-failed"),
+    # Batch schedules (recurring re-runs of a batch's stored documents).
+    ("POST", "/v1/studio/batch-schedules"),
+    ("GET", "/v1/studio/batch-schedules"),
+    ("PATCH", "/v1/studio/batch-schedules/{schedule_id}"),
+    ("DELETE", "/v1/studio/batch-schedules/{schedule_id}"),
+    ("POST", "/v1/studio/batch-schedules/{schedule_id}/run-now"),
 }
 
 
@@ -71,4 +77,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 35
+    assert len(EXPECTED_STUDIO_ROUTES) == 40

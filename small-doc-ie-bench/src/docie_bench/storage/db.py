@@ -345,6 +345,11 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.batch_store import ensure_batch_tables
 
     ensure_batch_tables(_engine)
+    # Same race again: batch_schedules is also new (recurring batch-extraction
+    # configs the once-a-minute cron scans).
+    from docie_bench.studio.schedule_store import ensure_batch_schedule_table
+
+    ensure_batch_schedule_table(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:

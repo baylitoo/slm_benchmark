@@ -18,6 +18,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     retryBatchFailed: vi.fn(),
     triggerBatchExtract: vi.fn(),
     downloadBatchResults: vi.fn(),
+    listBatchSchedules: vi.fn(),
+    createBatchSchedule: vi.fn(),
     // fileToBase64 reads a File via FileReader; stub it to a deterministic
     // marker so the assembled payload is checkable without jsdom's async
     // FileReader dance.
@@ -75,6 +77,8 @@ describe("BatchView", () => {
       channel: "batch:r",
       topics: [],
     });
+    vi.mocked(api.listBatchSchedules).mockReset().mockResolvedValue([]);
+    vi.mocked(api.createBatchSchedule).mockReset();
   });
 
   it("sends a single .zip as zip_b64", async () => {
@@ -178,5 +182,45 @@ describe("BatchView", () => {
 
     await userEvent.click(retry);
     expect(api.retryBatchFailed).toHaveBeenCalledWith("ev-4");
+  });
+
+  it("opens the schedule form from a settled batch and creates the schedule", async () => {
+    vi.mocked(api.listBatches).mockResolvedValue([
+      makeBatch(), // running -> no Schedule action
+      makeBatch({ event_id: "ev-5", name: "settled", status: "completed", failed_items: 0 }),
+    ]);
+    vi.mocked(api.createBatchSchedule).mockResolvedValue({
+      id: "s-1",
+      tenant_id: "t",
+      name: "re-run: settled",
+      source_event_id: "ev-5",
+      schema_name: "invoice",
+      selectors: {},
+      interval: "daily",
+      every_n_minutes: null,
+      enabled: true,
+      next_run_at: new Date("2026-01-02T00:00:00Z").toISOString(),
+      last_run_at: null,
+      last_event_id: null,
+      last_error: null,
+      created_at: new Date("2026-01-01T00:00:00Z").toISOString(),
+      updated_at: new Date("2026-01-01T00:00:00Z").toISOString(),
+    });
+    renderView();
+    const schedule = await screen.findByRole("button", { name: /Schedule/ });
+    expect(screen.getAllByRole("button", { name: /^Schedule/ })).toHaveLength(1); // settled only
+
+    await userEvent.click(schedule);
+    // Form prefilled from the source batch; submit with the default interval.
+    expect(screen.getByDisplayValue("re-run: settled")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Create schedule/ }));
+
+    await waitFor(() => expect(api.createBatchSchedule).toHaveBeenCalledTimes(1));
+    expect(api.createBatchSchedule).toHaveBeenCalledWith({
+      source_event_id: "ev-5",
+      name: "re-run: settled",
+      interval: "daily",
+      every_n_minutes: undefined,
+    });
   });
 });
