@@ -576,8 +576,9 @@ def test_chat_upstream_error_writes_error_usage_row(api, usage_db) -> None:
 
 
 def test_chat_stream_writes_usage_row_without_tokens(api, usage_db) -> None:
-    # The stream proxy relays raw SSE bytes and never parses a usage block:
-    # the request + latency still land in the ledger, tokens stay None.
+    # This mock upstream's SSE frames never carry a usage block (unlike the
+    # dedicated fixtures below) -- the row must still land, tokens None,
+    # exactly the pre-fix fallback behavior.
     client, _ = api
     with client.stream(
         "POST",
@@ -595,6 +596,96 @@ def test_chat_stream_writes_usage_row_without_tokens(api, usage_db) -> None:
     assert row.surface == "chat"
     assert row.prompt_tokens is None
     assert row.completion_tokens is None
+
+
+def test_chat_stream_requests_include_usage_by_default(api) -> None:
+    # llama-server/OpenAI only emit a final usage frame when asked -- the
+    # relay must ask, without a caller having to know that itself.
+    client, captured = api
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        list(response.iter_lines())
+    sent = json.loads(captured[-1].content)
+    assert sent["stream_options"] == {"include_usage": True}
+
+
+def test_chat_stream_preserves_callers_stream_options(api) -> None:
+    client, captured = api
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "stream": True,
+            "stream_options": {"include_usage": False, "custom_flag": "x"},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        list(response.iter_lines())
+    sent = json.loads(captured[-1].content)
+    # A caller that explicitly opted OUT (or set other options) is honored --
+    # this only fills in the default, never overrides an explicit choice.
+    assert sent["stream_options"] == {"include_usage": False, "custom_flag": "x"}
+
+
+@pytest.fixture
+def api_stream_with_usage(monkeypatch):
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        if model_profile == "lfm2.5-350m":
+            return UPSTREAM
+        raise ProfileResolutionError(f"model {model_profile!r} is not routable")
+
+    monkeypatch.setattr("docie_bench.chat_api.resolve_extraction_profile", fake_resolver)
+
+    async def _sse_chunks() -> AsyncIterator[bytes]:
+        # The final usage frame split ACROSS two raw chunks -- proves the
+        # byte-buffer scan reassembles a frame straddling a chunk boundary,
+        # not just one that happens to land whole in a single yield.
+        yield b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: {"choices":['
+        yield (
+            b'],"usage":{"prompt_tokens":11,"completion_tokens":4,'
+            b'"total_tokens":15}}\n\ndata: [DONE]\n\n'
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_chunks()
+        )
+
+    configure_http_transport(httpx.MockTransport(handler))
+    app = FastAPI()
+    app.include_router(chat_router)
+    client = TestClient(app)
+    yield client
+    configure_http_transport(None)
+
+
+def test_chat_stream_captures_usage_split_across_chunks(api_stream_with_usage, usage_db) -> None:
+    with api_stream_with_usage.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        assert response.status_code == 200
+        events = [line for line in response.iter_lines() if line.startswith("data: ")]
+
+    # Relayed bytes are UNCHANGED -- the usage-scanning is a side channel.
+    assert events[-1] == "data: [DONE]"
+    (row,) = _usage_rows()
+    assert row.status == "ok"
+    assert row.prompt_tokens == 11
+    assert row.completion_tokens == 4
 
 
 def test_chat_usage_ledger_down_never_fails_the_chat(api, monkeypatch) -> None:
