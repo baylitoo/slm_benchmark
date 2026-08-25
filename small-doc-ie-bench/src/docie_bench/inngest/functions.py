@@ -56,6 +56,7 @@ LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
 REPAIR_EVENT = "serving/repair.requested"
 RECONFIGURE_EVENT = "serving/reconfigure.requested"
+RESIZE_EVENT = "serving/resize.requested"
 PIN_EVENT = "serving/pin.requested"
 
 # Poll cadence for the worker-side await of a serving-side load (the worker
@@ -1398,6 +1399,47 @@ async def reconfigure_deployment_job(ctx: inngest.Context) -> Any:
     return result
 
 
+async def _run_resize(data: dict[str, Any]) -> Any:
+    """Zero-downtime context resize (drain-and-relaunch), or an in-place
+    launch edit when the deployment is stopped/offloaded."""
+    cp = _serving_control_plane()
+    raw_context = data.get("context_length")
+    if raw_context is None:
+        raise ValueError("resize event must include 'context_length'")
+    return await cp.resize_store_model(
+        _required_name(data, "resize"),
+        context_length=int(raw_context),
+    )
+
+
+@serving_client.create_function(
+    fn_id="serving-resize",
+    trigger=inngest.TriggerEvent(event=RESIZE_EVENT),
+)
+async def resize_store_model_job(ctx: inngest.Context) -> Any:
+    """Change a live store deployment's context window with zero downtime.
+
+    Event ``data``: ``name`` (required), ``context_length`` (required),
+    ``channel``. Runs ONLY on ``serving`` (holds the Popen handles and the
+    correct cgroup view RAM admission needs): re-checks the fit against LIVE
+    measured memory, spawns the new-sized instance on its own port, waits for
+    it to become READY, flips routing to it, then reaps the old process — the
+    old instance keeps serving until the new one has proven itself healthy.
+    """
+    data = dict(ctx.event.data or {})
+    channel = str(data.get("channel") or f"run:{ctx.event.id}")
+
+    await publish(channel, TOPIC_STATUS, {"state": "resizing", "name": data.get("name")})
+    try:
+        result = await ctx.step.run("resize", lambda: _run_resize(data))
+    except Exception as exc:  # noqa: BLE001 - surface error then re-raise
+        logger.exception("resize_store_model_job failed (name=%s)", data.get("name"))
+        await _publish_error_safely(channel, str(exc))
+        raise
+    await publish(channel, TOPIC_RESULT, result)
+    return result
+
+
 async def _run_pin(data: dict[str, Any]) -> Any:
     cp = _serving_control_plane()
     return await cp.pin(_required_name(data, "pin"), pinned=bool(data.get("pinned", True)))
@@ -1998,6 +2040,7 @@ serving_functions = [
     unload_deployment_job,
     repair_deployment_job,
     reconfigure_deployment_job,
+    resize_store_model_job,
     pin_deployment_job,
 ]
 
@@ -2059,6 +2102,7 @@ __all__ = [
     "unload_deployment_job",
     "repair_deployment_job",
     "reconfigure_deployment_job",
+    "resize_store_model_job",
     "pin_deployment_job",
     "gc_studio_runs_job",
     "benchmark_idempotency_key",
@@ -2066,5 +2110,6 @@ __all__ = [
     "UNLOAD_EVENT",
     "REPAIR_EVENT",
     "RECONFIGURE_EVENT",
+    "RESIZE_EVENT",
     "PIN_EVENT",
 ]

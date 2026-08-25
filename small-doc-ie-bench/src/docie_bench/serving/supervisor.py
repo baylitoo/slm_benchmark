@@ -348,6 +348,68 @@ class PersistentSupervisor:
             del self._records[name]
             self._save()
 
+    def reap(self, record: DeploymentRecord) -> None:
+        """Kill ``record``'s runtime process, INCLUDING a pidless orphan.
+
+        Public seam for a caller holding its OWN snapshot of a record whose
+        process no longer belongs to that name's live entry — the zero-
+        downtime resize sequence (:meth:`adopt`) hands a record's process to a
+        DIFFERENT name and needs to stop the just-discarded one afterwards.
+        Same reaping as ``remove()``/``stop()`` (``_reap``), but does not
+        touch ``self._records`` — by the time this runs, ``record.spec.name``
+        may already describe a different process.
+        """
+        with self._lock:
+            self._reap(record)
+
+    def adopt(self, name: str, source: DeploymentRecord) -> DeploymentRecord:
+        """Atomically hand ``name``'s identity to ``source``'s LIVE process.
+
+        The zero-downtime resize seam: a drain-and-relaunch spawns the new-
+        sized instance under a throwaway record (``source``) on its own port,
+        waits for it to reach READY, then calls this so ``name`` — the
+        deployment identity every other surface (placements, the API, the
+        Studio) already knows — owns that process going forward. ``spec``
+        (carrying the new launch: port, context_length, ...), ``pid``,
+        ``pid_create_time``, ``endpoint``, ``state`` and ``loaded_at`` move
+        from ``source`` onto ``name``'s record; ``name``'s own bookkeeping —
+        ``restart_count``, ``activation``, ``pinned``, ``last_served`` — is
+        preserved (this is a resize of an existing deployment, not a fresh
+        one). Returns ``name``'s record exactly as it was immediately BEFORE
+        the swap, so the caller can :meth:`reap` the process it just
+        replaced. Does not touch ``source``'s own record — the caller must
+        :meth:`discard` it separately (adopting a process must never imply
+        killing it).
+        """
+        with self._lock:
+            target = self._get_live(name)
+            previous = replace(target)
+            target.spec = replace(target.spec, launch=source.spec.launch)
+            target.state = source.state
+            target.pid = source.pid
+            target.pid_create_time = source.pid_create_time
+            target.endpoint = source.endpoint
+            target.loaded_at = source.loaded_at
+            target.consecutive_health_failures = 0
+            target.last_error = None
+            target.exited_after_start = False
+            target.updated_at = self._clock()
+            self._save()
+            return previous
+
+    def discard(self, name: str) -> None:
+        """Drop ``name``'s bookkeeping record WITHOUT touching its process.
+
+        The sibling half of :meth:`adopt`: once a shadow deployment's process
+        has been adopted by another record, its own record is a pure
+        bookkeeping leftover — a plain ``remove()`` would kill the process out
+        from under its new owner.
+        """
+        with self._lock:
+            self._get_live(name)  # KeyError for an unknown name
+            del self._records[name]
+            self._save()
+
     def mark_failed(
         self, name: str, error: str | None, *, shutdown: bool = False
     ) -> DeploymentRecord:
