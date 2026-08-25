@@ -242,3 +242,114 @@ def test_resize_edits_a_stopped_deployment_in_place(
     assert record["spec"]["desired_state"] == "stopped"
     assert record["state"] == "stopped"
     assert adapter.specs == specs_before  # nothing spawned
+
+
+def test_resize_clears_the_shadows_placement_row_after_a_successful_flip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reconciler creates a placement row for ANY record it observes
+    mid-await (design: "the Board converges instead of staying blind
+    forever") -- so the shadow's throwaway record could pick one up while
+    ``await_ready`` is polling it. Once routing has flipped to it, that row
+    must be cleared, or a phantom deployment (empty ``model_name``, a name no
+    supervisor record owns) lingers in the catalog forever."""
+    import uuid as uuid_module
+
+    import docie_bench.storage.db as db
+    from docie_bench.serving import control_plane as cp_module
+    from docie_bench.serving.catalog import ModelCatalog
+
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path / 'catalog.db'}")
+    try:
+        _set_port_range(monkeypatch)
+        model_path = _weights_file(tmp_path, "svc")
+        adapter = _CapturingAdapter()
+        plane, supervisor = _plane(tmp_path, adapter)
+        _seed_llamacpp(supervisor, "svc", 8090, model_path, context_length=8192)
+
+        from docie_bench.serving import lifecycle
+
+        monkeypatch.setattr(
+            lifecycle,
+            "read_node_memory",
+            lambda: NodeMemory(total_bytes=100 * 1024**3, free_bytes=50 * 1024**3, source="vm"),
+        )
+        # Pin the shadow's generated name so the test can pre-seed (simulating
+        # the reconciler) and later assert on its placement row.
+        fixed_uuid = uuid_module.UUID(int=0x1234)
+        monkeypatch.setattr(cp_module.uuid, "uuid4", lambda: fixed_uuid)
+        shadow_name = f"svc__resize-{fixed_uuid.hex[:8]}"
+        ModelCatalog().publish_observed(
+            shadow_name,
+            engine="llama-server",
+            state="ready",
+            endpoint="http://127.0.0.1:8091/v1",
+            phase="hot",
+            pid=999,
+            pid_create_time=1.0,
+            rss_bytes=0,
+            health_ok=True,
+            last_error=None,
+        )
+        assert ModelCatalog().get_placement(shadow_name) is not None
+
+        asyncio.run(plane.resize_store_model("svc", context_length=32768))
+
+        assert ModelCatalog().get_placement(shadow_name) is None
+    finally:
+        db.dispose_engine()
+
+
+def test_resize_clears_the_shadows_placement_row_when_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same cleanup on the OTHER exit: the shadow never reaches READY."""
+    import uuid as uuid_module
+
+    import docie_bench.storage.db as db
+    from docie_bench.serving import control_plane as cp_module
+    from docie_bench.serving.catalog import ModelCatalog
+
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path / 'catalog.db'}")
+    try:
+        _set_port_range(monkeypatch)
+        model_path = _weights_file(tmp_path, "svc")
+        adapter = _CapturingAdapter(rejected_contexts={32768})
+        plane, supervisor = _plane(tmp_path, adapter)
+        _seed_llamacpp(supervisor, "svc", 8090, model_path, context_length=8192)
+
+        from docie_bench.serving import lifecycle
+
+        monkeypatch.setattr(
+            lifecycle,
+            "read_node_memory",
+            lambda: NodeMemory(total_bytes=100 * 1024**3, free_bytes=50 * 1024**3, source="vm"),
+        )
+        # The shadow never reports healthy -- keep await_ready's budget tiny
+        # so the test fails fast instead of burning its real ~120s floor.
+        monkeypatch.setattr(lifecycle, "load_timeout_s", lambda *a, **k: 0.01)
+        fixed_uuid = uuid_module.UUID(int=0x5678)
+        monkeypatch.setattr(cp_module.uuid, "uuid4", lambda: fixed_uuid)
+        shadow_name = f"svc__resize-{fixed_uuid.hex[:8]}"
+        ModelCatalog().publish_observed(
+            shadow_name,
+            engine="llama-server",
+            state="starting",
+            endpoint="",
+            phase="loading",
+            pid=999,
+            pid_create_time=1.0,
+            rss_bytes=0,
+            health_ok=False,
+            last_error=None,
+        )
+        assert ModelCatalog().get_placement(shadow_name) is not None
+
+        with pytest.raises(RuntimeError, match="rejected by the runtime"):
+            asyncio.run(plane.resize_store_model("svc", context_length=32768))
+
+        assert ModelCatalog().get_placement(shadow_name) is None
+    finally:
+        db.dispose_engine()

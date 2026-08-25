@@ -1259,14 +1259,33 @@ class _DefaultSupervisor:
         if shadow.state != LifecycleState.READY:
             error = shadow.last_error or "the resized instance did not become ready"
             self.backend.remove(shadow_name)
+            # The reconciler creates a placement row for ANY record it
+            # observes mid-await (design: "the Board converges instead of
+            # staying blind forever") — best-effort clean it up so a failed
+            # resize never leaves a permanent orphan row behind.
+            clear_placement(shadow_name)
             raise RuntimeError(f"resize of {name!r} was rejected by the runtime: {error}")
 
-        # Flip routing to the proven-healthy new instance BEFORE touching the
-        # old one: the old process keeps serving until this UPDATE lands, so
-        # store:<name> is never pointed at nothing.
-        mark_placement_ready(name, endpoint=str(shadow.endpoint or ""))
-        previous = self.backend.adopt(name, shadow)
+        try:
+            # Flip routing to the proven-healthy new instance BEFORE touching
+            # the old one: the old process keeps serving until this UPDATE
+            # lands, so store:<name> is never pointed at nothing.
+            mark_placement_ready(name, endpoint=str(shadow.endpoint or ""))
+            previous = self.backend.adopt(name, shadow)
+        except Exception:
+            # ``name`` vanished (a concurrent delete) mid-handoff: the shadow
+            # is still a live, unowned process. Reap it here too — otherwise
+            # it leaks exactly like the orphan-process class this repo has
+            # already had to fix once (an undeleted record holding RAM
+            # forever), just introduced by resize instead of delete.
+            self.backend.remove(shadow_name)
+            clear_placement(shadow_name)
+            raise
         self.backend.discard(shadow_name)
+        # The shadow's own placement row (if the reconciler created one while
+        # it was still a distinct record) is superseded by the flip above —
+        # drop it so it never lingers as a phantom deployment.
+        clear_placement(shadow_name)
         self.backend.reap(previous)
         return self.backend.get(name)
 
