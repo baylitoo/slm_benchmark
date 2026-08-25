@@ -53,6 +53,8 @@ EXPECTED_STUDIO_ROUTES = {
     ("POST", "/v1/studio/comparisons"),
     ("GET", "/v1/studio/artifacts/{artifact_id}"),
     ("GET", "/v1/studio/seeds"),
+    # Per-deployment usage aggregates (Observability tab's Usage section).
+    ("GET", "/v1/studio/usage"),
     # Batch extraction (N documents, one durable job, per-document state).
     ("POST", "/v1/studio/extract/batch"),
     ("GET", "/v1/studio/batches"),
@@ -71,4 +73,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 35
+    assert len(EXPECTED_STUDIO_ROUTES) == 36

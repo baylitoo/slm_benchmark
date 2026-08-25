@@ -62,3 +62,31 @@ export interface ActivityView {
 export function getActivity(): Promise<ActivityView> {
   return request<ActivityView>("/v1/serving/activity");
 }
+
+export type UsageWindow = "24h" | "7d" | "30d";
+
+/** One deployment/profile's aggregates over the requested window, folded at
+ * read time from the raw usage_records ledger. */
+export interface UsageDeployment {
+  deployment: string;
+  requests: number;
+  errors: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  avg_latency_ms: number | null;
+  p95_latency_ms: number | null;
+  last_used_at: string | null;
+}
+
+export interface UsageSummaryView {
+  window: UsageWindow;
+  deployments: UsageDeployment[];
+}
+
+/** Per-deployment usage over a bounded window (requests, errors, tokens
+ * in/out, avg+p95 latency, last used). Rows are written by the serving
+ * surfaces themselves (chat/embed/rerank/extract); no DATABASE_URL degrades
+ * to an empty listing, same contract as the other Studio listings. */
+export function getUsageSummary(window: UsageWindow): Promise<UsageSummaryView> {
+  return request<UsageSummaryView>(`/v1/studio/usage?window=${encodeURIComponent(window)}`);
+}

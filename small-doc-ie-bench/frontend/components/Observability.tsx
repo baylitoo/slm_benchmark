@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback, useEffect, useState } from "react";
 import {
   BarChart3,
   ExternalLink,
@@ -8,17 +9,22 @@ import {
   ClipboardCheck,
   HardDrive,
   Activity,
+  TrendingUp,
 } from "lucide-react";
 import { GRAFANA_URL, GRAFANA_DASHBOARD_URL, INNGEST_URL, METRICS_URL } from "@/lib/env";
 import {
   getReviewMetrics,
   getOcrCacheStats,
   getActivity,
+  getUsageSummary,
   ApiError,
   type ReviewMetricsView,
   type OcrCacheStatsView,
   type ActivityEntry,
   type ActivityView,
+  type UsageDeployment,
+  type UsageSummaryView,
+  type UsageWindow,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Card, Badge } from "./ui";
@@ -28,6 +34,9 @@ import { T } from "@/lib/i18n";
 const REVIEW_POLL_MS = 10000;
 const OCR_CACHE_POLL_MS = 15000;
 const ACTIVITY_POLL_MS = 15000;
+const USAGE_POLL_MS = 15000;
+
+const USAGE_WINDOWS: UsageWindow[] = ["24h", "7d", "30d"];
 
 /**
  * Observability = external tooling: quick-link tiles (Grafana / Inngest /
@@ -97,6 +106,7 @@ export function Observability({
           <OcrCacheCard active={active} />
           <ActivityCard active={active} onNavigate={onNavigate} />
         </div>
+        <UsageCard active={active} />
         <Card
           title="Small Document IE Benchmark"
           subtitle="Agent requests, PII detections, latency, and gate blocks — live from Prometheus."
@@ -359,6 +369,175 @@ function ActivityCard({
               +{entries.length - shown.length} more
             </p>
           )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** Compact token/request count: 950 -> "950", 12_400 -> "12.4k", 3_200_000 -> "3.2M". */
+export function formatCount(value: number): string {
+  if (value < 1000) return `${value}`;
+  if (value < 1_000_000) return `${(value / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+function formatLatency(ms: number | null): string {
+  if (ms == null) return "n/a";
+  if (ms >= 10_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms)}ms`;
+}
+
+function totalTokens(entry: UsageDeployment): number {
+  return entry.prompt_tokens + entry.completion_tokens;
+}
+
+// Exported for Observability.test.tsx -- rendered only by this page.
+export function UsageCard({ active }: { active: boolean }) {
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>("24h");
+  const fetchUsage = useCallback(() => getUsageSummary(usageWindow), [usageWindow]);
+  const usage = usePolling<UsageSummaryView>(fetchUsage, USAGE_POLL_MS, active);
+  const { refresh } = usage;
+  // usePolling keeps the latest fetch closure in a ref but only re-arms its
+  // interval on interval/enabled changes -- switching the window needs an
+  // immediate refetch, not a wait for the next tick.
+  useEffect(() => {
+    refresh();
+  }, [usageWindow, refresh]);
+
+  const entries = usage.data?.deployments ?? [];
+  const maxTokens = Math.max(1, ...entries.map(totalTokens));
+  const anyTokens = entries.some((entry) => totalTokens(entry) > 0);
+
+  return (
+    <Card
+      icon={<TrendingUp className="h-5 w-5" />}
+      title="Usage"
+      subtitle="Per-deployment traffic from the durable usage ledger — every chat, embeddings, rerank and extract request served, aggregated over the selected window."
+      actions={
+        <div className="flex items-center gap-1 rounded-md border border-border bg-muted p-0.5">
+          {USAGE_WINDOWS.map((candidate) => (
+            <button
+              key={candidate}
+              type="button"
+              onClick={() => setUsageWindow(candidate)}
+              aria-pressed={usageWindow === candidate}
+              className={`rounded px-2 py-0.5 text-xs font-medium transition ${
+                usageWindow === candidate
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {candidate}
+            </button>
+          ))}
+        </div>
+      }
+    >
+      {usage.error ? (
+        <p className="text-sm text-muted-foreground">
+          Couldn&apos;t load usage. Is the API reachable?
+        </p>
+      ) : usage.loading ? (
+        <p className="text-sm text-muted-foreground"><T>Loading…</T></p>
+      ) : entries.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          <T>No usage recorded in this window yet — a row is written each time a request is served (chat, embeddings, rerank or extract). Recording needs DATABASE_URL set on the API.</T>
+        </p>
+      ) : (
+        <div className="space-y-4">
+          {anyTokens && (
+            <div className="space-y-1.5">
+              <p className="text-xs font-medium text-muted-foreground">
+                <T>Token volume (in + out)</T>
+              </p>
+              {entries.map((entry) => (
+                <div key={entry.deployment} className="flex items-center gap-2 text-xs">
+                  <span
+                    className="w-40 shrink-0 truncate font-medium text-foreground"
+                    title={entry.deployment}
+                  >
+                    {entry.deployment}
+                  </span>
+                  <div className="h-3 flex-1 overflow-hidden rounded-sm bg-muted">
+                    {/* Two-segment CSS bar: prompt (solid) + completion
+                        (translucent), both scaled against the busiest
+                        deployment so the rows compare visually. */}
+                    <div
+                      className="flex h-full"
+                      style={{ width: `${Math.max(1, (totalTokens(entry) / maxTokens) * 100)}%` }}
+                    >
+                      <div
+                        className="h-full bg-accent"
+                        style={{
+                          width: `${totalTokens(entry) > 0 ? (entry.prompt_tokens / totalTokens(entry)) * 100 : 0}%`,
+                        }}
+                      />
+                      <div className="h-full flex-1 bg-accent/50" />
+                    </div>
+                  </div>
+                  <span className="w-14 shrink-0 text-right tabular-nums text-muted-foreground">
+                    {formatCount(totalTokens(entry))}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-left text-sm">
+              <thead>
+                <tr className="border-b border-border text-xs text-muted-foreground">
+                  <th className="py-1.5 pr-3 font-medium"><T>Deployment</T></th>
+                  <th className="py-1.5 pr-3 text-right font-medium"><T>Requests</T></th>
+                  <th className="py-1.5 pr-3 text-right font-medium"><T>Errors</T></th>
+                  <th className="py-1.5 pr-3 text-right font-medium"><T>Tokens in</T></th>
+                  <th className="py-1.5 pr-3 text-right font-medium"><T>Tokens out</T></th>
+                  <th className="py-1.5 pr-3 text-right font-medium"><T>Avg latency</T></th>
+                  <th className="py-1.5 pr-3 text-right font-medium"><T>p95</T></th>
+                  <th className="py-1.5 text-right font-medium"><T>Last used</T></th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((entry) => (
+                  <tr key={entry.deployment} className="border-b border-border/60 last:border-0">
+                    <td className="max-w-[220px] truncate py-1.5 pr-3 font-medium text-foreground">
+                      {entry.deployment}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums">
+                      {formatCount(entry.requests)}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums">
+                      {entry.errors > 0 ? (
+                        <Badge tone="err">{formatCount(entry.errors)}</Badge>
+                      ) : (
+                        <span className="text-muted-foreground">0</span>
+                      )}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums">
+                      {formatCount(entry.prompt_tokens)}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums">
+                      {formatCount(entry.completion_tokens)}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums">
+                      {formatLatency(entry.avg_latency_ms)}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums">
+                      {formatLatency(entry.p95_latency_ms)}
+                    </td>
+                    <td className="py-1.5 text-right text-xs text-muted-foreground">
+                      {entry.last_used_at
+                        ? `${formatAge(secondsAgo(entry.last_used_at))} ago`
+                        : "n/a"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            <T>Streamed chats count requests and latency but not tokens (the proxy relays raw bytes without parsing usage).</T>
+          </p>
         </div>
       )}
     </Card>
