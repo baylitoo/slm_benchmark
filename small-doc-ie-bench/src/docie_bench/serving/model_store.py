@@ -110,6 +110,10 @@ class FamilyContract:
     # ``reranker`` (a GGUF served by llama-server --reranking): same API
     # surface, different runtime and artifact shape.
     multi_vector: bool = False
+    # A faster-whisper/CTranslate2 snapshot served by the ASR runtime. These
+    # repositories use model.bin rather than safetensors, but otherwise share
+    # the canonical atomic snapshot path and lifecycle.
+    asr: bool = False
     stop_sequences: tuple[str, ...] = ()
     # Generation defaults inherited by a family-synthesized profile (a store deploy
     # whose served id matches no models.yaml profile). These are the single source
@@ -135,7 +139,7 @@ class FamilyContract:
         the third) means one flag here, not a widened disjunction at every
         call site.
         """
-        return self.analyzer or self.transformers_runtime or self.multi_vector
+        return self.analyzer or self.transformers_runtime or self.multi_vector or self.asr
 
 
 # Known families. Adding a new model is "drop the GGUF + pick (or add) a family".
@@ -294,6 +298,15 @@ FAMILIES: dict[str, FamilyContract] = {
         response_format_style="none",
         prompt_profile="strict_extraction_v1",
         multi_vector=True,
+        ollama_faithful=False,
+    ),
+    "asr_whisper": FamilyContract(
+        name="asr_whisper",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        asr=True,
+        default_timeout_seconds=600.0,
         ollama_faithful=False,
     ),
     # Encoder analyzers (safetensors checkpoints served by the encoder runtime,
@@ -659,14 +672,19 @@ class ModelStore:
         if not contract.snapshot:
             raise ModelStoreError(
                 f"add_snapshot is for snapshot families (analyzer / transformers / "
-                f"multi_vector); {family!r} is not one"
+                f"multi_vector / asr); {family!r} is not one"
             )
         src = Path(snapshot_dir)
         if not src.is_dir():
             raise ModelStoreError(f"snapshot directory not found: {src}")
-        if not any(p.suffix == ".safetensors" for p in src.rglob("*") if p.is_file()):
+        has_safetensors = any(
+            p.suffix == ".safetensors" for p in src.rglob("*") if p.is_file()
+        )
+        has_ctranslate2 = (src / "model.bin").is_file()
+        if not has_safetensors and not (contract.asr and has_ctranslate2):
             raise ModelStoreError(
-                f"snapshot {src} has no .safetensors weights — not a servable checkpoint"
+                f"snapshot {src} has no compatible weights — expected .safetensors"
+                + (" or faster-whisper model.bin" if contract.asr else "")
             )
         _assert_within(self.root / name, self.root, label=f"store name {name!r}")
 

@@ -39,7 +39,7 @@ def record_placement(model_name: str, record: object) -> None:
     runtime_label = str(getattr(runtime, "value", runtime))
     engine = (
         runtime_label
-        if runtime_label in {"encoder", "transformers", "multi_vector"}
+        if runtime_label in {"encoder", "transformers", "multi_vector", "asr"}
         else "llama-server"
     )
     try:

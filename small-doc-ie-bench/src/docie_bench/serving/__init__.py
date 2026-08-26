@@ -1,4 +1,5 @@
 from docie_bench.serving.runtime import (
+    ASRRuntime,
     HealthResult,
     LifecycleState,
     LlamaCppRuntime,
@@ -26,6 +27,7 @@ from docie_bench.serving.supervisor import (
 )
 
 __all__ = [
+    "ASRRuntime",
     "DeploymentRecord",
     "DeploymentSpec",
     "DesiredState",

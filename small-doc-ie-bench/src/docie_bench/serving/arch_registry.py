@@ -261,6 +261,7 @@ def resolve_family(
     has_gguf: bool,
     has_safetensors: bool,
     has_mmproj: bool,
+    has_ctranslate2: bool = False,
     repo_id: str | None = None,
     tags: tuple[str, ...] = (),
     pipeline_tag: str | None = None,
@@ -289,6 +290,25 @@ def resolve_family(
         base_model=base_model,
         library_name=library_name,
     )
+
+    # Whisper ASR needs the CTranslate2 conversion consumed by faster-whisper,
+    # not the original transformers safetensors checkpoint. Requiring the
+    # concrete model.bin artifact prevents a plausible-looking deploy that can
+    # never load in the managed runtime.
+    is_asr = pipeline_tag == "automatic-speech-recognition" or arch == "whisper"
+    if is_asr:
+        if has_ctranslate2:
+            return SupportVerdict(
+                "supported",
+                "asr_whisper",
+                "Whisper automatic-speech-recognition (CTranslate2 snapshot)",
+            )
+        return SupportVerdict(
+            "needs_family",
+            "asr_whisper",
+            "Whisper ASR detected, but this repository has no faster-whisper "
+            "CTranslate2 model.bin; select a converted checkpoint",
+        )
 
     # Encoder analyzers are detected by the gliner marker, not a base arch
     # (GLiNER2's base is mdeberta but that is NOT what we serve it as). These

@@ -6,9 +6,9 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.api
       args:
-        # The public API owns /v1/audio/transcriptions, so only this image opts
-        # into faster-whisper/CTranslate2. Other services stay lightweight.
-        PIP_EXTRAS: "ocr,mcp,asr"
+        # The public API proxies transcription to a managed serving deployment;
+        # it never loads faster-whisper weights in an API replica.
+        PIP_EXTRAS: "ocr,mcp"
     env_file: .env
     environment:
       # Construct the container-network URL here instead of relying on a
@@ -45,8 +45,6 @@ services:
       - ./runs:/app/runs
       - ./annotations:/app/annotations
       - ocr-cache:/app/.cache/ocr
-      # faster-whisper/Hugging Face model downloads survive api rebuilds.
-      - asr-cache:/root/.cache/huggingface
       - serving-state:/app/.serving
       # Durable artifact store shared with the worker: the worker writes
       # report.html/predictions.jsonl here and the api serves them back by id,
@@ -169,10 +167,9 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.api
       args:
-        # Encoder deployments (runtime: "encoder", e.g. the GLiNER PII guard)
-        # spawn inside THIS container — it needs the analyzer library. Other
-        # services keep the light "ocr" default.
-        PIP_EXTRAS: "ocr,encoders"
+        # Managed encoder and ASR deployments spawn inside this single serving
+        # node, so their optional runtimes belong here rather than in API replicas.
+        PIP_EXTRAS: "ocr,encoders,asr"
         # llama.cpp pin: the serving container holds the llama-server that
         # actually serves deployed models. Set LLAMA_REF in .env to a commit/
         # tag to rebuild llama.cpp at that pin (reproducible + picks up new
@@ -453,7 +450,6 @@ volumes:
   postgres-data:
   grafana-data:
   ocr-cache:
-  asr-cache:
   redis-data:
   serving-state:
   artifact-store:
