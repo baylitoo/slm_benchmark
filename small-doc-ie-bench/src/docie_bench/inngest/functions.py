@@ -1715,7 +1715,9 @@ async def _run_seed_hf(
                     )
             try:
                 async with httpx.AsyncClient(transport=transport) as client:
-                    snap_files = await list_snapshot_files(repo, client=client)
+                    snap_files = await list_snapshot_files(
+                        repo, client=client, allow_ctranslate2=contract.asr
+                    )
                     await publish(
                         channel,
                         TOPIC_STATUS,

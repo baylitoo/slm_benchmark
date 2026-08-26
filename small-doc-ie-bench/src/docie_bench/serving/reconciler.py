@@ -146,6 +146,7 @@ _ENGINE_BY_RUNTIME: dict[RuntimeKind, str] = {
     RuntimeKind.ENCODER: "encoder",
     RuntimeKind.TRANSFORMERS: "transformers",
     RuntimeKind.MULTI_VECTOR: "multi_vector",
+    RuntimeKind.ASR: "asr",
 }
 
 

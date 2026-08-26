@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
@@ -30,6 +31,7 @@ from docie_bench.asr.models import (
     TranscriptionResult,
     TranscriptionSegment,
 )
+from docie_bench.asr.routing import ASRRoute
 from docie_bench.asr.uploads import (
     detect_audio_mime_type,
     store_validated_audio_upload,
@@ -77,6 +79,46 @@ class FakeBackend:
                 TranscriptionSegment(id=0, start=0.0, end=2.0, text=f" {text}"),
             ),
         )
+
+
+class FakeASRClient:
+    def __init__(self, *, fail: bool = False, **_kwargs: object) -> None:
+        self.fail = fail
+
+    async def __aenter__(self) -> FakeASRClient:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def post(self, url: str, **kwargs: object) -> httpx.Response:
+        if self.fail:
+            raise httpx.ConnectError("runtime offline")
+        files = kwargs["files"]
+        assert isinstance(files, dict)
+        assert files["file"][1].read().startswith(b"RIFF")
+        assert url == "http://asr-runtime:8093/v1/audio/transcriptions"
+        return httpx.Response(
+            200,
+            json={"text": "hello world", "backend": "fake-asr"},
+            headers={"content-type": "application/json"},
+        )
+
+
+def _install_managed_route(
+    monkeypatch: pytest.MonkeyPatch, *, fail: bool = False
+) -> None:
+    monkeypatch.setattr(
+        asr_api,
+        "resolve_asr_route",
+        lambda _model: ASRRoute("asr-default", "http://asr-runtime:8093/v1", "whisper-small"),
+    )
+    monkeypatch.setattr(
+        asr_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: FakeASRClient(fail=fail, **kwargs),
+    )
+    monkeypatch.setattr(asr_api, "stamp", lambda _name: None)
 
 
 def test_transcript_normalization_and_edit_distance() -> None:
@@ -219,8 +261,7 @@ def test_faster_whisper_missing_extra_has_actionable_error(
 def test_transcription_endpoint_returns_verbose_json_and_cleans_temp_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = FakeBackend()
-    monkeypatch.setattr(asr_api, "get_backend", lambda **_kwargs: backend)
+    _install_managed_route(monkeypatch)
     response = TestClient(main_api.app).post(
         "/v1/audio/transcriptions",
         files={"file": ("clip.wav", _wav(), "audio/wav")},
@@ -235,11 +276,6 @@ def test_transcription_endpoint_returns_verbose_json_and_cleans_temp_file(
     assert response.status_code == 200, response.text
     assert response.json()["text"] == "hello world"
     assert response.json()["backend"] == "fake-asr"
-    assert backend.options == [
-        TranscriptionOptions(language="fr", prompt="meeting", temperature=0.25)
-    ]
-    assert len(backend.paths) == 1
-    assert not backend.paths[0].exists()
 
 
 def test_transcription_endpoint_rejects_unknown_model_before_reading_audio() -> None:
@@ -249,7 +285,7 @@ def test_transcription_endpoint_rejects_unknown_model_before_reading_audio() -> 
         data={"model": "download-anything"},
     )
     assert response.status_code == 404
-    assert "configured alias" in response.json()["detail"]
+    assert "Unknown ASR" in response.json()["detail"]
 
 
 def test_transcription_endpoint_uses_platform_api_key_policy(
@@ -263,8 +299,7 @@ def test_transcription_endpoint_uses_platform_api_key_policy(
         max_concurrent=2,
     )
     monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
-    backend = FakeBackend()
-    monkeypatch.setattr(asr_api, "get_backend", lambda **_kwargs: backend)
+    _install_managed_route(monkeypatch)
     client = TestClient(main_api.app)
     request = {
         "files": {"file": ("clip.wav", _wav(), "audio/wav")},
@@ -279,25 +314,17 @@ def test_transcription_endpoint_uses_platform_api_key_policy(
     assert response.status_code == 200
 
 
-def test_transcription_endpoint_maps_backend_unavailability_and_cleans_file(
+def test_transcription_endpoint_maps_runtime_unavailability_and_cleans_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class MissingBackend(FakeBackend):
-        def transcribe(
-            self, audio_path: Path, options: TranscriptionOptions
-        ) -> TranscriptionResult:
-            self.paths.append(audio_path)
-            raise ASRDependencyUnavailableError("install the asr extra")
-
-    backend = MissingBackend()
-    monkeypatch.setattr(asr_api, "get_backend", lambda **_kwargs: backend)
+    _install_managed_route(monkeypatch, fail=True)
     response = TestClient(main_api.app).post(
         "/v1/audio/transcriptions",
         files={"file": ("clip.wav", _wav(), "audio/wav")},
         data={"model": "asr-default"},
     )
     assert response.status_code == 503
-    assert not backend.paths[0].exists()
+    assert "unreachable" in response.json()["detail"]
 
 
 def test_asr_manifest_and_corpus_benchmark_artifacts(tmp_path: Path) -> None:

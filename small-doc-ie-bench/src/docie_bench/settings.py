@@ -101,18 +101,17 @@ class Settings(BaseSettings):
     ocr_language: str | None = None
     runs_dir: Path = Path("runs")
 
-    # First-class speech-to-text. The API accepts only this configured model
-    # (or its public alias), so an untrusted multipart request cannot trigger an
-    # arbitrary Hugging Face download. faster-whisper itself remains an
-    # optional dependency and is imported only on the first transcription.
+    # First-class speech-to-text. ASR_MODEL is the host-native CLI default;
+    # public requests resolve only to ready, managed ASR deployments. The
+    # serving node owns faster-whisper and model memory, never API replicas.
     asr_model: str = "small"
-    asr_model_alias: str = "asr-default"
     asr_device: Literal["cpu", "cuda", "auto"] = "cpu"
     asr_compute_type: str = "int8"
     asr_cpu_threads: int = Field(default=0, ge=0, le=256)
     asr_num_workers: int = Field(default=1, ge=1, le=32)
     asr_beam_size: int = Field(default=5, ge=1, le=100)
     asr_vad_filter: bool = True
+    asr_timeout_seconds: float = Field(default=600.0, gt=0.0, le=7_200.0)
     asr_max_upload_mb: int = Field(default=25, ge=1, le=1_024)
     asr_allowed_upload_mime_types: str = (
         "audio/flac,audio/mp4,audio/mpeg,audio/ogg,audio/wav,audio/webm"

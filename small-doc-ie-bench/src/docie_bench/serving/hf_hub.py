@@ -227,6 +227,8 @@ def _runtime_for_family(family: str | None, *, has_gguf: bool) -> str | None:
         return "transformers"
     if contract.multi_vector:
         return "multi_vector"
+    if contract.asr:
+        return "asr"
     return "llama.cpp"
 
 
@@ -450,7 +452,7 @@ def _content_total(response: httpx.Response, *, offset: int) -> int | None:
 # encoder runtime loads safetensors, so pulling .bin/.onnx/.h5 doubles the
 # download for nothing.
 _SNAPSHOT_SKIP_SUFFIXES = frozenset(
-    {".gguf", ".bin", ".pt", ".pth", ".h5", ".onnx", ".msgpack", ".tflite", ".ot"}
+    {".gguf", ".pt", ".pth", ".h5", ".onnx", ".msgpack", ".tflite", ".ot"}
 )
 _SNAPSHOT_SKIP_DIRS = ("onnx/", "openvino/", "coreml/", "tflite/")
 
@@ -460,6 +462,8 @@ def _is_snapshot_file(filename: str) -> bool:
     if any(lower.startswith(prefix) or f"/{prefix}" in lower for prefix in _SNAPSHOT_SKIP_DIRS):
         return False
     suffix = filename[filename.rfind(".") :].lower() if "." in filename else ""
+    if suffix == ".bin" and lower != "model.bin":
+        return False
     return suffix not in _SNAPSHOT_SKIP_SUFFIXES
 
 
@@ -483,7 +487,9 @@ def _snapshot_files_from_siblings(siblings: list[dict[str, Any]]) -> list[HfGguf
     return files
 
 
-async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[HfGgufFile]:
+async def list_snapshot_files(
+    repo: str, *, client: httpx.AsyncClient, allow_ctranslate2: bool = False
+) -> list[HfGgufFile]:
     """The repo's safetensors-checkpoint files (weights + config + tokenizer).
 
     Reuses the same ``?blobs=true`` metadata as :func:`list_repo_ggufs` but keeps
@@ -512,10 +518,10 @@ async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[H
     has_safetensors = any(
         file.filename.lower().endswith(".safetensors") for file in files
     )
-    if not has_safetensors:
-        raise HfHubError(
-            f"repo {repo!r} ships no safetensors weights — not an encoder checkpoint"
-        )
+    has_ctranslate2 = any(file.filename.lower() == "model.bin" for file in files)
+    if not has_safetensors and not (allow_ctranslate2 and has_ctranslate2):
+        expected = "safetensors or CTranslate2 model.bin" if allow_ctranslate2 else "safetensors"
+        raise HfHubError(f"repo {repo!r} ships no {expected} weights")
     return files
 
 
@@ -656,6 +662,10 @@ async def search_models(
         architecture = _extract_architecture(item)
         has_gguf = bool(item.get("gguf")) or "gguf" in tags
         has_safetensors = bool(item.get("safetensors")) or "safetensors" in tags
+        has_ctranslate2 = (
+            "faster-whisper" in str(repo_id).lower()
+            or str(item.get("library_name") or "").lower() == "ctranslate2"
+        )
         # The list can't see the projector file; approximate for the PRELIM
         # verdict so a vision repo isn't wrongly flagged "needs mmproj" here.
         # inspect_repo reads the real file list and corrects it on select.
@@ -670,6 +680,7 @@ async def search_models(
             has_gguf=has_gguf,
             has_safetensors=has_safetensors,
             has_mmproj=has_mmproj,
+            has_ctranslate2=has_ctranslate2,
             repo_id=str(repo_id),
             tags=tuple(tags),
             pipeline_tag=str(pipe) if pipe else None,
@@ -791,6 +802,9 @@ async def inspect_repo(
         str(s.get("rfilename", "")).endswith(".safetensors") for s in siblings
     )
     has_mmproj = any(g.is_mmproj for g in ggufs)
+    has_ctranslate2 = any(
+        str(s.get("rfilename", "")).lower() == "model.bin" for s in siblings
+    )
 
     architecture = _extract_architecture(payload)
     # Custom-code detection: a safetensors checkpoint with an `auto_map` (or an
@@ -817,6 +831,7 @@ async def inspect_repo(
         has_gguf=has_gguf,
         has_safetensors=has_safetensors,
         has_mmproj=has_mmproj,
+        has_ctranslate2=has_ctranslate2,
         repo_id=repo,
         tags=tuple(tags),
         pipeline_tag=str(pipe) if pipe else None,

@@ -311,6 +311,40 @@ def create_app(
         typer.echo(f"docie multi-vector [{model}] -> http://{host}:{port}/v1")
         uvicorn.run(create_multi_vector_app(model_id=model), host=host, port=port)
 
+    @app.command("asr-runtime", hidden=True)
+    def asr_runtime(
+        model: str = typer.Option(..., help="Local faster-whisper snapshot or model id."),
+        alias: str = typer.Option(..., help="Served OpenAI model id."),
+        host: str = typer.Option("127.0.0.1", help="Bind address."),
+        port: int = typer.Option(8093, min=1, max=65535),
+        device: str = typer.Option("cpu"),
+        compute_type: str = typer.Option("int8", "--compute-type"),
+        cpu_threads: int = typer.Option(0, min=0, max=256),
+        num_workers: int = typer.Option(1, min=1, max=32),
+        beam_size: int = typer.Option(5, min=1, max=100),
+        vad_filter: bool = typer.Option(True, "--vad-filter/--no-vad-filter"),
+    ) -> None:
+        """Serve one managed ASR model on /v1/audio/transcriptions."""
+        import uvicorn
+
+        from docie_bench.asr.server import create_asr_app
+
+        typer.echo(f"docie ASR [{alias}] -> http://{host}:{port}/v1")
+        uvicorn.run(
+            create_asr_app(
+                model_id=model,
+                alias=alias,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
+                beam_size=beam_size,
+                vad_filter=vad_filter,
+            ),
+            host=host,
+            port=port,
+        )
+
     return app
 
 

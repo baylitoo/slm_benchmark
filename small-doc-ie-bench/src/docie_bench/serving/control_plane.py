@@ -975,6 +975,18 @@ class _DefaultSupervisor:
             # /v1/rerank. The snapshot dir is the model; no extra flags.
             runtime_kind = RuntimeKind.MULTI_VECTOR
             launch_extra_args = ()
+        elif contract.asr:
+            from docie_bench.settings import get_settings
+
+            asr_settings = get_settings()
+            runtime_kind = RuntimeKind.ASR
+            launch_extra_args = (
+                "--num-workers",
+                str(asr_settings.asr_num_workers),
+                "--beam-size",
+                str(asr_settings.asr_beam_size),
+                "--vad-filter" if asr_settings.asr_vad_filter else "--no-vad-filter",
+            )
         else:
             runtime_kind = RuntimeKind.LLAMACPP
             launch_extra_args = store.family_launch_args(name)
@@ -991,6 +1003,11 @@ class _DefaultSupervisor:
                     port=chosen,
                     context_length=context_length,
                     max_tokens=max_tokens,
+                    device=(asr_settings.asr_device if contract.asr else "auto"),
+                    dtype=(asr_settings.asr_compute_type if contract.asr else "auto"),
+                    cpu_threads=(
+                        asr_settings.asr_cpu_threads or None if contract.asr else None
+                    ),
                     extra_args=launch_extra_args,
                 ),
                 bind_host=bind_host,

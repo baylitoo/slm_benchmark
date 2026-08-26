@@ -93,6 +93,11 @@ class FasterWhisperBackend:
                 ) from exc
             return self._model
 
+    def load(self) -> None:
+        """Load model weights now so runtime readiness is truthful."""
+
+        self._load_model()
+
     def transcribe(
         self,
         audio_path: Path,

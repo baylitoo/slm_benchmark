@@ -28,6 +28,7 @@ class RuntimeKind(StrEnum):
     ENCODER = "encoder"
     TRANSFORMERS = "transformers"
     MULTI_VECTOR = "multi_vector"
+    ASR = "asr"
 
 
 class LifecycleState(StrEnum):
@@ -46,6 +47,7 @@ class RuntimeFeature(StrEnum):
     STRUCTURED_OUTPUT = "structured_output"
     TOOL_CALLS = "tool_calls"
     VISION = "vision"
+    TRANSCRIPTION = "transcription"
 
 
 class RuntimeConfigurationError(ValueError):
@@ -807,6 +809,63 @@ class MultiVectorRuntime(RuntimeAdapter):
         )
 
 
+class ASRRuntime(RuntimeAdapter):
+    """Launch a model-pinned faster-whisper transcription runtime."""
+
+    kind = RuntimeKind.ASR
+    executable_names = ("docie", "docie-serving")
+    health_path = "/healthz"
+    features = frozenset({RuntimeFeature.TRANSCRIPTION})
+
+    def resolve_executable(self, spec: RuntimeLaunchSpec) -> str | None:
+        return super().resolve_executable(spec) or sys.executable
+
+    def detect_version(self, executable: str) -> str | None:
+        try:
+            return f"faster-whisper {importlib.metadata.version('faster-whisper')}"
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    def probe(self, spec: RuntimeLaunchSpec) -> RuntimeCapabilities:
+        capabilities = super().probe(spec)
+        if importlib.util.find_spec("faster_whisper") is None:
+            return replace(
+                capabilities,
+                compatible=False,
+                reasons=(
+                    *capabilities.reasons,
+                    "faster-whisper is not installed on the serving node "
+                    "(pip install 'small-doc-ie-bench[asr]')",
+                ),
+            )
+        return capabilities
+
+    def build_command(self, spec: RuntimeLaunchSpec) -> tuple[str, ...]:
+        self.validate(spec)
+        found = RuntimeAdapter.resolve_executable(self, spec)
+        base = (found,) if found else (sys.executable, "-m", "docie_bench.serving.cli")
+        command = [
+            *base,
+            "asr-runtime",
+            "--model",
+            spec.model,
+            "--alias",
+            spec.alias,
+            "--host",
+            spec.host,
+            "--port",
+            str(spec.port),
+            "--device",
+            spec.device,
+            "--compute-type",
+            spec.dtype,
+        ]
+        if spec.cpu_threads is not None:
+            command.extend(("--cpu-threads", str(spec.cpu_threads)))
+        command.extend(spec.extra_args)
+        return tuple(command)
+
+
 def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
     return {
         RuntimeKind.VLLM: VLLMRuntime(),
@@ -816,6 +875,7 @@ def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
         RuntimeKind.ENCODER: EncoderRuntime(),
         RuntimeKind.TRANSFORMERS: TransformersRuntime(),
         RuntimeKind.MULTI_VECTOR: MultiVectorRuntime(),
+        RuntimeKind.ASR: ASRRuntime(),
     }
 
 
