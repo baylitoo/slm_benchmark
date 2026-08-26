@@ -27,11 +27,13 @@ import {
   Download,
   FileStack,
   Wrench,
+  AudioLines,
   type LucideIcon,
 } from "lucide-react";
 
 export type SectionId =
   | "playground"
+  | "asr"
   | "deploy"
   | "agents"
   | "benchmark"
@@ -64,6 +66,10 @@ export const NAV_GROUPS: NavGroup[] = [
       { id: "deploy", label: "MCP Tools", icon: Wrench, view: "mcp" },
       { id: "deploy", label: "Sizing", icon: Gauge, view: "sizing" },
     ],
+  },
+  {
+    heading: "Audio",
+    items: [{ id: "asr", label: "Speech to text", icon: AudioLines }],
   },
   {
     heading: "Agents",
@@ -100,9 +106,10 @@ export const NAV_GROUPS: NavGroup[] = [
   },
 ];
 
-/** The SIX unique sections — the single source of truth for the mount loop. */
+/** Unique sections — the single source of truth for the mount loop. */
 export const SECTIONS: SectionId[] = [
   "playground",
+  "asr",
   "deploy",
   "agents",
   "benchmark",
@@ -113,6 +120,7 @@ export const SECTIONS: SectionId[] = [
 /** Default sub-view applied when a section is entered via a view-less path. */
 export const DEFAULT_VIEW: Record<SectionId, string> = {
   playground: "",
+  asr: "",
   deploy: "deployments",
   agents: "catalog",
   benchmark: "run",

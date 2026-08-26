@@ -9,6 +9,7 @@ import { Agents } from "./Agents";
 import { Benchmark } from "./Benchmark";
 import { Review } from "./Review";
 import { Observability } from "./Observability";
+import { ASRWorkspace } from "./ASRWorkspace";
 import { Sidebar } from "./shell/Sidebar";
 import { TopBar } from "./shell/TopBar";
 import { SectionActivityProvider } from "./shell/SectionActivity";
@@ -86,7 +87,7 @@ export function AppShell() {
 
         <main className="flex-1 overflow-y-auto bg-background">
           <div className="px-6 py-5">
-            {/* All SIX sections stay mounted; only the active one is shown so a
+            {/* All sections stay mounted; only the active one is shown so a
                 running extraction / deploy / benchmark survives nav changes.
                 Iterates the de-duped SECTIONS list — never the grouped nav —
                 so each section (and its pollers) mounts exactly once. The
@@ -102,6 +103,7 @@ export function AppShell() {
                   {id === "playground" && (
                     <Playground active={active === "playground"} onNavigate={onNavigate} />
                   )}
+                  {id === "asr" && <ASRWorkspace active={active === "asr"} />}
                   {id === "deploy" && (
                     <Deploy
                       active={active === "deploy"}
