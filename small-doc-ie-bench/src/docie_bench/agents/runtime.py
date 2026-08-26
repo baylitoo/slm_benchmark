@@ -102,6 +102,8 @@ async def complete_agent(
         return await _complete_ocr(spec, body, http_client=http_client)
     if spec.kind == "proxy_security":
         return await _complete_proxy(spec, body, http_client=http_client)
+    if spec.kind == "workflow":
+        return await _complete_workflow(spec, body, http_client=http_client)
     return await _complete_custom(spec, body, http_client=http_client)
 
 
@@ -875,6 +877,112 @@ async def _complete_with_tools(
     # possibility here.
     assert isinstance(completion, dict)
     return completion, tool_call_trace
+
+
+def _resolve_workflow_steps(spec: AgentSpec) -> list[dict[str, Any]]:
+    """``options.steps`` — a non-empty, ORDERED list of
+    ``{model_profile, system_prompt?, mcp_servers?, mcp_tools?}`` steps
+    (#265). Each step's shape mirrors a ``custom`` agent's own
+    model_profile/options exactly, so the SAME per-step spec can drive
+    ``_resolve_mcp_servers``/``_complete_with_tools``/``_forward_chat``
+    unchanged (see ``_complete_workflow``)."""
+    raw = spec.options.get("steps")
+    if not isinstance(raw, list) or not raw:
+        raise AgentError(
+            f"agent {spec.name!r}: options.steps must be a non-empty list of "
+            "{model_profile, system_prompt?, mcp_servers?, mcp_tools?} steps",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    steps: list[dict[str, Any]] = []
+    for index, raw_step in enumerate(raw):
+        if not isinstance(raw_step, dict) or not raw_step.get("model_profile"):
+            raise AgentError(
+                f"agent {spec.name!r}: options.steps[{index}] must be an object "
+                "with a non-empty model_profile",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        steps.append(raw_step)
+    return steps
+
+
+def _message_content(completion: dict[str, Any]) -> str | None:
+    choices = completion.get("choices")
+    message = (
+        choices[0].get("message")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+        else None
+    )
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, str) else None
+
+
+async def _complete_workflow(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> dict[str, Any]:
+    """A ``workflow`` agent (#265): a fixed, ORDERED sequence of steps, each
+    its own model_profile + prompt (+ optional MCP tools from #259), run
+    server-side in one request — the "prompt chaining" pattern, deliberately
+    narrow so a small (350M-class) model handles one well-scoped sub-task
+    per step instead of the whole request in one shot.
+
+    Step 1 receives the caller's own messages unchanged; each LATER step
+    receives only the PREVIOUS step's answer as its single user message —
+    not the accumulated history, not the original request. Usage sums
+    across every step (same contract the MCP tool loop already uses); every
+    step's own model/content and any tool calls it made ride
+    ``docie_agent.steps``/``docie_agent.tool_calls`` for the "Try it" trace
+    view (#262).
+    """
+    steps = _resolve_workflow_steps(spec)
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    step_trace: list[dict[str, Any]] = []
+    tool_call_trace: list[dict[str, Any]] = []
+    previous_content: str | None = None
+    completion: dict[str, Any] | None = None
+    for index, step in enumerate(steps):
+        step_spec = spec.model_copy(
+            update={
+                "model_profile": step["model_profile"],
+                "system_prompt": step.get("system_prompt"),
+                "options": {
+                    "mcp_servers": step.get("mcp_servers"),
+                    "mcp_tools": step.get("mcp_tools"),
+                },
+            }
+        )
+        step_body = (
+            dict(body)
+            if index == 0
+            else {"messages": [{"role": "user", "content": previous_content or ""}]}
+        )
+        server_names = _resolve_mcp_servers(step_spec)
+        if server_names:
+            completion, step_tool_calls = await _complete_with_tools(
+                step_spec, step_body, server_names, http_client=http_client
+            )
+            tool_call_trace.extend(step_tool_calls)
+        else:
+            completion = await _forward_chat(step_spec, step_body, http_client=http_client)
+        usage = completion.get("usage")
+        if isinstance(usage, dict):
+            for key in totals:
+                value = usage.get(key)
+                if isinstance(value, int):
+                    totals[key] += value
+        previous_content = _message_content(completion)
+        step_trace.append(
+            {"step": index, "model_profile": step["model_profile"], "content": previous_content}
+        )
+    assert completion is not None  # _resolve_workflow_steps guarantees >=1 step
+    docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind, "steps": step_trace}
+    if tool_call_trace:
+        docie_agent["tool_calls"] = tool_call_trace
+    final = dict(completion)
+    final["usage"] = totals
+    final["docie_agent"] = docie_agent
+    return final
 
 
 def _build_policy_router(spec: AgentSpec, policy_name: str) -> ExtractionRouter:
