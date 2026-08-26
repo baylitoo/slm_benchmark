@@ -191,6 +191,9 @@ def test_custom_agent_runs_the_tool_loop_when_mcp_servers_set(api, monkeypatch) 
     assert call["tool"] == "calc__add"
     assert call["status"] == "ok"
     assert isinstance(call["latency_ms"], int)
+    # Full arguments/result ride the live trace (#262) for the "Try it" view.
+    assert call["arguments"] == '{"a": 2, "b": 3}'
+    assert call["result"] == "5"
     # Usage summed across both rounds, same contract as the chat surface.
     assert body["usage"] == {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42}
     # Round 2 carries the executed exchange.
@@ -363,6 +366,9 @@ def test_agent_completion_records_a_usage_row_with_the_tool_trace(
     (call,) = row["tool_calls"]
     assert call["tool"] == "calc__add"
     assert call["status"] == "ok"
+    # The ledger is aggregate stats, not a store for tool payloads (#262):
+    # arguments/result are stripped before persisting.
+    assert set(call) == {"tool", "status", "latency_ms"}
 
 
 def test_agent_completion_without_tools_records_no_tool_call_trace(api, monkeypatch) -> None:

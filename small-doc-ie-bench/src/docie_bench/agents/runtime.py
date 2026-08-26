@@ -53,6 +53,23 @@ from docie_bench.studio.routing_policies import (
 
 PROXY_MODES = ("placeholder", "block", "detect")
 
+# A tool's arguments/result can be arbitrarily large (a document, an OCR
+# dump) -- the "Try it" trace (#262) rides the live completion response, so
+# cap each field rather than let one tool call balloon the payload.
+_TRACE_TEXT_LIMIT = 4000
+
+
+def _stringify_tool_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _truncate_trace_text(text: str) -> str:
+    if len(text) <= _TRACE_TEXT_LIMIT:
+        return text
+    return text[:_TRACE_TEXT_LIMIT] + f"… ({len(text)} chars total)"
+
 
 class AgentError(Exception):
     """Mapped to an OpenAI-style error payload by the API layer."""
@@ -741,10 +758,11 @@ async def _complete_with_tools(
     here via ``mcp_tools.run_tool_loop`` rather than duplicated, so both
     surfaces share one loop implementation and one error taxonomy.
 
-    Returns ``(completion, tool_call_trace)`` — the trace (#261) is every
-    tool call this request actually executed, in order, each entry
-    ``{"tool": qualified_name, "status": "ok"|"error", "latency_ms": int}``.
-    Empty when the model never called a tool.
+    Returns ``(completion, tool_call_trace)`` — the trace (#261/#262) is
+    every tool call this request actually executed, in order, each entry
+    ``{"tool": qualified_name, "status": "ok"|"error", "latency_ms": int,
+    "arguments": str, "result": str}`` (the latter two truncated at
+    ``_TRACE_TEXT_LIMIT``). Empty when the model never called a tool.
     """
     from contextlib import AsyncExitStack
 
@@ -782,9 +800,17 @@ async def _complete_with_tools(
 
     tool_call_trace: list[dict[str, Any]] = []
 
-    def record_tool_call(name: str, ok: bool, latency_ms: int) -> None:
+    def record_tool_call(
+        name: str, ok: bool, latency_ms: int, arguments: Any, result: str
+    ) -> None:
         tool_call_trace.append(
-            {"tool": name, "status": "ok" if ok else "error", "latency_ms": latency_ms}
+            {
+                "tool": name,
+                "status": "ok" if ok else "error",
+                "latency_ms": latency_ms,
+                "arguments": _truncate_trace_text(_stringify_tool_value(arguments)),
+                "result": _truncate_trace_text(result),
+            }
         )
 
     # A config error (a bad allowlist) is captured rather than raised INSIDE

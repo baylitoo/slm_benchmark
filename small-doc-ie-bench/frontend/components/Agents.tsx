@@ -25,6 +25,7 @@ import {
   Sparkles,
   FileText,
   FilePlus2,
+  Wrench,
 } from "lucide-react";
 import {
   ApiError,
@@ -439,7 +440,7 @@ const SAMPLE_PII_TEXT =
   "Report prepared by Jean Dupont. Contact: jean.dupont@acme.fr or " +
   "+33 6 12 34 56 78. Refund to IBAN DE89 3704 0044 0532 0130 00.";
 
-function TryPanel({ agent }: { agent: AgentView }) {
+export function TryPanel({ agent }: { agent: AgentView }) {
   const isOcr = agent.kind === "ocr";
   const options = (agent.options ?? {}) as Record<string, unknown>;
   const ocrMode =
@@ -501,6 +502,7 @@ function TryPanel({ agent }: { agent: AgentView }) {
 
   const pii = result?.docie_agent?.pii;
   const content = result?.choices?.[0]?.message?.content;
+  const toolCalls = result?.docie_agent?.tool_calls ?? [];
 
   return (
     <div className="rounded-md border border-border bg-card p-3">
@@ -551,6 +553,39 @@ function TryPanel({ agent }: { agent: AgentView }) {
               <p className="text-xs text-muted-foreground">
                 Sent upstream as: {pii?.placeholders?.join(" ")}
               </p>
+            )}
+            {toolCalls.length > 0 && (
+              <div>
+                <p className="mb-1 flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                  <Wrench className="h-3.5 w-3.5" />
+                  <T>Tool calls</T>
+                </p>
+                <ol className="space-y-1.5">
+                  {toolCalls.map((call, index) => (
+                    <li
+                      key={`${call.tool}-${index}`}
+                      className="rounded-md border border-border bg-muted/40 p-2 text-xs"
+                    >
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-muted-foreground">#{index + 1}</span>
+                        <span className="font-medium text-foreground">{call.tool}</span>
+                        <Badge tone={call.status === "ok" ? "ok" : "err"}>{call.status}</Badge>
+                        <span className="text-muted-foreground">{call.latency_ms}ms</span>
+                      </div>
+                      {call.arguments && (
+                        <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">
+                          {call.arguments}
+                        </pre>
+                      )}
+                      {call.result && (
+                        <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">
+                          {call.result}
+                        </pre>
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              </div>
             )}
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground"><T>Response</T></p>
