@@ -143,6 +143,85 @@ Storage/lifecycle-wise, a transformers model is a **safetensors snapshot** in th
 store — the same directory-entry path the encoders already use — so seed,
 deploy, sizing and the fit gate all treat it like any other store model.
 
+### Case study: OvisOCR2 — a rung-1-shaped model that is actually rung-3-only
+
+`ATH-MaaS/OvisOCR2` (0.9B, image-text-to-text OCR/document-parsing) looks like
+a rung-1 (GGUF + llama.cpp) candidate: it's small, its base is
+`Qwen/Qwen3.5-0.8B`, and its own Hub page lists "Quantizations (21 models)".
+It is not. This is the failure mode the ladder doesn't automatically catch —
+worth naming so it doesn't repeat.
+
+**Why the GGUF path doesn't work.** Qwen3.5 is a *hybrid* architecture (same
+family as Qwen3-Next): most layers are Gated DeltaNet (linear attention — a
+fixed-size recurrent state, not a growing KV cache) with a minority of full
+softmax-attention layers for global retrieval. llama.cpp's Qwen3.5 support
+(`LLM_ARCH_QWEN35`/`QWEN35MOE`, [ggml-org/llama.cpp#19435](https://github.com/ggml-org/llama.cpp/pull/19435),
+merged/reverted/re-merged as #19453/#19468) is, per the author, **text only —
+no multimodal capability**, and is new enough to still have an open GPU
+correctness bug ([#19683](https://github.com/ggml-org/llama.cpp/issues/19683):
+degenerate output on CUDA, correct on CPU). OvisOCR2's actual point — the
+Ovis vision stack (an AIMv2 vision transformer + a custom Visual Embedding
+Table bolted onto the Qwen3.5 backbone) — has **no llama.cpp/mtmd
+implementation at all**
+([#19917 "Qwen3.5 image input is not supported"](https://github.com/ggml-org/llama.cpp/issues/19917),
+corroborated by [ollama#15898](https://github.com/ollama/ollama/issues/15898)).
+So every one of those 21 community GGUF quantizations, however it loads in
+llama-server, can only be the **text backbone** — a chat model, never an OCR
+model. `arch_registry`'s `RUNTIME_NOTES` pattern (a known-arch caveat keyed by
+GGUF `general.architecture`) is exactly the mechanism for surfacing this once
+a real GGUF of this repo is inspected; nothing has been added preemptively
+for an arch string ("ovis"/"ovis2_5"/whatever this converts to) nobody has
+confirmed yet — that's a `RUNTIME_NOTES` entry to add the day a real one shows
+up, not now on inference.
+
+**Why "add a family" (rung 2) doesn't apply.** Rung 2 assumes the runtime can
+already load the architecture and only the serving *contract* is missing. No
+family contract fixes a missing ggml kernel — the vision stack literally
+cannot be loaded by any llama-server build today.
+
+**Why rung 3 (transformers, `trust_remote_code`) is the answer — and costs
+zero new family code.** Ovis models bolt on custom modeling code (the AIMv2
+tower + Visual Embedding Table) that isn't upstreamed into `transformers`
+(tracked, still open, as
+[huggingface/transformers#36824](https://github.com/huggingface/transformers/issues/36824)).
+That is precisely what the existing `transformers_trust_remote_code` family
+exists for — no per-model contract, the pre-flight inspector already detects
+`config.json`'s `auto_map` and gates deploy behind an explicit
+`remote_code_approval_required` blocker (see "Pre-flight support detection"
+below). Onboarding this model is "pick `transformers_trust_remote_code` at
+deploy," not writing a family.
+
+**The real gap this surfaced, and what got fixed.** The generic transformers
+shim (`transformers_server/server.py`) inferred vision capability from
+*which* AutoModel constructor happened to succeed — `AutoModelForImageTextToText`
+first, `AutoModelForCausalLM` as the fallback. Ovis's known registration
+pattern (predating the image-text-to-text auto class) registers its
+`auto_map` only under `AutoModelForCausalLM`, so a load would silently land
+in the "text-only" branch despite being genuinely multimodal. Fixed by
+deriving `vision` from the loaded **processor's own shape**
+(`_processor_is_multimodal`: does it carry an `image_processor`, the
+standard `ProcessorMixin` composition every VLM processor uses regardless of
+which AutoModel class loaded it) instead of from load-path success — a fix
+that generalizes to any future custom-code VLM in this exact shape, not just
+Ovis. Separately, the shim's chat-completions route caught only `ValueError`
+from a backend failure; anything else (an `AttributeError`/`TypeError` from a
+custom model whose calling convention diverges from the standard
+`apply_chat_template(images=...)` contract this shim assumes generically —
+a real risk specifically for last-resort onboarding) reached the caller as an
+unhandled 500 with no actionable message. Now any backend exception comes
+back OpenAI-shaped, with the real error text.
+
+**What is NOT verified here.** No GPU/large-download environment was
+available to actually load `ATH-MaaS/OvisOCR2`'s real weights end to end.
+Whether Ovis's specific custom code implements the standard
+`apply_chat_template(images=...)` contract at all (rather than a bespoke
+`.chat()`/`preprocess_inputs()` entry point, a real and recurring pattern for
+older custom-code VLM repos) is unconfirmed — if it doesn't, the two fixes
+above turn that failure into a clear error instead of a crash, but do not by
+themselves make generation work; that would need a per-model adapter, which
+is out of scope until someone confirms it's actually needed against real
+weights.
+
 ## Pre-flight support detection
 
 Studio provides **HuggingFace-like browsing with a deploy decision that already
