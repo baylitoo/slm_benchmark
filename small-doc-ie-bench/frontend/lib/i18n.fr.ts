@@ -79,6 +79,10 @@ export const FR_MESSAGES: Record<string, string> = {
 
   // Playground
   "Chat directly with any live deployment.": "Discutez directement avec n’importe quel déploiement actif.",
+  "Chat, attach a file or image, or turn on extraction — one place for every synchronous request.":
+    "Discutez, joignez un fichier ou une image, ou activez l'extraction — un seul endroit pour chaque requête synchrone.",
+  "Compute embeddings or rerank documents with your deployed models (RAG-ready).":
+    "Calculez des plongements ou reclassez des documents avec vos modèles déployés (prêts pour le RAG).",
   "Send an image to a vision deployment (OCR / description) — free-text answer.": "Envoyez une image à un déploiement de vision (OCR / description) — réponse en texte libre.",
   "Compute embeddings with your deployed models (RAG-ready).": "Calculez des plongements avec vos modèles déployés (prêts pour le RAG).",
   "Score documents against a query with a reranker deployment (retrieval, ranked).": "Évaluez des documents par rapport à une requête avec un reranker (recherche classée).",
@@ -499,6 +503,15 @@ export const FR_MESSAGES: Record<string, string> = {
   "Enable a tool server and chat models can use its tools — pick servers per conversation in the Playground's Chat panel. Enabled entries are written to the server registry and spawned per request.": "Activez un serveur d'outils et les modèles de chat pourront utiliser ses outils — sélectionnez les serveurs par conversation dans le panneau Chat du Playground. Les entrées activées sont écrites dans le registre et lancées à chaque requête.",
   "Tools:": "Outils :",
   "tool answers arrive unstreamed": "les réponses avec outils arrivent sans streaming",
+  "Extraction": "Extraction",
+  "On: Send routes to constrained-generation extraction (schema-validated JSON) instead of a chat reply.":
+    "Activée : Envoyer déclenche une extraction à génération contrainte (JSON validé par schéma) au lieu d'une réponse de chat.",
+  "Ask anything, attach an image or PDF, or turn on extraction — all through the same deployment.":
+    "Posez une question, joignez une image ou un PDF, ou activez l'extraction — tout via le même déploiement.",
+  "Free-form conversation, file/image attachments, and extraction — all in one timeline.":
+    "Conversation libre, pièces jointes (fichier/image) et extraction — le tout dans une seule chronologie.",
+  "Rendering preview…": "Génération de l'aperçu…",
+  "Remove attachment": "Retirer la pièce jointe",
   "GET /v1/serving/deployments — live serving runtimes.": "GET /v1/serving/deployments — environnements d’inférence actifs.",
   "Add model": "Ajouter un modèle",
   "Deploy model": "Déployer un modèle",
