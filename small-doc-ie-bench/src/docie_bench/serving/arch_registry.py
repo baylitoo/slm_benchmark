@@ -123,6 +123,14 @@ RUNTIME_NOTES: dict[str, str] = {
         "serving needs a recent llama-server (deepseek-ocr mtmd support) — "
         "rebuild the serving image if the deploy fails to load"
     ),
+    "qwen35": (
+        "serving needs a llama-server built after ggml-org/llama.cpp#19468 "
+        "(2026-02-10, Qwen3.5 dense/MoE + vision) — rebuild the serving image "
+        "if the deploy fails to load. A vision deploy also needs an mmproj "
+        "converted from THIS SAME checkpoint — a projector from a different "
+        "Qwen3.5 size/variant has a mismatched output dimension and will not "
+        "load (e.g. the 27B variant projects to 5120 dims, 35B-A3B to 2048)."
+    ),
 }
 
 
