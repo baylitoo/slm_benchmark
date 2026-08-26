@@ -120,12 +120,16 @@ export interface AgentToolCallTrace {
   result?: string;
 }
 
-/** One workflow step's outcome (#265) -- the "Try it" trace view's
- * per-step detail, alongside any tool calls that step made. */
+/** One workflow step's outcome (#265; `name`/`routed_to` added #266) -- the
+ * "Try it" trace view's per-step detail, alongside any tool calls that step
+ * made. `routed_to` is set only for a classifier (`route`) step -- the name
+ * of the step it jumped to instead of falling through sequentially. */
 export interface AgentWorkflowStepTrace {
   step: number;
+  name?: string;
   model_profile: string;
   content: string | null;
+  routed_to?: string | null;
 }
 
 export interface AgentChatResponse {

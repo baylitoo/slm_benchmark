@@ -162,4 +162,38 @@ describe("Agents TryPanel — workflow step trace (#265)", () => {
     // the completion's overall Response text -- both are the same answer.
     expect(screen.getAllByText("final summary").length).toBeGreaterThanOrEqual(2);
   });
+
+  it("shows a route step's jump target (#266)", async () => {
+    const response: AgentChatResponse = {
+      choices: [{ message: { role: "assistant", content: "handled: billing" } }],
+      docie_agent: {
+        agent: "chain",
+        kind: "workflow",
+        steps: [
+          {
+            step: 0,
+            name: "0",
+            model_profile: "classifier",
+            content: "Label: billing",
+            routed_to: "handle-billing",
+          },
+          {
+            step: 1,
+            name: "handle-billing",
+            model_profile: "billing-handler",
+            content: "handled: billing",
+            routed_to: null,
+          },
+        ],
+      },
+    };
+    vi.mocked(api.agentChat).mockResolvedValue(response);
+
+    render(<TryPanel agent={WORKFLOW_AGENT} />);
+    const user = userEvent.setup();
+    await user.type(screen.getByRole("textbox"), "why was I charged twice?");
+    await user.click(screen.getByRole("button", { name: /run/i }));
+
+    expect(await screen.findAllByText("handle-billing")).not.toHaveLength(0);
+  });
 });

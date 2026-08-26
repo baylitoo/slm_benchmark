@@ -572,6 +572,11 @@ export function TryPanel({ agent }: { agent: AgentView }) {
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="text-muted-foreground">#{step.step + 1}</span>
                         <span className="font-medium text-foreground">{step.model_profile}</span>
+                        {step.routed_to && (
+                          <span className="text-muted-foreground">
+                            <T>routed to</T> <span className="font-medium text-foreground">{step.routed_to}</span>
+                          </span>
+                        )}
                       </div>
                       {step.content && (
                         <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">
