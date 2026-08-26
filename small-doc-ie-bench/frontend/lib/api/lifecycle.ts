@@ -70,6 +70,23 @@ export function updateDeployment(
   );
 }
 
+/** Change a live deployment's context window with zero downtime: the server
+ * drains a new-sized shadow instance into READY before routing to it and
+ * stopping the old one -- no restart gap. A stopped/offloaded deployment has
+ * no process to drain and is edited in place instead. Only llama.cpp
+ * deployments accept this (422 otherwise); a 422 also carries the RAM
+ * deficit up front (footprint/needed/available/shortfall) when the new
+ * context would not fit, without touching the running deployment. */
+export function resizeDeployment(
+  name: string,
+  contextLength: number,
+): Promise<LifecycleActionResponse> {
+  return request<LifecycleActionResponse>(
+    `/v1/serving/store/${encodeURIComponent(name)}/resize`,
+    { method: "POST", body: JSON.stringify({ context_length: contextLength }) },
+  );
+}
+
 /** A deployment's runtime log tail (GET /v1/serving/deployments/{name}/logs). */
 export interface DeploymentLogs {
   name: string;

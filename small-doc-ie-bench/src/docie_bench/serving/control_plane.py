@@ -16,6 +16,7 @@ import shutil
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
@@ -38,6 +39,25 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 Result = object | Awaitable[object]
+
+
+class ResizeUnsupportedError(ValueError):
+    """A resize was requested against a runtime that ignores --ctx-size.
+
+    Only llama.cpp (``RuntimeKind.LLAMACPP``) honors a context-length launch
+    override; every other runtime (encoder / transformers / multi-vector
+    safetensors snapshots, remote endpoints) would silently ignore it, so
+    resize refuses up front instead of pretending to apply a no-op.
+    """
+
+
+class ResizeAdmissionError(RuntimeError):
+    """A resize was rejected by the RAM admission gate; nothing was touched.
+
+    Raised BEFORE the new-sized shadow instance is spawned — the currently
+    running deployment is completely unaffected by a resize that would not
+    fit, mirroring the load path's fit-before-evict discipline.
+    """
 
 
 def reachable_launch(
@@ -253,6 +273,8 @@ class Supervisor(Protocol):
         context_length: int,
         max_tokens: int | None,
     ) -> Result: ...
+
+    def resize_store_model(self, name: str, *, context_length: int) -> Result: ...
 
     def pin(self, name: str, *, pinned: bool) -> Result: ...
 
@@ -506,6 +528,24 @@ class ControlPlane:
             _required(name, "deployment"),
             context_length=context_length,
             max_tokens=max_tokens,
+        )
+        return to_data(await _resolve(result))
+
+    async def resize_store_model(self, name: str, *, context_length: int) -> object:
+        """Change a live store deployment's context window with zero downtime.
+
+        A HOT deployment is resized by drain-and-relaunch (a shadow instance
+        at the new context length is spawned, awaited to READY, routed to,
+        and only THEN does the old process stop); a stopped/offloaded
+        deployment has no process to drain and is edited in place, mirroring
+        ``reconfigure``. Threaded: RAM admission reads live node memory and a
+        hot resize blocks through the shadow's ``await_ready`` poll — neither
+        may stall the Connect heartbeats.
+        """
+        result = await asyncio.to_thread(
+            self.supervisor.resize_store_model,
+            _required(name, "deployment"),
+            context_length=context_length,
         )
         return to_data(await _resolve(result))
 
@@ -1134,6 +1174,120 @@ class _DefaultSupervisor:
         # is the shared alias for scaled replicas, or the record name otherwise.
         record_placement(str(old_launch.alias or name), result)
         return result
+
+    def resize_store_model(self, name: str, *, context_length: int) -> object:
+        """Change a live store deployment's context window with zero downtime.
+
+        llama-server cannot resize its KV cache in place — the context length
+        is fixed at process start — so a HOT deployment (running, READY, with
+        a live endpoint) is resized by drain-and-relaunch: a shadow instance
+        is spawned at ``context_length`` on its OWN port, awaited to READY,
+        and only THEN is routing flipped to it and the old process reaped.
+        The old instance keeps serving every request until the new one has
+        proven itself healthy — routing is never pointed at nothing. A
+        stopped/offloaded deployment has no process to drain, so its launch is
+        just updated in place (mirrors ``reconfigure``).
+
+        Admission reuses the SAME fit policy every load-shaped decision
+        shares (``lifecycle.assess_fit``): the candidate is priced at the NEW
+        context length and checked against live measured free RAM, because
+        the old and new processes briefly coexist during the handoff. A
+        rejection raises :class:`ResizeAdmissionError` carrying the
+        FitDecision's numbers and touches NOTHING — no shadow is spawned, no
+        port is allocated, the running deployment is completely unaffected.
+
+        Only the LLAMACPP runtime honors ``--ctx-size``; every other runtime
+        raises :class:`ResizeUnsupportedError` before anything is touched.
+        """
+        from docie_bench.serving import lifecycle
+        from docie_bench.serving.runtime import LifecycleState, RuntimeKind
+        from docie_bench.serving.supervisor import DeploymentSpec, DesiredState
+
+        record = self.backend.get(name)
+        old_spec = record.spec
+        old_launch = old_spec.launch
+        if old_launch.runtime != RuntimeKind.LLAMACPP:
+            raise ResizeUnsupportedError(
+                f"deployment {name!r} runs the {old_launch.runtime.value!r} runtime, "
+                f"which does not accept a context-length override (only llama.cpp "
+                f"honors --ctx-size)"
+            )
+
+        new_launch = replace(old_launch, context_length=context_length)
+        is_hot = (
+            old_spec.desired_state == DesiredState.RUNNING
+            and record.state == LifecycleState.READY
+            and record.endpoint is not None
+        )
+        if not is_hot:
+            # Nothing running to drain: edit in place and stay stopped, same
+            # as reconfigure's offloaded/stopped branch.
+            return self.backend.deploy(replace(old_spec, launch=new_launch))
+
+        candidate = replace(record, spec=replace(old_spec, launch=new_launch))
+        decision = lifecycle.assess_fit(candidate)
+        if not decision.fits:
+            available = (decision.free_bytes or 0) - decision.margin_bytes
+            raise ResizeAdmissionError(
+                f"resizing {name!r} to {context_length} tokens of context needs "
+                f"~{decision.needed_bytes} bytes but only {available} bytes are "
+                f"available ({decision.free_bytes} free minus a "
+                f"{decision.margin_bytes}-byte safety margin): {decision.reason}"
+            )
+
+        bind_host, advertise_host = self._reachability_hosts()
+        # Store models always run the in-worker LLAMACPP subprocess, so guard
+        # the advertise host unconditionally (mirrors serve_store_model).
+        self._guard_deterministic_advertise(advertise_host)
+        # Deliberately NOT excluding ``name``'s own port: the old instance is
+        # still hot on it throughout the handoff (that is the whole point of
+        # zero downtime), so the shadow must land on a genuinely different one.
+        reserved = self._reserved_ports()
+        chosen = self._port_allocator().allocate(bind_host=bind_host, reserved=reserved)
+        shadow_launch = reachable_launch(
+            replace(new_launch, port=chosen),
+            bind_host=bind_host,
+            advertise_host=advertise_host,
+        )
+        shadow_name = f"{name}__resize-{uuid.uuid4().hex[:8]}"
+        self.backend.deploy(
+            DeploymentSpec(name=shadow_name, launch=shadow_launch, health_failure_threshold=60)
+        )
+        shadow = self.backend.await_ready(
+            shadow_name, timeout_s=lifecycle.load_timeout_s(old_launch.model)
+        )
+        if shadow.state != LifecycleState.READY:
+            error = shadow.last_error or "the resized instance did not become ready"
+            self.backend.remove(shadow_name)
+            # The reconciler creates a placement row for ANY record it
+            # observes mid-await (design: "the Board converges instead of
+            # staying blind forever") — best-effort clean it up so a failed
+            # resize never leaves a permanent orphan row behind.
+            clear_placement(shadow_name)
+            raise RuntimeError(f"resize of {name!r} was rejected by the runtime: {error}")
+
+        try:
+            # Flip routing to the proven-healthy new instance BEFORE touching
+            # the old one: the old process keeps serving until this UPDATE
+            # lands, so store:<name> is never pointed at nothing.
+            mark_placement_ready(name, endpoint=str(shadow.endpoint or ""))
+            previous = self.backend.adopt(name, shadow)
+        except Exception:
+            # ``name`` vanished (a concurrent delete) mid-handoff: the shadow
+            # is still a live, unowned process. Reap it here too — otherwise
+            # it leaks exactly like the orphan-process class this repo has
+            # already had to fix once (an undeleted record holding RAM
+            # forever), just introduced by resize instead of delete.
+            self.backend.remove(shadow_name)
+            clear_placement(shadow_name)
+            raise
+        self.backend.discard(shadow_name)
+        # The shadow's own placement row (if the reconciler created one while
+        # it was still a distinct record) is superseded by the flip above —
+        # drop it so it never lingers as a phantom deployment.
+        clear_placement(shadow_name)
+        self.backend.reap(previous)
+        return self.backend.get(name)
 
     def stop(self, name: str) -> object:
         result = self.backend.stop(name)
