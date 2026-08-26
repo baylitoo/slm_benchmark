@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from docie_bench.agents.api import router as agents_router
+from docie_bench.asr.api import router as asr_router
 from docie_bench.benchmark.routing_config import build_extraction_router
 from docie_bench.chat_api import router as chat_router
 from docie_bench.extract.routing import (
@@ -117,6 +118,9 @@ app.include_router(agents_router)
 app.include_router(chat_router)
 # MCP catalog + registry management (browse/enable/disable/test).
 app.include_router(mcp_router)
+# OpenAI-compatible speech-to-text surface. The route itself uses
+# TenantDependency so it shares the same auth/quota policy as extraction.
+app.include_router(asr_router)
 
 # Allow the DocIE Studio frontend (separate origin) to call the API from the
 # browser. Defaults to the local Studio UI origins; override via

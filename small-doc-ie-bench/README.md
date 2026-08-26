@@ -2,13 +2,13 @@
 
 A local small-language-model (SLM) serving fabric and document-information-extraction
 platform, plus the enterprise-grade CPU-only benchmark harness that qualifies which
-model to trust for a given task. It separates OCR/layout, model serving, constrained
-JSON extraction, validation, persistence, and benchmark reporting behind one
-OpenAI-compatible API.
+model to trust for a given task. It separates OCR/layout, speech-to-text, model
+serving, constrained JSON extraction, validation, persistence, and benchmark
+reporting behind one OpenAI-compatible API.
 
 The project is designed for a Ryzen-class CPU server with 64 GB RAM and no GPU — it
 runs an SLM fleet (LFM2.5, Qwen, Gemma, NuExtract, and any GGUF/HF model) as workflow
-steps: OCR, structured extraction, PII detection, embeddings.
+steps: OCR, speech transcription, structured extraction, PII detection, embeddings.
 
 **Two ways in:**
 
@@ -161,6 +161,9 @@ run `docie gateway` instead of starting each one individually.
 - **Schema-constrained extraction**: JSON Schema / Pydantic first; no free-form JSON guessing.
 - **OCR modularity**: `liteparse` (PDFium spatial text + OCR fallback), `tesseract`, `paddleocr`, or a deployed vision model, behind one interface.
 - **OCR laboratory**: content-addressed OCR artifacts, persistent cache, and no-LLM OCR reports.
+- **Speech-to-text foundation**: optional local faster-whisper inference, an
+  OpenAI-compatible transcription API, subtitle output, and reproducible corpus
+  WER/CER + real-time-factor benchmarks. See [docs/asr.md](docs/asr.md).
 - **Production API**: FastAPI service with health checks, metrics, file-size limits, structured logs, and optional Postgres audit persistence.
 - **Benchmark runner**: run many model profiles over the same dataset and produce JSONL predictions, metrics, and an HTML report.
 - **Docker Compose stack**: the Studio (web/api/worker), Inngest, Postgres, Redis, Prometheus, and Grafana — or the bare CLI + llama.cpp-compatible server.
@@ -571,6 +574,8 @@ Do not select by leaderboard alone. Select by field-level accuracy under constra
 - `GET /v1/schemas`
 - `POST /v1/extract/text`
 - `POST /v1/extract/file`
+- `POST /v1/audio/transcriptions` — authenticated OpenAI-compatible batch
+  transcription (`json`, `verbose_json`, `text`, `srt`, or `vtt`).
 - `POST /v1/embeddings` — vectors from an `embedding`-family deployment.
 - `POST /v1/rerank` — relevance-score a query against a document list, from a
   `reranker`-family deployment (e.g. LFM2.5-ColBERT-350M).

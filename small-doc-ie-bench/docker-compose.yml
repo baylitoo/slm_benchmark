@@ -5,6 +5,10 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
+      args:
+        # The public API owns /v1/audio/transcriptions, so only this image opts
+        # into faster-whisper/CTranslate2. Other services stay lightweight.
+        PIP_EXTRAS: "ocr,mcp,asr"
     env_file: .env
     environment:
       # Construct the container-network URL here instead of relying on a
@@ -41,6 +45,8 @@ services:
       - ./runs:/app/runs
       - ./annotations:/app/annotations
       - ocr-cache:/app/.cache/ocr
+      # faster-whisper/Hugging Face model downloads survive api rebuilds.
+      - asr-cache:/root/.cache/huggingface
       - serving-state:/app/.serving
       # Durable artifact store shared with the worker: the worker writes
       # report.html/predictions.jsonl here and the api serves them back by id,
@@ -447,6 +453,7 @@ volumes:
   postgres-data:
   grafana-data:
   ocr-cache:
+  asr-cache:
   redis-data:
   serving-state:
   artifact-store:
