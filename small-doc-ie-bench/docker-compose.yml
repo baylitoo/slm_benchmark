@@ -9,7 +9,7 @@ services:
         # The public API proxies transcription to a managed serving deployment;
         # it never loads faster-whisper weights in an API replica.
         PIP_EXTRAS: "ocr,mcp"
-    env_file: .env
+    env_file: ${DOCIE_ENV_FILE:-.env}
     environment:
       # Construct the container-network URL here instead of relying on a
       # DATABASE_URL value that itself references ${POSTGRES_PASSWORD} in an
@@ -175,7 +175,7 @@ services:
         # tag to rebuild llama.cpp at that pin (reproducible + picks up new
         # arch support, e.g. Unlimited-OCR). Empty = latest HEAD (cached).
         LLAMA_REF: ${LLAMA_REF:-}
-    env_file: .env
+    env_file: ${DOCIE_ENV_FILE:-.env}
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
       DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
@@ -238,7 +238,7 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
-    env_file: .env
+    env_file: ${DOCIE_ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
       # Registers ONLY extraction/benchmark/GC — no lifecycle functions, no
@@ -296,7 +296,7 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
-    env_file: .env
+    env_file: ${DOCIE_ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/docie
     profiles: ["tools"]
