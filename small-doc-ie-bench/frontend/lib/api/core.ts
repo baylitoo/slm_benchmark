@@ -62,10 +62,42 @@ export async function readBody(res: Response): Promise<unknown> {
   }
 }
 
+/** One FastAPI/pydantic validation-error item ({detail: [...]} on a 422). */
+interface ValidationErrorItem {
+  loc?: unknown[];
+  msg?: unknown;
+}
+
+function isValidationErrorItem(v: unknown): v is ValidationErrorItem {
+  return Boolean(v) && typeof v === "object" && "msg" in (v as object);
+}
+
+/**
+ * A 422's ``detail`` is a LIST of pydantic error items, not a string — e.g.
+ * ``[{"loc": ["body", "document_type"], "msg": "String should match pattern
+ * '...'", ...}]``. ``JSON.stringify``-ing that verbatim reads as a broken
+ * response, not a validation message. Render "field: message" per item
+ * instead (``loc`` is ``["body", <field>, ...]``; drop the leading "body").
+ */
+function formatValidationErrors(items: unknown[]): string | null {
+  const lines = items
+    .filter(isValidationErrorItem)
+    .map((item) => {
+      const loc = (item.loc ?? []).filter((part) => part !== "body");
+      const field = loc.length > 0 ? loc.join(".") : null;
+      const msg = typeof item.msg === "string" ? item.msg : null;
+      if (field && msg) return `${field}: ${msg}`;
+      return msg ?? (field ? String(field) : null);
+    })
+    .filter((line): line is string => Boolean(line));
+  return lines.length > 0 ? lines.join("; ") : null;
+}
+
 export function detailOf(body: unknown, fallback: string): string {
   if (body && typeof body === "object" && "detail" in body) {
     const d = (body as { detail: unknown }).detail;
     if (typeof d === "string") return d;
+    if (Array.isArray(d)) return formatValidationErrors(d) ?? JSON.stringify(d);
     return JSON.stringify(d);
   }
   if (typeof body === "string" && body) return body;
