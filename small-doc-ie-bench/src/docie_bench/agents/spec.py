@@ -51,6 +51,12 @@ class AgentSpec(BaseModel):
           via generic GBNF, not its bespoke chat_template_kwargs path.
       Back-compat: an agent saved before ``mode`` existed derives it — an
       ``extractor`` present means ``ocr_extract``, otherwise ``ocr``.
+    * ``custom`` — a passthrough chat agent (system prompt + backing model).
+      Optional ``mcp_servers`` (list of registered MCP server names, see
+      ``GET /v1/mcp/servers``) turns on tool use: the agent runs the same
+      bounded model<->tools loop the generic chat surface uses, advertising
+      each server's tools and executing any tool_calls the model returns.
+      Absent/empty means the original bare-forward behavior, unchanged.
     """
 
     name: str = Field(pattern=_NAME_RE, max_length=63)

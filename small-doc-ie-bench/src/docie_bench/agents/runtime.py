@@ -637,11 +637,115 @@ def _build_analyzer(
     return analyze, f"guard:{guard_profile.name}", guard_state
 
 
+def _resolve_mcp_servers(spec: AgentSpec) -> list[str]:
+    """``options.mcp_servers`` — registry server names this agent may use as
+    tool sources (registry-only, see mcp_tools.py: never a caller-supplied
+    URL/command). Empty/absent means no tools — the existing bare-forward
+    behavior, unchanged for every agent that doesn't opt in."""
+    raw = spec.options.get("mcp_servers")
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or not all(isinstance(n, str) and n for n in raw):
+        raise AgentError(
+            f"agent {spec.name!r}: options.mcp_servers must be a list of registered "
+            "MCP server names",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    return raw
+
+
 async def _complete_custom(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
-    completion = await _forward_chat(spec, dict(body), http_client=http_client)
+    server_names = _resolve_mcp_servers(spec)
+    if server_names:
+        completion = await _complete_with_tools(
+            spec, dict(body), server_names, http_client=http_client
+        )
+    else:
+        completion = await _forward_chat(spec, dict(body), http_client=http_client)
     completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind}
+    return completion
+
+
+async def _complete_with_tools(
+    spec: AgentSpec,
+    body: dict[str, Any],
+    server_names: list[str],
+    *,
+    http_client: httpx.AsyncClient,
+) -> dict[str, Any]:
+    """A ``custom`` agent with ``options.mcp_servers`` set: connect, advertise
+    the servers' tools, and run the same bounded model<->tools loop the
+    generic chat surface uses (``chat_api._chat_with_mcp_tools``) — reused
+    here via ``mcp_tools.run_tool_loop`` rather than duplicated, so both
+    surfaces share one loop implementation and one error taxonomy.
+    """
+    from contextlib import AsyncExitStack
+
+    from docie_bench import mcp_tools as mcp_mod
+    from docie_bench.settings import get_settings
+
+    upstream = _resolve_backing(spec.model_profile)
+    try:
+        registry = mcp_mod.load_mcp_registry()
+    except mcp_mod.MCPConfigError as exc:
+        raise AgentError(str(exc), status_code=500, error_type="mcp_config_error") from exc
+    unknown = [name for name in server_names if name not in registry]
+    if unknown:
+        raise AgentError(
+            f"agent {spec.name!r} references unregistered MCP server(s): "
+            f"{', '.join(unknown)} — register them first (see GET /v1/mcp/servers)",
+            status_code=400,
+            error_type="mcp_server_not_registered",
+        )
+    try:
+        mcp_mod._require_mcp()
+    except mcp_mod.MCPUnavailableError as exc:
+        raise AgentError(str(exc), status_code=501, error_type="mcp_unavailable") from exc
+    specs = [registry[name] for name in server_names]
+
+    forward = dict(body)
+    if spec.system_prompt:
+        forward["messages"] = [
+            {"role": "system", "content": spec.system_prompt},
+            *(forward.get("messages") or []),
+        ]
+
+    async def post(round_body: dict[str, Any]) -> dict[str, Any]:
+        return await _post_chat(upstream, dict(round_body), http_client=http_client)
+
+    try:
+        async with AsyncExitStack() as stack:
+            try:
+                sessions = await mcp_mod.open_mcp_sessions(stack, specs)
+                tools, mapping = await mcp_mod.collect_openai_tools(sessions)
+            except Exception as exc:  # noqa: BLE001 - connect/handshake failure is a gateway error
+                raise AgentError(
+                    f"could not connect to MCP server(s): {exc}",
+                    status_code=502,
+                    error_type="mcp_server_unreachable",
+                ) from exc
+            completion = await mcp_mod.run_tool_loop(post, forward, sessions, mapping, tools)
+    except AgentError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
+        raise AgentError(
+            f"MCP session error: {exc}", status_code=502, error_type="mcp_server_unreachable"
+        ) from exc
+    if completion is None:
+        raise AgentError(
+            f"model kept calling tools for {get_settings().mcp_max_tool_iterations} rounds "
+            "without a final answer",
+            status_code=502,
+            error_type="mcp_tool_loop_exhausted",
+        )
+    # run_tool_loop's only non-dict, non-None return is whatever `post` itself
+    # returned as an error object -- but _post_chat never returns one, it
+    # raises AgentError instead (caught above). A dict is the only remaining
+    # possibility here.
+    assert isinstance(completion, dict)
     return completion
 
 
