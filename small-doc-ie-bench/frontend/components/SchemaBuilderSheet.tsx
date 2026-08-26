@@ -26,6 +26,28 @@ function emptyFieldRow(): FieldRow {
 
 const SCALAR_FIELD_TYPES: DynamicFieldType[] = ["string", "date", "number", "money"];
 
+// Mirrors the backend's DynamicSchemaSpec/DynamicFieldSpec pattern exactly
+// (schemas/dynamic.py _FIELD_NAME_RE) -- checking it here means a bad name
+// ("Purchase Order") gets a clear inline message instead of reaching the
+// server and bouncing back as a 422 the user has to decode.
+const NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+// Only field names collide with these (schemas/dynamic.py's DynamicFieldSpec
+// reserves them for the compiled model's own document_type/extraction_notes
+// keys) -- document_type itself is exempt from this check.
+const RESERVED_FIELD_NAMES = new Set(["document_type", "extraction_notes"]);
+
+function patternError(label: string, name: string): string | null {
+  return NAME_PATTERN.test(name)
+    ? null
+    : `${label} must be lower snake_case (letters, digits, underscores; start with a letter) — got "${name}".`;
+}
+
+function fieldNameError(label: string, name: string): string | null {
+  return patternError(label, name) ?? (RESERVED_FIELD_NAMES.has(name)
+    ? `${label}: "${name}" is a reserved name.`
+    : null);
+}
+
 export function SchemaBuilderSheet({
   open,
   onClose,
@@ -100,10 +122,32 @@ export function SchemaBuilderSheet({
       setError("Document type is required.");
       return;
     }
+    const documentTypeErr = patternError("Document type", documentType.trim());
+    if (documentTypeErr) {
+      setError(documentTypeErr);
+      return;
+    }
     const namedFields = fields.filter((field) => field.name.trim());
     if (namedFields.length === 0) {
       setError("At least one named field is required.");
       return;
+    }
+    for (const field of namedFields) {
+      const fieldErr = fieldNameError(`Field "${field.name.trim()}"`, field.name.trim());
+      if (fieldErr) {
+        setError(fieldErr);
+        return;
+      }
+      for (const sub of field.subFields.filter((s) => s.name.trim())) {
+        const subErr = fieldNameError(
+          `Sub-field "${sub.name.trim()}" (in "${field.name.trim()}")`,
+          sub.name.trim(),
+        );
+        if (subErr) {
+          setError(subErr);
+          return;
+        }
+      }
     }
     const emptyListField = namedFields.find(
       (field) =>

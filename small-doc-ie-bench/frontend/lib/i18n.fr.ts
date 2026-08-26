@@ -79,6 +79,10 @@ export const FR_MESSAGES: Record<string, string> = {
 
   // Playground
   "Chat directly with any live deployment.": "Discutez directement avec n’importe quel déploiement actif.",
+  "Chat, attach a file or image, or turn on extraction — one place for every synchronous request.":
+    "Discutez, joignez un fichier ou une image, ou activez l'extraction — un seul endroit pour chaque requête synchrone.",
+  "Compute embeddings or rerank documents with your deployed models (RAG-ready).":
+    "Calculez des plongements ou reclassez des documents avec vos modèles déployés (prêts pour le RAG).",
   "Send an image to a vision deployment (OCR / description) — free-text answer.": "Envoyez une image à un déploiement de vision (OCR / description) — réponse en texte libre.",
   "Compute embeddings with your deployed models (RAG-ready).": "Calculez des plongements avec vos modèles déployés (prêts pour le RAG).",
   "Score documents against a query with a reranker deployment (retrieval, ranked).": "Évaluez des documents par rapport à une requête avec un reranker (recherche classée).",
@@ -132,6 +136,20 @@ export const FR_MESSAGES: Record<string, string> = {
   "(empty response)": "(réponse vide)",
   "Retrying automatically…": "Nouvelle tentative automatique…",
   "Still starting — send your message again in a bit.": "Toujours en cours de démarrage — renvoyez votre message dans quelques instants.",
+  "Send one prompt to two deployments side by side and compare their answers.": "Envoyez un même message à deux déploiements côte à côte et comparez leurs réponses.",
+  "Arena": "Arène",
+  "One prompt, two deployments — the same conversation runs against both, answers stream side by side.": "Un message, deux déploiements — la même conversation est envoyée aux deux, les réponses défilent côte à côte.",
+  "Left model": "Modèle de gauche",
+  "Right model": "Modèle de droite",
+  "Feeds the shared history by default.": "Alimente l’historique partagé par défaut.",
+  "Optional — applied to both sides.": "Facultatif — appliqué aux deux côtés.",
+  "Send one prompt to both deployments and compare the answers side by side.": "Envoyez un même message aux deux déploiements et comparez les réponses côte à côte.",
+  "Model is loading — retrying automatically…": "Le modèle se charge — nouvelle tentative automatique…",
+  "Continue from": "Continuer depuis",
+  "Left": "Gauche",
+  "Right": "Droite",
+  "Waiting for the models…": "En attente des modèles…",
+  "Type a message for both models (Enter to send, Shift+Enter for a new line)…": "Saisissez un message pour les deux modèles (Entrée pour envoyer, Maj+Entrée pour une nouvelle ligne)…",
   "No live vision deployment — deploy a vision model (family lfm2_vl / vision_ocr).": "Aucun déploiement de vision actif — déployez un modèle de vision (famille lfm2_vl / vision_ocr).",
   "Choose an image or PDF first.": "Choisissez d’abord une image ou un PDF.",
   "The document produced no page images.": "Le document n’a produit aucune image de page.",
@@ -485,6 +503,15 @@ export const FR_MESSAGES: Record<string, string> = {
   "Enable a tool server and chat models can use its tools — pick servers per conversation in the Playground's Chat panel. Enabled entries are written to the server registry and spawned per request.": "Activez un serveur d'outils et les modèles de chat pourront utiliser ses outils — sélectionnez les serveurs par conversation dans le panneau Chat du Playground. Les entrées activées sont écrites dans le registre et lancées à chaque requête.",
   "Tools:": "Outils :",
   "tool answers arrive unstreamed": "les réponses avec outils arrivent sans streaming",
+  "Extraction": "Extraction",
+  "On: Send routes to constrained-generation extraction (schema-validated JSON) instead of a chat reply.":
+    "Activée : Envoyer déclenche une extraction à génération contrainte (JSON validé par schéma) au lieu d'une réponse de chat.",
+  "Ask anything, attach an image or PDF, or turn on extraction — all through the same deployment.":
+    "Posez une question, joignez une image ou un PDF, ou activez l'extraction — tout via le même déploiement.",
+  "Free-form conversation, file/image attachments, and extraction — all in one timeline.":
+    "Conversation libre, pièces jointes (fichier/image) et extraction — le tout dans une seule chronologie.",
+  "Rendering preview…": "Génération de l'aperçu…",
+  "Remove attachment": "Retirer la pièce jointe",
   "GET /v1/serving/deployments — live serving runtimes.": "GET /v1/serving/deployments — environnements d’inférence actifs.",
   "Add model": "Ajouter un modèle",
   "Deploy model": "Déployer un modèle",

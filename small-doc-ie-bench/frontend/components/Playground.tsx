@@ -5,16 +5,18 @@ import {
   Boxes,
   FileText,
   Fingerprint,
-  Image as ImageIcon,
   ListOrdered,
   MessageSquare,
   Play,
   Send,
   Sparkles,
+  Swords,
   Trash2,
   Upload,
   AlertCircle,
   FilePlus2,
+  Paperclip,
+  X,
 } from "lucide-react";
 import {
   triggerExtract,
@@ -26,7 +28,6 @@ import {
   rerank,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
-  visionDeploymentNames,
   getDeployments,
   getStore,
   getFamilies,
@@ -69,8 +70,7 @@ import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
 
-type InputMode = "text" | "file";
-type PlaygroundMode = "extract" | "chat" | "vision" | "embed" | "rerank";
+type PlaygroundMode = "chat" | "arena" | "embedrerank";
 
 // Deep-link callback threaded from AppShell so first-run empty states can send
 // the user straight to Models to deploy a model. Optional everywhere: when it
@@ -86,44 +86,11 @@ export function Playground({
   active?: boolean;
   onNavigate?: NavigateToDeploy;
 }) {
-  const { toast } = useToast();
-  const [mode, setMode] = useState<PlaygroundMode>("extract");
-  const [inputMode, setInputMode] = useState<InputMode>("text");
-  const [text, setText] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  const [schemaName, setSchemaName] = useState("invoice");
-  const [dynamicSchemaName, setDynamicSchemaName] = useState("");
-  const [schemaSheetOpen, setSchemaSheetOpen] = useState(false);
-  const dynamicSchemas = useAsync<DynamicSchemaSummary[]>(
-    "dynamic-schemas",
-    listDynamicSchemas,
-  );
-  const routingPolicies = useAsync<RoutingPolicySummary[]>(
-    "routing-policies",
-    listRoutingPolicies,
-  );
-  const [selectedDeployment, setSelectedDeployment] = useState<string>("");
-  // "single" routes to one deployment; "policy" runs a saved routing policy
-  // (cheap stage first, escalate on the policy's own confidence rules). The
-  // toggle makes the two structurally exclusive -- the backend rejects both.
-  const [modelSource, setModelSource] = useState<"single" | "policy">("single");
-  const [selectedPolicy, setSelectedPolicy] = useState<string>("");
-  const [ocrBackend, setOcrBackend] = useState("");
-  const [language, setLanguage] = useState("");
+  const [mode, setMode] = useState<PlaygroundMode>("chat");
 
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
-
-  // Routable deployments, sourced from the same endpoint the Deploy tab uses
-  // (GET /v1/serving/deployments): live ones PLUS evicted `managed` ones — a
-  // request to an evicted deployment auto-reloads it (PR-4 cold-start-on-
-  // demand), so it must stay selectable here or the flagship flow would be
-  // unreachable from the UI. Polling is paused while the tab is hidden.
+  // Auto-refreshing lists shared by every mode — held at the top level so
+  // switching modes never re-fetches or remounts a poller.
   const deployments = usePolling<DeploymentRecord[]>(getDeployments, DEPLOY_POLL_MS, active);
-  // Poll the store (not a one-shot fetch): the vision/embed model pickers derive
-  // from it, so a model seeded/deployed after the Playground opened must appear
-  // without a page reload — same cadence as the deployments list.
   const store = usePolling<StoreEntry[]>(getStore, DEPLOY_POLL_MS, active);
   const families = useAsync<ModelFamily[]>("families", getFamilies);
   const embeddingNames = useMemo(
@@ -134,10 +101,10 @@ export function Playground({
     () => rerankerDeploymentNames(store.data, families.data),
     [store.data, families.data],
   );
-  const visionNames = useMemo(() => visionDeploymentNames(store.data), [store.data]);
-  // Encoders (analyzers) AND embedding models are excluded from extract/chat:
-  // they don't answer chat/extraction prompts. Embedding models live in the
-  // Embed mode instead.
+  // Encoders (analyzers) AND embedding models are excluded from chat/arena:
+  // they don't answer chat prompts. Embedding/reranker models live in the
+  // Embed/Rerank mode instead. Vision and extraction ride the SAME deployment
+  // list — Chat now handles both inline, so there's no separate narrowing.
   const selectable = useMemo(
     () =>
       selectableDeployments(deployments.data ?? []).filter(
@@ -147,88 +114,6 @@ export function Playground({
       ),
     [deployments.data, embeddingNames],
   );
-  const selectableNames = useMemo(
-    () => selectable.map((d) => d.spec?.name ?? "").filter(Boolean),
-    [selectable],
-  );
-
-  // Pre-select the first selectable deployment so an explicit `deployment` is
-  // always sent when one exists; resync if the current pick disappears.
-  useEffect(() => {
-    if (selectableNames.length === 0) {
-      if (selectedDeployment !== "") setSelectedDeployment("");
-      return;
-    }
-    if (!selectableNames.includes(selectedDeployment)) {
-      setSelectedDeployment(selectableNames[0]);
-    }
-  }, [selectableNames, selectedDeployment]);
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setTrigger(null);
-
-    const payload: ExtractRequest = dynamicSchemaName
-      ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
-      : { schema_name: schemaName || "invoice" };
-    // Exactly ONE model selector goes out (they're mutually exclusive
-    // server-side): a saved routing policy, OR the deployment selector
-    // (its value is a DeploymentRecord spec.name; never model_profile).
-    // Empty single-model selection → backend default.
-    if (modelSource === "policy") {
-      if (!selectedPolicy) {
-        setError("Pick a routing policy, or switch back to a single model.");
-        return;
-      }
-      payload.routing_policy = selectedPolicy;
-    } else if (selectedDeployment) {
-      payload.deployment = selectedDeployment;
-    }
-    if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
-    if (language.trim()) payload.language = language.trim();
-
-    try {
-      if (inputMode === "text") {
-        if (!text.trim()) {
-          setError("Paste some document text first.");
-          return;
-        }
-        payload.text = text;
-      } else {
-        if (!file) {
-          setError("Choose a PDF or image file first.");
-          return;
-        }
-        payload.content_b64 = await fileToBase64(file);
-        payload.filename = file.name;
-      }
-
-      setSubmitting(true);
-      const res = await triggerExtract(payload);
-      setTrigger(res);
-      toast({ title: "Extraction started", description: res.channel, tone: "success" });
-    } catch (e) {
-      const msg =
-        e instanceof ApiUnavailable
-          ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
-          : e instanceof ApiError
-            ? e.message
-            : e instanceof Error
-              ? e.message
-              : "Something went wrong.";
-      setError(msg);
-      toast({ title: "Extraction failed", description: msg, tone: "error" });
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  // Genuine first-run empty: deployments loaded cleanly but none can serve an
-  // extraction. Kept distinct from loading / endpoint-error (those legitimately
-  // fall back to the server default and must NOT disable Run).
-  const extractNoModel =
-    !deployments.loading && !deployments.error && selectable.length === 0;
 
   return (
     <div>
@@ -236,24 +121,18 @@ export function Playground({
         title="Playground"
         subtitle={
           mode === "chat"
-            ? "Chat directly with any live deployment."
-            : mode === "vision"
-              ? "Send an image to a vision deployment (OCR / description) — free-text answer."
-              : mode === "embed"
-                ? "Compute embeddings with your deployed models (RAG-ready)."
-                : mode === "rerank"
-                  ? "Score documents against a query with a reranker deployment (retrieval, ranked)."
-                  : "Paste text or upload a document, route it to a live deployment, and watch the extraction stream."
+            ? "Chat, attach a file or image, or turn on extraction — one place for every synchronous request."
+            : mode === "arena"
+              ? "Send one prompt to two deployments side by side and compare their answers."
+              : "Compute embeddings or rerank documents with your deployed models (RAG-ready)."
         }
         actions={
           <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
             {(
               [
-                ["extract", "Extract", Sparkles],
                 ["chat", "Chat", MessageSquare],
-                ["vision", "Vision", ImageIcon],
-                ["embed", "Embed", Fingerprint],
-                ["rerank", "Rerank", ListOrdered],
+                ["arena", "Arena", Swords],
+                ["embedrerank", "Embed/Rerank", Fingerprint],
               ] as [PlaygroundMode, string, typeof Sparkles][]
             ).map(([m, label, Icon]) => (
               <button
@@ -275,242 +154,43 @@ export function Playground({
         }
       />
 
-      {/* Both modes stay mounted (hidden, never unmounted) so an in-flight
-          extraction stream or a chat history survives switching modes. */}
+      {/* Every mode stays mounted (hidden, never unmounted) so an in-flight
+          extraction stream or a chat/arena history survives switching modes. */}
       <div hidden={mode !== "chat"}>
         <ChatPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
       </div>
-      <div hidden={mode !== "vision"}>
-        <VisionPanel
-          deployments={deployments.data ?? []}
-          visionNames={visionNames}
-          onNavigate={onNavigate}
-        />
+      <div hidden={mode !== "arena"}>
+        <ArenaPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
       </div>
-      <div hidden={mode !== "embed"}>
-        <EmbedPanel
+      <div hidden={mode !== "embedrerank"}>
+        <EmbedRerankPanel
           deployments={deployments.data ?? []}
           embeddingNames={embeddingNames}
-          onNavigate={onNavigate}
-        />
-      </div>
-      <div hidden={mode !== "rerank"}>
-        <RerankPanel
-          deployments={deployments.data ?? []}
           rerankerNames={rerankerNames}
           onNavigate={onNavigate}
         />
-      </div>
-      <div hidden={mode !== "extract"}>
-      <div className="grid gap-6 lg:grid-cols-2">
-      <Card
-        icon={<Sparkles className="h-5 w-5" />}
-        title="Extract"
-        subtitle="Paste text or upload a document, then run extraction."
-      >
-        <form onSubmit={onSubmit} className="space-y-4">
-          <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
-            {(["text", "file"] as InputMode[]).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setInputMode(m)}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 transition",
-                  inputMode === m
-                    ? "bg-card text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {m === "text" ? <FileText className="h-4 w-4" /> : <Upload className="h-4 w-4" />}
-                {m === "text" ? "Paste text" : "Upload file"}
-              </button>
-            ))}
-          </div>
-
-          {inputMode === "text" ? (
-            <Field label="Document text">
-              <TextArea
-                rows={10}
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                placeholder="Paste the raw document text here…"
-              />
-            </Field>
-          ) : (
-            <Field label="Document file" hint="PDF or image; encoded to base64 in your browser.">
-              <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-muted/30 px-4 py-8 text-center transition hover:border-accent hover:bg-muted/50">
-                <Upload className="h-6 w-6 text-muted-foreground" />
-                <span className="text-sm text-foreground">
-                  {file ? file.name : "Click to choose a PDF or image"}
-                </span>
-                {file && (
-                  <span className="text-xs text-muted-foreground">
-                    {(file.size / 1024).toFixed(1)} KB
-                  </span>
-                )}
-                <input
-                  type="file"
-                  accept=".pdf,image/*"
-                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                  className="sr-only"
-                />
-              </label>
-            </Field>
-          )}
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field
-              label="Schema name"
-              hint={
-                dynamicSchemaName
-                  ? "Disabled while a saved schema is selected below."
-                  : undefined
-              }
-            >
-              <TextInput
-                value={schemaName}
-                onChange={(e) => setSchemaName(e.target.value)}
-                placeholder="invoice"
-                disabled={Boolean(dynamicSchemaName)}
-              />
-              <div className="mt-2 flex items-center gap-2">
-                <Select
-                  className="h-8 flex-1 text-xs"
-                  value={dynamicSchemaName}
-                  onChange={(e) => setDynamicSchemaName(e.target.value)}
-                >
-                  <option value="">(use schema name above)</option>
-                  {(dynamicSchemas.data ?? []).map((s) => (
-                    <option key={s.name} value={s.name}>
-                      {s.name} (saved)
-                    </option>
-                  ))}
-                </Select>
-                <button
-                  type="button"
-                  onClick={() => setSchemaSheetOpen(true)}
-                  className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
-                >
-                  <FilePlus2 className="h-3 w-3" />
-                  <T>New schema…</T>
-                </button>
-              </div>
-            </Field>
-            <SchemaBuilderSheet
-              open={schemaSheetOpen}
-              onClose={() => setSchemaSheetOpen(false)}
-              onCreated={(name) => {
-                setDynamicSchemaName(name);
-                dynamicSchemas.reload();
-              }}
-            />
-            <Field
-              label="Model"
-              hint={
-                modelSource === "policy"
-                  ? "A saved routing policy: the document goes to the first stage and escalates to later stages on the policy's confidence/validity rules and budgets. The result carries the routing audit."
-                  : "Runtime to route this extraction to. Evicted deployments reload on request (first request waits for the model load)."
-              }
-            >
-              <div className="space-y-2">
-                <Segmented
-                  value={modelSource}
-                  onChange={setModelSource}
-                  options={[
-                    { value: "single", label: "Single model" },
-                    { value: "policy", label: "Routing policy" },
-                  ]}
-                />
-                {modelSource === "policy" ? (
-                  <Select
-                    value={selectedPolicy}
-                    onChange={(e) => setSelectedPolicy(e.target.value)}
-                    aria-label="Routing policy"
-                  >
-                    <option value="">
-                      {routingPolicies.data && routingPolicies.data.length === 0
-                        ? "(no saved policies — create one in Benchmark)"
-                        : "(pick a policy)"}
-                    </option>
-                    {(routingPolicies.data ?? []).map((p) => (
-                      <option key={p.name} value={p.name}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </Select>
-                ) : (
-                  <DeploymentSelect
-                    deployments={deployments}
-                    selectable={selectable}
-                    value={selectedDeployment}
-                    onChange={setSelectedDeployment}
-                    emptyNoun="chat"
-                    onNavigate={onNavigate}
-                  />
-                )}
-              </div>
-            </Field>
-            <Field label="OCR backend" hint="Optional — for file uploads.">
-              <TextInput
-                value={ocrBackend}
-                onChange={(e) => setOcrBackend(e.target.value)}
-                placeholder="(default)"
-              />
-            </Field>
-            <Field label="Language" hint="Optional ISO code.">
-              <TextInput
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                placeholder="(auto)"
-              />
-            </Field>
-          </div>
-
-          {error && <Alert tone="err">{error}</Alert>}
-
-          <div className="space-y-1.5">
-            <Button type="submit" loading={submitting} disabled={extractNoModel}>
-              <Play className="h-4 w-4" />
-              {submitting ? "Submitting…" : "Run extraction"}
-            </Button>
-            {extractNoModel && (
-              <p className="text-xs text-muted-foreground">
-                <T>Deploy a chat model before running an extraction.</T>
-              </p>
-            )}
-          </div>
-        </form>
-      </Card>
-
-      <Card
-        icon={<Play className="h-5 w-5" />}
-        title="Live result"
-        subtitle="Realtime stream when available, polling otherwise."
-        actions={trigger ? <Badge tone="info">{trigger.channel}</Badge> : undefined}
-      >
-        {trigger ? (
-          <ResultPanel trigger={trigger} noun="extraction" />
-        ) : (
-          <p className="text-sm text-muted-foreground">
-            <T>Run an extraction to see live progress and the resulting JSON here.</T>
-          </p>
-        )}
-      </Card>
-      </div>
       </div>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Chat mode — classic free-form queries against a live deployment, through
-// the generic OpenAI surface (POST /v1/chat/completions, model = deployment).
+// Chat mode — free-form conversation with a live deployment through the
+// generic OpenAI surface (POST /v1/chat/completions), PLUS everything that
+// used to be its own Playground tab:
+//   - Vision: attach an image or PDF and it rides the same message as
+//     multimodal content — no separate mode, no separate model list.
+//   - Extraction: a toggle that redirects Send to POST /v1/extract (schema +
+//     model-source selection identical to the old standalone Extract form);
+//     each extraction becomes its own inline result card in the timeline,
+//     interleaved freely with ordinary chat turns.
 // ---------------------------------------------------------------------------
 
 interface ChatMsg {
-  role: "user" | "assistant" | "status";
+  role: "user" | "assistant" | "status" | "extraction";
   content: string;
+  /** Only set when role === "extraction". */
+  trigger?: TriggerResponse;
 }
 
 // A cold store: model's first request can take a while to boot. Auto-retry a
@@ -519,7 +199,14 @@ interface ChatMsg {
 // status message and resend by hand.
 const MAX_LOAD_RETRIES = 3;
 
-function ChatPanel({
+const VISION_PRESETS = [
+  "Extract all the text from this document (OCR).",
+  "Describe this image in detail.",
+  "What is written in this document? Return it verbatim.",
+];
+
+// Exported for tests: rendered by Playground with its polled deployment state.
+export function ChatPanel({
   deployments,
   selectable,
   onNavigate,
@@ -529,15 +216,13 @@ function ChatPanel({
   onNavigate?: NavigateToDeploy;
 }) {
   const { t } = useI18n();
-  // Chat owns its OWN selection: it only offers LIVE deployments, so sharing
-  // the Extract-side selection (which legitimately includes evicted
+  const { toast } = useToast();
+  // Chat owns its OWN selection: it only offers LIVE deployments by default,
+  // so sharing a broader selection (which legitimately includes evicted
   // auto-reload targets) would let the select DISPLAY one model while the
   // request carries another — the exact mismatch this state split fixes.
   // Evicted deployments stay selectable — a request to one auto-reloads it
-  // (load-on-demand), same convention as the Extract and Vision pickers.
-  // Prefer a live model as the default so the FIRST message a user sends
-  // doesn't automatically eat a cold-start wait, but still let a cold one be
-  // picked deliberately.
+  // (load-on-demand), same convention throughout the Studio.
   const [model, setModel] = useState("");
   const chatNames = useMemo(
     () => selectable.map((d) => d.spec?.name ?? "").filter(Boolean),
@@ -568,31 +253,187 @@ function ChatPanel({
   const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // --- Attachment (vision + extraction file input share one attach slot) ---
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  // PDF rasterization DPI — higher = sharper text (better for dense documents
+  // / small vision models), larger payload. Only used for a PDF attachment in
+  // CHAT mode (extraction rasterizes server-side via its own OCR backend).
+  const [dpi, setDpi] = useState(200);
+
+  function clearAttachment() {
+    if (preview?.startsWith("blob:")) URL.revokeObjectURL(preview);
+    setPreview(null);
+    setFile(null);
+  }
+
+  async function onAttach(f: File | null) {
+    clearAttachment();
+    setFile(f);
+    if (!f) return;
+    if (f.type.startsWith("image/")) {
+      setPreview(URL.createObjectURL(f));
+      return;
+    }
+    // PDF: rasterize page 1 (low DPI, single page) for a real visual preview
+    // — an <img> can't show a PDF directly. Best-effort: on failure the run
+    // still renders the pages when sent.
+    setPreviewLoading(true);
+    try {
+      const b64 = await fileToBase64(f);
+      const { images } = await renderDocument(b64, f.name, 150, 1);
+      setPreview(images[0] ?? null);
+    } catch {
+      setPreview(null);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
+  // --- Extraction toggle ---
+  const [extractionOn, setExtractionOn] = useState(false);
+  const [schemaName, setSchemaName] = useState("invoice");
+  const [dynamicSchemaName, setDynamicSchemaName] = useState("");
+  const [schemaSheetOpen, setSchemaSheetOpen] = useState(false);
+  const dynamicSchemas = useAsync<DynamicSchemaSummary[]>("dynamic-schemas", listDynamicSchemas);
+  const routingPolicies = useAsync<RoutingPolicySummary[]>(
+    "routing-policies",
+    listRoutingPolicies,
+  );
+  // "single" routes to the deployment picked above; "policy" runs a saved
+  // routing policy (cheap stage first, escalate on the policy's own
+  // confidence rules) — mutually exclusive with a single deployment, same as
+  // the backend's own contract. Only meaningful while extraction is on.
+  const [modelSource, setModelSource] = useState<"single" | "policy">("single");
+  const [selectedPolicy, setSelectedPolicy] = useState<string>("");
+  const [ocrBackend, setOcrBackend] = useState("");
+  const [language, setLanguage] = useState("");
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [msgs, busy]);
 
-  async function send() {
-    const text = input.trim();
-    if (!text || busy) return;
+  function isPdfFile(f: File): boolean {
+    return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
+  }
+
+  async function runExtraction() {
+    if (busy) return;
+    const trimmed = input.trim();
+    const attached = file;
+    if (!trimmed && !attached) {
+      setError("Paste some document text first, or attach a file.");
+      return;
+    }
+    const payload: ExtractRequest = dynamicSchemaName
+      ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
+      : { schema_name: schemaName || "invoice" };
+    if (modelSource === "policy") {
+      if (!selectedPolicy) {
+        setError("Pick a routing policy, or switch back to a single model.");
+        return;
+      }
+      payload.routing_policy = selectedPolicy;
+    } else if (model) {
+      payload.deployment = model;
+    }
+    if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
+    if (language.trim()) payload.language = language.trim();
+
+    let displayLabel: string;
+    try {
+      if (attached) {
+        payload.content_b64 = await fileToBase64(attached);
+        payload.filename = attached.name;
+        displayLabel = `📎 ${attached.name}`;
+      } else {
+        payload.text = trimmed;
+        displayLabel = trimmed;
+      }
+    } catch {
+      setError("Could not read the attached file.");
+      return;
+    }
+
+    setError(null);
+    setInput("");
+    clearAttachment();
+    setBusy(true);
+    try {
+      const res = await triggerExtract(payload);
+      setMsgs((prev) => [
+        ...prev,
+        { role: "user", content: displayLabel },
+        { role: "extraction", content: dynamicSchemaName || schemaName || "invoice", trigger: res },
+      ]);
+      toast({ title: "Extraction started", description: res.channel, tone: "success" });
+    } catch (e) {
+      const msg =
+        e instanceof ApiUnavailable
+          ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
+          : e instanceof ApiError || e instanceof Error
+            ? e.message
+            : "Something went wrong.";
+      setError(msg);
+      toast({ title: "Extraction failed", description: msg, tone: "error" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendChat() {
+    if (busy) return;
+    const trimmed = input.trim();
+    const attached = file;
+    if (!trimmed && !attached) return;
     if (!model) {
       setError("No deployment selected — deploy a model under Serving → Models first.");
       return;
     }
     setError(null);
-    const next: ChatMsg[] = [...msgs, { role: "user", content: text }];
+
+    // Prior turns replay as plain text (an attachment from an earlier turn
+    // isn't re-sent — only its display label is kept, same convention every
+    // OpenAI-style chat playground uses for image history).
+    const priorHistory = msgs
+      .filter((m): m is ChatMsg & { role: "user" | "assistant" } =>
+        m.role === "user" || m.role === "assistant",
+      )
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    let newContent: unknown = trimmed;
+    let displayLabel = trimmed;
+    if (attached) {
+      try {
+        const b64 = await fileToBase64(attached);
+        const imageUrls = isPdfFile(attached)
+          ? (await renderDocument(b64, attached.name, dpi)).images
+          : [`data:${attached.type || "image/png"};base64,${b64}`];
+        if (imageUrls.length === 0) {
+          setError("The document produced no page images.");
+          return;
+        }
+        newContent = [
+          { type: "text", text: trimmed || "Describe this image." },
+          ...imageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+        ];
+        displayLabel = trimmed || `📎 ${attached.name}`;
+      } catch {
+        setError("Could not read the attached file.");
+        return;
+      }
+    }
+
+    const next: ChatMsg[] = [...msgs, { role: "user", content: displayLabel }];
     setMsgs(next);
     setInput("");
+    clearAttachment();
     setBusy(true);
     const payload = [
       ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
-      // "status" bubbles (a give-up-and-retry-later notice from an earlier
-      // turn's cold start) are UI-only — an unrecognized role sent upstream
-      // can break the model's chat template. Only user/assistant turns are
-      // real conversation history.
-      ...next
-        .filter((m): m is ChatMsg & { role: "user" | "assistant" } => m.role !== "status")
-        .map((m) => ({ role: m.role, content: m.content })),
+      ...priorHistory,
+      { role: "user", content: newContent },
     ];
     await attempt(next, payload, 0);
     setBusy(false);
@@ -649,38 +490,163 @@ function ChatPanel({
     }
   }
 
+  function submit() {
+    void (extractionOn ? runExtraction() : sendChat());
+  }
+
+  const showVisionExtras = !extractionOn && file && !file.type.startsWith("image/");
+
   return (
     <Card
       icon={<MessageSquare className="h-5 w-5" />}
       title="Chat"
-      subtitle="Free-form conversation with the selected deployment (multi-turn, history kept locally)."
+      subtitle="Free-form conversation, file/image attachments, and extraction — all in one timeline."
     >
       <div className="space-y-4">
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field
-            label="Deployment"
-            hint="Evicted deployments reload on request (first message waits for the load)."
-          >
-            <DeploymentSelect
-              deployments={deployments}
-              selectable={selectable}
-              value={model}
-              onChange={setModel}
-              emptyNoun="chat"
-              onNavigate={onNavigate}
-              disabled={busy}
-            />
-          </Field>
+          {extractionOn && modelSource === "policy" ? (
+            <Field
+              label="Routing policy"
+              hint="The document goes to the first stage and escalates to later stages on the policy's confidence/validity rules and budgets. The result carries the routing audit."
+            >
+              <Select
+                value={selectedPolicy}
+                onChange={(e) => setSelectedPolicy(e.target.value)}
+                aria-label="Routing policy"
+              >
+                <option value="">
+                  {routingPolicies.data && routingPolicies.data.length === 0
+                    ? "(no saved policies — create one in Benchmark)"
+                    : "(pick a policy)"}
+                </option>
+                {(routingPolicies.data ?? []).map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          ) : (
+            <Field
+              label="Deployment"
+              hint="Evicted deployments reload on request (first message waits for the load)."
+            >
+              <DeploymentSelect
+                deployments={deployments}
+                selectable={selectable}
+                value={model}
+                onChange={setModel}
+                emptyNoun="chat"
+                onNavigate={onNavigate}
+                disabled={busy}
+              />
+            </Field>
+          )}
           <Field label="System prompt" hint="Optional — applied to the whole conversation.">
             <TextInput
               value={system}
               onChange={(e) => setSystem(e.target.value)}
               placeholder="You are…"
+              disabled={extractionOn}
             />
           </Field>
         </div>
 
-        {(mcpServers.data ?? []).length > 0 && (
+        <div className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-muted/20 px-3 py-2">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={extractionOn}
+              onChange={(e) => setExtractionOn(e.target.checked)}
+              className="h-4 w-4 rounded border-border"
+            />
+            <Sparkles className="h-4 w-4 text-muted-foreground" />
+            <span className="font-medium"><T>Extraction</T></span>
+          </label>
+          <span className="text-xs text-muted-foreground">
+            <T>
+              On: Send routes to constrained-generation extraction (schema-validated JSON) instead
+              of a chat reply.
+            </T>
+          </span>
+        </div>
+
+        {extractionOn && (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label="Schema name"
+              hint={
+                dynamicSchemaName ? "Disabled while a saved schema is selected below." : undefined
+              }
+            >
+              <TextInput
+                value={schemaName}
+                onChange={(e) => setSchemaName(e.target.value)}
+                placeholder="invoice"
+                disabled={Boolean(dynamicSchemaName)}
+              />
+              <div className="mt-2 flex items-center gap-2">
+                <Select
+                  className="h-8 flex-1 text-xs"
+                  value={dynamicSchemaName}
+                  onChange={(e) => setDynamicSchemaName(e.target.value)}
+                >
+                  <option value="">(use schema name above)</option>
+                  {(dynamicSchemas.data ?? []).map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.name} (saved)
+                    </option>
+                  ))}
+                </Select>
+                <button
+                  type="button"
+                  onClick={() => setSchemaSheetOpen(true)}
+                  className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                >
+                  <FilePlus2 className="h-3 w-3" />
+                  <T>New schema…</T>
+                </button>
+              </div>
+            </Field>
+            <SchemaBuilderSheet
+              open={schemaSheetOpen}
+              onClose={() => setSchemaSheetOpen(false)}
+              onCreated={(name) => {
+                setDynamicSchemaName(name);
+                dynamicSchemas.reload();
+              }}
+            />
+            <Field
+              label="Model source"
+              hint="Route to the deployment above, or to a saved routing policy instead."
+            >
+              <Segmented
+                value={modelSource}
+                onChange={setModelSource}
+                options={[
+                  { value: "single", label: "Single model" },
+                  { value: "policy", label: "Routing policy" },
+                ]}
+              />
+            </Field>
+            <Field label="OCR backend" hint="Optional — for file uploads.">
+              <TextInput
+                value={ocrBackend}
+                onChange={(e) => setOcrBackend(e.target.value)}
+                placeholder="(default)"
+              />
+            </Field>
+            <Field label="Language" hint="Optional ISO code.">
+              <TextInput
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                placeholder="(auto)"
+              />
+            </Field>
+          </div>
+        )}
+
+        {(mcpServers.data ?? []).length > 0 && !extractionOn && (
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">
               <T>Tools:</T>
@@ -720,17 +686,27 @@ function ChatPanel({
         <div className="scroll-thin max-h-[50vh] min-h-40 space-y-3 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
           {msgs.length === 0 && (
             <p className="text-sm text-muted-foreground">
-              <T>Ask anything — the request goes straight to the deployment through the OpenAI-compatible surface.</T>
+              <T>
+                Ask anything, attach an image or PDF, or turn on extraction — all through the same
+                deployment.
+              </T>
             </p>
           )}
           {msgs.map((m, i) =>
             m.role === "status" ? (
-              <p
-                key={i}
-                className="flex items-center gap-2 text-xs italic text-muted-foreground"
-              >
+              <p key={i} className="flex items-center gap-2 text-xs italic text-muted-foreground">
                 <Spinner /> {m.content}
               </p>
+            ) : m.role === "extraction" ? (
+              <div key={i} className="rounded-lg border border-border bg-card">
+                <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <T>Extraction</T> · {m.content}
+                </div>
+                <div className="p-3">
+                  {m.trigger && <ResultPanel trigger={m.trigger} noun="extraction" />}
+                </div>
+              </div>
             ) : (
               <div
                 key={i}
@@ -757,9 +733,80 @@ function ChatPanel({
           <div ref={bottomRef} />
         </div>
 
+        {previewLoading && (
+          <p className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Spinner /> <T>Rendering preview…</T>
+          </p>
+        )}
+        {preview && (
+          <div className="flex items-start gap-3 rounded-md border border-border bg-muted/20 p-2">
+            <img
+              src={preview}
+              alt="attachment preview"
+              className="h-20 w-20 shrink-0 rounded-md border border-border object-cover"
+            />
+            <div className="min-w-0 flex-1 space-y-1">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span className="truncate">{file?.name}</span>
+                <button
+                  type="button"
+                  onClick={clearAttachment}
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                  aria-label={t("Remove attachment")}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+              {showVisionExtras && (
+                <label className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <span><T>Render quality</T></span>
+                  <Select
+                    value={String(dpi)}
+                    onChange={(e) => setDpi(Number(e.target.value))}
+                    className="h-7 w-auto text-xs"
+                  >
+                    <option value="150">150 DPI — faster, smaller</option>
+                    <option value="200">200 DPI — recommended</option>
+                    <option value="300">300 DPI — sharpest, heaviest</option>
+                  </Select>
+                </label>
+              )}
+              {!extractionOn && file && (
+                <div className="flex flex-wrap gap-1">
+                  {VISION_PRESETS.map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => setInput(p)}
+                      className="rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                    >
+                      {p.length > 32 ? `${p.slice(0, 32)}…` : p}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {error && <Alert tone="err">{error}</Alert>}
 
         <div className="flex items-end gap-2">
+          <label
+            className={cn(
+              "flex h-[4.5rem] shrink-0 cursor-pointer items-center justify-center rounded-md border border-dashed border-border px-3 text-muted-foreground transition hover:border-accent hover:text-foreground",
+              file && "border-accent text-accent",
+            )}
+            title="Attach an image or PDF"
+          >
+            <Paperclip className="h-4 w-4" />
+            <input
+              type="file"
+              accept=".pdf,image/*"
+              onChange={(e) => void onAttach(e.target.files?.[0] ?? null)}
+              className="sr-only"
+            />
+          </label>
           <TextArea
             rows={2}
             value={input}
@@ -767,19 +814,18 @@ function ChatPanel({
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
-                void send();
+                submit();
               }
             }}
-            placeholder="Type a message (Enter to send, Shift+Enter for a new line)…"
+            placeholder={
+              extractionOn
+                ? "Paste document text, or attach a file (Enter to run)…"
+                : "Type a message, attach an image/PDF (Enter to send, Shift+Enter for a new line)…"
+            }
           />
-          <Button
-            type="button"
-            loading={busy}
-            disabled={chatNames.length === 0}
-            onClick={() => void send()}
-          >
-            <Send className="h-4 w-4" />
-            Send
+          <Button type="button" loading={busy} disabled={chatNames.length === 0} onClick={submit}>
+            {extractionOn ? <Play className="h-4 w-4" /> : <Send className="h-4 w-4" />}
+            {extractionOn ? "Run extraction" : "Send"}
           </Button>
           <Button
             type="button"
@@ -800,278 +846,366 @@ function ChatPanel({
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Vision mode — send an image to a vision deployment (lfm2_vl / nuextract3 /
-// vision_ocr) as an OpenAI multimodal chat request; the answer is free text
-// (OCR, description, caption). Closes the deploy→use loop for vision models.
+// Arena mode — one prompt, two deployments, answers streamed side by side.
+// Both sides receive the exact same message list (system + shared history +
+// the new prompt) concurrently. Multi-turn: every turn stores BOTH answers,
+// and a per-turn "Continue from" control picks which side's answer feeds the
+// next turn as assistant history (default: left) — the conversation stays
+// coherent while still exposing where the two models diverge.
 // ---------------------------------------------------------------------------
 
-const VISION_PRESETS = [
-  "Extract all the text from this document (OCR).",
-  "Describe this image in detail.",
-  "What is written in this document? Return it verbatim.",
-];
+type ArenaSide = 0 | 1;
 
-function VisionPanel({
+interface ArenaAnswer {
+  /** Deployment this side used when the turn was sent (the picker may change later). */
+  model: string;
+  content: string;
+  status: "streaming" | "loading" | "done" | "error";
+  error?: string;
+  elapsedMs: number;
+}
+
+interface ArenaTurn {
+  prompt: string;
+  /** [left, right] */
+  answers: [ArenaAnswer, ArenaAnswer];
+  /** Which side's answer feeds later turns as assistant history. */
+  historySide: ArenaSide;
+}
+
+function formatElapsed(ms: number): string {
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+// Exported for tests: rendered by Playground with its polled deployment state.
+export function ArenaPanel({
   deployments,
-  visionNames,
+  selectable,
   onNavigate,
 }: {
-  deployments: DeploymentRecord[];
-  visionNames: Set<string>;
+  deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
+  selectable: DeploymentRecord[];
   onNavigate?: NavigateToDeploy;
 }) {
-  // Include evicted (managed) deployments, not just live ones — a request to an
-  // evicted vision deployment auto-reloads it (the first request waits for the
-  // load), exactly like the Extract picker. Requiring isLiveDeployment hid a
-  // deployed-but-idle VLM as "no vision model deployed yet".
-  const selectableVision = useMemo(
-    () =>
-      selectableDeployments(deployments).filter(
-        (d) => d.spec?.name && visionNames.has(d.spec.name),
-      ),
-    [deployments, visionNames],
+  const { t } = useI18n();
+  const chatNames = useMemo(
+    () => selectable.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [selectable],
   );
-  const names = useMemo(
-    () => selectableVision.map((d) => d.spec?.name ?? "").filter(Boolean),
-    [selectableVision],
+  const liveNames = useMemo(
+    () =>
+      selectable
+        .filter(isLiveDeployment)
+        .map((d) => d.spec?.name ?? "")
+        .filter(Boolean),
+    [selectable],
   );
 
-  const [model, setModel] = useState("");
-  const [prompt, setPrompt] = useState(VISION_PRESETS[0]);
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
-  // PDF rasterization DPI — higher = sharper text (better for dense documents /
-  // small vision models), larger payload. Only used for PDFs.
-  const [dpi, setDpi] = useState(200);
+  // Two independent selections, one per side. Same live-first preference as
+  // Chat, and the right side defaults to a DIFFERENT model when one exists —
+  // comparing a model against itself is allowed, just not the default.
+  const [modelA, setModelA] = useState("");
+  const [modelB, setModelB] = useState("");
+  useEffect(() => {
+    if (chatNames.length === 0) {
+      if (modelA !== "") setModelA("");
+      if (modelB !== "") setModelB("");
+      return;
+    }
+    const preferred = [
+      ...liveNames,
+      ...chatNames.filter((n) => !liveNames.includes(n)),
+    ];
+    if (!chatNames.includes(modelA)) setModelA(preferred[0]);
+    if (!chatNames.includes(modelB)) setModelB(preferred[1] ?? preferred[0]);
+  }, [chatNames, liveNames, modelA, modelB]);
+
+  const [system, setSystem] = useState("");
+  const [input, setInput] = useState("");
+  const [turns, setTurns] = useState<ArenaTurn[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // A cold store: model triggering a load isn't a failure — style it apart
-  // from an actual error so "warming up" doesn't read as "something broke".
-  const [errorIsLoading, setErrorIsLoading] = useState(false);
-  const [answer, setAnswer] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (names.length === 0) {
-      if (model !== "") setModel("");
-      return;
-    }
-    if (!names.includes(model)) setModel(names[0]);
-  }, [names, model]);
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [turns, busy]);
 
-  async function onFile(f: File | null) {
-    setAnswer(null);
-    setError(null);
-    if (preview?.startsWith("blob:")) URL.revokeObjectURL(preview);
-    setPreview(null);
-    setFile(f);
-    if (!f) return;
-    if (f.type.startsWith("image/")) {
-      setPreview(URL.createObjectURL(f));
-      return;
-    }
-    // PDF: rasterize page 1 (low DPI, single page) for a real visual preview —
-    // an <img> can't show a PDF directly. Best-effort: on failure the run still
-    // renders the pages when sent.
-    setPreviewLoading(true);
+  function patchAnswer(turnIndex: number, side: ArenaSide, patch: Partial<ArenaAnswer>) {
+    setTurns((prev) =>
+      prev.map((turn, i) =>
+        i === turnIndex
+          ? {
+              ...turn,
+              answers: turn.answers.map((a, j) =>
+                j === side ? { ...a, ...patch } : a,
+              ) as [ArenaAnswer, ArenaAnswer],
+            }
+          : turn,
+      ),
+    );
+  }
+
+  async function runSide(
+    turnIndex: number,
+    side: ArenaSide,
+    model: string,
+    payload: { role: string; content: unknown }[],
+    retryCount = 0,
+  ): Promise<void> {
+    const started = performance.now();
     try {
-      const b64 = await fileToBase64(f);
-      const { images } = await renderDocument(b64, f.name, 150, 1);
-      setPreview(images[0] ?? null);
-    } catch {
-      setPreview(null);
-    } finally {
-      setPreviewLoading(false);
+      let content = "";
+      await chatCompletionStream(model, payload, (token) => {
+        content += token;
+        patchAnswer(turnIndex, side, {
+          content,
+          status: "streaming",
+          elapsedMs: performance.now() - started,
+        });
+      });
+      patchAnswer(turnIndex, side, {
+        content: content || t("(empty response)"),
+        status: "done",
+        elapsedMs: performance.now() - started,
+      });
+    } catch (e) {
+      if (e instanceof ModelLoading && retryCount < MAX_LOAD_RETRIES) {
+        // Same bounded cold-start retry as Chat: the backend's load trigger
+        // is idempotent, so re-sending after the ETA is safe. The elapsed
+        // clock restarts per attempt — it measures the answering attempt,
+        // not the cold-start wait.
+        patchAnswer(turnIndex, side, { status: "loading" });
+        const waitMs = Math.min(Math.max(e.etaSeconds, 2), 30) * 1000;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        return runSide(turnIndex, side, model, payload, retryCount + 1);
+      }
+      const msg =
+        e instanceof ModelLoading
+          ? `${e.message} ${t("Still starting — send your message again in a bit.")}`
+          : e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+            ? e.message
+            : "Chat request failed.";
+      patchAnswer(turnIndex, side, {
+        status: "error",
+        error: msg,
+        elapsedMs: performance.now() - started,
+      });
     }
   }
 
-  async function run() {
-    if (!model) {
-      setError("No live vision deployment — deploy a vision model (family lfm2_vl / vision_ocr).");
-      return;
+  // Shared history: each finished turn contributes its user prompt plus ONE
+  // assistant answer — the side picked by that turn's "Continue from" control,
+  // falling back to the other side when the picked one failed. A turn where
+  // both sides failed contributes nothing (it never happened, history-wise).
+  function historyMessages(): { role: string; content: string }[] {
+    const out: { role: string; content: string }[] = [];
+    for (const turn of turns) {
+      const picked = turn.answers[turn.historySide];
+      const other = turn.answers[turn.historySide === 0 ? 1 : 0];
+      const answer =
+        picked.status === "done" ? picked : other.status === "done" ? other : null;
+      if (!answer) continue;
+      out.push({ role: "user", content: turn.prompt });
+      out.push({ role: "assistant", content: answer.content });
     }
-    if (!file) {
-      setError("Choose an image or PDF first.");
+    return out;
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    if (!modelA || !modelB) {
+      setError("No deployment selected — deploy a model under Serving → Models first.");
       return;
     }
     setError(null);
-    setErrorIsLoading(false);
+    const payload = [
+      ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
+      ...historyMessages(),
+      { role: "user", content: text },
+    ];
+    const turnIndex = turns.length;
+    const blank = (model: string): ArenaAnswer => ({
+      model,
+      content: "",
+      status: "streaming",
+      elapsedMs: 0,
+    });
+    setTurns((prev) => [
+      ...prev,
+      { prompt: text, historySide: 0, answers: [blank(modelA), blank(modelB)] },
+    ]);
+    setInput("");
     setBusy(true);
-    setAnswer(null);
-    try {
-      const b64 = await fileToBase64(file);
-      // Vision models take IMAGES, not PDFs (llama-server rejects a
-      // data:application/pdf URL). A PDF is rasterized to PNG page images
-      // server-side first; a plain image is sent as-is.
-      const isPdf =
-        file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-      const imageUrls = isPdf
-        ? (await renderDocument(b64, file.name, dpi)).images
-        : [`data:${file.type || "image/png"};base64,${b64}`];
-      if (imageUrls.length === 0) {
-        setError("The document produced no page images.");
-        return;
-      }
-      const res = await chatCompletion(model, [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt.trim() || "Describe this image." },
-            ...imageUrls.map((url) => ({
-              type: "image_url" as const,
-              image_url: { url },
-            })),
-          ],
-        },
-      ]);
-      setAnswer(res.choices?.[0]?.message?.content ?? "(empty response)");
-    } catch (e) {
-      setErrorIsLoading(e instanceof ModelLoading);
-      setError(
-        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
-          ? e.message
-          : "Vision request failed.",
-      );
-    } finally {
-      setBusy(false);
-    }
+    // Both sides get the exact same payload, concurrently. Each side settles
+    // on its own — one failing never cancels the other.
+    await Promise.all([
+      runSide(turnIndex, 0, modelA, payload),
+      runSide(turnIndex, 1, modelB, payload),
+    ]);
+    setBusy(false);
   }
 
   return (
     <Card
-      icon={<ImageIcon className="h-5 w-5" />}
-      title="Vision"
-      subtitle="Upload an image, ask a question — the vision deployment answers in free text (OCR / description)."
+      icon={<Swords className="h-5 w-5" />}
+      title="Arena"
+      subtitle="One prompt, two deployments — the same conversation runs against both, answers stream side by side."
     >
-      <div className="grid gap-4 lg:grid-cols-2">
-        <div className="space-y-4">
-          <Field
-            label="Vision deployment"
-            hint="Deploy a vision model (Serving → Models: family lfm2_vl / nuextract3 / vision_ocr)."
-          >
-            {names.length === 0 ? (
-              <EmptyModelState noun="vision" onNavigate={onNavigate} />
-            ) : (
-              <Select value={model} onChange={(e) => setModel(e.target.value)}>
-                {names.map((n) => (
-                  <option key={n} value={n}>
-                    {n}
-                  </option>
-                ))}
-              </Select>
-            )}
+      <div className="space-y-4">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Left model" hint="Feeds the shared history by default.">
+            <DeploymentSelect
+              deployments={deployments}
+              selectable={selectable}
+              value={modelA}
+              onChange={setModelA}
+              emptyNoun="chat"
+              onNavigate={onNavigate}
+              disabled={busy}
+            />
           </Field>
-
-          <Field label="Image / document" hint="PNG, JPG or PDF — encoded in your browser.">
-            <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-muted/30 px-4 py-6 text-center transition hover:border-accent hover:bg-muted/50">
-              <Upload className="h-6 w-6 text-muted-foreground" />
-              <span className="text-sm text-foreground">
-                {file ? file.name : "Click to choose an image or PDF"}
-              </span>
-              <input
-                type="file"
-                accept=".pdf,image/*"
-                onChange={(e) => onFile(e.target.files?.[0] ?? null)}
-                className="sr-only"
-              />
-            </label>
+          <Field label="Right model">
+            <DeploymentSelect
+              deployments={deployments}
+              selectable={selectable}
+              value={modelB}
+              onChange={setModelB}
+              emptyNoun="chat"
+              onNavigate={onNavigate}
+              disabled={busy}
+            />
           </Field>
+        </div>
+        <Field label="System prompt" hint="Optional — applied to both sides.">
+          <TextInput
+            value={system}
+            onChange={(e) => setSystem(e.target.value)}
+            placeholder="You are…"
+          />
+        </Field>
 
-          {previewLoading && (
-            <p className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Spinner /> Rendering preview…
+        <div className="scroll-thin max-h-[55vh] min-h-40 space-y-4 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
+          {turns.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              <T>Send one prompt to both deployments and compare the answers side by side.</T>
             </p>
           )}
-          {preview && (
-            // A PDF's preview is its rasterized page 1 (an <img> can't show a PDF).
-            <img
-              src={preview}
-              alt="preview"
-              className="max-h-56 w-full rounded-md border border-border object-contain"
-            />
-          )}
-          {file && !file.type.startsWith("image/") && (
-            <div className="space-y-2 rounded-md border border-border bg-muted/40 px-3 py-2">
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <FileText className="h-4 w-4 shrink-0" />
-                <span className="truncate">{file.name}</span>
-                <span className="ml-auto shrink-0 text-xs"><T>PDF · page 1 shown; all pages sent</T></span>
+          {turns.map((turn, i) => (
+            <div key={i} className="space-y-2">
+              <div className="flex justify-end">
+                <div className="max-w-[85%] whitespace-pre-wrap rounded-lg bg-accent px-3 py-2 text-sm text-accent-foreground">
+                  {turn.prompt}
+                </div>
               </div>
-              <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span><T>Render quality</T></span>
-                <Select
-                  value={String(dpi)}
-                  onChange={(e) => setDpi(Number(e.target.value))}
-                  className="h-7 w-auto text-xs"
-                >
-                  <option value="150">150 DPI — faster, smaller</option>
-                  <option value="200">200 DPI — recommended</option>
-                  <option value="300">300 DPI — sharpest, heaviest</option>
-                </Select>
-                <span className="text-muted-foreground/80">
-                  <T>higher = sharper text, larger request</T>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {turn.answers.map((a, side) => (
+                  <div
+                    key={side}
+                    className="flex flex-col rounded-lg border border-border bg-card"
+                  >
+                    <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
+                      <span className="truncate text-xs font-medium text-foreground">
+                        {a.model}
+                      </span>
+                      {turn.historySide === side && <Badge tone="info">history</Badge>}
+                      <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
+                        {a.status === "loading" ? <Spinner /> : formatElapsed(a.elapsedMs)}
+                      </span>
+                    </div>
+                    <div className="px-3 py-2 text-sm">
+                      {a.status === "error" ? (
+                        <p className="text-red-600 dark:text-red-400">{a.error}</p>
+                      ) : a.status === "loading" ? (
+                        <p className="flex items-center gap-2 text-xs italic text-muted-foreground">
+                          <Spinner /> <T>Model is loading — retrying automatically…</T>
+                        </p>
+                      ) : (
+                        <div className="whitespace-pre-wrap text-foreground/90">
+                          {a.content || (a.status === "streaming" ? "…" : "")}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <span className="text-xs text-muted-foreground">
+                  <T>Continue from</T>
                 </span>
-              </label>
+                <Segmented
+                  value={turn.historySide === 0 ? "left" : "right"}
+                  onChange={(v) =>
+                    setTurns((prev) =>
+                      prev.map((tt, j) =>
+                        j === i ? { ...tt, historySide: v === "left" ? 0 : 1 } : tt,
+                      ),
+                    )
+                  }
+                  options={[
+                    { value: "left", label: "Left" },
+                    { value: "right", label: "Right" },
+                  ]}
+                />
+              </div>
             </div>
+          ))}
+          {busy && (
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Spinner /> <T>Waiting for the models…</T>
+            </p>
           )}
-
-          <Field label="Prompt">
-            <TextArea rows={2} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
-          </Field>
-          <div className="flex flex-wrap gap-1.5">
-            {VISION_PRESETS.map((p) => (
-              <button
-                key={p}
-                type="button"
-                onClick={() => setPrompt(p)}
-                className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
-              >
-                {p.length > 32 ? `${p.slice(0, 32)}…` : p}
-              </button>
-            ))}
-          </div>
-
-          {error &&
-            (errorIsLoading ? (
-              <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
-                <Spinner /> {error}
-              </p>
-            ) : (
-              <Alert tone="err">{error}</Alert>
-            ))}
-
-          <Button type="button" loading={busy} disabled={!model || !file} onClick={() => void run()}>
-            <Play className="h-4 w-4" />
-            Run
-          </Button>
+          <div ref={bottomRef} />
         </div>
 
-        <div>
-          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            <T>Answer</T>
-          </p>
-          {busy ? (
-            <p className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Spinner /> <T>The vision model is reading the image… (CPU vision is slow)</T>
-            </p>
-          ) : answer != null ? (
-            <pre className="scroll-thin max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-sm leading-relaxed text-foreground/90">
-              {answer}
-            </pre>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              <T>Pick a vision deployment, upload an image, and run to see the answer.</T>
-            </p>
-          )}
+        {error && <Alert tone="err">{error}</Alert>}
+
+        <div className="flex items-end gap-2">
+          <TextArea
+            rows={2}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            placeholder="Type a message for both models (Enter to send, Shift+Enter for a new line)…"
+          />
+          <Button
+            type="button"
+            loading={busy}
+            disabled={chatNames.length === 0}
+            onClick={() => void send()}
+          >
+            <Send className="h-4 w-4" />
+            Send
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={turns.length === 0 || busy}
+            onClick={() => {
+              setTurns([]);
+              setError(null);
+            }}
+            title="Clear the conversation"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
         </div>
       </div>
     </Card>
   );
 }
 
-// Embed mode — local embeddings + cosine similarity (RAG demo). Vectors are
-// computed on this node; nothing leaves the infra.
+// ---------------------------------------------------------------------------
+// Embed/Rerank mode — one panel, a sub-mode toggle. The deployment list is
+// FILTERED per sub-mode (embedding-family vs reranker-family names) — a hard
+// boundary via filtering, not just a label, so the picker can never offer a
+// model the chosen operation can't run.
 // ---------------------------------------------------------------------------
 
 function cosine(a: number[], b: number[]): number {
@@ -1086,36 +1220,38 @@ function cosine(a: number[], b: number[]): number {
   return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
 }
 
-function EmbedPanel({
+type EmbedRerankMode = "embed" | "rerank";
+
+// Exported for tests: rendered by Playground with its polled deployment state.
+export function EmbedRerankPanel({
   deployments,
   embeddingNames,
+  rerankerNames,
   onNavigate,
 }: {
   deployments: DeploymentRecord[];
   embeddingNames: Set<string>;
+  rerankerNames: Set<string>;
   onNavigate?: NavigateToDeploy;
 }) {
-  // Same as the vision picker: an evicted embedding deployment reloads on the
-  // next request, so include selectable (live + managed-evicted), not only live.
-  const embedDeployments = useMemo(
+  const [subMode, setSubMode] = useState<EmbedRerankMode>("embed");
+  const activeNames = subMode === "embed" ? embeddingNames : rerankerNames;
+
+  // Same as every other picker: an evicted deployment reloads on the next
+  // request, so include selectable (live + managed-evicted), not only live.
+  const modeDeployments = useMemo(
     () =>
       selectableDeployments(deployments).filter(
-        (d) => d.spec?.name && embeddingNames.has(d.spec.name),
+        (d) => d.spec?.name && activeNames.has(d.spec.name),
       ),
-    [deployments, embeddingNames],
+    [deployments, activeNames],
   );
   const names = useMemo(
-    () => embedDeployments.map((d) => d.spec?.name ?? "").filter(Boolean),
-    [embedDeployments],
+    () => modeDeployments.map((d) => d.spec?.name ?? "").filter(Boolean),
+    [modeDeployments],
   );
 
   const [model, setModel] = useState("");
-  const [textA, setTextA] = useState("Facture 5 400 € TTC, échéance 30 jours.");
-  const [textB, setTextB] = useState("Invoice total 5400 EUR, net 30 payment terms.");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<{ dims: number; sim: number; a: number[] } | null>(null);
-
   useEffect(() => {
     if (names.length === 0) {
       if (model !== "") setModel("");
@@ -1124,7 +1260,26 @@ function EmbedPanel({
     if (!names.includes(model)) setModel(names[0]);
   }, [names, model]);
 
-  async function run() {
+  // Embed sub-state
+  const [textA, setTextA] = useState("Facture 5 400 € TTC, échéance 30 jours.");
+  const [textB, setTextB] = useState("Invoice total 5400 EUR, net 30 payment terms.");
+  const [embedResult, setEmbedResult] = useState<{
+    dims: number;
+    sim: number;
+    a: number[];
+  } | null>(null);
+
+  // Rerank sub-state
+  const [query, setQuery] = useState("What is the invoice total?");
+  const [docs, setDocs] = useState(
+    "FACTURE total 5 400 € TTC, échéance 30 jours.\nWeather forecast for tomorrow: light rain.\nInvoice total 5400 EUR, net 30 payment terms.",
+  );
+  const [rerankResult, setRerankResult] = useState<{ doc: string; score: number }[] | null>(null);
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function runEmbed() {
     if (!model) {
       setError("No live embedding deployment — deploy an embedding model (family: embedding).");
       return;
@@ -1132,10 +1287,14 @@ function EmbedPanel({
     setError(null);
     setBusy(true);
     try {
-      const res = await embed(model, [textA, textB]);
-      const a = res.data?.[0]?.embedding ?? [];
-      const b = res.data?.[1]?.embedding ?? [];
-      setResult({ dims: a.length, sim: cosine(a, b), a });
+      // Two INDEPENDENT calls, not one batched [textA, textB] request: a
+      // batch input's response order isn't guaranteed to line up with the
+      // request order on every backend, and pairing by array position alone
+      // previously produced a silently-wrong (or empty) second vector.
+      const [resA, resB] = await Promise.all([embed(model, textA), embed(model, textB)]);
+      const a = resA.data?.[0]?.embedding ?? [];
+      const b = resB.data?.[0]?.embedding ?? [];
+      setEmbedResult({ dims: a.length, sim: cosine(a, b), a });
     } catch (e) {
       setError(
         e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
@@ -1147,116 +1306,11 @@ function EmbedPanel({
     }
   }
 
-  return (
-    <Card
-      icon={<Fingerprint className="h-5 w-5" />}
-      title="Embeddings"
-      subtitle="Two texts in, cosine similarity out — the retrieval primitive, computed on-node."
-    >
-      <div className="space-y-4">
-        <Field
-          label="Embedding deployment"
-          hint="Deploy an embedding GGUF (e.g. LiquidAI/LFM2.5-Embedding-350M-GGUF) with family 'embedding'."
-        >
-          {names.length === 0 ? (
-            <EmptyModelState noun="embedding" onNavigate={onNavigate} />
-          ) : (
-            <Select value={model} onChange={(e) => setModel(e.target.value)}>
-              {names.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </Select>
-          )}
-        </Field>
-
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Text A">
-            <TextArea rows={3} value={textA} onChange={(e) => setTextA(e.target.value)} />
-          </Field>
-          <Field label="Text B">
-            <TextArea rows={3} value={textB} onChange={(e) => setTextB(e.target.value)} />
-          </Field>
-        </div>
-
-        {error && <Alert tone="err">{error}</Alert>}
-
-        <Button type="button" loading={busy} onClick={() => void run()} disabled={!model}>
-          <Fingerprint className="h-4 w-4" />
-          Embed & compare
-        </Button>
-
-        {result && (
-          <div className="space-y-3 rounded-md border border-border bg-muted/20 p-4">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge tone="info">{result.dims} dims</Badge>
-              <Badge tone={result.sim > 0.7 ? "ok" : result.sim > 0.4 ? "warn" : "neutral"}>
-                cosine similarity {result.sim.toFixed(4)}
-              </Badge>
-            </div>
-            <div>
-              <p className="mb-1 text-xs font-medium text-muted-foreground">
-                <T>Text A vector (first 12 dims)</T>
-              </p>
-              <pre className="scroll-thin overflow-x-auto rounded-md border border-border bg-card p-3 text-xs text-foreground/90">
-                [{result.a.slice(0, 12).map((v) => v.toFixed(4)).join(", ")}
-                {result.a.length > 12 ? ", …" : ""}]
-              </pre>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              <T>Both vectors were computed by the selected deployment.</T>
-            </p>
-          </div>
-        )}
-      </div>
-    </Card>
-  );
-}
-
-function RerankPanel({
-  deployments,
-  rerankerNames,
-  onNavigate,
-}: {
-  deployments: DeploymentRecord[];
-  rerankerNames: Set<string>;
-  onNavigate?: NavigateToDeploy;
-}) {
-  // Same as the embed picker: an evicted reranker deployment reloads on the
-  // next request, so include selectable (live + managed-evicted), not only live.
-  const rerankDeployments = useMemo(
-    () =>
-      selectableDeployments(deployments).filter(
-        (d) => d.spec?.name && rerankerNames.has(d.spec.name),
-      ),
-    [deployments, rerankerNames],
-  );
-  const names = useMemo(
-    () => rerankDeployments.map((d) => d.spec?.name ?? "").filter(Boolean),
-    [rerankDeployments],
-  );
-
-  const [model, setModel] = useState("");
-  const [query, setQuery] = useState("What is the invoice total?");
-  const [docs, setDocs] = useState(
-    "FACTURE total 5 400 € TTC, échéance 30 jours.\nWeather forecast for tomorrow: light rain.\nInvoice total 5400 EUR, net 30 payment terms.",
-  );
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<{ doc: string; score: number }[] | null>(null);
-
-  useEffect(() => {
-    if (names.length === 0) {
-      if (model !== "") setModel("");
-      return;
-    }
-    if (!names.includes(model)) setModel(names[0]);
-  }, [names, model]);
-
-  async function run() {
+  async function runRerank() {
     if (!model) {
-      setError("No live reranker deployment — deploy a reranker model (family: reranker or multi_vector).");
+      setError(
+        "No live reranker deployment — deploy a reranker model (family: reranker or multi_vector).",
+      );
       return;
     }
     const documents = docs.split("\n").map((d) => d.trim()).filter(Boolean);
@@ -1274,7 +1328,7 @@ function RerankPanel({
           score: r.relevance_score ?? 0,
         }))
         .sort((a, b) => b.score - a.score);
-      setResult(ranked);
+      setRerankResult(ranked);
     } catch (e) {
       setError(
         e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
@@ -1286,19 +1340,40 @@ function RerankPanel({
     }
   }
 
+  function switchMode(next: EmbedRerankMode) {
+    setSubMode(next);
+    setError(null);
+  }
+
   return (
     <Card
-      icon={<ListOrdered className="h-5 w-5" />}
-      title="Rerank"
-      subtitle="A query and a list of documents in, relevance-ranked out — the retrieval second stage, computed on-node."
+      icon={<Fingerprint className="h-5 w-5" />}
+      title="Embed / Rerank"
+      subtitle="The retrieval primitives, computed on-node — nothing leaves the infra."
     >
       <div className="space-y-4">
+        <Segmented
+          value={subMode}
+          onChange={switchMode}
+          options={[
+            { value: "embed", label: "Embed" },
+            { value: "rerank", label: "Rerank" },
+          ]}
+        />
+
         <Field
-          label="Reranker deployment"
-          hint="Deploy a reranker: a GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF, family 'reranker') or a safetensors ColBERT (e.g. mixedbread-ai/mxbai-edge-colbert-v0-32m, family 'multi_vector')."
+          label={subMode === "embed" ? "Embedding deployment" : "Reranker deployment"}
+          hint={
+            subMode === "embed"
+              ? "Deploy an embedding GGUF (e.g. LiquidAI/LFM2.5-Embedding-350M-GGUF) with family 'embedding'."
+              : "Deploy a reranker: a GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF, family 'reranker') or a safetensors ColBERT (e.g. mixedbread-ai/mxbai-edge-colbert-v0-32m, family 'multi_vector')."
+          }
         >
           {names.length === 0 ? (
-            <EmptyModelState noun="reranker" onNavigate={onNavigate} />
+            <EmptyModelState
+              noun={subMode === "embed" ? "embedding" : "reranker"}
+              onNavigate={onNavigate}
+            />
           ) : (
             <Select value={model} onChange={(e) => setModel(e.target.value)}>
               {names.map((n) => (
@@ -1310,39 +1385,84 @@ function RerankPanel({
           )}
         </Field>
 
-        <Field label="Query">
-          <TextInput value={query} onChange={(e) => setQuery(e.target.value)} />
-        </Field>
-        <Field label="Documents" hint="One document per line.">
-          <TextArea rows={5} value={docs} onChange={(e) => setDocs(e.target.value)} />
-        </Field>
+        {subMode === "embed" ? (
+          <>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Text A">
+                <TextArea rows={3} value={textA} onChange={(e) => setTextA(e.target.value)} />
+              </Field>
+              <Field label="Text B">
+                <TextArea rows={3} value={textB} onChange={(e) => setTextB(e.target.value)} />
+              </Field>
+            </div>
 
-        {error && <Alert tone="err">{error}</Alert>}
+            {error && <Alert tone="err">{error}</Alert>}
 
-        <Button type="button" loading={busy} onClick={() => void run()} disabled={!model}>
-          <ListOrdered className="h-4 w-4" />
-          Rerank
-        </Button>
+            <Button type="button" loading={busy} onClick={() => void runEmbed()} disabled={!model}>
+              <Fingerprint className="h-4 w-4" />
+              Embed & compare
+            </Button>
 
-        {result && (
-          <div className="space-y-2 rounded-md border border-border bg-muted/20 p-4">
-            {result.map((r, i) => (
-              <div
-                key={i}
-                className="flex items-start gap-2 rounded-md border border-border bg-card p-2 text-sm"
-              >
-                {/* Score-based tone only -- ok/"healthy" for rank #1 was
-                    conflating "best result" with a health signal. Results
-                    are already sorted best-first (see the caption below),
-                    so rank is conveyed by position, not badge color. */}
-                <Badge tone={r.score > 0 ? "info" : "neutral"}>{r.score.toFixed(4)}</Badge>
-                <p className="text-foreground/90">{r.doc}</p>
+            {embedResult && (
+              <div className="space-y-3 rounded-md border border-border bg-muted/20 p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone="info">{embedResult.dims} dims</Badge>
+                  <Badge
+                    tone={
+                      embedResult.sim > 0.7 ? "ok" : embedResult.sim > 0.4 ? "warn" : "neutral"
+                    }
+                  >
+                    cosine similarity {embedResult.sim.toFixed(4)}
+                  </Badge>
+                </div>
+                <div>
+                  <p className="mb-1 text-xs font-medium text-muted-foreground">
+                    <T>Text A vector (first 12 dims)</T>
+                  </p>
+                  <pre className="scroll-thin overflow-x-auto rounded-md border border-border bg-card p-3 text-xs text-foreground/90">
+                    [{embedResult.a.slice(0, 12).map((v) => v.toFixed(4)).join(", ")}
+                    {embedResult.a.length > 12 ? ", …" : ""}]
+                  </pre>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  <T>Both vectors were computed by the selected deployment.</T>
+                </p>
               </div>
-            ))}
-            <p className="text-xs text-muted-foreground">
-              <T>Sorted by relevance_score, highest first — the same order a retrieval pipeline would keep.</T>
-            </p>
-          </div>
+            )}
+          </>
+        ) : (
+          <>
+            <Field label="Query">
+              <TextInput value={query} onChange={(e) => setQuery(e.target.value)} />
+            </Field>
+            <Field label="Documents" hint="One document per line.">
+              <TextArea rows={5} value={docs} onChange={(e) => setDocs(e.target.value)} />
+            </Field>
+
+            {error && <Alert tone="err">{error}</Alert>}
+
+            <Button type="button" loading={busy} onClick={() => void runRerank()} disabled={!model}>
+              <ListOrdered className="h-4 w-4" />
+              Rerank
+            </Button>
+
+            {rerankResult && (
+              <div className="space-y-2 rounded-md border border-border bg-muted/20 p-4">
+                {rerankResult.map((r, i) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-2 rounded-md border border-border bg-card p-2 text-sm"
+                  >
+                    <Badge tone={r.score > 0 ? "info" : "neutral"}>{r.score.toFixed(4)}</Badge>
+                    <p className="text-foreground/90">{r.doc}</p>
+                  </div>
+                ))}
+                <p className="text-xs text-muted-foreground">
+                  <T>Sorted by relevance_score, highest first — the same order a retrieval pipeline would keep.</T>
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
     </Card>
@@ -1363,7 +1483,7 @@ function EmptyModelState({
   noun,
   onNavigate,
 }: {
-  noun: "chat" | "vision" | "embedding" | "reranker";
+  noun: "chat" | "embedding" | "reranker";
   onNavigate?: NavigateToDeploy;
 }) {
   const { t } = useI18n();
@@ -1406,7 +1526,7 @@ function DeploymentSelect({
   selectable: DeploymentRecord[];
   value: string;
   onChange: (name: string) => void;
-  emptyNoun?: "chat" | "vision" | "embedding";
+  emptyNoun?: "chat" | "embedding";
   onNavigate?: NavigateToDeploy;
   /** Locks the picker mid-request — e.g. Chat's cold-start retry chain keeps
    * calling the model it started with; switching mid-retry would silently
