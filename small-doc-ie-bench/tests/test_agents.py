@@ -354,7 +354,15 @@ def test_shared_extraction_result_keeps_agent_flat_contract() -> None:
 def test_templates_listed(api) -> None:
     client, _ = api
     ids = {t["id"] for t in client.get("/v1/agents/templates").json()}
-    assert ids == {"proxy-security", "ocr-agent", "custom"}
+    assert ids == {"proxy-security", "ocr-agent", "custom", "docs-search-agent"}
+
+
+def test_docs_search_agent_template_wires_the_docs_search_server(api) -> None:
+    client, _ = api
+    templates = {t["id"]: t for t in client.get("/v1/agents/templates").json()}
+    template = templates["docs-search-agent"]
+    assert template["kind"] == "custom"
+    assert template["defaults"]["options"]["mcp_servers"] == ["docs-search"]
 
 
 def test_create_from_template_and_list(api) -> None:
