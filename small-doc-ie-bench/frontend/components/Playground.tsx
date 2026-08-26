@@ -36,6 +36,7 @@ import {
   fileToBase64,
   renderDocument,
   listDynamicSchemas,
+  listSchemas,
   listRoutingPolicies,
   ApiError,
   ApiUnavailable,
@@ -296,6 +297,7 @@ export function ChatPanel({
   const [schemaName, setSchemaName] = useState("invoice");
   const [dynamicSchemaName, setDynamicSchemaName] = useState("");
   const [schemaSheetOpen, setSchemaSheetOpen] = useState(false);
+  const schemas = useAsync<string[]>("schemas", listSchemas);
   const dynamicSchemas = useAsync<DynamicSchemaSummary[]>("dynamic-schemas", listDynamicSchemas);
   const routingPolicies = useAsync<RoutingPolicySummary[]>(
     "routing-policies",
@@ -573,30 +575,41 @@ export function ChatPanel({
 
         {extractionOn && (
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field
-              label="Schema name"
-              hint={
-                dynamicSchemaName ? "Disabled while a saved schema is selected below." : undefined
-              }
-            >
-              <TextInput
-                value={schemaName}
-                onChange={(e) => setSchemaName(e.target.value)}
-                placeholder="invoice"
-                disabled={Boolean(dynamicSchemaName)}
-              />
-              <div className="mt-2 flex items-center gap-2">
+            <Field label="Schema">
+              <div className="flex items-center gap-2">
                 <Select
-                  className="h-8 flex-1 text-xs"
-                  value={dynamicSchemaName}
-                  onChange={(e) => setDynamicSchemaName(e.target.value)}
+                  className="flex-1"
+                  aria-label="Schema"
+                  value={dynamicSchemaName ? `d:${dynamicSchemaName}` : `s:${schemaName}`}
+                  onChange={(e) => {
+                    const [kind, name] = [
+                      e.target.value.slice(0, 2),
+                      e.target.value.slice(2),
+                    ];
+                    if (kind === "d:") {
+                      setDynamicSchemaName(name);
+                    } else {
+                      setSchemaName(name);
+                      setDynamicSchemaName("");
+                    }
+                  }}
                 >
-                  <option value="">(use schema name above)</option>
-                  {(dynamicSchemas.data ?? []).map((s) => (
-                    <option key={s.name} value={s.name}>
-                      {s.name} (saved)
-                    </option>
-                  ))}
+                  <optgroup label="Built-in">
+                    {(schemas.data ?? []).map((s) => (
+                      <option key={s} value={`s:${s}`}>
+                        {s}
+                      </option>
+                    ))}
+                  </optgroup>
+                  {(dynamicSchemas.data ?? []).length > 0 && (
+                    <optgroup label="Saved">
+                      {(dynamicSchemas.data ?? []).map((s) => (
+                        <option key={s.name} value={`d:${s.name}`}>
+                          {s.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                 </Select>
                 <button
                   type="button"
