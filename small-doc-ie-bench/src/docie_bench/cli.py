@@ -8,6 +8,10 @@ from typing import Annotated
 import typer
 from rich import print
 
+from docie_bench.asr.backend import ASRError, get_backend
+from docie_bench.asr.benchmark import run_asr_benchmark
+from docie_bench.asr.formats import TranscriptionFormat, render_transcription
+from docie_bench.asr.models import ASRBackend, TranscriptionOptions
 from docie_bench.benchmark.comparison import (
     compare_runs,
     list_baselines,
@@ -36,6 +40,7 @@ from docie_bench.llm.model_profiles import load_model_profiles
 from docie_bench.logging_config import configure_logging
 from docie_bench.ocr.runner import run_ocr_benchmark
 from docie_bench.schemas.extraction import SCHEMA_REGISTRY, schema_json
+from docie_bench.settings import get_settings
 
 app = typer.Typer(no_args_is_help=True)
 benchmark_app = typer.Typer(no_args_is_help=True)
@@ -44,12 +49,92 @@ ocr_app = typer.Typer(no_args_is_help=True)
 schema_app = typer.Typer(no_args_is_help=True)
 dataset_app = typer.Typer(no_args_is_help=True)
 models_app = typer.Typer(no_args_is_help=True)
+asr_app = typer.Typer(no_args_is_help=True)
 app.add_typer(benchmark_app, name="benchmark")
 benchmark_app.add_typer(baseline_app, name="baseline")
 benchmark_app.add_typer(ocr_app, name="ocr")
 app.add_typer(schema_app, name="schema")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(models_app, name="models")
+app.add_typer(asr_app, name="asr")
+
+
+def _configured_asr_backend(model: str | None = None) -> ASRBackend:
+    settings = get_settings()
+    return get_backend(
+        model=model or settings.asr_model,
+        device=settings.asr_device,
+        compute_type=settings.asr_compute_type,
+        cpu_threads=settings.asr_cpu_threads,
+        num_workers=settings.asr_num_workers,
+        beam_size=settings.asr_beam_size,
+        vad_filter=settings.asr_vad_filter,
+    )
+
+
+@asr_app.command("transcribe")
+def asr_transcribe(
+    audio: Annotated[Path, typer.Argument(exists=True, readable=True, dir_okay=False)],
+    model: Annotated[str | None, typer.Option(help="Whisper model name/path override")] = None,
+    language: Annotated[str | None, typer.Option(help="ISO language hint")] = None,
+    prompt: Annotated[str | None, typer.Option(help="Optional transcription context")] = None,
+    temperature: Annotated[float, typer.Option(min=0.0, max=1.0)] = 0.0,
+    response_format: Annotated[
+        TranscriptionFormat, typer.Option("--format", help="Output format")
+    ] = TranscriptionFormat.TEXT,
+    output: Annotated[Path | None, typer.Option(help="Write output to this file")] = None,
+) -> None:
+    """Transcribe one local audio file."""
+
+    try:
+        result = _configured_asr_backend(model).transcribe(
+            audio,
+            TranscriptionOptions(
+                language=language,
+                prompt=prompt,
+                temperature=temperature,
+            ),
+        )
+    except ASRError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload, _media_type = render_transcription(result, response_format)
+    rendered = (
+        json.dumps(payload, ensure_ascii=False, indent=2)
+        if isinstance(payload, dict)
+        else payload
+    )
+    if output is not None:
+        from docie_bench.benchmark.reproducibility import atomic_write_text
+
+        atomic_write_text(output, rendered)
+        print(f"[green]Transcription written[/green]: {output}")
+    else:
+        typer.echo(rendered, nl=not rendered.endswith("\n"))
+
+
+@asr_app.command("benchmark")
+def asr_benchmark(
+    manifest: Annotated[Path, typer.Argument(exists=True, readable=True, dir_okay=False)],
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    model: Annotated[str | None, typer.Option(help="Whisper model name/path override")] = None,
+    temperature: Annotated[float, typer.Option(min=0.0, max=1.0)] = 0.0,
+) -> None:
+    """Benchmark speech-to-text over an audio/reference JSONL manifest."""
+
+    try:
+        result = run_asr_benchmark(
+            manifest_path=manifest,
+            backend=_configured_asr_backend(model),
+            output_dir=output_dir,
+            temperature=temperature,
+        )
+    except (ASRError, ValueError, FileExistsError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    print(f"[green]ASR benchmark complete[/green]: {result.run_dir}")
+    print(f"Predictions: {result.predictions_path}")
+    print(f"Metrics: {result.metrics_path}")
+    print(f"Report: {result.report_path}")
+    print(f"Manifest: {result.manifest_path}")
 
 
 @benchmark_app.command("run")

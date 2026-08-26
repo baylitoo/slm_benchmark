@@ -39,6 +39,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+asr = [
+  "faster-whisper>=1.1.0,<2.0.0"
+]
 ocr = [
   "pytesseract>=0.3.13"
 ]

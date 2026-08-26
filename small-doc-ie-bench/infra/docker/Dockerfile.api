@@ -70,10 +70,11 @@ COPY --from=llama-builder /src/build/bin/llama-server /usr/local/bin/llama-serve
 
 # PIP_EXTRAS lets one service opt into heavier optional groups without
 # bloating every image built from this file: the `serving` service passes
-# "ocr,encoders" (torch + gliner for encoder deployments), everything else
-# keeps the light default. `mcp` is in the default because the api service
-# hosts both sides of the MCP tool path (the chat tool loop and the
-# first-party stdio servers) — without it every catalog feature answers 501.
+# "ocr,encoders" (torch + gliner for encoder deployments), while Compose's
+# `api` passes "ocr,mcp,asr" for its transcription route. `mcp` is in the
+# default because the api service hosts both sides of the MCP tool path (the
+# chat tool loop and the first-party stdio servers) — without it every catalog
+# feature answers 501.
 ARG PIP_EXTRAS=ocr,mcp
 
 # ── Dependency layer ─────────────────────────────────────────────────────────

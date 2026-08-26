@@ -101,6 +101,23 @@ class Settings(BaseSettings):
     ocr_language: str | None = None
     runs_dir: Path = Path("runs")
 
+    # First-class speech-to-text. The API accepts only this configured model
+    # (or its public alias), so an untrusted multipart request cannot trigger an
+    # arbitrary Hugging Face download. faster-whisper itself remains an
+    # optional dependency and is imported only on the first transcription.
+    asr_model: str = "small"
+    asr_model_alias: str = "asr-default"
+    asr_device: Literal["cpu", "cuda", "auto"] = "cpu"
+    asr_compute_type: str = "int8"
+    asr_cpu_threads: int = Field(default=0, ge=0, le=256)
+    asr_num_workers: int = Field(default=1, ge=1, le=32)
+    asr_beam_size: int = Field(default=5, ge=1, le=100)
+    asr_vad_filter: bool = True
+    asr_max_upload_mb: int = Field(default=25, ge=1, le=1_024)
+    asr_allowed_upload_mime_types: str = (
+        "audio/flac,audio/mp4,audio/mpeg,audio/ogg,audio/wav,audio/webm"
+    )
+
     # MCP tool sources for served chat models (docie_bench.mcp_tools): the
     # operator-owned registry of reachable MCP servers. Callers of
     # /v1/chat/completions pick servers from this file BY NAME via the
@@ -245,10 +262,22 @@ class Settings(BaseSettings):
         return self.max_request_body_mb * 1024 * 1024
 
     @property
+    def asr_max_upload_bytes(self) -> int:
+        return self.asr_max_upload_mb * 1024 * 1024
+
+    @property
     def allowed_mime_types(self) -> set[str]:
         return {
             value.strip().lower()
             for value in self.allowed_upload_mime_types.split(",")
+            if value.strip()
+        }
+
+    @property
+    def allowed_asr_mime_types(self) -> set[str]:
+        return {
+            value.strip().lower()
+            for value in self.asr_allowed_upload_mime_types.split(",")
             if value.strip()
         }
 
