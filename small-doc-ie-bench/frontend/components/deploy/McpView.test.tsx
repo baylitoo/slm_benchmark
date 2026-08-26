@@ -15,6 +15,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     enableMcpServer: vi.fn(),
     disableMcpServer: vi.fn(),
     testMcpServer: vi.fn(),
+    getCodeInterpreterWorkers: vi.fn(),
   };
 });
 
@@ -114,5 +115,41 @@ describe("McpView", () => {
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: /disable/i }));
     await waitFor(() => expect(api.disableMcpServer).toHaveBeenCalledWith("calculator"));
+  });
+
+  it("shows the sandbox worker pool for an enabled code-interpreter entry", async () => {
+    vi.mocked(api.listMcpCatalog).mockResolvedValue([
+      makeEntry({
+        name: "code-interpreter",
+        title: "Code Interpreter",
+        tools: ["run_python"],
+        enabled: true,
+      }),
+    ]);
+    vi.mocked(api.getCodeInterpreterWorkers).mockResolvedValue({
+      queues: [
+        { queue: "default", size: 1, available: 2, idle: 1, working: 1, paused: 0, failed: 0 },
+      ],
+    });
+    renderView();
+    await waitFor(() => expect(api.getCodeInterpreterWorkers).toHaveBeenCalled());
+    expect(await screen.findByText("2 workers")).toBeInTheDocument();
+    expect(screen.getByText(/1 idle · 1 working · 1 queued/)).toBeInTheDocument();
+  });
+
+  it("does not fetch the worker pool for a non-code-interpreter entry", async () => {
+    vi.mocked(api.listMcpCatalog).mockResolvedValue([makeEntry({ enabled: true })]);
+    renderView();
+    await screen.findByText("Calculator");
+    expect(api.getCodeInterpreterWorkers).not.toHaveBeenCalled();
+  });
+
+  it("shows an error when the sandbox is unreachable", async () => {
+    vi.mocked(api.listMcpCatalog).mockResolvedValue([
+      makeEntry({ name: "code-interpreter", title: "Code Interpreter", enabled: true }),
+    ]);
+    vi.mocked(api.getCodeInterpreterWorkers).mockRejectedValue(new Error("could not reach judge0"));
+    renderView();
+    expect(await screen.findByText(/could not reach judge0/)).toBeInTheDocument();
   });
 });

@@ -16,7 +16,7 @@ from mcp.shared.memory import create_client_server_memory_streams
 
 from docie_bench.mcp_api import router as mcp_router
 from docie_bench.mcp_catalog import CATALOG, registry_entry_for
-from docie_bench.mcp_servers import calculator, dates, docs_search, web_fetch
+from docie_bench.mcp_servers import calculator, code_interpreter, dates, docs_search, web_fetch
 from docie_bench.settings import get_settings
 
 # ---------------------------------------------------------------- calculator
@@ -167,6 +167,81 @@ def test_search_documents_rejects_empty_query(docs: Path) -> None:
         docs_search.search_documents("   ")
 
 
+# ------------------------------------------------------------ code-interpreter
+
+
+def test_submit_code_raises_when_token_missing(monkeypatch) -> None:
+    monkeypatch.delenv(code_interpreter.TOKEN_ENV, raising=False)
+    with pytest.raises(code_interpreter.CodeInterpreterUnavailableError, match="TOKEN"):
+        code_interpreter.submit_code("print(1)")
+
+
+def test_submit_code_posts_to_judge0_and_maps_the_response(monkeypatch) -> None:
+    monkeypatch.setenv(code_interpreter.TOKEN_ENV, "secret-token")
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "stdout": "6\n",
+                "stderr": "",
+                "exit_code": 0,
+                "status": {"id": 3, "description": "Accepted"},
+            },
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: real_client(transport=httpx.MockTransport(handler)).post(url, **kw),
+    )
+
+    result = code_interpreter.submit_code("print(3 * 2)", url="http://judge0-server:2358")
+
+    assert result == {
+        "stdout": "6\n",
+        "stderr": "",
+        "exit_code": 0,
+        "timed_out": False,
+        "truncated": False,
+    }
+    (request,) = captured
+    assert request.headers["x-auth-token"] == "secret-token"
+    body = json.loads(request.content)
+    assert body["language_id"] == 71
+    assert body["source_code"] == "print(3 * 2)"
+    assert request.url.params["wait"] == "true"
+
+
+def test_submit_code_maps_time_limit_exceeded(monkeypatch) -> None:
+    monkeypatch.setenv(code_interpreter.TOKEN_ENV, "secret-token")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "stdout": None,
+                "stderr": None,
+                "exit_code": None,
+                "status": {"id": 5, "description": "Time Limit Exceeded"},
+            },
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: real_client(transport=httpx.MockTransport(handler)).post(url, **kw),
+    )
+
+    result = code_interpreter.submit_code("while True: pass", url="http://judge0-server:2358")
+    assert result["timed_out"] is True
+    assert result["stdout"] == ""
+
+
 # --------------------------------------------------- servers speak real MCP
 
 
@@ -177,6 +252,7 @@ def test_search_documents_rejects_empty_query(docs: Path) -> None:
         (dates, {"parse_date", "date_diff", "today"}),
         (web_fetch, {"fetch"}),
         (docs_search, {"list_files", "read_document", "search_text"}),
+        (code_interpreter, {"run_python"}),
     ],
 )
 async def test_build_server_exposes_expected_tools(module, expected_tools) -> None:
@@ -215,10 +291,12 @@ def client(registry_path: Path) -> TestClient:
 
 def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_path: Path) -> None:
     entries = {e["name"]: e for e in client.get("/v1/mcp/catalog").json()["entries"]}
-    assert set(entries) == {"calculator", "dates", "web-fetch", "docs-search"}
+    assert set(entries) == {"calculator", "dates", "web-fetch", "docs-search", "code-interpreter"}
     assert not entries["calculator"]["enabled"]
     assert entries["web-fetch"]["params"][0]["name"] == "allowed_hosts"
     assert entries["docs-search"]["params"][0]["name"] == "docs_dir"
+    ci_params = {p["name"]: p["required"] for p in entries["code-interpreter"]["params"]}
+    assert ci_params == {"url": False, "token": True}
 
     client.post("/v1/mcp/servers", json={"catalog": "calculator"})
     entries = {e["name"]: e for e in client.get("/v1/mcp/catalog").json()["entries"]}
@@ -339,3 +417,134 @@ def test_enable_docs_search_writes_its_dir_env_var(client: TestClient, registry_
     saved = json.loads(registry_path.read_text(encoding="utf-8"))["servers"]["docs-search"]
     assert saved["command"] == ["python", "-m", "docie_bench.mcp_servers.docs_search"]
     assert saved["env"] == {"DOCIE_MCP_DOCS_SEARCH_DIR": "/data/agent-docs"}
+
+
+def test_enable_code_interpreter_requires_the_token_param(client: TestClient) -> None:
+    res = client.post("/v1/mcp/servers", json={"catalog": "code-interpreter", "params": {}})
+    assert res.status_code == 422
+    assert "token" in res.json()["detail"]
+
+
+def test_enable_code_interpreter_writes_url_and_token_env(
+    client: TestClient, registry_path: Path
+) -> None:
+    res = client.post(
+        "/v1/mcp/servers",
+        json={
+            "catalog": "code-interpreter",
+            "params": {"token": "secret-token", "url": "http://judge0-server:2358"},
+        },
+    )
+    assert res.status_code == 201, res.text
+    saved = json.loads(registry_path.read_text(encoding="utf-8"))["servers"]["code-interpreter"]
+    assert saved["command"] == ["python", "-m", "docie_bench.mcp_servers.code_interpreter"]
+    assert saved["env"] == {
+        "DOCIE_MCP_CODE_INTERPRETER_TOKEN": "secret-token",
+        "DOCIE_MCP_CODE_INTERPRETER_URL": "http://judge0-server:2358",
+    }
+
+
+# ---------------------------------------------------- code-interpreter workers
+
+
+def test_workers_route_404_for_a_non_code_interpreter_server(
+    client: TestClient, registry_path: Path
+) -> None:
+    client.post("/v1/mcp/servers", json={"catalog": "calculator"})
+    assert client.get("/v1/mcp/servers/calculator/workers").status_code == 404
+
+
+def test_workers_route_404_when_unregistered(client: TestClient) -> None:
+    assert client.get("/v1/mcp/servers/code-interpreter/workers").status_code == 404
+
+
+def test_workers_route_422_without_a_token(client: TestClient, registry_path: Path) -> None:
+    registry_path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "code-interpreter": {
+                        "transport": "stdio",
+                        "command": ["python", "-m", "docie_bench.mcp_servers.code_interpreter"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = client.get("/v1/mcp/servers/code-interpreter/workers")
+    assert res.status_code == 422
+    assert "TOKEN" in res.json()["detail"]
+
+
+def test_workers_route_proxies_judge0(
+    client: TestClient, registry_path: Path, monkeypatch
+) -> None:
+    registry_path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "code-interpreter": {
+                        "transport": "stdio",
+                        "command": ["python", "-m", "docie_bench.mcp_servers.code_interpreter"],
+                        "env": {
+                            "DOCIE_MCP_CODE_INTERPRETER_TOKEN": "secret-token",
+                            "DOCIE_MCP_CODE_INTERPRETER_URL": "http://judge0-server:2358",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-auth-token"] == "secret-token"
+        assert request.url.path == "/workers"
+        return httpx.Response(200, json=[{"queue": "default", "size": 0, "available": 2,
+                                           "idle": 2, "working": 0, "paused": 0, "failed": 0}])
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+
+    res = client.get("/v1/mcp/servers/code-interpreter/workers")
+    assert res.status_code == 200, res.text
+    assert res.json()["queues"][0]["available"] == 2
+
+
+def test_workers_route_502_when_judge0_unreachable(
+    client: TestClient, registry_path: Path, monkeypatch
+) -> None:
+    registry_path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "code-interpreter": {
+                        "transport": "stdio",
+                        "command": ["python", "-m", "docie_bench.mcp_servers.code_interpreter"],
+                        "env": {
+                            "DOCIE_MCP_CODE_INTERPRETER_TOKEN": "secret-token",
+                            "DOCIE_MCP_CODE_INTERPRETER_URL": "http://judge0-server:2358",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+
+    assert client.get("/v1/mcp/servers/code-interpreter/workers").status_code == 502
