@@ -20,6 +20,7 @@ tenant guard applies.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
@@ -53,6 +54,11 @@ from docie_bench.studio import usage_store
 
 router = APIRouter(tags=["chat"], dependencies=[Depends(agents_tenant_guard)])
 
+# Bound on the disposable usage-frame scan buffer (see _stream_chat_completions):
+# a single SSE line ought to be at most one completion frame's worth of JSON.
+# Past this, give up scanning for a usage block rather than growing unboundedly.
+_SSE_USAGE_SCAN_LIMIT = 262_144
+
 # Same dependency the router already guards with -- FastAPI caches a repeated
 # dependency per request, so declaring it again as a route parameter hands the
 # route the SAME authenticated TenantContext without a second quota acquire.
@@ -72,9 +78,10 @@ def _record_usage_outcome(
     whatever the surface is about to return -- a completion dict (status
     ``ok``, token counts lifted from its OpenAI ``usage`` block when present)
     or an error ``JSONResponse`` (status ``error``, no tokens). The streaming
-    chat path records its own row (``_stream_chat_completions``): its tokens
-    are never parsed, so they stay ``None`` there. ``record_usage`` never
-    raises -- a ledger hiccup cannot fail the request it describes.
+    chat path records its own row (``_stream_chat_completions``): tokens land
+    there too when the upstream's final SSE frame carries a usage block,
+    ``None`` otherwise. ``record_usage`` never raises -- a ledger hiccup
+    cannot fail the request it describes.
     """
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -489,14 +496,23 @@ async def _stream_chat_completions(
     the full decoded string, and a multi-byte UTF-8 sequence can straddle a
     chunk boundary. The gateway's proven streaming path skips it too.
 
-    Usage accounting: raw SSE bytes are never parsed here, so a streamed
-    request's usage row carries no token counts — but it still counts as a
-    request, with latency measured to the end of the relay (the ``finally``
-    below runs whether the stream drained or the caller disconnected). A
-    refused stream (unreachable upstream / upstream 4xx-5xx before any bytes)
-    records an ``error`` row instead.
+    Usage accounting: bytes are relayed to the caller completely unchanged
+    (this must never become a de-facto buffering point), but a SECOND,
+    disposable line-buffer is fed the same bytes to look for the final
+    ``data: {...}`` frame's ``usage`` block — the OpenAI/llama-server
+    streaming contract sends one when the request carries
+    ``stream_options: {"include_usage": true}`` (set below if the caller
+    didn't already ask for it). If no such frame ever arrives (older
+    llama-server, a caller that stripped the option back out, a dropped
+    connection), the row falls back to ``tokens=None`` exactly as before —
+    this is pure upside, never a regression.
     """
     forward["stream"] = True
+    stream_options = forward.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    stream_options.setdefault("include_usage", True)
+    forward["stream_options"] = stream_options
     stream_ctx = client.stream("POST", url, json=forward, headers=headers, timeout=timeout)
     try:
         upstream = await stream_ctx.__aenter__()
@@ -526,14 +542,43 @@ async def _stream_chat_completions(
     recency.stamp_served_profile(profile_name)
 
     async def body_iterator() -> AsyncIterator[bytes]:
+        usage: dict[str, Any] | None = None
+        parse_buffer: bytearray | None = bytearray()
         try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
+                # Byte-level scan of a COPY of what was just relayed -- never
+                # holds up delivery, never touches the bytes handed to the
+                # caller. Splitting on b"\n" is safe even mid multi-byte UTF-8
+                # character: continuation bytes are 0x80-0xBF, never 0x0A.
+                if parse_buffer is not None:
+                    parse_buffer += chunk
+                    if len(parse_buffer) > _SSE_USAGE_SCAN_LIMIT:
+                        # Give up silently; any usage already parsed stands.
+                        parse_buffer = None
+                        continue
+                    *lines, parse_buffer = parse_buffer.split(b"\n")
+                    parse_buffer = bytearray(parse_buffer)
+                    for raw_line in lines:
+                        line = bytes(raw_line).strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = line[len(b"data:") :].strip()
+                        if payload in (b"", b"[DONE]"):
+                            continue
+                        try:
+                            frame = json.loads(payload)
+                        except ValueError:
+                            continue
+                        if isinstance(frame, dict) and isinstance(frame.get("usage"), dict):
+                            usage = frame["usage"]
         finally:
             await stream_ctx.__aexit__(None, None, None)
-            # tokens=None on purpose: the proxy relays raw bytes and never
-            # reassembles the usage block a stream's final frame may carry.
-            _record_usage_outcome(profile_name, "chat", tenant_id, started, None)
+            # ``usage`` is populated only when the upstream's final SSE frame
+            # actually carried a usage block (stream_options.include_usage,
+            # set above) -- otherwise this is None exactly as before the fix.
+            outcome = {"usage": usage} if usage is not None else None
+            _record_usage_outcome(profile_name, "chat", tenant_id, started, outcome)
 
     return StreamingResponse(
         body_iterator(), status_code=upstream.status_code, media_type=media_type

@@ -536,7 +536,7 @@ export function UsageCard({ active }: { active: boolean }) {
             </table>
           </div>
           <p className="text-xs text-muted-foreground">
-            <T>Streamed chats count requests and latency but not tokens (the proxy relays raw bytes without parsing usage).</T>
+            <T>Streamed chats count tokens when the upstream sends a final usage frame; older runtimes or a caller that opts out still count requests and latency only.</T>
           </p>
         </div>
       )}
