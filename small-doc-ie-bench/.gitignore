@@ -8,6 +8,7 @@ __pycache__/
 .cache/
 runs/
 annotations/
+artifacts/asr-compose-smoke/
 models/*.gguf
 models/*.bin
 models/*.safetensors

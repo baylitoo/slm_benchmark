@@ -21,6 +21,8 @@ the canonical model store and loaded by one managed runtime on that serving
 node. API replicas only validate and proxy uploads, so scaling the public API
 does not duplicate model memory. Canonical snapshots live in the shared serving
 state, while the serving node's `hf-cache` volume persists Hub caches.
+Release verification and production recovery are documented in
+[ASR rollout and rollback](asr-operations.md).
 
 | Setting | Default | Purpose |
 |---|---:|---|
@@ -148,8 +150,9 @@ faster-whisper CTranslate2 repository (it must contain `model.bin`):
 
 ```bash
 # In Studio: Models -> search/select a faster-whisper model -> Seed
-# Then deploy the canonical store entry (example name):
-docie up whisper-small --name asr-default
+# Then deploy that canonical store entry under Serving -> Deployments.
+# Host-native equivalent (deployment name equals the store name):
+docie up whisper-small
 ```
 
 The deployment appears in the same lifecycle views as LLM and encoder models.
@@ -204,7 +207,7 @@ values below 1 mean faster-than-real-time processing.
 
 ## Current boundaries
 
-This milestone currently provides offline synchronous transcription and durable
-single/batch jobs. It does not yet provide streaming, speaker diarization,
-speech translation, or browser microphone capture. The Studio ASR workspace is
-the next separate milestone slice rather than hidden partial UI support.
+This milestone provides offline synchronous transcription, durable single/batch
+jobs, managed serving, and the Studio ASR workspace. It does not yet provide
+streaming, speaker diarization, speech translation, or browser microphone
+capture.
