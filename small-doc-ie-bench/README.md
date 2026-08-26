@@ -576,6 +576,9 @@ Do not select by leaderboard alone. Select by field-level accuracy under constra
 - `POST /v1/extract/file`
 - `POST /v1/audio/transcriptions` — authenticated OpenAI-compatible batch
   transcription (`json`, `verbose_json`, `text`, `srt`, or `vtt`).
+- `POST /v1/audio/transcription-jobs` — durable single/batch transcription;
+  returns a pollable job id and writes text, verbose JSON, SRT, VTT, and a
+  batch manifest to tenant-scoped artifacts.
 - `POST /v1/embeddings` — vectors from an `embedding`-family deployment.
 - `POST /v1/rerank` — relevance-score a query against a document list, from a
   `reranker`-family deployment (e.g. LFM2.5-ColBERT-350M).

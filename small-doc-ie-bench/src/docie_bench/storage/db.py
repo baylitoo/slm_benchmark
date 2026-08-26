@@ -268,6 +268,7 @@ def init_engine(database_url: str | None = None) -> None:
     if not resolved_url:
         return
     # Import model modules before creating metadata.
+    import docie_bench.asr.job_models  # noqa: F401
     import docie_bench.orchestrator.models  # noqa: F401
     import docie_bench.serving.catalog  # noqa: F401
     import docie_bench.studio.models  # noqa: F401
@@ -350,6 +351,11 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.usage_store import ensure_usage_record_table
 
     ensure_usage_record_table(_engine)
+    # Durable ASR job/index/artifact tables. They are new tables, so use the
+    # same race-safe CREATE IF NOT EXISTS pattern as batch and usage domains.
+    from docie_bench.asr.job_store import ensure_asr_job_tables
+
+    ensure_asr_job_tables(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:

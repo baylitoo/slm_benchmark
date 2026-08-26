@@ -148,3 +148,23 @@ REVIEW_QUEUE_DEPTH = Gauge(
     "Current review queue depth by status",
     ["status"],
 )
+
+ASR_JOB_ITEMS = Counter(
+    "docie_asr_job_items_total",
+    "Durable ASR job items by deployment and terminal outcome",
+    ["deployment", "outcome"],
+)
+
+ASR_JOB_ITEM_LATENCY = Histogram(
+    "docie_asr_job_item_latency_seconds",
+    "Processing time for durable ASR job items",
+    ["deployment"],
+    buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600),
+)
+
+ASR_JOB_REAL_TIME_FACTOR = Histogram(
+    "docie_asr_job_real_time_factor",
+    "Processing seconds divided by audio seconds for durable ASR items",
+    ["deployment"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 5, 10),
+)

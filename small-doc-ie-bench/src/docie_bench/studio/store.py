@@ -316,6 +316,11 @@ class RunStore:
                     ).all()
                 )
                 orphans = prior_relkeys - still_referenced
+                # This is one physical content-addressed store shared with
+                # batch extraction and durable ASR. A retry replacing a Studio
+                # artifact must not delete identical content still referenced
+                # by either of those domains.
+                orphans -= _non_studio_blob_references(session, only=prior_relkeys)
         # Delete blobs only AFTER the transaction commits, so a rollback can never
         # strand a delete of a still-referenced blob (mirrors ``gc()``).
         for relkey in orphans:
@@ -539,22 +544,11 @@ class RunStore:
             # the grace window: silent data loss, and "retry failed only" loses
             # the documents it needs. artifacts_json is JSON, so its relkeys are
             # extracted in Python rather than SQL.
-            from docie_bench.studio.models import BatchItem, BatchRun
-
-            referenced.update(
-                relkey
-                for relkey in session.scalars(
-                    select(BatchItem.input_relkey).where(BatchItem.input_relkey.is_not(None))
-                ).all()
-                if relkey
-            )
-            for artifacts in session.scalars(
-                select(BatchRun.artifacts_json).where(BatchRun.artifacts_json.is_not(None))
-            ).all():
-                for artifact in artifacts or []:
-                    relkey = artifact.get("relkey") if isinstance(artifact, dict) else None
-                    if relkey:
-                        referenced.add(str(relkey))
+            referenced.update(_non_studio_blob_references(session))
+            # ``orphans`` above is row-driven and normally reclaimed
+            # immediately. Subtract all shared-domain refs before that fast
+            # path too; mark-and-sweep already consults ``referenced`` below.
+            orphans -= referenced
 
         # Row-driven reclamation first: these are provably dead (their run is gone),
         # so they are reclaimed regardless of age.
@@ -619,6 +613,42 @@ def _run_to_dict(run: StudioRun) -> dict[str, Any]:
 def default_run_store() -> RunStore:
     """Build a RunStore from process defaults (shared blob dir + app DB)."""
     return RunStore(get_session_factory(), default_blob_store())
+
+
+def _non_studio_blob_references(
+    session: Session, *, only: set[str] | None = None
+) -> set[str]:
+    """Blob keys retained by batch extraction or durable ASR jobs."""
+    from docie_bench.asr.job_models import ASRJobArtifact, ASRJobItem
+    from docie_bench.studio.models import BatchItem, BatchRun
+
+    referenced = {
+        str(relkey)
+        for relkey in session.scalars(
+            select(BatchItem.input_relkey).where(BatchItem.input_relkey.is_not(None))
+        ).all()
+        if relkey and (only is None or relkey in only)
+    }
+    for artifacts in session.scalars(
+        select(BatchRun.artifacts_json).where(BatchRun.artifacts_json.is_not(None))
+    ).all():
+        for artifact in artifacts or []:
+            relkey = artifact.get("relkey") if isinstance(artifact, dict) else None
+            if relkey and (only is None or str(relkey) in only):
+                referenced.add(str(relkey))
+    referenced.update(
+        str(relkey)
+        for relkey in session.scalars(
+            select(ASRJobItem.input_relkey).where(ASRJobItem.input_relkey.is_not(None))
+        ).all()
+        if relkey and (only is None or relkey in only)
+    )
+    referenced.update(
+        str(relkey)
+        for relkey in session.scalars(select(ASRJobArtifact.relkey)).all()
+        if only is None or relkey in only
+    )
+    return referenced
 
 
 __all__ = [
