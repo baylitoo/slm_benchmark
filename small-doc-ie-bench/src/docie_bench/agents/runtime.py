@@ -655,6 +655,62 @@ def _resolve_mcp_servers(spec: AgentSpec) -> list[str]:
     return raw
 
 
+def _resolve_tool_allowlist(
+    spec: AgentSpec,
+    server_names: list[str],
+    mapping: dict[str, tuple[str, str]],
+    *,
+    separator: str,
+) -> set[str] | None:
+    """``options.mcp_tools`` — an optional ``{server_name: [tool_name, ...]}``
+    restricting which of a server's tools this agent may use, instead of
+    every tool the server happens to expose. ``None`` means unrestricted
+    (every listed tool allowed) — the default for an agent that only set
+    ``mcp_servers``. Validated against the SERVER's own live tool list
+    (``mapping``, from ``collect_openai_tools``) so a stale or typo'd tool
+    name is a clear config error, not a silent no-op.
+    """
+    raw = spec.options.get("mcp_tools")
+    if raw in (None, {}):
+        return None
+    if not isinstance(raw, dict):
+        raise AgentError(
+            f"agent {spec.name!r}: options.mcp_tools must be an object of "
+            "{server_name: [tool_name, ...]}",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    allowed: set[str] = set()
+    for server_name, tool_names in raw.items():
+        if server_name not in server_names:
+            raise AgentError(
+                f"agent {spec.name!r}: options.mcp_tools names server {server_name!r}, "
+                "which is not in options.mcp_servers",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        if not isinstance(tool_names, list) or not all(
+            isinstance(t, str) and t for t in tool_names
+        ):
+            raise AgentError(
+                f"agent {spec.name!r}: options.mcp_tools[{server_name!r}] must be a "
+                "list of tool names",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        for tool_name in tool_names:
+            qualified = f"{server_name}{separator}{tool_name}"
+            if qualified not in mapping:
+                raise AgentError(
+                    f"agent {spec.name!r}: options.mcp_tools names tool {tool_name!r} "
+                    f"on server {server_name!r}, which does not exist on that server",
+                    status_code=500,
+                    error_type="invalid_agent_config",
+                )
+            allowed.add(qualified)
+    return allowed
+
+
 async def _complete_custom(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
@@ -716,6 +772,15 @@ async def _complete_with_tools(
     async def post(round_body: dict[str, Any]) -> dict[str, Any]:
         return await _post_chat(upstream, dict(round_body), http_client=http_client)
 
+    # A config error (a bad allowlist) is captured rather than raised INSIDE
+    # the AsyncExitStack body: raising there would propagate the exception
+    # through the MCP session/task-group teardown machinery, which can
+    # itself raise during unwind (anyio cancellation) and shadow the
+    # original AgentError with a generic 502 -- confirmed empirically, not
+    # theoretical. Deferring the raise to after the stack closes cleanly
+    # sidesteps that race entirely.
+    config_error: AgentError | None = None
+    completion: dict[str, Any] | None = None
     try:
         async with AsyncExitStack() as stack:
             try:
@@ -727,13 +792,33 @@ async def _complete_with_tools(
                     status_code=502,
                     error_type="mcp_server_unreachable",
                 ) from exc
-            completion = await mcp_mod.run_tool_loop(post, forward, sessions, mapping, tools)
+            try:
+                allowed = _resolve_tool_allowlist(
+                    spec, server_names, mapping, separator=mcp_mod.TOOL_SEPARATOR
+                )
+            except AgentError as exc:
+                config_error = exc
+            else:
+                if allowed is not None:
+                    # Filter BOTH the advertised list and the routing map: a
+                    # disallowed tool must never be advertised to the model,
+                    # and even a hallucinated call to a real-but-disallowed
+                    # name must fall through run_tool_loop's "not all_mcp"
+                    # branch (returned to the caller, never executed) rather
+                    # than being honored.
+                    tools = [t for t in tools if t["function"]["name"] in allowed]
+                    mapping = {
+                        name: target for name, target in mapping.items() if name in allowed
+                    }
+                completion = await mcp_mod.run_tool_loop(post, forward, sessions, mapping, tools)
     except AgentError:
         raise
     except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
         raise AgentError(
             f"MCP session error: {exc}", status_code=502, error_type="mcp_server_unreachable"
         ) from exc
+    if config_error is not None:
+        raise config_error
     if completion is None:
         raise AgentError(
             f"model kept calling tools for {get_settings().mcp_max_tool_iterations} rounds "

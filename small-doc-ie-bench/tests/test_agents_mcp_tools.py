@@ -40,6 +40,11 @@ def _calc_server() -> MCPServer:
         """Add two integers."""
         return a + b
 
+    @server.tool()
+    def subtract(a: int, b: int) -> int:
+        """Subtract two integers."""
+        return a - b
+
     return server
 
 
@@ -237,3 +242,90 @@ def test_custom_agent_bad_mcp_servers_option_is_a_clear_error(api) -> None:
     )
     assert response.status_code == 500
     assert response.json()["error"]["type"] == "invalid_agent_config"
+
+
+# ── per-server tool allowlisting (options.mcp_tools) ─────────────────────────
+
+
+@pytest.fixture
+def api_with_calc(api, monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
+    """The calc server (add + subtract) wired to a fresh open_mcp_sessions,
+    for every allowlist test below."""
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://unused")
+        },
+    )
+    server = _calc_server()
+
+    async def fake_open(stack, specs):
+        session = await stack.enter_async_context(_memory_session(server))
+        return {"calc": session}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open)
+    return api
+
+
+def test_mcp_tools_allowlist_filters_advertised_tools(api_with_calc) -> None:
+    client, captured = api_with_calc
+    _create_agent(client, options={"mcp_servers": ["calc"], "mcp_tools": {"calc": ["add"]}})
+    client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "what is 2+3?"}]},
+    )
+    sent_tools = json.loads(captured[0].content)["tools"]
+    names = {t["function"]["name"] for t in sent_tools}
+    assert names == {"calc__add"}  # subtract is NOT advertised
+
+
+def test_mcp_tools_allowlist_naming_unknown_tool_is_500(api_with_calc) -> None:
+    client, _ = api_with_calc
+    _create_agent(
+        client, options={"mcp_servers": ["calc"], "mcp_tools": {"calc": ["multiply"]}}
+    )
+    response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 500
+    assert response.json()["error"]["type"] == "invalid_agent_config"
+    assert "multiply" in response.json()["error"]["message"]
+
+
+def test_mcp_tools_allowlist_naming_unselected_server_is_500(api_with_calc) -> None:
+    client, _ = api_with_calc
+    _create_agent(
+        client, options={"mcp_servers": ["calc"], "mcp_tools": {"other": ["add"]}}
+    )
+    response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 500
+    assert "not in options.mcp_servers" in response.json()["error"]["message"]
+
+
+def test_mcp_tools_allowlist_malformed_is_500(api_with_calc) -> None:
+    client, _ = api_with_calc
+    _create_agent(
+        client, options={"mcp_servers": ["calc"], "mcp_tools": ["calc"]}  # must be an object
+    )
+    response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 500
+    assert response.json()["error"]["type"] == "invalid_agent_config"
+
+
+def test_no_mcp_tools_option_advertises_every_tool(api_with_calc) -> None:
+    client, captured = api_with_calc
+    _create_agent(client, options={"mcp_servers": ["calc"]})  # no allowlist -> unrestricted
+    client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    names = {t["function"]["name"] for t in json.loads(captured[0].content)["tools"]}
+    assert names == {"calc__add", "calc__subtract"}

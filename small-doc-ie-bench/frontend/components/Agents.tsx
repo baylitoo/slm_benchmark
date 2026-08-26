@@ -41,9 +41,11 @@ import {
   getStore,
   isLiveDeployment,
   listDynamicSchemas,
+  listMcpServers,
   listRoutingPolicies,
   listSchemas,
   selectableDeployments,
+  testMcpServer,
   updateAgent,
   visionDeploymentNames,
   type AgentChatResponse,
@@ -51,6 +53,8 @@ import {
   type AgentTemplate,
   type AgentView,
   type DynamicSchemaSummary,
+  type McpRegisteredServer,
+  type McpTool,
   type RoutingPolicySummary,
   type StoreEntry,
 } from "@/lib/api";
@@ -613,7 +617,8 @@ function AgentDetails({ agent }: { agent: AgentView }) {
 // Create
 // ---------------------------------------------------------------------------
 
-function CreateView({
+// Exported for tests: rendered by Agents with its polled/async state.
+export function CreateView({
   templates,
   prefill,
   editAgent,
@@ -714,6 +719,46 @@ function CreateView({
   const [schemaName, setSchemaName] = useState("");
   const [schemaSheetOpen, setSchemaSheetOpen] = useState(false);
 
+  // custom-kind tool use: registered MCP servers this agent may call, plus an
+  // optional per-server tool allowlist (a server key is only sent when the
+  // operator has restricted it below the full live tool list).
+  const mcpRegistered = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
+  const [mcpServers, setMcpServers] = useState<string[]>([]);
+  const [mcpServerTools, setMcpServerTools] = useState<Record<string, McpTool[]>>({});
+  const [mcpToolTesting, setMcpToolTesting] = useState<string | null>(null);
+  const [mcpAllowlist, setMcpAllowlist] = useState<Record<string, string[]>>({});
+
+  async function toggleMcpServer(name: string) {
+    if (mcpServers.includes(name)) {
+      setMcpServers((prev) => prev.filter((n) => n !== name));
+      return;
+    }
+    setMcpServers((prev) => [...prev, name]);
+    if (mcpServerTools[name]) return;
+    setMcpToolTesting(name);
+    try {
+      const res = await testMcpServer(name);
+      setMcpServerTools((prev) => ({ ...prev, [name]: res.tools }));
+    } catch {
+      // Live tool listing is a convenience for the allowlist checkboxes only
+      // — the server is still selectable (unrestricted) without it.
+      setMcpServerTools((prev) => ({ ...prev, [name]: [] }));
+    } finally {
+      setMcpToolTesting(null);
+    }
+  }
+
+  function toggleMcpTool(server: string, tool: string) {
+    setMcpAllowlist((prev) => {
+      const known = (mcpServerTools[server] ?? []).map((t) => t.name);
+      const current = prev[server] ?? known;
+      const next = current.includes(tool)
+        ? current.filter((t) => t !== tool)
+        : [...current, tool];
+      return { ...prev, [server]: next };
+    });
+  }
+
   // Vision deployments (store family flagged vision) — the model picker for the
   // vision→structured stage.
   const visionModels = useMemo(() => {
@@ -790,6 +835,24 @@ function CreateView({
     setMaxTokens(typeof o.max_tokens === "number" ? String(o.max_tokens) : "");
     setVisionModel(typeof o.vision_model === "string" ? o.vision_model : "");
     setSchemaName(typeof o.schema === "string" ? o.schema : "");
+    const savedServers = Array.isArray(o.mcp_servers) ? (o.mcp_servers as unknown[]).map(String) : [];
+    setMcpServers(savedServers);
+    const savedAllowlist =
+      o.mcp_tools && typeof o.mcp_tools === "object" && !Array.isArray(o.mcp_tools)
+        ? (o.mcp_tools as Record<string, unknown>)
+        : {};
+    setMcpAllowlist(
+      Object.fromEntries(
+        Object.entries(savedAllowlist)
+          .filter(([, v]) => Array.isArray(v))
+          .map(([k, v]) => [k, (v as unknown[]).map(String)]),
+      ),
+    );
+    savedServers.forEach((serverName) => {
+      testMcpServer(serverName)
+        .then((res) => setMcpServerTools((prev) => ({ ...prev, [serverName]: res.tools })))
+        .catch(() => setMcpServerTools((prev) => ({ ...prev, [serverName]: [] })));
+    });
     // Back-compat: an agent saved before `mode` derives it — extractor → the
     // OCR→LLM pipeline, otherwise plain OCR.
     const savedMode = o.mode;
@@ -855,7 +918,24 @@ function CreateView({
                     backend: ocrBackend,
                     language: ocrLanguage || null,
                   }
-            : {};
+            : kind === "custom"
+              ? {
+                  mcp_servers: mcpServers.length > 0 ? mcpServers : null,
+                  // A server is only listed here when the operator actually
+                  // restricted it below its full live tool list — otherwise
+                  // omitted, meaning "every tool this server exposes".
+                  mcp_tools: (() => {
+                    const restricted = mcpServers
+                      .map((server): [string, string[]] | null => {
+                        const known = (mcpServerTools[server] ?? []).map((t) => t.name);
+                        const selected = mcpAllowlist[server] ?? known;
+                        return selected.length < known.length ? [server, selected] : null;
+                      })
+                      .filter((entry): entry is [string, string[]] => entry !== null);
+                    return restricted.length > 0 ? Object.fromEntries(restricted) : null;
+                  })(),
+                }
+              : {};
       if (editing && editAgent) {
         await updateAgent(editAgent.name, {
           model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
@@ -1360,6 +1440,79 @@ function CreateView({
                     <T>Structured output needs a model whose runtime enforces a schema (llama.cpp GBNF / vLLM). A NuExtract model here runs via generic grammar, not its bespoke chat-template path.</T>
                   </p>
                 )}
+              </div>
+            </Card>
+          )}
+
+          {kind === "custom" && (
+            <Card
+              title="Tools"
+              subtitle="MCP servers this agent may call — the model gets their tools and the platform executes any it calls."
+            >
+              <div className="space-y-3">
+                {(mcpRegistered.data ?? []).length === 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    <T>
+                      No MCP servers are registered yet — enable one under Serving → MCP Tools.
+                    </T>
+                  </p>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5">
+                    {(mcpRegistered.data ?? []).map((server) => {
+                      const on = mcpServers.includes(server.name);
+                      return (
+                        <button
+                          key={server.name}
+                          type="button"
+                          aria-pressed={on}
+                          onClick={() => void toggleMcpServer(server.name)}
+                          className={cn(
+                            "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+                            on
+                              ? "border-accent bg-accent text-accent-foreground"
+                              : "border-border bg-card text-muted-foreground hover:text-foreground",
+                          )}
+                        >
+                          {server.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {mcpServers.map((server) => {
+                  const tools = mcpServerTools[server];
+                  const selected = mcpAllowlist[server] ?? tools?.map((t) => t.name) ?? [];
+                  return (
+                    <div key={server} className="rounded-md border border-border p-2">
+                      <p className="mb-1.5 text-xs font-medium text-foreground">{server}</p>
+                      {mcpToolTesting === server ? (
+                        <p className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <T>Listing tools…</T>
+                        </p>
+                      ) : tools === undefined ? null : tools.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">
+                          <T>
+                            Could not list this server's tools — it will still be usable,
+                            unrestricted.
+                          </T>
+                        </p>
+                      ) : (
+                        <div className="flex flex-wrap gap-x-4 gap-y-1">
+                          {tools.map((tool) => (
+                            <Checkbox
+                              key={tool.name}
+                              checked={selected.includes(tool.name)}
+                              onChange={() => toggleMcpTool(server, tool.name)}
+                              label={tool.name}
+                              title={tool.description}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </Card>
           )}
