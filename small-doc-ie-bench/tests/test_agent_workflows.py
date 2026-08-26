@@ -2,6 +2,9 @@
 own backing model/prompt, run server-side in one request -- "prompt
 chaining". Step 1 sees the caller's own messages; each later step sees ONLY
 the previous step's answer, not the accumulated history.
+
+A step may also carry a `route` (#266): a cheap classifier whose own answer
+picks a NAMED next step instead of the next one in the list.
 """
 
 from __future__ import annotations
@@ -120,9 +123,214 @@ def test_workflow_chains_steps_each_seeing_only_the_previous_answer(api) -> None
     ]
 
     assert body["docie_agent"]["steps"] == [
-        {"step": 0, "model_profile": "alpha", "content": "echo: hello"},
-        {"step": 1, "model_profile": "beta", "content": "echo: echo: hello"},
+        {
+            "step": 0,
+            "name": "0",
+            "model_profile": "alpha",
+            "content": "echo: hello",
+            "routed_to": None,
+        },
+        {
+            "step": 1,
+            "name": "1",
+            "model_profile": "beta",
+            "content": "echo: echo: hello",
+            "routed_to": None,
+        },
     ]
+
+
+# ── conditional routing (#266): a step's own answer picks a NAMED next
+# step instead of always falling through to the next one in the list ───────
+
+
+def test_workflow_route_step_matches_a_messy_answer_and_skips_chaining_its_label(api) -> None:
+    """The classifier's answer ("Label: billing", not the bare label
+    "billing") still matches by substring -- and the step it routes to
+    sees the ORIGINAL request text, never the classifier's own label."""
+    client, captured = api
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        body = json.loads(request.content)
+        if body["model"] == "classifier":
+            return httpx.Response(
+                200,
+                json=_completion(
+                    "Label: billing",
+                    usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                ),
+            )
+        last = body["messages"][-1]["content"]
+        return httpx.Response(
+            200,
+            json=_completion(
+                f"handled: {last}",
+                usage={"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
+            ),
+        )
+
+    configure_http_transport(httpx.MockTransport(handler))
+    _create_workflow(
+        client,
+        [
+            {
+                "model_profile": "classifier",
+                "route": {"routes": {"billing": "handle-billing"}},
+            },
+            {"name": "handle-billing", "model_profile": "billing-handler"},
+        ],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "why was I charged twice?"}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "handled: why was I charged twice?"
+
+    classify_req, handle_req = (json.loads(r.content) for r in captured)
+    assert classify_req["messages"][-1]["content"] == "why was I charged twice?"
+    # The target step sees the original text, NOT the classifier's own
+    # "Label: billing" answer.
+    assert handle_req["messages"][-1]["content"] == "why was I charged twice?"
+
+    assert body["docie_agent"]["steps"] == [
+        {
+            "step": 0,
+            "name": "0",
+            "model_profile": "classifier",
+            "content": "Label: billing",
+            "routed_to": "handle-billing",
+        },
+        {
+            "step": 1,
+            "name": "handle-billing",
+            "model_profile": "billing-handler",
+            "content": "handled: why was I charged twice?",
+            "routed_to": None,
+        },
+    ]
+
+
+def test_workflow_route_falls_back_to_default_when_no_label_matches(api) -> None:
+    client, captured = api
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        body = json.loads(request.content)
+        content = "no idea what this is" if body["model"] == "classifier" else "handled generically"
+        return httpx.Response(
+            200,
+            json=_completion(
+                content, usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            ),
+        )
+
+    configure_http_transport(httpx.MockTransport(handler))
+    _create_workflow(
+        client,
+        [
+            {
+                "model_profile": "classifier",
+                "route": {"routes": {"billing": "handle-billing"}, "default": "handle-other"},
+            },
+            {"name": "handle-billing", "model_profile": "billing-handler"},
+            {"name": "handle-other", "model_profile": "generic-handler"},
+        ],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "what time is it?"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "handled generically"
+
+
+def test_workflow_route_step_with_no_match_and_no_default_is_unroutable(api) -> None:
+    client, _ = api
+    configure_http_transport(
+        httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json=_completion(
+                    "not a known label",
+                    usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                ),
+            )
+        )
+    )
+    _create_workflow(
+        client,
+        [
+            {"model_profile": "classifier", "route": {"routes": {"billing": "handle-billing"}}},
+            {"name": "handle-billing", "model_profile": "billing-handler"},
+        ],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "workflow_unroutable"
+
+
+def test_workflow_route_target_must_be_a_real_step_name(api) -> None:
+    client, _ = api
+    _create_workflow(
+        client,
+        [{"model_profile": "classifier", "route": {"routes": {"billing": "does-not-exist"}}}],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "billing please"}]},
+    )
+    assert response.status_code == 500
+    assert response.json()["error"]["type"] == "invalid_agent_config"
+
+
+def test_workflow_routing_loop_hits_the_step_budget(api) -> None:
+    client, _ = api
+    configure_http_transport(
+        httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json=_completion(
+                    "ping", usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                ),
+            )
+        )
+    )
+    _create_workflow(
+        client,
+        [
+            {"name": "a", "model_profile": "alpha", "route": {"routes": {"ping": "b"}}},
+            {"name": "b", "model_profile": "beta", "route": {"routes": {"ping": "a"}}},
+        ],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "workflow_budget_exhausted"
+
+
+def test_workflow_rejects_a_duplicate_step_name(api) -> None:
+    client, _ = api
+    _create_workflow(
+        client,
+        [
+            {"name": "dupe", "model_profile": "alpha"},
+            {"name": "dupe", "model_profile": "beta"},
+        ],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 500
+    assert response.json()["error"]["type"] == "invalid_agent_config"
 
 
 def test_workflow_requires_a_non_empty_steps_list(api) -> None:

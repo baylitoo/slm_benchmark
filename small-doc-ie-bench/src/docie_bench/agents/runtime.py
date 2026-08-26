@@ -879,13 +879,23 @@ async def _complete_with_tools(
     return completion, tool_call_trace
 
 
-def _resolve_workflow_steps(spec: AgentSpec) -> list[dict[str, Any]]:
+_MAX_WORKFLOW_STEPS = 16
+
+
+def _resolve_workflow_steps(
+    spec: AgentSpec,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
     """``options.steps`` — a non-empty, ORDERED list of
-    ``{model_profile, system_prompt?, mcp_servers?, mcp_tools?}`` steps
-    (#265). Each step's shape mirrors a ``custom`` agent's own
-    model_profile/options exactly, so the SAME per-step spec can drive
-    ``_resolve_mcp_servers``/``_complete_with_tools``/``_forward_chat``
-    unchanged (see ``_complete_workflow``)."""
+    ``{model_profile, system_prompt?, mcp_servers?, mcp_tools?, name?, route?}``
+    steps (#265, route added #266). Each step's shape mirrors a ``custom``
+    agent's own model_profile/options exactly, so the SAME per-step spec can
+    drive ``_resolve_mcp_servers``/``_complete_with_tools``/``_forward_chat``
+    unchanged (see ``_complete_workflow``).
+
+    Every step is addressable by name — its own ``name`` if given, else its
+    list index as a string — so a ``route`` step (a cheap classifier) can
+    jump to any other step instead of only the next one in the list.
+    """
     raw = spec.options.get("steps")
     if not isinstance(raw, list) or not raw:
         raise AgentError(
@@ -895,6 +905,8 @@ def _resolve_workflow_steps(spec: AgentSpec) -> list[dict[str, Any]]:
             error_type="invalid_agent_config",
         )
     steps: list[dict[str, Any]] = []
+    names: list[str] = []
+    by_name: dict[str, int] = {}
     for index, raw_step in enumerate(raw):
         if not isinstance(raw_step, dict) or not raw_step.get("model_profile"):
             raise AgentError(
@@ -903,8 +915,74 @@ def _resolve_workflow_steps(spec: AgentSpec) -> list[dict[str, Any]]:
                 status_code=500,
                 error_type="invalid_agent_config",
             )
+        raw_name = raw_step.get("name")
+        name = str(raw_name) if isinstance(raw_name, str) and raw_name else str(index)
+        if name in by_name:
+            raise AgentError(
+                f"agent {spec.name!r}: options.steps has a duplicate step name {name!r}",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        by_name[name] = index
+        names.append(name)
         steps.append(raw_step)
-    return steps
+    return steps, names, by_name
+
+
+def _resolve_route_target(
+    answer: str | None,
+    route: Any,
+    by_name: dict[str, int],
+    *,
+    spec: AgentSpec,
+    step_name: str,
+) -> str:
+    """A ``route`` step is a cheap classifier: match its OWN answer against
+    ``route.routes`` (``{label: target_step_name}``) by substring, in
+    declaration order, falling back to ``route.default`` — never an exact
+    match, since a small model's answer is rarely just the bare label
+    ("Label: billing", "billing.", ...). Fails closed (an ``AgentError``,
+    not a silent guess) when nothing matches and there is no default, or
+    when the resolved target step name doesn't exist."""
+    if not isinstance(route, dict):
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} route must be an object",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    routes = route.get("routes")
+    if not isinstance(routes, dict) or not routes:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} route.routes must be a "
+            "non-empty object of {label: step_name}",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    haystack = (answer or "").lower()
+    target: str | None = None
+    for label, candidate in routes.items():
+        needle = str(label).strip().lower()
+        if needle and needle in haystack:
+            target = candidate
+            break
+    if target is None:
+        default = route.get("default")
+        target = default if isinstance(default, str) and default else None
+    if target is None:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} classifier answered "
+            f"{answer!r}, which matches no route label and no default is configured",
+            status_code=502,
+            error_type="workflow_unroutable",
+        )
+    if target not in by_name:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} routes to {target!r}, which "
+            "is not the name of any step in options.steps",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    return target
 
 
 def _message_content(completion: dict[str, Any]) -> str | None:
@@ -918,6 +996,15 @@ def _message_content(completion: dict[str, Any]) -> str | None:
     return content if isinstance(content, str) else None
 
 
+def _last_message_content(body: dict[str, Any]) -> str | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
+    return content if isinstance(content, str) else None
+
+
 async def _complete_workflow(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
@@ -928,20 +1015,42 @@ async def _complete_workflow(
     per step instead of the whole request in one shot.
 
     Step 1 receives the caller's own messages unchanged; each LATER step
-    receives only the PREVIOUS step's answer as its single user message —
-    not the accumulated history, not the original request. Usage sums
-    across every step (same contract the MCP tool loop already uses); every
-    step's own model/content and any tool calls it made ride
+    receives only the last SUBSTANTIVE step's answer as its single user
+    message — not the accumulated history, not the original request. A
+    step may carry a ``route`` (#266): instead of falling through to the
+    next step in the list, it's a cheap classifier whose own answer picks
+    a NAMED step to jump to next (see ``_resolve_route_target``) — the
+    classifier's answer itself is never chained forward, since it's a
+    label ("billing"), not content. A flat step-execution budget
+    (``_MAX_WORKFLOW_STEPS``) guards against a routing loop.
+
+    Usage sums across every step executed (same contract the MCP tool loop
+    already uses); every step's own model/content, its route target (if
+    any), and any tool calls it made ride
     ``docie_agent.steps``/``docie_agent.tool_calls`` for the "Try it" trace
     view (#262).
     """
-    steps = _resolve_workflow_steps(spec)
+    steps, names, by_name = _resolve_workflow_steps(spec)
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     step_trace: list[dict[str, Any]] = []
     tool_call_trace: list[dict[str, Any]] = []
-    previous_content: str | None = None
+    # Seeded from the caller's own request so a `route` step landing at
+    # index 0 still hands the target step real content, not "" -- a
+    # classifier's job is to pick a destination, never to replace content.
+    chain_content: str | None = _last_message_content(body)
     completion: dict[str, Any] | None = None
-    for index, step in enumerate(steps):
+    index = 0
+    visited = 0
+    while True:
+        if visited >= _MAX_WORKFLOW_STEPS:
+            raise AgentError(
+                f"agent {spec.name!r}: workflow exceeded {_MAX_WORKFLOW_STEPS} step "
+                "executions — likely a routing loop",
+                status_code=502,
+                error_type="workflow_budget_exhausted",
+            )
+        step = steps[index]
+        step_name = names[index]
         step_spec = spec.model_copy(
             update={
                 "model_profile": step["model_profile"],
@@ -954,8 +1063,8 @@ async def _complete_workflow(
         )
         step_body = (
             dict(body)
-            if index == 0
-            else {"messages": [{"role": "user", "content": previous_content or ""}]}
+            if visited == 0
+            else {"messages": [{"role": "user", "content": chain_content or ""}]}
         )
         server_names = _resolve_mcp_servers(step_spec)
         if server_names:
@@ -971,10 +1080,37 @@ async def _complete_workflow(
                 value = usage.get(key)
                 if isinstance(value, int):
                     totals[key] += value
-        previous_content = _message_content(completion)
+        step_answer = _message_content(completion)
+        visited += 1
+        route = step.get("route")
+        if route is not None:
+            target_name = _resolve_route_target(
+                step_answer, route, by_name, spec=spec, step_name=step_name
+            )
+            step_trace.append(
+                {
+                    "step": index,
+                    "name": step_name,
+                    "model_profile": step["model_profile"],
+                    "content": step_answer,
+                    "routed_to": target_name,
+                }
+            )
+            index = by_name[target_name]
+            continue
+        chain_content = step_answer
         step_trace.append(
-            {"step": index, "model_profile": step["model_profile"], "content": previous_content}
+            {
+                "step": index,
+                "name": step_name,
+                "model_profile": step["model_profile"],
+                "content": step_answer,
+                "routed_to": None,
+            }
         )
+        index += 1
+        if index >= len(steps):
+            break
     assert completion is not None  # _resolve_workflow_steps guarantees >=1 step
     docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind, "steps": step_trace}
     if tool_call_trace:
