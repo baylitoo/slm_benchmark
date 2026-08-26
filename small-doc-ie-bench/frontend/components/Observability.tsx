@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import {
   BarChart3,
   ExternalLink,
@@ -10,6 +10,8 @@ import {
   HardDrive,
   Activity,
   TrendingUp,
+  ChevronRight,
+  ChevronDown,
 } from "lucide-react";
 import { GRAFANA_URL, GRAFANA_DASHBOARD_URL, INNGEST_URL, METRICS_URL } from "@/lib/env";
 import {
@@ -395,6 +397,7 @@ function totalTokens(entry: UsageDeployment): number {
 // Exported for Observability.test.tsx -- rendered only by this page.
 export function UsageCard({ active }: { active: boolean }) {
   const [usageWindow, setUsageWindow] = useState<UsageWindow>("24h");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const fetchUsage = useCallback(() => getUsageSummary(usageWindow), [usageWindow]);
   const usage = usePolling<UsageSummaryView>(fetchUsage, USAGE_POLL_MS, active);
   const { refresh } = usage;
@@ -498,40 +501,118 @@ export function UsageCard({ active }: { active: boolean }) {
                 </tr>
               </thead>
               <tbody>
-                {entries.map((entry) => (
-                  <tr key={entry.deployment} className="border-b border-border/60 last:border-0">
-                    <td className="max-w-[220px] truncate py-1.5 pr-3 font-medium text-foreground">
-                      {entry.deployment}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatCount(entry.requests)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {entry.errors > 0 ? (
-                        <Badge tone="err">{formatCount(entry.errors)}</Badge>
-                      ) : (
-                        <span className="text-muted-foreground">0</span>
+                {entries.map((entry) => {
+                  const hasTools = entry.tool_calls.length > 0;
+                  const isOpen = expanded.has(entry.deployment);
+                  return (
+                    <Fragment key={entry.deployment}>
+                      <tr className="border-b border-border/60 last:border-0">
+                        <td className="max-w-[220px] py-1.5 pr-3 font-medium text-foreground">
+                          <div className="flex items-center gap-1">
+                            {hasTools ? (
+                              <button
+                                type="button"
+                                aria-label={
+                                  isOpen
+                                    ? `Collapse ${entry.deployment} tool calls`
+                                    : `Expand ${entry.deployment} tool calls`
+                                }
+                                onClick={() =>
+                                  setExpanded((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(entry.deployment)) {
+                                      next.delete(entry.deployment);
+                                    } else {
+                                      next.add(entry.deployment);
+                                    }
+                                    return next;
+                                  })
+                                }
+                                className="shrink-0 text-muted-foreground hover:text-foreground"
+                              >
+                                {isOpen ? (
+                                  <ChevronDown className="h-3.5 w-3.5" />
+                                ) : (
+                                  <ChevronRight className="h-3.5 w-3.5" />
+                                )}
+                              </button>
+                            ) : (
+                              <span className="w-3.5 shrink-0" />
+                            )}
+                            <span className="truncate" title={entry.deployment}>
+                              {entry.deployment}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatCount(entry.requests)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {entry.errors > 0 ? (
+                            <Badge tone="err">{formatCount(entry.errors)}</Badge>
+                          ) : (
+                            <span className="text-muted-foreground">0</span>
+                          )}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatCount(entry.prompt_tokens)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatCount(entry.completion_tokens)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatLatency(entry.avg_latency_ms)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatLatency(entry.p95_latency_ms)}
+                        </td>
+                        <td className="py-1.5 text-right text-xs text-muted-foreground">
+                          {entry.last_used_at
+                            ? `${formatAge(secondsAgo(entry.last_used_at))} ago`
+                            : "n/a"}
+                        </td>
+                      </tr>
+                      {hasTools && isOpen && (
+                        <tr className="border-b border-border/60 last:border-0">
+                          <td colSpan={8} className="bg-muted/40 py-2 pl-8 pr-3">
+                            <table className="w-full max-w-md text-left text-xs">
+                              <thead>
+                                <tr className="text-muted-foreground">
+                                  <th className="pb-1 pr-3 font-medium"><T>Tool</T></th>
+                                  <th className="pb-1 pr-3 text-right font-medium"><T>Calls</T></th>
+                                  <th className="pb-1 pr-3 text-right font-medium"><T>Errors</T></th>
+                                  <th className="pb-1 text-right font-medium"><T>Avg latency</T></th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {entry.tool_calls.map((tool) => (
+                                  <tr key={tool.tool}>
+                                    <td className="max-w-[200px] truncate py-0.5 pr-3 font-medium text-foreground">
+                                      {tool.tool}
+                                    </td>
+                                    <td className="py-0.5 pr-3 text-right tabular-nums">
+                                      {formatCount(tool.calls)}
+                                    </td>
+                                    <td className="py-0.5 pr-3 text-right tabular-nums">
+                                      {tool.errors > 0 ? (
+                                        <Badge tone="err">{formatCount(tool.errors)}</Badge>
+                                      ) : (
+                                        <span className="text-muted-foreground">0</span>
+                                      )}
+                                    </td>
+                                    <td className="py-0.5 text-right tabular-nums">
+                                      {formatLatency(tool.avg_latency_ms)}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
                       )}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatCount(entry.prompt_tokens)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatCount(entry.completion_tokens)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatLatency(entry.avg_latency_ms)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatLatency(entry.p95_latency_ms)}
-                    </td>
-                    <td className="py-1.5 text-right text-xs text-muted-foreground">
-                      {entry.last_used_at
-                        ? `${formatAge(secondsAgo(entry.last_used_at))} ago`
-                        : "n/a"}
-                    </td>
-                  </tr>
-                ))}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>

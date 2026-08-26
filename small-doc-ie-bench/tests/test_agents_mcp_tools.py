@@ -184,7 +184,13 @@ def test_custom_agent_runs_the_tool_loop_when_mcp_servers_set(api, monkeypatch) 
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["choices"][0]["message"]["content"] == "the sum is 5"
-    assert body["docie_agent"] == {"agent": "tool-helper", "kind": "custom"}
+    assert body["docie_agent"]["agent"] == "tool-helper"
+    assert body["docie_agent"]["kind"] == "custom"
+    # Per-call tool trace (#261) — the "Try it" view's per-request detail.
+    (call,) = body["docie_agent"]["tool_calls"]
+    assert call["tool"] == "calc__add"
+    assert call["status"] == "ok"
+    assert isinstance(call["latency_ms"], int)
     # Usage summed across both rounds, same contract as the chat surface.
     assert body["usage"] == {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42}
     # Round 2 carries the executed exchange.
@@ -329,3 +335,66 @@ def test_no_mcp_tools_option_advertises_every_tool(api_with_calc) -> None:
     )
     names = {t["function"]["name"] for t in json.loads(captured[0].content)["tools"]}
     assert names == {"calc__add", "calc__subtract"}
+
+
+# ── usage-ledger recording (#261: tool-call observability) ──────────────────
+
+
+def test_agent_completion_records_a_usage_row_with_the_tool_trace(
+    api_with_calc, monkeypatch
+) -> None:
+    from docie_bench.studio import usage_store
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(usage_store, "record_usage", lambda **kw: calls.append(kw) or True)
+    client, _ = api_with_calc
+    _create_agent(client, options={"mcp_servers": ["calc"]})
+    response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "what is 2+3?"}]},
+    )
+    assert response.status_code == 200, response.text
+    (row,) = calls
+    assert row["deployment"] == "tool-helper"
+    assert row["surface"] == "agent"
+    assert row["status"] == "ok"
+    assert row["prompt_tokens"] == 30
+    assert row["completion_tokens"] == 12
+    (call,) = row["tool_calls"]
+    assert call["tool"] == "calc__add"
+    assert call["status"] == "ok"
+
+
+def test_agent_completion_without_tools_records_no_tool_call_trace(api, monkeypatch) -> None:
+    from docie_bench.studio import usage_store
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(usage_store, "record_usage", lambda **kw: calls.append(kw) or True)
+    client, _ = api
+    _create_agent(client)  # no options.mcp_servers -> bare forward
+    client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    (row,) = calls
+    assert row["surface"] == "agent"
+    assert row["status"] == "ok"
+    assert row["tool_calls"] is None
+
+
+def test_agent_error_records_a_usage_row_with_error_status(api, monkeypatch) -> None:
+    from docie_bench.studio import usage_store
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(usage_store, "record_usage", lambda **kw: calls.append(kw) or True)
+    client, _ = api
+    _create_agent(client, options={"mcp_servers": ["ghost"]})  # unregistered -> 400
+    response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 400
+    (row,) = calls
+    assert row["status"] == "error"
+    assert row["prompt_tokens"] is None
+    assert row["tool_calls"] is None

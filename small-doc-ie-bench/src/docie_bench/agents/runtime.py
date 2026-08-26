@@ -715,13 +715,16 @@ async def _complete_custom(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
     server_names = _resolve_mcp_servers(spec)
+    docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind}
     if server_names:
-        completion = await _complete_with_tools(
+        completion, tool_calls = await _complete_with_tools(
             spec, dict(body), server_names, http_client=http_client
         )
+        if tool_calls:
+            docie_agent["tool_calls"] = tool_calls
     else:
         completion = await _forward_chat(spec, dict(body), http_client=http_client)
-    completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind}
+    completion["docie_agent"] = docie_agent
     return completion
 
 
@@ -731,12 +734,17 @@ async def _complete_with_tools(
     server_names: list[str],
     *,
     http_client: httpx.AsyncClient,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """A ``custom`` agent with ``options.mcp_servers`` set: connect, advertise
     the servers' tools, and run the same bounded model<->tools loop the
     generic chat surface uses (``chat_api._chat_with_mcp_tools``) — reused
     here via ``mcp_tools.run_tool_loop`` rather than duplicated, so both
     surfaces share one loop implementation and one error taxonomy.
+
+    Returns ``(completion, tool_call_trace)`` — the trace (#261) is every
+    tool call this request actually executed, in order, each entry
+    ``{"tool": qualified_name, "status": "ok"|"error", "latency_ms": int}``.
+    Empty when the model never called a tool.
     """
     from contextlib import AsyncExitStack
 
@@ -771,6 +779,13 @@ async def _complete_with_tools(
 
     async def post(round_body: dict[str, Any]) -> dict[str, Any]:
         return await _post_chat(upstream, dict(round_body), http_client=http_client)
+
+    tool_call_trace: list[dict[str, Any]] = []
+
+    def record_tool_call(name: str, ok: bool, latency_ms: int) -> None:
+        tool_call_trace.append(
+            {"tool": name, "status": "ok" if ok else "error", "latency_ms": latency_ms}
+        )
 
     # A config error (a bad allowlist) is captured rather than raised INSIDE
     # the AsyncExitStack body: raising there would propagate the exception
@@ -810,7 +825,9 @@ async def _complete_with_tools(
                     mapping = {
                         name: target for name, target in mapping.items() if name in allowed
                     }
-                completion = await mcp_mod.run_tool_loop(post, forward, sessions, mapping, tools)
+                completion = await mcp_mod.run_tool_loop(
+                    post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
+                )
     except AgentError:
         raise
     except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
@@ -831,7 +848,7 @@ async def _complete_with_tools(
     # raises AgentError instead (caught above). A dict is the only remaining
     # possibility here.
     assert isinstance(completion, dict)
-    return completion
+    return completion, tool_call_trace
 
 
 def _build_policy_router(spec: AgentSpec, policy_name: str) -> ExtractionRouter:
