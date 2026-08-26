@@ -71,6 +71,31 @@ AGENT_TEMPLATES: list[dict[str, Any]] = [
         ),
         "defaults": {"system_prompt": "", "options": {}},
     },
+    {
+        "id": "docs-search-agent",
+        "kind": "custom",
+        "display_name": "Document Search Agent",
+        "description": (
+            "Agentic RAG demo: wires a custom agent to the Document Search "
+            "MCP server (enable it under MCP servers first — see the "
+            "catalog) so even a small model searches a directory of "
+            "documents before answering, instead of guessing from a "
+            "stuffed prompt. Every tool call is visible in Try it (#262) "
+            "and the Observability usage ledger (#261)."
+        ),
+        "defaults": {
+            "system_prompt": (
+                "You are a document search assistant. You do not know the "
+                "contents of any document from memory. Before answering, "
+                "call list_files to see what is available, then use "
+                "search_text or read_document to find the actual answer. "
+                "Cite which document and page your answer came from. If "
+                "nothing relevant is found, say so plainly instead of "
+                "guessing."
+            ),
+            "options": {"mcp_servers": ["docs-search"], "mcp_tools": None},
+        },
+    },
 ]
 
 

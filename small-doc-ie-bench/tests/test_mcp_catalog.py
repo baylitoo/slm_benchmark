@@ -16,7 +16,7 @@ from mcp.shared.memory import create_client_server_memory_streams
 
 from docie_bench.mcp_api import router as mcp_router
 from docie_bench.mcp_catalog import CATALOG, registry_entry_for
-from docie_bench.mcp_servers import calculator, dates, web_fetch
+from docie_bench.mcp_servers import calculator, dates, docs_search, web_fetch
 from docie_bench.settings import get_settings
 
 # ---------------------------------------------------------------- calculator
@@ -106,6 +106,67 @@ async def test_fetch_url_redirects_reported_and_body_truncated(monkeypatch) -> N
     assert len(big["text"]) <= 200_000
 
 
+# ----------------------------------------------------------------- docs-search
+
+
+@pytest.fixture
+def docs(tmp_path: Path, monkeypatch) -> Path:
+    monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(tmp_path))
+    return tmp_path
+
+
+def test_list_documents_only_lists_supported_files_recursively(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+    (docs / "ignored.docx").write_text("nope")
+    sub = docs / "sub"
+    sub.mkdir()
+    (sub / "b.pdf").write_bytes(b"%PDF-fake")
+    assert docs_search.list_documents() == ["a.txt", "sub/b.pdf"]
+
+
+def test_resolve_document_rejects_escape_attempts(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+    # A POSIX-rooted path isn't `.is_absolute()` on a Windows test runner (no
+    # drive letter), so it's caught by the parents-check instead of the
+    # explicit absolute-path guard -- either way it must never resolve
+    # inside docs_dir(), which is what actually matters.
+    with pytest.raises(ValueError, match="relative|outside"):
+        docs_search.resolve_document("/etc/passwd")
+    with pytest.raises(ValueError, match="outside"):
+        docs_search.resolve_document("../outside.txt")
+    with pytest.raises(ValueError, match="no such document"):
+        docs_search.resolve_document("missing.txt")
+    (docs / "b.exe").write_bytes(b"x")
+    with pytest.raises(ValueError, match="unsupported file type"):
+        docs_search.resolve_document("b.exe")
+    assert docs_search.resolve_document("a.txt") == (docs / "a.txt").resolve()
+
+
+def test_document_text_groups_lines_by_page(docs: Path) -> None:
+    (docs / "note.txt").write_text("first line\nsecond line\n")
+    result = docs_search.document_text("note.txt")
+    assert result == {
+        "path": "note.txt",
+        "pages": [{"page": 1, "text": "first line\nsecond line"}],
+    }
+
+
+def test_search_documents_across_all_or_one_file(docs: Path) -> None:
+    (docs / "a.txt").write_text("the invoice total is 400 EUR")
+    (docs / "b.txt").write_text("nothing relevant here")
+    everywhere = docs_search.search_documents("invoice")
+    assert [m["path"] for m in everywhere] == ["a.txt"]
+    assert everywhere[0]["snippet"] == "the invoice total is 400 EUR"
+    scoped = docs_search.search_documents("nothing", path="b.txt")
+    assert len(scoped) == 1
+    assert docs_search.search_documents("invoice", path="b.txt") == []
+
+
+def test_search_documents_rejects_empty_query(docs: Path) -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        docs_search.search_documents("   ")
+
+
 # --------------------------------------------------- servers speak real MCP
 
 
@@ -115,6 +176,7 @@ async def test_fetch_url_redirects_reported_and_body_truncated(monkeypatch) -> N
         (calculator, {"calc", "sum_check"}),
         (dates, {"parse_date", "date_diff", "today"}),
         (web_fetch, {"fetch"}),
+        (docs_search, {"list_files", "read_document", "search_text"}),
     ],
 )
 async def test_build_server_exposes_expected_tools(module, expected_tools) -> None:
@@ -153,9 +215,10 @@ def client(registry_path: Path) -> TestClient:
 
 def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_path: Path) -> None:
     entries = {e["name"]: e for e in client.get("/v1/mcp/catalog").json()["entries"]}
-    assert set(entries) == {"calculator", "dates", "web-fetch"}
+    assert set(entries) == {"calculator", "dates", "web-fetch", "docs-search"}
     assert not entries["calculator"]["enabled"]
     assert entries["web-fetch"]["params"][0]["name"] == "allowed_hosts"
+    assert entries["docs-search"]["params"][0]["name"] == "docs_dir"
 
     client.post("/v1/mcp/servers", json={"catalog": "calculator"})
     entries = {e["name"]: e for e in client.get("/v1/mcp/catalog").json()["entries"]}
@@ -230,6 +293,49 @@ def test_test_route_unknown_server_404(client: TestClient) -> None:
     assert client.post("/v1/mcp/servers/nope/test").status_code == 404
 
 
+def test_docs_search_spawned_end_to_end(
+    client: TestClient, registry_path: Path, tmp_path: Path
+) -> None:
+    # Real stdio spawn with the env-var-scoped docs dir -- proves the
+    # subprocess actually sees DOCIE_MCP_DOCS_SEARCH_DIR (this SDK only
+    # inherits a minimal curated env by default, not the full parent env).
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "invoice.txt").write_text("total due: 42 EUR")
+    registry_path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "docs-search": {
+                        "transport": "stdio",
+                        "command": [
+                            sys.executable, "-m", "docie_bench.mcp_servers.docs_search",
+                        ],
+                        "env": {docs_search.DOCS_DIR_ENV: str(docs)},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = client.post("/v1/mcp/servers/docs-search/test")
+    assert res.status_code == 200, res.text
+    assert {t["name"] for t in res.json()["tools"]} == {
+        "list_files", "read_document", "search_text",
+    }
+
+
 def test_registry_entry_for_omits_empty_env() -> None:
     entry = CATALOG["calculator"]
     assert "env" not in registry_entry_for(entry, {})
+
+
+def test_enable_docs_search_writes_its_dir_env_var(client: TestClient, registry_path: Path) -> None:
+    res = client.post(
+        "/v1/mcp/servers",
+        json={"catalog": "docs-search", "params": {"docs_dir": "/data/agent-docs"}},
+    )
+    assert res.status_code == 201, res.text
+    saved = json.loads(registry_path.read_text(encoding="utf-8"))["servers"]["docs-search"]
+    assert saved["command"] == ["python", "-m", "docie_bench.mcp_servers.docs_search"]
+    assert saved["env"] == {"DOCIE_MCP_DOCS_SEARCH_DIR": "/data/agent-docs"}

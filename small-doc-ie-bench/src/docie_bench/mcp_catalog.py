@@ -70,6 +70,31 @@ CATALOG: dict[str, CatalogEntry] = {
                 ),
             ),
         ),
+        CatalogEntry(
+            name="docs-search",
+            title="Document Search",
+            description=(
+                "Agentic RAG demo: list, read, and substring-search a shared "
+                "directory of PDFs/text files (parsed via liteparse, the "
+                "same PDF backend the rest of the platform uses). Built to "
+                "prove out small models — search first, then answer from "
+                "what was actually found."
+            ),
+            module="docie_bench.mcp_servers.docs_search",
+            tools=("list_files", "read_document", "search_text"),
+            params=(
+                CatalogParam(
+                    name="docs_dir",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_DIR",
+                    description=(
+                        "Directory of documents this server may read (relative "
+                        "paths resolve against the server process's cwd). "
+                        "Defaults to 'data/agent-docs' if left blank — drop "
+                        "PDFs/text files there for the agent to search."
+                    ),
+                ),
+            ),
+        ),
     )
 }
 

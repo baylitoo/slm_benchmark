@@ -404,3 +404,91 @@ def test_agent_error_records_a_usage_row_with_error_status(api, monkeypatch) -> 
     assert row["status"] == "error"
     assert row["prompt_tokens"] is None
     assert row["tool_calls"] is None
+
+
+# ── docs-search-agent template end-to-end (#275) ─────────────────────────────
+
+
+def test_docs_search_agent_template_finds_and_cites_a_real_document(
+    tmp_path, monkeypatch
+) -> None:
+    """The Document Search template (agents/templates.py): a custom agent
+    wired to the REAL docs_search MCP server (not the scripted calc server
+    the other tests use) — proves the whole demo end-to-end: the model
+    calls search_text, gets back text extracted from a real .txt document,
+    and answers from it."""
+    from docie_bench.mcp_servers import docs_search
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "invoice.txt").write_text("total due: 42 EUR")
+    monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(docs))
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path / "serving-home"))
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        return UPSTREAM
+
+    monkeypatch.setattr("docie_bench.agents.runtime.resolve_extraction_profile", fake_resolver)
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "docs-search": MCPServerSpec(
+                name="docs-search", transport="streamable-http", url="http://unused"
+            )
+        },
+    )
+
+    async def fake_open(stack, specs):
+        session = await stack.enter_async_context(_memory_session(docs_search.build_server()))
+        return {"docs-search": session}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        body = json.loads(request.content)
+        has_tool_result = any(m.get("role") == "tool" for m in body["messages"])
+        if not has_tool_result:
+            return httpx.Response(
+                200,
+                json=_tool_calls_completion(
+                    "docs-search__search_text", '{"query": "total due"}'
+                ),
+            )
+        result = next(m["content"] for m in body["messages"] if m.get("role") == "tool")
+        return httpx.Response(200, json=_final_completion(f"Per invoice.txt: {result}"))
+
+    configure_http_transport(httpx.MockTransport(handler))
+    app = FastAPI()
+    app.include_router(agents_router)
+    client = TestClient(app)
+    try:
+        _create_agent(
+            client,
+            options={"mcp_servers": ["docs-search"]},
+            system_prompt="Search before answering. Cite the document.",
+        )
+        response = client.post(
+            "/v1/agents/tool-helper/chat/completions",
+            json={"messages": [{"role": "user", "content": "what is the total due?"}]},
+        )
+    finally:
+        configure_http_transport(None)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "invoice.txt" in body["choices"][0]["message"]["content"]
+    assert "42 EUR" in body["choices"][0]["message"]["content"]
+    round1_tools = {t["function"]["name"] for t in json.loads(captured[0].content)["tools"]}
+    assert round1_tools == {
+        "docs-search__list_files",
+        "docs-search__read_document",
+        "docs-search__search_text",
+    }
+    (call,) = body["docie_agent"]["tool_calls"]
+    assert call["tool"] == "docs-search__search_text"
+    assert "invoice.txt" in call["result"]
+    assert "42 EUR" in call["result"]
