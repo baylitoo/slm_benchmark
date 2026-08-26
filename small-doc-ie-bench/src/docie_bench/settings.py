@@ -114,12 +114,26 @@ class Settings(BaseSettings):
     # Per-response read timeout for MCP client sessions (list_tools/call_tool).
     mcp_tool_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
 
-    # Durable, addressable artifact store for Studio benchmark runs. Must resolve
-    # to the SAME location on every replica that reads it (a shared volume or an
-    # S3/MinIO mount) — the worker writes here and the api/web replicas read back
-    # by artifact id, never by a worker-local path. Metrics summaries live in
-    # Postgres (small); report.html / predictions.jsonl live only in this store.
+    # Durable, addressable artifact store for Studio benchmark runs — the worker
+    # writes here and the api/web replicas read back by artifact id, never by a
+    # worker-local path. Metrics summaries live in Postgres (small);
+    # report.html / predictions.jsonl live only in this store.
+    #
+    # "filesystem" (default): blobs under artifact_store_dir, which must resolve
+    # to the SAME location on every replica that reads it (a shared volume).
+    # "s3": blobs as objects in an S3-compatible bucket (AWS S3 or MinIO) — no
+    # shared volume needed, the right choice for multi-replica deployments.
+    artifact_store_backend: Literal["filesystem", "s3"] = "filesystem"
     artifact_store_dir: Path = Path("artifacts")
+    # S3 backend knobs (only read when artifact_store_backend="s3"). Credentials
+    # and region come from the standard AWS chain (AWS_ACCESS_KEY_ID,
+    # AWS_SECRET_ACCESS_KEY, AWS_REGION / config files / instance roles) —
+    # deliberately never from docie settings. endpoint_url None targets AWS;
+    # set it for MinIO or any other S3-compatible server. The optional prefix
+    # namespaces this store's objects inside a shared bucket.
+    artifact_store_s3_bucket: str | None = None
+    artifact_store_s3_endpoint_url: str | None = None
+    artifact_store_s3_prefix: str = ""
     # Retention/GC for the Studio run index (see docie_bench.studio.store.RunStore.gc
     # and docs/docie-studio.md). Age wins first, then a hard cap on run count.
     studio_run_retention_days: int = Field(default=30, ge=1, le=3650)

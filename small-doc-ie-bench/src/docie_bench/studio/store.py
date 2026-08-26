@@ -1,10 +1,15 @@
 """Blob store + run index service for durable Studio benchmark results.
 
-``ArtifactBlobStore`` is a content-addressed, atomic-write store rooted at a
-shared directory (a Docker volume or an S3/MinIO mount). Reads resolve a
-*store-relative* key against the store root, so a run written by the worker is
-readable from the ``api`` replica with no shared knowledge of the worker's local
-paths — the property PR-2 exists to guarantee.
+The blob store is content-addressed and pluggable behind ``BlobStoreBackend``:
+
+  - ``ArtifactBlobStore`` (default): atomic writes rooted at a shared directory
+    (a Docker volume every replica mounts);
+  - ``S3ArtifactBlobStore``: objects in an S3-compatible bucket (AWS S3 or
+    MinIO), so multi-replica deployments need no shared volume at all.
+
+Reads resolve a *store-relative* key against the store root, so a run written
+by the worker is readable from the ``api`` replica with no shared knowledge of
+the worker's local paths — the property PR-2 exists to guarantee.
 
 ``RunStore`` wraps the Postgres index: it claims runs idempotently, records
 metrics + artifact references on completion, resolves artifacts for
@@ -24,7 +29,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -49,26 +54,66 @@ class StoredBlob:
     media_type: str
 
 
+def _safe_blob_name(name: str) -> str:
+    safe_name = Path(name).name
+    if not safe_name or safe_name != name:
+        raise ValueError("Artifact name must be a plain file name")
+    return safe_name
+
+
+def _content_relkey(digest: str, name: str) -> str:
+    # Fan out on the digest so a listing level never holds unbounded entries, and
+    # keep the human-readable name as the leaf. POSIX separators keep the key
+    # stable across OSes and backends (it is only ever joined back onto the
+    # store root / bucket prefix).
+    return f"{digest[:2]}/{digest}/{name}"
+
+
+class BlobStoreBackend(Protocol):
+    """The exact operations ``RunStore`` and the Studio APIs use on a blob store.
+
+    Every implementation must share these semantics:
+
+      - ``put`` is content-addressed: identical bytes land on the identical
+        relkey (``digest[:2]/digest/name``), and re-putting existing content
+        refreshes the blob's last-modified time — the liveness signal the GC
+        orphan sweep in ``RunStore.gc`` relies on;
+      - ``read`` of a missing blob raises ``FileNotFoundError``; a key that
+        escapes the store root raises ``ValueError``;
+      - ``delete`` is idempotent and reports whether a blob was removed;
+      - ``iter_keys`` enumerates every committed blob (backs mark-and-sweep);
+      - ``modified_at`` returns a tz-aware UTC timestamp, or ``None`` if gone.
+    """
+
+    def put(
+        self, *, name: str, content: bytes, media_type: str = "application/octet-stream"
+    ) -> StoredBlob: ...
+
+    def read(self, relkey: str) -> bytes: ...
+
+    def exists(self, relkey: str) -> bool: ...
+
+    def delete(self, relkey: str) -> bool: ...
+
+    def iter_keys(self) -> Iterator[str]: ...
+
+    def modified_at(self, relkey: str) -> dt.datetime | None: ...
+
+
 class ArtifactBlobStore:
-    """Content-addressed, atomic blob store rooted at a shared directory."""
+    """Filesystem backend: content-addressed, atomic blob store rooted at a
+    shared directory. The default backend, and the reference for the semantics
+    ``BlobStoreBackend`` implementations must preserve."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
 
-    def _relkey(self, digest: str, name: str) -> str:
-        # Fan out on the digest so a directory never holds unbounded entries, and
-        # keep the human-readable name as the leaf. POSIX separators keep the key
-        # stable across OSes (it is only ever joined back onto ``root``).
-        return f"{digest[:2]}/{digest}/{name}"
-
     def put(
         self, *, name: str, content: bytes, media_type: str = "application/octet-stream"
     ) -> StoredBlob:
-        safe_name = Path(name).name
-        if not safe_name or safe_name != name:
-            raise ValueError("Artifact name must be a plain file name")
+        safe_name = _safe_blob_name(name)
         digest = hashlib.sha256(content).hexdigest()
-        relkey = self._relkey(digest, safe_name)
+        relkey = _content_relkey(digest, safe_name)
         destination = self.root / relkey
         destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -174,8 +219,163 @@ class ArtifactBlobStore:
         return dt.datetime.fromtimestamp(mtime, tz=dt.UTC)
 
 
-def default_blob_store() -> ArtifactBlobStore:
-    return ArtifactBlobStore(get_settings().artifact_store_dir)
+def _make_s3_client(endpoint_url: str | None) -> Any:
+    """Build a boto3 S3 client, or fail with an actionable install hint.
+
+    Credentials/region deliberately come from the standard AWS chain (the
+    ``AWS_*`` environment variables, shared config files, or an instance role)
+    — never from docie settings, so no secret ever lands in plaintext config.
+    """
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError(
+            "artifact_store_backend='s3' requires the optional boto3 dependency. "
+            "Install it with: pip install 'small-doc-ie-bench[s3]'"
+        ) from exc
+    return boto3.client("s3", endpoint_url=endpoint_url)
+
+
+def _s3_not_found(exc: Exception) -> bool:
+    """True when a botocore ClientError means "no such object" (404/NoSuchKey)."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    code = str(response.get("Error", {}).get("Code", ""))
+    return code in {"NoSuchKey", "NotFound", "404"}
+
+
+class S3ArtifactBlobStore:
+    """S3-compatible backend: blobs as objects in a bucket (AWS S3 or MinIO).
+
+    Key layout mirrors the filesystem backend exactly —
+    ``<prefix>/<digest[:2]>/<digest>/<name>`` — so relkeys recorded in the DB
+    stay backend-agnostic. GC parity: ``modified_at`` maps to the object's
+    ``LastModified``, and ``put`` uploads unconditionally so a re-put of
+    existing content refreshes that timestamp (the filesystem backend's
+    ``utime`` dedup refresh, expressed the S3 way; per-object PUTs are already
+    atomic, so no temp-file dance is needed).
+
+    ``endpoint_url=None`` targets AWS; point it at a MinIO/other S3-compatible
+    server otherwise. ``client`` injects a pre-built (or fake) S3 client and
+    skips boto3 entirely — the test seam.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        prefix: str = "",
+        endpoint_url: str | None = None,
+        client: Any | None = None,
+    ) -> None:
+        if not bucket:
+            raise ValueError("S3 artifact store requires a bucket name")
+        self.bucket = bucket
+        self.prefix = prefix.strip("/")
+        self._key_prefix = f"{self.prefix}/" if self.prefix else ""
+        self._client = client if client is not None else _make_s3_client(endpoint_url)
+
+    def _valid_relkey(self, relkey: str) -> bool:
+        # Parity with the filesystem ``path_for`` guard: a poisoned DB row must
+        # never address an object outside this store's prefix.
+        if not relkey or relkey.startswith("/") or "\\" in relkey:
+            return False
+        return all(part not in ("", ".", "..") for part in relkey.split("/"))
+
+    def _object_key(self, relkey: str) -> str:
+        if not self._valid_relkey(relkey):
+            raise ValueError("Artifact key escapes the store root")
+        return f"{self._key_prefix}{relkey}"
+
+    def put(
+        self, *, name: str, content: bytes, media_type: str = "application/octet-stream"
+    ) -> StoredBlob:
+        safe_name = _safe_blob_name(name)
+        digest = hashlib.sha256(content).hexdigest()
+        relkey = _content_relkey(digest, safe_name)
+        self._client.put_object(
+            Bucket=self.bucket,
+            Key=self._object_key(relkey),
+            Body=content,
+            ContentType=media_type,
+        )
+        return StoredBlob(
+            relkey=relkey, sha256=digest, size_bytes=len(content), media_type=media_type
+        )
+
+    def read(self, relkey: str) -> bytes:
+        key = self._object_key(relkey)
+        try:
+            response = self._client.get_object(Bucket=self.bucket, Key=key)
+        except Exception as exc:
+            if _s3_not_found(exc):
+                raise FileNotFoundError(relkey) from exc
+            raise
+        return bytes(response["Body"].read())
+
+    def exists(self, relkey: str) -> bool:
+        return self.modified_at(relkey) is not None
+
+    def delete(self, relkey: str) -> bool:
+        """Delete a blob. Idempotent; empty "directories" do not exist on S3."""
+        if not self.exists(relkey):
+            return False
+        self._client.delete_object(Bucket=self.bucket, Key=self._object_key(relkey))
+        return True
+
+    def iter_keys(self) -> Iterator[str]:
+        """Yield the store-relative key of every committed blob under the prefix.
+
+        Backs the mark-and-sweep in ``RunStore.gc`` via paginated object
+        listing. Dot-prefixed leaf names are skipped for parity with the
+        filesystem walk (S3 puts never create temp objects, but a relkey must
+        enumerate identically on both backends).
+        """
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._key_prefix):
+            for entry in page.get("Contents", []) or []:
+                key = str(entry["Key"])
+                relkey = key[len(self._key_prefix) :]
+                if not relkey or relkey.rsplit("/", 1)[-1].startswith("."):
+                    continue
+                yield relkey
+
+    def modified_at(self, relkey: str) -> dt.datetime | None:
+        """Last-modified time of a blob (UTC, from ``LastModified``), or ``None``."""
+        if not self._valid_relkey(relkey):
+            return None
+        try:
+            response = self._client.head_object(
+                Bucket=self.bucket, Key=f"{self._key_prefix}{relkey}"
+            )
+        except Exception as exc:
+            if _s3_not_found(exc):
+                return None
+            raise
+        value = response.get("LastModified")
+        if not isinstance(value, dt.datetime):  # pragma: no cover - S3 always reports it
+            return dt.datetime.now(dt.UTC)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.UTC)
+        return value.astimezone(dt.UTC)
+
+
+def default_blob_store() -> BlobStoreBackend:
+    """Build the process-default blob store from settings (the backend seam)."""
+    settings = get_settings()
+    if settings.artifact_store_backend == "s3":
+        bucket = settings.artifact_store_s3_bucket
+        if not bucket:
+            raise RuntimeError(
+                "artifact_store_backend='s3' requires ARTIFACT_STORE_S3_BUCKET to be set"
+            )
+        return S3ArtifactBlobStore(
+            bucket,
+            prefix=settings.artifact_store_s3_prefix,
+            endpoint_url=settings.artifact_store_s3_endpoint_url,
+        )
+    return ArtifactBlobStore(settings.artifact_store_dir)
 
 
 class RunStoreUnavailableError(RuntimeError):
@@ -188,7 +388,7 @@ class RunStore:
     def __init__(
         self,
         session_factory: sessionmaker[Session] | None,
-        blob_store: ArtifactBlobStore,
+        blob_store: BlobStoreBackend,
     ) -> None:
         self._sessions = session_factory
         self.blobs = blob_store
@@ -624,8 +824,10 @@ def default_run_store() -> RunStore:
 __all__ = [
     "ARTIFACT_URI_PREFIX",
     "ArtifactBlobStore",
+    "BlobStoreBackend",
     "RunStore",
     "RunStoreUnavailableError",
+    "S3ArtifactBlobStore",
     "StoredBlob",
     "default_blob_store",
     "default_run_store",
