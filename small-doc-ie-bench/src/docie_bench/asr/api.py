@@ -71,3 +71,10 @@ async def create_transcription(
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type"),
     )
+
+
+# Kept as a sub-router so the synchronous OpenAI-compatible endpoint and the
+# durable job control plane share the same authenticated /v1/audio namespace.
+from docie_bench.asr.jobs_api import router as jobs_router  # noqa: E402
+
+router.include_router(jobs_router)

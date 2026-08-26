@@ -1924,11 +1924,16 @@ def _gc_seed_leftovers_sync() -> dict[str, int]:
 
 def _gc_studio_runs_sync() -> dict[str, int]:
     """Apply the retention policy to the durable Studio run index (blocking)."""
+    from docie_bench.asr.job_store import default_asr_job_store
     from docie_bench.studio.store import default_run_store
 
     store = default_run_store()
     if store.enabled:
         settings = get_settings()
+        asr_summary = default_asr_job_store().gc(
+            max_age_days=settings.asr_job_retention_days,
+            max_jobs=settings.asr_job_retention_max,
+        )
         summary = dict(
             store.gc(
                 max_age_days=settings.studio_run_retention_days,
@@ -1936,6 +1941,7 @@ def _gc_studio_runs_sync() -> dict[str, int]:
                 orphan_grace_hours=settings.studio_orphan_grace_hours,
             )
         )
+        summary.update(asr_summary)
     else:
         logger.info("studio run GC skipped: no DATABASE_URL")
         summary = {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
@@ -1965,6 +1971,52 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
     return await ctx.step.run("gc-studio-runs", _gc_studio_runs)
 
 
+# Durable ASR transcription: queue-owned, per-tenant backpressure, and one
+# memoized step per recording. The executor lives in asr.jobs_worker so its
+# batch/partial-failure semantics are directly testable without Inngest.
+_asr_settings = get_settings()
+
+
+@inngest_client.create_function(
+    fn_id="asr-transcription-job",
+    trigger=inngest.TriggerEvent(event="asr/transcription.requested"),
+    idempotency="event.data.idempotency_key",
+    retries=2,
+    concurrency=[
+        inngest.Concurrency(limit=_asr_settings.asr_job_concurrency, scope="fn"),
+        inngest.Concurrency(
+            limit=_asr_settings.asr_job_tenant_concurrency,
+            key="event.data.tenant_id",
+            scope="fn",
+        ),
+    ],
+    throttle=inngest.Throttle(
+        limit=30,
+        period=60,
+        key="event.data.tenant_id",
+    ),
+)
+async def run_asr_transcription_job(ctx: inngest.Context) -> dict[str, Any]:
+    from docie_bench.asr.job_store import default_asr_job_store
+    from docie_bench.asr.jobs_worker import process_transcription_job
+
+    data = dict(ctx.event.data or {})
+    event_id = str(data.get("job_id") or ctx.event.id)
+    channel = str(data.get("channel") or f"asr:{event_id}")
+    try:
+        await _ensure_deployment_live(ctx.step, data, channel)
+        return await process_transcription_job(
+            data,
+            event_id=event_id,
+            step=ctx.step,
+        )
+    except Exception as exc:  # noqa: BLE001 - retry twice, then durably settle failure
+        await publish(channel, TOPIC_ERROR, {"job_id": event_id, "message": str(exc)})
+        if ctx.attempt >= 2:
+            default_asr_job_store().fail_job(event_id, error=str(exc))
+        raise
+
+
 # --------------------------------------------------------------------- roles
 # P1 (design doc §0.1): the compose topology splits the old `worker` into a
 # dedicated single-replica `serving` service (owns every function that spawns
@@ -1988,6 +2040,7 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
 worker_functions = [
     extract_document,
     run_benchmark_job,
+    run_asr_transcription_job,
     gc_studio_runs_job,
 ]
 
@@ -2053,6 +2106,7 @@ __all__ = [
     "apps_for_role",
     "extract_document",
     "run_benchmark_job",
+    "run_asr_transcription_job",
     "deploy_model_job",
     "seed_ollama_job",
     "seed_hf_job",

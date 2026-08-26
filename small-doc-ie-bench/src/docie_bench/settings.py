@@ -116,6 +116,14 @@ class Settings(BaseSettings):
     asr_allowed_upload_mime_types: str = (
         "audio/flac,audio/mp4,audio/mpeg,audio/ogg,audio/wav,audio/webm"
     )
+    # Durable ASR jobs use Inngest for backpressure and the shared artifact
+    # store for outputs. These limits are deliberately separate from the
+    # synchronous request quota: long recordings should queue, not occupy an
+    # API request or stampede one serving node.
+    asr_job_concurrency: int = Field(default=4, ge=1, le=128)
+    asr_job_tenant_concurrency: int = Field(default=2, ge=1, le=32)
+    asr_job_retention_days: int = Field(default=30, ge=1, le=3650)
+    asr_job_retention_max: int = Field(default=1000, ge=1, le=1_000_000)
 
     # MCP tool sources for served chat models (docie_bench.mcp_tools): the
     # operator-owned registry of reachable MCP servers. Callers of
