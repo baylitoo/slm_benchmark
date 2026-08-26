@@ -96,6 +96,41 @@ AGENT_TEMPLATES: list[dict[str, Any]] = [
             "options": {"mcp_servers": ["docs-search"], "mcp_tools": None},
         },
     },
+    {
+        "id": "workflow-agent",
+        "kind": "workflow",
+        "display_name": "Workflow Agent",
+        "description": (
+            "Prompt chaining (#265): a fixed, ORDERED sequence of steps, "
+            "each its own backing model and system prompt. One request "
+            "runs the whole sequence server-side — each step after the "
+            "first receives only the previous step's answer, not the "
+            "original request. Built to prove small (350M-class) models "
+            "handle narrow sub-tasks reliably in a pipeline even where one "
+            "model doing the whole thing in one shot would struggle."
+        ),
+        "defaults": {
+            "system_prompt": None,
+            "options": {
+                "steps": [
+                    {
+                        "model_profile": "",
+                        "system_prompt": (
+                            "Extract the key facts from the input as a short "
+                            "bullet list. Output only the bullets."
+                        ),
+                    },
+                    {
+                        "model_profile": "",
+                        "system_prompt": (
+                            "Using only the bullet list you were given, write "
+                            "a one-paragraph summary."
+                        ),
+                    },
+                ]
+            },
+        },
+    },
 ]
 
 

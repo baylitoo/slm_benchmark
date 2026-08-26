@@ -26,6 +26,7 @@ import {
   FileText,
   FilePlus2,
   Wrench,
+  Workflow,
 } from "lucide-react";
 import {
   ApiError,
@@ -116,6 +117,7 @@ const KIND_META: Record<AgentKind, { label: string; icon: React.ReactNode }> = {
   proxy_security: { label: "Security proxy", icon: <ShieldCheck className="h-5 w-5" /> },
   ocr: { label: "Document extraction", icon: <ScanText className="h-5 w-5" /> },
   custom: { label: "Custom", icon: <Wand2 className="h-5 w-5" /> },
+  workflow: { label: "Workflow", icon: <Workflow className="h-5 w-5" /> },
 };
 
 // Narrowed to this section, same trick Playground.tsx uses for its own
@@ -503,6 +505,7 @@ export function TryPanel({ agent }: { agent: AgentView }) {
   const pii = result?.docie_agent?.pii;
   const content = result?.choices?.[0]?.message?.content;
   const toolCalls = result?.docie_agent?.tool_calls ?? [];
+  const workflowSteps = result?.docie_agent?.steps ?? [];
 
   return (
     <div className="rounded-md border border-border bg-card p-3">
@@ -553,6 +556,32 @@ export function TryPanel({ agent }: { agent: AgentView }) {
               <p className="text-xs text-muted-foreground">
                 Sent upstream as: {pii?.placeholders?.join(" ")}
               </p>
+            )}
+            {workflowSteps.length > 0 && (
+              <div>
+                <p className="mb-1 flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                  <Workflow className="h-3.5 w-3.5" />
+                  <T>Steps</T>
+                </p>
+                <ol className="space-y-1.5">
+                  {workflowSteps.map((step) => (
+                    <li
+                      key={step.step}
+                      className="rounded-md border border-border bg-muted/40 p-2 text-xs"
+                    >
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-muted-foreground">#{step.step + 1}</span>
+                        <span className="font-medium text-foreground">{step.model_profile}</span>
+                      </div>
+                      {step.content && (
+                        <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">
+                          {step.content}
+                        </pre>
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              </div>
             )}
             {toolCalls.length > 0 && (
               <div>
@@ -783,6 +812,25 @@ export function CreateView({
     }
   }
 
+  // workflow-kind: a fixed, ordered sequence of steps (#265) -- each its own
+  // backing model + system prompt, optionally its own MCP tools too (kept
+  // out of the v1 step editor UI; settable via the API directly).
+  const [steps, setSteps] = useState<{ model_profile: string; system_prompt: string }[]>([
+    { model_profile: "", system_prompt: "" },
+  ]);
+
+  function addStep() {
+    setSteps((prev) => [...prev, { model_profile: "", system_prompt: "" }]);
+  }
+
+  function removeStep(index: number) {
+    setSteps((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function updateStep(index: number, patch: Partial<{ model_profile: string; system_prompt: string }>) {
+    setSteps((prev) => prev.map((step, i) => (i === index ? { ...step, ...patch } : step)));
+  }
+
   function toggleMcpTool(server: string, tool: string) {
     setMcpAllowlist((prev) => {
       const known = (mcpServerTools[server] ?? []).map((t) => t.name);
@@ -839,6 +887,9 @@ export function CreateView({
     if (typeof options.mode === "string") setMode(options.mode);
     if (typeof options.backend === "string") setOcrBackend(options.backend);
     if (typeof options.max_tokens === "number") setMaxTokens(String(options.max_tokens));
+    if (Array.isArray(options.steps) && options.steps.length > 0) {
+      setSteps((options.steps as unknown[]).map(toStepDraft));
+    }
   }, [prefill]);
 
   // Load an existing agent's full config for editing (name + template locked).
@@ -848,6 +899,7 @@ export function CreateView({
       proxy_security: "proxy-security",
       ocr: "ocr-agent",
       custom: "custom",
+      workflow: "workflow-agent",
     };
     setTemplateId(templateForKind[editAgent.kind] ?? "custom");
     setName(editAgent.name);
@@ -888,6 +940,9 @@ export function CreateView({
         .then((res) => setMcpServerTools((prev) => ({ ...prev, [serverName]: res.tools })))
         .catch(() => setMcpServerTools((prev) => ({ ...prev, [serverName]: [] })));
     });
+    if (Array.isArray(o.steps) && o.steps.length > 0) {
+      setSteps((o.steps as unknown[]).map(toStepDraft));
+    }
     // Back-compat: an agent saved before `mode` derives it — extractor → the
     // OCR→LLM pipeline, otherwise plain OCR.
     const savedMode = o.mode;
@@ -970,10 +1025,19 @@ export function CreateView({
                     return restricted.length > 0 ? Object.fromEntries(restricted) : null;
                   })(),
                 }
-              : {};
+              : kind === "workflow"
+                ? {
+                    steps: steps
+                      .filter((s) => s.model_profile.trim())
+                      .map((s) => ({
+                        model_profile: s.model_profile.trim(),
+                        system_prompt: s.system_prompt.trim() || null,
+                      })),
+                  }
+                : {};
       if (editing && editAgent) {
         await updateAgent(editAgent.name, {
-          model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
+          model_profile: kind === "ocr" || kind === "workflow" ? null : modelProfile.trim() || null,
           system_prompt: systemPrompt.trim() || null,
           options,
         });
@@ -982,7 +1046,7 @@ export function CreateView({
         const created = await createAgent({
           name: name.trim(),
           template: templateId,
-          model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
+          model_profile: kind === "ocr" || kind === "workflow" ? null : modelProfile.trim() || null,
           system_prompt: systemPrompt.trim() || null,
           options,
         });
@@ -1043,7 +1107,7 @@ export function CreateView({
                 disabled={editing}
               />
             </Field>
-            {kind !== "ocr" && (
+            {kind !== "ocr" && kind !== "workflow" && (
               <Field
                 label="Backing model"
                 htmlFor="agent-model"
@@ -1093,7 +1157,7 @@ export function CreateView({
                 )}
               </Field>
             )}
-            {kind !== "ocr" && (
+            {kind !== "ocr" && kind !== "workflow" && (
               <Field
                 label="System prompt"
                 htmlFor="agent-prompt"
@@ -1552,6 +1616,59 @@ export function CreateView({
             </Card>
           )}
 
+          {kind === "workflow" && (
+            <Card
+              title="Steps"
+              subtitle="A fixed, ordered pipeline — each step gets ONLY the previous step's answer as its input (the first step gets the caller's own messages)."
+            >
+              <div className="space-y-3">
+                {steps.map((step, index) => (
+                  <div key={index} className="rounded-md border border-border p-2">
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <p className="text-xs font-medium text-foreground">
+                        <T>Step</T> {index + 1}
+                      </p>
+                      {steps.length > 1 && (
+                        <button
+                          type="button"
+                          aria-label={`Remove step ${index + 1}`}
+                          onClick={() => removeStep(index)}
+                          className="text-muted-foreground hover:text-foreground"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                    <Select
+                      aria-label={`Step ${index + 1} model`}
+                      value={step.model_profile}
+                      onChange={(e) => updateStep(index, { model_profile: e.target.value })}
+                    >
+                      <option value="">Choose a model…</option>
+                      {chatDeployments.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </Select>
+                    <TextArea
+                      className="mt-2"
+                      rows={2}
+                      aria-label={`Step ${index + 1} system prompt`}
+                      value={step.system_prompt}
+                      onChange={(e) => updateStep(index, { system_prompt: e.target.value })}
+                      placeholder="What this step alone is responsible for…"
+                    />
+                  </div>
+                ))}
+                <Button type="button" variant="secondary" size="sm" onClick={addStep}>
+                  <PlusCircle className="h-3.5 w-3.5" />
+                  <T>Add step</T>
+                </Button>
+              </div>
+            </Card>
+          )}
+
           <Card title="Endpoint" subtitle="Created agents are addressable immediately.">
             <CopyLine
               label="base_url"
@@ -1577,6 +1694,16 @@ export function CreateView({
 
 function errMessage(e: unknown): string {
   return toUserMessage(e);
+}
+
+/** One workflow step (#265), permissively parsed from an unknown value --
+ * a saved agent's/template's options.steps entry. */
+function toStepDraft(raw: unknown): { model_profile: string; system_prompt: string } {
+  const step = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    model_profile: typeof step.model_profile === "string" ? step.model_profile : "",
+    system_prompt: typeof step.system_prompt === "string" ? step.system_prompt : "",
+  };
 }
 
 /** Agent names are OpenAI model ids: normalize typing into the slug the

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-AgentKind = Literal["proxy_security", "ocr", "custom"]
+AgentKind = Literal["proxy_security", "ocr", "custom", "workflow"]
 
 _NAME_RE = r"^[a-z0-9][a-z0-9._-]{0,62}$"
 
@@ -61,6 +61,18 @@ class AgentSpec(BaseModel):
       a server to a named subset of its tools instead of exposing all of
       them — validated against the server's own live tool list, so a typo'd
       or stale name is a clear config error rather than a silent no-op.
+    * ``workflow`` — a fixed, ORDERED sequence of steps (``options.steps``,
+      a non-empty list), each ``{model_profile: str, system_prompt?: str,
+      mcp_servers?: list[str], mcp_tools?: dict}`` — the same per-step
+      shape a ``custom`` agent's top-level fields/options use. One request
+      runs every step server-side: the first step receives the caller's
+      own messages, and each later step receives only the PREVIOUS step's
+      answer as its single user message ("prompt chaining" — a small model
+      handling one narrow sub-task per step). The top-level
+      ``model_profile``/``system_prompt`` are unused (each step carries its
+      own); the final step's answer is the response, with every step's
+      content and tool calls available via ``docie_agent.steps`` (the "Try
+      it" trace view, #262).
     """
 
     name: str = Field(pattern=_NAME_RE, max_length=63)

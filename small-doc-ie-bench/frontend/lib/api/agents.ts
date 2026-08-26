@@ -14,7 +14,7 @@ import {
   unauthorizedError,
 } from "./core";
 
-export type AgentKind = "proxy_security" | "ocr" | "custom";
+export type AgentKind = "proxy_security" | "ocr" | "custom" | "workflow";
 
 /** A catalog template (GET /v1/agents/templates). */
 export interface AgentTemplate {
@@ -120,6 +120,14 @@ export interface AgentToolCallTrace {
   result?: string;
 }
 
+/** One workflow step's outcome (#265) -- the "Try it" trace view's
+ * per-step detail, alongside any tool calls that step made. */
+export interface AgentWorkflowStepTrace {
+  step: number;
+  model_profile: string;
+  content: string | null;
+}
+
 export interface AgentChatResponse {
   model?: string;
   choices?: { message?: { role?: string; content?: string } }[];
@@ -128,6 +136,7 @@ export interface AgentChatResponse {
     kind?: string;
     pii?: AgentPiiReport;
     tool_calls?: AgentToolCallTrace[];
+    steps?: AgentWorkflowStepTrace[];
   };
   [k: string]: unknown;
 }
