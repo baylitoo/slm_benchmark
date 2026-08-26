@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.pytest-tmp-*
+.mypy_cache
+.ruff_cache
+.cache
+artifacts
+annotations
+runs
+models
+frontend/.next
+frontend/node_modules

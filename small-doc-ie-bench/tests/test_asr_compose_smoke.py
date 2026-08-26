@@ -95,6 +95,11 @@ def test_compose_services_support_an_operator_supplied_env_file() -> None:
     assert compose.count("env_file: ${DOCIE_ENV_FILE:-.env}") == 4
 
 
+def test_docker_context_excludes_local_dependency_and_build_trees() -> None:
+    ignored = set(Path(".dockerignore").read_text(encoding="utf-8").splitlines())
+    assert {"frontend/node_modules", "frontend/.next", "artifacts", ".git"} <= ignored
+
+
 def test_runbook_keeps_state_and_requires_tree_verification() -> None:
     runbook = Path("docs/asr-operations.md").read_text(encoding="utf-8")
     for invariant in (

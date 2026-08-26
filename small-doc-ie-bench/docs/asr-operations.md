@@ -14,6 +14,11 @@ uses `Systran/faster-whisper-tiny.en` on CPU/int8, records the immutable Hub
 revision observed before and after download, and fails if the revision changes
 during the seed.
 
+The repository `.dockerignore` excludes local dependency, build, test-cache,
+model, and smoke-artifact trees from the image context. Keep those exclusions:
+an operator may run the gate after `npm ci`/`next build`, and local outputs must
+not make the candidate image slow, oversized, or host-state-dependent.
+
 Run from the repository root on the exact candidate commit:
 
 ```bash

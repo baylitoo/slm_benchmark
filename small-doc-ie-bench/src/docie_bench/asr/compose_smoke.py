@@ -444,6 +444,7 @@ def run_compose_smoke(config: SmokeConfig) -> dict[str, Any]:
     }
     api_key = secrets.token_urlsafe(24)
     caught: BaseException | None = None
+    command_diagnostics = ""
     with tempfile.TemporaryDirectory(prefix="docie-asr-compose-") as temp_dir:
         env_file = Path(temp_dir) / "smoke.env"
         ports = _unique_local_ports(("api", "postgres", "inngest", "inngest_connect"))
@@ -456,10 +457,23 @@ def run_compose_smoke(config: SmokeConfig) -> dict[str, Any]:
         except BaseException as exc:  # noqa: BLE001 - persist diagnostics, then re-raise
             caught = exc
             evidence["result"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+            if isinstance(exc, subprocess.CalledProcessError):
+                stdout = str(exc.stdout or "")
+                stderr = str(exc.stderr or "")
+                command_diagnostics = stdout + stderr
+                evidence["command_failure"] = {
+                    "exit_code": exc.returncode,
+                    "command": [str(part) for part in exc.cmd],
+                    # Bound the JSON record; the full output lives in the log file.
+                    "output_tail": command_diagnostics[-20_000:],
+                }
         finally:
             logs = compose.command("logs", "--no-color", "--tail", "300", check=False)
             log_path = config.evidence_path.with_suffix(".logs.txt")
-            log_path.write_text(logs.stdout + logs.stderr, encoding="utf-8")
+            log_path.write_text(
+                command_diagnostics + logs.stdout + logs.stderr,
+                encoding="utf-8",
+            )
             cleanup = compose.cleanup()
             evidence["cleanup"] = {
                 "command_scope": config.project,
