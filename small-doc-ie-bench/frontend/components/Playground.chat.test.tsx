@@ -15,6 +15,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     chatCompletionStream: vi.fn(),
     chatCompletion: vi.fn(),
     listMcpServers: vi.fn(),
+    listSchemas: vi.fn(),
     listDynamicSchemas: vi.fn(),
     listRoutingPolicies: vi.fn(),
     triggerExtract: vi.fn(),
@@ -73,6 +74,7 @@ describe("ChatPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(api.listMcpServers).mockResolvedValue([]);
+    vi.mocked(api.listSchemas).mockResolvedValue(["invoice", "identity_card"]);
     vi.mocked(api.listDynamicSchemas).mockResolvedValue([]);
     vi.mocked(api.listRoutingPolicies).mockResolvedValue([]);
     vi.mocked(api.chatCompletionStream).mockImplementation(async (_model, _messages, onToken) => {
@@ -161,6 +163,72 @@ describe("ChatPanel", () => {
     );
     const call = vi.mocked(api.triggerExtract).mock.calls[0][0];
     expect(call.deployment).toBeUndefined();
+  });
+
+  it("lists built-in and saved schemas in one Select, not a free-text field", async () => {
+    vi.mocked(api.listDynamicSchemas).mockResolvedValue([
+      {
+        name: "purchase_order",
+        spec: { document_type: "purchase_order", fields: [] },
+        created_at: "",
+        updated_at: "",
+      },
+    ]);
+    vi.mocked(api.triggerExtract).mockResolvedValue({
+      event_ids: ["e3"],
+      channel: "extract:e3",
+      topics: ["result"],
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("checkbox"));
+    const select = await screen.findByRole("combobox", { name: "Schema" });
+    // Both buckets are real options in ONE list -- no separate free-text
+    // field and no chance of a typo'd, non-existent schema name.
+    expect(await screen.findByRole("option", { name: "identity_card" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "purchase_order" })).toBeInTheDocument();
+
+    await user.selectOptions(select, "purchase_order");
+    await user.type(screen.getByPlaceholderText(/Paste document text/), "po body");
+    await user.click(screen.getByRole("button", { name: "Run extraction" }));
+
+    await waitFor(() =>
+      expect(api.triggerExtract).toHaveBeenCalledWith(
+        expect.objectContaining({ dynamic_schema_name: "purchase_order" }),
+      ),
+    );
+  });
+
+  it("defaults to the built-in invoice schema and can switch back from a saved one", async () => {
+    vi.mocked(api.listDynamicSchemas).mockResolvedValue([
+      {
+        name: "purchase_order",
+        spec: { document_type: "purchase_order", fields: [] },
+        created_at: "",
+        updated_at: "",
+      },
+    ]);
+    vi.mocked(api.triggerExtract).mockResolvedValue({
+      event_ids: ["e4"],
+      channel: "extract:e4",
+      topics: ["result"],
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("checkbox"));
+    const select = await screen.findByRole("combobox", { name: "Schema" });
+    await user.selectOptions(select, "purchase_order");
+    await user.selectOptions(select, "identity_card");
+    await user.type(screen.getByPlaceholderText(/Paste document text/), "id body");
+    await user.click(screen.getByRole("button", { name: "Run extraction" }));
+
+    await waitFor(() =>
+      expect(api.triggerExtract).toHaveBeenCalledWith(
+        expect.objectContaining({ schema_name: "identity_card" }),
+      ),
+    );
+    const call = vi.mocked(api.triggerExtract).mock.calls[0][0];
+    expect(call.dynamic_schema_name).toBeUndefined();
   });
 
   it("hides MCP tool chips while extraction is on", async () => {
