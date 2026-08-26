@@ -1,7 +1,8 @@
 # ADR: Sandboxing for arbitrary tool/code execution
 
-**Status:** decided (design only — see #263, #264). No sandbox code ships in
-this PR; #264 implements the `code_interpreter` tool kind on top of it.
+**Status:** decided and implemented (#263, #264 shipped together — a
+docs-only design PR wasn't acceptable on its own; this ADR ships alongside
+the real `code_interpreter` tool it decides for).
 
 ## Context
 
@@ -15,70 +16,74 @@ you trust."* That's fine for the first-party servers shipped so far
 audited, read-only or narrowly-scoped stdio process.
 
 It stops being fine the moment a tool kind runs **arbitrary** model-supplied
-code (#264's `code_interpreter`) or shells out to a system command chosen by
-the model rather than an operator. That needs a real isolation boundary
-between "the model's generated snippet" and "the host the serving process
-runs on" — not an admin's judgment call per registered server.
+code. That needs a real isolation boundary between "the model's generated
+snippet" and "the host the serving process runs on" — not an admin's
+judgment call per registered server, and not something we hand-roll and
+hope is airtight: this specific problem (safely running untrusted code,
+with lifecycle/pooling already solved) has mature, widely-deployed prior
+art. Reinventing it was the wrong instinct — the first draft of this ADR
+did, and was corrected before anything shipped.
 
-**Deployment shape this decision is scoped to** (see `docs/docie-studio.md`,
-`project_coolify_deployment` context): self-hosted via Coolify, which
-orchestrates plain `docker compose` — no Kubernetes, no guaranteed access to
-reconfigure the Docker daemon's runtime list, no KVM guarantee, CPU-only. The
-`api`/`worker` images are `python:3.11-slim-bookworm` (Debian). Any option
-that assumes a container orchestrator beyond compose, or host-level config
-an operator has to hand-tune outside their normal Coolify deploy, is not
-realistic here — it would work in the demo environment and silently not work
-(or need undocumented host surgery) for anyone who actually self-hosts this.
+**Deployment shape this decision is scoped to**: self-hosted via Coolify,
+which orchestrates plain `docker compose` — no Kubernetes, no guaranteed
+KVM, CPU-only, single operator (not a multi-tenant judge service).
 
 ## Options surveyed
 
-| Option | Isolation strength | Fits this deployment shape? |
-| --- | --- | --- |
-| **Namespaced subprocess** (bubblewrap: mount/PID/net namespaces) + POSIX rlimits | Real kernel-enforced isolation (separate mount namespace, no network, no visibility of other processes); weaker than a VM (shares the host kernel) | **Yes** — one `apt-get install bubblewrap` line in the existing Debian image, runs as a plain subprocess inside the current container, no host config, no orchestrator dependency |
-| **gVisor** (`runsc`) — user-space kernel intercepting syscalls | Strong (a real syscall boundary, not just namespaces) | No for v1 — needs the *host's* Docker daemon configured with an extra runtime (`/etc/docker/daemon.json`), which Coolify doesn't manage; running it from inside an already-containerized worker needs docker-in-docker or a host socket mount, a materially bigger operational ask than this feature justifies |
-| **Firecracker** microVMs | Strongest (real VM boundary) | No for v1 — needs KVM and a VMM control plane; not guaranteed on a generic Coolify host, heaviest to operate of any option here |
-| **Managed sandbox service** (e.g. a cloud code-execution API) | Strong, but the boundary is someone else's infrastructure | No for v1 — adds an external network dependency, a third-party account/cost, and cuts against this project's local-first/air-gapped serving story; every other tool kind so far runs entirely on the operator's own infrastructure |
+| Option | Isolation | Cost | Fits here? |
+| --- | --- | --- | --- |
+| **Hand-rolled bubblewrap subprocess** | Real namespaces, but *we* own every hardening decision | We own 100% of the security review and 100% of lifecycle/pooling, from scratch. A first pass of this already leaked the whole container filesystem read-only before anyone caught it. | No — the exact "hard to get right, easy to get wrong" trap this ADR exists to avoid |
+| **gVisor** / **Firecracker** | Stronger (syscall boundary / real VM) | Needs host-level Docker daemon config or KVM Coolify doesn't manage | No — assumes infra this deployment shape doesn't guarantee |
+| **Managed sandbox service** (cloud code-exec API) | Strong, but it's someone else's infrastructure | External network dependency, third-party account/cost, breaks the local-first story every other tool kind here keeps | No |
+| **Piston** (self-hosted code-execution engine) | `isolate` (namespaces + cgroups) | Needs `--privileged`; no documented worker-pool/concurrency model (verified against its own README, not assumed) | No — same privilege cost as Judge0 below, with a *less* solved lifecycle story |
+| **Judge0** (self-hosted code-execution engine) | Same `isolate` primitive | Needs `--privileged` (same cost as Piston — unavoidable, it's `isolate`'s own requirement, not a Judge0 choice); one disclosed SSRF advisory (fixed upstream, and specifically triggered by a feature — result callbacks — we don't need) | **Yes** |
+
+`--privileged` is a real, non-negotiable cost of `isolate`-based execution
+(both mature options need it) — it's not something either self-hosted
+option dodges, so it isn't a differentiator between them. What *is* a
+differentiator: Judge0 ships an actual persistent worker pool (Redis-queued
+Sidekiq-style workers, `COUNT` configurable, default `2 * nproc`) with a
+`GET /workers` introspection endpoint — submissions queue and get picked up
+by already-running workers, not spawned cold per call. Piston documents
+none of that.
 
 ## Decision
 
-**Bubblewrap (`bwrap`), wrapping a plain subprocess, with POSIX rlimits as a
-second layer.** Concretely, for #264 to implement:
+**Judge0**, run as its own pair of services (`server` + `worker`, both
+`privileged: true` — required by `isolate`, not by Judge0's choice) in
+`docker-compose.yml`, with its own dedicated Postgres/Redis (not shared with
+the app's), on the internal compose network only (no host port published).
 
-- Mount namespace: bind-mount only a fresh, per-call scratch directory
-  (read-write) plus the Python interpreter/stdlib (read-only) — nothing else
-  of the container's filesystem is visible.
-- Network namespace: unshared, unconditionally, for v1 — no network access
-  at all. (This also makes "no package installation" in #264's scope a
-  property of the sandbox, not a rule the tool has to remember to enforce.)
-- PID namespace: unshared — the snippet can't see or signal any other
-  process, including its own supposed children surviving past the call.
-- `resource.setrlimit` inside the sandboxed process as defense in depth
-  (namespaces alone don't cap CPU/memory): `RLIMIT_CPU` (a few seconds),
-  `RLIMIT_AS` (memory), `RLIMIT_NPROC` (effectively 1 — no fork bombs).
-- A hard wall-clock timeout on the subprocess itself (belt-and-suspenders
-  against a CPU-limit that doesn't trip for an I/O-bound infinite loop).
-- stdout/stderr captured with a byte cap (mirrors the tool-call trace
-  truncation already shipped in #262's `_TRACE_TEXT_LIMIT`) — a runaway print
-  loop must not blow up the model's context either.
-- **Fail closed, not silently unsandboxed**: if `bwrap` isn't on `PATH`, the
-  `code_interpreter` tool kind refuses to run with a clear error, the same
-  shape as `mcp_tools.MCPUnavailableError`/`_require_mcp()` for the optional
-  `mcp` SDK dependency — never falls back to running the snippet bare.
+Hardening applied on top of Judge0's defaults (verified against its own
+`judge0.conf`, not assumed):
 
-gVisor/Firecracker are not rejected forever — if a stronger guarantee becomes
-necessary (e.g. genuinely hostile multi-tenant code execution, not an
-operator's own agents), they're the natural next step and this decision
-should be revisited. They're just the wrong first cut for this deployment
-shape.
+- `AUTHN_TOKEN` set (auth is **off** by default upstream — an
+  unauthenticated code-execution service reachable by any other container
+  on the network is a lateral-movement risk even without a published port).
+- `ENABLE_CALLBACKS=false` — result callbacks are the exact feature the
+  disclosed SSRF advisory exploited, and this integration doesn't need them
+  (the MCP tool gets its result from the response, not a webhook).
+- `enable_wait_result=true` (Judge0's own default) — lets the v1 integration
+  do a plain synchronous request instead of a polling loop. Judge0's own
+  docs note this "doesn't scale well" for a public multi-tenant judge
+  service; irrelevant here, one operator's agent tool calls at a time.
+- Judge0's own `cpu_time_limit`/`wall_time_limit`/`memory_limit` per
+  submission — no separate limiting layer to build or get wrong.
 
-## Consequences for #264
+The `code_interpreter` MCP tool (#264, `docie_bench/mcp_servers/
+code_interpreter.py`) is a thin HTTP client: `POST /submissions?wait=true`
+(`language_id=71`, Python) against the Judge0 server, mapping its
+`stdout`/`stderr`/`status`/`time` response to a completion the model reads.
+Wired the same way every other MCP tool is (#259) — an agent opts in via
+`options.mcp_servers: ["code-interpreter"]`, no new plumbing.
 
-- New optional runtime dependency: `bubblewrap` in the `api`/`worker`
-  Dockerfiles (Debian package, one line).
-- New settings, mirroring the `mcp_tool_timeout_seconds`/
-  `mcp_max_tool_iterations` naming convention (`docie_bench/settings.py`):
-  a CPU-seconds cap, a memory cap, an output-byte cap — operator-tunable,
-  not hardcoded.
-- The `code_interpreter` tool's "unavailable" error is a distinct, clearly
-  labeled error type (like `mcp_unavailable`) so an operator sees exactly
-  why a tool call refused, not a generic 500.
+Worker-pool visibility answers a real operational ask (not just a nice-to-
+have): Judge0's `GET /workers` (queue size, idle/working/paused counts) is
+surfaced as a status card nested in the Studio's existing MCP tab, not a
+new page.
+
+Piston, gVisor, and Firecracker aren't rejected forever — if Judge0's
+disclosed advisory class or its `--privileged` requirement becomes
+unacceptable, or genuinely hostile (not just untrusted) code execution
+becomes a requirement, this should be revisited. They're just the wrong
+fit for what this milestone actually needs.

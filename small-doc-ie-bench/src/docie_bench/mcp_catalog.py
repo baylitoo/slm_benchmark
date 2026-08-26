@@ -95,6 +95,42 @@ CATALOG: dict[str, CatalogEntry] = {
                 ),
             ),
         ),
+        CatalogEntry(
+            name="code-interpreter",
+            title="Code Interpreter",
+            description=(
+                "Sandboxed Python execution via a self-hosted Judge0 instance "
+                "(docker-compose.yml's judge0-server, start with "
+                "`docker compose --profile sandbox up`) — lets an agent "
+                "actually run a snippet instead of reasoning about it. See "
+                "docs/adr-agent-sandboxing.md. Refuses to run without a "
+                "matching auth token; never falls back to running code "
+                "unsandboxed."
+            ),
+            module="docie_bench.mcp_servers.code_interpreter",
+            tools=("run_python",),
+            params=(
+                CatalogParam(
+                    name="url",
+                    env_var="DOCIE_MCP_CODE_INTERPRETER_URL",
+                    description=(
+                        "Judge0 base URL. Defaults to "
+                        "'http://judge0-server:2358' (the compose-network "
+                        "address of the judge0-server service) if left blank."
+                    ),
+                ),
+                CatalogParam(
+                    name="token",
+                    env_var="DOCIE_MCP_CODE_INTERPRETER_TOKEN",
+                    description=(
+                        "Auth token — must match JUDGE0_AUTH_TOKEN in .env. "
+                        "Required: the tool refuses to run without it rather "
+                        "than submitting code to an unauthenticated Judge0."
+                    ),
+                    required=True,
+                ),
+            ),
+        ),
     )
 }
 

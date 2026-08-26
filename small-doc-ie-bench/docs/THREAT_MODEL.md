@@ -13,7 +13,7 @@ access.
 - FastAPI to OCR and model servers: document content remains untrusted across this boundary.
 - API process to audit database: tenant context, hashes, and configured/redacted results are stored.
 - Benchmark API to host filesystem: disabled by default because it accepts server-side paths.
-- Agents to MCP tool servers: only operator-registered servers by name are reachable (never a caller-supplied URL/command, see `docie_bench/mcp_tools.py`); the spawned process runs with the server's own privileges, so registering one is an operator trust decision, not a per-request one. Arbitrary model-generated code execution (the planned `code_interpreter` tool, #264) needs a stronger boundary than that — see `docs/adr-agent-sandboxing.md`.
+- Agents to MCP tool servers: only operator-registered servers by name are reachable (never a caller-supplied URL/command, see `docie_bench/mcp_tools.py`); the spawned process runs with the server's own privileges, so registering one is an operator trust decision, not a per-request one. Arbitrary model-generated code execution (the `code_interpreter` tool, #264) is the one first-party server that needs a stronger boundary than that: it runs each snippet in Judge0 (a dedicated, `--privileged` sandboxed execution service on the internal compose network, no host port published, auth token required, result callbacks disabled) rather than in-process — see `docs/adr-agent-sandboxing.md`.
 
 ## Defenses
 
