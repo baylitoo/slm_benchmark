@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -303,6 +304,7 @@ async def run_tool_loop(
     mapping: Mapping[str, tuple[str, str]],
     mcp_tools: list[dict[str, Any]],
     max_iterations: int | None = None,
+    on_tool_call: Callable[[str, bool, int], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -312,6 +314,11 @@ async def run_tool_loop(
     the error object from ``post``, or ``None`` when ``max_iterations``
     rounds all ended in tool calls — the route maps that to an explicit 502
     rather than silently returning a half-finished exchange.
+
+    ``on_tool_call``, when given, is invoked synchronously right after each
+    executed tool call with ``(qualified_name, ok, latency_ms)`` — the
+    Agents surface's observability seam (#261), unused by the generic chat
+    surface.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -362,9 +369,17 @@ async def run_tool_loop(
             if not isinstance(call, dict):
                 continue
             function = call.get("function") or {}
+            call_name = str(function.get("name"))
+            call_started = time.monotonic()
             result_text = await execute_tool_call(
-                sessions, mapping, str(function.get("name")), function.get("arguments")
+                sessions, mapping, call_name, function.get("arguments")
             )
+            if on_tool_call is not None:
+                on_tool_call(
+                    call_name,
+                    not result_text.startswith("error:"),
+                    int((time.monotonic() - call_started) * 1000),
+                )
             messages.append(
                 {
                     "role": "tool",

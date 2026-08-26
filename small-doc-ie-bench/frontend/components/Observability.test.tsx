@@ -23,6 +23,7 @@ function makeEntry(overrides: Partial<UsageDeployment> = {}): UsageDeployment {
     avg_latency_ms: 240.5,
     p95_latency_ms: 910,
     last_used_at: new Date().toISOString(),
+    tool_calls: [],
     ...overrides,
   };
 }
@@ -72,5 +73,40 @@ describe("UsageCard", () => {
     vi.mocked(api.getUsageSummary).mockResolvedValue({ window: "24h", deployments: [] });
     render(<UsageCard active />);
     expect(await screen.findByText(/No usage recorded/)).toBeInTheDocument();
+  });
+
+  it("expands an agent's tool-call trace on demand", async () => {
+    vi.mocked(api.getUsageSummary).mockResolvedValue({
+      window: "24h",
+      deployments: [
+        makeEntry({
+          deployment: "calc-helper",
+          tool_calls: [
+            { tool: "calc__add", calls: 5, errors: 1, avg_latency_ms: 12.5 },
+            { tool: "calc__subtract", calls: 2, errors: 0, avg_latency_ms: 8 },
+          ],
+        }),
+      ],
+    });
+    render(<UsageCard active />);
+    await screen.findAllByText("calc-helper");
+    // Collapsed by default -- no tool rows visible yet.
+    expect(screen.queryByText("calc__add")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /expand calc-helper tool calls/i }));
+    expect(await screen.findByText("calc__add")).toBeInTheDocument();
+    expect(screen.getByText("calc__subtract")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /collapse calc-helper tool calls/i }),
+    );
+    expect(screen.queryByText("calc__add")).not.toBeInTheDocument();
+  });
+
+  it("shows no expand affordance for a deployment with no tool calls", async () => {
+    vi.mocked(api.getUsageSummary).mockResolvedValue({ window: "24h", deployments: [makeEntry()] });
+    render(<UsageCard active />);
+    await screen.findAllByText("lfm2.5-350m");
+    expect(screen.queryByRole("button", { name: /tool calls/i })).not.toBeInTheDocument();
   });
 });

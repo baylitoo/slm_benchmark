@@ -36,6 +36,7 @@ from docie_bench.agents.runtime import AgentError, complete_agent
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.agents.templates import AGENT_TEMPLATES, template_by_id
 from docie_bench.security import TenantContext, get_quota_manager
+from docie_bench.studio import usage_store
 from docie_bench.telemetry import AGENT_LATENCY, AGENT_PII_DETECTED, AGENT_REQUESTS
 
 
@@ -212,7 +213,45 @@ async def list_agent_models() -> dict[str, Any]:
     }
 
 
-async def _serve_completion(spec: AgentSpec, request: Request) -> Any:
+def _record_agent_usage(
+    spec: AgentSpec, tenant: TenantContext, started: float, outcome: Any
+) -> None:
+    """One usage-ledger row per agent completion (#261) — the same seam
+    chat_api._record_usage_outcome uses for the generic surfaces, with the
+    agent NAME as ``deployment`` so the Usage view's per-deployment grouping
+    lines each agent up on its own row. ``tool_calls`` (an MCP tool-call
+    trace, see ``docie_agent.tool_calls``) rides along when the request ran
+    the tool loop — never present on an error outcome or a tool-less agent.
+    """
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    status = "error" if isinstance(outcome, AgentError) else "ok"
+    if isinstance(outcome, dict):
+        usage = outcome.get("usage")
+        if isinstance(usage, dict):
+            raw_prompt = usage.get("prompt_tokens")
+            raw_completion = usage.get("completion_tokens")
+            prompt_tokens = raw_prompt if isinstance(raw_prompt, int) else None
+            completion_tokens = raw_completion if isinstance(raw_completion, int) else None
+        docie_agent = outcome.get("docie_agent")
+        if isinstance(docie_agent, dict):
+            raw_calls = docie_agent.get("tool_calls")
+            if isinstance(raw_calls, list):
+                tool_calls = raw_calls
+    usage_store.record_usage(
+        deployment=spec.name,
+        surface="agent",
+        tenant_id=tenant.tenant_id,
+        latency_ms=int((time.monotonic() - started) * 1000),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        status=status,
+        tool_calls=tool_calls,
+    )
+
+
+async def _serve_completion(spec: AgentSpec, request: Request, tenant: TenantContext) -> Any:
     try:
         body = await request.json()
     except ValueError:
@@ -236,10 +275,12 @@ async def _serve_completion(spec: AgentSpec, request: Request) -> Any:
         # upstream_error, ...) — the Observability dashboard groups on it.
         AGENT_REQUESTS.labels(spec.name, spec.kind, exc.error_type).inc()
         AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
+        _record_agent_usage(spec, tenant, started, exc)
         return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
     AGENT_REQUESTS.labels(spec.name, spec.kind, "ok").inc()
     AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
     _record_pii_metrics(spec.name, completion)
+    _record_agent_usage(spec, tenant, started, completion)
     if wants_stream:
         return _single_chunk_sse(completion)
     return JSONResponse(completion)
@@ -259,9 +300,13 @@ def _record_pii_metrics(agent_name: str, completion: dict[str, Any]) -> None:
 
 
 @router.post("/chat/completions")
-async def agents_chat_completions(request: Request) -> Any:
+async def agents_chat_completions(
+    request: Request, tenant: Annotated[TenantContext, Depends(agents_tenant_guard)]
+) -> Any:
     # Peek at the model field for routing; _serve_completion re-reads the body
-    # (Starlette caches it, so the double read is free).
+    # (Starlette caches it, so the double read is free). Redeclaring
+    # agents_tenant_guard here reuses the router-level dependency's cached
+    # result for this request rather than re-authenticating.
     try:
         body = await request.json()
     except ValueError:
@@ -283,7 +328,7 @@ async def agents_chat_completions(request: Request) -> Any:
         )
     except AgentRegistryError as exc:
         raise _http_error(exc) from exc
-    return await _serve_completion(spec, request)
+    return await _serve_completion(spec, request, tenant)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +373,9 @@ async def agent_models(name: str) -> dict[str, Any]:
 
 
 @router.post("/{name}/chat/completions")
-async def agent_chat_completions(name: str, request: Request) -> Any:
+async def agent_chat_completions(
+    name: str, request: Request, tenant: Annotated[TenantContext, Depends(agents_tenant_guard)]
+) -> Any:
     try:
         spec = _registry().get(name)
     except AgentNotFoundError:
@@ -339,7 +386,7 @@ async def agent_chat_completions(name: str, request: Request) -> Any:
         )
     except AgentRegistryError as exc:
         raise _http_error(exc) from exc
-    return await _serve_completion(spec, request)
+    return await _serve_completion(spec, request, tenant)
 
 
 def _single_chunk_sse(completion: dict[str, Any]) -> StreamingResponse:

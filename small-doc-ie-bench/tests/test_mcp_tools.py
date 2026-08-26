@@ -229,6 +229,39 @@ async def test_run_tool_loop_executes_and_sums_usage() -> None:
     assert {t["function"]["name"] for t in posted[0]["tools"]} == {"calc__add", "calc__crash"}
 
 
+async def test_run_tool_loop_reports_each_call_through_on_tool_call() -> None:
+    responses = [
+        _tool_calls_completion("calc__add", '{"a": 2, "b": 3}', {}),
+        _final_completion("sum is 5", {}),
+    ]
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        return responses.pop(0)
+
+    traced: list[tuple[str, bool, int]] = []
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+3?"}]}
+        await run_tool_loop(
+            post,
+            body,
+            sessions,
+            mapping,
+            tools,
+            max_iterations=4,
+            on_tool_call=lambda name, ok, latency_ms: traced.append((name, ok, latency_ms)),
+        )
+
+    (call,) = traced
+    name, ok, latency_ms = call
+    assert name == "calc__add"
+    assert ok is True
+    assert isinstance(latency_ms, int)
+    assert latency_ms >= 0
+
+
 async def test_run_tool_loop_returns_caller_owned_calls_untouched() -> None:
     # The model calling a tool the CALLER advertised (not an MCP one) ends the
     # server-side loop: executing the caller's function is the caller's job.
