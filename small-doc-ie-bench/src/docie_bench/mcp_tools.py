@@ -304,7 +304,7 @@ async def run_tool_loop(
     mapping: Mapping[str, tuple[str, str]],
     mcp_tools: list[dict[str, Any]],
     max_iterations: int | None = None,
-    on_tool_call: Callable[[str, bool, int], None] | None = None,
+    on_tool_call: Callable[[str, bool, int, Any, str], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -316,9 +316,11 @@ async def run_tool_loop(
     rather than silently returning a half-finished exchange.
 
     ``on_tool_call``, when given, is invoked synchronously right after each
-    executed tool call with ``(qualified_name, ok, latency_ms)`` — the
-    Agents surface's observability seam (#261), unused by the generic chat
-    surface.
+    executed tool call with ``(qualified_name, ok, latency_ms, arguments,
+    result)`` — ``arguments`` is exactly what the model sent (string or
+    object, unparsed), ``result`` the text handed back to the model. The
+    Agents surface's observability seam (#261/#262), unused by the generic
+    chat surface.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -370,15 +372,16 @@ async def run_tool_loop(
                 continue
             function = call.get("function") or {}
             call_name = str(function.get("name"))
+            call_arguments = function.get("arguments")
             call_started = time.monotonic()
-            result_text = await execute_tool_call(
-                sessions, mapping, call_name, function.get("arguments")
-            )
+            result_text = await execute_tool_call(sessions, mapping, call_name, call_arguments)
             if on_tool_call is not None:
                 on_tool_call(
                     call_name,
                     not result_text.startswith("error:"),
                     int((time.monotonic() - call_started) * 1000),
+                    call_arguments,
+                    result_text,
                 )
             messages.append(
                 {

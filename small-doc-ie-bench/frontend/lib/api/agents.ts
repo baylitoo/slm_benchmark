@@ -110,10 +110,25 @@ export interface AgentPiiReport {
   degraded_to_regex?: boolean;
 }
 
+/** One executed MCP tool call (#261/#262): status/latency for the usage
+ * ledger, arguments/result for the "Try it" trace view. */
+export interface AgentToolCallTrace {
+  tool: string;
+  status: "ok" | "error";
+  latency_ms: number;
+  arguments?: string;
+  result?: string;
+}
+
 export interface AgentChatResponse {
   model?: string;
   choices?: { message?: { role?: string; content?: string } }[];
-  docie_agent?: { agent?: string; kind?: string; pii?: AgentPiiReport };
+  docie_agent?: {
+    agent?: string;
+    kind?: string;
+    pii?: AgentPiiReport;
+    tool_calls?: AgentToolCallTrace[];
+  };
   [k: string]: unknown;
 }
 

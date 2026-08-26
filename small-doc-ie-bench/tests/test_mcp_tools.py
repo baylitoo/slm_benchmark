@@ -238,7 +238,7 @@ async def test_run_tool_loop_reports_each_call_through_on_tool_call() -> None:
     async def post(body: dict[str, Any]) -> dict[str, Any]:
         return responses.pop(0)
 
-    traced: list[tuple[str, bool, int]] = []
+    traced: list[tuple[str, bool, int, Any, str]] = []
 
     async with _memory_session(_calc_server()) as session:
         sessions = {"calc": session}
@@ -251,15 +251,19 @@ async def test_run_tool_loop_reports_each_call_through_on_tool_call() -> None:
             mapping,
             tools,
             max_iterations=4,
-            on_tool_call=lambda name, ok, latency_ms: traced.append((name, ok, latency_ms)),
+            on_tool_call=lambda name, ok, latency_ms, args, result: traced.append(
+                (name, ok, latency_ms, args, result)
+            ),
         )
 
     (call,) = traced
-    name, ok, latency_ms = call
+    name, ok, latency_ms, arguments, result = call
     assert name == "calc__add"
     assert ok is True
     assert isinstance(latency_ms, int)
     assert latency_ms >= 0
+    assert arguments == '{"a": 2, "b": 3}'
+    assert result == "5"
 
 
 async def test_run_tool_loop_returns_caller_owned_calls_untouched() -> None:

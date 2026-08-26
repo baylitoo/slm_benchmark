@@ -219,9 +219,16 @@ def _record_agent_usage(
     """One usage-ledger row per agent completion (#261) — the same seam
     chat_api._record_usage_outcome uses for the generic surfaces, with the
     agent NAME as ``deployment`` so the Usage view's per-deployment grouping
-    lines each agent up on its own row. ``tool_calls`` (an MCP tool-call
-    trace, see ``docie_agent.tool_calls``) rides along when the request ran
-    the tool loop — never present on an error outcome or a tool-less agent.
+    lines each agent up on its own row. ``tool_calls`` rides along when the
+    request ran the tool loop — never present on an error outcome or a
+    tool-less agent.
+
+    The completion's own ``docie_agent.tool_calls`` (#262) carries each
+    call's full ``arguments``/``result`` for the live "Try it" trace view;
+    only ``tool``/``status``/``latency_ms`` are persisted here — the ledger
+    is an aggregate stats table (``usage_store.aggregate_usage``), not a
+    place to durably store arbitrary tool payloads (a document, an OCR
+    dump) on every request.
     """
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -238,7 +245,15 @@ def _record_agent_usage(
         if isinstance(docie_agent, dict):
             raw_calls = docie_agent.get("tool_calls")
             if isinstance(raw_calls, list):
-                tool_calls = raw_calls
+                tool_calls = [
+                    {
+                        "tool": c.get("tool"),
+                        "status": c.get("status"),
+                        "latency_ms": c.get("latency_ms"),
+                    }
+                    for c in raw_calls
+                    if isinstance(c, dict)
+                ]
     usage_store.record_usage(
         deployment=spec.name,
         surface="agent",
