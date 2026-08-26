@@ -57,6 +57,10 @@ class AgentSpec(BaseModel):
       bounded model<->tools loop the generic chat surface uses, advertising
       each server's tools and executing any tool_calls the model returns.
       Absent/empty means the original bare-forward behavior, unchanged.
+      Optional ``mcp_tools`` (``{server_name: [tool_name, ...]}``) restricts
+      a server to a named subset of its tools instead of exposing all of
+      them — validated against the server's own live tool list, so a typo'd
+      or stale name is a clear config error rather than a silent no-op.
     """
 
     name: str = Field(pattern=_NAME_RE, max_length=63)
