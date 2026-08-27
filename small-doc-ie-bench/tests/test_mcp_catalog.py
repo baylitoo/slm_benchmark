@@ -112,6 +112,7 @@ async def test_fetch_url_redirects_reported_and_body_truncated(monkeypatch) -> N
 @pytest.fixture
 def docs(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(tmp_path))
+    docs_search._EXTRACTION_CACHE.clear()
     return tmp_path
 
 
@@ -200,6 +201,53 @@ def test_search_documents_unknown_backend_is_a_clear_config_error(docs: Path, mo
     monkeypatch.setenv(docs_search.BACKEND_ENV, "vector")
     with pytest.raises(ValueError, match="Unknown search backend 'vector'"):
         docs_search.search_documents("hello")
+
+
+# ── extraction memoization: repeated search/read against the SAME document
+# skips re-running liteparse (expected agentic-search usage) ────────────────
+
+
+def _counting_extractor(monkeypatch, calls: list[Path]):
+    """Stub liteparse's extract() to log every call it receives -- for
+    asserting the cache actually skips re-extraction, not just that search
+    still returns the right answer."""
+    from docie_bench.ocr import factory as ocr_factory
+    from docie_bench.schemas.common import OCRBlock
+
+    class _Stub:
+        def extract(self, path: Path) -> list[OCRBlock]:
+            calls.append(path)
+            return [OCRBlock(id="b1", text=path.read_text(), page=1, source="manual")]
+
+    monkeypatch.setattr(ocr_factory, "get_ocr_backend", lambda name: _Stub())
+
+
+def test_repeated_search_against_the_same_document_extracts_once(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("the invoice total is 400 EUR")
+    calls: list[Path] = []
+    _counting_extractor(monkeypatch, calls)
+
+    docs_search.search_documents("invoice")
+    docs_search.search_documents("invoice")
+    docs_search.document_text("a.txt")
+
+    assert len(calls) == 1
+
+
+def test_extraction_cache_invalidates_when_the_file_changes(docs: Path, monkeypatch) -> None:
+    path = docs / "a.txt"
+    path.write_text("version one")
+    calls: list[Path] = []
+    _counting_extractor(monkeypatch, calls)
+
+    docs_search.document_text("a.txt")
+    assert len(calls) == 1
+
+    # A changed mtime/size (however small) must miss, not serve stale text --
+    # the cache key is (path, mtime_ns, size), not just the path.
+    path.write_text("version two, now longer")
+    docs_search.document_text("a.txt")
+    assert len(calls) == 2
 
 
 # ------------------------------------------------------------ code-interpreter

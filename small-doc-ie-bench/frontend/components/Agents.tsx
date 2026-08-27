@@ -605,6 +605,9 @@ export function TryPanel({ agent }: { agent: AgentView }) {
                         <span className="font-medium text-foreground">{call.tool}</span>
                         <Badge tone={call.status === "ok" ? "ok" : "err"}>{call.status}</Badge>
                         <span className="text-muted-foreground">{call.latency_ms}ms</span>
+                        {call.step_name && (
+                          <Badge tone="info">step: {call.step_name}</Badge>
+                        )}
                       </div>
                       {call.arguments && (
                         <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">

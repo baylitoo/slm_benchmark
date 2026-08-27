@@ -1028,7 +1028,9 @@ async def _complete_workflow(
     already uses); every step's own model/content, its route target (if
     any), and any tool calls it made ride
     ``docie_agent.steps``/``docie_agent.tool_calls`` for the "Try it" trace
-    view (#262).
+    view (#262) — each tool-call entry is tagged with the ``step``/
+    ``step_name`` that made it, so a multi-step workflow's calls aren't
+    flattened into one unattributed list.
     """
     steps, names, by_name = _resolve_workflow_steps(spec)
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -1071,6 +1073,13 @@ async def _complete_workflow(
             completion, step_tool_calls = await _complete_with_tools(
                 step_spec, step_body, server_names, http_client=http_client
             )
+            # _complete_with_tools is kind-agnostic (a `custom` agent has no
+            # notion of "step") -- tag which step made each call here, at
+            # the workflow-specific call site, so the trace doesn't flatten
+            # a multi-step workflow's tool calls into one unattributed list.
+            for call in step_tool_calls:
+                call["step"] = index
+                call["step_name"] = step_name
             tool_call_trace.extend(step_tool_calls)
         else:
             completion = await _forward_chat(step_spec, step_body, http_client=http_client)

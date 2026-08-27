@@ -111,13 +111,18 @@ export interface AgentPiiReport {
 }
 
 /** One executed MCP tool call (#261/#262): status/latency for the usage
- * ledger, arguments/result for the "Try it" trace view. */
+ * ledger, arguments/result for the "Try it" trace view. `step`/`step_name`
+ * are set only for a workflow agent (#265) -- which step made this call,
+ * since a multi-step workflow's calls would otherwise read as one
+ * unattributed list. */
 export interface AgentToolCallTrace {
   tool: string;
   status: "ok" | "error";
   latency_ms: number;
   arguments?: string;
   result?: string;
+  step?: number;
+  step_name?: string;
 }
 
 /** One workflow step's outcome (#265; `name`/`routed_to` added #266) -- the
