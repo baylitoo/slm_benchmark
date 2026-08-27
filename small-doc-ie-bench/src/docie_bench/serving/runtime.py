@@ -492,6 +492,7 @@ class LlamaCppRuntime(RuntimeAdapter):
             spec.host,
             "--port",
             str(spec.port),
+            "--jinja",
         ]
         if spec.context_length is not None:
             command.extend(["--ctx-size", str(spec.context_length)])
