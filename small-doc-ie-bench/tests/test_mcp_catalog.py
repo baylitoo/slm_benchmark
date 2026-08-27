@@ -167,6 +167,41 @@ def test_search_documents_rejects_empty_query(docs: Path) -> None:
         docs_search.search_documents("   ")
 
 
+# ── pluggable search backends (#282): search_documents dispatches through
+# get_search_backend, an operator-set env var picks which one -────────────
+
+
+def test_get_search_backend_returns_substring_by_default() -> None:
+    backend_cls = docs_search.SubstringSearchBackend
+    assert isinstance(docs_search.get_search_backend("substring"), backend_cls)
+    assert isinstance(docs_search.get_search_backend("SUBSTRING"), backend_cls)
+
+
+def test_get_search_backend_rejects_unknown_name() -> None:
+    with pytest.raises(ValueError, match="Unknown search backend"):
+        docs_search.get_search_backend("vector")
+
+
+def test_search_documents_uses_the_backend_env_var(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("the invoice total is 400 EUR")
+
+    class _StubBackend(docs_search.SearchBackend):
+        def search(self, query: str, targets: list[str]) -> list[dict]:
+            return [{"path": "stub", "page": 0, "snippet": f"stub:{query}:{targets}"}]
+
+    monkeypatch.setattr(docs_search, "get_search_backend", lambda name: _StubBackend())
+    monkeypatch.setenv(docs_search.BACKEND_ENV, "whatever-the-stub-ignores")
+    result = docs_search.search_documents("invoice")
+    assert result == [{"path": "stub", "page": 0, "snippet": "stub:invoice:['a.txt']"}]
+
+
+def test_search_documents_unknown_backend_is_a_clear_config_error(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.BACKEND_ENV, "vector")
+    with pytest.raises(ValueError, match="Unknown search backend 'vector'"):
+        docs_search.search_documents("hello")
+
+
 # ------------------------------------------------------------ code-interpreter
 
 
@@ -294,7 +329,8 @@ def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_pa
     assert set(entries) == {"calculator", "dates", "web-fetch", "docs-search", "code-interpreter"}
     assert not entries["calculator"]["enabled"]
     assert entries["web-fetch"]["params"][0]["name"] == "allowed_hosts"
-    assert entries["docs-search"]["params"][0]["name"] == "docs_dir"
+    docs_search_params = {p["name"] for p in entries["docs-search"]["params"]}
+    assert docs_search_params == {"docs_dir", "backend"}
     ci_params = {p["name"]: p["required"] for p in entries["code-interpreter"]["params"]}
     assert ci_params == {"url": False, "token": True}
 
