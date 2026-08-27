@@ -74,11 +74,11 @@ CATALOG: dict[str, CatalogEntry] = {
             name="docs-search",
             title="Document Search",
             description=(
-                "Agentic RAG demo: list, read, and substring-search a shared "
-                "directory of PDFs/text files (parsed via liteparse, the "
-                "same PDF backend the rest of the platform uses). Built to "
-                "prove out small models — search first, then answer from "
-                "what was actually found."
+                "Agentic RAG demo: list, read, and search a shared directory "
+                "of PDFs/text files (parsed via liteparse, the same PDF "
+                "backend the rest of the platform uses). Built to prove out "
+                "small models — search first, then answer from what was "
+                "actually found."
             ),
             module="docie_bench.mcp_servers.docs_search",
             tools=("list_files", "read_document", "search_text"),
@@ -91,6 +91,16 @@ CATALOG: dict[str, CatalogEntry] = {
                         "paths resolve against the server process's cwd). "
                         "Defaults to 'data/agent-docs' if left blank — drop "
                         "PDFs/text files there for the agent to search."
+                    ),
+                ),
+                CatalogParam(
+                    name="backend",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_BACKEND",
+                    description=(
+                        "Retrieval strategy (see docs_search.SearchBackend). "
+                        "Only 'substring' is implemented today; defaults to "
+                        "it if left blank. An unrecognized value is a config "
+                        "error the first time search_text is called."
                     ),
                 ),
             ),
