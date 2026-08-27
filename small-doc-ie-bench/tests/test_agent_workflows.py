@@ -465,3 +465,88 @@ def test_workflow_step_can_use_its_own_mcp_tools(api, monkeypatch) -> None:
     assert body["choices"][0]["message"]["content"] == "the sum is 5"
     (call,) = body["docie_agent"]["tool_calls"]
     assert call["tool"] == "calc__add"
+    assert call["step"] == 0
+    assert call["step_name"] == "0"
+
+
+def test_workflow_tool_calls_are_tagged_with_the_step_that_made_them(api, monkeypatch) -> None:
+    """A multi-step workflow where more than one step calls tools -- the
+    trace must attribute each call to its OWN step, not flatten them into
+    one unattributed list (#282-adjacent UI-visibility fix)."""
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://unused")
+        },
+    )
+    server = _calc_server()
+
+    async def fake_open(stack, specs):
+        session = await stack.enter_async_context(_memory_session(server))
+        return {"calc": session}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open)
+
+    client, captured = api
+
+    def tool_call_response(args: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "r1",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "calc__add", "arguments": args},
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        body = json.loads(request.content)
+        if any(m.get("role") == "tool" for m in body["messages"]):
+            return httpx.Response(
+                200,
+                json=_completion(
+                    "5", usage={"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27}
+                ),
+            )
+        args = '{"a": 2, "b": 3}' if body["model"] == "alpha" else '{"a": 10, "b": 20}'
+        return tool_call_response(args)
+
+    configure_http_transport(httpx.MockTransport(handler))
+
+    _create_workflow(
+        client,
+        [
+            {"name": "first", "model_profile": "alpha", "mcp_servers": ["calc"]},
+            {"name": "second", "model_profile": "beta", "mcp_servers": ["calc"]},
+        ],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "add some numbers"}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    call_1, call_2 = body["docie_agent"]["tool_calls"]
+    assert call_1["step"] == 0
+    assert call_1["step_name"] == "first"
+    assert call_2["step"] == 1
+    assert call_2["step_name"] == "second"

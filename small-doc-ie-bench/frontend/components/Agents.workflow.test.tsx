@@ -196,4 +196,31 @@ describe("Agents TryPanel — workflow step trace (#265)", () => {
 
     expect(await screen.findAllByText("handle-billing")).not.toHaveLength(0);
   });
+
+  it("tags a workflow's tool calls with the step that made them", async () => {
+    const response: AgentChatResponse = {
+      choices: [{ message: { role: "assistant", content: "5" } }],
+      docie_agent: {
+        agent: "chain",
+        kind: "workflow",
+        tool_calls: [
+          {
+            tool: "calc__add",
+            status: "ok",
+            latency_ms: 12,
+            step: 0,
+            step_name: "first",
+          },
+        ],
+      },
+    };
+    vi.mocked(api.agentChat).mockResolvedValue(response);
+
+    render(<TryPanel agent={WORKFLOW_AGENT} />);
+    const user = userEvent.setup();
+    await user.type(screen.getByRole("textbox"), "add some numbers");
+    await user.click(screen.getByRole("button", { name: /run/i }));
+
+    expect(await screen.findAllByText(/step: first/)).not.toHaveLength(0);
+  });
 });

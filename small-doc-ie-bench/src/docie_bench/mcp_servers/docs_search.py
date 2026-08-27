@@ -12,6 +12,12 @@ stuffed prompt. The seam exists so bm25/vector (e.g. against
 changing ``search_text``'s signature -- backend choice is an operator-set
 catalog param (``BACKEND_ENV``), never a per-call agent argument.
 
+Extraction itself is memoized per (path, mtime, size) via
+``_extracted_blocks`` -- re-parsing a PDF (OCR fallback especially) on
+every ``search_text``/``read_document`` call against the same document
+within one tool loop would be wasteful, and agentic search is expected to
+hit the same document repeatedly.
+
 The directory is read-only and operator-controlled via ``DOCS_DIR_ENV`` (see
 ``mcp_catalog.CATALOG["docs-search"]``) -- this process never writes to it,
 and every path a tool receives is resolved strictly inside it (see
@@ -29,12 +35,36 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from docie_bench.schemas.common import OCRBlock
+
 DOCS_DIR_ENV = "DOCIE_MCP_DOCS_SEARCH_DIR"
 BACKEND_ENV = "DOCIE_MCP_DOCS_SEARCH_BACKEND"
 _DEFAULT_DOCS_DIR = "data/agent-docs"
 _DEFAULT_BACKEND = "substring"
 _SUPPORTED_SUFFIXES = (".pdf", ".txt")
 _SNIPPET_CHARS = 300
+
+# Keyed by (resolved path, mtime_ns, size) so a changed file misses rather
+# than serving stale blocks. Agentic search is expected to hit the SAME
+# document repeatedly within one tool loop (list, search it several times,
+# then read it) -- this skips re-running OCR fallback on scanned pages
+# after the first hit. No eviction: the server process is spawned fresh
+# per request (see agents/runtime.py's _complete_with_tools), so the cache
+# never outlives one tool loop and can't grow unbounded.
+_EXTRACTION_CACHE: dict[tuple[str, int, int], list[OCRBlock]] = {}
+
+
+def _extracted_blocks(path: Path) -> list[OCRBlock]:
+    from docie_bench.ocr.factory import get_ocr_backend
+
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _EXTRACTION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    blocks = get_ocr_backend("liteparse").extract(path)
+    _EXTRACTION_CACHE[key] = blocks
+    return blocks
 
 
 class SearchBackend(ABC):
@@ -54,13 +84,10 @@ class SubstringSearchBackend(SearchBackend):
     today's default, and for now the only implemented backend."""
 
     def search(self, query: str, targets: list[str]) -> list[dict[str, Any]]:
-        from docie_bench.ocr.factory import get_ocr_backend
-
         needle = query.lower()
-        ocr = get_ocr_backend("liteparse")
         matches: list[dict[str, Any]] = []
         for relative in targets:
-            for block in ocr.extract(resolve_document(relative)):
+            for block in _extracted_blocks(resolve_document(relative)):
                 if needle in block.text.lower():
                     matches.append(
                         {
@@ -121,10 +148,8 @@ def list_documents() -> list[str]:
 
 def document_text(relative: str) -> dict[str, Any]:
     """One document's full text, grouped by page, in reading order."""
-    from docie_bench.ocr.factory import get_ocr_backend
-
     path = resolve_document(relative)
-    blocks = get_ocr_backend("liteparse").extract(path)
+    blocks = _extracted_blocks(path)
     pages: dict[int, list[str]] = {}
     for block in blocks:
         pages.setdefault(block.page, []).append(block.text)
