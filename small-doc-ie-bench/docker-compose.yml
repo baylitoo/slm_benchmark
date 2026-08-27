@@ -378,31 +378,38 @@ services:
     profiles: ["sandbox"]
     privileged: true
     # Some deployment platforms (confirmed on Coolify, via a live
-    # deployment: `docker exec judge0-server env` still showed docie's own
-    # DATABASE_URL after this service was given an explicit
-    # `environment: {DATABASE_URL: ""}` override) inject their full
-    # project-wide env set into every compose service in a way that
-    # OVERRIDES this file's own `environment:` block, contradicting
-    # standard Compose precedence (a service's own `environment:` entry
-    # should always win over an injected/env_file value for the same
-    # key -- it didn't, here). Judge0 is a Rails app: ActiveRecord
-    # auto-detects DATABASE_URL over database.yml whenever it's present at
-    # all, tries to load a "postgresql+psycopg" adapter (a SQLAlchemy
-    # scheme, meaningless to Ruby), and crash-loops.
+    # deployment) inject their own project-wide "Environment Variables" over
+    # this file's own per-service `environment:` block, but ONLY for key
+    # NAMES that also appear in that project-wide list -- confirmed via a
+    # clean negative control: POSTGRES_HOST/POSTGRES_DB/POSTGRES_USER (never
+    # entered as project vars, judge0-internal-only names) correctly kept
+    # this file's values, while DATABASE_URL and POSTGRES_PORT (both real
+    # docie project vars, coincidentally also read by judge0's own Rails
+    # app) got silently overridden with docie's OWN values instead of
+    # judge0's. Judge0 is a Rails app: ActiveRecord auto-detects
+    # DATABASE_URL over database.yml whenever it's present at all, and a
+    # leaked docie POSTGRES_PORT (docie's own postgres's HOST-published
+    # port, meaningless for container-to-container traffic) points judge0
+    # at a port judge0-db was never listening on -- both crash-looped/
+    # connection-refused for this exact reason.
     #
-    # A compose-level override can't be trusted to win on every platform,
-    # so this unsets DATABASE_URL INSIDE the container's own shell instead,
-    # after whatever got injected -- nothing outside the container can
-    # override that. Wraps (doesn't replace) judge0's real entrypoint,
-    # `/api/docker-entrypoint.sh` (confirmed via judge0's own Dockerfile,
-    # https://github.com/judge0/judge0/blob/master/Dockerfile).
+    # A compose-level `environment:` override can't be trusted to win on
+    # every platform, so both are forced INSIDE the container's own shell
+    # instead, after whatever got injected -- nothing outside the container
+    # can override that. Wraps (doesn't replace) judge0's real entrypoint,
+    # `/api/docker-entrypoint.sh` (confirmed via `docker inspect
+    # judge0/judge0:latest`, matching judge0's own Dockerfile:
+    # https://github.com/judge0/judge0/blob/master/Dockerfile). 5432 is
+    # judge0-db's fixed container-internal Postgres port (the official
+    # postgres image always listens there; the HOST-published mapping is a
+    # separate, irrelevant number).
     #
     # Overriding `entrypoint:` clears the image's own default CMD (Compose
     # spec: "Compose implementations MUST clear out any default command on
     # the Docker image ... when entrypoint is configured") -- so `command:`
     # has to restate it explicitly, or "$@" below expands to nothing and
     # the entrypoint script gets called with no command at all.
-    entrypoint: ["/bin/sh", "-c", "unset DATABASE_URL; exec /api/docker-entrypoint.sh \"$@\"", "--"]
+    entrypoint: ["/bin/sh", "-c", "unset DATABASE_URL; export POSTGRES_PORT=5432; exec /api/docker-entrypoint.sh \"$@\"", "--"]
     command: ["/api/scripts/server"]
     environment:
       REDIS_HOST: judge0-redis
@@ -441,7 +448,7 @@ services:
     # See judge0-server's entrypoint comment above -- same leak, same fix.
     # "$@" here picks up the `command:` below (./scripts/workers), not
     # judge0-server's default (/api/scripts/server).
-    entrypoint: ["/bin/sh", "-c", "unset DATABASE_URL; exec /api/docker-entrypoint.sh \"$@\"", "--"]
+    entrypoint: ["/bin/sh", "-c", "unset DATABASE_URL; export POSTGRES_PORT=5432; exec /api/docker-entrypoint.sh \"$@\"", "--"]
     command: ["./scripts/workers"]
     environment:
       REDIS_HOST: judge0-redis
