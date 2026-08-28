@@ -123,6 +123,7 @@ def test_llamacpp_requires_gguf_and_builds_cpu_flags() -> None:
         "127.0.0.1",
         "--port",
         "8000",
+        "--jinja",
         "--ctx-size",
         "4096",
         "--threads",
