@@ -25,7 +25,6 @@ import {
   Sparkles,
   FileText,
   FilePlus2,
-  Wrench,
   Workflow,
 } from "lucide-react";
 import {
@@ -69,6 +68,7 @@ import { Alert, Badge, Button, Card, Checkbox, ComingSoon, Field, Select, Skelet
 import { PageHeader } from "./patterns/PageHeader";
 import { Table, type Column } from "./patterns/Table";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
+import { ToolCallTrace } from "./ToolCallTrace";
 
 // The three document-extraction stages an "ocr" agent can run. Persisted as
 // options.mode; the UI is a picker over these.
@@ -588,42 +588,7 @@ export function TryPanel({ agent }: { agent: AgentView }) {
                 </ol>
               </div>
             )}
-            {toolCalls.length > 0 && (
-              <div>
-                <p className="mb-1 flex items-center gap-1 text-xs font-medium text-muted-foreground">
-                  <Wrench className="h-3.5 w-3.5" />
-                  <T>Tool calls</T>
-                </p>
-                <ol className="space-y-1.5">
-                  {toolCalls.map((call, index) => (
-                    <li
-                      key={`${call.tool}-${index}`}
-                      className="rounded-md border border-border bg-muted/40 p-2 text-xs"
-                    >
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="text-muted-foreground">#{index + 1}</span>
-                        <span className="font-medium text-foreground">{call.tool}</span>
-                        <Badge tone={call.status === "ok" ? "ok" : "err"}>{call.status}</Badge>
-                        <span className="text-muted-foreground">{call.latency_ms}ms</span>
-                        {call.step_name && (
-                          <Badge tone="info">step: {call.step_name}</Badge>
-                        )}
-                      </div>
-                      {call.arguments && (
-                        <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">
-                          {call.arguments}
-                        </pre>
-                      )}
-                      {call.result && (
-                        <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">
-                          {call.result}
-                        </pre>
-                      )}
-                    </li>
-                  ))}
-                </ol>
-              </div>
-            )}
+            <ToolCallTrace calls={toolCalls} />
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground"><T>Response</T></p>
               <pre className="scroll-thin max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed text-foreground/90">

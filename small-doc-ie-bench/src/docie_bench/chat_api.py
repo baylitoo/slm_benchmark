@@ -414,6 +414,9 @@ async def _chat_with_mcp_tools(
     async def post(body: dict[str, Any]) -> dict[str, Any] | JSONResponse:
         return await _post_upstream(client, url, headers, body, profile)
 
+    tool_call_trace: list[dict[str, Any]] = []
+    record_tool_call = mcp_mod.make_trace_recorder(tool_call_trace)
+
     try:
         async with AsyncExitStack() as stack:
             try:
@@ -425,7 +428,9 @@ async def _chat_with_mcp_tools(
                     status_code=502,
                     error_type="mcp_server_unreachable",
                 )
-            completion = await mcp_mod.run_tool_loop(post, forward, sessions, mapping, tools)
+            completion = await mcp_mod.run_tool_loop(
+                post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
+            )
     except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
         return _openai_error(
             f"MCP session error: {exc}",
@@ -445,6 +450,8 @@ async def _chat_with_mcp_tools(
     recency.stamp_served_profile(profile.name)
     if get_settings().fix_mojibake:
         completion = fix_completion_content(completion)
+    if tool_call_trace:
+        completion = {**completion, "docie_agent": {"tool_calls": tool_call_trace}}
     return completion
 
 

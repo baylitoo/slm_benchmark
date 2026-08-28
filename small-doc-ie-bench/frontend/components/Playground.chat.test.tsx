@@ -242,4 +242,34 @@ describe("ChatPanel", () => {
     await user.click(screen.getByRole("checkbox"));
     expect(screen.queryByText("Tools:")).not.toBeInTheDocument();
   });
+
+  it("renders the tool-call trace under the answer when a selected MCP server ran a tool", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    vi.mocked(api.chatCompletion).mockResolvedValue({
+      choices: [{ message: { role: "assistant", content: "found it" } }],
+      docie_agent: {
+        tool_calls: [
+          {
+            tool: "docs-search__search_text",
+            status: "ok",
+            latency_ms: 42,
+            arguments: '{"query":"invoice"}',
+            result: "page 1: ...",
+          },
+        ],
+      },
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "search the doc");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("found it")).toBeInTheDocument();
+    expect(screen.getByText("docs-search__search_text")).toBeInTheDocument();
+    expect(screen.getByText("42ms")).toBeInTheDocument();
+    expect(screen.getByText('{"query":"invoice"}')).toBeInTheDocument();
+  });
 });
