@@ -315,6 +315,39 @@ def _truncate_trace_text(text: str) -> str:
     return text[:TRACE_TEXT_LIMIT] + f"… ({len(text)} chars total)"
 
 
+# Generic across every MCP server, not docs-search-specific: any server that
+# exposes a "list X" tool alongside tools that take one of X's identifiers as
+# an argument has the same failure mode -- a small model skips the listing
+# call, or invents a plausible-looking id instead of using one it actually
+# saw. A per-tool error message that includes the real listing (see
+# docs_search.resolve_document) helps a model self-correct AFTER a bad call,
+# but doesn't stop the first one; this directive is the upfront half of that
+# same fix.
+TOOL_DISCIPLINE_DIRECTIVE = (
+    "Tool discipline: when a tool takes an identifier (a path, id, or name) "
+    "that another tool lists, call the listing tool first and use one of its "
+    "results EXACTLY as returned. Never invent, guess, or construct an "
+    "identifier from other context. If the listing has nothing relevant, say "
+    "so directly instead of guessing."
+)
+
+
+def _with_tool_discipline_directive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold ``TOOL_DISCIPLINE_DIRECTIVE`` into the request's system message —
+    appended to the caller's own system prompt if one exists, otherwise
+    inserted as a new one. Never adds a second ``system`` message: chat
+    templates commonly assume at most one, and merging keeps that true
+    regardless of what the caller supplied.
+    """
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = f"{content}\n\n{TOOL_DISCIPLINE_DIRECTIVE}"
+                return messages
+    return [{"role": "system", "content": TOOL_DISCIPLINE_DIRECTIVE}, *messages]
+
+
 def make_trace_recorder(
     trace: list[dict[str, Any]],
 ) -> Callable[[str, bool, int, Any, str], None]:
@@ -365,10 +398,18 @@ async def run_tool_loop(
     ``make_trace_recorder``'s output to collect a "Try it"-shaped trace
     (#261/#262); both the Agents surface and the generic ``mcp_servers`` chat
     surface use it.
+
+    Whenever ``mcp_tools`` is non-empty, ``TOOL_DISCIPLINE_DIRECTIVE`` is
+    folded into the request's system message before the first round — a
+    small model reliably skips a "call this first" tool docstring, so the
+    same instruction is repeated at the request level for every caller
+    automatically, not left to each caller's own system prompt.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
     messages = [dict(m) if isinstance(m, dict) else m for m in (forward.get("messages") or [])]
+    if mcp_tools:
+        messages = _with_tool_discipline_directive(messages)
     caller_tools = list(forward.get("tools") or [])
     caller_tool_names = {
         str(t.get("function", {}).get("name"))
