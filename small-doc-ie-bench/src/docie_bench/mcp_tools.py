@@ -332,20 +332,58 @@ TOOL_DISCIPLINE_DIRECTIVE = (
 )
 
 
-def _with_tool_discipline_directive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Fold ``TOOL_DISCIPLINE_DIRECTIVE`` into the request's system message —
-    appended to the caller's own system prompt if one exists, otherwise
-    inserted as a new one. Never adds a second ``system`` message: chat
-    templates commonly assume at most one, and merging keeps that true
-    regardless of what the caller supplied.
+def _with_system_addendum(messages: list[dict[str, Any]], addendum: str) -> list[dict[str, Any]]:
+    """Fold ``addendum`` into the request's system message — appended to the
+    caller's own system prompt if one exists, otherwise inserted as a new
+    one. Never adds a second ``system`` message: chat templates commonly
+    assume at most one, and merging keeps that true regardless of what the
+    caller supplied.
     """
     for message in messages:
         if isinstance(message, dict) and message.get("role") == "system":
             content = message.get("content")
             if isinstance(content, str):
-                message["content"] = f"{content}\n\n{TOOL_DISCIPLINE_DIRECTIVE}"
+                message["content"] = f"{content}\n\n{addendum}"
                 return messages
-    return [{"role": "system", "content": TOOL_DISCIPLINE_DIRECTIVE}, *messages]
+    return [{"role": "system", "content": addendum}, *messages]
+
+
+async def _eager_list_context(
+    sessions: Mapping[str, ClientSession],
+    mapping: Mapping[str, tuple[str, str]],
+    on_tool_call: Callable[[str, bool, int, Any, str], None] | None,
+) -> str | None:
+    """Auto-call every advertised tool a catalog entry marks as its
+    ``eager_list_tool`` (docs-search's ``list_files``) once, up front, and
+    return their results as context text — or ``None`` if none apply.
+
+    The model then starts the request already knowing the real identifiers
+    for that server instead of discovering them (or inventing them) via a
+    tool call it may skip or get wrong. Complements ``TOOL_DISCIPLINE_DIRECTIVE``:
+    that's an instruction the model might ignore, this makes the listing
+    true regardless of whether it does. Reported through ``on_tool_call``
+    exactly like a model-issued call, same as a real one, so it shows up in
+    the trace instead of happening invisibly.
+    """
+    from docie_bench.mcp_catalog import CATALOG
+
+    lines: list[str] = []
+    for qualified_name, (server_name, tool_name) in mapping.items():
+        entry = CATALOG.get(server_name)
+        if entry is None or entry.eager_list_tool != tool_name:
+            continue
+        call_started = time.monotonic()
+        result = await execute_tool_call(sessions, mapping, qualified_name, {})
+        if on_tool_call is not None:
+            on_tool_call(
+                qualified_name,
+                not result.startswith("error:"),
+                int((time.monotonic() - call_started) * 1000),
+                {},
+                result,
+            )
+        lines.append(f"{server_name}.{tool_name}(): {result}")
+    return "\n".join(lines) if lines else None
 
 
 def make_trace_recorder(
@@ -403,13 +441,20 @@ async def run_tool_loop(
     folded into the request's system message before the first round — a
     small model reliably skips a "call this first" tool docstring, so the
     same instruction is repeated at the request level for every caller
-    automatically, not left to each caller's own system prompt.
+    automatically, not left to each caller's own system prompt. Any
+    catalog-declared ``eager_list_tool`` (docs-search's ``list_files``) is
+    also called once up front and its result folded in alongside it — see
+    ``_eager_list_context``.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
     messages = [dict(m) if isinstance(m, dict) else m for m in (forward.get("messages") or [])]
     if mcp_tools:
-        messages = _with_tool_discipline_directive(messages)
+        addendum = TOOL_DISCIPLINE_DIRECTIVE
+        eager_context = await _eager_list_context(sessions, mapping, on_tool_call)
+        if eager_context:
+            addendum = f"{addendum}\n\n{eager_context}"
+        messages = _with_system_addendum(messages, addendum)
     caller_tools = list(forward.get("tools") or [])
     caller_tool_names = {
         str(t.get("function", {}).get("name"))

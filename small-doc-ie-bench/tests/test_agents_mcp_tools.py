@@ -493,7 +493,10 @@ def test_docs_search_agent_template_finds_and_cites_a_real_document(
         "docs-search__read_document",
         "docs-search__search_text",
     }
-    (call,) = body["docie_agent"]["tool_calls"]
+    # docs-search's `list_files` is auto-called once up front (eager_list_tool)
+    # -- trace[0] is that eager call, trace[1] the model's own search.
+    eager_call, call = body["docie_agent"]["tool_calls"]
+    assert eager_call["tool"] == "docs-search__list_files"
     assert call["tool"] == "docs-search__search_text"
     assert "invoice.txt" in call["result"]
     assert "42 EUR" in call["result"]
