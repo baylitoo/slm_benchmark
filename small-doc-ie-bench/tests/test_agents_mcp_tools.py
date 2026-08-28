@@ -228,7 +228,12 @@ def test_custom_agent_injects_system_prompt_before_the_tool_loop(api, monkeypatc
         json={"messages": [{"role": "user", "content": "what is 2+3?"}]},
     )
     first_round = json.loads(captured[0].content)["messages"]
-    assert first_round[0] == {"role": "system", "content": "You are a calculator assistant."}
+    # The agent's own system prompt survives, with the tool-discipline
+    # directive (#294) folded into the SAME message -- never a second one.
+    assert first_round[0]["role"] == "system"
+    assert first_round[0]["content"].startswith("You are a calculator assistant.\n\n")
+    assert "Tool discipline" in first_round[0]["content"]
+    assert sum(1 for m in first_round if m["role"] == "system") == 1
 
 
 def test_custom_agent_unregistered_mcp_server_is_400(api) -> None:

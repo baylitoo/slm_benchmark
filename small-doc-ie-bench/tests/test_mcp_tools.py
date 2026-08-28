@@ -26,6 +26,7 @@ from mcp.shared.memory import create_client_server_memory_streams
 
 from docie_bench import mcp_tools
 from docie_bench.mcp_tools import (
+    TOOL_DISCIPLINE_DIRECTIVE,
     MCPConfigError,
     MCPServerSpec,
     collect_openai_tools,
@@ -227,6 +228,51 @@ async def test_run_tool_loop_executes_and_sums_usage() -> None:
     assert round2[-1] == {"role": "tool", "tool_call_id": "call_1", "content": "5"}
     # Both rounds advertised the MCP tools.
     assert {t["function"]["name"] for t in posted[0]["tools"]} == {"calc__add", "calc__crash"}
+
+
+async def test_run_tool_loop_inserts_the_directive_when_no_system_message_exists() -> None:
+    posted: list[dict[str, Any]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return _final_completion("hi", {})
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        await run_tool_loop(post, body, sessions, mapping, tools, max_iterations=4)
+
+    messages = posted[0]["messages"]
+    assert messages[0] == {"role": "system", "content": TOOL_DISCIPLINE_DIRECTIVE}
+    assert messages[1] == {"role": "user", "content": "hi"}
+
+
+async def test_run_tool_loop_appends_the_directive_to_an_existing_system_message() -> None:
+    posted: list[dict[str, Any]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return _final_completion("hi", {})
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+        await run_tool_loop(post, body, sessions, mapping, tools, max_iterations=4)
+
+    messages = posted[0]["messages"]
+    assert sum(1 for m in messages if m["role"] == "system") == 1
+    assert messages[0] == {
+        "role": "system",
+        "content": f"You are helpful.\n\n{TOOL_DISCIPLINE_DIRECTIVE}",
+    }
 
 
 async def test_run_tool_loop_reports_each_call_through_on_tool_call() -> None:
