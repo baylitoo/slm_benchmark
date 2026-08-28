@@ -49,6 +49,7 @@ import {
   type RerankResponse,
   type DynamicSchemaSummary,
   type RoutingPolicySummary,
+  type AgentToolCallTrace,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -70,6 +71,7 @@ import {
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
+import { ToolCallTrace } from "./ToolCallTrace";
 
 type PlaygroundMode = "chat" | "arena" | "embedrerank";
 
@@ -192,6 +194,8 @@ interface ChatMsg {
   content: string;
   /** Only set when role === "extraction". */
   trigger?: TriggerResponse;
+  /** Only set on an assistant turn that ran MCP tools (selectedMcp). */
+  toolCalls?: AgentToolCallTrace[];
 }
 
 // A cold store: model's first request can take a while to boot. Auto-retry a
@@ -451,7 +455,15 @@ export function ChatPanel({
         // Tool exchange runs server-side; the final answer arrives in one piece.
         const res = await chatCompletion(model, payload, selectedMcp);
         const answer = res.choices?.[0]?.message?.content ?? "";
-        setMsgs([...next, { role: "assistant", content: answer || t("(empty response)") }]);
+        const toolCalls = res.docie_agent?.tool_calls;
+        setMsgs([
+          ...next,
+          {
+            role: "assistant",
+            content: answer || t("(empty response)"),
+            ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {}),
+          },
+        ]);
         return;
       }
       let content = "";
@@ -723,7 +735,10 @@ export function ChatPanel({
             ) : (
               <div
                 key={i}
-                className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}
+                className={cn(
+                  "flex flex-col gap-1.5",
+                  m.role === "user" ? "items-end" : "items-start",
+                )}
               >
                 <div
                   className={cn(
@@ -735,6 +750,11 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.toolCalls && m.toolCalls.length > 0 && (
+                  <div className="w-full max-w-[85%]">
+                    <ToolCallTrace calls={m.toolCalls} />
+                  </div>
+                )}
               </div>
             ),
           )}

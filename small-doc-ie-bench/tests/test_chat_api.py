@@ -516,6 +516,63 @@ def test_chat_mcp_sdk_missing_is_501(api, monkeypatch) -> None:
     assert "'mcp' package" in resp.json()["error"]["message"]
 
 
+def test_chat_mcp_response_carries_the_tool_call_trace(api, monkeypatch) -> None:
+    # The Playground's Chat mode (and any other caller of the generic
+    # `mcp_servers` surface) needs the same "Try it" trace shape the Agents
+    # surface already returns -- `run_tool_loop`'s `on_tool_call` seam is
+    # shared via `mcp_tools.make_trace_recorder`.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(post, body, sessions, mapping, tools, on_tool_call=None):
+        assert on_tool_call is not None
+        on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
+        return {
+            "id": "chatcmpl-1",
+            "choices": [{"message": {"role": "assistant", "content": "3"}}],
+        }
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+        },
+    )
+    assert resp.status_code == 200
+    trace = resp.json()["docie_agent"]["tool_calls"]
+    assert trace == [
+        {
+            "tool": "calc__add",
+            "status": "ok",
+            "latency_ms": 12,
+            "arguments": '{"a": 1, "b": 2}',
+            "result": "3",
+        }
+    ]
+
+
 # ── usage ledger: every resolved request writes one durable row ─────────────
 
 

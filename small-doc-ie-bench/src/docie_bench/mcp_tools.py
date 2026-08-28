@@ -297,6 +297,49 @@ def _accumulate_usage(totals: dict[str, int], usage: Any) -> None:
             totals[key] += value
 
 
+# A tool's arguments/result can be arbitrarily large (a document, an OCR
+# dump) -- the trace rides the live completion response, so cap each field
+# rather than let one tool call balloon the payload.
+TRACE_TEXT_LIMIT = 4000
+
+
+def _stringify_tool_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _truncate_trace_text(text: str) -> str:
+    if len(text) <= TRACE_TEXT_LIMIT:
+        return text
+    return text[:TRACE_TEXT_LIMIT] + f"… ({len(text)} chars total)"
+
+
+def make_trace_recorder(
+    trace: list[dict[str, Any]],
+) -> Callable[[str, bool, int, Any, str], None]:
+    """Build an ``on_tool_call`` callback that appends each call's outcome to
+    ``trace`` in the shared "Try it" trace shape (tool/status/latency_ms/
+    arguments/result). One instance of this shape is used by both the Agents
+    surface (#261/#262) and the generic ``mcp_servers`` chat surface, so a
+    caller's trace list always renders identically regardless of which
+    endpoint produced it.
+    """
+
+    def record(name: str, ok: bool, latency_ms: int, arguments: Any, result: str) -> None:
+        trace.append(
+            {
+                "tool": name,
+                "status": "ok" if ok else "error",
+                "latency_ms": latency_ms,
+                "arguments": _truncate_trace_text(_stringify_tool_value(arguments)),
+                "result": _truncate_trace_text(result),
+            }
+        )
+
+    return record
+
+
 async def run_tool_loop(
     post: Callable[[dict[str, Any]], Awaitable[Any]],
     body: Mapping[str, Any],
@@ -318,9 +361,10 @@ async def run_tool_loop(
     ``on_tool_call``, when given, is invoked synchronously right after each
     executed tool call with ``(qualified_name, ok, latency_ms, arguments,
     result)`` — ``arguments`` is exactly what the model sent (string or
-    object, unparsed), ``result`` the text handed back to the model. The
-    Agents surface's observability seam (#261/#262), unused by the generic
-    chat surface.
+    object, unparsed), ``result`` the text handed back to the model. Pass
+    ``make_trace_recorder``'s output to collect a "Try it"-shaped trace
+    (#261/#262); both the Agents surface and the generic ``mcp_servers`` chat
+    surface use it.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
