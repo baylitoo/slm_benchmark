@@ -23,6 +23,13 @@ class CatalogEntry:
     module: str
     tools: tuple[str, ...]
     params: tuple[CatalogParam, ...] = field(default_factory=tuple)
+    # A zero-argument tool name (one of ``tools``) that lists this server's
+    # addressable identifiers (docs-search's `list_files`). When set,
+    # mcp_tools.run_tool_loop calls it once up front and folds the real
+    # listing into context -- the model starts every request already
+    # knowing valid identifiers instead of discovering them (or inventing
+    # them) via a tool call it may skip.
+    eager_list_tool: str | None = None
 
 
 CATALOG: dict[str, CatalogEntry] = {
@@ -82,6 +89,7 @@ CATALOG: dict[str, CatalogEntry] = {
             ),
             module="docie_bench.mcp_servers.docs_search",
             tools=("list_files", "read_document", "search_text"),
+            eager_list_tool="list_files",
             params=(
                 CatalogParam(
                     name="docs_dir",

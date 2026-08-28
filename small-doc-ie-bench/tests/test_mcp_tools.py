@@ -275,6 +275,70 @@ async def test_run_tool_loop_appends_the_directive_to_an_existing_system_message
     }
 
 
+async def test_run_tool_loop_eagerly_lists_docs_search_files_before_the_first_round(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # docs-search's catalog entry declares `eager_list_tool="list_files"` --
+    # registered under that exact name so the CATALOG lookup in
+    # `_eager_list_context` matches.
+    from docie_bench.mcp_servers import docs_search
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(docs))
+
+    posted: list[dict[str, Any]] = []
+    traced: list[tuple[str, bool, int, Any, str]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return _final_completion("hi", {})
+
+    async with _memory_session(docs_search.build_server()) as session:
+        sessions = {"docs-search": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        await run_tool_loop(
+            post,
+            body,
+            sessions,
+            mapping,
+            tools,
+            max_iterations=4,
+            on_tool_call=lambda name, ok, latency_ms, args, result: traced.append(
+                (name, ok, latency_ms, args, result)
+            ),
+        )
+
+    system_content = posted[0]["messages"][0]["content"]
+    assert "a.txt" in system_content
+    # Reported through on_tool_call exactly like a model-issued call, so the
+    # trace shows it happened rather than it running invisibly.
+    (call,) = traced
+    assert call[0] == "docs-search__list_files"
+    assert call[1] is True
+    assert "a.txt" in call[4]
+
+
+async def test_run_tool_loop_skips_eager_listing_when_no_catalog_entry_declares_one() -> None:
+    posted: list[dict[str, Any]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return _final_completion("hi", {})
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        await run_tool_loop(post, body, sessions, mapping, tools, max_iterations=4)
+
+    # Only the tool-discipline directive, no eager-listing text appended --
+    # `calc` has no `eager_list_tool` in the catalog.
+    assert posted[0]["messages"][0]["content"] == TOOL_DISCIPLINE_DIRECTIVE
+
+
 async def test_run_tool_loop_reports_each_call_through_on_tool_call() -> None:
     responses = [
         _tool_calls_completion("calc__add", '{"a": 2, "b": 3}', {}),
