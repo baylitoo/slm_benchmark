@@ -41,7 +41,10 @@ DOCS_DIR_ENV = "DOCIE_MCP_DOCS_SEARCH_DIR"
 BACKEND_ENV = "DOCIE_MCP_DOCS_SEARCH_BACKEND"
 _DEFAULT_DOCS_DIR = "data/agent-docs"
 _DEFAULT_BACKEND = "substring"
-_SUPPORTED_SUFFIXES = (".pdf", ".txt")
+# Public: also the write-side allowlist for mcp_session_documents (#296) --
+# an upload that isn't one of these suffixes would just sit in list_files
+# forever with nothing able to read it back.
+SUPPORTED_SUFFIXES = (".pdf", ".txt")
 _SNIPPET_CHARS = 300
 
 # Keyed by (resolved path, mtime_ns, size) so a changed file misses rather
@@ -140,10 +143,10 @@ def resolve_document(relative: str) -> Path:
             f"no such document: {relative!r} -- call list_files and use one of its paths "
             f"exactly, don't invent one ({hint})"
         )
-    if candidate.suffix.lower() not in _SUPPORTED_SUFFIXES:
+    if candidate.suffix.lower() not in SUPPORTED_SUFFIXES:
         raise ValueError(
             f"unsupported file type {candidate.suffix!r} "
-            f"(expected one of {', '.join(_SUPPORTED_SUFFIXES)})"
+            f"(expected one of {', '.join(SUPPORTED_SUFFIXES)})"
         )
     return candidate
 
@@ -153,7 +156,7 @@ def list_documents() -> list[str]:
     return sorted(
         p.relative_to(root).as_posix()
         for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in _SUPPORTED_SUFFIXES
+        if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES
     )
 
 

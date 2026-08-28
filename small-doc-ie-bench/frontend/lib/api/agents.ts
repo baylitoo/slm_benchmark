@@ -207,6 +207,7 @@ export function chatCompletion(
   model: string,
   messages: { role: string; content: unknown }[],
   mcpServers?: string[],
+  sessionId?: string,
 ): Promise<AgentChatResponse> {
   return openaiPost(`${API_BASE}/v1/chat/completions`, {
     model,
@@ -214,6 +215,9 @@ export function chatCompletion(
     // Named MCP servers: the backend advertises their tools, runs the tool
     // exchange, and returns the final completion (non-streaming only).
     ...(mcpServers && mcpServers.length > 0 ? { mcp_servers: mcpServers } : {}),
+    // Points docs-search (if selected) at this session's uploaded documents
+    // instead of the shared operator corpus (#296) — see uploadSessionDocument.
+    ...(sessionId ? { session_id: sessionId } : {}),
   });
 }
 

@@ -264,6 +264,13 @@ async def chat_completions(request: Request, tenant: TenantParam) -> Any:
             status_code=400,
             error_type="invalid_request_error",
         )
+    session_id = body.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        return _openai_error(
+            "'session_id' must be a string",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
     forward = dict(body)
     forward["model"] = profile.model
     url = f"{profile.base_url}/chat/completions"
@@ -286,7 +293,7 @@ async def chat_completions(request: Request, tenant: TenantParam) -> Any:
                 error_type="invalid_request_error",
             )
         outcome = await _chat_with_mcp_tools(
-            client, url, headers, forward, profile, [str(n) for n in mcp_server_names]
+            client, url, headers, forward, profile, [str(n) for n in mcp_server_names], session_id
         )
         # run_tool_loop already summed usage across every tool round into the
         # final completion's usage block, so this one row carries the whole
@@ -341,6 +348,7 @@ async def _post_upstream(
     body = dict(forward)
     body.pop("stream", None)
     body.pop("mcp_servers", None)
+    body.pop("session_id", None)
     try:
         upstream = await client.post(
             url, json=body, headers=headers, timeout=profile.timeout_seconds
@@ -381,6 +389,7 @@ async def _chat_with_mcp_tools(
     forward: dict[str, Any],
     profile: ModelProfile,
     server_names: list[str],
+    session_id: str | None = None,
 ) -> Any:
     """Serve one chat request with MCP tools: connect, advertise, loop.
 
@@ -388,8 +397,16 @@ async def _chat_with_mcp_tools(
     ``settings.mcp_servers_config`` — the request can never point the server
     at an arbitrary URL or command. The ``mcp`` SDK being absent is a clean
     501 (the extra is optional), not an ImportError.
+
+    ``session_id`` (#296): when given and ``docs-search`` is among
+    ``server_names``, that server's spec is launched with its documents
+    directory overridden to this session's upload directory instead of the
+    operator's shared one — a Playground attachment uploaded via
+    ``POST /v1/studio/session-documents`` becomes searchable for this
+    conversation without ever touching the shared corpus.
     """
     from contextlib import AsyncExitStack
+    from dataclasses import replace
 
     from docie_bench import mcp_tools as mcp_mod
 
@@ -410,6 +427,21 @@ async def _chat_with_mcp_tools(
     except mcp_mod.MCPUnavailableError as exc:
         return _openai_error(str(exc), status_code=501, error_type="mcp_unavailable")
     specs = [registry[name] for name in server_names]
+
+    if session_id is not None and "docs-search" in server_names:
+        from docie_bench.mcp_servers.docs_search import DOCS_DIR_ENV
+        from docie_bench.mcp_session_documents import SessionDocumentError, session_documents_dir
+
+        try:
+            session_dir = session_documents_dir(session_id)
+        except SessionDocumentError as exc:
+            return _openai_error(str(exc), status_code=400, error_type="invalid_request_error")
+        specs = [
+            replace(spec, env={**spec.env, DOCS_DIR_ENV: str(session_dir)})
+            if spec.name == "docs-search"
+            else spec
+            for spec in specs
+        ]
 
     async def post(body: dict[str, Any]) -> dict[str, Any] | JSONResponse:
         return await _post_upstream(client, url, headers, body, profile)

@@ -97,8 +97,11 @@ from .dynamic_schemas import (
 from .extract import (
     ExtractRequest,
     RenderDocumentRequest,
+    UploadSessionDocumentRequest,
+    UploadSessionDocumentResponse,
     render_document,
     trigger_extract,
+    upload_session_document,
 )
 from .extract import (
     router as _extract_router,
@@ -174,6 +177,9 @@ __all__ = [
     "trigger_extract",
     "RenderDocumentRequest",
     "render_document",
+    "UploadSessionDocumentRequest",
+    "UploadSessionDocumentResponse",
+    "upload_session_document",
     "list_datasets",
     "validate_dataset_version",
     "list_model_profiles",

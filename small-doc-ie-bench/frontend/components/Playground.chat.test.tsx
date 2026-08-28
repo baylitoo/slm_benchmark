@@ -20,6 +20,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listRoutingPolicies: vi.fn(),
     triggerExtract: vi.fn(),
     fileToBase64: vi.fn(async () => "ZmFrZQ=="),
+    renderDocument: vi.fn(async () => ({ images: ["data:image/png;base64,ZmFrZQ=="], pages: 1 })),
+    uploadSessionDocument: vi.fn(),
   };
 });
 
@@ -271,5 +273,72 @@ describe("ChatPanel", () => {
     expect(screen.getByText("docs-search__search_text")).toBeInTheDocument();
     expect(screen.getByText("42ms")).toBeInTheDocument();
     expect(screen.getByText('{"query":"invoice"}')).toBeInTheDocument();
+  });
+
+  it("uploads a PDF attachment to docs-search and carries the session id into the next turn", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    vi.mocked(api.uploadSessionDocument).mockResolvedValue({
+      session_id: "abc123",
+      stored_name: "xyz.pdf",
+    });
+    vi.mocked(api.chatCompletion).mockResolvedValue({
+      choices: [{ message: { role: "assistant", content: "read it" } }],
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+
+    const file = new File(["%PDF-fake"], "invoice.pdf", { type: "application/pdf" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+    await user.type(screen.getByPlaceholderText(/Type a message/), "what's in this?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(api.uploadSessionDocument).toHaveBeenCalledTimes(1));
+    // First upload of the conversation: no session id yet, so undefined —
+    // the backend mints a fresh one and returns it.
+    expect(api.uploadSessionDocument).toHaveBeenCalledWith("ZmFrZQ==", "invoice.pdf", undefined);
+    await waitFor(() => expect(api.chatCompletion).toHaveBeenCalledTimes(1));
+    expect(api.chatCompletion).toHaveBeenCalledWith(
+      "lfm2.5-350m",
+      expect.any(Array),
+      ["docs-search"],
+      "abc123",
+    );
+
+    // A second turn with no new attachment still carries the SAME session id
+    // forward -- docs-search keeps seeing the file from turn 1.
+    await user.type(screen.getByPlaceholderText(/Type a message/), "anything else?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(api.chatCompletion).toHaveBeenCalledTimes(2));
+    expect(api.chatCompletion).toHaveBeenLastCalledWith(
+      "lfm2.5-350m",
+      expect.any(Array),
+      ["docs-search"],
+      "abc123",
+    );
+  });
+
+  it("does not upload an image attachment to docs-search (not a suffix it accepts)", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    vi.mocked(api.chatCompletion).mockResolvedValue({
+      choices: [{ message: { role: "assistant", content: "described it" } }],
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+
+    const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+    await user.type(screen.getByPlaceholderText(/Type a message/), "describe this");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(api.chatCompletion).toHaveBeenCalledTimes(1));
+    expect(api.uploadSessionDocument).not.toHaveBeenCalled();
   });
 });
