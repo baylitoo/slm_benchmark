@@ -143,6 +143,24 @@ def test_resolve_document_rejects_escape_attempts(docs: Path) -> None:
     assert docs_search.resolve_document("a.txt") == (docs / "a.txt").resolve()
 
 
+def test_missing_document_error_lists_the_real_files_so_a_retry_self_corrects(
+    docs: Path,
+) -> None:
+    # A model that invents a path instead of calling list_files first should
+    # still land on a real one after seeing the error -- the error message
+    # IS the correction, not just an upfront instruction it may have ignored.
+    (docs / "invoice.pdf").write_bytes(b"%PDF-fake")
+    with pytest.raises(ValueError, match=r"invoice\.pdf"):
+        docs_search.resolve_document("1/20")
+
+
+def test_missing_document_error_says_nothing_is_available_when_the_directory_is_empty(
+    docs: Path,
+) -> None:
+    with pytest.raises(ValueError, match="no documents are available"):
+        docs_search.resolve_document("anything.pdf")
+
+
 def test_document_text_groups_lines_by_page(docs: Path) -> None:
     (docs / "note.txt").write_text("first line\nsecond line\n")
     result = docs_search.document_text("note.txt")
