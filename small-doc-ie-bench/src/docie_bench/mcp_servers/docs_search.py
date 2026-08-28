@@ -117,9 +117,11 @@ def resolve_document(relative: str) -> Path:
 
     Raises ``ValueError`` (surfaced to the model as a tool-error string, see
     ``mcp_tools.execute_tool_call``) on an absolute path, a ``..`` escape, a
-    missing file, or an unsupported extension -- never on a path that merely
-    doesn't exist yet, since the model is expected to call this with a path
-    it already saw from ``list_documents``.
+    missing file, or an unsupported extension. A missing file's error
+    message includes the real listing -- a small model that invents a path
+    instead of calling ``list_files`` first still gets corrected on its next
+    attempt, rather than needing to have followed instructions perfectly the
+    first time.
     """
     if Path(relative).is_absolute():
         raise ValueError(f"{relative!r} must be a path relative to the documents directory")
@@ -128,7 +130,16 @@ def resolve_document(relative: str) -> Path:
     if candidate != root and root not in candidate.parents:
         raise ValueError(f"{relative!r} is outside the documents directory")
     if not candidate.is_file():
-        raise ValueError(f"no such document: {relative!r}")
+        available = list_documents()
+        hint = (
+            f"available documents: {available}"
+            if available
+            else "no documents are available in the documents directory"
+        )
+        raise ValueError(
+            f"no such document: {relative!r} -- call list_files and use one of its paths "
+            f"exactly, don't invent one ({hint})"
+        )
     if candidate.suffix.lower() not in _SUPPORTED_SUFFIXES:
         raise ValueError(
             f"unsupported file type {candidate.suffix!r} "
@@ -181,21 +192,27 @@ def build_server() -> Any:
     @server.tool()
     def list_files() -> list[str]:
         """List every readable document (.pdf/.txt) under the shared
-        documents directory, as paths relative to it. Call this first."""
+        documents directory, as paths relative to it. ALWAYS call this
+        first, before read_document or search_text -- these tools only see
+        this fixed directory, never a file attached elsewhere in the
+        conversation. If the file you're looking for isn't in this list, it
+        genuinely isn't available here; say so instead of guessing a path."""
         return list_documents()
 
     @server.tool()
     def read_document(path: str) -> dict[str, Any]:
-        """Read one document's full text (a path from list_files), grouped
-        by page. PDFs are parsed via liteparse (PDFium text + OCR fallback
-        for scanned pages)."""
+        """Read one document's full text, grouped by page. `path` MUST be
+        one of the exact strings returned by list_files -- never invent,
+        guess, or construct a path from an id/number seen elsewhere. PDFs
+        are parsed via liteparse (PDFium text + OCR fallback for scanned
+        pages)."""
         return document_text(path)
 
     @server.tool()
     def search_text(query: str, path: str | None = None) -> list[dict[str, Any]]:
-        """Search for `query` across one document (pass `path` from
-        list_files) or every document if `path` is omitted. Returns one
-        match per hit page: {path, page, snippet}.
+        """Search for `query` across one document (pass `path` -- one of the
+        exact strings from list_files, never invented) or every document if
+        `path` is omitted. Returns one match per hit page: {path, page, snippet}.
         Search before you answer -- don't guess at content you haven't read
         or found."""
         return search_documents(query, path)
