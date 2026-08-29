@@ -27,11 +27,13 @@ from mcp.shared.memory import create_client_server_memory_streams
 from docie_bench import mcp_tools
 from docie_bench.mcp_tools import (
     TOOL_DISCIPLINE_DIRECTIVE,
+    TRACE_TEXT_LIMIT,
     MCPConfigError,
     MCPServerSpec,
     collect_openai_tools,
     execute_tool_call,
     load_mcp_registry,
+    make_trace_recorder,
     run_tool_loop,
 )
 
@@ -228,6 +230,20 @@ async def test_run_tool_loop_executes_and_sums_usage() -> None:
     assert round2[-1] == {"role": "tool", "tool_call_id": "call_1", "content": "5"}
     # Both rounds advertised the MCP tools.
     assert {t["function"]["name"] for t in posted[0]["tools"]} == {"calc__add", "calc__crash"}
+
+
+def test_trace_recorder_clips_at_the_raised_limit_not_the_old_4000() -> None:
+    # #284: a docs-search read_document/search_text result on a real PDF
+    # routinely exceeded the old 4000-char cap and got silently clipped.
+    trace: list[dict] = []
+    record = make_trace_recorder(trace)
+    long_result = "x" * (TRACE_TEXT_LIMIT + 500)
+
+    record("docs-search__read_document", True, 1, {}, long_result)
+
+    assert TRACE_TEXT_LIMIT > 4000
+    assert len(trace[0]["result"]) < len(long_result)
+    assert trace[0]["result"].startswith("x" * TRACE_TEXT_LIMIT)
 
 
 async def test_run_tool_loop_inserts_the_directive_when_no_system_message_exists() -> None:

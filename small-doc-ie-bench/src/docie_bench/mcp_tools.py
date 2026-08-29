@@ -299,8 +299,11 @@ def _accumulate_usage(totals: dict[str, int], usage: Any) -> None:
 
 # A tool's arguments/result can be arbitrarily large (a document, an OCR
 # dump) -- the trace rides the live completion response, so cap each field
-# rather than let one tool call balloon the payload.
-TRACE_TEXT_LIMIT = 4000
+# rather than let one tool call balloon the payload. 4000 clipped routine
+# docs-search results (a read_document on a multi-page PDF, a search_text
+# with many hits) in practice (#284); 20000 covers those while still
+# bounding a truly pathological result.
+TRACE_TEXT_LIMIT = 20_000
 
 
 def _stringify_tool_value(value: Any) -> str:
