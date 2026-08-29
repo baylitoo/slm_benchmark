@@ -1939,8 +1939,21 @@ def _gc_studio_runs_sync() -> dict[str, int]:
         summary = {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
     # The serving-volume sweep needs no database — run it either way.
     summary.update(_gc_seed_leftovers_sync())
+    summary.update(_gc_session_documents_sync())
     logger.info("studio run GC: %s", summary)
     return summary
+
+
+def _gc_session_documents_sync() -> dict[str, int]:
+    """Prune stale session-scoped docs-search uploads (#296, blocking).
+
+    No client-triggered delete exists — a closed tab or crashed session
+    leaves nothing else to reclaim the directory a Playground attachment
+    was written into.
+    """
+    from docie_bench.mcp_session_documents import gc_stale_sessions
+
+    return {"deleted_session_documents": gc_stale_sessions()}
 
 
 async def _gc_studio_runs() -> dict[str, int]:
@@ -1953,7 +1966,9 @@ async def _gc_studio_runs() -> dict[str, int]:
     trigger=inngest.TriggerCron(cron="0 3 * * *"),
 )
 async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
-    """Nightly retention sweep for the Studio run index (rows + orphan blobs).
+    """Nightly retention sweep for the Studio run index (rows + orphan blobs),
+    stale seed-download staging dirs, and stale session-scoped docs-search
+    uploads (#296).
 
     Bounds unbounded run accumulation: deletes runs older than
     ``STUDIO_RUN_RETENTION_DAYS`` or beyond the newest ``STUDIO_RUN_RETENTION_MAX``,

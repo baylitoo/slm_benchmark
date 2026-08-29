@@ -573,6 +573,109 @@ def test_chat_mcp_response_carries_the_tool_call_trace(api, monkeypatch) -> None
     ]
 
 
+def test_chat_mcp_session_id_points_docs_search_at_the_session_directory(
+    api, monkeypatch, tmp_path
+) -> None:
+    # A Playground attachment uploaded via POST /v1/studio/session-documents
+    # (#296) is only searchable if docs-search's spec is launched with its
+    # documents directory overridden to that session's upload directory.
+    from docie_bench import mcp_session_documents, mcp_tools
+    from docie_bench.mcp_servers.docs_search import DOCS_DIR_ENV
+    from docie_bench.mcp_tools import MCPServerSpec
+    from docie_bench.settings import get_settings
+
+    monkeypatch.setenv("MCP_SESSION_DOCUMENTS_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+
+    session_id, _ = mcp_session_documents.save_document(None, "invoice.pdf", b"%PDF-fake")
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "docs-search": MCPServerSpec(
+                name="docs-search", transport="streamable-http", url="http://x"
+            )
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    captured_specs: list[list] = []
+
+    async def fake_open_sessions(stack, specs):
+        captured_specs.append(specs)
+        return {"docs-search": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(post, body, sessions, mapping, tools, on_tool_call=None):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what's in the attached file?"}],
+            "mcp_servers": ["docs-search"],
+            "session_id": session_id,
+        },
+    )
+    assert resp.status_code == 200
+    (specs,) = captured_specs
+    (spec,) = specs
+    assert spec.env[DOCS_DIR_ENV] == str(tmp_path / session_id)
+    get_settings.cache_clear()
+
+
+def test_chat_mcp_unknown_session_id_is_400(api, monkeypatch) -> None:
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "docs-search": MCPServerSpec(
+                name="docs-search", transport="streamable-http", url="http://x"
+            )
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["docs-search"],
+            "session_id": "not-a-real-session",
+        },
+    )
+    assert resp.status_code == 400
+    assert "invalid session id" in resp.json()["error"]["message"]
+
+
+def test_chat_mcp_session_id_must_be_a_string(api) -> None:
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["calc"],
+            "session_id": 12345,
+        },
+    )
+    assert resp.status_code == 400
+    assert "session_id" in resp.json()["error"]["message"]
+
+
 # ── usage ledger: every resolved request writes one durable row ─────────────
 
 

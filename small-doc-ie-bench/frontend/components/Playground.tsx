@@ -35,6 +35,7 @@ import {
   isLiveDeployment,
   fileToBase64,
   renderDocument,
+  uploadSessionDocument,
   listDynamicSchemas,
   listSchemas,
   listRoutingPolicies,
@@ -252,6 +253,14 @@ export function ChatPanel({
   const [system, setSystem] = useState("");
   const mcpServers = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
   const [selectedMcp, setSelectedMcp] = useState<string[]>([]);
+  // Server-issued once the first attachment is uploaded for docs-search
+  // (#296) -- carried for the rest of this conversation so every later
+  // upload/chat turn lands in the SAME session directory. Never invented
+  // client-side; reset with the rest of the chat state on Clear. A ref, not
+  // state: sendChat awaits the upload then immediately calls attempt() in
+  // the SAME turn, which needs the just-issued id synchronously -- state
+  // set this render wouldn't be visible until the next one.
+  const docsSearchSessionIdRef = useRef<string | undefined>(undefined);
   const [input, setInput] = useState("");
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [busy, setBusy] = useState(false);
@@ -413,6 +422,23 @@ export function ChatPanel({
     if (attached) {
       try {
         const b64 = await fileToBase64(attached);
+        // Additive, not instead-of: vision still reads the rendered page
+        // images below regardless. Only a real .pdf is worth indexing for
+        // docs-search (#296) — an image attachment has no text to search,
+        // and isn't a suffix docs-search accepts anyway.
+        if (isPdfFile(attached) && selectedMcp.includes("docs-search")) {
+          try {
+            const uploaded = await uploadSessionDocument(
+              b64,
+              attached.name,
+              docsSearchSessionIdRef.current,
+            );
+            docsSearchSessionIdRef.current = uploaded.session_id;
+          } catch {
+            // Best-effort: docs-search just won't see this file, vision
+            // still answers from the page images below either way.
+          }
+        }
         const imageUrls = isPdfFile(attached)
           ? (await renderDocument(b64, attached.name, dpi)).images
           : [`data:${attached.type || "image/png"};base64,${b64}`];
@@ -453,7 +479,12 @@ export function ChatPanel({
     try {
       if (selectedMcp.length > 0) {
         // Tool exchange runs server-side; the final answer arrives in one piece.
-        const res = await chatCompletion(model, payload, selectedMcp);
+        const res = await chatCompletion(
+          model,
+          payload,
+          selectedMcp,
+          docsSearchSessionIdRef.current,
+        );
         const answer = res.choices?.[0]?.message?.content ?? "";
         const toolCalls = res.docie_agent?.tool_calls;
         setMsgs([
@@ -867,6 +898,7 @@ export function ChatPanel({
             onClick={() => {
               setMsgs([]);
               setError(null);
+              docsSearchSessionIdRef.current = undefined;
             }}
             title="Clear the conversation"
           >

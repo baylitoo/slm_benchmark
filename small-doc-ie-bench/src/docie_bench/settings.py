@@ -114,6 +114,17 @@ class Settings(BaseSettings):
     # Per-response read timeout for MCP client sessions (list_tools/call_tool).
     mcp_tool_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
 
+    # Session-scoped document uploads (#296): a Playground attachment is written
+    # here under a server-issued session id, isolated per conversation -- docs-search
+    # is pointed at THIS directory for that request instead of the shared operator
+    # corpus, so it can search a file the model wasn't otherwise given no way to
+    # discover. Size/MIME caps reuse max_upload_mb/allowed_upload_mime_types (the
+    # existing generic upload limits); max_files and max_age bound disk usage
+    # across many uploads within one session and across abandoned sessions.
+    mcp_session_documents_root: Path = Path("data/session-docs")
+    mcp_session_documents_max_files: int = Field(default=20, ge=1, le=500)
+    mcp_session_documents_max_age_hours: int = Field(default=24, ge=1, le=720)
+
     # Durable, addressable artifact store for Studio benchmark runs. Must resolve
     # to the SAME location on every replica that reads it (a shared volume or an
     # S3/MinIO mount) — the worker writes here and the api/web replicas read back
