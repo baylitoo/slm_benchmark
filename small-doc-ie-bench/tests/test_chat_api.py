@@ -20,7 +20,7 @@ UPSTREAM = ModelProfile(
 )
 
 
-@pytest.fixture()
+@pytest.fixture
 def api(monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
     def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
         if model_profile == "lfm2.5-350m":
@@ -458,7 +458,9 @@ def test_chat_mcp_stream_relays_each_tool_call_as_its_own_sse_event(api, monkeyp
     async def fake_collect_tools(sessions):
         return [], {}
 
-    async def fake_run_tool_loop(post, body, sessions, mapping, tools, on_tool_call=None):
+    async def fake_run_tool_loop(
+        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None
+    ):
         assert on_tool_call is not None
         on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
         return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
@@ -499,6 +501,59 @@ def test_chat_mcp_stream_relays_each_tool_call_as_its_own_sse_event(api, monkeyp
     (content_event,) = content_events
     assert content_event["completion"]["choices"][0]["message"]["content"] == "3"
     assert response.text.strip().endswith("data: [DONE]")
+
+
+def test_chat_mcp_stream_relays_reasoning_content_as_its_own_sse_event(api, monkeypatch) -> None:
+    # A reasoning-capable model's "why" for calling a tool arrives as its
+    # own event too -- answers "is there a hidden thinking step" instead of
+    # silently discarding message.reasoning_content.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None
+    ):
+        assert on_reasoning is not None
+        on_reasoning("the user asked for 1+2, so I should call calc.add")
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (reasoning_event,) = [e for e in events if e["type"] == "reasoning"]
+    assert reasoning_event["text"] == "the user asked for 1+2, so I should call calc.add"
 
 
 def test_chat_mcp_stream_unregistered_server_sends_an_error_event(api) -> None:
@@ -610,7 +665,9 @@ def test_chat_mcp_response_carries_the_tool_call_trace(api, monkeypatch) -> None
     async def fake_collect_tools(sessions):
         return [], {}
 
-    async def fake_run_tool_loop(post, body, sessions, mapping, tools, on_tool_call=None):
+    async def fake_run_tool_loop(
+        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None
+    ):
         assert on_tool_call is not None
         on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
         return {
@@ -680,7 +737,9 @@ def test_chat_mcp_session_id_points_docs_search_at_the_session_directory(
     async def fake_collect_tools(sessions):
         return [], {}
 
-    async def fake_run_tool_loop(post, body, sessions, mapping, tools, on_tool_call=None):
+    async def fake_run_tool_loop(
+        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None
+    ):
         return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
     monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)

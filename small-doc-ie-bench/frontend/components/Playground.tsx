@@ -203,6 +203,10 @@ interface ChatMsg {
   trigger?: TriggerResponse;
   /** Only set on an assistant turn that ran MCP tools (selectedMcp). */
   toolCalls?: AgentToolCallTrace[];
+  /** Reasoning-capable model's "why" for a round (calling a tool, or the
+   * final answer) -- only set when the chat template emits one separately
+   * from content/tool_calls. One entry per round that had any. */
+  reasoning?: string[];
 }
 
 // A cold store: model's first request can take a while to boot. Auto-retry a
@@ -533,15 +537,26 @@ export function ChatPanel({
         // finishes -- the trace renders progressively instead of the whole
         // exchange completing silently behind "Waiting for the model…".
         const liveToolCalls: AgentToolCallTrace[] = [];
+        const liveReasoning: string[] = [];
+        const patchLiveMsg = () => {
+          setMsgs((prev) => {
+            const patch = {
+              content: "",
+              toolCalls: [...liveToolCalls],
+              ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
+            };
+            return prev.length <= next.length
+              ? [...next, { role: "assistant", ...patch }]
+              : prev.map((m, i) => (i === next.length ? { ...m, ...patch } : m));
+          });
+        };
         const onToolCall = (call: AgentToolCallTrace) => {
           liveToolCalls.push(call);
-          setMsgs((prev) =>
-            prev.length <= next.length
-              ? [...next, { role: "assistant", content: "", toolCalls: [...liveToolCalls] }]
-              : prev.map((m, i) =>
-                  i === next.length ? { ...m, toolCalls: [...liveToolCalls] } : m,
-                ),
-          );
+          patchLiveMsg();
+        };
+        const onReasoning = (text: string) => {
+          liveReasoning.push(text);
+          patchLiveMsg();
         };
         const res = await chatCompletionMcpStream(
           model,
@@ -549,6 +564,7 @@ export function ChatPanel({
           selectedMcp,
           onToolCall,
           docsSearchSessionIdRef.current,
+          onReasoning,
         );
         const answer = res.choices?.[0]?.message?.content ?? "";
         const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
@@ -556,6 +572,7 @@ export function ChatPanel({
           role: "assistant",
           content: answer || t("(empty response)"),
           ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          ...(liveReasoning.length > 0 ? { reasoning: liveReasoning } : {}),
         };
         setMsgs((prev) =>
           prev.length <= next.length
@@ -876,6 +893,18 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.reasoning && m.reasoning.length > 0 && (
+                  <div className="w-full max-w-[85%] space-y-1">
+                    {m.reasoning.map((text, ri) => (
+                      <p
+                        key={ri}
+                        className="rounded-md border border-border bg-muted/20 px-2 py-1 text-xs italic text-muted-foreground"
+                      >
+                        {text}
+                      </p>
+                    ))}
+                  </div>
+                )}
                 {m.toolCalls && m.toolCalls.length > 0 && (
                   <div className="w-full max-w-[85%]">
                     <ToolCallTrace calls={m.toolCalls} />
