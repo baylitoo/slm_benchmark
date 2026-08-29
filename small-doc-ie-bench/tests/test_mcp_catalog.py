@@ -581,6 +581,7 @@ def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_pa
         "docs-search",
         "code-interpreter",
         "call-llm",
+        "sql-agent",
     }
     assert not entries["calculator"]["enabled"]
     assert entries["web-fetch"]["params"][0]["name"] == "allowed_hosts"
@@ -591,6 +592,15 @@ def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_pa
         "snippet_window",
         "snippet_max_chars",
         "peek_char_budget",
+    }
+    sql_agent_params = {p["name"]: p["secret"] for p in entries["sql-agent"]["params"]}
+    assert sql_agent_params == {
+        "host": False,
+        "port": False,
+        "user": False,
+        "password": True,
+        "dbname": False,
+        "row_limit": False,
     }
     ci_params = {p["name"]: p["required"] for p in entries["code-interpreter"]["params"]}
     assert ci_params == {"url": False, "token": True}
