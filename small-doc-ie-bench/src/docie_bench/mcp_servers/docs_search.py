@@ -16,7 +16,14 @@ Extraction itself is memoized per (path, mtime, size) via
 ``_extracted_blocks`` -- re-parsing a PDF (OCR fallback especially) on
 every ``search_text``/``read_document`` call against the same document
 within one tool loop would be wasteful, and agentic search is expected to
-hit the same document repeatedly.
+hit the same document repeatedly. That in-memory cache alone only helps
+WITHIN one tool loop though: this server is a fresh subprocess per chat
+request (see agents/runtime.py's _complete_with_tools), so its memory is
+gone before the next turn. A disk-backed second tier (see
+``_load_disk_cache``/``_write_disk_cache``) survives that -- the next
+turn's fresh subprocess, or a fresh subprocess for a different chat
+request against the SAME document, skips OCR entirely instead of paying
+it again.
 
 The directory is read-only and operator-controlled via ``DOCS_DIR_ENV`` (see
 ``mcp_catalog.CATALOG["docs-search"]``) -- this process never writes to it,
@@ -30,6 +37,8 @@ as web_fetch's allowed-hosts param.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -57,6 +66,50 @@ _SNIPPET_CHARS = 300
 _EXTRACTION_CACHE: dict[tuple[str, int, int], list[OCRBlock]] = {}
 
 
+def _cache_dir() -> Path:
+    """A SIBLING of ``docs_dir()``, never inside it -- the docstring's "this
+    process never writes to docs_dir()" invariant holds for the
+    operator-controlled shared corpus (a read-only mount stays read-only)
+    even though extraction results now persist to disk."""
+    root = docs_dir()
+    cache = root.parent / f"{root.name}.extraction-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
+def _disk_cache_path(path: Path) -> Path:
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+    return _cache_dir() / f"{digest}.json"
+
+
+def _load_disk_cache(path: Path, stat: os.stat_result) -> list[OCRBlock] | None:
+    try:
+        raw = json.loads(_disk_cache_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if raw.get("mtime_ns") != stat.st_mtime_ns or raw.get("size") != stat.st_size:
+        return None  # the file changed since this was written -- a real miss
+    try:
+        return [OCRBlock.model_validate(b) for b in raw["blocks"]]
+    except Exception:  # noqa: BLE001 - a malformed/partial cache file is just a miss
+        return None
+
+
+def _write_disk_cache(path: Path, stat: os.stat_result, blocks: list[OCRBlock]) -> None:
+    payload = {
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "blocks": [b.model_dump(mode="json") for b in blocks],
+    }
+    cache_path = _disk_cache_path(path)
+    tmp = cache_path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(cache_path)
+    except OSError:
+        pass  # best-effort -- this request's extraction still succeeded either way
+
+
 def _extracted_blocks(path: Path) -> list[OCRBlock]:
     from docie_bench.ocr.factory import get_ocr_backend
 
@@ -65,8 +118,13 @@ def _extracted_blocks(path: Path) -> list[OCRBlock]:
     cached = _EXTRACTION_CACHE.get(key)
     if cached is not None:
         return cached
+    from_disk = _load_disk_cache(path, stat)
+    if from_disk is not None:
+        _EXTRACTION_CACHE[key] = from_disk
+        return from_disk
     blocks = get_ocr_backend("liteparse").extract(path)
     _EXTRACTION_CACHE[key] = blocks
+    _write_disk_cache(path, stat, blocks)
     return blocks
 
 

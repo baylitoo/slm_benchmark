@@ -268,6 +268,73 @@ def test_extraction_cache_invalidates_when_the_file_changes(docs: Path, monkeypa
     assert len(calls) == 2
 
 
+# ── disk-backed second tier: survives the fresh-subprocess-per-request
+# lifecycle the in-memory cache alone can't (#298) ──────────────────────────
+
+
+def test_extraction_survives_a_simulated_fresh_subprocess(docs: Path, monkeypatch) -> None:
+    """docs-search is a new subprocess per chat request -- clearing
+    _EXTRACTION_CACHE simulates that restart. The disk tier must still
+    skip re-extraction."""
+    path = docs / "a.txt"
+    path.write_text("the invoice total is 400 EUR")
+    calls: list[Path] = []
+    _counting_extractor(monkeypatch, calls)
+
+    docs_search.document_text("a.txt")
+    assert len(calls) == 1
+
+    docs_search._EXTRACTION_CACHE.clear()
+    docs_search.document_text("a.txt")
+    assert len(calls) == 1
+
+
+def test_disk_cache_lives_beside_docs_dir_not_inside_it(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("hello")
+    _counting_extractor(monkeypatch, [])
+    docs_search.document_text("a.txt")
+
+    cache_dir = docs.parent / f"{docs.name}.extraction-cache"
+    assert cache_dir.is_dir()
+    assert list(cache_dir.glob("*.json"))
+    # docs_dir() itself gets no new files -- "this process never writes to
+    # docs_dir()" holds even for the operator's read-only shared corpus.
+    assert list(docs.iterdir()) == [docs / "a.txt"]
+
+
+def test_disk_cache_invalidates_when_the_file_changes_across_a_fresh_process(
+    docs: Path, monkeypatch
+) -> None:
+    path = docs / "a.txt"
+    path.write_text("version one")
+    calls: list[Path] = []
+    _counting_extractor(monkeypatch, calls)
+
+    docs_search.document_text("a.txt")
+    docs_search._EXTRACTION_CACHE.clear()
+
+    path.write_text("version two, now longer")
+    docs_search.document_text("a.txt")
+    assert len(calls) == 2  # disk cache's own mtime/size check also misses correctly
+
+
+def test_disk_cache_falls_back_gracefully_on_a_malformed_cache_file(
+    docs: Path, monkeypatch
+) -> None:
+    path = docs / "a.txt"
+    path.write_text("hello")
+    calls: list[Path] = []
+    _counting_extractor(monkeypatch, calls)
+
+    cache_path = docs_search._disk_cache_path(docs_search.resolve_document("a.txt"))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("not valid json{{{")
+
+    result = docs_search.document_text("a.txt")
+    assert len(calls) == 1  # gracefully re-extracted instead of crashing
+    assert result["pages"][0]["text"] == "hello"
+
+
 # ------------------------------------------------------------ code-interpreter
 
 
