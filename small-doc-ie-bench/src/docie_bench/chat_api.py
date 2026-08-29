@@ -546,6 +546,12 @@ async def _stream_chat_with_mcp_tools(
         trace (#261/#262), so the frontend's existing ``ToolCallTrace``
         component renders each one as it arrives instead of only after
         the fact.
+      ``{"type": "reasoning", "text": <round's reasoning_content>}`` — a
+        reasoning-capable model's "why" for that round (calling a tool, or
+        the final answer), when the chat template emits one separately
+        from ``content``/``tool_calls``. Answers "is there a hidden
+        thinking step before the tool call" with the model's own words
+        instead of leaving it invisible.
       ``{"type": "content", "completion": <final OpenAI-shaped completion>}``
       ``{"type": "error", "error": {"message", "type", "code"}}``
     Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
@@ -598,7 +604,15 @@ async def _stream_chat_with_mcp_tools(
                         queue.put_nowait({"type": "error", "error": error})
                         return
                     completion = await mcp_mod.run_tool_loop(
-                        post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
+                        post,
+                        forward,
+                        sessions,
+                        mapping,
+                        tools,
+                        on_tool_call=record_tool_call,
+                        on_reasoning=lambda text: queue.put_nowait(
+                            {"type": "reasoning", "text": text}
+                        ),
                     )
             except Exception as exc:  # noqa: BLE001 - transport teardown failure
                 message = f"MCP session error: {exc}"

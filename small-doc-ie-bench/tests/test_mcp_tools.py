@@ -392,6 +392,33 @@ async def test_run_tool_loop_reports_each_call_through_on_tool_call() -> None:
     assert result == "5"
 
 
+async def test_run_tool_loop_reports_reasoning_content_for_every_round() -> None:
+    # LFM2.5's bundled chat template opens <think> unconditionally --
+    # llama-server (with --jinja) surfaces it as reasoning_content SEPARATE
+    # from content/tool_calls. Fires for the tool-calling round AND the
+    # final round, since "is there a hidden thinking step" applies to both.
+    tool_round = _tool_calls_completion("calc__add", '{"a": 2, "b": 3}', {})
+    tool_round["choices"][0]["message"]["reasoning_content"] = "the user wants 2+3, call calc.add"
+    final_round = _final_completion("sum is 5", {})
+    final_round["choices"][0]["message"]["reasoning_content"] = "I have the answer, respond"
+    responses = [tool_round, final_round]
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        return responses.pop(0)
+
+    reasoning: list[str] = []
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+3?"}]}
+        await run_tool_loop(
+            post, body, sessions, mapping, tools, max_iterations=4, on_reasoning=reasoning.append
+        )
+
+    assert reasoning == ["the user wants 2+3, call calc.add", "I have the answer, respond"]
+
+
 async def test_run_tool_loop_returns_caller_owned_calls_untouched() -> None:
     # The model calling a tool the CALLER advertised (not an MCP one) ends the
     # server-side loop: executing the caller's function is the caller's job.

@@ -311,6 +311,7 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -324,6 +325,7 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
     );
   });
 
@@ -402,5 +404,34 @@ describe("ChatPanel", () => {
     resolveCompletion({ choices: [{ message: { role: "assistant", content: "who found it" } }] });
     expect(await screen.findByText("who found it")).toBeInTheDocument();
     expect(screen.getByText("docs-search__list_files")).toBeInTheDocument();
+  });
+
+  it("renders reasoning_content the moment it streams in, before the tool call", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (_model, _messages, _servers, onToolCall, _sessionId, onReasoning) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          onReasoning?.("the user wants the TTC, so I should search the CVEC document");
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "what's the total?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(
+      await screen.findByText("the user wants the TTC, so I should search the CVEC document"),
+    ).toBeInTheDocument();
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "no info" } }] });
+    expect(await screen.findByText("no info")).toBeInTheDocument();
+    expect(
+      screen.getByText("the user wants the TTC, so I should search the CVEC document"),
+    ).toBeInTheDocument();
   });
 });

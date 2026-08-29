@@ -427,6 +427,7 @@ async def run_tool_loop(
     mcp_tools: list[dict[str, Any]],
     max_iterations: int | None = None,
     on_tool_call: Callable[[str, bool, int, Any, str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -453,6 +454,17 @@ async def run_tool_loop(
     catalog-declared ``eager_list_tool`` (docs-search's ``list_files``) is
     also called once up front and its result folded in alongside it — see
     ``_eager_list_context``.
+
+    ``on_reasoning``, when given, is invoked once per round with that
+    round's ``message.reasoning_content`` whenever it's a non-empty string —
+    a reasoning-capable model (LFM2.5's bundled chat template opens
+    ``<think>`` unconditionally) emits its "why" for calling a tool (or for
+    the final answer) in this SEPARATE field when ``--jinja`` is on;
+    ``message.content``/``tool_calls`` stay clean either way. Fires for
+    EVERY round, including the last one, so "is there a hidden thinking
+    step before the tool call, or does the model just formulate it
+    directly" has a real answer instead of that reasoning being silently
+    discarded.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -483,6 +495,10 @@ async def run_tool_loop(
             if isinstance(choices, list) and choices and isinstance(choices[0], dict)
             else None
         )
+        if on_reasoning is not None and isinstance(message, dict):
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                on_reasoning(reasoning)
         calls = message.get("tool_calls") if isinstance(message, dict) else None
         names = [
             str(call.get("function", {}).get("name", ""))
