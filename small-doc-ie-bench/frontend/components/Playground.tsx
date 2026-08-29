@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import {
   triggerExtract,
-  chatCompletion,
+  chatCompletionMcpStream,
   chatCompletionStream,
   listMcpServers,
   type McpRegisteredServer,
@@ -529,23 +529,39 @@ export function ChatPanel({
   ) {
     try {
       if (selectedMcp.length > 0) {
-        // Tool exchange runs server-side; the final answer arrives in one piece.
-        const res = await chatCompletion(
+        // Each tool call arrives as its own SSE event the instant it
+        // finishes -- the trace renders progressively instead of the whole
+        // exchange completing silently behind "Waiting for the model…".
+        const liveToolCalls: AgentToolCallTrace[] = [];
+        const onToolCall = (call: AgentToolCallTrace) => {
+          liveToolCalls.push(call);
+          setMsgs((prev) =>
+            prev.length <= next.length
+              ? [...next, { role: "assistant", content: "", toolCalls: [...liveToolCalls] }]
+              : prev.map((m, i) =>
+                  i === next.length ? { ...m, toolCalls: [...liveToolCalls] } : m,
+                ),
+          );
+        };
+        const res = await chatCompletionMcpStream(
           model,
           payload,
           selectedMcp,
+          onToolCall,
           docsSearchSessionIdRef.current,
         );
         const answer = res.choices?.[0]?.message?.content ?? "";
-        const toolCalls = res.docie_agent?.tool_calls;
-        setMsgs([
-          ...next,
-          {
-            role: "assistant",
-            content: answer || t("(empty response)"),
-            ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {}),
-          },
-        ]);
+        const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
+        const finalMsg: ChatMsg = {
+          role: "assistant",
+          content: answer || t("(empty response)"),
+          ...(toolCalls.length > 0 ? { toolCalls } : {}),
+        };
+        setMsgs((prev) =>
+          prev.length <= next.length
+            ? [...next, finalMsg]
+            : prev.map((m, i) => (i === next.length ? finalMsg : m)),
+        );
         return;
       }
       let content = "";
@@ -812,7 +828,7 @@ export function ChatPanel({
             })}
             {selectedMcp.length > 0 && (
               <span className="text-xs text-muted-foreground">
-                <T>tool answers arrive unstreamed</T>
+                <T>tool calls stream live; the final answer arrives in one piece</T>
               </span>
             )}
           </div>

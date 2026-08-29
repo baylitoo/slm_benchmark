@@ -435,21 +435,92 @@ def test_chat_forwards_tool_role_messages(api) -> None:
     assert json.loads(captured[-1].content)["messages"] == messages
 
 
-def test_chat_mcp_with_stream_is_400(api) -> None:
-    # The server drives the tool exchange, so only the FINAL completion has a
-    # meaningful shape -- streaming intermediate rounds is refused up front.
+def test_chat_mcp_stream_relays_each_tool_call_as_its_own_sse_event(api, monkeypatch) -> None:
+    # Each executed tool call arrives as its own SSE frame the moment it
+    # finishes, instead of the whole exchange completing silently before
+    # anything reaches the client ("Waiting for the model…" with zero
+    # visibility into the agentic search actually running).
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(post, body, sessions, mapping, tools, on_tool_call=None):
+        assert on_tool_call is not None
+        on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
     client, _ = api
-    resp = client.post(
+    response = client.post(
         "/v1/chat/completions",
         json={
             "model": "lfm2.5-350m",
-            "messages": [{"role": "user", "content": "hi"}],
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
             "mcp_servers": ["calc"],
             "stream": True,
         },
     )
-    assert resp.status_code == 400
-    assert "stream" in resp.json()["error"]["message"]
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    tool_events = [e for e in events if e["type"] == "tool_call"]
+    content_events = [e for e in events if e["type"] == "content"]
+    assert tool_events == [
+        {
+            "type": "tool_call",
+            "tool": "calc__add",
+            "status": "ok",
+            "latency_ms": 12,
+            "arguments": '{"a": 1, "b": 2}',
+            "result": "3",
+        }
+    ]
+    (content_event,) = content_events
+    assert content_event["completion"]["choices"][0]["message"]["content"] == "3"
+    assert response.text.strip().endswith("data: [DONE]")
+
+
+def test_chat_mcp_stream_unregistered_server_sends_an_error_event(api) -> None:
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["ghost"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (error_event,) = events
+    assert error_event["type"] == "error"
+    assert "unregistered MCP server" in error_event["error"]["message"]
 
 
 def test_chat_mcp_field_must_be_a_string_list(api) -> None:

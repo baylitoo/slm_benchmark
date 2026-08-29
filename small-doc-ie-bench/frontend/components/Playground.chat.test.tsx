@@ -13,7 +13,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     chatCompletionStream: vi.fn(),
-    chatCompletion: vi.fn(),
+    chatCompletionMcpStream: vi.fn(),
     listMcpServers: vi.fn(),
     listSchemas: vi.fn(),
     listDynamicSchemas: vi.fn(),
@@ -253,7 +253,7 @@ describe("ChatPanel", () => {
     vi.mocked(api.listMcpServers).mockResolvedValue([
       { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
     ]);
-    vi.mocked(api.chatCompletion).mockResolvedValue({
+    vi.mocked(api.chatCompletionMcpStream).mockResolvedValue({
       choices: [{ message: { role: "assistant", content: "found it" } }],
       docie_agent: {
         tool_calls: [
@@ -287,7 +287,7 @@ describe("ChatPanel", () => {
       session_id: "abc123",
       stored_name: "xyz.pdf",
     });
-    vi.mocked(api.chatCompletion).mockResolvedValue({
+    vi.mocked(api.chatCompletionMcpStream).mockResolvedValue({
       choices: [{ message: { role: "assistant", content: "read it" } }],
     });
     renderChat();
@@ -304,11 +304,12 @@ describe("ChatPanel", () => {
     // First upload of the conversation: no session id yet, so undefined —
     // the backend mints a fresh one and returns it.
     expect(api.uploadSessionDocument).toHaveBeenCalledWith("ZmFrZQ==", "invoice.pdf", undefined);
-    await waitFor(() => expect(api.chatCompletion).toHaveBeenCalledTimes(1));
-    expect(api.chatCompletion).toHaveBeenCalledWith(
+    await waitFor(() => expect(api.chatCompletionMcpStream).toHaveBeenCalledTimes(1));
+    expect(api.chatCompletionMcpStream).toHaveBeenCalledWith(
       "lfm2.5-350m",
       expect.any(Array),
       ["docs-search"],
+      expect.any(Function),
       "abc123",
     );
 
@@ -316,11 +317,12 @@ describe("ChatPanel", () => {
     // forward -- docs-search keeps seeing the file from turn 1.
     await user.type(screen.getByPlaceholderText(/Type a message/), "anything else?");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    await waitFor(() => expect(api.chatCompletion).toHaveBeenCalledTimes(2));
-    expect(api.chatCompletion).toHaveBeenLastCalledWith(
+    await waitFor(() => expect(api.chatCompletionMcpStream).toHaveBeenCalledTimes(2));
+    expect(api.chatCompletionMcpStream).toHaveBeenLastCalledWith(
       "lfm2.5-350m",
       expect.any(Array),
       ["docs-search"],
+      expect.any(Function),
       "abc123",
     );
   });
@@ -329,12 +331,12 @@ describe("ChatPanel", () => {
     vi.mocked(api.listMcpServers).mockResolvedValue([
       { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
     ]);
-    vi.mocked(api.chatCompletion).mockResolvedValue({
+    vi.mocked(api.chatCompletionMcpStream).mockResolvedValue({
       choices: [{ message: { role: "assistant", content: "described it" } }],
     });
     // Vision on (this deployment is vision-capable) -- otherwise the new
     // vision-off guard refuses to send an image attachment at all, and this
-    // test wants to reach chatCompletion to prove docs-search skips it.
+    // test wants to reach chatCompletionMcpStream to prove docs-search skips it.
     renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "docs-search" }));
@@ -345,7 +347,7 @@ describe("ChatPanel", () => {
     await user.type(screen.getByPlaceholderText(/Type a message/), "describe this");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
-    await waitFor(() => expect(api.chatCompletion).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.chatCompletionMcpStream).toHaveBeenCalledTimes(1));
     expect(api.uploadSessionDocument).not.toHaveBeenCalled();
   });
 
@@ -364,6 +366,41 @@ describe("ChatPanel", () => {
 
     expect(await screen.findByText(/Vision is off/)).toBeInTheDocument();
     expect(api.chatCompletionStream).not.toHaveBeenCalled();
-    expect(api.chatCompletion).not.toHaveBeenCalled();
+    expect(api.chatCompletionMcpStream).not.toHaveBeenCalled();
+  });
+
+  it("renders a tool call the moment it streams in, before the final answer arrives", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (_model, _messages, _servers, onToolCall) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          onToolCall({
+            tool: "docs-search__list_files",
+            status: "ok",
+            latency_ms: 19,
+            arguments: "{}",
+            result: "invoice.pdf",
+          });
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "who signed this?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    // The tool call is visible WHILE the request is still in flight -- the
+    // whole point of streaming instead of "Waiting for the model…" with no
+    // visibility into the agentic search running underneath it.
+    expect(await screen.findByText("docs-search__list_files")).toBeInTheDocument();
+    expect(screen.queryByText("who found it")).not.toBeInTheDocument();
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "who found it" } }] });
+    expect(await screen.findByText("who found it")).toBeInTheDocument();
+    expect(screen.getByText("docs-search__list_files")).toBeInTheDocument();
   });
 });

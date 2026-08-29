@@ -305,3 +305,108 @@ export async function chatCompletionStream(
     }
   }
 }
+
+/**
+ * Streaming variant of `chatCompletion` for the `mcp_servers` tool-loop
+ * path: each executed tool call arrives as its own SSE event the moment it
+ * finishes (`onToolCall`), instead of the whole exchange completing
+ * silently before anything reaches the caller. NOT the OpenAI token-stream
+ * format — there is no meaningful token stream for a tool-calling round —
+ * so this parses `{"type": "tool_call"|"content"|"error", ...}` frames, not
+ * `choices[0].delta`. Resolves with the final completion once a `content`
+ * event lands; throws on an `error` event or a connection that ends
+ * without either.
+ */
+export async function chatCompletionMcpStream(
+  model: string,
+  messages: { role: string; content: unknown }[],
+  mcpServers: string[],
+  onToolCall: (call: AgentToolCallTrace) => void,
+  sessionId?: string,
+): Promise<AgentChatResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        ...authHeader(),
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: true,
+        mcp_servers: mcpServers,
+        ...(sessionId ? { session_id: sessionId } : {}),
+      }),
+    });
+  } catch (e) {
+    throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
+  }
+
+  if (res.status === 202) {
+    const body = await readBody(res);
+    if (body && typeof body === "object" && "status" in body) {
+      const loading = body as { status?: string; deployment?: string; eta_seconds?: number };
+      if (loading.status === "loading") {
+        throw new ModelLoading(loading.deployment ?? "model", loading.eta_seconds ?? 0);
+      }
+    }
+  }
+  if (!res.ok) {
+    const body = await readBody(res);
+    if (res.status === 401) throw unauthorizedError(body);
+    const err =
+      body && typeof body === "object" && "error" in body
+        ? (body as { error?: { message?: string; type?: string } }).error
+        : undefined;
+    const detail = err?.message ?? detailOf(body, `Request failed (HTTP ${res.status})`);
+    throw new ApiError(res.status, err?.type ? `${err.type}: ${detail}` : detail);
+  }
+  if (!res.body) throw new ApiError(res.status, "empty response body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completion: AgentChatResponse | null = null;
+  let streamError: { message?: string; type?: string } | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let frameEnd: number;
+    while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, frameEnd);
+      buffer = buffer.slice(frameEnd + 2);
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") {
+          if (streamError) {
+            throw new ApiError(502, streamError.message ?? "MCP stream error");
+          }
+          if (completion) return completion;
+          throw new ApiError(502, "MCP stream ended with no content");
+        }
+        try {
+          const event = JSON.parse(data) as { type?: string; [k: string]: unknown };
+          if (event.type === "tool_call") {
+            const { type: _type, ...call } = event;
+            onToolCall(call as unknown as AgentToolCallTrace);
+          } else if (event.type === "content") {
+            completion = event.completion as AgentChatResponse;
+          } else if (event.type === "error") {
+            streamError = event.error as { message?: string; type?: string };
+          }
+        } catch {
+          // Malformed/partial frame — skip it rather than kill the stream.
+        }
+      }
+    }
+  }
+  if (streamError) throw new ApiError(502, streamError.message ?? "MCP stream error");
+  if (completion) return completion;
+  throw new ApiError(502, "MCP stream ended with no content");
+}
