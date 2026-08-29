@@ -54,14 +54,16 @@ _DEFAULT_BACKEND = "substring"
 # an upload that isn't one of these suffixes would just sit in list_files
 # forever with nothing able to read it back.
 SUPPORTED_SUFFIXES = (".pdf", ".txt")
-# The FULL hit page's text (joined from every extracted block on it, not
-# just the one block that matched), truncated to this many characters --
-# 300 gave the model a near-useless few-word fragment, especially on a
-# page with several short matching lines (liteparse splits a page into
-# many small blocks; a legal document's page can have "Chapter" match on
-# 5+ separate short lines). ~1500 is roughly half a dense page: enough
-# surrounding context to judge relevance without duplicating read_document.
-_SNIPPET_CHARS = 1500
+# Characters of surrounding context kept on each side of a match --
+# 300 gave the model a near-useless few-word fragment; the full hit page
+# (tried next) blew a 128k context after several searches on a long
+# document (each snippet compounds across every round of one tool loop).
+# 400 each side is enough to judge relevance without re-dumping the page.
+_SNIPPET_WINDOW = 400
+# Absolute safety cap on one match's snippet -- a page with many scattered
+# hits (a common word) could otherwise join many windows into something
+# still too large.
+_SNIPPET_CHARS_MAX = 4000
 
 # Keyed by (resolved path, mtime_ns, size) so a changed file misses rather
 # than serving stale blocks. Agentic search is expected to hit the SAME
@@ -147,6 +149,30 @@ class SearchBackend(ABC):
         raise NotImplementedError
 
 
+def _windowed_snippet(text: str, needle: str) -> str:
+    """Every occurrence of ``needle`` in ``text``, each with
+    ``_SNIPPET_WINDOW`` characters of context on both sides -- overlapping
+    windows merge into one span instead of duplicating the shared text."""
+    lower = text.lower()
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        idx = lower.find(needle, start)
+        if idx == -1:
+            break
+        lo = max(0, idx - _SNIPPET_WINDOW)
+        hi = min(len(text), idx + len(needle) + _SNIPPET_WINDOW)
+        spans.append((lo, hi))
+        start = idx + len(needle)
+    merged: list[tuple[int, int]] = []
+    for lo, hi in spans:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return "…".join(text[lo:hi] for lo, hi in merged)[:_SNIPPET_CHARS_MAX]
+
+
 class SubstringSearchBackend(SearchBackend):
     """Case-insensitive substring match over liteparse-extracted text --
     today's default, and for now the only implemented backend."""
@@ -163,11 +189,12 @@ class SubstringSearchBackend(SearchBackend):
                 if needle in block.text.lower() and block.page not in hit_pages:
                     hit_pages.append(block.page)
             for page in hit_pages:
+                page_text = "\n".join(page_lines[page])
                 matches.append(
                     {
                         "path": relative,
                         "page": page,
-                        "snippet": "\n".join(page_lines[page])[:_SNIPPET_CHARS],
+                        "snippet": _windowed_snippet(page_text, needle),
                     }
                 )
         return matches
