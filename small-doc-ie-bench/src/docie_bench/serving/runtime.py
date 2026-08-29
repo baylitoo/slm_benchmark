@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import importlib.metadata
 import importlib.util
+import json
+import logging
 import os
 import shutil
 import subprocess
@@ -18,6 +20,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import psutil
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeKind(StrEnum):
@@ -179,6 +183,54 @@ def _default_health_get(url: str, timeout: float, headers: Mapping[str, str]) ->
     )
 
 
+def _default_json_get(
+    url: str, timeout: float, headers: Mapping[str, str]
+) -> dict[str, Any] | None:
+    """Best-effort GET+JSON-decode -- ``None`` on any failure (unreachable,
+    non-200, not JSON). Used for capability-drift checks that must never
+    turn a genuinely healthy deployment unhealthy just because an optional
+    diagnostic endpoint is unavailable."""
+    request = urllib.request.Request(url, headers=dict(headers))  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            if not (200 <= response.status < 300):
+                return None
+            body = response.read()
+    except (OSError, urllib.error.URLError):
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+JsonGet = Callable[[str, float, Mapping[str, str]], "dict[str, Any] | None"]
+
+
+def llamacpp_tool_calls_mismatch(props: Mapping[str, Any]) -> str | None:
+    """Compare llama-server's own ``GET /props`` report against
+    ``RuntimeFeature.TOOL_CALLS`` (#290): ``LlamaCppRuntime.features``
+    declares tool-calling support unconditionally, but the model's ACTUAL
+    chat template is what decides whether that's true, per llama.cpp's own
+    ``chat_template_caps.supports_tool_calls`` (see
+    ``common/jinja/caps.h``/``caps.cpp`` -- the exact keys this checks
+    against). ``None`` means no mismatch (or the field wasn't reported,
+    an older llama-server build); a string is the loud warning to log.
+    """
+    caps = props.get("chat_template_caps")
+    if not isinstance(caps, dict) or "supports_tool_calls" not in caps:
+        return None
+    if caps.get("supports_tool_calls") is False:
+        return (
+            "llama-server reports chat_template_caps.supports_tool_calls=false for "
+            "this model's ACTUAL chat template, but LlamaCppRuntime advertises "
+            "RuntimeFeature.TOOL_CALLS -- a request with 'tools' set will not get "
+            "structured tool_calls back from this deployment"
+        )
+    return None
+
+
 class RuntimeAdapter:
     kind: RuntimeKind
     executable_names: tuple[str, ...] = ()
@@ -191,11 +243,13 @@ class RuntimeAdapter:
         popen_factory: PopenFactory = subprocess.Popen,
         run_command: RunCommand = subprocess.run,
         health_get: HealthGet = _default_health_get,
+        json_get: JsonGet = _default_json_get,
         which: Callable[[str], str | None] = shutil.which,
     ) -> None:
         self._popen_factory = popen_factory
         self._run_command = run_command
         self._health_get = health_get
+        self._json_get = json_get
         self._which = which
         self._processes: dict[int, Process] = {}
 
@@ -500,6 +554,29 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--threads", str(spec.cpu_threads)])
         command.extend(spec.extra_args)
         return tuple(command)
+
+    def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> HealthResult:
+        """The base ``/health`` check, plus a capability-drift check (#290):
+        only once the process is actually healthy, query ``GET /props`` and
+        compare its ``chat_template_caps`` against what ``features``
+        advertises. A mismatch is logged loudly -- never turns a healthy
+        deployment unhealthy, since the deployment genuinely IS up; it's the
+        TOOL_CALLS advertisement that would be a lie for THIS model's actual
+        chat template.
+        """
+        result = super().health(spec, timeout=timeout)
+        if not result.healthy:
+            return result
+        base = self.endpoint(spec).removesuffix("/v1")
+        headers: dict[str, str] = {}
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            headers["Authorization"] = f"Bearer {api_key}"
+        props = self._json_get(f"{base}/props", timeout, headers)
+        if props is not None:
+            mismatch = llamacpp_tool_calls_mismatch(props)
+            if mismatch is not None:
+                logger.warning("%s (alias=%r, endpoint=%r)", mismatch, spec.alias, base)
+        return result
 
 
 class OllamaRuntime(RuntimeAdapter):
