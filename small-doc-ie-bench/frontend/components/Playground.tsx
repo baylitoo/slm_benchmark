@@ -16,6 +16,7 @@ import {
   AlertCircle,
   FilePlus2,
   Paperclip,
+  Wrench,
   X,
 } from "lucide-react";
 import {
@@ -73,7 +74,7 @@ import {
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
-import { ToolCallTrace } from "./ToolCallTrace";
+import { ToolCallItem } from "./ToolCallTrace";
 
 type PlaygroundMode = "chat" | "arena" | "embedrerank";
 
@@ -207,7 +208,15 @@ interface ChatMsg {
    * final answer) -- only set when the chat template emits one separately
    * from content/tool_calls. One entry per round that had any. */
   reasoning?: string[];
+  /** toolCalls and reasoning above, interleaved in the order the SSE events
+   * actually arrived -- rendered as one chronological trace instead of two
+   * separate blocks that lose which reasoning step preceded which call. */
+  trace?: TraceEntry[];
 }
+
+type TraceEntry =
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool_call"; call: AgentToolCallTrace };
 
 // A cold store: model's first request can take a while to boot. Auto-retry a
 // bounded number of times (the backend's load trigger is idempotent — see
@@ -538,11 +547,13 @@ export function ChatPanel({
         // exchange completing silently behind "Waiting for the model…".
         const liveToolCalls: AgentToolCallTrace[] = [];
         const liveReasoning: string[] = [];
+        const liveTrace: TraceEntry[] = [];
         const patchLiveMsg = () => {
           setMsgs((prev) => {
             const patch = {
               content: "",
               toolCalls: [...liveToolCalls],
+              trace: [...liveTrace],
               ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
             };
             return prev.length <= next.length
@@ -552,10 +563,12 @@ export function ChatPanel({
         };
         const onToolCall = (call: AgentToolCallTrace) => {
           liveToolCalls.push(call);
+          liveTrace.push({ kind: "tool_call", call });
           patchLiveMsg();
         };
         const onReasoning = (text: string) => {
           liveReasoning.push(text);
+          liveTrace.push({ kind: "reasoning", text });
           patchLiveMsg();
         };
         const res = await chatCompletionMcpStream(
@@ -568,11 +581,24 @@ export function ChatPanel({
         );
         const answer = res.choices?.[0]?.message?.content ?? "";
         const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
+        // The live trace is only trustworthy when every reported tool call
+        // actually streamed as its own onToolCall event -- if the caller
+        // resolved with a completion's docie_agent.tool_calls that never
+        // streamed (e.g. a non-streaming response), fall back to reasoning
+        // then tool calls in report order rather than silently dropping them.
+        const finalTrace: TraceEntry[] =
+          toolCalls.length === liveToolCalls.length
+            ? liveTrace
+            : [
+                ...liveReasoning.map((text): TraceEntry => ({ kind: "reasoning", text })),
+                ...toolCalls.map((call): TraceEntry => ({ kind: "tool_call", call })),
+              ];
         const finalMsg: ChatMsg = {
           role: "assistant",
           content: answer || t("(empty response)"),
           ...(toolCalls.length > 0 ? { toolCalls } : {}),
           ...(liveReasoning.length > 0 ? { reasoning: liveReasoning } : {}),
+          ...(finalTrace.length > 0 ? { trace: finalTrace } : {}),
         };
         setMsgs((prev) =>
           prev.length <= next.length
@@ -893,21 +919,29 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
-                {m.reasoning && m.reasoning.length > 0 && (
-                  <div className="w-full max-w-[85%] space-y-1">
-                    {m.reasoning.map((text, ri) => (
-                      <p
-                        key={ri}
-                        className="rounded-md border border-border bg-muted/20 px-2 py-1 text-xs italic text-muted-foreground"
-                      >
-                        {text}
-                      </p>
-                    ))}
-                  </div>
-                )}
-                {m.toolCalls && m.toolCalls.length > 0 && (
-                  <div className="w-full max-w-[85%]">
-                    <ToolCallTrace calls={m.toolCalls} />
+                {m.trace && m.trace.length > 0 && (
+                  <div className="w-full max-w-[85%] space-y-1.5">
+                    <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                      <Wrench className="h-3.5 w-3.5" />
+                      <T>Trace</T>
+                    </p>
+                    <ol className="space-y-1.5">
+                      {(() => {
+                        let toolIndex = -1;
+                        return m.trace.map((entry, i) =>
+                          entry.kind === "reasoning" ? (
+                            <li
+                              key={i}
+                              className="rounded-md border border-border bg-muted/20 px-2 py-1 text-xs italic text-muted-foreground"
+                            >
+                              {entry.text}
+                            </li>
+                          ) : (
+                            <ToolCallItem key={i} call={entry.call} index={++toolIndex} />
+                          ),
+                        );
+                      })()}
+                    </ol>
                   </div>
                 )}
               </div>

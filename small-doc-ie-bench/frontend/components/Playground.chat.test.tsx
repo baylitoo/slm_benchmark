@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SWRConfig } from "swr";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -433,5 +433,48 @@ describe("ChatPanel", () => {
     expect(
       screen.getByText("the user wants the TTC, so I should search the CVEC document"),
     ).toBeInTheDocument();
+  });
+
+  it("interleaves reasoning and tool calls in the order they streamed", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (_model, _messages, _servers, onToolCall, _sessionId, onReasoning) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          onReasoning?.("first, list the files");
+          onToolCall({
+            tool: "docs-search__list_files",
+            status: "ok",
+            latency_ms: 5,
+            arguments: "{}",
+            result: "[]",
+          });
+          onReasoning?.("now search for the total");
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "what's the total?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const traceLabel = await screen.findByText("Trace");
+    const traceContainer = traceLabel.closest("div");
+    if (!traceContainer) throw new Error("trace container not found");
+    const texts = within(traceContainer)
+      .getAllByRole("listitem")
+      .map((el) => el.textContent ?? "");
+    const firstReasoning = texts.findIndex((t) => t.includes("first, list the files"));
+    const toolCall = texts.findIndex((t) => t.includes("docs-search__list_files"));
+    const secondReasoning = texts.findIndex((t) => t.includes("now search for the total"));
+    expect(firstReasoning).toBeGreaterThanOrEqual(0);
+    expect(toolCall).toBeGreaterThan(firstReasoning);
+    expect(secondReasoning).toBeGreaterThan(toolCall);
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "42 EUR" } }] });
+    expect(await screen.findByText("42 EUR")).toBeInTheDocument();
   });
 });
