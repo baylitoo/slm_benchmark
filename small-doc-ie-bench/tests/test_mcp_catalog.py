@@ -166,8 +166,62 @@ def test_document_text_groups_lines_by_page(docs: Path) -> None:
     result = docs_search.document_text("note.txt")
     assert result == {
         "path": "note.txt",
+        "total_pages": 1,
         "pages": [{"page": 1, "text": "first line\nsecond line"}],
     }
+    assert "notice" not in result
+
+
+def _multi_page_extractor(monkeypatch, page_count: int, chars_per_page: int):
+    """Stub liteparse's extract() to return ``page_count`` pages of
+    ``chars_per_page`` characters each -- .txt extraction always lands
+    everything on page 1 (see ocr/base.py's text_to_blocks), so a real
+    multi-page document needs a controlled fake extractor instead."""
+    from docie_bench.ocr import factory as ocr_factory
+    from docie_bench.schemas.common import OCRBlock
+
+    def _page(n: int) -> OCRBlock:
+        text = f"page {n} " + "x" * chars_per_page
+        return OCRBlock(id=f"b{n}", text=text, page=n, source="manual")
+
+    class _Stub:
+        def extract(self, path: Path) -> list[OCRBlock]:
+            return [_page(n) for n in range(1, page_count + 1)]
+
+    monkeypatch.setattr(ocr_factory, "get_ocr_backend", lambda name: _Stub())
+
+
+_BIG_PAGE_CHARS = 2000
+
+
+def test_document_text_peeks_a_long_document_instead_of_returning_it_whole(
+    docs: Path, monkeypatch
+) -> None:
+    # A 150-page regulation must not overflow a small model's context --
+    # the default (no page range) call stops well short of the full body.
+    (docs / "big.pdf").write_bytes(b"%PDF-fake")
+    _multi_page_extractor(monkeypatch, page_count=4, chars_per_page=_BIG_PAGE_CHARS)
+
+    result = docs_search.document_text("big.pdf")
+
+    assert result["total_pages"] == 4
+    assert len(result["pages"]) < 4
+    assert "notice" in result
+    assert "search_text" in result["notice"]
+    assert "start_page" in result["notice"]
+
+
+def test_document_text_honors_an_explicit_page_range_regardless_of_budget(
+    docs: Path, monkeypatch
+) -> None:
+    (docs / "big.pdf").write_bytes(b"%PDF-fake")
+    _multi_page_extractor(monkeypatch, page_count=4, chars_per_page=_BIG_PAGE_CHARS)
+
+    result = docs_search.document_text("big.pdf", start_page=3, end_page=4)
+
+    assert result["total_pages"] == 4
+    assert [p["page"] for p in result["pages"]] == [3, 4]
+    assert "notice" not in result  # an explicit range is trusted, no budget applied
 
 
 def test_search_documents_across_all_or_one_file(docs: Path) -> None:
