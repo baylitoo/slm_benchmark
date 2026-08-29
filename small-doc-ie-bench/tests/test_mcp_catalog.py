@@ -235,6 +235,23 @@ def test_search_documents_across_all_or_one_file(docs: Path) -> None:
     assert docs_search.search_documents("invoice", path="b.txt") == []
 
 
+def test_search_documents_returns_one_match_per_page_with_the_full_page_as_snippet(
+    docs: Path,
+) -> None:
+    # liteparse splits a page into many small blocks (one per line for a
+    # .txt file) -- a page with the query on several lines must come back
+    # as ONE match with the whole page as context, not one near-duplicate
+    # per matching line.
+    (docs / "a.txt").write_text(
+        "Chapter I\nsome unrelated text\nChapter II mentions Chapter I\nabout Chapter III"
+    )
+    matches = docs_search.search_documents("chapter")
+    assert len(matches) == 1
+    assert matches[0]["page"] == 1
+    assert "Chapter I" in matches[0]["snippet"]
+    assert "Chapter III" in matches[0]["snippet"]
+
+
 def test_search_documents_rejects_empty_query(docs: Path) -> None:
     with pytest.raises(ValueError, match="must not be empty"):
         docs_search.search_documents("   ")

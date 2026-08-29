@@ -54,7 +54,14 @@ _DEFAULT_BACKEND = "substring"
 # an upload that isn't one of these suffixes would just sit in list_files
 # forever with nothing able to read it back.
 SUPPORTED_SUFFIXES = (".pdf", ".txt")
-_SNIPPET_CHARS = 300
+# The FULL hit page's text (joined from every extracted block on it, not
+# just the one block that matched), truncated to this many characters --
+# 300 gave the model a near-useless few-word fragment, especially on a
+# page with several short matching lines (liteparse splits a page into
+# many small blocks; a legal document's page can have "Chapter" match on
+# 5+ separate short lines). ~1500 is roughly half a dense page: enough
+# surrounding context to judge relevance without duplicating read_document.
+_SNIPPET_CHARS = 1500
 
 # Keyed by (resolved path, mtime_ns, size) so a changed file misses rather
 # than serving stale blocks. Agentic search is expected to hit the SAME
@@ -148,15 +155,21 @@ class SubstringSearchBackend(SearchBackend):
         needle = query.lower()
         matches: list[dict[str, Any]] = []
         for relative in targets:
-            for block in _extracted_blocks(resolve_document(relative)):
-                if needle in block.text.lower():
-                    matches.append(
-                        {
-                            "path": relative,
-                            "page": block.page,
-                            "snippet": block.text[:_SNIPPET_CHARS],
-                        }
-                    )
+            blocks = _extracted_blocks(resolve_document(relative))
+            page_lines: dict[int, list[str]] = {}
+            hit_pages: list[int] = []
+            for block in blocks:
+                page_lines.setdefault(block.page, []).append(block.text)
+                if needle in block.text.lower() and block.page not in hit_pages:
+                    hit_pages.append(block.page)
+            for page in hit_pages:
+                matches.append(
+                    {
+                        "path": relative,
+                        "page": page,
+                        "snippet": "\n".join(page_lines[page])[:_SNIPPET_CHARS],
+                    }
+                )
         return matches
 
 
