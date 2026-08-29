@@ -17,6 +17,7 @@ from docie_bench.serving.runtime import (
     RuntimeLaunchSpec,
     RuntimeUnavailableError,
     VLLMRuntime,
+    llamacpp_tool_calls_mismatch,
 )
 
 
@@ -130,6 +131,39 @@ def test_llamacpp_requires_gguf_and_builds_cpu_flags() -> None:
         "12",
     )
     assert adapter.probe(_spec(RuntimeKind.LLAMACPP)).compatible is False
+
+
+def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
+    # Field name/shape confirmed against llama.cpp's own source (#290):
+    # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
+    # caps.cpp, surfaced verbatim as GET /props's "chat_template_caps".
+    supported = {"chat_template_caps": {"supports_tool_calls": True}}
+    unsupported = {"chat_template_caps": {"supports_tool_calls": False}}
+    assert llamacpp_tool_calls_mismatch(supported) is None
+    assert "supports_tool_calls=false" in (llamacpp_tool_calls_mismatch(unsupported) or "")
+    # An older llama-server build (or a malformed /props) reports nothing --
+    # never treat "field absent" as a mismatch.
+    assert llamacpp_tool_calls_mismatch({}) is None
+
+
+def test_llamacpp_health_warns_on_capability_mismatch_but_stays_healthy(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {
+            "chat_template_caps": {"supports_tool_calls": False}
+        },
+    )
+    spec = _spec(RuntimeKind.LLAMACPP, alias="lfm2.5-vl-3b")
+
+    with caplog.at_level("WARNING"):
+        result = adapter.health(spec)
+
+    assert result.healthy is True  # the deployment IS up -- never fail health over this
+    assert any("supports_tool_calls=false" in r.message for r in caplog.records)
+    assert any("lfm2.5-vl-3b" in r.message for r in caplog.records)
 
 
 def test_start_uses_shell_false_and_tracks_lifecycle(tmp_path: Path) -> None:
