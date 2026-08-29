@@ -28,6 +28,7 @@ import {
   rerank,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
+  visionDeploymentNames,
   getDeployments,
   getStore,
   getFamilies,
@@ -161,7 +162,12 @@ export function Playground({
       {/* Every mode stays mounted (hidden, never unmounted) so an in-flight
           extraction stream or a chat/arena history survives switching modes. */}
       <div hidden={mode !== "chat"}>
-        <ChatPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
+        <ChatPanel
+          deployments={deployments}
+          selectable={selectable}
+          store={store}
+          onNavigate={onNavigate}
+        />
       </div>
       <div hidden={mode !== "arena"}>
         <ArenaPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
@@ -215,10 +221,12 @@ const VISION_PRESETS = [
 export function ChatPanel({
   deployments,
   selectable,
+  store,
   onNavigate,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   selectable: DeploymentRecord[];
+  store: ReturnType<typeof usePolling<StoreEntry[]>>;
   onNavigate?: NavigateToDeploy;
 }) {
   const { t } = useI18n();
@@ -249,6 +257,19 @@ export function ChatPanel({
     }
     if (!chatNames.includes(model)) setModel(liveNames[0] ?? chatNames[0]);
   }, [chatNames, liveNames, model]);
+
+  const visionNames = useMemo(() => visionDeploymentNames(store.data), [store.data]);
+  const modelHasVision = visionNames.has(model);
+  // Explicit toggle, not implicit-forever: an image/PDF attachment only
+  // rides the message as image_url content when this is on. Defaults to
+  // following the deployment's own capability (vision model -> on), but the
+  // user can flip it off even for a vision model (it's the expensive path)
+  // -- and it MUST be off for a non-vision model, since llama-server 500s on
+  // image content with no mmproj rather than silently ignoring it.
+  const [visionEnabled, setVisionEnabled] = useState(false);
+  useEffect(() => {
+    setVisionEnabled(modelHasVision);
+  }, [model, modelHasVision]);
 
   const [system, setSystem] = useState("");
   const mcpServers = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
@@ -417,15 +438,38 @@ export function ChatPanel({
       )
       .map((m) => ({ role: m.role, content: m.content }));
 
+    // Vision is now an explicit toggle (defaults to following the
+    // deployment's own capability, see the effect above) -- an image
+    // attachment with vision off has nothing to ride on (docs-search only
+    // accepts .pdf/.txt), and a PDF with vision off AND docs-search
+    // unselected has no path to reach the model either. Both are refused
+    // up front rather than silently sending a useless/erroring attachment
+    // (llama-server 500s on image content with no mmproj rather than
+    // ignoring it).
+    if (attached && !visionEnabled) {
+      if (!isPdfFile(attached)) {
+        setError(
+          "This deployment has no vision (or Vision is off) — image attachments need Vision on.",
+        );
+        return;
+      }
+      if (!selectedMcp.includes("docs-search")) {
+        setError(
+          "Vision is off and docs-search isn't selected — turn Vision on, or select docs-search so this PDF can be read.",
+        );
+        return;
+      }
+    }
+
     let newContent: unknown = trimmed;
     let displayLabel = trimmed;
     if (attached) {
       try {
         const b64 = await fileToBase64(attached);
-        // Additive, not instead-of: vision still reads the rendered page
-        // images below regardless. Only a real .pdf is worth indexing for
-        // docs-search (#296) — an image attachment has no text to search,
-        // and isn't a suffix docs-search accepts anyway.
+        // Additive, not instead-of, when vision IS on: vision still reads
+        // the rendered page images below regardless. Only a real .pdf is
+        // worth indexing for docs-search (#296) — an image attachment has
+        // no text to search, and isn't a suffix docs-search accepts anyway.
         if (isPdfFile(attached) && selectedMcp.includes("docs-search")) {
           try {
             const uploaded = await uploadSessionDocument(
@@ -439,17 +483,24 @@ export function ChatPanel({
             // still answers from the page images below either way.
           }
         }
-        const imageUrls = isPdfFile(attached)
-          ? (await renderDocument(b64, attached.name, dpi)).images
-          : [`data:${attached.type || "image/png"};base64,${b64}`];
-        if (imageUrls.length === 0) {
-          setError("The document produced no page images.");
-          return;
+        if (visionEnabled) {
+          const imageUrls = isPdfFile(attached)
+            ? (await renderDocument(b64, attached.name, dpi)).images
+            : [`data:${attached.type || "image/png"};base64,${b64}`];
+          if (imageUrls.length === 0) {
+            setError("The document produced no page images.");
+            return;
+          }
+          newContent = [
+            { type: "text", text: trimmed || "Describe this image." },
+            ...imageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+          ];
+        } else {
+          // Vision off, PDF, docs-search selected (guarded above): the
+          // upload just made the real file searchable -- no image content
+          // to send, the model reads it via docs-search's tools instead.
+          newContent = trimmed || "Look up the attached document via docs-search.";
         }
-        newContent = [
-          { type: "text", text: trimmed || "Describe this image." },
-          ...imageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
-        ];
         displayLabel = trimmed || `📎 ${attached.name}`;
       } catch {
         setError("Could not read the attached file.");
@@ -699,6 +750,34 @@ export function ChatPanel({
                 placeholder="(auto)"
               />
             </Field>
+          </div>
+        )}
+
+        {model && !extractionOn && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              <T>Vision:</T>
+            </span>
+            <button
+              type="button"
+              aria-pressed={visionEnabled}
+              disabled={busy || !modelHasVision}
+              onClick={() => setVisionEnabled((v) => !v)}
+              title={
+                modelHasVision
+                  ? t("An attached image/PDF rides the message as page images.")
+                  : t("This deployment has no vision support (no mmproj).")
+              }
+              className={cn(
+                "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+                visionEnabled
+                  ? "border-accent bg-accent text-accent-foreground"
+                  : "border-border bg-card text-muted-foreground hover:text-foreground",
+                !modelHasVision && "cursor-not-allowed opacity-50",
+              )}
+            >
+              {visionEnabled ? <T>on</T> : <T>off</T>}
+            </button>
           </div>
         )}
 
