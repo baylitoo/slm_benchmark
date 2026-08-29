@@ -5,7 +5,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatPanel } from "@/components/Playground";
 import { ToastProvider } from "@/components/Toast";
 import * as api from "@/lib/api";
-import type { DeploymentRecord } from "@/lib/api";
+import type { DeploymentRecord, StoreEntry } from "@/lib/api";
 import type { PollingState } from "@/lib/usePolling";
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -44,7 +44,7 @@ function makeDeployment(name: string): DeploymentRecord {
 
 const RECORDS = [makeDeployment("lfm2.5-350m")];
 
-function makePolling(data: DeploymentRecord[]): PollingState<DeploymentRecord[]> {
+function makePolling<T>(data: T): PollingState<T> {
   return {
     data,
     error: null,
@@ -56,13 +56,17 @@ function makePolling(data: DeploymentRecord[]): PollingState<DeploymentRecord[]>
   };
 }
 
-function renderChat(records: DeploymentRecord[] = RECORDS) {
+function renderChat(records: DeploymentRecord[] = RECORDS, storeEntries: StoreEntry[] = []) {
   // Fresh SWR cache per render -- ChatPanel's useAsync hooks (mcp servers,
   // dynamic schemas, routing policies) share module-global keys otherwise.
   return render(
     <SWRConfig value={{ provider: () => new Map() }}>
       <ToastProvider>
-        <ChatPanel deployments={makePolling(records)} selectable={records} />
+        <ChatPanel
+          deployments={makePolling(records)}
+          selectable={records}
+          store={makePolling(storeEntries)}
+        />
       </ToastProvider>
     </SWRConfig>,
   );
@@ -98,7 +102,7 @@ describe("ChatPanel", () => {
   });
 
   it("attaches an image and sends it as multimodal content (vision folded into chat)", async () => {
-    renderChat();
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
     const user = userEvent.setup();
     const file = new File(["fake-bytes"], "invoice.png", { type: "image/png" });
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
@@ -328,7 +332,10 @@ describe("ChatPanel", () => {
     vi.mocked(api.chatCompletion).mockResolvedValue({
       choices: [{ message: { role: "assistant", content: "described it" } }],
     });
-    renderChat();
+    // Vision on (this deployment is vision-capable) -- otherwise the new
+    // vision-off guard refuses to send an image attachment at all, and this
+    // test wants to reach chatCompletion to prove docs-search skips it.
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "docs-search" }));
 
@@ -340,5 +347,23 @@ describe("ChatPanel", () => {
 
     await waitFor(() => expect(api.chatCompletion).toHaveBeenCalledTimes(1));
     expect(api.uploadSessionDocument).not.toHaveBeenCalled();
+  });
+
+  it("refuses to send a PDF attachment on a non-vision model with docs-search unselected", async () => {
+    // The real bug this guards against: sending image content to a model
+    // with no mmproj 500s upstream. Vision defaults off for a non-vision
+    // deployment, and with no docs-search selected there's no other way
+    // for the model to see this file -- refuse up front instead.
+    renderChat();
+    const user = userEvent.setup();
+    const file = new File(["%PDF-fake"], "invoice.pdf", { type: "application/pdf" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+    await user.type(screen.getByPlaceholderText(/Type a message/), "who signed this?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/Vision is off/)).toBeInTheDocument();
+    expect(api.chatCompletionStream).not.toHaveBeenCalled();
+    expect(api.chatCompletion).not.toHaveBeenCalled();
   });
 });
