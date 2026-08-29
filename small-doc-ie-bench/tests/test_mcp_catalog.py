@@ -392,7 +392,14 @@ def client(registry_path: Path) -> TestClient:
 
 def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_path: Path) -> None:
     entries = {e["name"]: e for e in client.get("/v1/mcp/catalog").json()["entries"]}
-    assert set(entries) == {"calculator", "dates", "web-fetch", "docs-search", "code-interpreter"}
+    assert set(entries) == {
+        "calculator",
+        "dates",
+        "web-fetch",
+        "docs-search",
+        "code-interpreter",
+        "call-llm",
+    }
     assert not entries["calculator"]["enabled"]
     assert entries["web-fetch"]["params"][0]["name"] == "allowed_hosts"
     docs_search_params = {p["name"] for p in entries["docs-search"]["params"]}
