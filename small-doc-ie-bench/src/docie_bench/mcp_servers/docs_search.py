@@ -48,6 +48,13 @@ from docie_bench.schemas.common import OCRBlock
 
 DOCS_DIR_ENV = "DOCIE_MCP_DOCS_SEARCH_DIR"
 BACKEND_ENV = "DOCIE_MCP_DOCS_SEARCH_BACKEND"
+# Operator-tunable, same shape as DOCS_DIR_ENV/BACKEND_ENV -- these tune how
+# much text one tool result feeds back into the model's context, not what
+# the model can ask for, so they're catalog params (see
+# mcp_catalog.CATALOG["docs-search"]), never per-call tool arguments.
+SNIPPET_WINDOW_ENV = "DOCIE_MCP_DOCS_SEARCH_SNIPPET_WINDOW"
+SNIPPET_MAX_CHARS_ENV = "DOCIE_MCP_DOCS_SEARCH_SNIPPET_MAX_CHARS"
+PEEK_CHAR_BUDGET_ENV = "DOCIE_MCP_DOCS_SEARCH_PEEK_CHAR_BUDGET"
 _DEFAULT_DOCS_DIR = "data/agent-docs"
 _DEFAULT_BACKEND = "substring"
 # Public: also the write-side allowlist for mcp_session_documents (#296) --
@@ -64,6 +71,19 @@ _SNIPPET_WINDOW = 400
 # hits (a common word) could otherwise join many windows into something
 # still too large.
 _SNIPPET_CHARS_MAX = 4000
+
+
+def _int_env(name: str, default: int) -> int:
+    """``default`` unless ``name`` is set to a valid int -- an unset or
+    malformed override falls back rather than crashing a tool call over an
+    operator typo in an env var."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 # Keyed by (resolved path, mtime_ns, size) so a changed file misses rather
 # than serving stale blocks. Agentic search is expected to hit the SAME
@@ -151,8 +171,10 @@ class SearchBackend(ABC):
 
 def _windowed_snippet(text: str, needle: str) -> str:
     """Every occurrence of ``needle`` in ``text``, each with
-    ``_SNIPPET_WINDOW`` characters of context on both sides -- overlapping
+    ``SNIPPET_WINDOW_ENV`` characters of context on both sides -- overlapping
     windows merge into one span instead of duplicating the shared text."""
+    window = _int_env(SNIPPET_WINDOW_ENV, _SNIPPET_WINDOW)
+    max_chars = _int_env(SNIPPET_MAX_CHARS_ENV, _SNIPPET_CHARS_MAX)
     lower = text.lower()
     spans: list[tuple[int, int]] = []
     start = 0
@@ -160,8 +182,8 @@ def _windowed_snippet(text: str, needle: str) -> str:
         idx = lower.find(needle, start)
         if idx == -1:
             break
-        lo = max(0, idx - _SNIPPET_WINDOW)
-        hi = min(len(text), idx + len(needle) + _SNIPPET_WINDOW)
+        lo = max(0, idx - window)
+        hi = min(len(text), idx + len(needle) + window)
         spans.append((lo, hi))
         start = idx + len(needle)
     merged: list[tuple[int, int]] = []
@@ -170,7 +192,7 @@ def _windowed_snippet(text: str, needle: str) -> str:
             merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
         else:
             merged.append((lo, hi))
-    return "…".join(text[lo:hi] for lo, hi in merged)[:_SNIPPET_CHARS_MAX]
+    return "…".join(text[lo:hi] for lo, hi in merged)[:max_chars]
 
 
 class SubstringSearchBackend(SearchBackend):
@@ -300,7 +322,7 @@ def document_text(
         selected = page_numbers
     else:
         selected = []
-        budget = PEEK_CHAR_BUDGET
+        budget = _int_env(PEEK_CHAR_BUDGET_ENV, PEEK_CHAR_BUDGET)
         for p in page_numbers:
             if selected and len(page_texts[p]) > budget:
                 break

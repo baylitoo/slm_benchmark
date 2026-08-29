@@ -111,6 +111,35 @@ CATALOG: dict[str, CatalogEntry] = {
                         "error the first time search_text is called."
                     ),
                 ),
+                CatalogParam(
+                    name="snippet_window",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_SNIPPET_WINDOW",
+                    description=(
+                        "Characters of context kept on each side of a "
+                        "search_text match. Defaults to 400 if left blank -- "
+                        "lower this if long-document searches are filling "
+                        "the model's context across several rounds."
+                    ),
+                ),
+                CatalogParam(
+                    name="snippet_max_chars",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_SNIPPET_MAX_CHARS",
+                    description=(
+                        "Hard ceiling on one match's snippet, in case many "
+                        "scattered hits on the same page merge into a large "
+                        "span. Defaults to 4000 if left blank."
+                    ),
+                ),
+                CatalogParam(
+                    name="peek_char_budget",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_PEEK_CHAR_BUDGET",
+                    description=(
+                        "Characters returned by read_document's default "
+                        "'peek' (no page range) before it stops and points "
+                        "the model at search_text instead. Defaults to 4000 "
+                        "if left blank."
+                    ),
+                ),
             ),
         ),
         CatalogEntry(
