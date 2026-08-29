@@ -149,6 +149,50 @@ CATALOG: dict[str, CatalogEntry] = {
                 ),
             ),
         ),
+        CatalogEntry(
+            name="call-llm",
+            title="Call LLM (sub-agent dispatch)",
+            description=(
+                "Dispatch a scoped sub-task -- e.g. 'extract the answer from "
+                "this search result' -- to a separate, typically cheap model "
+                "instead of reasoning about a large context dump in the "
+                "orchestrating model's own context. One completion, no "
+                "tools, no recursion (#285)."
+            ),
+            module="docie_bench.mcp_servers.call_llm",
+            tools=("call_llm",),
+            params=(
+                CatalogParam(
+                    name="default_model_profile",
+                    env_var="DOCIE_MCP_CALL_LLM_DEFAULT_PROFILE",
+                    description=(
+                        "model_profile every call_llm call dispatches to "
+                        "unless the caller overrides it per-call. Required "
+                        "unless every caller always passes model_profile "
+                        "explicitly."
+                    ),
+                ),
+                CatalogParam(
+                    name="api_base",
+                    env_var="DOCIE_MCP_CALL_LLM_API_BASE",
+                    description=(
+                        "Base URL of docie's own OpenAI-compatible API -- "
+                        "the sub-request loops back through it. Defaults to "
+                        "'http://127.0.0.1:8080' if left blank, correct when "
+                        "this server runs in the same container as the api "
+                        "process (the normal case)."
+                    ),
+                ),
+                CatalogParam(
+                    name="api_key",
+                    env_var="DOCIE_MCP_CALL_LLM_API_KEY",
+                    description=(
+                        "API key for the loopback request when AUTH_REQUIRED "
+                        "is on. Must be one of the operator's API_KEYS."
+                    ),
+                ),
+            ),
+        ),
     )
 }
 
