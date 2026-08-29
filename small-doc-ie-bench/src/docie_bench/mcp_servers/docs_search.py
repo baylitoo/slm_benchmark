@@ -218,19 +218,74 @@ def list_documents() -> list[str]:
     )
 
 
-def document_text(relative: str) -> dict[str, Any]:
-    """One document's full text, grouped by page, in reading order."""
+# A "peek" (no page range requested, on a document long enough to matter)
+# stops accumulating pages once their combined text would exceed this many
+# characters -- character budget, not a page count, because page density
+# varies wildly (a dense two-column legal page can hold 10x a sparse one).
+# Sized to comfortably fit a small model's context alongside everything
+# else in the conversation, while still being long enough to see a
+# document's structure (title, table of contents, opening section).
+PEEK_CHAR_BUDGET = 4000
+
+
+def document_text(
+    relative: str, start_page: int | None = None, end_page: int | None = None
+) -> dict[str, Any]:
+    """One document's text, grouped by page, in reading order.
+
+    With no page range and the document is long, returns a PEEK (pages
+    from the start, up to ``PEEK_CHAR_BUDGET`` characters) plus a
+    ``notice`` naming the real page count and how to read more --
+    never the whole body of a long document unconditionally, which would
+    overflow a small model's context window on something like a
+    150-page regulation. Pass ``start_page``/``end_page`` (1-indexed,
+    inclusive) to read a specific section once ``search_text`` has
+    located it -- an explicit range is trusted as-is, no budget applied.
+    """
     path = resolve_document(relative)
     blocks = _extracted_blocks(path)
     pages: dict[int, list[str]] = {}
     for block in blocks:
         pages.setdefault(block.page, []).append(block.text)
-    return {
+    page_numbers = sorted(pages)
+    page_texts = {page: "\n".join(lines) for page, lines in pages.items()}
+    total_pages = len(page_numbers)
+
+    notice: str | None = None
+    if start_page is not None or end_page is not None:
+        lo = start_page if start_page is not None else page_numbers[0]
+        hi = end_page if end_page is not None else page_numbers[-1]
+        selected = [p for p in page_numbers if lo <= p <= hi]
+    elif total_pages <= 1:
+        selected = page_numbers
+    else:
+        selected = []
+        budget = PEEK_CHAR_BUDGET
+        for p in page_numbers:
+            if selected and len(page_texts[p]) > budget:
+                break
+            selected.append(p)
+            budget -= len(page_texts[p])
+            if budget <= 0:
+                break
+        if len(selected) < total_pages:
+            notice = (
+                f"This document has {total_pages} pages; showing pages "
+                f"{selected[0]}-{selected[-1]} as a peek (a long document isn't "
+                "returned in full, to avoid overflowing your context). Use "
+                "search_text to find the pages that actually answer the "
+                "question, then call read_document again with "
+                "start_page/end_page to read that specific section."
+            )
+
+    result: dict[str, Any] = {
         "path": relative,
-        "pages": [
-            {"page": page, "text": "\n".join(lines)} for page, lines in sorted(pages.items())
-        ],
+        "total_pages": total_pages,
+        "pages": [{"page": p, "text": page_texts[p]} for p in selected],
     }
+    if notice is not None:
+        result["notice"] = notice
+    return result
 
 
 def search_documents(query: str, path: str | None = None) -> list[dict[str, Any]]:
@@ -261,13 +316,28 @@ def build_server() -> Any:
         return list_documents()
 
     @server.tool()
-    def read_document(path: str) -> dict[str, Any]:
-        """Read one document's full text, grouped by page. `path` MUST be
-        one of the exact strings returned by list_files -- never invent,
-        guess, or construct a path from an id/number seen elsewhere. PDFs
-        are parsed via liteparse (PDFium text + OCR fallback for scanned
-        pages)."""
-        return document_text(path)
+    def read_document(
+        path: str, start_page: int | None = None, end_page: int | None = None
+    ) -> dict[str, Any]:
+        """Read one document's text, grouped by page. `path` MUST be one of
+        the exact strings returned by list_files -- never invent, guess, or
+        construct a path from an id/number seen elsewhere. PDFs are parsed
+        via liteparse (PDFium text + OCR fallback for scanned pages).
+
+        For a LONG document (call this once with no page range first --
+        the response's `total_pages` tells you how long it really is):
+        1. Peek: call with no start_page/end_page. On a long document you
+           get the opening pages plus a `notice`, not the whole body --
+           never assume a short response means a short document.
+        2. Search: call search_text with a specific query to find which
+           page(s) actually answer the question. Each hit reports its page.
+        3. Read: call read_document again with start_page/end_page set to
+           the page(s) search_text pointed at, to read that section in full.
+        Formulate the search query from what you actually need to answer,
+        not a generic re-read of the whole document -- the question may
+        need several distinct searches (several facts on different pages)
+        before you have everything required to answer it."""
+        return document_text(path, start_page, end_page)
 
     @server.tool()
     def search_text(query: str, path: str | None = None) -> list[dict[str, Any]]:
@@ -275,7 +345,9 @@ def build_server() -> Any:
         exact strings from list_files, never invented) or every document if
         `path` is omitted. Returns one match per hit page: {path, page, snippet}.
         Search before you answer -- don't guess at content you haven't read
-        or found."""
+        or found. On a long document, use a hit's `page` as read_document's
+        start_page/end_page to read that section in full rather than
+        answering from the snippet alone."""
         return search_documents(query, path)
 
     return server
