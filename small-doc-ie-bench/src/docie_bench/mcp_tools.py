@@ -385,8 +385,13 @@ async def _eager_list_context(
                 {},
                 result,
             )
-        lines.append(f"{server_name}.{tool_name}(): {result}")
-    return "\n".join(lines) if lines else None
+        lines.append(
+            f"{server_name}.{tool_name}() was already called for you. Its result -- "
+            f"the ONLY valid identifiers for {server_name} right now -- is:\n{result}\n"
+            f"Use one of these EXACTLY as returned whenever a {server_name} tool asks "
+            "for an identifier. Never modify, translate, or construct a different one."
+        )
+    return "\n\n".join(lines) if lines else None
 
 
 def make_trace_recorder(
