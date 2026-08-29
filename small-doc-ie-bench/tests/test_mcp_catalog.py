@@ -224,6 +224,17 @@ def test_document_text_honors_an_explicit_page_range_regardless_of_budget(
     assert "notice" not in result  # an explicit range is trusted, no budget applied
 
 
+def test_document_text_peek_budget_is_operator_tunable(docs: Path, monkeypatch) -> None:
+    (docs / "big.pdf").write_bytes(b"%PDF-fake")
+    _multi_page_extractor(monkeypatch, page_count=4, chars_per_page=_BIG_PAGE_CHARS)
+    page_len = len("page 1 ") + _BIG_PAGE_CHARS  # matches _multi_page_extractor's format
+    monkeypatch.setenv(docs_search.PEEK_CHAR_BUDGET_ENV, str(page_len * 3))
+
+    result = docs_search.document_text("big.pdf")
+
+    assert len(result["pages"]) == 3
+
+
 def test_search_documents_across_all_or_one_file(docs: Path) -> None:
     (docs / "a.txt").write_text("the invoice total is 400 EUR")
     (docs / "b.txt").write_text("nothing relevant here")
@@ -263,6 +274,15 @@ def test_search_documents_snippet_stays_windowed_on_a_large_page(docs: Path) -> 
     assert "needle" in snippet
     assert len(snippet) < len(text)
     assert len(snippet) <= 2 * docs_search._SNIPPET_WINDOW + len("needle")
+
+
+def test_search_documents_snippet_window_is_operator_tunable(docs: Path, monkeypatch) -> None:
+    monkeypatch.setenv(docs_search.SNIPPET_WINDOW_ENV, "10")
+    filler = "x" * 5000
+    text = f"{filler} needle {filler}"
+    (docs / "big.txt").write_text(text)
+    matches = docs_search.search_documents("needle")
+    assert len(matches[0]["snippet"]) <= 2 * 10 + len("needle")
 
 
 def test_search_documents_rejects_empty_query(docs: Path) -> None:
@@ -554,7 +574,13 @@ def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_pa
     assert not entries["calculator"]["enabled"]
     assert entries["web-fetch"]["params"][0]["name"] == "allowed_hosts"
     docs_search_params = {p["name"] for p in entries["docs-search"]["params"]}
-    assert docs_search_params == {"docs_dir", "backend"}
+    assert docs_search_params == {
+        "docs_dir",
+        "backend",
+        "snippet_window",
+        "snippet_max_chars",
+        "peek_char_budget",
+    }
     ci_params = {p["name"]: p["required"] for p in entries["code-interpreter"]["params"]}
     assert ci_params == {"url": False, "token": True}
 
