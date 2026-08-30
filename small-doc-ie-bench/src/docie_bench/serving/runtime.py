@@ -87,6 +87,10 @@ class RuntimeLaunchSpec:
     api_key_env: str | None = None
     extra_args: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
+    # llama.cpp-specific multi-slot launch flags (#248/#321): other runtimes'
+    # build_command never reads these.
+    n_parallel: int = 1
+    cache_reuse: int | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -111,6 +115,10 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("extra_args must not contain NUL bytes")
         if any("\x00" in key or "\x00" in value for key, value in self.env.items()):
             raise RuntimeConfigurationError("environment entries must not contain NUL bytes")
+        if self.n_parallel < 1:
+            raise RuntimeConfigurationError("n_parallel must be positive")
+        if self.cache_reuse is not None and self.cache_reuse < 1:
+            raise RuntimeConfigurationError("cache_reuse must be positive")
 
 
 @dataclass(frozen=True)
@@ -672,9 +680,20 @@ class LlamaCppRuntime(RuntimeAdapter):
             "--jinja",
         ]
         if spec.context_length is not None:
-            command.extend(["--ctx-size", str(spec.context_length)])
+            ctx_size = spec.context_length
+            if spec.n_parallel > 1:
+                # llama-server splits --ctx-size across slots (effective
+                # per-slot context = ctx_size / n_parallel), so the total
+                # budget must be scaled up to give each slot the configured
+                # context_length.
+                ctx_size = spec.context_length * spec.n_parallel
+            command.extend(["--ctx-size", str(ctx_size)])
+        if spec.n_parallel > 1:
+            command.extend(["--parallel", str(spec.n_parallel)])
         if spec.cpu_threads is not None:
             command.extend(["--threads", str(spec.cpu_threads)])
+        if spec.cache_reuse is not None:
+            command.extend(["--cache-reuse", str(spec.cache_reuse)])
         command.extend(spec.extra_args)
         return tuple(command)
 

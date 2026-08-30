@@ -274,6 +274,10 @@ class WhatIfPlanItem(BaseModel):
 
 class WhatIfRequest(BaseModel):
     plan: list[WhatIfPlanItem] = Field(min_length=1, max_length=100)
+    # Call-level (not per-item): mirrors compute_whatif's own n_parallel
+    # parameter, which prices every row in the plan under the same llama-server
+    # slot count (#248/#321) rather than per-row.
+    n_parallel: int = Field(default=1, ge=1, le=32)
 
 
 def _sizing_inputs() -> tuple[
@@ -407,6 +411,7 @@ async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
             placements,
             footprints=FootprintStore(),
             margin_fraction=get_settings().serving_sizing_margin_fraction,
+            n_parallel=request.n_parallel,
         )
     except (UnknownModelError, UnpriceableModelError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -775,15 +780,18 @@ def _gib(value: int) -> str:
 
 
 def admit_replica_ram(
-    model: str, added_instances: int, context_length: int | None
+    model: str,
+    added_instances: int,
+    context_length: int | None,
+    n_parallel: int = 1,
 ) -> None:
     """RAM admission gate for launching ``added_instances`` MORE instances of
     ``model``: N x the per-instance footprint must fit the sizing budget.
 
     Prices with the SAME engine as ``/sizing/whatif`` (``compute_whatif`` —
-    footprint formula, safety margin, loading-placement reservation), so this
-    gate and the Sizing tab can never disagree. Raises a 422 with the explicit
-    deficit when the plan PROVABLY does not fit.
+    footprint formula, safety margin, loading-placement reservation, and now
+    also ``n_parallel``), so this gate and the Sizing tab can never disagree.
+    Raises a 422 with the explicit deficit when the plan PROVABLY does not fit.
 
     Fail-open by design when nothing can be proven: no catalog / no (or stale)
     node snapshot / an unpriceable model all admit the deploy — the serving
@@ -817,6 +825,7 @@ def admit_replica_ram(
             placements,
             footprints=FootprintStore(),
             margin_fraction=get_settings().serving_sizing_margin_fraction,
+            n_parallel=n_parallel,
         )
     except (UnknownModelError, UnpriceableModelError):
         return
@@ -842,6 +851,10 @@ class ScaleRequest(BaseModel):
 
     replicas: int = Field(ge=1, le=16)
     context_length: int | None = None
+    # llama-server request slots (#248/#321): 32 is an operator sanity ceiling,
+    # not a llama.cpp hard limit.
+    n_parallel: int = Field(default=1, ge=1, le=32)
+    cache_reuse: int | None = Field(default=None, ge=1)
 
 
 @router.post("/store/{name}/scale")
@@ -883,17 +896,23 @@ async def scale_store_model(
     to_remove = replica_names_to_remove(name, existing, request.replicas)
     current = count_replica_deployments(name, existing)
     if to_add:
-        admit_replica_ram(name, len(to_add), request.context_length)
+        admit_replica_ram(
+            name, len(to_add), request.context_length, n_parallel=request.n_parallel
+        )
         ctx_len = request.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH
         channel = f"scale:{uuid.uuid4().hex}"
         event_ids: list[str] = []
         for deployment_name in to_add:
-            data = {
+            data: dict[str, Any] = {
                 "model": name,
                 "deployment_name": deployment_name,
                 "context_length": ctx_len,
                 "channel": channel,
             }
+            if request.n_parallel > 1:
+                data["n_parallel"] = request.n_parallel
+            if request.cache_reuse is not None:
+                data["cache_reuse"] = request.cache_reuse
             ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
             event_ids.extend(ids)
         return {

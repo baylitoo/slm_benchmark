@@ -135,6 +135,77 @@ def test_llamacpp_requires_gguf_and_builds_cpu_flags() -> None:
     assert adapter.probe(_spec(RuntimeKind.LLAMACPP)).compatible is False
 
 
+def test_llamacpp_n_parallel_default_is_byte_identical_to_before() -> None:
+    """n_parallel=1 (the default) must never emit --parallel and must never
+    scale --ctx-size -- this is the existing, already-tested default path."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        context_length=4096,
+        cpu_threads=12,
+    )
+
+    assert adapter.build_command(spec) == (
+        "llama-server",
+        "--model",
+        "C:/models/invoice.gguf",
+        "--alias",
+        "invoice",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--jinja",
+        "--ctx-size",
+        "4096",
+        "--threads",
+        "12",
+    )
+
+
+def test_llamacpp_n_parallel_scales_ctx_size_and_appends_parallel_flag() -> None:
+    """--ctx-size is a SHARED total budget divided across slots by llama-server
+    (confirmed against the ggml-org/llama.cpp server README): giving each slot
+    the configured context_length requires ctx_size = context_length *
+    n_parallel."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        context_length=8192,
+        n_parallel=4,
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--ctx-size" in command
+    assert command[command.index("--ctx-size") + 1] == "32768"
+    assert "--parallel" in command
+    assert command[command.index("--parallel") + 1] == "4"
+
+
+def test_llamacpp_cache_reuse_emits_flag() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        cache_reuse=256,
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--cache-reuse" in command
+    assert command[command.index("--cache-reuse") + 1] == "256"
+
+
+def test_launch_spec_rejects_invalid_n_parallel_and_cache_reuse() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="n_parallel"):
+        _spec(RuntimeKind.LLAMACPP, n_parallel=0)
+    with pytest.raises(RuntimeConfigurationError, match="cache_reuse"):
+        _spec(RuntimeKind.LLAMACPP, cache_reuse=0)
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in

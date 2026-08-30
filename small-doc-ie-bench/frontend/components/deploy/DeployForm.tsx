@@ -68,6 +68,10 @@ export function DeployForm({
   // Target total instances (replicas) of the store model, load-balanced behind
   // one model id. Only sent for Auto (store-entry) deploys when > 1.
   const [replicas, setReplicas] = useState("1");
+  // llama-server request slots (#248/#321). Only meaningful for llama.cpp —
+  // shown for Auto (which resolves to llama.cpp for GGUF store models) and
+  // for an explicit "llamacpp" runtime pick, never for vllm/ollama/remote.
+  const [nParallel, setNParallel] = useState("1");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,6 +105,10 @@ export function DeployForm({
   // chip that would wrongly trigger the explicit-runtime serve() route.
   const backends = (selectedEntry?.available_backends ?? []).filter((b) => b !== "encoder");
   const isEncoderEntry = (selectedEntry?.available_backends ?? []).includes("encoder");
+  // Parallel slots is a llama.cpp-only launch flag: Auto resolves to
+  // llama.cpp for GGUF store models, and an explicit runtime pick must be
+  // "llamacpp" — never vllm/ollama/remote, where the flag is meaningless.
+  const showNParallel = runtime === "" || runtime === "llamacpp";
 
   function pick(modelName: string) {
     setSelected(modelName);
@@ -137,6 +145,7 @@ export function DeployForm({
         ...(contextLength.trim() ? { context_length: Number(contextLength) } : {}),
         ...(maxTokens.trim() ? { max_tokens: Number(maxTokens) } : {}),
         ...(replicaCount > 1 ? { replicas: replicaCount } : {}),
+        ...(showNParallel && Number(nParallel) > 1 ? { n_parallel: Number(nParallel) } : {}),
       };
       const res = await deployModel(payload);
       setTrigger(res);
@@ -303,6 +312,22 @@ export function DeployForm({
                       value={replicas}
                       onChange={(e) => setReplicas(e.target.value)}
                       placeholder="1"
+                    />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field
+                    label="Parallel slots"
+                    hint="N parallel request slots — context is divided per-slot, so this multiplies total KV RAM by N."
+                  >
+                    <TextInput
+                      type="number"
+                      min={1}
+                      max={32}
+                      value={nParallel}
+                      onChange={(e) => setNParallel(e.target.value)}
+                      placeholder="1"
+                      aria-label="Parallel slots"
                     />
                   </Field>
                 )}

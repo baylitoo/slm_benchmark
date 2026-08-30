@@ -17,6 +17,12 @@ export interface DeployRequest {
    * deploy per missing replica on auto-allocated ports — store-entry (Auto)
    * deploys only, and incompatible with an explicit name/port. */
   replicas?: number;
+  /** llama-server request slots (default 1, meaningless for non-llamacpp
+   * runtimes). context_length is divided across slots by the runtime, so the
+   * caller must size context_length for a single slot's worth of context. */
+  n_parallel?: number;
+  /** llama-server --cache-reuse: min chunk size to reuse from KV cache. */
+  cache_reuse?: number;
   [k: string]: unknown;
 }
 
