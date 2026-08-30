@@ -13,6 +13,9 @@ export interface DeployRequest {
   port?: number;
   context_length?: number;
   max_tokens?: number;
+  /** TARGET total instances of the store model (default 1). >1 fans out one
+   * deploy per missing replica on auto-allocated ports — store-entry (Auto)
+   * deploys only, and incompatible with an explicit name/port. */
   replicas?: number;
   [k: string]: unknown;
 }
@@ -126,6 +129,12 @@ export interface DeploymentRecord {
    * observed_available=false when the database is unreachable. */
   observed?: ObservedPlacement | null;
   observed_available?: boolean;
+  /** The shared launch alias this record's requests are load-balanced behind
+   * (the base store name for a scaled model). */
+  replica_group?: string | null;
+  /** How many deployment records share `replica_group` right now (1 = not
+   * scaled). Derived server-side from the records, never stored. */
+  replicas?: number;
   [k: string]: unknown;
 }
 

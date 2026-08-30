@@ -161,6 +161,15 @@ def _observed_placements() -> dict[str, dict[str, Any]] | None:
         return None
 
 
+def _replica_base(record: dict[str, Any]) -> str | None:
+    """The routable base a record belongs to: the launch ``--alias`` (shared by
+    every replica of a scaled store model), falling back to the record name."""
+    spec = record.get("spec") or {}
+    launch = spec.get("launch") or {}
+    base = launch.get("alias") or spec.get("name")
+    return str(base) if base else None
+
+
 @router.get("/deployments")
 async def list_deployments() -> Any:
     """Deployment records with their live observed state.
@@ -170,11 +179,20 @@ async def list_deployments() -> Any:
     cycle — ``None`` per record when no observation has been published yet,
     and ``observed_available: false`` on all records when the observed state
     is unreachable (desired state only).
+
+    Replicas: each record also carries ``replica_group`` (the shared launch
+    alias its requests are load-balanced behind) and ``replicas`` (how many
+    records share that group right now). Derived from the records, never
+    stored — no schema migration.
     """
     records = await _control_plane().list_deployments()
     observed = _observed_placements()
     if not isinstance(records, list):
         return records
+    group_sizes: dict[str, int] = {}
+    for record in records:
+        if isinstance(record, dict) and (base := _replica_base(record)):
+            group_sizes[base] = group_sizes.get(base, 0) + 1
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -183,6 +201,9 @@ async def list_deployments() -> Any:
         record["observed_available"] = observed is not None
         obs = observed.get(name) if observed and name else None
         record["observed"] = obs
+        base = _replica_base(record)
+        record["replica_group"] = base
+        record["replicas"] = group_sizes.get(base, 1) if base else 1
         # Derived, not stored (no migration): the published last_error already
         # carries the killing signal (OOM) and the fit-check reason. The
         # observed row's last_error is the superset (the reconciler appends the
@@ -737,6 +758,85 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     return await _fire_lifecycle_event(name, event=UNLOAD_EVENT, prefix="unload")
 
 
+async def existing_deployment_names() -> list[str]:
+    """Every deployment record name in the shared on-disk state (replica math
+    input for the scale endpoint and the replicated-deploy trigger)."""
+    records = await _control_plane().list_deployments()
+    return [
+        str(spec_name)
+        for record in (records if isinstance(records, list) else [])
+        if isinstance(record, dict)
+        and (spec_name := (record.get("spec") or {}).get("name"))
+    ]
+
+
+def _gib(value: int) -> str:
+    return f"{value / (1024 ** 3):.1f} GiB"
+
+
+def admit_replica_ram(
+    model: str, added_instances: int, context_length: int | None
+) -> None:
+    """RAM admission gate for launching ``added_instances`` MORE instances of
+    ``model``: N x the per-instance footprint must fit the sizing budget.
+
+    Prices with the SAME engine as ``/sizing/whatif`` (``compute_whatif`` —
+    footprint formula, safety margin, loading-placement reservation), so this
+    gate and the Sizing tab can never disagree. Raises a 422 with the explicit
+    deficit when the plan PROVABLY does not fit.
+
+    Fail-open by design when nothing can be proven: no catalog / no (or stale)
+    node snapshot / an unpriceable model all admit the deploy — the serving
+    container's live per-instance fit gate (``lifecycle.assess_fit``) remains
+    the runtime backstop, and refusing on ignorance would turn every degraded
+    observability state into a deploy outage.
+    """
+    if added_instances < 1:
+        return
+    from docie_bench.serving.resources import FootprintStore
+    from docie_bench.serving.sizing import (
+        UnknownModelError,
+        UnpriceableModelError,
+        compute_whatif,
+    )
+
+    models, snapshot, placements, _detail = _sizing_inputs()
+    if not models or snapshot is None:
+        return
+    try:
+        report = compute_whatif(
+            models,
+            snapshot,
+            [
+                {
+                    "model": model,
+                    "instances": added_instances,
+                    "context_length": context_length,
+                }
+            ],
+            placements,
+            footprints=FootprintStore(),
+            margin_fraction=get_settings().serving_sizing_margin_fraction,
+        )
+    except (UnknownModelError, UnpriceableModelError):
+        return
+    if report.ok is False:
+        item = report.per_item[0]
+        free = report.free_effective_bytes or 0
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"not enough RAM to launch {added_instances} more instance(s) of "
+                f"{model!r}: {added_instances} x {_gib(item.footprint_bytes)} per "
+                f"instance = {_gib(report.total_predicted_bytes)} needed, but only "
+                f"{_gib(max(free, 0))} is available after the safety margin and "
+                f"loading reservations (short by {_gib(report.deficit_bytes or 0)}). "
+                f"Lower the replica count, or free RAM by unloading/deleting a "
+                f"deployment (see the Sizing tab)."
+            ),
+        )
+
+
 class ScaleRequest(BaseModel):
     """Body of POST /store/{name}/scale — the TARGET total replica count."""
 
@@ -753,57 +853,87 @@ async def scale_store_model(
     Deploying the SAME store model several times means several records — the
     first is the bare store name, the rest are ``<name>-2``/``-3``/… on their
     own auto-allocated ports (control_plane.replica_names_to_add). Idempotent:
-    if already at/above the target, nothing is spawned. This fans out one
-    ordinary ``serving/deploy.requested`` per new replica (each carrying
+    already at the target, nothing happens.
+
+    Scale UP first passes the RAM admission gate (``admit_replica_ram`` — N x
+    per-instance footprint against the live sizing budget; a provable deficit
+    is a 422, an unknowable budget admits and leaves the serving container's
+    fit gate as the backstop), then fans out one ordinary
+    ``serving/deploy.requested`` per new replica (each carrying
     ``deployment_name``), so every deploy reuses the proven single-deploy job —
     timeouts, port reallocation, placement recording — with no long-running
-    scale job. The fit check lives in the Sizing surface the UI drives; the
-    reconciler is the runtime backstop.
+    scale job.
+
+    Scale DOWN fans out one ``serving/delete.requested`` per surplus replica —
+    highest suffix first, the bare base record always survives — reusing the
+    real teardown job (kill process, free port, DELETE placement row), so a
+    drained replica leaves the load-balancing rotation exactly like a deleted
+    deployment.
     """
     del tenant  # authenticated principal required; ops surface, no per-tenant scoping
     from docie_bench.serving.control_plane import (
         count_replica_deployments,
         replica_names_to_add,
+        replica_names_to_remove,
     )
     from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
-    records = await _control_plane().list_deployments()
-    existing = [
-        str(spec_name)
-        for record in (records if isinstance(records, list) else [])
-        if isinstance(record, dict)
-        and (spec_name := (record.get("spec") or {}).get("name"))
-    ]
+    existing = await existing_deployment_names()
     to_add = replica_names_to_add(name, existing, request.replicas)
+    to_remove = replica_names_to_remove(name, existing, request.replicas)
     current = count_replica_deployments(name, existing)
-    if not to_add:
+    if to_add:
+        admit_replica_ram(name, len(to_add), request.context_length)
+        ctx_len = request.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH
+        channel = f"scale:{uuid.uuid4().hex}"
+        event_ids: list[str] = []
+        for deployment_name in to_add:
+            data = {
+                "model": name,
+                "deployment_name": deployment_name,
+                "context_length": ctx_len,
+                "channel": channel,
+            }
+            ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
+            event_ids.extend(ids)
+        return {
+            "model": name,
+            "target": request.replicas,
+            "current": current,
+            "adding": to_add,
+            "removing": [],
+            "event_ids": event_ids,
+            "channel": channel,
+        }
+    if to_remove:
+        channel = f"scale:{uuid.uuid4().hex}"
+        event_ids = []
+        for deployment_name in to_remove:
+            ids = await send_or_503(
+                inngest_client,
+                inngest.Event(
+                    name=DELETE_EVENT,
+                    data={"name": deployment_name, "channel": channel},
+                ),
+            )
+            event_ids.extend(ids)
         return {
             "model": name,
             "target": request.replicas,
             "current": current,
             "adding": [],
-            "event_ids": [],
-            "channel": None,
-        }
-    ctx_len = request.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH
-    channel = f"scale:{uuid.uuid4().hex}"
-    event_ids: list[str] = []
-    for deployment_name in to_add:
-        data = {
-            "model": name,
-            "deployment_name": deployment_name,
-            "context_length": ctx_len,
+            "removing": to_remove,
+            "event_ids": event_ids,
             "channel": channel,
         }
-        ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
-        event_ids.extend(ids)
     return {
         "model": name,
         "target": request.replicas,
         "current": current,
-        "adding": to_add,
-        "event_ids": event_ids,
-        "channel": channel,
+        "adding": [],
+        "removing": [],
+        "event_ids": [],
+        "channel": None,
     }
 
 
