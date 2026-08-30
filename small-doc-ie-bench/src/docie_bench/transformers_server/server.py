@@ -30,7 +30,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import time
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Request
@@ -296,17 +298,9 @@ def create_transformers_app(
     default_temperature: float = DEFAULT_TEMPERATURE,
 ) -> FastAPI:
     """Build the transformers shim app. ``backend=None`` loads one at startup."""
-    app = FastAPI(
-        title="docie transformers",
-        summary="Hugging Face transformers model behind the OpenAI chat surface "
-        "(last-resort serving; unquantized weights ~2-3x a GGUF's RAM).",
-    )
-    app.state.backend = backend
-    app.state.model_id = model_id
-    app.state.trust_remote_code = trust_remote_code
 
-    @app.on_event("startup")
-    def load_model() -> None:
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Load at startup (not first request) so missing weights/extra fail the
         # deploy immediately instead of 500ing the first caller. The multi-GB
         # download happens here — the deploy's readiness window is sized for it.
@@ -314,6 +308,17 @@ def create_transformers_app(
             app.state.backend = HfTransformersBackend(
                 model_id, trust_remote_code=trust_remote_code
             )
+        yield
+
+    app = FastAPI(
+        title="docie transformers",
+        summary="Hugging Face transformers model behind the OpenAI chat surface "
+        "(last-resort serving; unquantized weights ~2-3x a GGUF's RAM).",
+        lifespan=lifespan,
+    )
+    app.state.backend = backend
+    app.state.model_id = model_id
+    app.state.trust_remote_code = trust_remote_code
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
