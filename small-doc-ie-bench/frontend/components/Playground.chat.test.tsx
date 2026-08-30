@@ -313,6 +313,7 @@ describe("ChatPanel", () => {
       "abc123",
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -326,6 +327,7 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
     );
