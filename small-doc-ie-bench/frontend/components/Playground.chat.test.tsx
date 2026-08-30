@@ -515,4 +515,32 @@ describe("ChatPanel", () => {
     await user.click(summary);
     expect(details).toHaveAttribute("open");
   });
+
+  it("renders per-round token usage inline in the trace", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (_model, _messages, _servers, _onToolCall, _sessionId, _onReasoning, _onSystemAddendum, onUsage) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          onUsage?.({
+            round: { prompt_tokens: 120, completion_tokens: 8, total_tokens: 128 },
+            cumulative: { prompt_tokens: 120, completion_tokens: 8, total_tokens: 128 },
+          });
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "what's the total?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/120/)).toBeInTheDocument();
+    expect(screen.getByText(/128/)).toBeInTheDocument();
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "42 EUR" } }] });
+    expect(await screen.findByText("42 EUR")).toBeInTheDocument();
+  });
 });

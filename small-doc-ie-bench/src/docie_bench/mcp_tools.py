@@ -429,6 +429,7 @@ async def run_tool_loop(
     on_tool_call: Callable[[str, bool, int, Any, str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
     on_system_addendum: Callable[[str], None] | None = None,
+    on_usage: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -476,6 +477,17 @@ async def run_tool_loop(
     This is real, load-bearing content injected on top of whatever system
     prompt the caller supplied, but until now it was never surfaced
     anywhere a caller could see it.
+
+    ``on_usage``, when given, is invoked once per round, right after that
+    round's ``completion.get("usage")`` is read, with a single dict:
+    ``{"round": <that round's own usage dict, or {} when absent>,
+    "cumulative": <running totals through this round>}``. Per-round shows
+    the cost of the last action; cumulative shows total consumption so
+    far — there is currently no other way to see how close a live agentic
+    exchange is getting to the deployment's context window without reading
+    the final completion's summed ``usage`` by hand after the whole
+    exchange already finished. Fires for EVERY round, including the last
+    one, same as ``on_reasoning``.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -501,7 +513,15 @@ async def run_tool_loop(
         completion = await post(forward)
         if not isinstance(completion, dict):
             return completion
-        _accumulate_usage(totals, completion.get("usage"))
+        round_usage = completion.get("usage")
+        _accumulate_usage(totals, round_usage)
+        if on_usage is not None:
+            on_usage(
+                {
+                    "round": round_usage if isinstance(round_usage, dict) else {},
+                    "cumulative": dict(totals),
+                }
+            )
         choices = completion.get("choices")
         message = (
             choices[0].get("message")

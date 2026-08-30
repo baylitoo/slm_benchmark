@@ -488,6 +488,46 @@ async def test_run_tool_loop_system_addendum_matches_the_folded_system_message(
     assert "a.txt" in addendum
 
 
+async def test_run_tool_loop_reports_per_round_and_cumulative_usage() -> None:
+    # on_usage fires once per round with that round's OWN usage plus the
+    # RUNNING cumulative totals through that round -- round 2's cumulative
+    # must include round 1, not just repeat round 1's own numbers.
+    responses = [
+        _tool_calls_completion(
+            "calc__add",
+            '{"a": 2, "b": 3}',
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        ),
+        _final_completion(
+            "sum is 5", {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27}
+        ),
+    ]
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        return responses.pop(0)
+
+    usage_events: list[dict[str, Any]] = []
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+3?"}]}
+        await run_tool_loop(
+            post, body, sessions, mapping, tools, max_iterations=4, on_usage=usage_events.append
+        )
+
+    assert usage_events == [
+        {
+            "round": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "cumulative": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
+        {
+            "round": {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27},
+            "cumulative": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
+        },
+    ]
+
+
 async def test_run_tool_loop_returns_caller_owned_calls_untouched() -> None:
     # The model calling a tool the CALLER advertised (not an MCP one) ends the
     # server-side loop: executing the caller's function is the caller's job.

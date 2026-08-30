@@ -1127,6 +1127,10 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
         raise ValueError("deploy event must include 'model'")
     cp = _serving_control_plane()
     runtime = data.get("runtime")
+    raw_n_parallel = data.get("n_parallel")
+    n_parallel = int(raw_n_parallel) if raw_n_parallel is not None else 1
+    raw_cache_reuse = data.get("cache_reuse")
+    cache_reuse = int(raw_cache_reuse) if raw_cache_reuse is not None else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1136,6 +1140,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             max_tokens=(
                 int(data["max_tokens"]) if data.get("max_tokens") is not None else None
             ),
+            n_parallel=n_parallel,
+            cache_reuse=cache_reuse,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1158,6 +1164,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             # Scale: a distinct record name for another replica of `model`
             # (control_plane.serve_store_model looks the weights up by `model`).
             deployment_name=str(raw_dep_name) if raw_dep_name else None,
+            n_parallel=n_parallel,
+            cache_reuse=cache_reuse,
         )
     return record
 
@@ -1165,6 +1173,16 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
 @serving_client.create_function(
     fn_id="serving-deploy",
     trigger=inngest.TriggerEvent(event="serving/deploy.requested"),
+    # Global (not per-model/per-host key), limit=1: unlike serving-load's
+    # LoadCoordinator, the deploy path (ControlPlane.serve/up ->
+    # _DefaultSupervisor.serve/serve_store_model) never checks RAM fit against
+    # other in-flight deploys before spawning. Serving is single-replica by
+    # construction (see _guard_deterministic_advertise and this fn's own
+    # docstring), so every deploy lands on the same node's RAM regardless of
+    # which model it names -- a per-model key would let two unrelated deploys
+    # spawn concurrently and jointly overcommit the host, which is exactly the
+    # gap this closes.
+    concurrency=[inngest.Concurrency(limit=1)],
 )
 async def deploy_model_job(ctx: inngest.Context) -> Any:
     """Deploy a model so it can serve the gateway/benchmark.
