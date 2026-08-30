@@ -93,11 +93,16 @@ export function getSizing(): Promise<SizingView> {
   return request<SizingView>("/v1/serving/sizing");
 }
 
-/** Price a hypothetical deployment mix — fits or an explicit deficit. */
-export function whatifSizing(plan: WhatIfPlanEntry[]): Promise<WhatIfView> {
+/** Price a hypothetical deployment mix — fits or an explicit deficit.
+ * `n_parallel` is call-level (mirrors the server's WhatIfRequest field): every
+ * row in the plan is priced under the same llama-server slot count. */
+export function whatifSizing(
+  plan: WhatIfPlanEntry[],
+  n_parallel?: number,
+): Promise<WhatIfView> {
   return request<WhatIfView>("/v1/serving/sizing/whatif", {
     method: "POST",
-    body: JSON.stringify({ plan }),
+    body: JSON.stringify({ plan, ...(n_parallel && n_parallel > 1 ? { n_parallel } : {}) }),
   });
 }
 

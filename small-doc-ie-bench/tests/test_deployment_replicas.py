@@ -124,10 +124,12 @@ def _no_sizing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(serving_api, "_sizing_inputs", lambda: ([], None, [], None))
 
 
-def _scale(name: str, replicas: int) -> dict[str, Any]:
+def _scale(name: str, replicas: int, **extra: Any) -> dict[str, Any]:
     from docie_bench.inngest.serving_api import ScaleRequest, scale_store_model
 
-    return asyncio.run(scale_store_model(name, ScaleRequest(replicas=replicas), tenant=None))
+    return asyncio.run(
+        scale_store_model(name, ScaleRequest(replicas=replicas, **extra), tenant=None)
+    )
 
 
 # ── deploy fan-out: replicas on the deploy trigger ──────────────────────────
@@ -210,6 +212,46 @@ def test_deploy_single_replica_path_is_unchanged(
     assert len(response.event_ids) == 1
 
 
+def test_deploy_single_instance_threads_n_parallel_and_cache_reuse(
+    serving_home: Path, captured_events: list[Any]
+) -> None:
+    """The non-replicated path model_dumps the whole DeployRequest, so
+    n_parallel/cache_reuse ride along to the worker automatically (#248/#321)."""
+    _deploy({"model": MODEL, "n_parallel": 4, "cache_reuse": 256})
+
+    assert len(captured_events) == 1
+    event = captured_events[0]
+    assert event.data["n_parallel"] == 4
+    assert event.data["cache_reuse"] == 256
+
+
+def test_deploy_replicas_thread_n_parallel_into_each_event(
+    serving_home: Path, captured_events: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replicated path builds each event dict by hand — n_parallel/
+    cache_reuse must be threaded in the same way context_length already is."""
+    _no_sizing(monkeypatch)
+
+    _deploy({"model": MODEL, "replicas": 2, "n_parallel": 4, "cache_reuse": 256})
+
+    assert len(captured_events) == 2
+    assert all(e.data["n_parallel"] == 4 for e in captured_events)
+    assert all(e.data["cache_reuse"] == 256 for e in captured_events)
+
+
+def test_deploy_replicas_omits_n_parallel_when_default(
+    serving_home: Path, captured_events: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """n_parallel=1 (the default) is not sent -- mirrors how max_tokens is only
+    included when set, keeping the event shape unchanged for ordinary deploys."""
+    _no_sizing(monkeypatch)
+
+    _deploy({"model": MODEL, "replicas": 2})
+
+    assert all("n_parallel" not in e.data for e in captured_events)
+    assert all("cache_reuse" not in e.data for e in captured_events)
+
+
 # ── RAM admission: N x footprint against the sizing budget ─────────────────
 
 
@@ -275,6 +317,32 @@ def test_deploy_replicas_rejected_when_ram_budget_exceeded(
     assert captured_events == []
 
 
+def test_deploy_replicas_ram_gate_scales_with_n_parallel(
+    serving_home: Path, captured_events: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The RAM admission gate must see n_parallel too (#248/#321): a plan that
+    fits at n_parallel=1 can legitimately not fit at n_parallel=2, since the
+    KV-cache term (and therefore the priced footprint) scales with it."""
+    from docie_bench.inngest import serving_api
+
+    # weights=0.5 GiB -> footprint(n_parallel=1)=1.5 GiB, footprint(n_parallel=2)
+    # =2.0 GiB (ctx=8192 default). free_effective ~= 1.75 GiB sits between them.
+    monkeypatch.setattr(
+        serving_api,
+        "_sizing_inputs",
+        lambda: _sized_inputs(size_gib=0.5, total_gib=8.0, free_gib=2.55),
+    )
+    _seed_replicas(serving_home, {MODEL: (MODEL, 8088)})
+
+    _deploy({"model": MODEL, "replicas": 2, "n_parallel": 1})
+    assert len(captured_events) == 1
+
+    with pytest.raises(HTTPException) as excinfo:
+        _deploy({"model": MODEL, "replicas": 2, "n_parallel": 2})
+    assert excinfo.value.status_code == 422
+    assert "not enough RAM" in excinfo.value.detail
+
+
 def test_scale_up_admits_when_budget_fits(
     serving_home: Path, captured_events: list[Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -290,6 +358,26 @@ def test_scale_up_admits_when_budget_fits(
     result = _scale(MODEL, 2)
     assert result["adding"] == [MODEL, f"{MODEL}-2"]
     assert len(captured_events) == 2
+
+
+def test_scale_up_ram_gate_scales_with_n_parallel(
+    serving_home: Path, captured_events: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same n_parallel-aware admission as the deploy trigger, via ScaleRequest."""
+    from docie_bench.inngest import serving_api
+
+    monkeypatch.setattr(
+        serving_api,
+        "_sizing_inputs",
+        lambda: _sized_inputs(size_gib=0.5, total_gib=8.0, free_gib=2.55),
+    )
+
+    result = _scale(MODEL, 1, n_parallel=1)
+    assert result["adding"] == [MODEL]
+
+    with pytest.raises(HTTPException) as excinfo:
+        _scale(MODEL, 1, n_parallel=2)
+    assert excinfo.value.status_code == 422
 
 
 def test_scale_admission_fails_open_without_snapshot(

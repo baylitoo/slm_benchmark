@@ -38,6 +38,11 @@ class DeployRequest(BaseModel):
     # endpoint's semantics): >1 fans out one deploy per missing replica, each
     # on its own auto-allocated port, load-balanced behind the model id.
     replicas: int = Field(default=1, ge=1, le=16)
+    # llama-server request slots (#248/#321). 32 is an operator sanity ceiling,
+    # not a llama.cpp hard limit. Meaningless for non-llamacpp runtimes; the
+    # build_command for those simply never reads it.
+    n_parallel: int = Field(default=1, ge=1, le=32)
+    cache_reuse: int | None = Field(default=None, ge=1)
 
 
 async def _trigger_replicated_deploy(
@@ -79,7 +84,9 @@ async def _trigger_replicated_deploy(
         )
     existing = await existing_deployment_names()
     to_add = replica_names_to_add(payload.model, existing, payload.replicas)
-    admit_replica_ram(payload.model, len(to_add), payload.context_length)
+    admit_replica_ram(
+        payload.model, len(to_add), payload.context_length, n_parallel=payload.n_parallel
+    )
     channel = f"deploy:{uuid.uuid4().hex}"
     event_ids: list[str] = []
     for deployment_name in to_add:
@@ -91,6 +98,10 @@ async def _trigger_replicated_deploy(
         }
         if payload.max_tokens is not None:
             data["max_tokens"] = payload.max_tokens
+        if payload.n_parallel > 1:
+            data["n_parallel"] = payload.n_parallel
+        if payload.cache_reuse is not None:
+            data["cache_reuse"] = payload.cache_reuse
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )

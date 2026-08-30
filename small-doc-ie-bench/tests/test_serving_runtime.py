@@ -17,7 +17,9 @@ from docie_bench.serving.runtime import (
     RuntimeLaunchSpec,
     RuntimeUnavailableError,
     VLLMRuntime,
+    fetch_llamacpp_slots,
     llamacpp_tool_calls_mismatch,
+    normalize_llamacpp_slot,
 )
 
 
@@ -133,6 +135,77 @@ def test_llamacpp_requires_gguf_and_builds_cpu_flags() -> None:
     assert adapter.probe(_spec(RuntimeKind.LLAMACPP)).compatible is False
 
 
+def test_llamacpp_n_parallel_default_is_byte_identical_to_before() -> None:
+    """n_parallel=1 (the default) must never emit --parallel and must never
+    scale --ctx-size -- this is the existing, already-tested default path."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        context_length=4096,
+        cpu_threads=12,
+    )
+
+    assert adapter.build_command(spec) == (
+        "llama-server",
+        "--model",
+        "C:/models/invoice.gguf",
+        "--alias",
+        "invoice",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--jinja",
+        "--ctx-size",
+        "4096",
+        "--threads",
+        "12",
+    )
+
+
+def test_llamacpp_n_parallel_scales_ctx_size_and_appends_parallel_flag() -> None:
+    """--ctx-size is a SHARED total budget divided across slots by llama-server
+    (confirmed against the ggml-org/llama.cpp server README): giving each slot
+    the configured context_length requires ctx_size = context_length *
+    n_parallel."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        context_length=8192,
+        n_parallel=4,
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--ctx-size" in command
+    assert command[command.index("--ctx-size") + 1] == "32768"
+    assert "--parallel" in command
+    assert command[command.index("--parallel") + 1] == "4"
+
+
+def test_llamacpp_cache_reuse_emits_flag() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        cache_reuse=256,
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--cache-reuse" in command
+    assert command[command.index("--cache-reuse") + 1] == "256"
+
+
+def test_launch_spec_rejects_invalid_n_parallel_and_cache_reuse() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="n_parallel"):
+        _spec(RuntimeKind.LLAMACPP, n_parallel=0)
+    with pytest.raises(RuntimeConfigurationError, match="cache_reuse"):
+        _spec(RuntimeKind.LLAMACPP, cache_reuse=0)
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
@@ -164,6 +237,84 @@ def test_llamacpp_health_warns_on_capability_mismatch_but_stays_healthy(
     assert result.healthy is True  # the deployment IS up -- never fail health over this
     assert any("supports_tool_calls=false" in r.message for r in caplog.records)
     assert any("lfm2.5-vl-3b" in r.message for r in caplog.records)
+
+
+def test_llamacpp_slots_tolerates_a_missing_field_schema() -> None:
+    # Schema varies by llama-server build (#315): one slot reports the full
+    # shape (including build-dependent timing/cache fields), the other only
+    # the bare minimum an older build might report. Neither should raise, and
+    # only genuinely-present, correctly-typed fields make it through.
+    raw = [
+        {
+            "id": 0,
+            "is_processing": True,
+            "n_ctx": 4096,
+            "prompt": "x" * 500,
+            "prompt_ms": 12.5,
+            "predicted_ms": 340.1,
+            "cache_n": 128,
+            "next_token": {"has_next_token": True, "n_remain": -1, "unexpected_field": object()},
+            "unexpected_top_level_field": {"nested": "junk"},
+        },
+        {"id": 1, "is_processing": False},
+    ]
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        slots_get=lambda url, timeout, headers: raw,
+    )
+    spec = _spec(RuntimeKind.LLAMACPP, port=8090)
+
+    slots = adapter.slots(spec)
+
+    assert len(slots) == 2
+    assert slots[0]["id"] == 0
+    assert slots[0]["n_ctx"] == 4096
+    assert len(slots[0]["prompt"]) <= 200  # truncated, not raw
+    assert slots[0]["prompt_ms"] == 12.5
+    assert slots[0]["cache_n"] == 128
+    assert slots[0]["next_token"] == {"has_next_token": True, "n_remain": -1}
+    assert "unexpected_top_level_field" not in slots[0]
+    # The minimal slot carries only what it actually reported.
+    assert slots[1] == {"id": 1, "is_processing": False}
+
+
+def test_llamacpp_slots_never_raises_on_query_failure_and_never_touches_health() -> None:
+    def boom(url: str, timeout: float, headers: dict[str, str]) -> list[dict] | None:
+        return None  # mirrors _default_slots_get's contract on an unreachable/old build
+
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        slots_get=boom,
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    assert adapter.slots(spec) == ()
+    # health() doesn't even query /slots -- a slots-query failure must never
+    # be able to flip an otherwise-healthy deployment to unhealthy.
+    assert adapter.health(spec).healthy is True
+
+
+def test_fetch_llamacpp_slots_works_from_a_bare_endpoint_string() -> None:
+    # The Observability API route has a deployment's already-resolved
+    # endpoint, not a RuntimeLaunchSpec -- this is the seam it calls directly.
+    calls: list[str] = []
+
+    def slots_get(url: str, timeout: float, headers: dict[str, str]) -> list[dict]:
+        calls.append(url)
+        return [{"id": 0, "is_processing": False}]
+
+    result = fetch_llamacpp_slots("http://127.0.0.1:8090/v1", slots_get=slots_get)
+
+    assert calls == ["http://127.0.0.1:8090/slots"]
+    assert result == ({"id": 0, "is_processing": False},)
+
+
+def test_normalize_llamacpp_slot_drops_wrong_typed_fields() -> None:
+    # A boolean must never be read as the numeric id/n_ctx/timing fields --
+    # bool is an int subclass in Python, an easy defensive-parsing mistake.
+    assert normalize_llamacpp_slot({"id": True, "n_ctx": False, "prompt_ms": True}) == {}
+    assert normalize_llamacpp_slot({}) == {}
 
 
 def test_start_uses_shell_false_and_tracks_lifecycle(tmp_path: Path) -> None:

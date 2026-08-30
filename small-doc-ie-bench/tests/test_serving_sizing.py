@@ -35,12 +35,23 @@ from docie_bench.serving.sizing import (
 GIB = 1024**3
 
 
-def _fp(size_bytes: int, *, context: int = DEFAULT_DEPLOY_CONTEXT_LENGTH, mmproj: int = 0) -> int:
+def _fp(
+    size_bytes: int,
+    *,
+    context: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
+    mmproj: int = 0,
+    n_parallel: int = 1,
+) -> int:
     """The PR-2 footprint formula, restated so fits are asserted from first
-    principles: weights + KV(ctx) + runtime overhead (+ mmproj). The default
-    context is the DEPLOY default (8192) — what the engine must price when a
-    caller specifies none."""
-    return size_bytes + KV_CACHE_BYTES_PER_TOKEN * context + RUNTIME_OVERHEAD_BYTES + mmproj
+    principles: weights + KV(ctx, n_parallel) + runtime overhead (+ mmproj).
+    The default context is the DEPLOY default (8192) — what the engine must
+    price when a caller specifies none."""
+    return (
+        size_bytes
+        + KV_CACHE_BYTES_PER_TOKEN * context * n_parallel
+        + RUNTIME_OVERHEAD_BYTES
+        + mmproj
+    )
 
 
 def _model(name: str, size_bytes: int | None, **extra: Any) -> dict[str, Any]:
@@ -381,6 +392,42 @@ def test_whatif_respects_per_item_context_and_calibration(tmp_path: Path) -> Non
     assert small_item.calibrated is True
 
 
+def test_whatif_n_parallel_doubles_the_kv_cache_term(tmp_path: Path) -> None:
+    """#248/#321: n_parallel=2 must scale the KV-cache term of the footprint —
+    the same math the llama.cpp launch command uses (ctx_size = context_length
+    * n_parallel). Weights and the fixed runtime overhead do NOT scale with
+    n_parallel, so the relationship is asserted on the KV-only remainder (the
+    formula's own named constant, not a hardcoded byte count), not on the
+    whole footprint."""
+    weights = 2 * GIB
+    models = [_model("small", weights)]
+    plan = [{"model": "small", "instances": 1, "context_length": 8192}]
+
+    single = compute_whatif(
+        models,
+        _snapshot(free=20 * GIB),
+        plan,
+        footprints=_footprints(tmp_path),
+        margin_fraction=0.0,
+        n_parallel=1,
+    )
+    doubled = compute_whatif(
+        models,
+        _snapshot(free=20 * GIB),
+        plan,
+        footprints=_footprints(tmp_path),
+        margin_fraction=0.0,
+        n_parallel=2,
+    )
+
+    single_kv = single.per_item[0].footprint_bytes - weights - RUNTIME_OVERHEAD_BYTES
+    doubled_kv = doubled.per_item[0].footprint_bytes - weights - RUNTIME_OVERHEAD_BYTES
+    assert single_kv > 0
+    assert doubled_kv == 2 * single_kv
+    # The whole-footprint ratio is nowhere near 2x -- weights dominate.
+    assert doubled.per_item[0].footprint_bytes < 2 * single.per_item[0].footprint_bytes
+
+
 def test_whatif_rejects_unknown_and_unpriceable_models(tmp_path: Path) -> None:
     models = [_model("small", 2 * GIB), _model("mystery", None)]
 
@@ -531,6 +578,32 @@ def test_whatif_endpoint_matches_the_fit_table_math() -> None:
     )
     assert deficit_payload["ok"] is False
     assert deficit_payload["deficit_bytes"] == 3 * _fp(2 * GIB) - (6 * GIB - margin)
+
+
+@pytest.mark.usefixtures("_sqlite_catalog", "_serving_home")
+def test_whatif_endpoint_accepts_and_threads_n_parallel() -> None:
+    """WhatIfRequest.n_parallel (#248/#321) is call-level, mirroring
+    compute_whatif's own n_parallel parameter -- it must reach the engine."""
+    from docie_bench.inngest.serving_api import (
+        WhatIfPlanItem,
+        WhatIfRequest,
+        serving_sizing_whatif,
+    )
+    from docie_bench.serving.catalog import ModelCatalog
+
+    _seed_store("small", 2 * GIB)
+    ModelCatalog().publish_node_snapshot(
+        total_bytes=16 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=0
+    )
+    margin = int(16 * GIB * 0.10)
+
+    payload = asyncio.run(
+        serving_sizing_whatif(
+            WhatIfRequest(plan=[WhatIfPlanItem(model="small")], n_parallel=2)
+        )
+    )
+    assert payload["ok"] is True
+    assert payload["remaining_bytes"] == (6 * GIB - margin) - _fp(2 * GIB, n_parallel=2)
 
 
 @pytest.mark.usefixtures("_sqlite_catalog", "_serving_home")
