@@ -15,6 +15,7 @@ import {
   Upload,
   AlertCircle,
   FilePlus2,
+  Gauge,
   Paperclip,
   Wrench,
   X,
@@ -53,6 +54,7 @@ import {
   type DynamicSchemaSummary,
   type RoutingPolicySummary,
   type AgentToolCallTrace,
+  type AgentUsageTrace,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -216,7 +218,8 @@ interface ChatMsg {
 
 type TraceEntry =
   | { kind: "reasoning"; text: string }
-  | { kind: "tool_call"; call: AgentToolCallTrace };
+  | { kind: "tool_call"; call: AgentToolCallTrace }
+  | { kind: "usage"; usage: AgentUsageTrace };
 
 // A cold store: model's first request can take a while to boot. Auto-retry a
 // bounded number of times (the backend's load trigger is idempotent — see
@@ -547,6 +550,7 @@ export function ChatPanel({
         // exchange completing silently behind "Waiting for the model…".
         const liveToolCalls: AgentToolCallTrace[] = [];
         const liveReasoning: string[] = [];
+        const liveUsage: AgentUsageTrace[] = [];
         const liveTrace: TraceEntry[] = [];
         const patchLiveMsg = () => {
           setMsgs((prev) => {
@@ -571,6 +575,11 @@ export function ChatPanel({
           liveTrace.push({ kind: "reasoning", text });
           patchLiveMsg();
         };
+        const onUsage = (usage: AgentUsageTrace) => {
+          liveUsage.push(usage);
+          liveTrace.push({ kind: "usage", usage });
+          patchLiveMsg();
+        };
         const res = await chatCompletionMcpStream(
           model,
           payload,
@@ -578,6 +587,7 @@ export function ChatPanel({
           onToolCall,
           docsSearchSessionIdRef.current,
           onReasoning,
+          onUsage,
         );
         const answer = res.choices?.[0]?.message?.content ?? "";
         const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
@@ -591,6 +601,7 @@ export function ChatPanel({
             ? liveTrace
             : [
                 ...liveReasoning.map((text): TraceEntry => ({ kind: "reasoning", text })),
+                ...liveUsage.map((usage): TraceEntry => ({ kind: "usage", usage })),
                 ...toolCalls.map((call): TraceEntry => ({ kind: "tool_call", call })),
               ];
         const finalMsg: ChatMsg = {
@@ -935,6 +946,17 @@ export function ChatPanel({
                               className="rounded-md border border-border bg-muted/20 px-2 py-1 text-xs italic text-muted-foreground"
                             >
                               {entry.text}
+                            </li>
+                          ) : entry.kind === "usage" ? (
+                            <li
+                              key={i}
+                              className="flex items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs text-muted-foreground"
+                            >
+                              <Gauge className="h-3.5 w-3.5" />
+                              <span>
+                                {entry.usage.round.prompt_tokens ?? 0} <T>prompt tokens</T> ·{" "}
+                                {entry.usage.cumulative.total_tokens ?? 0} <T>total</T>
+                              </span>
                             </li>
                           ) : (
                             <ToolCallItem key={i} call={entry.call} index={++toolIndex} />
