@@ -459,7 +459,15 @@ def test_chat_mcp_stream_relays_each_tool_call_as_its_own_sse_event(api, monkeyp
         return [], {}
 
     async def fake_run_tool_loop(
-        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None, on_usage=None
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
     ):
         assert on_tool_call is not None
         on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
@@ -526,7 +534,15 @@ def test_chat_mcp_stream_relays_reasoning_content_as_its_own_sse_event(api, monk
         return [], {}
 
     async def fake_run_tool_loop(
-        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None, on_usage=None
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
     ):
         assert on_reasoning is not None
         on_reasoning("the user asked for 1+2, so I should call calc.add")
@@ -556,6 +572,68 @@ def test_chat_mcp_stream_relays_reasoning_content_as_its_own_sse_event(api, monk
     assert reasoning_event["text"] == "the user asked for 1+2, so I should call calc.add"
 
 
+def test_chat_mcp_stream_relays_system_addendum_as_its_own_sse_event_once(api, monkeypatch) -> None:
+    # run_tool_loop's TOOL_DISCIPLINE_DIRECTIVE (folded into the request's
+    # system message before the first round) is real, load-bearing content
+    # that was never surfaced anywhere -- it now arrives as its own one-time
+    # SSE event, with the exact addendum text, not a placeholder.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import TOOL_DISCIPLINE_DIRECTIVE, MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+    ):
+        assert on_system_addendum is not None
+        on_system_addendum(TOOL_DISCIPLINE_DIRECTIVE)
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    addendum_events = [e for e in events if e["type"] == "system_addendum"]
+    assert addendum_events == [{"type": "system_addendum", "text": TOOL_DISCIPLINE_DIRECTIVE}]
+
+
 def test_chat_mcp_stream_relays_usage_as_its_own_sse_event(api, monkeypatch) -> None:
     # run_tool_loop's on_usage (per-round + cumulative token counts) arrives
     # as its own event too -- lets a client show context consumption before
@@ -579,7 +657,15 @@ def test_chat_mcp_stream_relays_usage_as_its_own_sse_event(api, monkeypatch) -> 
         return [], {}
 
     async def fake_run_tool_loop(
-        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None, on_usage=None
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
     ):
         assert on_usage is not None
         on_usage(

@@ -313,6 +313,7 @@ describe("ChatPanel", () => {
       "abc123",
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -326,6 +327,7 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
     );
@@ -480,13 +482,49 @@ describe("ChatPanel", () => {
     expect(await screen.findByText("42 EUR")).toBeInTheDocument();
   });
 
+  it("renders the system-prompt addendum collapsed by default, and expands it on click", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    const addendum =
+      "Tool discipline: when a tool takes an identifier (a path, id, or name) " +
+      "that another tool lists, call the listing tool first and use one of its " +
+      "results EXACTLY as returned.";
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (_model, _messages, _servers, _onToolCall, _sessionId, _onReasoning, onSystemAddendum) => {
+        onSystemAddendum?.(addendum);
+        return Promise.resolve({
+          choices: [{ message: { role: "assistant", content: "found it" } }],
+        });
+      },
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "search the doc");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("found it")).toBeInTheDocument();
+    const summary = screen.getByText("System-prompt addendum");
+    const details = summary.closest("details");
+    if (!details) throw new Error("details element not found");
+
+    // Collapsed by default: the addendum text exists in the DOM (a native
+    // <details> keeps its content mounted) but the element is closed.
+    expect(details).not.toHaveAttribute("open");
+    expect(screen.getByText(addendum, { exact: false })).toBeInTheDocument();
+
+    await user.click(summary);
+    expect(details).toHaveAttribute("open");
+  });
+
   it("renders per-round token usage inline in the trace", async () => {
     vi.mocked(api.listMcpServers).mockResolvedValue([
       { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
     ]);
     let resolveCompletion!: (value: api.AgentChatResponse) => void;
     vi.mocked(api.chatCompletionMcpStream).mockImplementation(
-      (_model, _messages, _servers, _onToolCall, _sessionId, _onReasoning, onUsage) =>
+      (_model, _messages, _servers, _onToolCall, _sessionId, _onReasoning, _onSystemAddendum, onUsage) =>
         new Promise((resolve) => {
           resolveCompletion = resolve;
           onUsage?.({

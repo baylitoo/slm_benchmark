@@ -214,6 +214,11 @@ interface ChatMsg {
    * actually arrived -- rendered as one chronological trace instead of two
    * separate blocks that lose which reasoning step preceded which call. */
   trace?: TraceEntry[];
+  /** The server-injected system-prompt addendum (TOOL_DISCIPLINE_DIRECTIVE,
+   * plus any eager-list context) that run_tool_loop folds on top of the
+   * caller's own system prompt -- fires once per request, not once per
+   * round, so it's a field on the message rather than a TraceEntry. */
+  systemAddendum?: string;
 }
 
 type TraceEntry =
@@ -552,6 +557,7 @@ export function ChatPanel({
         const liveReasoning: string[] = [];
         const liveUsage: AgentUsageTrace[] = [];
         const liveTrace: TraceEntry[] = [];
+        let liveSystemAddendum: string | undefined;
         const patchLiveMsg = () => {
           setMsgs((prev) => {
             const patch = {
@@ -559,6 +565,7 @@ export function ChatPanel({
               toolCalls: [...liveToolCalls],
               trace: [...liveTrace],
               ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
+              ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
             };
             return prev.length <= next.length
               ? [...next, { role: "assistant", ...patch }]
@@ -575,6 +582,10 @@ export function ChatPanel({
           liveTrace.push({ kind: "reasoning", text });
           patchLiveMsg();
         };
+        const onSystemAddendum = (text: string) => {
+          liveSystemAddendum = text;
+          patchLiveMsg();
+        };
         const onUsage = (usage: AgentUsageTrace) => {
           liveUsage.push(usage);
           liveTrace.push({ kind: "usage", usage });
@@ -587,6 +598,7 @@ export function ChatPanel({
           onToolCall,
           docsSearchSessionIdRef.current,
           onReasoning,
+          onSystemAddendum,
           onUsage,
         );
         const answer = res.choices?.[0]?.message?.content ?? "";
@@ -610,6 +622,7 @@ export function ChatPanel({
           ...(toolCalls.length > 0 ? { toolCalls } : {}),
           ...(liveReasoning.length > 0 ? { reasoning: liveReasoning } : {}),
           ...(finalTrace.length > 0 ? { trace: finalTrace } : {}),
+          ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
         };
         setMsgs((prev) =>
           prev.length <= next.length
@@ -930,6 +943,16 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.systemAddendum && (
+                  <details className="w-full max-w-[85%] rounded-md border border-border bg-muted/20 text-xs">
+                    <summary className="cursor-pointer px-2 py-1 font-medium text-muted-foreground hover:text-foreground">
+                      <T>System-prompt addendum</T>
+                    </summary>
+                    <pre className="scroll-thin max-h-48 overflow-auto whitespace-pre-wrap border-t border-border px-2 py-1.5 text-foreground/80">
+                      {m.systemAddendum}
+                    </pre>
+                  </details>
+                )}
                 {m.trace && m.trace.length > 0 && (
                   <div className="w-full max-w-[85%] space-y-1.5">
                     <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
