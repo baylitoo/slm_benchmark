@@ -36,6 +36,8 @@ import os
 import re
 from typing import Any
 
+from docie_bench.mcp_servers.env_config import int_env
+
 HOST_ENV = "DOCIE_MCP_SQL_AGENT_HOST"
 PORT_ENV = "DOCIE_MCP_SQL_AGENT_PORT"
 USER_ENV = "DOCIE_MCP_SQL_AGENT_USER"
@@ -56,16 +58,6 @@ _DISALLOWED_LEADING_KEYWORDS = frozenset(
         "grant", "revoke", "call", "merge", "copy", "vacuum", "reindex", "refresh",
     }
 )
-
-
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
 
 
 def _connect() -> Any:
@@ -229,7 +221,7 @@ def run_query_impl(sql: str) -> dict[str, Any]:
     import psycopg
 
     _reject_if_not_select(sql)
-    limit = _int_env(ROW_LIMIT_ENV, _DEFAULT_ROW_LIMIT)
+    limit = int_env(ROW_LIMIT_ENV, _DEFAULT_ROW_LIMIT)
     try:
         with _connect() as conn, conn.cursor() as cur:
             cur.execute(sql)
