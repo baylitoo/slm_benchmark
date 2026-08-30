@@ -180,6 +180,41 @@ def test_chat_requires_model(api) -> None:
     assert response.status_code == 400
 
 
+def test_chat_malformed_body_is_openai_shaped_400(api) -> None:
+    """A body that isn't even valid JSON must still 400 in the SAME
+    OpenAI error shape as every hand-rolled ``_openai_error(...)`` in this
+    file, not FastAPI's default ``{"detail": [...]}`` validation shape."""
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        content=b"not json",
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert set(error) == {"message", "type", "code"}
+    assert error["type"] == "invalid_request_error"
+
+
+def test_chat_forwards_unrecognized_openai_fields_untouched(api) -> None:
+    """Fields this handler never inspects (temperature, top_p, ...) must
+    still reach the upstream verbatim -- the point of ``extra="allow"``."""
+    client, captured = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
+            "top_p": 0.9,
+        },
+    )
+    assert response.status_code == 200, response.text
+    sent = json.loads(captured[-1].content)
+    assert sent["temperature"] == 0.2
+    assert sent["top_p"] == 0.9
+
+
 def test_chat_stream_proxies_real_upstream_chunks(api) -> None:
     """A stream: true request gets the upstream's actual token-by-token SSE
     frames relayed as they arrive — not one buffered chunk built after the

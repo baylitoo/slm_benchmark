@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from docie_bench.agents.api import (
     _client,
@@ -63,6 +66,61 @@ _SSE_USAGE_SCAN_LIMIT = 262_144
 # dependency per request, so declaring it again as a route parameter hands the
 # route the SAME authenticated TenantContext without a second quota acquire.
 TenantParam = Annotated[TenantContext, Depends(agents_tenant_guard)]
+
+_NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
+
+
+class ChatCompletionRequest(BaseModel):
+    """Body of ``POST /v1/chat/completions``.
+
+    Only the fields ``chat_completions`` itself reads and branches on are
+    declared -- ``extra="allow"`` is load-bearing, not incidental: the rest
+    of the OpenAI-compatible body (``messages``, ``temperature``, ``tools``,
+    ...) is forwarded upstream largely as-is (``forward = dict(body)``-style)
+    and must never be dropped or rejected by a closed schema.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: _NonEmptyStr
+    stream: bool | None = None
+    mcp_servers: list[_NonEmptyStr] | None = None
+    session_id: str | None = None
+
+
+def _validation_error_to_openai(exc: RequestValidationError) -> JSONResponse:
+    """Reformat FastAPI's ``{"detail": [...]}`` 422 shape into this
+    endpoint's existing ``_openai_error(...)`` 400 shape, which clients of
+    ``/v1/chat/completions`` already depend on."""
+    errors = exc.errors()
+    first = errors[0] if errors else None
+    if first is None:
+        message = "invalid request body"
+    else:
+        field = ".".join(str(part) for part in first["loc"] if part != "body")
+        msg = first.get("msg", "invalid request")
+        message = f"{field!r}: {msg}" if field else msg
+    return _openai_error(message, status_code=400, error_type="invalid_request_error")
+
+
+class _ChatCompletionsValidationRoute(APIRoute):
+    """Scoped to the single ``/v1/chat/completions`` route it's attached to
+    (via ``route_class_override`` on ``add_api_route`` below) -- every other
+    route on this router, and every other route in the app, keeps FastAPI's
+    default validation-error response untouched."""
+
+    def get_route_handler(
+        self,
+    ) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request) -> Response:
+            try:
+                return await original_route_handler(request)
+            except RequestValidationError as exc:
+                return _validation_error_to_openai(exc)
+
+        return custom_route_handler
 
 
 def _record_usage_outcome(
@@ -218,29 +276,8 @@ async def list_models() -> dict[str, Any]:
     }
 
 
-@router.post("/v1/chat/completions")
-async def chat_completions(request: Request, tenant: TenantParam) -> Any:
-    try:
-        body = await request.json()
-    except ValueError:
-        return _openai_error(
-            "request body must be valid JSON",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
-    if not isinstance(body, dict):
-        return _openai_error(
-            "request body must be a JSON object",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
-    model = str(body.get("model") or "")
-    if not model:
-        return _openai_error(
-            "missing required 'model' field (a deployment name or profile)",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
+async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) -> Any:
+    model = payload.model
     resolved = await _resolve_or_error(model)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -253,25 +290,14 @@ async def chat_completions(request: Request, tenant: TenantParam) -> Any:
             error_type="invalid_request_error",
         )
 
-    wants_stream = bool(body.get("stream"))
-    mcp_server_names = body.get("mcp_servers")
-    if mcp_server_names is not None and (
-        not isinstance(mcp_server_names, list)
-        or not all(isinstance(name, str) and name for name in mcp_server_names)
-    ):
-        return _openai_error(
-            "'mcp_servers' must be a list of registered MCP server names",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
-    session_id = body.get("session_id")
-    if session_id is not None and not isinstance(session_id, str):
-        return _openai_error(
-            "'session_id' must be a string",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
-    forward = dict(body)
+    wants_stream = bool(payload.stream)
+    mcp_server_names = payload.mcp_servers
+    session_id = payload.session_id
+    # exclude_unset: only fields the caller actually sent are forwarded --
+    # same as the old dict(body) -- so a field this model declares but the
+    # caller omitted (stream, mcp_servers, session_id) doesn't materialize
+    # as an explicit null in the upstream request.
+    forward = payload.model_dump(exclude_unset=True)
     forward["model"] = profile.model
     url = f"{profile.base_url}/chat/completions"
     headers = {
@@ -334,6 +360,17 @@ async def chat_completions(request: Request, tenant: TenantParam) -> Any:
     if get_settings().fix_mojibake:
         completion = fix_completion_content(completion)
     return completion
+
+
+# route_class_override, not the @router.post(...) decorator (it doesn't expose
+# this kwarg) -- scopes _ChatCompletionsValidationRoute's OpenAI-shaped 400 to
+# this one route without touching any other route's default FastAPI 422.
+router.add_api_route(
+    "/v1/chat/completions",
+    chat_completions,
+    methods=["POST"],
+    route_class_override=_ChatCompletionsValidationRoute,
+)
 
 
 async def _post_upstream(
