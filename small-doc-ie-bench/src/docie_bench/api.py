@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -80,7 +81,7 @@ from docie_bench.serving.profile_resolver import (
 )
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
-from docie_bench.storage.db import get_session_factory, init_engine
+from docie_bench.storage.db import dispose_engine, get_session_factory, init_engine
 from docie_bench.studio import usage_store
 from docie_bench.studio.routing_policies import (
     RoutingPolicyUnavailableError,
@@ -97,9 +98,23 @@ settings = get_settings()
 configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
 
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    init_engine()
+    sessions = get_session_factory()
+    configure_orchestrator(OrchestratorService(sessions) if sessions is not None else None)
+    settings.ocr_cache_dir.mkdir(parents=True, exist_ok=True)
+    settings.runs_dir.mkdir(parents=True, exist_ok=True)
+    settings.annotation_export_dir.mkdir(parents=True, exist_ok=True)
+    yield
+    dispose_engine()
+
+
 app = FastAPI(
     title="Small Document IE Benchmark API",
     version="0.1.0",
+    lifespan=lifespan,
 )
 # Privileged/destructive routers (worker lease ops + experiment control, studio
 # job triggers, serving control plane) are gated by tenant_guard at include time,
@@ -369,16 +384,6 @@ def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> Extrac
     return response.model_copy(
         update={"result": redact_fields(response.result, settings.response_redaction_fields)}
     )
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_engine()
-    sessions = get_session_factory()
-    configure_orchestrator(OrchestratorService(sessions) if sessions is not None else None)
-    settings.ocr_cache_dir.mkdir(parents=True, exist_ok=True)
-    settings.runs_dir.mkdir(parents=True, exist_ok=True)
-    settings.annotation_export_dir.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/healthz")
