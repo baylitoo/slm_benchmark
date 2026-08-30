@@ -541,6 +541,15 @@ async def _stream_chat_with_mcp_tools(
     stream for a tool-calling round) — a caller opts in by setting BOTH
     ``stream`` and ``mcp_servers``. Event shapes, one JSON object per
     ``data:`` frame:
+      ``{"type": "system_addendum", "text": <addendum>}`` — fired once per
+        request, before the first model round, when ``run_tool_loop`` folds
+        ``TOOL_DISCIPLINE_DIRECTIVE`` (and any eager-list context) into the
+        request's system message. This is real content injected on top of
+        whatever the caller's own system prompt says, but was never
+        surfaced anywhere until now — a one-time header, not a per-round
+        event. Note a docs-search request's eager-list ``tool_call`` event
+        (see ``_eager_list_context``) is emitted BEFORE this one, since that
+        listing call happens while the addendum text is still being built.
       ``{"type": "tool_call", "tool", "status", "latency_ms", "arguments",
         "result"}`` — same shape as the static ``docie_agent.tool_calls``
         trace (#261/#262), so the frontend's existing ``ToolCallTrace``
@@ -612,6 +621,9 @@ async def _stream_chat_with_mcp_tools(
                         on_tool_call=record_tool_call,
                         on_reasoning=lambda text: queue.put_nowait(
                             {"type": "reasoning", "text": text}
+                        ),
+                        on_system_addendum=lambda text: queue.put_nowait(
+                            {"type": "system_addendum", "text": text}
                         ),
                     )
             except Exception as exc:  # noqa: BLE001 - transport teardown failure

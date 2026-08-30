@@ -419,6 +419,75 @@ async def test_run_tool_loop_reports_reasoning_content_for_every_round() -> None
     assert reasoning == ["the user wants 2+3, call calc.add", "I have the answer, respond"]
 
 
+async def test_run_tool_loop_reports_system_addendum_exactly_once() -> None:
+    # Fired once, right after _with_system_addendum runs, before the first
+    # round -- not once per round like on_reasoning/on_tool_call.
+    responses = [
+        _tool_calls_completion("calc__add", '{"a": 2, "b": 3}', {}),
+        _final_completion("sum is 5", {}),
+    ]
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        return responses.pop(0)
+
+    addenda: list[str] = []
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+3?"}]}
+        await run_tool_loop(
+            post,
+            body,
+            sessions,
+            mapping,
+            tools,
+            max_iterations=4,
+            on_system_addendum=addenda.append,
+        )
+
+    assert addenda == [TOOL_DISCIPLINE_DIRECTIVE]
+
+
+async def test_run_tool_loop_system_addendum_matches_the_folded_system_message(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The reported addendum must be the exact text folded into the request
+    # (directive + eager-list context), not a placeholder -- assert it
+    # against what the upstream `post` actually received.
+    from docie_bench.mcp_servers import docs_search
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(docs))
+
+    posted: list[dict[str, Any]] = []
+    addenda: list[str] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return _final_completion("hi", {})
+
+    async with _memory_session(docs_search.build_server()) as session:
+        sessions = {"docs-search": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        await run_tool_loop(
+            post,
+            body,
+            sessions,
+            mapping,
+            tools,
+            max_iterations=4,
+            on_system_addendum=addenda.append,
+        )
+
+    (addendum,) = addenda
+    assert posted[0]["messages"][0]["content"] == addendum
+    assert "a.txt" in addendum
+
+
 async def test_run_tool_loop_returns_caller_owned_calls_untouched() -> None:
     # The model calling a tool the CALLER advertised (not an MCP one) ends the
     # server-side loop: executing the caller's function is the caller's job.

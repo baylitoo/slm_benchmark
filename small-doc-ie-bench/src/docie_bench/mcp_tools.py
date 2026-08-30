@@ -428,6 +428,7 @@ async def run_tool_loop(
     max_iterations: int | None = None,
     on_tool_call: Callable[[str, bool, int, Any, str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    on_system_addendum: Callable[[str], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -465,6 +466,16 @@ async def run_tool_loop(
     step before the tool call, or does the model just formulate it
     directly" has a real answer instead of that reasoning being silently
     discarded.
+
+    ``on_system_addendum``, when given, is invoked exactly once — right
+    after the addendum above is folded into ``messages``, before the first
+    round ever runs — with the FULL addendum text actually used (directive
+    alone, or directive plus eager-list context). Only fires when
+    ``mcp_tools`` is non-empty, same condition that builds the addendum in
+    the first place; a request with no MCP tools in play never calls this.
+    This is real, load-bearing content injected on top of whatever system
+    prompt the caller supplied, but until now it was never surfaced
+    anywhere a caller could see it.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -475,6 +486,8 @@ async def run_tool_loop(
         if eager_context:
             addendum = f"{addendum}\n\n{eager_context}"
         messages = _with_system_addendum(messages, addendum)
+        if on_system_addendum is not None:
+            on_system_addendum(addendum)
     caller_tools = list(forward.get("tools") or [])
     caller_tool_names = {
         str(t.get("function", {}).get("name"))

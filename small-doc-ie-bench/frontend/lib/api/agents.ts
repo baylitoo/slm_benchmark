@@ -312,11 +312,18 @@ export async function chatCompletionStream(
  * finishes (`onToolCall`), instead of the whole exchange completing
  * silently before anything reaches the caller. NOT the OpenAI token-stream
  * format — there is no meaningful token stream for a tool-calling round —
- * so this parses `{"type": "tool_call"|"reasoning"|"content"|"error", ...}`
- * frames, not `choices[0].delta`. `onReasoning`, when a reasoning-capable
- * model's chat template emits one, fires with that round's "why" (calling
- * a tool, or the final answer) BEFORE the tool call it precedes — answers
- * "is there a hidden thinking step" instead of leaving it invisible.
+ * so this parses `{"type": "system_addendum"|"tool_call"|"reasoning"|
+ * "content"|"error", ...}` frames, not `choices[0].delta`. `onReasoning`,
+ * when a reasoning-capable model's chat template emits one, fires with that
+ * round's "why" (calling a tool, or the final answer) BEFORE the tool call
+ * it precedes — answers "is there a hidden thinking step" instead of
+ * leaving it invisible. `onSystemAddendum`, when given, fires exactly once
+ * per request, before the first model round, with the server-injected
+ * system-prompt text (`TOOL_DISCIPLINE_DIRECTIVE`, plus any eager-list
+ * context) that `run_tool_loop` folds in on top of the caller's own system
+ * prompt. For a docs-search request, its eager-list `tool_call` event can
+ * arrive BEFORE this one -- that listing call happens while the addendum
+ * text is still being assembled.
  * Resolves with the final completion once a `content` event lands; throws
  * on an `error` event or a connection that ends without either.
  */
@@ -327,6 +334,7 @@ export async function chatCompletionMcpStream(
   onToolCall: (call: AgentToolCallTrace) => void,
   sessionId?: string,
   onReasoning?: (text: string) => void,
+  onSystemAddendum?: (text: string) => void,
 ): Promise<AgentChatResponse> {
   let res: Response;
   try {
@@ -401,6 +409,8 @@ export async function chatCompletionMcpStream(
             onToolCall(call as unknown as AgentToolCallTrace);
           } else if (event.type === "reasoning") {
             if (onReasoning && typeof event.text === "string") onReasoning(event.text);
+          } else if (event.type === "system_addendum") {
+            if (onSystemAddendum && typeof event.text === "string") onSystemAddendum(event.text);
           } else if (event.type === "content") {
             completion = event.completion as AgentChatResponse;
           } else if (event.type === "error") {
