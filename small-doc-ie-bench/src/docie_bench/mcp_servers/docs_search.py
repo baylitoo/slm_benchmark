@@ -289,6 +289,15 @@ def list_documents() -> list[str]:
 # document's structure (title, table of contents, opening section).
 PEEK_CHAR_BUDGET = 4000
 
+# An explicit start_page/end_page range used to be trusted as-is, unbounded --
+# a model asking for e.g. start_page=1, end_page=40 on a long document could
+# still recreate the exact context-bloat problem the peek budget above
+# exists to prevent. Page-count based, not character-based (unlike the peek
+# budget), because the caller already chose these specific pages via
+# search_text -- the cap is about how much of THAT choice comes back in one
+# call, not about guessing page density.
+MAX_EXPLICIT_RANGE_PAGES = 5
+
 
 def document_text(
     relative: str, start_page: int | None = None, end_page: int | None = None
@@ -302,7 +311,9 @@ def document_text(
     overflow a small model's context window on something like a
     150-page regulation. Pass ``start_page``/``end_page`` (1-indexed,
     inclusive) to read a specific section once ``search_text`` has
-    located it -- an explicit range is trusted as-is, no budget applied.
+    located it -- capped at ``MAX_EXPLICIT_RANGE_PAGES`` pages per call,
+    with a ``notice`` naming where to continue if the requested range was
+    wider than that.
     """
     path = resolve_document(relative)
     blocks = _extracted_blocks(path)
@@ -318,6 +329,14 @@ def document_text(
         lo = start_page if start_page is not None else page_numbers[0]
         hi = end_page if end_page is not None else page_numbers[-1]
         selected = [p for p in page_numbers if lo <= p <= hi]
+        if len(selected) > MAX_EXPLICIT_RANGE_PAGES:
+            selected = selected[:MAX_EXPLICIT_RANGE_PAGES]
+            notice = (
+                f"start_page/end_page is capped at {MAX_EXPLICIT_RANGE_PAGES} pages per "
+                f"call; showing pages {selected[0]}-{selected[-1]}. Call read_document "
+                f"again with start_page={selected[-1] + 1} to continue reading past this "
+                "section."
+            )
     elif total_pages <= 1:
         selected = page_numbers
     else:
@@ -395,10 +414,12 @@ def build_server() -> Any:
            page(s) actually answer the question. Each hit reports its page.
         3. Read: call read_document again with start_page/end_page set to
            the page(s) search_text pointed at, to read that section in full.
-        Formulate the search query from what you actually need to answer,
-        not a generic re-read of the whole document -- the question may
-        need several distinct searches (several facts on different pages)
-        before you have everything required to answer it."""
+        start_page/end_page returns at most 5 pages per call -- a wider
+        range gets truncated with a `notice` telling you the start_page to
+        continue from. Formulate the search query from what you actually
+        need to answer, not a generic re-read of the whole document -- the
+        question may need several distinct searches (several facts on
+        different pages) before you have everything required to answer it."""
         return document_text(path, start_page, end_page)
 
     @server.tool()
