@@ -511,6 +511,44 @@ async def deployment_status(name: str) -> Any:
         raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
 
 
+@router.get("/deployments/{name}/slots")
+async def deployment_slots(name: str) -> dict[str, Any]:
+    """llama-server's own ``GET /slots`` introspection (#315), queried live
+    and on demand for one deployment -- the same shape as
+    ``code_interpreter_workers``'s live call to Judge0's own ``/workers``: a
+    status card, not something baked into the reconciler's observed-state
+    publish loop. 404s (the domain marker) for a deployment that is not
+    llama.cpp, or one with no live endpoint yet, so the UI can render "not
+    applicable" instead of a broken card.
+    """
+    try:
+        record = await _control_plane().deployment_status(name)
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+    launch = (record.get("spec") or {}).get("launch") or {} if isinstance(record, dict) else {}
+    if launch.get("runtime") != "llamacpp":
+        raise HTTPException(
+            status_code=404,
+            detail=f"deployment {name!r} is not a llama.cpp runtime",
+            headers=_DOMAIN_404,
+        )
+    endpoint = record.get("endpoint") if isinstance(record, dict) else None
+    if not endpoint:
+        raise HTTPException(
+            status_code=404,
+            detail=f"deployment {name!r} has no live endpoint yet",
+            headers=_DOMAIN_404,
+        )
+    from docie_bench.serving.runtime import fetch_llamacpp_slots
+
+    request_headers: dict[str, str] = {}
+    api_key_env = launch.get("api_key_env")
+    if api_key_env and (api_key := os.environ.get(api_key_env)):
+        request_headers["Authorization"] = f"Bearer {api_key}"
+    slots = fetch_llamacpp_slots(endpoint, headers=request_headers)
+    return {"name": name, "slots": list(slots)}
+
+
 def _serving_home() -> Path:
     """The shared serving home (``DOCIE_SERVING_HOME``) on the serving-state
     volume that api, serving and worker all mount."""

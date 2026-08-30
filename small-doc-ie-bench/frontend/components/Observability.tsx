@@ -12,6 +12,8 @@ import {
   TrendingUp,
   ChevronRight,
   ChevronDown,
+  Cpu,
+  RefreshCw,
 } from "lucide-react";
 import { GRAFANA_URL, GRAFANA_DASHBOARD_URL, INNGEST_URL, METRICS_URL } from "@/lib/env";
 import {
@@ -19,6 +21,8 @@ import {
   getOcrCacheStats,
   getActivity,
   getUsageSummary,
+  getDeployments,
+  getDeploymentSlots,
   ApiError,
   type ReviewMetricsView,
   type OcrCacheStatsView,
@@ -27,6 +31,8 @@ import {
   type UsageDeployment,
   type UsageSummaryView,
   type UsageWindow,
+  type DeploymentRecord,
+  type LlamaCppSlot,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Card, Badge } from "./ui";
@@ -37,6 +43,7 @@ const REVIEW_POLL_MS = 10000;
 const OCR_CACHE_POLL_MS = 15000;
 const ACTIVITY_POLL_MS = 15000;
 const USAGE_POLL_MS = 15000;
+const SLOTS_DEPLOYMENTS_POLL_MS = 15000;
 
 const USAGE_WINDOWS: UsageWindow[] = ["24h", "7d", "30d"];
 
@@ -107,6 +114,7 @@ export function Observability({
           <ReviewQueueCard active={active} onNavigate={onNavigate} />
           <OcrCacheCard active={active} />
           <ActivityCard active={active} onNavigate={onNavigate} />
+          <SlotsCard active={active} />
         </div>
         <UsageCard active={active} />
         <Card
@@ -371,6 +379,153 @@ function ActivityCard({
               +{entries.length - shown.length} more
             </p>
           )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function llamaCppRunningDeploymentNames(records: DeploymentRecord[]): string[] {
+  return records
+    .filter((r) => r.spec?.launch?.runtime === "llamacpp" && r.state === "running")
+    .map((r) => r.spec?.name)
+    .filter((name): name is string => Boolean(name));
+}
+
+/** One deployment's slots, fetched on demand (not eagerly for every
+ * deployment on page load) -- mirrors McpView's CodeInterpreterWorkers:
+ * collapsed by default, a click expands and triggers the live GET /slots
+ * query, a refresh icon re-queries. Every slot field is optional (#315):
+ * this only ever renders what the specific llama-server build reported. */
+function SlotRow({ name }: { name: string }) {
+  const [open, setOpen] = useState(false);
+  const [slots, setSlots] = useState<LlamaCppSlot[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await getDeploymentSlots(name);
+      setSlots(res.slots);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function toggle() {
+    const next = !open;
+    setOpen(next);
+    if (next && slots === null && !loading) void load();
+  }
+
+  return (
+    <div className="rounded-md border border-border bg-muted/40 p-2 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={toggle}
+          className="flex min-w-0 items-center gap-1 font-medium text-foreground hover:text-accent"
+        >
+          {open ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+          )}
+          <span className="truncate" title={name}>
+            {name}
+          </span>
+        </button>
+        {open && (
+          <button
+            type="button"
+            aria-label={`Refresh ${name} slots`}
+            onClick={() => void load()}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-1.5 space-y-1 pl-5">
+          {error ? (
+            <p className="text-destructive">
+              <T>Couldn&apos;t reach this deployment.</T> {error}
+            </p>
+          ) : loading && slots === null ? (
+            <p className="text-muted-foreground">
+              <T>Loading…</T>
+            </p>
+          ) : !slots || slots.length === 0 ? (
+            <p className="text-muted-foreground">
+              <T>No slots reported.</T>
+            </p>
+          ) : (
+            slots.map((slot, i) => (
+              <div key={slot.id ?? i} className="flex flex-wrap items-center gap-2">
+                <Badge tone={slot.is_processing ? "info" : "neutral"}>
+                  slot {slot.id ?? i} · {slot.is_processing ? "busy" : "idle"}
+                </Badge>
+                {slot.n_ctx != null && (
+                  <span className="text-muted-foreground">ctx {slot.n_ctx}</span>
+                )}
+                {slot.cache_n != null && (
+                  <span className="text-muted-foreground">cache {slot.cache_n}</span>
+                )}
+                {slot.prompt_ms != null && (
+                  <span className="text-muted-foreground">
+                    prefill {formatLatency(slot.prompt_ms)}
+                  </span>
+                )}
+                {slot.predicted_ms != null && (
+                  <span className="text-muted-foreground">
+                    decode {formatLatency(slot.predicted_ms)}
+                  </span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SlotsCard({ active }: { active: boolean }) {
+  const deployments = usePolling<DeploymentRecord[]>(
+    getDeployments,
+    SLOTS_DEPLOYMENTS_POLL_MS,
+    active,
+  );
+  const names = llamaCppRunningDeploymentNames(deployments.data ?? []);
+
+  return (
+    <Card
+      icon={<Cpu className="h-5 w-5" />}
+      title="llama.cpp slots"
+      subtitle="Per-slot prompt state and cache/timing straight from each deployment's own GET /slots — expand a deployment to query it live."
+    >
+      {deployments.error ? (
+        <p className="text-sm text-muted-foreground">
+          Couldn&apos;t load deployments. Is the API reachable?
+        </p>
+      ) : deployments.loading ? (
+        <p className="text-sm text-muted-foreground">
+          <T>Loading…</T>
+        </p>
+      ) : names.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          <T>No running llama.cpp deployments.</T>
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {names.map((name) => (
+            <SlotRow key={name} name={name} />
+          ))}
         </div>
       )}
     </Card>

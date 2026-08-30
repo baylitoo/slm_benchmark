@@ -207,6 +207,125 @@ def _default_json_get(
 
 JsonGet = Callable[[str, float, Mapping[str, str]], "dict[str, Any] | None"]
 
+SlotsGet = Callable[[str, float, Mapping[str, str]], "list[dict[str, Any]] | None"]
+
+
+def _default_slots_get(
+    url: str, timeout: float, headers: Mapping[str, str]
+) -> list[dict[str, Any]] | None:
+    """Best-effort GET+JSON-decode for ``GET /slots`` -- unlike ``/props``
+    (a single JSON object), llama-server's own ``/slots`` returns a JSON
+    ARRAY, one entry per processing slot. ``None`` on any failure
+    (unreachable, non-200, not a JSON array): the same never-fail contract as
+    ``_default_json_get`` -- a diagnostic endpoint that is disabled
+    (``--no-slots``) or absent on an older build must never read as an error.
+    """
+    request = urllib.request.Request(url, headers=dict(headers))  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            if not (200 <= response.status < 300):
+                return None
+            body = response.read()
+    except (OSError, urllib.error.URLError):
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+# Optional numeric fields llama-server MAY report per slot, varying by build
+# (#315): some builds surface only prompt/cache state, others add per-slot
+# prefill/decode timing directly on the slot entry (rather than only in a
+# completion response's separate "timings" object). Every one of these is
+# genuinely optional -- absence is normal, never an error.
+_SLOT_NUMERIC_FIELDS = (
+    "id_task",
+    "n_past",
+    "n_remain",
+    "n_decoded",
+    "cache_n",
+    "prompt_n",
+    "prompt_ms",
+    "predicted_n",
+    "predicted_ms",
+    "tokens_per_second",
+)
+
+_NEXT_TOKEN_FIELDS = (
+    "has_next_token",
+    "has_new_line",
+    "n_remain",
+    "n_decoded",
+    "stopped_eos",
+    "stopped_limit",
+    "stopped_word",
+    "stopping_word",
+)
+
+
+def normalize_llamacpp_slot(slot: Mapping[str, Any]) -> dict[str, Any]:
+    """Defensively project one raw ``GET /slots`` entry down to what the
+    Observability slots card understands (#315).
+
+    llama-server's ``/slots`` schema is NOT fixed across builds -- some
+    report only prompt/cache state, others add per-slot prefill/decode
+    timing, and field names have shifted release to release. Every field read
+    here is optional and type-checked before use: a missing or unexpectedly-
+    typed field is silently skipped, never raised on, so an older/newer/
+    unknown llama-server build degrades to a smaller card instead of breaking
+    the query.
+    """
+    def _is_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    normalized: dict[str, Any] = {}
+    if _is_int(slot.get("id")):
+        normalized["id"] = slot["id"]
+    if isinstance(slot.get("is_processing"), bool):
+        normalized["is_processing"] = slot["is_processing"]
+    if _is_int(slot.get("n_ctx")):
+        normalized["n_ctx"] = slot["n_ctx"]
+    prompt = slot.get("prompt")
+    if isinstance(prompt, str):
+        normalized["prompt"] = prompt[:200]
+    for key in _SLOT_NUMERIC_FIELDS:
+        value = slot.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            normalized[key] = value
+    next_token = slot.get("next_token")
+    if isinstance(next_token, Mapping):
+        normalized["next_token"] = {
+            key: next_token[key]
+            for key in _NEXT_TOKEN_FIELDS
+            if key in next_token and isinstance(next_token[key], (bool, int, float, str))
+        }
+    return normalized
+
+
+def fetch_llamacpp_slots(
+    endpoint: str,
+    *,
+    timeout: float = 2,
+    headers: Mapping[str, str] | None = None,
+    slots_get: SlotsGet = _default_slots_get,
+) -> tuple[dict[str, Any], ...]:
+    """Query and normalize llama-server's ``GET /slots`` from a bare endpoint
+    string -- no ``RuntimeLaunchSpec`` needed. This is the seam the
+    Observability API route calls directly against a deployment's already-
+    resolved ``endpoint`` (#315), and what ``LlamaCppRuntime.slots`` delegates
+    to for callers that do have a spec. Never raises -- see
+    ``_default_slots_get`` / ``normalize_llamacpp_slot``.
+    """
+    base = endpoint.rstrip("/").removesuffix("/v1")
+    raw = slots_get(f"{base}/slots", timeout, dict(headers or {}))
+    if raw is None:
+        return ()
+    return tuple(normalize_llamacpp_slot(slot) for slot in raw)
+
 
 def llamacpp_tool_calls_mismatch(props: Mapping[str, Any]) -> str | None:
     """Compare llama-server's own ``GET /props`` report against
@@ -526,6 +645,10 @@ class LlamaCppRuntime(RuntimeAdapter):
         }
     )
 
+    def __init__(self, *, slots_get: SlotsGet = _default_slots_get, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._slots_get = slots_get
+
     def validate(self, spec: RuntimeLaunchSpec) -> None:
         super().validate(spec)
         if Path(spec.model).suffix.lower() != ".gguf":
@@ -577,6 +700,21 @@ class LlamaCppRuntime(RuntimeAdapter):
             if mismatch is not None:
                 logger.warning("%s (alias=%r, endpoint=%r)", mismatch, spec.alias, base)
         return result
+
+    def slots(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> tuple[dict[str, Any], ...]:
+        """llama-server's own ``GET /slots`` introspection (#315): per-slot
+        prompt state, KV cache reuse, and (on builds that report it)
+        prefill/decode timing -- mirrors the ``GET /props`` call already in
+        ``health()``. Never raises and never affects health: an unreachable
+        or malformed ``/slots`` response yields an empty tuple, the same
+        never-fail contract as the ``/props`` capability check above.
+        """
+        headers: dict[str, str] = {}
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            headers["Authorization"] = f"Bearer {api_key}"
+        return fetch_llamacpp_slots(
+            self.endpoint(spec), timeout=timeout, headers=headers, slots_get=self._slots_get
+        )
 
 
 class OllamaRuntime(RuntimeAdapter):
