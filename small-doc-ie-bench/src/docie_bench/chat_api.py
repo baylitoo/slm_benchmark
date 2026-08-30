@@ -552,6 +552,12 @@ async def _stream_chat_with_mcp_tools(
         from ``content``/``tool_calls``. Answers "is there a hidden
         thinking step before the tool call" with the model's own words
         instead of leaving it invisible.
+      ``{"type": "usage", "round": {...}, "cumulative": {...}}`` — that
+        round's own token usage plus the running cumulative totals through
+        this round (``run_tool_loop``'s ``on_usage``), the raw counts with
+        no context-window denominator. Lets a client show how much a live
+        agentic exchange is consuming before the final completion lands,
+        instead of only after the whole exchange finishes.
       ``{"type": "content", "completion": <final OpenAI-shaped completion>}``
       ``{"type": "error", "error": {"message", "type", "code"}}``
     Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
@@ -613,6 +619,7 @@ async def _stream_chat_with_mcp_tools(
                         on_reasoning=lambda text: queue.put_nowait(
                             {"type": "reasoning", "text": text}
                         ),
+                        on_usage=lambda usage: queue.put_nowait({"type": "usage", **usage}),
                     )
             except Exception as exc:  # noqa: BLE001 - transport teardown failure
                 message = f"MCP session error: {exc}"

@@ -125,6 +125,14 @@ export interface AgentToolCallTrace {
   step_name?: string;
 }
 
+/** One round's token usage from the agentic tool loop (`on_usage`, #314):
+ * `round` is that round's own usage, `cumulative` the running totals
+ * through this round -- both raw counts, no context-window denominator. */
+export interface AgentUsageTrace {
+  round: Record<string, number>;
+  cumulative: Record<string, number>;
+}
+
 /** One workflow step's outcome (#265; `name`/`routed_to` added #266) -- the
  * "Try it" trace view's per-step detail, alongside any tool calls that step
  * made. `routed_to` is set only for a classifier (`route`) step -- the name
@@ -312,11 +320,14 @@ export async function chatCompletionStream(
  * finishes (`onToolCall`), instead of the whole exchange completing
  * silently before anything reaches the caller. NOT the OpenAI token-stream
  * format — there is no meaningful token stream for a tool-calling round —
- * so this parses `{"type": "tool_call"|"reasoning"|"content"|"error", ...}`
+ * so this parses `{"type": "tool_call"|"reasoning"|"usage"|"content"|"error", ...}`
  * frames, not `choices[0].delta`. `onReasoning`, when a reasoning-capable
  * model's chat template emits one, fires with that round's "why" (calling
  * a tool, or the final answer) BEFORE the tool call it precedes — answers
  * "is there a hidden thinking step" instead of leaving it invisible.
+ * `onUsage` fires once per round with that round's own token usage plus the
+ * running cumulative totals (raw counts, no context-window denominator —
+ * see `AgentUsageTrace`).
  * Resolves with the final completion once a `content` event lands; throws
  * on an `error` event or a connection that ends without either.
  */
@@ -327,6 +338,7 @@ export async function chatCompletionMcpStream(
   onToolCall: (call: AgentToolCallTrace) => void,
   sessionId?: string,
   onReasoning?: (text: string) => void,
+  onUsage?: (usage: AgentUsageTrace) => void,
 ): Promise<AgentChatResponse> {
   let res: Response;
   try {
@@ -401,6 +413,13 @@ export async function chatCompletionMcpStream(
             onToolCall(call as unknown as AgentToolCallTrace);
           } else if (event.type === "reasoning") {
             if (onReasoning && typeof event.text === "string") onReasoning(event.text);
+          } else if (event.type === "usage") {
+            if (onUsage) {
+              onUsage({
+                round: (event.round as Record<string, number>) ?? {},
+                cumulative: (event.cumulative as Record<string, number>) ?? {},
+              });
+            }
           } else if (event.type === "content") {
             completion = event.completion as AgentChatResponse;
           } else if (event.type === "error") {
