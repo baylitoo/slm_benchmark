@@ -211,7 +211,7 @@ def test_document_text_peeks_a_long_document_instead_of_returning_it_whole(
     assert "start_page" in result["notice"]
 
 
-def test_document_text_honors_an_explicit_page_range_regardless_of_budget(
+def test_document_text_honors_an_explicit_page_range_under_the_page_cap(
     docs: Path, monkeypatch
 ) -> None:
     (docs / "big.pdf").write_bytes(b"%PDF-fake")
@@ -221,7 +221,18 @@ def test_document_text_honors_an_explicit_page_range_regardless_of_budget(
 
     assert result["total_pages"] == 4
     assert [p["page"] for p in result["pages"]] == [3, 4]
-    assert "notice" not in result  # an explicit range is trusted, no budget applied
+    assert "notice" not in result  # 2 pages requested, under the 5-page cap
+
+
+def test_document_text_caps_an_explicit_range_at_max_pages(docs: Path, monkeypatch) -> None:
+    (docs / "big.pdf").write_bytes(b"%PDF-fake")
+    _multi_page_extractor(monkeypatch, page_count=20, chars_per_page=10)
+
+    result = docs_search.document_text("big.pdf", start_page=3, end_page=20)
+
+    assert [p["page"] for p in result["pages"]] == [3, 4, 5, 6, 7]
+    assert "notice" in result
+    assert "start_page=8" in result["notice"]
 
 
 def test_document_text_peek_budget_is_operator_tunable(docs: Path, monkeypatch) -> None:
