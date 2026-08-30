@@ -1232,6 +1232,32 @@ def replica_names_to_add(
     return names
 
 
+def replica_names_to_remove(
+    base: str, existing_names: Iterable[str], target_total: int
+) -> list[str]:
+    """The replica record names to DELETE to bring ``base`` down to
+    ``target_total`` deployments — the scale-down mirror of
+    :func:`replica_names_to_add`.
+
+    Victims are picked highest suffix first (``base-3`` before ``base-2``
+    before the bare ``base``), so scaling down peels off the most recently
+    added instance and the canonical bare-name record survives while any
+    replica remains (a ``target_total >= 1`` can therefore never remove the
+    bare ``base``). Already at/below the target returns ``[]`` — scaling is
+    idempotent in both directions.
+    """
+    pattern = _replica_re(base)
+    matched: list[tuple[int, str]] = []
+    for candidate in set(existing_names):
+        found = pattern.match(candidate)
+        if found:
+            index = int(found.group(1)) if found.group(1) else 1
+            matched.append((index, candidate))
+    matched.sort(reverse=True)
+    delta = max(0, len(matched) - max(target_total, 0))
+    return [name for _index, name in matched[:delta]]
+
+
 def to_data(value: object) -> object:
     """Recursively convert common backend values to deterministic JSON-safe data."""
     if value is None or isinstance(value, (bool, int, float, str)):

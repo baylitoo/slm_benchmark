@@ -65,6 +65,9 @@ export function DeployForm({
   const [portDirty, setPortDirty] = useState(false);
   const [contextLength, setContextLength] = useState("8192");
   const [maxTokens, setMaxTokens] = useState("");
+  // Target total instances (replicas) of the store model, load-balanced behind
+  // one model id. Only sent for Auto (store-entry) deploys when > 1.
+  const [replicas, setReplicas] = useState("1");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -113,6 +116,14 @@ export function DeployForm({
       setError("Select a model to deploy.");
       return;
     }
+    const replicaCount = runtime === "" && replicas.trim() ? Number(replicas) : 1;
+    if (replicaCount > 1 && (name.trim() || (portDirty && port.trim()))) {
+      // Mirrors the server's 422: N instances are auto-named on auto ports.
+      setError(
+        "Replicas auto-name each instance on auto-allocated ports — clear the deployment name and port override to deploy replicas.",
+      );
+      return;
+    }
     setSubmitting(true);
     try {
       const payload = {
@@ -125,6 +136,7 @@ export function DeployForm({
         ...(portDirty && port.trim() ? { port: Number(port) } : {}),
         ...(contextLength.trim() ? { context_length: Number(contextLength) } : {}),
         ...(maxTokens.trim() ? { max_tokens: Number(maxTokens) } : {}),
+        ...(replicaCount > 1 ? { replicas: replicaCount } : {}),
       };
       const res = await deployModel(payload);
       setTrigger(res);
@@ -279,6 +291,21 @@ export function DeployForm({
                     placeholder="family default"
                   />
                 </Field>
+                {runtime === "" && (
+                  <Field
+                    label="Replicas"
+                    hint="Target instances of this model, load-balanced behind one id. Each uses an auto port; RAM is checked for all of them."
+                  >
+                    <TextInput
+                      type="number"
+                      min={1}
+                      max={16}
+                      value={replicas}
+                      onChange={(e) => setReplicas(e.target.value)}
+                      placeholder="1"
+                    />
+                  </Field>
+                )}
               </div>
 
               <PortsAdmin ports={ports} />

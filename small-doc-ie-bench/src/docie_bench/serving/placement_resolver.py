@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import random
+import threading
 import urllib.parse
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -110,6 +110,38 @@ def _placement_is_live(placement: dict[str, Any]) -> bool:
     )
 
 
+# Round-robin state for replica routing: one counter per store model, guarded
+# by a lock because resolution runs on concurrent request threads. See
+# round_robin_choice for the consistency model.
+_ROUND_ROBIN_LOCK = threading.Lock()
+_ROUND_ROBIN_COUNTERS: dict[str, int] = {}
+
+
+def round_robin_choice(
+    model_name: str, candidates: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """Pick the next live replica of ``model_name`` in rotation.
+
+    Candidates are ordered by record name (``base`` < ``base-2`` < …) so the
+    rotation sequence is deterministic, then indexed by a per-model counter.
+
+    CONSISTENCY MODEL (stated honestly): the counter is process-local and
+    in-memory. Each api/worker process rotates independently, a restart resets
+    the counter to zero, and nothing is coordinated across processes — the
+    guarantee is per-process rotation (successive calls in one process never
+    hit the same replica twice while several are live), which composes into
+    approximately uniform distribution across processes. When the live set
+    changes size between calls (a replica died or scaled in/out), the modulo
+    re-maps the counter and one endpoint may be skipped or repeated once —
+    acceptable for load balancing, never for session affinity (there is none).
+    """
+    ordered = sorted(candidates, key=lambda p: str(p.get("name") or ""))
+    with _ROUND_ROBIN_LOCK:
+        index = _ROUND_ROBIN_COUNTERS.get(model_name, 0)
+        _ROUND_ROBIN_COUNTERS[model_name] = index + 1
+    return ordered[index % len(ordered)]
+
+
 def _record_activity_best_effort(name: str, catalog: ModelCatalog) -> None:
     """Bump ``model_activity`` for ``name`` — best-effort, mirroring
     ``profile_resolver._catalog_family``'s swallow pattern for a similar
@@ -127,16 +159,20 @@ def resolve_store_profile(
     name: str,
     *,
     catalog: ModelCatalog | None = None,
-    chooser: Callable[[Sequence[dict[str, Any]]], dict[str, Any]] = random.choice,
+    chooser: Callable[[Sequence[dict[str, Any]]], dict[str, Any]] | None = None,
 ) -> ModelProfile:
     """Build the ModelProfile that extracts against a live placement of ``name``.
 
     LOAD BALANCING (PR-C): a scaled model has several placement rows (one per
     replica, all sharing ``model_name``); this picks ONE live replica per call.
-    ``chooser`` defaults to ``random.choice`` — stateless, so it distributes
-    evenly across replicas even from many concurrent workers with no shared
-    counter; tests inject a deterministic chooser. A single-instance model has
-    exactly one live row, so the pick is a no-op and behaviour is unchanged.
+    The default pick is :func:`round_robin_choice` — a process-local rotation
+    over the live replicas (see its docstring for the consistency model);
+    tests inject a deterministic ``chooser`` instead. Dead replicas are
+    skipped naturally: only rows with ``state="ready"`` and a non-empty
+    endpoint are candidates, and the serving reconciler republishes every
+    row's observed state each cycle, so a crashed replica leaves the rotation
+    within one reconcile interval. A single-instance model has exactly one
+    live row, so the pick is a no-op and behaviour is unchanged.
 
     Raises :class:`PlacementNotFoundError` when the model is not in the catalog
     or has no placement at all, and :class:`PlacementNotReadyError` when
@@ -170,7 +206,12 @@ def resolve_store_profile(
             f"store model {name!r} placement advertises no live endpoint — "
             f"wait for the deploy/reload to finish or redeploy."
         )
-    placement = live[0] if len(live) == 1 else chooser(live)
+    if len(live) == 1:
+        placement = live[0]
+    elif chooser is not None:
+        placement = chooser(live)
+    else:
+        placement = round_robin_choice(name, live)
     _record_activity_best_effort(name, catalog)
     contract = FAMILIES.get(str(entry.get("family") or ""))
     engine = str(placement.get("engine") or "")
@@ -207,4 +248,5 @@ __all__ = [
     "PlacementNotReadyError",
     "endpoint_is_loopback",
     "resolve_store_profile",
+    "round_robin_choice",
 ]
