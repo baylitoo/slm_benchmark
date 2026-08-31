@@ -52,29 +52,39 @@ def _require_token() -> str:
     return token
 
 
-def submit_code(code: str, *, url: str | None = None) -> dict[str, Any]:
+def submit_code(code: str, *, url: str | None = None, stdin: str = "") -> dict[str, Any]:
     """Submit ``code`` to Judge0 for sandboxed execution and return
     ``{stdout, stderr, exit_code, timed_out, truncated}``. Never raises for
     the SNIPPET's own failures — a traceback in stderr or a nonzero exit
     code is a normal, informative outcome — only for a missing token
     (:class:`CodeInterpreterUnavailableError`) or a Judge0 request itself
     failing (connection error, non-2xx response).
+
+    ``stdin``, if given, is fed to the snippet's standard input — for a
+    snippet that reads input rather than hardcoding test data inline. Left
+    at the default (``""``), the request body omits ``stdin`` entirely,
+    which Judge0 treats identically to its own default (``null``, "program
+    won't receive anything to standard input" — verified against judge0's
+    own submission API docs).
     """
     import httpx
 
     token = _require_token()
     base_url = url if url is not None else os.environ.get(URL_ENV, _DEFAULT_URL)
+    body: dict[str, Any] = {
+        "source_code": code,
+        "language_id": _PYTHON_LANGUAGE_ID,
+        "cpu_time_limit": _CPU_TIME_LIMIT_SECONDS,
+        "wall_time_limit": _WALL_TIME_LIMIT_SECONDS,
+        "memory_limit": _MEMORY_LIMIT_KB,
+    }
+    if stdin:
+        body["stdin"] = stdin
     response = httpx.post(
         f"{base_url}/submissions",
         params={"wait": "true", "base64_encoded": "false"},
         headers={"X-Auth-Token": token},
-        json={
-            "source_code": code,
-            "language_id": _PYTHON_LANGUAGE_ID,
-            "cpu_time_limit": _CPU_TIME_LIMIT_SECONDS,
-            "wall_time_limit": _WALL_TIME_LIMIT_SECONDS,
-            "memory_limit": _MEMORY_LIMIT_KB,
-        },
+        json=body,
         timeout=_WALL_TIME_LIMIT_SECONDS + 5.0,
     )
     response.raise_for_status()
@@ -97,14 +107,16 @@ def build_server() -> Any:
     server = MCPServer("docie-code-interpreter")
 
     @server.tool()
-    def run_python(code: str) -> dict[str, Any]:
+    def run_python(code: str, stdin: str = "") -> dict[str, Any]:
         """Run a short Python snippet in an isolated sandbox (Judge0: no
         network, no persistent filesystem, resource- and time-limited). No
         state persists across calls and no packages can be installed.
         Returns {stdout, stderr, exit_code, timed_out, truncated}. Use
         print() to produce output — a bare expression's value is not
-        captured."""
-        return submit_code(code)
+        captured. ``stdin``, if given, is fed to the snippet's standard
+        input — use it instead of hardcoding test data inline when the
+        snippet reads from input()/sys.stdin."""
+        return submit_code(code, stdin=stdin)
 
     return server
 

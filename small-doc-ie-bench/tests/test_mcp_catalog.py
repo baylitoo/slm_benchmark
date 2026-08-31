@@ -525,6 +525,84 @@ def test_submit_code_maps_time_limit_exceeded(monkeypatch) -> None:
     assert result["stdout"] == ""
 
 
+def test_submit_code_sends_stdin_when_given(monkeypatch) -> None:
+    monkeypatch.setenv(code_interpreter.TOKEN_ENV, "secret-token")
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "stdout": "hi\n",
+                "stderr": "",
+                "exit_code": 0,
+                "status": {"id": 3, "description": "Accepted"},
+            },
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: real_client(transport=httpx.MockTransport(handler)).post(url, **kw),
+    )
+
+    code_interpreter.submit_code(
+        "print(input())", url="http://judge0-server:2358", stdin="hi"
+    )
+
+    (request,) = captured
+    body = json.loads(request.content)
+    assert body["stdin"] == "hi"
+
+
+def test_submit_code_omits_stdin_when_not_given(monkeypatch) -> None:
+    monkeypatch.setenv(code_interpreter.TOKEN_ENV, "secret-token")
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "stdout": "6\n",
+                "stderr": "",
+                "exit_code": 0,
+                "status": {"id": 3, "description": "Accepted"},
+            },
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: real_client(transport=httpx.MockTransport(handler)).post(url, **kw),
+    )
+
+    code_interpreter.submit_code("print(3 * 2)", url="http://judge0-server:2358")
+
+    (request,) = captured
+    body = json.loads(request.content)
+    assert "stdin" not in body
+
+
+def test_run_python_threads_stdin_through_to_submit_code(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_submit_code(code, **kw):
+        calls.append({"code": code, **kw})
+        return {}
+
+    monkeypatch.setattr(code_interpreter, "submit_code", fake_submit_code)
+
+    server = code_interpreter.build_server()
+    run_python = server._tool_manager._tools["run_python"].fn
+    run_python("print(input())", stdin="hi")
+
+    assert calls == [{"code": "print(input())", "stdin": "hi"}]
+
+
 # --------------------------------------------------- servers speak real MCP
 
 
