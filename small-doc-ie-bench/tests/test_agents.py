@@ -316,6 +316,217 @@ def test_ocr_extract_agent_uses_shared_extraction_pipeline(
     assert content["invoice_number"] == "INV-7"
 
 
+def test_invoice_sum_check_matches() -> None:
+    from docie_bench.agents.runtime import _invoice_sum_check
+
+    result = {
+        "subtotal": {"amount": "30.00", "currency": "EUR"},
+        "line_items": [
+            {"line_total": {"amount": "10.00", "currency": "EUR"}},
+            {"line_total": {"amount": "20.00", "currency": "EUR"}},
+        ],
+    }
+    assert _invoice_sum_check(result) == {
+        "computed_total": 30.0,
+        "claimed_total": 30.0,
+        "difference": 0.0,
+        "matches": True,
+        "total_field": "subtotal",
+        "line_item_count": 2,
+    }
+
+
+def test_invoice_sum_check_flags_mismatch() -> None:
+    from docie_bench.agents.runtime import _invoice_sum_check
+
+    result = {
+        "subtotal": {"amount": "50.00", "currency": "EUR"},
+        "line_items": [
+            {"line_total": {"amount": "10.00", "currency": "EUR"}},
+            {"line_total": {"amount": "20.00", "currency": "EUR"}},
+        ],
+    }
+    check = _invoice_sum_check(result)
+    assert check is not None
+    assert check["matches"] is False
+    assert check["computed_total"] == 30.0
+    assert check["claimed_total"] == 50.0
+    assert check["difference"] == -20.0
+    assert check["total_field"] == "subtotal"
+
+
+def test_invoice_sum_check_falls_back_to_total_ttc_without_subtotal() -> None:
+    from docie_bench.agents.runtime import _invoice_sum_check
+
+    result = {
+        "total_ttc": {"amount": "30.00", "currency": "EUR"},
+        "line_items": [{"line_total": {"amount": "30.00", "currency": "EUR"}}],
+    }
+    check = _invoice_sum_check(result)
+    assert check is not None
+    assert check["total_field"] == "total_ttc"
+    assert check["matches"] is True
+
+
+def test_invoice_sum_check_no_op_without_summable_shape() -> None:
+    """No line_items/total shape (identity_card, empty line_items, line items
+    with no line_total amount) -> a silent no-op, never an error."""
+    from docie_bench.agents.runtime import _invoice_sum_check
+
+    assert _invoice_sum_check({"document_type": "identity_card", "document_number": None}) is None
+    assert _invoice_sum_check({"line_items": []}) is None
+    assert _invoice_sum_check({"line_items": [{"description": {"value": "no amount"}}]}) is None
+    assert _invoice_sum_check({"line_items": [{"line_total": {"amount": "10.00"}}]}) is None
+
+
+def test_ocr_extract_agent_attaches_sum_check_without_altering_result(
+    api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sum_check rides docie_agent as informational metadata alongside an
+    UNCHANGED extraction result — it never blocks or alters the extraction,
+    same principle as model_confidence elsewhere in this codebase."""
+    from docie_bench.extract.service import ExtractionService
+    from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation
+
+    client, _captured = api
+
+    async def fake_extract(self: ExtractionService, **kwargs: object) -> ExtractionResponse:
+        return ExtractionResponse(
+            request_id="sum-check-path",
+            schema_name="invoice",
+            model_profile=self.profile.name,
+            document_hash="sha256:test",
+            result={
+                "document_type": "invoice",
+                "invoice_number": {"value": "INV-9"},
+                "subtotal": {"amount": "100.00", "currency": "EUR"},
+                "line_items": [
+                    {"line_total": {"amount": "40.00", "currency": "EUR"}},
+                    {"line_total": {"amount": "40.00", "currency": "EUR"}},
+                ],
+            },
+            validation=ExtractionValidation(valid=True),
+            latency_ms=1,
+            response_format_style="json_object",
+        )
+
+    monkeypatch.setattr(ExtractionService, "extract_from_file", fake_extract)
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "doc-ocr-sum-check",
+            "kind": "ocr",
+            "options": {
+                "mode": "ocr_extract",
+                "extractor": "lfm2.5",
+                "backend": "liteparse",
+                "schema": "invoice",
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/v1/agents/doc-ocr-sum-check/chat/completions",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "extract structured data"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    content = json.loads(payload["choices"][0]["message"]["content"])
+    # Line items (40 + 40 = 80) don't sum to the stated subtotal (100) — the
+    # documented totals-miscomputation failure mode — but the extracted
+    # result itself is untouched by the check.
+    assert content["invoice_number"] == "INV-9"
+    assert content["subtotal"] == {"amount": "100.00", "currency": "EUR"}
+    assert content["line_items"] == [
+        {"line_total": {"amount": "40.00", "currency": "EUR"}},
+        {"line_total": {"amount": "40.00", "currency": "EUR"}},
+    ]
+    sum_check = payload["docie_agent"]["sum_check"]
+    assert sum_check["matches"] is False
+    assert sum_check["computed_total"] == 80.0
+    assert sum_check["claimed_total"] == 100.0
+    assert sum_check["difference"] == -20.0
+    assert sum_check["total_field"] == "subtotal"
+    assert sum_check["line_item_count"] == 2
+
+
+def test_ocr_extract_agent_omits_sum_check_for_unrecognized_schema_shape(
+    api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.extract.service import ExtractionService
+    from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation
+
+    client, _captured = api
+
+    async def fake_extract(self: ExtractionService, **kwargs: object) -> ExtractionResponse:
+        return ExtractionResponse(
+            request_id="no-sum-check-path",
+            schema_name="identity_card",
+            model_profile=self.profile.name,
+            document_hash="sha256:test",
+            result={
+                "document_type": "identity_card",
+                "document_number": {"value": "X1234567"},
+            },
+            validation=ExtractionValidation(valid=True),
+            latency_ms=1,
+            response_format_style="json_object",
+        )
+
+    monkeypatch.setattr(ExtractionService, "extract_from_file", fake_extract)
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "doc-ocr-no-sum-check",
+            "kind": "ocr",
+            "options": {
+                "mode": "ocr_extract",
+                "extractor": "lfm2.5",
+                "backend": "liteparse",
+                "schema": "identity_card",
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/v1/agents/doc-ocr-no-sum-check/chat/completions",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "extract structured data"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert "sum_check" not in payload["docie_agent"]
+
+
 def test_shared_extraction_result_keeps_agent_flat_contract() -> None:
     from docie_bench.agents.runtime import _flatten_agent_result
 

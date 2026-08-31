@@ -36,6 +36,7 @@ from docie_bench.extract.routing import (
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.mcp_servers.calculator import check_sum
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
@@ -169,6 +170,53 @@ def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
     }
 
 
+def _money_amount(value: Any) -> float | None:
+    """A MoneyField's numeric amount from the rich (pre-flatten) validated
+    result — ``{"amount": "12.50", "currency": "EUR", ...}`` — or ``None``
+    when the field is absent, null, or unparseable."""
+    if not isinstance(value, dict) or value.get("amount") is None:
+        return None
+    try:
+        return float(value["amount"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _invoice_sum_check(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Best-effort, server-side verification of an invoice-shaped extraction's
+    arithmetic: ``line_items[].line_total`` summed and compared against a
+    stated total, via calculator's ``check_sum`` — the plain function
+    (see ``mcp_servers/calculator.py``), called directly with no MCP session
+    and no tool loop. This never alters the extraction; it only annotates it.
+
+    Targets the one field shape ``InvoiceExtraction`` (and any dynamic schema
+    that happens to reuse the same field names) exposes: a ``line_items``
+    list of ``line_total`` MoneyFields plus a ``subtotal`` MoneyField —
+    ``subtotal`` is what a pre-tax line-item sum should equal, so it's
+    preferred over ``total_ttc`` (which also includes VAT) when both are
+    present. Any other schema shape — ``identity_card``, a dynamic schema
+    without these field names, or an invoice with no summable amounts — is a
+    silent no-op: this never raises, it just doesn't attach a ``sum_check``.
+    """
+    line_items = result.get("line_items")
+    if not isinstance(line_items, list) or not line_items:
+        return None
+    amounts = [
+        amount
+        for item in line_items
+        if isinstance(item, dict)
+        and (amount := _money_amount(item.get("line_total"))) is not None
+    ]
+    if not amounts:
+        return None
+    total_field = "subtotal" if _money_amount(result.get("subtotal")) is not None else "total_ttc"
+    claimed_total = _money_amount(result.get(total_field))
+    if claimed_total is None:
+        return None
+    outcome = check_sum(amounts, claimed_total)
+    return {**outcome, "total_field": total_field, "line_item_count": len(amounts)}
+
+
 async def _complete_structured_document(
     *,
     spec: AgentSpec,
@@ -275,6 +323,9 @@ async def _complete_structured_document(
     }
     if routing_audit is not None:
         docie_agent["routing"] = routing_audit
+    sum_check = _invoice_sum_check(response.result)
+    if sum_check is not None:
+        docie_agent["sum_check"] = sum_check
     return {
         "id": f"chatcmpl-agent-{response.request_id}",
         "object": "chat.completion",
