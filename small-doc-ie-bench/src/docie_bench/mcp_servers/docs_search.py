@@ -33,6 +33,18 @@ environment from the MCP client SDK (PATH/HOME-like vars, not the parent
 process's full env) -- ``DOCS_DIR_ENV``/``BACKEND_ENV`` reach it only
 because the catalog registers them explicitly as per-server env vars, same
 as web_fetch's allowed-hosts param.
+
+Every indexed document is ALSO exposed as an MCP resource (#332) under
+``docs://<relative-path>``, in addition to the ``list_files``/
+``read_document``/``search_text`` tool triad -- a capable client can
+``list_resources()`` to browse the corpus and ``read_resource(uri)`` to
+fetch a document directly, without going through a tool call. This is a
+separate, simpler read path: it does NOT go through ``run_tool_loop`` /
+``mcp_tools.py``, isn't traced through ``on_tool_call``, and a resource
+read returns the FULL document text rather than applying
+``read_document``'s peek/windowing discipline (see ``_full_document_text``)
+-- those caps exist to protect a model's context budget inside the
+agentic tool loop, which a resource read sits outside of.
 """
 
 from __future__ import annotations
@@ -41,6 +53,7 @@ import hashlib
 import json
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -299,6 +312,34 @@ PEEK_CHAR_BUDGET = 4000
 MAX_EXPLICIT_RANGE_PAGES = 5
 
 
+def _page_texts(path: Path) -> dict[int, str]:
+    """Extracted text grouped by page number, in reading order. Shared by
+    ``document_text`` (page-windowed) and ``_full_document_text`` (whole
+    document, for a resource read) so both agree on how pages are
+    assembled from the underlying OCR blocks."""
+    blocks = _extracted_blocks(path)
+    pages: dict[int, list[str]] = {}
+    for block in blocks:
+        pages.setdefault(block.page, []).append(block.text)
+    return {page: "\n".join(lines) for page, lines in pages.items()}
+
+
+def _full_document_text(relative: str) -> str:
+    """The ENTIRE document's text, every page, no peek/window capping --
+    unlike ``document_text`` (backing the ``read_document`` tool), a
+    resource read has no per-call start_page/end_page the way a tool call
+    does, and resource access sits outside the agentic tool loop (see
+    module docstring): the result isn't stuffed into a model's context
+    automatically the way a tool result is, so the PEEK_CHAR_BUDGET /
+    MAX_EXPLICIT_RANGE_PAGES caps that protect that loop don't apply here
+    -- a client browsing/reading a resource expects the resource, and owns
+    how it uses a large result (page through it, summarize it, discard
+    it)."""
+    path = resolve_document(relative)
+    page_texts = _page_texts(path)
+    return "\n\n".join(page_texts[p] for p in sorted(page_texts))
+
+
 def document_text(
     relative: str, start_page: int | None = None, end_page: int | None = None
 ) -> dict[str, Any]:
@@ -316,12 +357,8 @@ def document_text(
     wider than that.
     """
     path = resolve_document(relative)
-    blocks = _extracted_blocks(path)
-    pages: dict[int, list[str]] = {}
-    for block in blocks:
-        pages.setdefault(block.page, []).append(block.text)
-    page_numbers = sorted(pages)
-    page_texts = {page: "\n".join(lines) for page, lines in pages.items()}
+    page_texts = _page_texts(path)
+    page_numbers = sorted(page_texts)
     total_pages = len(page_numbers)
 
     notice: str | None = None
@@ -367,6 +404,18 @@ def document_text(
     if notice is not None:
         result["notice"] = notice
     return result
+
+
+# Every indexed document is also exposed as an MCP resource (#332) under
+# this scheme, e.g. "docs://invoices/2024-01.pdf" for the file at
+# "invoices/2024-01.pdf" under docs_dir() -- the identity URI, not a
+# search/read verb, since a resource IS the document rather than an action
+# on it.
+RESOURCE_URI_SCHEME = "docs"
+
+
+def resource_uri(relative: str) -> str:
+    return f"{RESOURCE_URI_SCHEME}://{relative}"
 
 
 def search_documents(query: str, path: str | None = None) -> list[dict[str, Any]]:
@@ -432,6 +481,29 @@ def build_server() -> Any:
         start_page/end_page to read that section in full rather than
         answering from the snippet alone."""
         return search_documents(query, path)
+
+    # One resource per indexed document (#332), same enumeration list_files
+    # already uses -- resources and list_files can never disagree about
+    # what's in the corpus. Static (not template) resources, registered up
+    # front from that same fixed listing, so list_resources() enumerates
+    # the corpus directly instead of a client having to guess URIs from a
+    # template: this server is a fresh subprocess per chat request (see
+    # module docstring), so the corpus can't drift mid-process the way a
+    # long-lived server's would.
+    def _make_reader(relative: str) -> Callable[[], str]:
+        def _read() -> str:
+            return _full_document_text(relative)
+
+        return _read
+
+    for relative in list_documents():
+        server.resource(
+            resource_uri(relative),
+            name=relative,
+            title=relative,
+            description=f"Full text of {relative!r} from the shared documents directory.",
+            mime_type="text/plain",
+        )(_make_reader(relative))
 
     return server
 
