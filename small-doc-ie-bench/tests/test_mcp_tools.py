@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from mcp.client.session import ClientSession
 from mcp.server.mcpserver import MCPServer
+from mcp.shared.exceptions import MCPError
 from mcp.shared.memory import create_client_server_memory_streams
 
 from docie_bench import mcp_tools
@@ -486,6 +487,71 @@ async def test_run_tool_loop_system_addendum_matches_the_folded_system_message(
     (addendum,) = addenda
     assert posted[0]["messages"][0]["content"] == addendum
     assert "a.txt" in addendum
+
+
+# ---------------------------------------------------------- docs-search resources (#332)
+
+
+async def test_docs_search_list_resources_has_one_resource_per_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from docie_bench.mcp_servers import docs_search
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("hello")
+    (docs / "b.txt").write_text("world")
+    # Nested dir with a space, same as list_files (rglob) already handles --
+    # e.g. a mcp_session_documents (#296) upload named by a user.
+    (docs / "sub dir").mkdir()
+    (docs / "sub dir" / "My Invoice.txt").write_text("nested")
+    monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(docs))
+
+    async with _memory_session(docs_search.build_server()) as session:
+        result = await session.list_resources()
+
+    by_uri = {str(r.uri): r for r in result.resources}
+    assert set(by_uri) == {
+        "docs://a.txt",
+        "docs://b.txt",
+        "docs://sub dir/My Invoice.txt",
+    }
+    assert by_uri["docs://a.txt"].name == "a.txt"
+    assert by_uri["docs://a.txt"].mime_type == "text/plain"
+    assert by_uri["docs://sub dir/My Invoice.txt"].name == "sub dir/My Invoice.txt"
+
+
+async def test_docs_search_read_resource_returns_full_document_text(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from docie_bench.mcp_servers import docs_search
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("total due: 42 EUR")
+    monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(docs))
+
+    async with _memory_session(docs_search.build_server()) as session:
+        result = await session.read_resource("docs://a.txt")
+
+    (content,) = result.contents
+    assert content.text == "total due: 42 EUR"
+    assert content.mime_type == "text/plain"
+
+
+async def test_docs_search_read_resource_unknown_uri_raises_mcp_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from docie_bench.mcp_servers import docs_search
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.DOCS_DIR_ENV, str(docs))
+
+    async with _memory_session(docs_search.build_server()) as session:
+        with pytest.raises(MCPError, match="Unknown resource"):
+            await session.read_resource("docs://nope.txt")
 
 
 async def test_run_tool_loop_reports_per_round_and_cumulative_usage() -> None:
