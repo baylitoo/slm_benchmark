@@ -45,6 +45,7 @@ class LifecycleState(StrEnum):
 class RuntimeFeature(StrEnum):
     BATCHING = "batching"
     EMBEDDINGS = "embeddings"
+    LOGPROBS = "logprobs"
     LORA = "lora"
     QUANTIZATION = "quantization"
     STRUCTURED_OUTPUT = "structured_output"
@@ -641,10 +642,15 @@ class VLLMRuntime(RuntimeAdapter):
 class LlamaCppRuntime(RuntimeAdapter):
     kind = RuntimeKind.LLAMACPP
     executable_names = ("llama-server",)
+    # LOGPROBS (#335): llama-server's /v1/chat/completions supports OpenAI-shaped
+    # logprobs/top_logprobs. Advertised here for llama.cpp only this round --
+    # vLLM/Ollama parity is unverified, so they deliberately don't get it (see
+    # extract.logprob_confidence, gated on ModelProfile.runtime == "llamacpp").
     features = frozenset(
         {
             RuntimeFeature.BATCHING,
             RuntimeFeature.EMBEDDINGS,
+            RuntimeFeature.LOGPROBS,
             RuntimeFeature.LORA,
             RuntimeFeature.QUANTIZATION,
             RuntimeFeature.STRUCTURED_OUTPUT,
