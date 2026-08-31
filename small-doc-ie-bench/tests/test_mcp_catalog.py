@@ -106,6 +106,86 @@ async def test_fetch_url_redirects_reported_and_body_truncated(monkeypatch) -> N
     assert len(big["text"]) <= 200_000
 
 
+def test_is_html_content_type() -> None:
+    assert web_fetch.is_html_content_type("text/html; charset=utf-8") is True
+    assert web_fetch.is_html_content_type("application/xhtml+xml") is True
+    assert web_fetch.is_html_content_type("application/json") is False
+    assert web_fetch.is_html_content_type("text/plain") is False
+    assert web_fetch.is_html_content_type("") is False
+
+
+async def test_fetch_url_extracts_text_from_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = (
+        "<html><head><title>T</title>"
+        "<style>body { color: red; }</style>"
+        "<script>function evil() { alert('tracked'); }</script>"
+        "</head><body>"
+        "<h1>Hello World</h1>"
+        "<p>This is the actual content.</p>"
+        "<script>console.log('more tracking');</script>"
+        "</body></html>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=page, headers={"content-type": "text/html; charset=utf-8"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    monkeypatch.setenv(web_fetch.ALLOWED_HOSTS_ENV, "site.com")
+    result = await web_fetch.fetch_url("https://site.com/page.html")
+    assert result["ok"] is True
+    assert result["content_type"] == "text/html; charset=utf-8"
+    assert "Hello World" in result["text"]
+    assert "actual content" in result["text"]
+    assert "<" not in result["text"]
+    assert "evil" not in result["text"]
+    assert "alert" not in result["text"]
+    assert "tracked" not in result["text"]
+    assert "color: red" not in result["text"]
+
+
+async def test_fetch_url_non_html_passes_through_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps({"a": 1, "b": [1, 2, 3]})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=payload, headers={"content-type": "application/json"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    monkeypatch.setenv(web_fetch.ALLOWED_HOSTS_ENV, "site.com")
+    result = await web_fetch.fetch_url("https://site.com/data.json")
+    assert result["ok"] is True
+    assert result["text"] == payload
+
+
+async def test_fetch_url_truncates_extracted_html_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = "<html><body>" + "<p>word</p>" * 60_000 + "</body></html>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=page, headers={"content-type": "text/html"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    monkeypatch.setenv(web_fetch.ALLOWED_HOSTS_ENV, "site.com")
+    result = await web_fetch.fetch_url("https://site.com/long.html")
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(result["text"].encode("utf-8")) <= 200_000
+    assert "<" not in result["text"]
+
+
 # ----------------------------------------------------------------- docs-search
 
 
