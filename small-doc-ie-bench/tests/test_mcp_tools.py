@@ -618,6 +618,65 @@ async def test_run_tool_loop_context_budget_does_not_fire_under_threshold() -> N
     assert budget_events == []
 
 
+async def test_run_tool_loop_context_budget_line_present_from_round_one_and_updates() -> None:
+    # The model must be aware of its budget from the FIRST round (not just
+    # warned once late), and the line must UPDATE with the latest cumulative
+    # total each round rather than accumulating stale duplicates.
+    responses = [
+        _tool_calls_completion(
+            "calc__add",
+            '{"a": 1, "b": 2}',
+            {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+        ),
+        _tool_calls_completion(
+            "calc__add",
+            '{"a": 3, "b": 4}',
+            {"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35},
+        ),
+        _final_completion(
+            "sum is 10", {"prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20}
+        ),
+    ]
+    posted: list[dict[str, Any]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return responses.pop(0)
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+3, then 1+2?"}]}
+        await run_tool_loop(
+            post,
+            body,
+            sessions,
+            mapping,
+            tools,
+            max_iterations=4,
+            context_length_ceiling=100,
+            # No on_context_budget given -- the model-facing line must still
+            # be present and update; it is not gated on this callback.
+        )
+
+    def budget_lines(round_index: int) -> list[str]:
+        content = next(
+            str(m["content"]) for m in posted[round_index]["messages"] if m["role"] == "system"
+        )
+        prefix = mcp_tools._CONTEXT_BUDGET_PREFIX
+        return [line for line in content.split("\n") if line.startswith(prefix)]
+
+    # Round 1 (index 0)'s request already carries the initial 0/100 line --
+    # aware from the very first round, not only once things get tight.
+    assert budget_lines(0) == [mcp_tools._context_budget_line(0, 100)]
+    # Round 2's request reflects round 1's actual usage (50 tokens) --
+    # updated, not appended alongside the stale initial line.
+    assert budget_lines(1) == [mcp_tools._context_budget_line(50, 100)]
+    # Round 3's request reflects cumulative after round 2 (50 + 35 = 85) --
+    # still exactly one line, always current.
+    assert budget_lines(2) == [mcp_tools._context_budget_line(85, 100)]
+
+
 async def test_run_tool_loop_context_budget_skips_when_ceiling_unresolvable() -> None:
     # context_length_ceiling=None (the caller couldn't resolve a deployment's
     # context window) must never raise or attempt the comparison -- fail
