@@ -385,9 +385,13 @@ function ActivityCard({
   );
 }
 
-function llamaCppRunningDeploymentNames(records: DeploymentRecord[]): string[] {
+/** Exported for direct unit testing, same pattern as {@link formatCount}. */
+export function llamaCppRunningDeploymentNames(records: DeploymentRecord[]): string[] {
+  // "ready" is the live-serving state every backend record actually uses
+  // (catalog.py/dashboard.py/placement_resolver.py) -- "running" never
+  // occurs, so this filter matched nothing against a real deployment.
   return records
-    .filter((r) => r.spec?.launch?.runtime === "llamacpp" && r.state === "running")
+    .filter((r) => r.spec?.launch?.runtime === "llamacpp" && r.state === "ready")
     .map((r) => r.spec?.name)
     .filter((name): name is string => Boolean(name));
 }

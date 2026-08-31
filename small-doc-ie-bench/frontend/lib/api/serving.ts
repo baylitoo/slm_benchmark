@@ -115,7 +115,7 @@ export interface DeploymentRecord {
     desired_state?: string;
     [k: string]: unknown;
   };
-  state?: string; // lifecycle: "running" | "stopped" | ...
+  state?: string; // lifecycle: "stopped" | "starting" | "ready" | "degraded" | "failed"
   pid?: number | null;
   endpoint?: string | null;
   restart_count?: number;

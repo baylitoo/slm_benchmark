@@ -1,9 +1,9 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { UsageCard, formatCount } from "@/components/Observability";
+import { UsageCard, formatCount, llamaCppRunningDeploymentNames } from "@/components/Observability";
 import * as api from "@/lib/api";
-import type { UsageDeployment } from "@/lib/api";
+import type { DeploymentRecord, UsageDeployment } from "@/lib/api";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -35,6 +35,36 @@ describe("formatCount", () => {
     expect(formatCount(1000)).toBe("1k");
     expect(formatCount(12400)).toBe("12.4k");
     expect(formatCount(3_200_000)).toBe("3.2M");
+  });
+});
+
+describe("llamaCppRunningDeploymentNames", () => {
+  function makeRecord(overrides: Partial<DeploymentRecord> = {}): DeploymentRecord {
+    return {
+      spec: { name: "lfm2.5-350m", launch: { runtime: "llamacpp" } },
+      state: "ready",
+      ...overrides,
+    };
+  }
+
+  it("matches a live llama.cpp deployment (state: ready, the real backend value)", () => {
+    expect(llamaCppRunningDeploymentNames([makeRecord()])).toEqual(["lfm2.5-350m"]);
+  });
+
+  it("excludes a non-llamacpp runtime even when ready", () => {
+    const record = makeRecord({ spec: { name: "x", launch: { runtime: "vllm" } } });
+    expect(llamaCppRunningDeploymentNames([record])).toEqual([]);
+  });
+
+  it("excludes a llamacpp deployment that isn't ready (starting/stopped/degraded/failed)", () => {
+    for (const state of ["starting", "stopped", "degraded", "failed", "running"]) {
+      expect(llamaCppRunningDeploymentNames([makeRecord({ state })])).toEqual([]);
+    }
+  });
+
+  it("drops a record with no resolvable name", () => {
+    const record = makeRecord({ spec: { launch: { runtime: "llamacpp" } } });
+    expect(llamaCppRunningDeploymentNames([record])).toEqual([]);
   });
 });
 
