@@ -55,6 +55,7 @@ import {
   type RoutingPolicySummary,
   type AgentToolCallTrace,
   type AgentUsageTrace,
+  type AgentContextBudgetTrace,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -219,6 +220,11 @@ interface ChatMsg {
    * caller's own system prompt -- fires once per request, not once per
    * round, so it's a field on the message rather than a TraceEntry. */
   systemAddendum?: string;
+  /** Fires AT MOST ONCE per exchange (#344): cumulative usage crossed the
+   * resolved deployment's context-budget warning threshold -- a standing
+   * risk for the rest of THIS exchange, not a per-round log entry, so it's
+   * a field on the message (like systemAddendum) rather than a TraceEntry. */
+  contextBudgetWarning?: AgentContextBudgetTrace;
 }
 
 type TraceEntry =
@@ -558,6 +564,7 @@ export function ChatPanel({
         const liveUsage: AgentUsageTrace[] = [];
         const liveTrace: TraceEntry[] = [];
         let liveSystemAddendum: string | undefined;
+        let liveContextBudget: AgentContextBudgetTrace | undefined;
         const patchLiveMsg = () => {
           setMsgs((prev) => {
             const patch = {
@@ -566,6 +573,7 @@ export function ChatPanel({
               trace: [...liveTrace],
               ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
               ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
+              ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
             };
             return prev.length <= next.length
               ? [...next, { role: "assistant", ...patch }]
@@ -591,6 +599,10 @@ export function ChatPanel({
           liveTrace.push({ kind: "usage", usage });
           patchLiveMsg();
         };
+        const onContextBudget = (budget: AgentContextBudgetTrace) => {
+          liveContextBudget = budget;
+          patchLiveMsg();
+        };
         const res = await chatCompletionMcpStream(
           model,
           payload,
@@ -600,6 +612,7 @@ export function ChatPanel({
           onReasoning,
           onSystemAddendum,
           onUsage,
+          onContextBudget,
         );
         const answer = res.choices?.[0]?.message?.content ?? "";
         const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
@@ -623,6 +636,7 @@ export function ChatPanel({
           ...(liveReasoning.length > 0 ? { reasoning: liveReasoning } : {}),
           ...(finalTrace.length > 0 ? { trace: finalTrace } : {}),
           ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
+          ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
         };
         setMsgs((prev) =>
           prev.length <= next.length
@@ -943,6 +957,17 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.contextBudgetWarning && (
+                  <Alert tone="warn" className="w-full max-w-[85%]">
+                    <span>
+                      <T>Context budget warning:</T> {m.contextBudgetWarning.cumulative_tokens} /{" "}
+                      {m.contextBudgetWarning.context_length}{" "}
+                      <T>tokens used</T> ({Math.round(m.contextBudgetWarning.threshold_fraction * 100)}%{" "}
+                      <T>threshold</T>) —{" "}
+                      <T>this exchange is at risk of overflowing the deployment's context window.</T>
+                    </span>
+                  </Alert>
+                )}
                 {m.systemAddendum && (
                   <details className="w-full max-w-[85%] rounded-md border border-border bg-muted/20 text-xs">
                     <summary className="cursor-pointer px-2 py-1 font-medium text-muted-foreground hover:text-foreground">

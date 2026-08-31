@@ -314,6 +314,7 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -327,6 +328,7 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
@@ -544,5 +546,67 @@ describe("ChatPanel", () => {
 
     resolveCompletion({ choices: [{ message: { role: "assistant", content: "42 EUR" } }] });
     expect(await screen.findByText("42 EUR")).toBeInTheDocument();
+  });
+
+  it("renders a warning banner when cumulative usage crosses the context budget", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (
+        _model,
+        _messages,
+        _servers,
+        _onToolCall,
+        _sessionId,
+        _onReasoning,
+        _onSystemAddendum,
+        _onUsage,
+        onContextBudget,
+      ) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          onContextBudget?.({
+            cumulative_tokens: 3300,
+            context_length: 4096,
+            threshold_fraction: 0.8,
+          });
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "keep going");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/Context budget warning/)).toBeInTheDocument();
+    expect(screen.getByText(/3300/)).toBeInTheDocument();
+    expect(screen.getByText(/4096/)).toBeInTheDocument();
+    expect(screen.getByText(/80%/)).toBeInTheDocument();
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "still going" } }] });
+    expect(await screen.findByText("still going")).toBeInTheDocument();
+    // The warning is a standing risk for the rest of the exchange -- it
+    // must still be visible once the final answer lands, not just during
+    // the live/streaming phase.
+    expect(screen.getByText(/Context budget warning/)).toBeInTheDocument();
+  });
+
+  it("does not render a context budget warning when no context_budget event fires", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    vi.mocked(api.chatCompletionMcpStream).mockResolvedValue({
+      choices: [{ message: { role: "assistant", content: "all fine" } }],
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "quick question");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("all fine")).toBeInTheDocument();
+    expect(screen.queryByText(/Context budget warning/)).not.toBeInTheDocument();
   });
 });

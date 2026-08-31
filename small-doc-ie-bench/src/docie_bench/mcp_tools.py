@@ -334,6 +334,30 @@ TOOL_DISCIPLINE_DIRECTIVE = (
     "so directly instead of guessing."
 )
 
+# Stable prefix marking the one line of the system message _with_context_budget_line
+# owns -- lets it find-and-REPLACE its own line every round instead of
+# appending a new stale snapshot each time (which would make the model's
+# context problem worse while trying to warn it about one).
+_CONTEXT_BUDGET_PREFIX = "Context budget:"
+
+
+def _context_budget_line(used_tokens: int, ceiling: int) -> str:
+    """The model-facing budget line for this round's CURRENT standing.
+
+    The model is told about the budget from round 1 (0/ceiling) and this is
+    re-folded every round after, always reflecting the latest cumulative
+    total -- not a one-time warning near the wall, continuous awareness so
+    the model can pace itself across the whole exchange (#344, revised per
+    explicit feedback: a late warning alone isn't enough).
+    """
+    percent = round(100 * used_tokens / ceiling) if ceiling else 0
+    return (
+        f"{_CONTEXT_BUDGET_PREFIX} {used_tokens}/{ceiling} tokens used ({percent}%) in this "
+        "exchange so far. Pace yourself -- as this climbs, wrap up and answer with what you "
+        "have rather than continuing to call tools, unless one more targeted call is clearly "
+        "necessary to answer at all."
+    )
+
 
 def _with_system_addendum(messages: list[dict[str, Any]], addendum: str) -> list[dict[str, Any]]:
     """Fold ``addendum`` into the request's system message — appended to the
@@ -349,6 +373,27 @@ def _with_system_addendum(messages: list[dict[str, Any]], addendum: str) -> list
                 message["content"] = f"{content}\n\n{addendum}"
                 return messages
     return [{"role": "system", "content": addendum}, *messages]
+
+
+def _with_context_budget_line(messages: list[dict[str, Any]], line: str) -> list[dict[str, Any]]:
+    """Fold ``line`` into the system message, REPLACING any previous budget
+    line (found via ``_CONTEXT_BUDGET_PREFIX``) rather than appending a new
+    one each round. The model always sees its CURRENT standing as one line,
+    never a growing history of stale snapshots eating its own budget.
+    """
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str):
+                text_lines = content.split("\n")
+                for i, existing in enumerate(text_lines):
+                    if existing.startswith(_CONTEXT_BUDGET_PREFIX):
+                        text_lines[i] = line
+                        message["content"] = "\n".join(text_lines)
+                        return messages
+                message["content"] = f"{content}\n\n{line}"
+                return messages
+    return [{"role": "system", "content": line}, *messages]
 
 
 async def _eager_list_context(
@@ -430,6 +475,8 @@ async def run_tool_loop(
     on_reasoning: Callable[[str], None] | None = None,
     on_system_addendum: Callable[[str], None] | None = None,
     on_usage: Callable[[dict[str, Any]], None] | None = None,
+    context_length_ceiling: int | None = None,
+    on_context_budget: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -488,6 +535,39 @@ async def run_tool_loop(
     the final completion's summed ``usage`` by hand after the whole
     exchange already finished. Fires for EVERY round, including the last
     one, same as ``on_reasoning``.
+
+    ``context_length_ceiling``, when given, is the resolved deployment's own
+    context window (its ``spec.launch.context_length`` deployment record) --
+    the caller resolves this BEFORE the loop starts, from the same
+    ``deployments.json`` this codebase already reads for capacity elsewhere.
+    ``None`` means the ceiling could not be resolved (an unknown/unpriceable
+    deployment, or a profile not backed by a live deployment record at all)
+    and the check below is skipped entirely -- fail-open, the same convention
+    every fit/pricing gate in this codebase uses for an unknowable value.
+
+    Whenever ``context_length_ceiling`` is known, the model is told about its
+    budget from the FIRST round on, not just warned once late: a
+    ``_CONTEXT_BUDGET_PREFIX``-marked line is folded into the system message
+    before round 1 (``0/ceiling``), then RE-FOLDED (replacing that same
+    line, never appended anew) after every round with the latest cumulative
+    total -- continuous awareness the model can pace itself against for the
+    whole exchange, not a single late warning near the wall.
+
+    Separately, ``on_context_budget``, when given, is invoked ONCE -- the
+    first round cumulative ``total_tokens`` reaches
+    ``settings.mcp_context_budget_warn_fraction`` (default 80%) of the
+    ceiling -- with ``{"cumulative_tokens": <int>, "context_length": <int>,
+    "threshold_fraction": <float>}``. This is the human/UI-facing mirror,
+    for a caller that wants a one-time actionable warning of its own (the
+    Playground renders it as a banner); it is independent of the continuous
+    model-facing line above, which happens regardless of whether this
+    callback is given.
+
+    Neither truncates, summarizes, or otherwise forces the exchange to end --
+    a cumulative total several real rounds deep can still hit a hard
+    ``exceed_context_size_error`` from llama-server on some LATER round if
+    the model doesn't act on its own budget awareness; this narrows that
+    risk, it doesn't eliminate it.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -500,6 +580,10 @@ async def run_tool_loop(
         messages = _with_system_addendum(messages, addendum)
         if on_system_addendum is not None:
             on_system_addendum(addendum)
+    if context_length_ceiling is not None:
+        messages = _with_context_budget_line(
+            messages, _context_budget_line(0, context_length_ceiling)
+        )
     caller_tools = list(forward.get("tools") or [])
     caller_tool_names = {
         str(t.get("function", {}).get("name"))
@@ -508,6 +592,7 @@ async def run_tool_loop(
     }
     forward["tools"] = caller_tools + mcp_tools
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    context_budget_warned = False
     for _ in range(limit):
         forward["messages"] = messages
         completion = await post(forward)
@@ -522,6 +607,23 @@ async def run_tool_loop(
                     "cumulative": dict(totals),
                 }
             )
+        if context_length_ceiling is not None:
+            # Model-facing: re-fold every round with the latest cumulative
+            # total, independent of the one-time human-facing signal below.
+            messages = _with_context_budget_line(
+                messages, _context_budget_line(totals["total_tokens"], context_length_ceiling)
+            )
+            if on_context_budget is not None and not context_budget_warned:
+                threshold_fraction = get_settings().mcp_context_budget_warn_fraction
+                if totals["total_tokens"] >= context_length_ceiling * threshold_fraction:
+                    context_budget_warned = True
+                    on_context_budget(
+                        {
+                            "cumulative_tokens": totals["total_tokens"],
+                            "context_length": context_length_ceiling,
+                            "threshold_fraction": threshold_fraction,
+                        }
+                    )
         choices = completion.get("choices")
         message = (
             choices[0].get("message")
