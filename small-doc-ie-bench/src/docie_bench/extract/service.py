@@ -13,6 +13,10 @@ from typing import Any
 import httpx
 
 from docie_bench.extract.grounding import ground_evidence
+from docie_bench.extract.logprob_confidence import (
+    attach_model_confidence,
+    compute_field_confidences,
+)
 from docie_bench.extract.validators import validate_extraction
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
@@ -632,9 +636,14 @@ class ExtractionService:
                 language=language,
                 metadata=metadata,
             )
+        # Opt-in (#335): llama.cpp-only per-token logprob confidence. Both the
+        # request flag AND the declared runtime must agree -- an unlabeled or
+        # non-llama.cpp profile never gets `logprobs` on the wire, regardless
+        # of the flag (see ModelProfile.runtime/.logprob_confidence).
+        want_logprobs = self.profile.logprob_confidence and self.profile.runtime == "llamacpp"
         client = OpenAICompatibleClient(self.profile)
         try:
-            raw, usage_dict, _raw_response = await client.chat_json(
+            raw, usage_dict, raw_response = await client.chat_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 schema_name=schema_name,
@@ -654,16 +663,33 @@ class ExtractionService:
                     and self.profile.prompt_profile == "strict_extraction_v1"
                     else None
                 ),
+                request_logprobs=want_logprobs,
             )
             effective_style = getattr(client, "last_response_format_style", None)
         finally:
             await client.aclose()
+        # Snapshot BEFORE any reshaping: `raw` here is exactly the FLAT dict
+        # the model generated (matches `generation_schema`'s unwrapped shape),
+        # which is what field-value substrings must be located against. Both
+        # NuExtract normalization and schema rehydration below rebuild new
+        # dicts rather than mutating `raw` in place, so this reference stays
+        # untouched by them.
+        field_confidences: dict[str, float | None] = (
+            compute_field_confidences(raw, raw_response) if want_logprobs else {}
+        )
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
         raw = rehydrate_extraction_result(raw, schema)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
+        if field_confidences:
+            # Attached to the plain validated dict, not a Pydantic field on
+            # TextField/MoneyField/etc: `model_confidence` is ad-hoc metadata
+            # this round, so any path that re-validates a stored result back
+            # through those wrapper models (extra="ignore" by default) will
+            # silently drop it again. Acceptable for this opt-in signal.
+            attach_model_confidence(normalized, field_confidences)
         if derived_subtotal:
             # The model didn't report a subtotal; it was computed here from
             # total_ttc - vat_amount, not read off the document. Without this,
