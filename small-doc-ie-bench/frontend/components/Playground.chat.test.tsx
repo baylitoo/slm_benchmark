@@ -17,6 +17,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listMcpServers: vi.fn(),
     listSchemas: vi.fn(),
     listDynamicSchemas: vi.fn(),
+    getSchemaFields: vi.fn(),
     listRoutingPolicies: vi.fn(),
     triggerExtract: vi.fn(),
     fileToBase64: vi.fn(async () => "ZmFrZQ=="),
@@ -82,6 +83,7 @@ describe("ChatPanel", () => {
     vi.mocked(api.listMcpServers).mockResolvedValue([]);
     vi.mocked(api.listSchemas).mockResolvedValue(["invoice", "identity_card"]);
     vi.mocked(api.listDynamicSchemas).mockResolvedValue([]);
+    vi.mocked(api.getSchemaFields).mockResolvedValue(["invoice_number", "vendor_name", "total_ttc"]);
     vi.mocked(api.listRoutingPolicies).mockResolvedValue([]);
     vi.mocked(api.chatCompletionStream).mockImplementation(async (_model, _messages, onToken) => {
       onToken("hi there");
@@ -119,6 +121,52 @@ describe("ChatPanel", () => {
     expect(parts[0]).toEqual({ type: "text", text: "what's the total?" });
     expect(parts[1].type).toBe("image_url");
     expect(parts[1].image_url?.url).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("renders only the generic vision presets when no schema is selected", async () => {
+    vi.mocked(api.listSchemas).mockResolvedValue([]);
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const file = new File(["fake-bytes"], "invoice.png", { type: "image/png" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+
+    expect(
+      await screen.findByRole("button", { name: /Extract all the text/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Describe this image/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /What is written/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Extract:/ })).not.toBeInTheDocument();
+  });
+
+  it("adds a schema-derived preset naming the selected schema's fields", async () => {
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const file = new File(["fake-bytes"], "invoice.png", { type: "image/png" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+
+    expect(
+      await screen.findByRole("button", { name: /^Extract: invoice_number/ }),
+    ).toBeInTheDocument();
+    expect(api.getSchemaFields).toHaveBeenCalledWith("invoice");
+    // The generic presets stay put -- this is additive, not a replacement.
+    expect(screen.getByRole("button", { name: /Describe this image/ })).toBeInTheDocument();
+  });
+
+  it("populates the message input from the schema-derived preset the same way a generic preset does", async () => {
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const file = new File(["fake-bytes"], "invoice.png", { type: "image/png" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+
+    const preset = await screen.findByRole("button", { name: /^Extract: invoice_number/ });
+    await user.click(preset);
+
+    expect(screen.getByPlaceholderText(/Type a message/)).toHaveValue(
+      "Extract: invoice_number, vendor_name, total_ttc",
+    );
   });
 
   it("routes Send to extraction when the toggle is on, and renders the result inline", async () => {

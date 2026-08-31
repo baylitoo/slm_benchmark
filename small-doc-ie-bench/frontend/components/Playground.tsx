@@ -41,6 +41,7 @@ import {
   uploadSessionDocument,
   listDynamicSchemas,
   listSchemas,
+  getSchemaFields,
   listRoutingPolicies,
   ApiError,
   ApiUnavailable,
@@ -364,6 +365,24 @@ export function ChatPanel({
     "routing-policies",
     listRoutingPolicies,
   );
+  // Field names for whichever schema is currently selected above -- used to
+  // build a schema-aware vision preset (see VISION_PRESETS below). A schema
+  // counts as "selected" only once it resolves against the lists this same
+  // picker already fetched (schemas.data / dynamicSchemas.data); this keeps
+  // the fresh-mount / no-schemas-configured case free of a preset that names
+  // fields nothing on the server actually recognizes.
+  const dynamicSchemaEntry = dynamicSchemaName
+    ? (dynamicSchemas.data ?? []).find((s) => s.name === dynamicSchemaName)
+    : undefined;
+  const builtinSchemaKnown =
+    !dynamicSchemaName && !!schemaName && (schemas.data ?? []).includes(schemaName);
+  const builtinSchemaFields = useAsync<string[]>(
+    `schema-fields:${builtinSchemaKnown ? schemaName : ""}`,
+    () => (builtinSchemaKnown ? getSchemaFields(schemaName) : Promise.resolve([])),
+  );
+  const selectedSchemaFields =
+    dynamicSchemaEntry?.spec.fields.map((f) => f.name) ??
+    (builtinSchemaKnown ? (builtinSchemaFields.data ?? []) : []);
   // "single" routes to the deployment picked above; "policy" runs a saved
   // routing policy (cheap stage first, escalate on the policy's own
   // confidence rules) — mutually exclusive with a single deployment, same as
@@ -1065,7 +1084,12 @@ export function ChatPanel({
               )}
               {!extractionOn && file && (
                 <div className="flex flex-wrap gap-1">
-                  {VISION_PRESETS.map((p) => (
+                  {[
+                    ...VISION_PRESETS,
+                    ...(selectedSchemaFields.length > 0
+                      ? [`Extract: ${selectedSchemaFields.join(", ")}`]
+                      : []),
+                  ].map((p) => (
                     <button
                       key={p}
                       type="button"

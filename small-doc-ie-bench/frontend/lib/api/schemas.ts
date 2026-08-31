@@ -11,6 +11,19 @@ export function listSchemas(): Promise<string[]> {
   return request<{ schemas: string[] }>("/v1/schemas").then((r) => r.schemas ?? []);
 }
 
+/** Field names for one built-in schema (GET /v1/schemas/{name}), read off its
+ * JSON schema `properties`. Excludes `document_type` (a fixed literal, not an
+ * extracted field) and `extraction_notes` (metadata, not a field). */
+export function getSchemaFields(name: string): Promise<string[]> {
+  return request<{ properties?: Record<string, unknown> }>(
+    `/v1/schemas/${encodeURIComponent(name)}`,
+  ).then((r) =>
+    Object.keys(r.properties ?? {}).filter(
+      (k) => k !== "document_type" && k !== "extraction_notes",
+    ),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic schemas -- named DynamicSchemaSpecs saved via the Studio's schema
 // builder. The spec itself (schemas/dynamic.py) already validates and already
