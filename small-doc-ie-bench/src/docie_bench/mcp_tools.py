@@ -430,6 +430,8 @@ async def run_tool_loop(
     on_reasoning: Callable[[str], None] | None = None,
     on_system_addendum: Callable[[str], None] | None = None,
     on_usage: Callable[[dict[str, Any]], None] | None = None,
+    context_length_ceiling: int | None = None,
+    on_context_budget: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -488,6 +490,30 @@ async def run_tool_loop(
     the final completion's summed ``usage`` by hand after the whole
     exchange already finished. Fires for EVERY round, including the last
     one, same as ``on_reasoning``.
+
+    ``context_length_ceiling``, when given, is the resolved deployment's own
+    context window (its ``spec.launch.context_length`` deployment record) --
+    the caller resolves this BEFORE the loop starts, from the same
+    ``deployments.json`` this codebase already reads for capacity elsewhere.
+    ``None`` means the ceiling could not be resolved (an unknown/unpriceable
+    deployment, or a profile not backed by a live deployment record at all)
+    and the check below is skipped entirely -- fail-open, the same convention
+    every fit/pricing gate in this codebase uses for an unknowable value.
+
+    ``on_context_budget``, when given (and ``context_length_ceiling`` is
+    known), is invoked ONCE -- the first round whose cumulative
+    ``total_tokens`` reaches ``settings.mcp_context_budget_warn_fraction``
+    (default 80%) of ``context_length_ceiling`` -- with
+    ``{"cumulative_tokens": <int>, "context_length": <int>,
+    "threshold_fraction": <float>}``. This is a WARNING signal only:
+    cumulative usage several real rounds deep can still hit a hard
+    ``exceed_context_size_error`` from llama-server on some LATER round with
+    zero prior warning, losing the whole in-progress exchange -- this gives a
+    caller a chance to see that coming before it happens. Fires at most once
+    per exchange (not once per round after crossing), so a long exchange
+    doesn't spam the same warning every round. Never truncates, summarizes,
+    or otherwise alters the exchange -- proactive mitigation is out of
+    scope, this only surfaces the risk.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -508,6 +534,7 @@ async def run_tool_loop(
     }
     forward["tools"] = caller_tools + mcp_tools
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    context_budget_warned = False
     for _ in range(limit):
         forward["messages"] = messages
         completion = await post(forward)
@@ -522,6 +549,21 @@ async def run_tool_loop(
                     "cumulative": dict(totals),
                 }
             )
+        if (
+            context_length_ceiling is not None
+            and on_context_budget is not None
+            and not context_budget_warned
+        ):
+            threshold_fraction = get_settings().mcp_context_budget_warn_fraction
+            if totals["total_tokens"] >= context_length_ceiling * threshold_fraction:
+                context_budget_warned = True
+                on_context_budget(
+                    {
+                        "cumulative_tokens": totals["total_tokens"],
+                        "context_length": context_length_ceiling,
+                        "threshold_fraction": threshold_fraction,
+                    }
+                )
         choices = completion.get("choices")
         message = (
             choices[0].get("message")

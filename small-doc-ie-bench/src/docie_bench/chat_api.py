@@ -548,6 +548,29 @@ async def _chat_with_mcp_tools(
     return completion
 
 
+def _context_length_for_profile(profile: ModelProfile) -> int | None:
+    """The resolved deployment's own ``context_length`` ceiling for
+    ``run_tool_loop``'s context-budget warning (#344), or ``None`` when it
+    can't be resolved.
+
+    Same lookup #333's batch fan-out capacity uses for ``n_parallel`` (both
+    read the live deployment record straight off ``deployments.json`` and
+    pull a field off ``spec.launch``) — here for ``context_length`` instead.
+    ``profile.name`` is the deployment's own name for a live-deployment
+    profile (``profile_resolver._synthesize_profile``); a profile that isn't
+    backed by one (a plain ``models.yaml`` entry, or the env fallback) has
+    no matching record, which is exactly the "unknown/unpriceable" case —
+    fail open, same convention as every other fit/pricing gate in this
+    codebase, rather than guess or block the request.
+    """
+    from docie_bench.serving.profile_resolver import _default_live_deployments
+
+    for record in _default_live_deployments():
+        if record.spec.name == profile.name:
+            return record.spec.launch.context_length
+    return None
+
+
 def _sse_event(payload: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(payload)}\n\n".encode()
 
@@ -604,6 +627,18 @@ async def _stream_chat_with_mcp_tools(
         no context-window denominator. Lets a client show how much a live
         agentic exchange is consuming before the final completion lands,
         instead of only after the whole exchange finishes.
+      ``{"type": "context_budget", "cumulative_tokens", "context_length",
+        "threshold_fraction"}`` — fired AT MOST ONCE per exchange (#344),
+        the first round whose cumulative usage crosses
+        ``settings.mcp_context_budget_warn_fraction`` (default 80%) of the
+        resolved deployment's own ``context_length`` (see
+        ``_context_length_for_profile``). A WARNING only — a long agentic
+        exchange can otherwise run several real rounds before a LATER
+        round's cumulative usage exceeds the deployment's context window and
+        llama-server hard-400s, losing the whole in-progress exchange with
+        no prior warning. Never fires when the ceiling can't be resolved
+        (an unknown/unpriceable deployment) — fail-open, same as every
+        other fit/pricing gate in this codebase.
       ``{"type": "content", "completion": <final OpenAI-shaped completion>}``
       ``{"type": "error", "error": {"message", "type", "code"}}``
     Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
@@ -615,6 +650,7 @@ async def _stream_chat_with_mcp_tools(
 
     from docie_bench import mcp_tools as mcp_mod
 
+    context_length_ceiling = _context_length_for_profile(profile)
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     class _QueueTraceSink(list[dict[str, Any]]):
@@ -669,6 +705,10 @@ async def _stream_chat_with_mcp_tools(
                             {"type": "system_addendum", "text": text}
                         ),
                         on_usage=lambda usage: queue.put_nowait({"type": "usage", **usage}),
+                        context_length_ceiling=context_length_ceiling,
+                        on_context_budget=lambda budget: queue.put_nowait(
+                            {"type": "context_budget", **budget}
+                        ),
                     )
             except Exception as exc:  # noqa: BLE001 - transport teardown failure
                 message = f"MCP session error: {exc}"

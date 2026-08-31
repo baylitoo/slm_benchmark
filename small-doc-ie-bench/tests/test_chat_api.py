@@ -503,6 +503,8 @@ def test_chat_mcp_stream_relays_each_tool_call_as_its_own_sse_event(api, monkeyp
         on_reasoning=None,
         on_system_addendum=None,
         on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
     ):
         assert on_tool_call is not None
         on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
@@ -578,6 +580,8 @@ def test_chat_mcp_stream_relays_reasoning_content_as_its_own_sse_event(api, monk
         on_reasoning=None,
         on_system_addendum=None,
         on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
     ):
         assert on_reasoning is not None
         on_reasoning("the user asked for 1+2, so I should call calc.add")
@@ -640,6 +644,8 @@ def test_chat_mcp_stream_relays_system_addendum_as_its_own_sse_event_once(api, m
         on_reasoning=None,
         on_system_addendum=None,
         on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
     ):
         assert on_system_addendum is not None
         on_system_addendum(TOOL_DISCIPLINE_DIRECTIVE)
@@ -701,6 +707,8 @@ def test_chat_mcp_stream_relays_usage_as_its_own_sse_event(api, monkeypatch) -> 
         on_reasoning=None,
         on_system_addendum=None,
         on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
     ):
         assert on_usage is not None
         on_usage(
@@ -737,6 +745,158 @@ def test_chat_mcp_stream_relays_usage_as_its_own_sse_event(api, monkeypatch) -> 
         "round": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         "cumulative": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
     }
+
+
+def test_chat_mcp_stream_relays_context_budget_as_its_own_sse_event(api, monkeypatch) -> None:
+    # run_tool_loop's on_context_budget (#344) arrives as its own event too --
+    # a client warning that cumulative usage crossed the resolved
+    # deployment's context-window threshold, before the exchange runs out of
+    # room entirely.
+    from docie_bench import chat_api, mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    monkeypatch.setattr(chat_api, "_context_length_for_profile", lambda profile: 4096)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+    ):
+        assert context_length_ceiling == 4096
+        assert on_context_budget is not None
+        on_context_budget(
+            {
+                "cumulative_tokens": 3300,
+                "context_length": 4096,
+                "threshold_fraction": 0.8,
+            }
+        )
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (budget_event,) = [e for e in events if e["type"] == "context_budget"]
+    assert budget_event == {
+        "type": "context_budget",
+        "cumulative_tokens": 3300,
+        "context_length": 4096,
+        "threshold_fraction": 0.8,
+    }
+
+
+def test_chat_mcp_stream_unresolvable_ceiling_skips_context_budget_check(
+    api, monkeypatch, tmp_path
+) -> None:
+    # A profile with no matching live deployment record (a plain models.yaml
+    # profile, or -- as here -- the test's stub resolver) can't be priced
+    # against a context window at all; run_tool_loop must get None and never
+    # be asked to warn, rather than guess a ceiling or block the request.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    # No monkeypatch of _context_length_for_profile itself: the real lookup
+    # runs, against an empty DOCIE_SERVING_HOME (an isolated tmp_path, not
+    # this machine's real deployments.json -- whatever it happens to have
+    # deployed right now is irrelevant), so it deterministically finds no
+    # live deployment record named "lfm2.5-350m" and resolves to None -- the
+    # "can't be priced" path this test covers.
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    seen_ceiling: list[int | None] = []
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+    ):
+        seen_ceiling.append(context_length_ceiling)
+        assert on_context_budget is not None  # still wired -- just never called
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert seen_ceiling == [None]
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert [e for e in events if e["type"] == "context_budget"] == []
 
 
 def test_chat_mcp_stream_unregistered_server_sends_an_error_event(api) -> None:

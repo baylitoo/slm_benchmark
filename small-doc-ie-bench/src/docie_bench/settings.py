@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     mcp_max_tool_iterations: int = Field(default=8, ge=1, le=64)
     # Per-response read timeout for MCP client sessions (list_tools/call_tool).
     mcp_tool_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    # Fraction of the resolved deployment's context_length at which
+    # run_tool_loop's on_context_budget warning fires (#344) -- a long
+    # agentic exchange otherwise runs several real rounds before a LATER
+    # round's cumulative usage exceeds the deployment's context window and
+    # llama-server 400s, losing the whole in-progress exchange with no prior
+    # warning. Fires once per exchange, the first round cumulative usage
+    # crosses this fraction; never truncates or summarizes.
+    mcp_context_budget_warn_fraction: float = Field(default=0.8, gt=0.0, le=1.0)
 
     # Session-scoped document uploads (#296): a Playground attachment is written
     # here under a server-issued session id, isolated per conversation -- docs-search
