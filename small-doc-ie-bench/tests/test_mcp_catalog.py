@@ -1073,6 +1073,16 @@ def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_pa
     ci_params = {p["name"]: p["required"] for p in entries["code-interpreter"]["params"]}
     assert ci_params == {"url": False, "token": True}
 
+    # Param widget hints (#387): a fixed enum, a plain number, the standout
+    # model_profile selector, and everything else defaulting to free text.
+    docs_search_by_name = {p["name"]: p for p in entries["docs-search"]["params"]}
+    assert docs_search_by_name["backend"]["kind"] == "enum"
+    assert docs_search_by_name["backend"]["choices"] == ["substring", "hybrid"]
+    assert docs_search_by_name["snippet_window"]["kind"] == "number"
+    assert docs_search_by_name["docs_dir"]["kind"] == "text"
+    call_llm_by_name = {p["name"]: p for p in entries["call-llm"]["params"]}
+    assert call_llm_by_name["default_model_profile"]["kind"] == "model_profile"
+
     client.post("/v1/mcp/servers", json={"catalog": "calculator"})
     entries = {e["name"]: e for e in client.get("/v1/mcp/catalog").json()["entries"]}
     assert entries["calculator"]["enabled"]

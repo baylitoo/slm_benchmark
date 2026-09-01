@@ -1,19 +1,23 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Plug, RefreshCw, Wrench } from "lucide-react";
 import {
+  deploymentModelType,
   disableMcpServer,
   enableMcpServer,
   getCodeInterpreterWorkers,
+  getDeployments,
   listMcpCatalog,
+  selectableDeployments,
   testMcpServer,
   type CodeInterpreterQueue,
   type McpCatalogEntry,
+  type McpCatalogParam,
   type McpTool,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
-import { Alert, Badge, Button, Spinner, TextInput } from "../ui";
+import { Alert, Badge, Button, Select, Spinner, TextInput } from "../ui";
 import { useToast } from "../Toast";
 import { T } from "@/lib/i18n";
 
@@ -24,6 +28,18 @@ import { T } from "@/lib/i18n";
 
 export function McpView({ active = true }: { active?: boolean }) {
   const catalog = useAsync<McpCatalogEntry[]>("mcp-catalog", listMcpCatalog);
+  // Only fetched for the "model_profile" param kind (call-llm's
+  // default_model_profile) — a select of live chat-capable deployments so a
+  // typo'd profile name is a config-time error, not a silent call_llm failure.
+  const deployments = useAsync("deployments", getDeployments);
+  const chatDeployments = useMemo(
+    () =>
+      selectableDeployments(deployments.data ?? [])
+        .filter((d) => deploymentModelType(d) === "chat")
+        .map((d) => d.spec?.name)
+        .filter((n): n is string => !!n),
+    [deployments.data],
+  );
   const { toast } = useToast();
   const [busy, setBusy] = useState<string | null>(null);
   const [params, setParams] = useState<Record<string, Record<string, string>>>({});
@@ -127,17 +143,17 @@ export function McpView({ active = true }: { active?: boolean }) {
             </div>
             {entry.name === "code-interpreter" && entry.enabled && <CodeInterpreterWorkers />}
             {entry.params.map((param) => (
-              <TextInput
+              <McpParamInput
                 key={param.name}
-                type={param.secret ? "password" : "text"}
-                aria-label={`${entry.name} ${param.name}`}
-                placeholder={param.description}
+                entryName={entry.name}
+                param={param}
                 disabled={entry.enabled}
                 value={params[entry.name]?.[param.name] ?? ""}
-                onChange={(e) =>
+                chatDeployments={chatDeployments}
+                onChange={(value) =>
                   setParams((prev) => ({
                     ...prev,
-                    [entry.name]: { ...prev[entry.name], [param.name]: e.target.value },
+                    [entry.name]: { ...prev[entry.name], [param.name]: value },
                   }))
                 }
               />
@@ -177,6 +193,75 @@ export function McpView({ active = true }: { active?: boolean }) {
         ))}
       </div>
     </div>
+  );
+}
+
+// One catalog param's enable-form widget, branched on `param.kind`:
+// "number" is a TextInput with type="number"; "enum" and "model_profile"
+// are a <Select> (fixed choices, or live chat deployments respectively);
+// "text" (default) is the original free-typed TextInput, secret-masking
+// included.
+function McpParamInput({
+  entryName,
+  param,
+  disabled,
+  value,
+  chatDeployments,
+  onChange,
+}: {
+  entryName: string;
+  param: McpCatalogParam;
+  disabled: boolean;
+  value: string;
+  chatDeployments: string[];
+  onChange: (value: string) => void;
+}) {
+  const label = `${entryName} ${param.name}`;
+  if (param.kind === "enum") {
+    return (
+      <Select
+        aria-label={label}
+        title={param.description}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="" />
+        {param.choices.map((choice) => (
+          <option key={choice} value={choice}>
+            {choice}
+          </option>
+        ))}
+      </Select>
+    );
+  }
+  if (param.kind === "model_profile") {
+    return (
+      <Select
+        aria-label={label}
+        title={param.description}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="" />
+        {chatDeployments.map((name) => (
+          <option key={name} value={name}>
+            {name}
+          </option>
+        ))}
+      </Select>
+    );
+  }
+  return (
+    <TextInput
+      type={param.kind === "number" ? "number" : param.secret ? "password" : "text"}
+      aria-label={label}
+      placeholder={param.description}
+      disabled={disabled}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    />
   );
 }
 
