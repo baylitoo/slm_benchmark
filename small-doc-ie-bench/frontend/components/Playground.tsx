@@ -1160,13 +1160,23 @@ export function ChatPanel({
             <Spinner /> <T>Rendering preview…</T>
           </p>
         )}
-        {preview && (
+        {file && (
           <div className="flex items-start gap-3 rounded-md border border-border bg-muted/20 p-2">
-            <img
-              src={preview}
-              alt="attachment preview"
-              className="h-20 w-20 shrink-0 rounded-md border border-border object-cover"
-            />
+            {preview ? (
+              <img
+                src={preview}
+                alt="attachment preview"
+                className="h-20 w-20 shrink-0 rounded-md border border-border object-cover"
+              />
+            ) : (
+              // Thumbnail rendering is best-effort (see onAttach's catch) --
+              // a failed/slow rasterization must never hide the DPI selector
+              // or recommended-prompt presets below, which don't depend on
+              // it and are still fully usable without a visual thumbnail.
+              <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-[10px] text-muted-foreground">
+                <T>No preview</T>
+              </div>
+            )}
             <div className="min-w-0 flex-1 space-y-1">
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <span className="truncate">{file?.name}</span>
