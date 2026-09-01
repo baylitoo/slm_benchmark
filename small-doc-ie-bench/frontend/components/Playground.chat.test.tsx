@@ -154,6 +154,25 @@ describe("ChatPanel", () => {
     expect(screen.getByRole("button", { name: /Describe this image/ })).toBeInTheDocument();
   });
 
+  it("keeps the DPI selector and presets usable when thumbnail rendering fails", async () => {
+    // A failed/slow rasterization (onAttach's own catch -> preview stays
+    // null) must never hide the DPI selector or recommended-prompt presets,
+    // which don't depend on the thumbnail image at all -- they used to be
+    // nested inside the same `{preview && ...}` gate as the <img>, so a
+    // render-document failure silently took the whole panel down with it.
+    vi.mocked(api.renderDocument).mockRejectedValueOnce(new Error("rasterization failed"));
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const file = new File(["%PDF-fake"], "report.pdf", { type: "application/pdf" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+
+    expect(await screen.findByText("No preview")).toBeInTheDocument();
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/Render quality/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Describe this image/ })).toBeInTheDocument();
+  });
+
   it("populates the message input from the schema-derived preset the same way a generic preset does", async () => {
     renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
     const user = userEvent.setup();
