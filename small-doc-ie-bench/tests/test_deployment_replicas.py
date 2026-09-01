@@ -463,10 +463,12 @@ def _fresh_round_robin() -> Iterator[None]:
     from docie_bench.serving import placement_resolver
 
     placement_resolver._ROUND_ROBIN_COUNTERS.clear()
+    placement_resolver._SESSION_AFFINITY.clear()
     try:
         yield
     finally:
         placement_resolver._ROUND_ROBIN_COUNTERS.clear()
+        placement_resolver._SESSION_AFFINITY.clear()
 
 
 def _seed_store(name: str) -> None:
@@ -544,6 +546,111 @@ def test_round_robin_counters_are_per_model(sqlite_catalog: None) -> None:
     assert resolve_store_profile("nuextract3").base_url == "http://worker:8095/v1"
     assert resolve_store_profile(MODEL).base_url == "http://worker:8092/v1"
     assert resolve_store_profile("nuextract3").base_url == "http://worker:8096/v1"
+
+
+# ── session affinity: pin a conversation to one replica (#337) ─────────────
+
+
+def test_session_affinity_pins_same_replica_across_calls(sqlite_catalog: None) -> None:
+    """Repeat calls with the SAME session_id must land on the SAME replica —
+    the whole point being to keep llama-server's prefix-KV cache warm across
+    turns, instead of round-robining every top-level chat completion."""
+    from docie_bench.serving.placement_resolver import resolve_store_profile
+
+    _seed_store(MODEL)
+    _place(MODEL, MODEL, port=8091)
+    _place(f"{MODEL}-2", MODEL, port=8092)
+    _place(f"{MODEL}-3", MODEL, port=8093)
+
+    urls = [
+        resolve_store_profile(MODEL, session_id="conv-abc").base_url for _ in range(5)
+    ]
+    assert len(set(urls)) == 1
+
+
+def test_session_affinity_distributes_across_different_sessions(
+    sqlite_catalog: None,
+) -> None:
+    """Different session_ids (or no session_id at all) must still spread load
+    across the live replicas — affinity must not collapse load balancing."""
+    from docie_bench.serving.placement_resolver import resolve_store_profile
+
+    _seed_store(MODEL)
+    _place(MODEL, MODEL, port=8091)
+    _place(f"{MODEL}-2", MODEL, port=8092)
+    _place(f"{MODEL}-3", MODEL, port=8093)
+
+    urls = {
+        resolve_store_profile(MODEL, session_id=f"conv-{i}").base_url for i in range(6)
+    }
+    assert urls == {
+        "http://worker:8091/v1",
+        "http://worker:8092/v1",
+        "http://worker:8093/v1",
+    }
+
+    # No session_id given: unchanged round-robin behavior too.
+    no_session_urls = [resolve_store_profile(MODEL).base_url for _ in range(3)]
+    assert set(no_session_urls) == urls
+
+
+def test_session_affinity_falls_back_and_repins_when_replica_dies(
+    sqlite_catalog: None,
+) -> None:
+    """A pinned replica that's no longer live must fall back to a normal pick
+    for that request AND update the pin, so the NEXT call for the same
+    session_id follows the replacement instead of reverting.
+
+    Three replicas are seeded (not two) so that after the pinned one dies,
+    two replicas remain live -- resolve_store_profile's single-live-replica
+    shortcut is deliberately NOT triggered, and the fallback/re-pin path
+    inside session_affinity_choice actually runs."""
+    from docie_bench.serving.placement_resolver import resolve_store_profile
+
+    _seed_store(MODEL)
+    _place(MODEL, MODEL, port=8091)
+    _place(f"{MODEL}-2", MODEL, port=8092)
+    _place(f"{MODEL}-3", MODEL, port=8093)
+
+    first = resolve_store_profile(MODEL, session_id="conv-xyz")
+    assert first.base_url == "http://worker:8091/v1"  # first pin: round-robin index 0
+
+    # Kill the replica the session got pinned to; two replicas remain live.
+    ModelCatalog().record_placement(
+        MODEL,
+        model_name=MODEL,
+        engine="llama-server",
+        endpoint="http://worker:8091/v1",
+        state="failed",
+    )
+
+    second = resolve_store_profile(MODEL, session_id="conv-xyz")
+    assert second.base_url != first.base_url
+
+    # The pin follows the replacement on the next call.
+    third = resolve_store_profile(MODEL, session_id="conv-xyz")
+    assert third.base_url == second.base_url
+
+
+def test_no_session_id_reproduces_prior_round_robin_behavior(
+    sqlite_catalog: None,
+) -> None:
+    """Omitting session_id entirely (the existing call shape) must behave
+    exactly as before this change — plain round-robin, no pinning."""
+    from docie_bench.serving.placement_resolver import resolve_store_profile
+
+    _seed_store(MODEL)
+    _place(MODEL, MODEL, port=8091)
+    _place(f"{MODEL}-2", MODEL, port=8092)
+    _place(f"{MODEL}-3", MODEL, port=8093)
+
+    urls = [resolve_store_profile(MODEL).base_url for _ in range(6)]
+    lap = [
+        "http://worker:8091/v1",
+        "http://worker:8092/v1",
+        "http://worker:8093/v1",
+    ]
+    assert urls == lap + lap
 
 
 # ── replica counts on the deployments view ──────────────────────────────────

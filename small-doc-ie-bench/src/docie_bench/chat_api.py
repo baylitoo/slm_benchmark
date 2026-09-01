@@ -180,9 +180,18 @@ def _loading_response(triggered: tuple[str, float]) -> JSONResponse:
     )
 
 
-async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
+async def _resolve_or_error(
+    model: str, *, session_id: str | None = None
+) -> ModelProfile | JSONResponse:
     """Resolve ``model`` the same way every route here needs to, folding in
     load-on-demand for a store model that isn't live yet.
+
+    ``session_id``, when given, is forwarded to ``resolve_extraction_profile``
+    so a scaled ``store:`` model pins the replica pick to the conversation
+    (see ``placement_resolver.session_affinity_choice``) instead of
+    round-robining every turn. Callers that have no session concept
+    (embeddings, rerank) simply omit it and get today's round-robin
+    behavior, unchanged.
 
     Mirrors api.py's resolve_profile (same trigger_deployment_load seam): a
     store: model with no live placement fires its own load/deploy and answers
@@ -209,7 +218,7 @@ async def _resolve_or_error(model: str) -> ModelProfile | JSONResponse:
     endpoint), not switch routes.
     """
     try:
-        profile = resolve_extraction_profile(model_profile=model)
+        profile = resolve_extraction_profile(model_profile=model, session_id=session_id)
     except (PlacementNotFoundError, PlacementNotReadyError) as exc:
         store_name = (
             model[len(STORE_PROFILE_PREFIX) :] if model.startswith(STORE_PROFILE_PREFIX) else None
@@ -278,7 +287,8 @@ async def list_models() -> dict[str, Any]:
 
 async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) -> Any:
     model = payload.model
-    resolved = await _resolve_or_error(model)
+    session_id = payload.session_id
+    resolved = await _resolve_or_error(model, session_id=session_id)
     if isinstance(resolved, JSONResponse):
         return resolved
     profile = resolved
@@ -292,7 +302,6 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
 
     wants_stream = bool(payload.stream)
     mcp_server_names = payload.mcp_servers
-    session_id = payload.session_id
     # exclude_unset: only fields the caller actually sent are forwarded --
     # same as the old dict(body) -- so a field this model declares but the
     # caller omitted (stream, mcp_servers, session_id) doesn't materialize
