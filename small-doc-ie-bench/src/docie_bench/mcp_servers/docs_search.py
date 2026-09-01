@@ -765,9 +765,12 @@ def build_server() -> Any:
         every note is anchored to the specific page it's about, never
         free-floating. Append-only: there is no edit/delete, so if an
         earlier note turns out wrong, write a new note saying so rather than
-        trying to correct it in place. Both note length and notes-per-
-        document are capped -- keep a note to a short observation, not
-        another full-text dump."""
+        trying to correct it in place. `note` is capped at roughly 2000
+        characters (operator-tunable) -- this is for a short observation or
+        discrepancy flag, NOT a summary or full-text dump of the page; a call
+        over the cap fails outright rather than truncating, so keep it brief
+        up front instead of finding out after the call fails. There is also
+        a cap on how many notes one document can hold in total."""
         return append_note(path, page, note)
 
     @server.tool()
