@@ -57,10 +57,28 @@ read returns the FULL document text rather than applying
 ``read_document``'s peek/windowing discipline (see ``_full_document_text``)
 -- those caps exist to protect a model's context budget inside the
 agentic tool loop, which a resource read sits outside of.
+
+``write_note``/``read_notes`` add a persistent, page-anchored memory layer
+on top of all of the above: the ``_EXTRACTION_CACHE``/disk cache only ever
+remembers extracted TEXT, never anything the model itself observed about
+that text, and that memory is gone the moment the tool loop ends. A note
+survives the same fresh-subprocess-per-request lifecycle the disk cache
+does (see ``_notes_dir``), so a later conversation over the SAME document
+can discover what an earlier one already found. This is deliberately the
+safe subset of "agent memory": append-only (no edit/delete -- a model
+correcting its own prior note risks silently erasing a right earlier
+observation with a wrong later one), every note anchored to a required
+``page`` (same evidence-grounding instinct as ``evidence_ids`` on an
+extracted field), and length/count-capped per document. ``read_notes`` is
+a plain callable tool, deliberately NOT the ``eager_list_tool`` the way
+``list_files`` is -- notes can accumulate across many conversations, so
+auto-injecting them into every request would be an unbounded context
+cost; a model has to choose to ask.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -89,6 +107,11 @@ RERANKER_URL_ENV = "DOCIE_MCP_DOCS_SEARCH_RERANKER_URL"
 SNIPPET_WINDOW_ENV = "DOCIE_MCP_DOCS_SEARCH_SNIPPET_WINDOW"
 SNIPPET_MAX_CHARS_ENV = "DOCIE_MCP_DOCS_SEARCH_SNIPPET_MAX_CHARS"
 PEEK_CHAR_BUDGET_ENV = "DOCIE_MCP_DOCS_SEARCH_PEEK_CHAR_BUDGET"
+# Caps on write_note -- a note is a short observation, not another full-text
+# dump, and it's never truncated or evicted once written (append-only, see
+# module docstring), so both caps fail the call loudly instead.
+NOTE_MAX_CHARS_ENV = "DOCIE_MCP_DOCS_SEARCH_NOTE_MAX_CHARS"
+MAX_NOTES_PER_DOC_ENV = "DOCIE_MCP_DOCS_SEARCH_MAX_NOTES_PER_DOC"
 _DEFAULT_DOCS_DIR = "data/agent-docs"
 _DEFAULT_BACKEND = "substring"
 # Public: also the write-side allowlist for mcp_session_documents (#296) --
@@ -105,6 +128,16 @@ _SNIPPET_WINDOW = 400
 # hits (a common word) could otherwise join many windows into something
 # still too large.
 _SNIPPET_CHARS_MAX = 4000
+
+# A note is a short observation ("the total on page 3 doesn't match the sum
+# of page 2's line items"), not a summary of the whole page -- 2000 chars is
+# generous for that while keeping read_notes cheap to call even after many
+# conversations have each left one.
+_NOTE_MAX_CHARS = 2000
+# No eviction (append-only, see module docstring), so this is a hard ceiling
+# on one document's total notes, not a rolling window -- 100 is far more
+# than a real usage pattern should ever need per document.
+_MAX_NOTES_PER_DOC = 100
 
 
 # Keyed by (resolved path, mtime_ns, size) so a changed file misses rather
@@ -159,6 +192,43 @@ def _write_disk_cache(path: Path, stat: os.stat_result, blocks: list[OCRBlock]) 
         tmp.replace(cache_path)
     except OSError:
         pass  # best-effort -- this request's extraction still succeeded either way
+
+
+def _notes_dir() -> Path:
+    """A SIBLING of ``docs_dir()``, never inside it -- same invariant, same
+    construction as ``_cache_dir()``, just a different suffix so notes and
+    extraction-cache files never collide."""
+    root = docs_dir()
+    notes = root.parent / f"{root.name}.notes"
+    notes.mkdir(parents=True, exist_ok=True)
+    return notes
+
+
+def _notes_path(path: Path) -> Path:
+    """Same content-addressed digest scheme as ``_disk_cache_path`` -- a
+    note file's name has no relation to the document's own name."""
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+    return _notes_dir() / f"{digest}.json"
+
+
+def _load_notes(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(_notes_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def _write_notes(path: Path, notes: list[dict[str, Any]]) -> None:
+    """Atomic tmp-file-then-replace, same write-safety convention as
+    ``_write_disk_cache`` -- unlike that cache (a regenerable optimization,
+    so a failed write there is silently swallowed), a note is the only copy
+    of an observation a model may believe it already persisted, so an
+    ``OSError`` here is left to propagate rather than fail silently."""
+    notes_path = _notes_path(path)
+    tmp = notes_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(notes), encoding="utf-8")
+    tmp.replace(notes_path)
 
 
 def _pdf_inspector_fast_path(path: Path) -> list[OCRBlock] | None:
@@ -443,6 +513,57 @@ def list_documents() -> list[str]:
     )
 
 
+def append_note(path: str, page: int, note: str) -> dict[str, Any]:
+    """Append one page-anchored note about ``path`` to its persistent note
+    file, oldest-first (see ``_notes_dir``/``_notes_path`` for where and how
+    that file lives). Append-only -- there is no edit/delete, by design (see
+    module docstring): the only way to correct a wrong earlier note is to
+    write a new one saying so.
+
+    Raises ``ValueError`` -- same convention as ``resolve_document`` -- for
+    a nonexistent/traversal ``path``, ``page < 1``, a ``note`` over
+    ``NOTE_MAX_CHARS_ENV``, or the (N+1)th note once
+    ``MAX_NOTES_PER_DOC_ENV`` is already hit. Caps fail the call loudly
+    rather than silently truncating the note or evicting an older one.
+    """
+    resolved = resolve_document(path)
+    if page < 1:
+        raise ValueError(f"page must be >= 1, got {page}")
+    max_chars = int_env(NOTE_MAX_CHARS_ENV, _NOTE_MAX_CHARS)
+    if len(note) > max_chars:
+        raise ValueError(
+            f"note is {len(note)} characters, over the {max_chars}-character cap "
+            f"({NOTE_MAX_CHARS_ENV}) -- write_note is for a short observation, not "
+            "another full-text dump; shorten it."
+        )
+    existing = _load_notes(resolved)
+    max_notes = int_env(MAX_NOTES_PER_DOC_ENV, _MAX_NOTES_PER_DOC)
+    if len(existing) >= max_notes:
+        raise ValueError(
+            f"{path!r} already has {len(existing)} notes, at the {max_notes}-note "
+            f"cap ({MAX_NOTES_PER_DOC_ENV}) -- notes are append-only and never "
+            "evicted, so there's no room left for another one."
+        )
+    entry: dict[str, Any] = {
+        "page": page,
+        "note": note,
+        "created_at": dt.datetime.now(dt.UTC).isoformat(),
+    }
+    existing.append(entry)
+    _write_notes(resolved, existing)
+    return entry
+
+
+def list_notes(path: str) -> list[dict[str, Any]]:
+    """Every note previously written about ``path`` (see ``append_note``),
+    oldest first -- an empty list if none exist yet. Resolves ``path``
+    through ``resolve_document`` like every other tool, so notes can only
+    ever be attached to (or read from) a document that genuinely exists in
+    the corpus."""
+    resolved = resolve_document(path)
+    return _load_notes(resolved)
+
+
 # A "peek" (no page range requested, on a document long enough to matter)
 # stops accumulating pages once their combined text would exceed this many
 # characters -- character budget, not a page count, because page density
@@ -631,6 +752,33 @@ def build_server() -> Any:
         start_page/end_page to read that section in full rather than
         answering from the snippet alone."""
         return search_documents(query, path)
+
+    @server.tool()
+    def write_note(path: str, page: int, note: str) -> dict[str, Any]:
+        """Leave a short, page-anchored note about a document -- persists to
+        disk across separate conversations/subprocess restarts (this server
+        is a fresh subprocess per chat request), so a later pass over the
+        SAME document can discover what an earlier one already found: a
+        summary, an observation, a discrepancy worth flagging ("the total on
+        page 3 doesn't match the sum of page 2's line items"). `path` MUST be
+        one of the exact strings from list_files. `page` is required --
+        every note is anchored to the specific page it's about, never
+        free-floating. Append-only: there is no edit/delete, so if an
+        earlier note turns out wrong, write a new note saying so rather than
+        trying to correct it in place. Both note length and notes-per-
+        document are capped -- keep a note to a short observation, not
+        another full-text dump."""
+        return append_note(path, page, note)
+
+    @server.tool()
+    def read_notes(path: str) -> list[dict[str, Any]]:
+        """Every note previously left about a document via write_note,
+        oldest first -- an empty list if none exist. Unlike list_files, this
+        is NOT called automatically before every request: call it yourself,
+        ideally before re-analyzing a document you may have already been
+        told about, so you don't re-derive something a previous pass on this
+        document may already have determined."""
+        return list_notes(path)
 
     # One resource per indexed document (#332), same enumeration list_files
     # already uses -- resources and list_files can never disagree about

@@ -606,6 +606,8 @@ def test_docs_search_agent_template_finds_and_cites_a_real_document(
         "docs-search__list_files",
         "docs-search__read_document",
         "docs-search__search_text",
+        "docs-search__write_note",
+        "docs-search__read_notes",
     }
     # docs-search's `list_files` is auto-called once up front (eager_list_tool)
     # -- trace[0] is that eager call, trace[1] the model's own search.

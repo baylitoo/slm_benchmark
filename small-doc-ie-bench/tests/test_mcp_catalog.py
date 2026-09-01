@@ -735,6 +735,105 @@ def test_disk_cache_falls_back_gracefully_on_a_malformed_cache_file(
     assert result["pages"][0]["text"] == "hello"
 
 
+# ── persistent, page-anchored notes: the safe subset of "agent memory" ─────
+
+
+def test_append_note_resolves_path_and_persists_it(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+
+    entry = docs_search.append_note("a.txt", 2, "the total looks wrong")
+
+    assert entry["page"] == 2
+    assert entry["note"] == "the total looks wrong"
+    assert "created_at" in entry
+    assert docs_search.list_notes("a.txt") == [entry]
+
+
+def test_append_note_rejects_a_nonexistent_or_traversal_path(docs: Path) -> None:
+    with pytest.raises(ValueError, match="no such document"):
+        docs_search.append_note("missing.txt", 1, "note")
+    with pytest.raises(ValueError, match="outside"):
+        docs_search.append_note("../outside.txt", 1, "note")
+
+
+def test_append_note_rejects_page_under_one(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+    with pytest.raises(ValueError, match="page must be >= 1"):
+        docs_search.append_note("a.txt", 0, "note")
+
+
+def test_append_note_rejects_a_note_over_the_length_cap(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.NOTE_MAX_CHARS_ENV, "10")
+    with pytest.raises(ValueError, match="character cap"):
+        docs_search.append_note("a.txt", 1, "this note is definitely over ten characters")
+
+
+def test_append_note_rejects_past_the_per_document_cap(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.MAX_NOTES_PER_DOC_ENV, "2")
+    docs_search.append_note("a.txt", 1, "one")
+    docs_search.append_note("a.txt", 1, "two")
+    with pytest.raises(ValueError, match="note cap"):
+        docs_search.append_note("a.txt", 1, "three")
+    assert len(docs_search.list_notes("a.txt")) == 2
+
+
+def test_list_notes_returns_oldest_first_and_empty_for_no_notes(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+    assert docs_search.list_notes("a.txt") == []
+
+    docs_search.append_note("a.txt", 1, "first")
+    docs_search.append_note("a.txt", 3, "second")
+
+    notes = docs_search.list_notes("a.txt")
+    assert [n["note"] for n in notes] == ["first", "second"]
+    assert [n["page"] for n in notes] == [1, 3]
+
+
+def test_notes_survive_a_simulated_fresh_subprocess(docs: Path) -> None:
+    """Notes exist precisely so a later, separate conversation/subprocess
+    can discover them -- clearing _EXTRACTION_CACHE (the only in-memory
+    state this module keeps) simulates that restart, then list_notes must
+    still read the same notes back off disk."""
+    (docs / "a.txt").write_text("hello")
+    docs_search.append_note("a.txt", 1, "left for a future conversation")
+
+    docs_search._EXTRACTION_CACHE.clear()
+
+    assert [n["note"] for n in docs_search.list_notes("a.txt")] == [
+        "left for a future conversation"
+    ]
+
+
+def test_notes_dir_is_a_sibling_of_docs_dir_not_inside_it(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+    docs_search.append_note("a.txt", 1, "note")
+
+    notes_dir = docs.parent / f"{docs.name}.notes"
+    assert notes_dir.is_dir()
+    assert list(notes_dir.glob("*.json"))
+    # docs_dir() itself gets no new files -- same "never writes to
+    # docs_dir()" invariant the extraction disk cache already respects.
+    assert list(docs.iterdir()) == [docs / "a.txt"]
+
+
+def test_note_max_chars_is_operator_tunable(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.NOTE_MAX_CHARS_ENV, "5")
+    docs_search.append_note("a.txt", 1, "12345")  # exactly at the cap: allowed
+    with pytest.raises(ValueError, match="character cap"):
+        docs_search.append_note("a.txt", 1, "123456")
+
+
+def test_max_notes_per_doc_is_operator_tunable(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("hello")
+    monkeypatch.setenv(docs_search.MAX_NOTES_PER_DOC_ENV, "1")
+    docs_search.append_note("a.txt", 1, "only one allowed")
+    with pytest.raises(ValueError, match="note cap"):
+        docs_search.append_note("a.txt", 1, "second")
+
+
 # ------------------------------------------------------------ code-interpreter
 
 
@@ -897,7 +996,10 @@ def test_run_python_threads_stdin_through_to_submit_code(monkeypatch) -> None:
         (calculator, {"calc", "sum_check"}),
         (dates, {"parse_date", "date_diff", "today"}),
         (web_fetch, {"fetch"}),
-        (docs_search, {"list_files", "read_document", "search_text"}),
+        (
+            docs_search,
+            {"list_files", "read_document", "search_text", "write_note", "read_notes"},
+        ),
         (code_interpreter, {"run_python"}),
     ],
 )
@@ -956,6 +1058,8 @@ def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_pa
         "snippet_window",
         "snippet_max_chars",
         "peek_char_budget",
+        "note_max_chars",
+        "max_notes_per_doc",
     }
     sql_agent_params = {p["name"]: p["secret"] for p in entries["sql-agent"]["params"]}
     assert sql_agent_params == {
@@ -1070,7 +1174,7 @@ def test_docs_search_spawned_end_to_end(
     res = client.post("/v1/mcp/servers/docs-search/test")
     assert res.status_code == 200, res.text
     assert {t["name"] for t in res.json()["tools"]} == {
-        "list_files", "read_document", "search_text",
+        "list_files", "read_document", "search_text", "write_note", "read_notes",
     }
 
 
