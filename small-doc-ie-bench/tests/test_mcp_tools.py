@@ -827,6 +827,186 @@ async def test_run_tool_loop_exhaustion_returns_none() -> None:
     assert count == 3  # the bound is exact, not off-by-one
 
 
+# ---------------------------------------------- human-in-the-loop pause/resume (#383)
+
+
+async def test_run_tool_loop_advertises_ask_user_only_when_exchange_id_is_given() -> None:
+    posted_without_hitl: list[dict[str, Any]] = []
+    posted_with_hitl: list[dict[str, Any]] = []
+
+    async def post_without_hitl(body: dict[str, Any]) -> dict[str, Any]:
+        posted_without_hitl.append(json.loads(json.dumps(body)))
+        return _final_completion("hi", {})
+
+    async def post_with_hitl(body: dict[str, Any]) -> dict[str, Any]:
+        posted_with_hitl.append(json.loads(json.dumps(body)))
+        return _final_completion("hi", {})
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+        await run_tool_loop(post_without_hitl, body, sessions, mapping, tools, max_iterations=1)
+
+        mcp_tools.open_pending_input("exch-advertise")
+        try:
+            await run_tool_loop(
+                post_with_hitl,
+                body,
+                sessions,
+                mapping,
+                tools,
+                max_iterations=1,
+                exchange_id="exch-advertise",
+            )
+        finally:
+            mcp_tools.close_pending_input("exch-advertise")
+
+    assert "ask_user" not in {t["function"]["name"] for t in posted_without_hitl[0]["tools"]}
+    assert "ask_user" in {t["function"]["name"] for t in posted_with_hitl[0]["tools"]}
+
+
+async def test_run_tool_loop_ask_user_call_pauses_and_resumes_with_the_answer() -> None:
+    posted: list[dict[str, Any]] = []
+    responses = [
+        _tool_calls_completion(
+            "ask_user", '{"question": "which invoice?", "choices": ["A", "B"]}', {}
+        ),
+        _final_completion("picked A", {}),
+    ]
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return responses[len(posted) - 1]
+
+    awaiting: list[dict[str, Any]] = []
+
+    def on_awaiting_input(payload: dict[str, Any]) -> None:
+        awaiting.append(payload)
+        # Synchronous, before run_tool_loop's wait_for even starts -- Event.set()
+        # is sticky, so this proves the answer doesn't need to race the await.
+        assert mcp_tools.submit_pending_answer("exch-ask", "A")
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        mcp_tools.open_pending_input("exch-ask")
+        try:
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            completion = await run_tool_loop(
+                post,
+                body,
+                sessions,
+                mapping,
+                tools,
+                max_iterations=4,
+                exchange_id="exch-ask",
+                on_awaiting_input=on_awaiting_input,
+            )
+        finally:
+            mcp_tools.close_pending_input("exch-ask")
+
+    assert completion["choices"][0]["message"]["content"] == "picked A"
+    assert awaiting == [{"question": "which invoice?", "choices": ["A", "B"]}]
+    # The answer folds in as the ask_user CALL's own tool result, not a new
+    # user turn -- round 2 carries it as a role:"tool" message.
+    round2 = posted[1]["messages"]
+    assert round2[-1] == {"role": "tool", "tool_call_id": "call_1", "content": "A"}
+
+
+async def test_run_tool_loop_user_pause_folds_the_answer_in_as_a_user_message() -> None:
+    posted: list[dict[str, Any]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(json.loads(json.dumps(body)))
+        return _final_completion("done", {})
+
+    def on_awaiting_input(payload: dict[str, Any]) -> None:
+        # A user-initiated pause carries no question/choices of its own.
+        assert payload == {}
+        assert mcp_tools.submit_pending_answer("exch-pause", "also check the shipping date")
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        mcp_tools.open_pending_input("exch-pause")
+        mcp_tools.request_pause("exch-pause")
+        try:
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            # max_iterations=1: exactly one REAL round is allowed. The pause
+            # happens before it and must not consume it -- this is the
+            # restructure's actual proof, not just documentation.
+            completion = await run_tool_loop(
+                post,
+                body,
+                sessions,
+                mapping,
+                tools,
+                max_iterations=1,
+                exchange_id="exch-pause",
+                on_awaiting_input=on_awaiting_input,
+            )
+        finally:
+            mcp_tools.close_pending_input("exch-pause")
+
+    assert completion["choices"][0]["message"]["content"] == "done"
+    assert len(posted) == 1  # the pause did not burn the one allowed round
+    assert posted[0]["messages"][-1] == {
+        "role": "user",
+        "content": "also check the shipping date",
+    }
+
+
+async def test_run_tool_loop_ask_user_timeout_raises_and_never_hangs(monkeypatch) -> None:
+    from docie_bench.settings import Settings
+
+    monkeypatch.setattr(
+        mcp_tools, "get_settings", lambda: Settings(mcp_ask_user_timeout_seconds=0.05)
+    )
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        return _tool_calls_completion("ask_user", '{"question": "which invoice?"}', {})
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        mcp_tools.open_pending_input("exch-timeout")
+        try:
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            with pytest.raises(mcp_tools.AskUserTimeoutError):
+                # Nobody ever answers -- must raise, not hang.
+                await run_tool_loop(
+                    post,
+                    body,
+                    sessions,
+                    mapping,
+                    tools,
+                    max_iterations=4,
+                    exchange_id="exch-timeout",
+                    on_awaiting_input=lambda _payload: None,
+                )
+        finally:
+            mcp_tools.close_pending_input("exch-timeout")
+
+    assert not mcp_tools.has_pending_input("exch-timeout")  # cleaned up, not leaked
+
+
+def test_open_close_pending_input_registry_lifecycle() -> None:
+    assert not mcp_tools.has_pending_input("exch-lifecycle")
+    mcp_tools.open_pending_input("exch-lifecycle")
+    assert mcp_tools.has_pending_input("exch-lifecycle")
+    mcp_tools.close_pending_input("exch-lifecycle")
+    assert not mcp_tools.has_pending_input("exch-lifecycle")
+    # A second close is a no-op, never an error.
+    mcp_tools.close_pending_input("exch-lifecycle")
+
+
+def test_request_pause_and_submit_pending_answer_report_unknown_exchange() -> None:
+    assert mcp_tools.request_pause("no-such-exchange") is False
+    assert mcp_tools.submit_pending_answer("no-such-exchange", "text") is False
+
+
 # ------------------------------------------------------------ route (end-to-end)
 
 
