@@ -12,6 +12,16 @@ stuffed prompt. The seam exists so bm25/vector (e.g. against
 changing ``search_text``'s signature -- backend choice is an operator-set
 catalog param (``BACKEND_ENV``), never a per-call agent argument.
 
+A PDF classified by ``pdf_inspector`` as fully text-based (no pages
+needing OCR) skips liteparse entirely and extracts via ``pdf_inspector``'s
+own positioned-text API instead (see ``_pdf_inspector_fast_path``) --
+faster for the common case, since it never has to probe for or run OCR.
+Anything else (scanned/image/mixed pages, or any classification/extraction
+failure) falls through to the existing liteparse path unchanged; this is a
+pure speed optimization, never a hard dependency, and never changes
+``OCRBlock``'s shape -- only its ``source`` tag differs (``"pdf_inspector"``
+vs ``"pdf_text"``) so provenance stays honest either way.
+
 Extraction itself is memoized per (path, mtime, size) via
 ``_extracted_blocks`` -- re-parsing a PDF (OCR fallback especially) on
 every ``search_text``/``read_document`` call against the same document
@@ -57,7 +67,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from docie_bench.schemas.common import OCRBlock
+from docie_bench.ocr.base import stable_block_id
+from docie_bench.schemas.common import BoundingBox, OCRBlock
 
 DOCS_DIR_ENV = "DOCIE_MCP_DOCS_SEARCH_DIR"
 BACKEND_ENV = "DOCIE_MCP_DOCS_SEARCH_BACKEND"
@@ -152,6 +163,53 @@ def _write_disk_cache(path: Path, stat: os.stat_result, blocks: list[OCRBlock]) 
         pass  # best-effort -- this request's extraction still succeeded either way
 
 
+def _pdf_inspector_fast_path(path: Path) -> list[OCRBlock] | None:
+    """A fast, OCR-free extraction for a PDF ``pdf_inspector`` classifies as
+    fully text-based -- ``None`` for anything else (scanned/image/mixed
+    pages, or any classification/extraction failure), which sends the
+    caller to the existing liteparse (PDFium + OCR fallback) path instead.
+
+    This is a pure speed optimization for the common case, never a hard
+    dependency: pdf_inspector erroring or misclassifying costs nothing
+    beyond falling back to the path that ran unconditionally before this
+    existed -- same fail-open convention this codebase uses for every other
+    "nice when it works" signal.
+    """
+    import pdf_inspector
+
+    try:
+        classification = pdf_inspector.classify_pdf(str(path))
+    except Exception:  # noqa: BLE001 - classification failure is just a cache miss for this path
+        return None
+    if classification.pdf_type != "text_based" or classification.pages_needing_ocr:
+        return None
+    try:
+        items = pdf_inspector.extract_text_with_positions(str(path))
+    except Exception:  # noqa: BLE001 - extraction failure falls back to liteparse
+        return None
+    blocks: list[OCRBlock] = []
+    for idx, item in enumerate(items):
+        text = (item.text or "").strip()
+        if not text:
+            continue
+        bbox = BoundingBox(
+            x0=float(item.x),
+            y0=float(item.y),
+            x1=float(item.x) + float(item.width),
+            y1=float(item.y) + float(item.height),
+        )
+        blocks.append(
+            OCRBlock(
+                id=stable_block_id(item.page, idx, text),
+                text=text,
+                page=item.page,
+                bbox=bbox,
+                source="pdf_inspector",
+            )
+        )
+    return blocks
+
+
 def _extracted_blocks(path: Path) -> list[OCRBlock]:
     from docie_bench.ocr.factory import get_ocr_backend
 
@@ -164,7 +222,11 @@ def _extracted_blocks(path: Path) -> list[OCRBlock]:
     if from_disk is not None:
         _EXTRACTION_CACHE[key] = from_disk
         return from_disk
-    blocks = get_ocr_backend("liteparse").extract(path)
+    blocks = None
+    if path.suffix.lower() == ".pdf":
+        blocks = _pdf_inspector_fast_path(path)
+    if blocks is None:
+        blocks = get_ocr_backend("liteparse").extract(path)
     _EXTRACTION_CACHE[key] = blocks
     _write_disk_cache(path, stat, blocks)
     return blocks
