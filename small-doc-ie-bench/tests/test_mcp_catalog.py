@@ -326,6 +326,104 @@ def test_document_text_peek_budget_is_operator_tunable(docs: Path, monkeypatch) 
     assert len(result["pages"]) == 3
 
 
+def _stub_pdf_inspector(
+    monkeypatch, *, pdf_type: str, pages_needing_ocr: list[int] | None = None
+):
+    """Stub pdf_inspector's classify_pdf/extract_text_with_positions --
+    real classification needs a real, parseable PDF this test suite has no
+    fixture for, so the library calls are mocked directly (same pattern
+    _multi_page_extractor already uses for liteparse)."""
+    import pdf_inspector
+
+    class _Classification:
+        def __init__(self) -> None:
+            self.pdf_type = pdf_type
+            self.pages_needing_ocr = pages_needing_ocr or []
+
+    class _Item:
+        def __init__(self, text: str, page: int) -> None:
+            self.text = text
+            self.page = page
+            self.x = 0.0
+            self.y = 0.0
+            self.width = 10.0
+            self.height = 10.0
+
+    monkeypatch.setattr(pdf_inspector, "classify_pdf", lambda path: _Classification())
+    monkeypatch.setattr(
+        pdf_inspector,
+        "extract_text_with_positions",
+        lambda path: [_Item("hello from pdf_inspector", 1)],
+    )
+
+
+def test_extracted_blocks_uses_pdf_inspector_fast_path_for_text_based_pdf(
+    docs: Path, monkeypatch
+) -> None:
+    from docie_bench.ocr import factory as ocr_factory
+
+    (docs / "a.pdf").write_bytes(b"%PDF-fake")
+    _stub_pdf_inspector(monkeypatch, pdf_type="text_based")
+
+    def _fail_if_called(name: str, **kwargs: object) -> None:
+        raise AssertionError("liteparse must not run when pdf_inspector's fast path applies")
+
+    monkeypatch.setattr(ocr_factory, "get_ocr_backend", _fail_if_called)
+
+    blocks = docs_search._extracted_blocks(docs / "a.pdf")
+
+    assert len(blocks) == 1
+    assert blocks[0].text == "hello from pdf_inspector"
+    assert blocks[0].source == "pdf_inspector"
+
+
+def test_extracted_blocks_falls_back_to_liteparse_for_a_scanned_pdf(
+    docs: Path, monkeypatch
+) -> None:
+    from docie_bench.ocr import factory as ocr_factory
+    from docie_bench.schemas.common import OCRBlock
+
+    (docs / "scanned.pdf").write_bytes(b"%PDF-fake")
+    _stub_pdf_inspector(monkeypatch, pdf_type="scanned", pages_needing_ocr=[0])
+
+    class _Stub:
+        def extract(self, path: Path) -> list[OCRBlock]:
+            return [OCRBlock(id="b1", text="ocr'd text", page=1, source="pdf_text")]
+
+    monkeypatch.setattr(ocr_factory, "get_ocr_backend", lambda name: _Stub())
+
+    blocks = docs_search._extracted_blocks(docs / "scanned.pdf")
+
+    assert len(blocks) == 1
+    assert blocks[0].source == "pdf_text"
+
+
+def test_extracted_blocks_falls_back_to_liteparse_when_pdf_inspector_errors(
+    docs: Path, monkeypatch
+) -> None:
+    import pdf_inspector
+
+    from docie_bench.ocr import factory as ocr_factory
+    from docie_bench.schemas.common import OCRBlock
+
+    (docs / "broken.pdf").write_bytes(b"%PDF-fake")
+    monkeypatch.setattr(
+        pdf_inspector,
+        "classify_pdf",
+        lambda path: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    class _Stub:
+        def extract(self, path: Path) -> list[OCRBlock]:
+            return [OCRBlock(id="b1", text="liteparse saved us", page=1, source="pdf_text")]
+
+    monkeypatch.setattr(ocr_factory, "get_ocr_backend", lambda name: _Stub())
+
+    blocks = docs_search._extracted_blocks(docs / "broken.pdf")
+
+    assert blocks[0].text == "liteparse saved us"
+
+
 def test_search_documents_across_all_or_one_file(docs: Path) -> None:
     (docs / "a.txt").write_text("the invoice total is 400 EUR")
     (docs / "b.txt").write_text("nothing relevant here")
