@@ -201,6 +201,120 @@ def test_custom_agent_runs_the_tool_loop_when_mcp_servers_set(api, monkeypatch) 
     assert round2[-1] == {"role": "tool", "tool_call_id": "call_1", "content": "5"}
 
 
+def test_custom_agent_with_tools_streams_tool_call_and_content_events(api, monkeypatch) -> None:
+    # #346: a `custom` agent with options.mcp_servers gets REAL incremental
+    # SSE events -- the executed tool call arrives the moment it finishes,
+    # not only after the whole multi-round exchange completes silently.
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://unused")
+        },
+    )
+    server = _calc_server()
+
+    async def fake_open(stack, specs):
+        session = await stack.enter_async_context(_memory_session(server))
+        return {"calc": session}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open)
+
+    client, captured = api
+    _create_agent(client, options={"mcp_servers": ["calc"]})
+    response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"stream": True, "messages": [{"role": "user", "content": "what is 2+3?"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert response.text.strip().endswith("data: [DONE]")
+    (tool_event,) = [e for e in events if e["type"] == "tool_call"]
+    assert tool_event["tool"] == "calc__add"
+    assert tool_event["status"] == "ok"
+    assert tool_event["result"] == "5"
+    (content_event,) = [e for e in events if e["type"] == "content"]
+    completion = content_event["completion"]
+    assert completion["choices"][0]["message"]["content"] == "the sum is 5"
+    assert completion["docie_agent"]["agent"] == "tool-helper"
+    assert completion["docie_agent"]["tool_calls"] == [
+        {k: v for k, v in tool_event.items() if k != "type"}
+    ]
+    # The tool_call event arrives BEFORE the content event -- real relay,
+    # not the whole exchange collapsed into a single frame at the end.
+    assert [e["type"] for e in events].index("tool_call") < [
+        e["type"] for e in events
+    ].index("content")
+
+
+def test_custom_agent_stream_mid_round_upstream_error_matches_non_streaming_taxonomy(
+    api, monkeypatch
+) -> None:
+    # #346: a mid-round upstream failure (round 2, posting the tool result)
+    # must surface with the SAME error_type the non-streaming path gives
+    # the IDENTICAL failure -- the streaming relay must never invent its
+    # own, different classification for a failure the non-streaming twin
+    # already has an established taxonomy for. The Observability dashboard
+    # groups on error_type, so this parity matters regardless of what the
+    # exact label is.
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://unused")
+        },
+    )
+
+    def make_handler() -> object:
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            has_tool_result = any(m.get("role") == "tool" for m in body["messages"])
+            if not has_tool_result:
+                return httpx.Response(
+                    200, json=_tool_calls_completion("calc__add", '{"a": 2, "b": 3}')
+                )
+            return httpx.Response(500, text="upstream kaboom")
+
+        return handler
+
+    async def fake_open(stack, specs):
+        session = await stack.enter_async_context(_memory_session(_calc_server()))
+        return {"calc": session}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open)
+
+    client, _captured = api
+    _create_agent(client, options={"mcp_servers": ["calc"]})
+
+    configure_http_transport(httpx.MockTransport(make_handler()))
+    non_stream_response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"messages": [{"role": "user", "content": "what is 2+3?"}]},
+    )
+    assert non_stream_response.status_code >= 400
+    non_stream_error_type = non_stream_response.json()["error"]["type"]
+
+    configure_http_transport(httpx.MockTransport(make_handler()))
+    stream_response = client.post(
+        "/v1/agents/tool-helper/chat/completions",
+        json={"stream": True, "messages": [{"role": "user", "content": "what is 2+3?"}]},
+    )
+    assert stream_response.status_code == 200, stream_response.text
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in stream_response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (error_event,) = [e for e in events if e["type"] == "error"]
+
+    assert error_event["error"]["type"] == non_stream_error_type
+
+
 def test_custom_agent_injects_system_prompt_before_the_tool_loop(api, monkeypatch) -> None:
     monkeypatch.setattr(
         mcp_tools,
