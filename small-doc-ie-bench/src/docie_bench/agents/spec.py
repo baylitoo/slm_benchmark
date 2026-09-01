@@ -62,10 +62,22 @@ class AgentSpec(BaseModel):
       them — validated against the server's own live tool list, so a typo'd
       or stale name is a clear config error rather than a silent no-op.
     * ``workflow`` — a fixed, ORDERED sequence of steps (``options.steps``,
-      a non-empty list), each ``{model_profile: str, system_prompt?: str,
-      mcp_servers?: list[str], mcp_tools?: dict, name?: str, route?: dict}``
-      — the same per-step shape a ``custom`` agent's top-level
-      fields/options use. One request runs every step server-side: the
+      a non-empty list). Each step is either an INLINE
+      ``{model_profile: str, system_prompt?: str, mcp_servers?: list[str],
+      mcp_tools?: dict, name?: str, route?: dict}`` definition — the same
+      per-step shape a ``custom`` agent's top-level fields/options use —
+      or a reference ``{"agent": "<name>", name?: str, route?: dict}``
+      (#336) that resolves to another SAVED ``AgentSpec`` at execution
+      time and uses ITS ``model_profile``/``system_prompt``/
+      ``mcp_servers``/``mcp_tools`` for that step, instead of re-specifying
+      them inline. This keeps a step in sync with the referenced agent —
+      fixing a bug or tuning a prompt on the saved agent propagates to
+      every workflow step that points at it. A referenced agent that is
+      itself ``workflow`` kind runs its own steps nested, sharing the
+      same step-execution budget described below (so a reference cycle
+      fails the same way a routing loop does — no separate cycle
+      detection); its ``mcp_servers``/``mcp_tools`` apply as-is, with no
+      per-step narrowing. One request runs every step server-side: the
       first step receives the caller's own messages, and each later step
       receives only the last SUBSTANTIVE step's answer as its single user
       message ("prompt chaining" — a small model handling one narrow
@@ -77,7 +89,8 @@ class AgentSpec(BaseModel):
       NEXT step by name instead of falling through the list — its own
       answer is a label, never chained forward as content. Unmatched with
       no ``default`` fails the request (``workflow_unroutable``); a
-      step-execution budget guards against a routing loop. The top-level
+      step-execution budget guards against a routing loop (and, per
+      above, against an agent-reference cycle). The top-level
       ``model_profile``/``system_prompt`` are unused (each step carries its
       own); the final (non-routing) step's answer is the response, with
       every step's content, route target, and tool calls available via

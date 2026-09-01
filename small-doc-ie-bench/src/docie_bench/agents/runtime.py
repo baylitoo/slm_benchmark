@@ -25,6 +25,7 @@ from docie_bench.agents.guard import (
     labels_from_entities,
     moderation_flags,
 )
+from docie_bench.agents.registry import AgentNotFoundError, AgentRegistry, AgentRegistryError
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.benchmark.routing_config import build_extraction_router
 from docie_bench.extract.routing import (
@@ -907,12 +908,16 @@ _MAX_WORKFLOW_STEPS = 16
 def _resolve_workflow_steps(
     spec: AgentSpec,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
-    """``options.steps`` — a non-empty, ORDERED list of
-    ``{model_profile, system_prompt?, mcp_servers?, mcp_tools?, name?, route?}``
-    steps (#265, route added #266). Each step's shape mirrors a ``custom``
-    agent's own model_profile/options exactly, so the SAME per-step spec can
-    drive ``_resolve_mcp_servers``/``_complete_with_tools``/``_forward_chat``
-    unchanged (see ``_complete_workflow``).
+    """``options.steps`` — a non-empty, ORDERED list of steps (#265, route
+    added #266, agent references added #336). Each step is either an
+    INLINE ``{model_profile, system_prompt?, mcp_servers?, mcp_tools?,
+    name?, route?}`` definition — the same shape a ``custom`` agent's own
+    model_profile/options use, so the SAME per-step spec can drive
+    ``_resolve_mcp_servers``/``_complete_with_tools``/``_forward_chat``
+    unchanged (see ``_run_workflow_steps``) — or a reference
+    ``{"agent": "<name>", name?: str, route?: dict}`` that resolves to
+    another SAVED ``AgentSpec`` at execution time (see
+    ``_resolve_step_agent``) and stands in for the inline fields.
 
     Every step is addressable by name — its own ``name`` if given, else its
     list index as a string — so a ``route`` step (a cheap classifier) can
@@ -922,7 +927,8 @@ def _resolve_workflow_steps(
     if not isinstance(raw, list) or not raw:
         raise AgentError(
             f"agent {spec.name!r}: options.steps must be a non-empty list of "
-            "{model_profile, system_prompt?, mcp_servers?, mcp_tools?} steps",
+            "{model_profile, system_prompt?, mcp_servers?, mcp_tools?} steps "
+            'or {"agent": "<name>"} references',
             status_code=500,
             error_type="invalid_agent_config",
         )
@@ -930,10 +936,14 @@ def _resolve_workflow_steps(
     names: list[str] = []
     by_name: dict[str, int] = {}
     for index, raw_step in enumerate(raw):
-        if not isinstance(raw_step, dict) or not raw_step.get("model_profile"):
+        has_model_profile = isinstance(raw_step, dict) and bool(raw_step.get("model_profile"))
+        agent_ref = raw_step.get("agent") if isinstance(raw_step, dict) else None
+        has_agent_ref = isinstance(agent_ref, str) and bool(agent_ref)
+        if not isinstance(raw_step, dict) or not (has_model_profile or has_agent_ref):
             raise AgentError(
                 f"agent {spec.name!r}: options.steps[{index}] must be an object "
-                "with a non-empty model_profile",
+                "with a non-empty model_profile, or an "
+                '{"agent": "<name>"} reference to another saved agent',
                 status_code=500,
                 error_type="invalid_agent_config",
             )
@@ -1007,6 +1017,32 @@ def _resolve_route_target(
     return target
 
 
+def _resolve_step_agent(spec: AgentSpec, step_name: str, agent_name: str) -> AgentSpec:
+    """Resolve a step's ``{"agent": "<name>"}`` reference (#336) to the
+    SAVED ``AgentSpec`` it names — read fresh from the registry, same as
+    every other registry lookup, so a fix to the referenced agent's config
+    is picked up on the workflow's very next request without touching the
+    workflow itself. Fails the same way other workflow config errors in
+    this module do (500, ``invalid_agent_config``) instead of leaking a
+    raw registry exception."""
+    try:
+        return AgentRegistry().get(agent_name)
+    except AgentNotFoundError as exc:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} references unknown agent "
+            f"{agent_name!r}",
+            status_code=500,
+            error_type="invalid_agent_config",
+        ) from exc
+    except AgentRegistryError as exc:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} could not resolve agent "
+            f"{agent_name!r}: {exc}",
+            status_code=500,
+            error_type="invalid_agent_config",
+        ) from exc
+
+
 def _message_content(completion: dict[str, Any]) -> str | None:
     choices = completion.get("choices")
     message = (
@@ -1027,14 +1063,62 @@ def _last_message_content(body: dict[str, Any]) -> str | None:
     return content if isinstance(content, str) else None
 
 
-async def _complete_workflow(
-    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+async def _run_one_step(
+    step_spec: AgentSpec,
+    step_body: dict[str, Any],
+    *,
+    index: int,
+    step_name: str,
+    http_client: httpx.AsyncClient,
+    tool_call_trace: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """A ``workflow`` agent (#265): a fixed, ORDERED sequence of steps, each
-    its own model_profile + prompt (+ optional MCP tools from #259), run
-    server-side in one request — the "prompt chaining" pattern, deliberately
-    narrow so a small (350M-class) model handles one well-scoped sub-task
-    per step instead of the whole request in one shot.
+    """Run one leaf step — an inline step, or a ``{"agent": ...}`` reference
+    to a non-``workflow`` agent — against its already-resolved ``step_spec``
+    (``model_profile``/``system_prompt``/``options.mcp_servers``/
+    ``options.mcp_tools``). Shared by both step shapes in
+    ``_run_workflow_steps`` since, once resolved, an inline step and a
+    resolved reference are indistinguishable to
+    ``_resolve_mcp_servers``/``_complete_with_tools``/``_forward_chat``."""
+    server_names = _resolve_mcp_servers(step_spec)
+    if server_names:
+        completion, step_tool_calls = await _complete_with_tools(
+            step_spec, step_body, server_names, http_client=http_client
+        )
+        # _complete_with_tools is kind-agnostic (a `custom` agent has no
+        # notion of "step") -- tag which step made each call here, at the
+        # workflow-specific call site, so the trace doesn't flatten a
+        # multi-step workflow's tool calls into one unattributed list.
+        for call in step_tool_calls:
+            call["step"] = index
+            call["step_name"] = step_name
+        tool_call_trace.extend(step_tool_calls)
+    else:
+        completion = await _forward_chat(step_spec, step_body, http_client=http_client)
+    return completion
+
+
+async def _run_workflow_steps(
+    spec: AgentSpec,
+    body: dict[str, Any],
+    *,
+    http_client: httpx.AsyncClient,
+    budget: list[int],
+    totals: dict[str, int],
+    step_trace: list[dict[str, Any]],
+    tool_call_trace: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str | None]:
+    """Run ONE workflow spec's ordered step list against state SHARED across
+    the whole call tree. A step referencing another ``workflow``-kind agent
+    (``{"agent": "<name>"}``, #336 — nested workflows) recurses into this
+    SAME function, so its steps consume the SAME step-execution budget,
+    usage totals, and trace as the caller's — that makes
+    ``_MAX_WORKFLOW_STEPS`` double as the cycle guard for a reference cycle
+    (two agents pointing at each other, or an agent pointing at itself)
+    exactly the way it already guards a routing loop, with no separate
+    cycle detection needed: the budget is checked, and consumed, once per
+    step DISPATCHED — inline, a leaf reference, or a nested-workflow
+    reference alike — before that step does any work, so a pure
+    reference-chase that never runs an actual completion still exhausts it.
 
     Step 1 receives the caller's own messages unchanged; each LATER step
     receives only the last SUBSTANTIVE step's answer as its single user
@@ -1043,8 +1127,146 @@ async def _complete_workflow(
     next step in the list, it's a cheap classifier whose own answer picks
     a NAMED step to jump to next (see ``_resolve_route_target``) — the
     classifier's answer itself is never chained forward, since it's a
-    label ("billing"), not content. A flat step-execution budget
-    (``_MAX_WORKFLOW_STEPS``) guards against a routing loop.
+    label ("billing"), not content.
+
+    Returns the final completion and the content it chains forward to
+    whichever step comes after this call (the caller's next step, for a
+    nested invocation).
+    """
+    steps, names, by_name = _resolve_workflow_steps(spec)
+    # Seeded from the caller's own request so a `route` step landing at
+    # index 0 still hands the target step real content, not "" -- a
+    # classifier's job is to pick a destination, never to replace content.
+    chain_content: str | None = _last_message_content(body)
+    completion: dict[str, Any] | None = None
+    index = 0
+    first = True
+    while True:
+        if budget[0] >= _MAX_WORKFLOW_STEPS:
+            raise AgentError(
+                f"agent {spec.name!r}: workflow exceeded {_MAX_WORKFLOW_STEPS} step "
+                "executions — likely a routing loop",
+                status_code=502,
+                error_type="workflow_budget_exhausted",
+            )
+        budget[0] += 1
+        step = steps[index]
+        step_name = names[index]
+        step_body = (
+            dict(body)
+            if first
+            else {"messages": [{"role": "user", "content": chain_content or ""}]}
+        )
+        agent_ref = step.get("agent")
+        used_model_profile: str | None
+        is_nested = False
+        if isinstance(agent_ref, str) and agent_ref:
+            ref_spec = _resolve_step_agent(spec, step_name, agent_ref)
+            if ref_spec.kind == "workflow":
+                is_nested = True
+                used_model_profile = None
+                completion, step_answer = await _run_workflow_steps(
+                    ref_spec,
+                    step_body,
+                    http_client=http_client,
+                    budget=budget,
+                    totals=totals,
+                    step_trace=step_trace,
+                    tool_call_trace=tool_call_trace,
+                )
+            else:
+                used_model_profile = ref_spec.model_profile
+                step_spec = spec.model_copy(
+                    update={
+                        "model_profile": ref_spec.model_profile,
+                        "system_prompt": ref_spec.system_prompt,
+                        "options": {
+                            "mcp_servers": ref_spec.options.get("mcp_servers"),
+                            "mcp_tools": ref_spec.options.get("mcp_tools"),
+                        },
+                    }
+                )
+                completion = await _run_one_step(
+                    step_spec,
+                    step_body,
+                    index=index,
+                    step_name=step_name,
+                    http_client=http_client,
+                    tool_call_trace=tool_call_trace,
+                )
+                step_answer = _message_content(completion)
+        else:
+            used_model_profile = step["model_profile"]
+            step_spec = spec.model_copy(
+                update={
+                    "model_profile": step["model_profile"],
+                    "system_prompt": step.get("system_prompt"),
+                    "options": {
+                        "mcp_servers": step.get("mcp_servers"),
+                        "mcp_tools": step.get("mcp_tools"),
+                    },
+                }
+            )
+            completion = await _run_one_step(
+                step_spec,
+                step_body,
+                index=index,
+                step_name=step_name,
+                http_client=http_client,
+                tool_call_trace=tool_call_trace,
+            )
+            step_answer = _message_content(completion)
+        # A nested workflow's own recursive call already folded every ONE of
+        # its steps' usage into these SAME shared `totals` as it ran them --
+        # re-adding its returned completion's usage here would double-count
+        # that nested call's last step.
+        if not is_nested:
+            usage = completion.get("usage")
+            if isinstance(usage, dict):
+                for key in totals:
+                    value = usage.get(key)
+                    if isinstance(value, int):
+                        totals[key] += value
+        first = False
+        trace_entry: dict[str, Any] = {
+            "step": index,
+            "name": step_name,
+            "model_profile": used_model_profile,
+            "content": step_answer,
+            "routed_to": None,
+        }
+        if isinstance(agent_ref, str) and agent_ref:
+            trace_entry["agent"] = agent_ref
+        route = step.get("route")
+        if route is not None:
+            target_name = _resolve_route_target(
+                step_answer, route, by_name, spec=spec, step_name=step_name
+            )
+            trace_entry["routed_to"] = target_name
+            step_trace.append(trace_entry)
+            index = by_name[target_name]
+            continue
+        chain_content = step_answer
+        step_trace.append(trace_entry)
+        index += 1
+        if index >= len(steps):
+            break
+    assert completion is not None  # _resolve_workflow_steps guarantees >=1 step
+    return completion, chain_content
+
+
+async def _complete_workflow(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> dict[str, Any]:
+    """A ``workflow`` agent (#265): a fixed, ORDERED sequence of steps, each
+    its own model_profile + prompt (+ optional MCP tools from #259) or a
+    reference to another saved agent's config (``{"agent": "<name>"}``,
+    #336), run server-side in one request — the "prompt chaining" pattern,
+    deliberately narrow so a small (350M-class) model handles one
+    well-scoped sub-task per step instead of the whole request in one shot.
+    See ``_run_workflow_steps`` for the step-execution/chaining/nesting
+    mechanics and the step-execution budget that guards against both a
+    routing loop and an agent-reference cycle.
 
     Usage sums across every step executed (same contract the MCP tool loop
     already uses); every step's own model/content, its route target (if
@@ -1054,95 +1276,18 @@ async def _complete_workflow(
     ``step_name`` that made it, so a multi-step workflow's calls aren't
     flattened into one unattributed list.
     """
-    steps, names, by_name = _resolve_workflow_steps(spec)
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     step_trace: list[dict[str, Any]] = []
     tool_call_trace: list[dict[str, Any]] = []
-    # Seeded from the caller's own request so a `route` step landing at
-    # index 0 still hands the target step real content, not "" -- a
-    # classifier's job is to pick a destination, never to replace content.
-    chain_content: str | None = _last_message_content(body)
-    completion: dict[str, Any] | None = None
-    index = 0
-    visited = 0
-    while True:
-        if visited >= _MAX_WORKFLOW_STEPS:
-            raise AgentError(
-                f"agent {spec.name!r}: workflow exceeded {_MAX_WORKFLOW_STEPS} step "
-                "executions — likely a routing loop",
-                status_code=502,
-                error_type="workflow_budget_exhausted",
-            )
-        step = steps[index]
-        step_name = names[index]
-        step_spec = spec.model_copy(
-            update={
-                "model_profile": step["model_profile"],
-                "system_prompt": step.get("system_prompt"),
-                "options": {
-                    "mcp_servers": step.get("mcp_servers"),
-                    "mcp_tools": step.get("mcp_tools"),
-                },
-            }
-        )
-        step_body = (
-            dict(body)
-            if visited == 0
-            else {"messages": [{"role": "user", "content": chain_content or ""}]}
-        )
-        server_names = _resolve_mcp_servers(step_spec)
-        if server_names:
-            completion, step_tool_calls = await _complete_with_tools(
-                step_spec, step_body, server_names, http_client=http_client
-            )
-            # _complete_with_tools is kind-agnostic (a `custom` agent has no
-            # notion of "step") -- tag which step made each call here, at
-            # the workflow-specific call site, so the trace doesn't flatten
-            # a multi-step workflow's tool calls into one unattributed list.
-            for call in step_tool_calls:
-                call["step"] = index
-                call["step_name"] = step_name
-            tool_call_trace.extend(step_tool_calls)
-        else:
-            completion = await _forward_chat(step_spec, step_body, http_client=http_client)
-        usage = completion.get("usage")
-        if isinstance(usage, dict):
-            for key in totals:
-                value = usage.get(key)
-                if isinstance(value, int):
-                    totals[key] += value
-        step_answer = _message_content(completion)
-        visited += 1
-        route = step.get("route")
-        if route is not None:
-            target_name = _resolve_route_target(
-                step_answer, route, by_name, spec=spec, step_name=step_name
-            )
-            step_trace.append(
-                {
-                    "step": index,
-                    "name": step_name,
-                    "model_profile": step["model_profile"],
-                    "content": step_answer,
-                    "routed_to": target_name,
-                }
-            )
-            index = by_name[target_name]
-            continue
-        chain_content = step_answer
-        step_trace.append(
-            {
-                "step": index,
-                "name": step_name,
-                "model_profile": step["model_profile"],
-                "content": step_answer,
-                "routed_to": None,
-            }
-        )
-        index += 1
-        if index >= len(steps):
-            break
-    assert completion is not None  # _resolve_workflow_steps guarantees >=1 step
+    completion, _ = await _run_workflow_steps(
+        spec,
+        body,
+        http_client=http_client,
+        budget=[0],
+        totals=totals,
+        step_trace=step_trace,
+        tool_call_trace=tool_call_trace,
+    )
     docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind, "steps": step_trace}
     if tool_call_trace:
         docie_agent["tool_calls"] = tool_call_trace

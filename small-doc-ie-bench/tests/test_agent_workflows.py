@@ -5,6 +5,11 @@ the previous step's answer, not the accumulated history.
 
 A step may also carry a `route` (#266): a cheap classifier whose own answer
 picks a NAMED next step instead of the next one in the list.
+
+A step may also be a reference, `{"agent": "<name>"}` (#336), instead of an
+inline definition: it resolves to another SAVED agent's config at execution
+time. A referenced agent that is itself `workflow` kind runs its own steps
+nested, against the same step-execution budget.
 """
 
 from __future__ import annotations
@@ -85,6 +90,25 @@ def _create_workflow(client: TestClient, steps: list[dict[str, Any]], **override
         "options": {"steps": steps},
     }
     payload.update(overrides)
+    response = client.post("/v1/agents", json=payload)
+    assert response.status_code == 201, response.text
+
+
+def _create_custom_agent(
+    client: TestClient,
+    name: str,
+    *,
+    model_profile: str,
+    system_prompt: str | None = None,
+    options: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "name": name,
+        "kind": "custom",
+        "model_profile": model_profile,
+        "system_prompt": system_prompt,
+        "options": options or {},
+    }
     response = client.post("/v1/agents", json=payload)
     assert response.status_code == 201, response.text
 
@@ -550,3 +574,204 @@ def test_workflow_tool_calls_are_tagged_with_the_step_that_made_them(api, monkey
     assert call_1["step_name"] == "first"
     assert call_2["step"] == 1
     assert call_2["step_name"] == "second"
+
+
+# ── a step may reference another saved agent instead of an inline
+# definition, {"agent": "<name>"} (#336) ────────────────────────────────────
+
+
+def test_workflow_step_can_reference_a_saved_agent_by_name(api) -> None:
+    client, captured = api
+    _create_custom_agent(
+        client,
+        "extractor-agent",
+        model_profile="extractor-model",
+        system_prompt="You are a custom extractor.",
+    )
+    _create_workflow(client, [{"agent": "extractor-agent"}])
+
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "echo: hello"
+
+    (step_req,) = (json.loads(r.content) for r in captured)
+    assert step_req["model"] == "extractor-model"
+    assert step_req["messages"] == [
+        {"role": "system", "content": "You are a custom extractor."},
+        {"role": "user", "content": "hello"},
+    ]
+    # The referenced agent's OWN config drives the step -- the trace names
+    # both the resolved model_profile and the agent that was referenced.
+    assert body["docie_agent"]["steps"] == [
+        {
+            "step": 0,
+            "name": "0",
+            "model_profile": "extractor-model",
+            "content": "echo: hello",
+            "routed_to": None,
+            "agent": "extractor-agent",
+        }
+    ]
+
+
+def test_workflow_step_referencing_an_agent_uses_its_mcp_tools(api, monkeypatch) -> None:
+    """The referenced agent's own mcp_servers/mcp_tools apply as-is to the
+    step -- the design decision this pass makes no attempt to narrow them
+    further."""
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://unused")
+        },
+    )
+    server = _calc_server()
+
+    async def fake_open(stack, specs):
+        session = await stack.enter_async_context(_memory_session(server))
+        return {"calc": session}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open)
+
+    client, captured = api
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        body = json.loads(request.content)
+        has_tool_result = any(m.get("role") == "tool" for m in body["messages"])
+        if not has_tool_result:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "r1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "calc__add",
+                                            "arguments": '{"a": 2, "b": 3}',
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                },
+            )
+        return httpx.Response(
+            200,
+            json=_completion(
+                "the sum is 5",
+                usage={"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27},
+            ),
+        )
+
+    configure_http_transport(httpx.MockTransport(handler))
+
+    _create_custom_agent(
+        client,
+        "calc-agent",
+        model_profile="calc-model",
+        options={"mcp_servers": ["calc"]},
+    )
+    _create_workflow(client, [{"agent": "calc-agent"}])
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "what is 2+3?"}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "the sum is 5"
+    (call,) = body["docie_agent"]["tool_calls"]
+    assert call["tool"] == "calc__add"
+    assert call["step"] == 0
+    assert call["step_name"] == "0"
+
+
+def test_workflow_step_agent_reference_to_unknown_agent_fails_clearly(api) -> None:
+    client, _ = api
+    _create_workflow(client, [{"agent": "does-not-exist"}])
+
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["type"] == "invalid_agent_config"
+    assert "does-not-exist" in body["error"]["message"]
+
+
+def test_workflow_step_can_reference_a_nested_workflow_agent(api) -> None:
+    """A referenced agent that is itself `workflow` kind runs its own steps
+    nested -- a shallow case where the outer workflow is a single dispatch
+    step onto a two-step inner workflow."""
+    client, captured = api
+    _create_workflow(
+        client,
+        [
+            {"model_profile": "inner-alpha", "system_prompt": "inner step one"},
+            {"model_profile": "inner-beta", "system_prompt": "inner step two"},
+        ],
+        name="inner-workflow",
+    )
+    _create_workflow(client, [{"agent": "inner-workflow"}])
+
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "echo: echo: hello"
+    # Usage sums across the NESTED steps too, same shared totals the outer
+    # workflow's own steps would contribute to.
+    assert body["usage"] == {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+
+    step1_req, step2_req = (json.loads(r.content) for r in captured)
+    assert step1_req["model"] == "inner-alpha"
+    assert step1_req["messages"][-1]["content"] == "hello"
+    assert step2_req["model"] == "inner-beta"
+    assert step2_req["messages"][-1]["content"] == "echo: hello"
+
+    steps_trace = body["docie_agent"]["steps"]
+    assert len(steps_trace) == 3
+    assert steps_trace[0]["model_profile"] == "inner-alpha"
+    assert steps_trace[0]["content"] == "echo: hello"
+    assert steps_trace[1]["model_profile"] == "inner-beta"
+    assert steps_trace[1]["content"] == "echo: echo: hello"
+    # The outer dispatch step's own trace entry names the agent it
+    # delegated to and carries the nested workflow's final answer.
+    assert steps_trace[2]["agent"] == "inner-workflow"
+    assert steps_trace[2]["content"] == "echo: echo: hello"
+
+
+def test_workflow_agent_reference_cycle_hits_the_step_budget(api) -> None:
+    """Two workflow agents referencing each other, with no inline step ever
+    running a completion, would recurse forever without the shared
+    step-execution budget -- the same guard that already catches a routing
+    loop catches this too."""
+    client, _ = api
+    _create_workflow(client, [{"agent": "loop-b"}], name="loop-a")
+    _create_workflow(client, [{"agent": "loop-a"}], name="loop-b")
+
+    response = client.post(
+        "/v1/agents/loop-a/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "workflow_budget_exhausted"
