@@ -14,6 +14,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     ...actual,
     chatCompletionStream: vi.fn(),
     chatCompletionMcpStream: vi.fn(),
+    pauseChatExchange: vi.fn(),
+    respondToChatExchange: vi.fn(),
     listMcpServers: vi.fn(),
     listSchemas: vi.fn(),
     listDynamicSchemas: vi.fn(),
@@ -460,6 +462,8 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -473,6 +477,8 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
@@ -897,5 +903,155 @@ describe("ChatPanel", () => {
     expect(screen.getAllByRole("button", { name: "Regenerate" })).toHaveLength(1);
     // An Edit control on every user message.
     expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(2);
+  });
+
+  // ── human-in-the-loop pause/resume (#383) ────────────────────────────────
+
+  it("shows the Pause button only while a tool-calling exchange is streaming", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "search the doc");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByRole("button", { name: "Pause" })).toBeInTheDocument();
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "done" } }] });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("never shows Pause for a plain chat exchange with no MCP servers selected", async () => {
+    let resolveToken!: () => void;
+    vi.mocked(api.chatCompletionStream).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveToken = () => resolve(undefined);
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/Type a message/), "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+    resolveToken();
+  });
+
+  it("calls pauseChatExchange with the exchange id reported by the stream", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (..._args) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          const onExchangeId = _args[10] as ((id: string) => void) | undefined;
+          onExchangeId?.("exch-123");
+        }),
+    );
+    vi.mocked(api.pauseChatExchange).mockResolvedValue(undefined);
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "search the doc");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const pauseButton = await screen.findByRole("button", { name: "Pause" });
+    await waitFor(() => expect(pauseButton).not.toBeDisabled());
+    await user.click(pauseButton);
+
+    await waitFor(() => expect(api.pauseChatExchange).toHaveBeenCalledWith("exch-123"));
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "done" } }] });
+  });
+
+  it("renders a multiple-choice picker for a model-issued ask_user question and answers it", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (..._args) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          const onExchangeId = _args[10] as ((id: string) => void) | undefined;
+          const onAwaitingInput = _args[11] as
+            | ((payload: { question?: string; choices?: string[] }) => void)
+            | undefined;
+          onExchangeId?.("exch-ask");
+          onAwaitingInput?.({ question: "which invoice?", choices: ["A", "B"] });
+        }),
+    );
+    vi.mocked(api.respondToChatExchange).mockResolvedValue(undefined);
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "search the invoices");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("which invoice?")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "A" }));
+
+    await waitFor(() =>
+      expect(api.respondToChatExchange).toHaveBeenCalledWith("exch-ask", "A"),
+    );
+    await waitFor(() => expect(screen.queryByText("which invoice?")).not.toBeInTheDocument());
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "picked A" } }] });
+    expect(await screen.findByText("picked A")).toBeInTheDocument();
+  });
+
+  it("renders a free-text prompt for a question with no choices and round-trips the typed answer", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (..._args) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          const onExchangeId = _args[10] as ((id: string) => void) | undefined;
+          const onAwaitingInput = _args[11] as
+            | ((payload: { question?: string; choices?: string[] }) => void)
+            | undefined;
+          onExchangeId?.("exch-pause");
+          onAwaitingInput?.({});
+        }),
+    );
+    vi.mocked(api.respondToChatExchange).mockResolvedValue(undefined);
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "keep going");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const dialog = await screen.findByRole("dialog");
+    const answerBox = within(dialog).getByPlaceholderText("Type your answer…");
+    await user.type(answerBox, "also check page 2");
+    await user.click(within(dialog).getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(api.respondToChatExchange).toHaveBeenCalledWith("exch-pause", "also check page 2"),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "done" } }] });
+    expect(await screen.findByText("done")).toBeInTheDocument();
   });
 });

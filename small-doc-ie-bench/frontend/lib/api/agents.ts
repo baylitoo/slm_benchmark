@@ -156,6 +156,16 @@ export interface AgentToolCallsUnsupportedTrace {
   message: string;
 }
 
+/** Fires whenever a paused exchange (#383) is waiting for a human answer --
+ * a model-issued `ask_user` tool call carries `question` (and `choices`
+ * when the model gave any -- render a picker; free text otherwise), a
+ * user-initiated pause (`pauseChatExchange`) carries neither -- render a
+ * plain "add context" box instead. Can fire more than once per exchange. */
+export interface AgentAwaitingInputTrace {
+  question?: string;
+  choices?: string[];
+}
+
 /** One workflow step's outcome (#265; `name`/`routed_to` added #266) -- the
  * "Try it" trace view's per-step detail, alongside any tool calls that step
  * made. `routed_to` is set only for a classifier (`route`) step -- the name
@@ -337,6 +347,59 @@ export async function chatCompletionStream(
   }
 }
 
+/** POST one of the human-in-the-loop control endpoints (#383) and surface
+ * OpenAI-shaped errors readably -- same error handling as `openaiPost`, but
+ * these return a small `{paused|accepted, exchange_id}` body, not a chat
+ * completion. A 404 (`unknown_exchange`) means the exchange already
+ * finished, timed out, or never opted into human-in-the-loop. */
+async function exchangeControlPost(path: string, payload: unknown): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...authHeader(),
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
+  }
+  if (res.ok) return;
+  const body = await readBody(res);
+  if (res.status === 401) throw unauthorizedError(body);
+  const err =
+    body && typeof body === "object" && "error" in body
+      ? (body as { error?: { message?: string; type?: string } }).error
+      : undefined;
+  const detail = err?.message ?? detailOf(body, `Request failed (HTTP ${res.status})`);
+  throw new ApiError(res.status, err?.type ? `${err.type}: ${detail}` : detail);
+}
+
+/**
+ * User-initiated pause (#383): flags a running `chatCompletionMcpStream`
+ * exchange (by the `exchangeId` its `onExchangeId` callback reported) to
+ * suspend at its next round boundary -- usable any time the exchange is
+ * running, including mid tool-search. This only REQUESTS the pause; the
+ * exchange's own `onAwaitingInput` callback fires once it actually takes
+ * effect. Throws (404 `unknown_exchange`) if the exchange already finished.
+ */
+export function pauseChatExchange(exchangeId: string): Promise<void> {
+  return exchangeControlPost("/v1/chat/completions/pause", { exchange_id: exchangeId });
+}
+
+/**
+ * Answers a paused exchange's `onAwaitingInput` callback (#383) -- a
+ * model-issued `ask_user` question, or a user-initiated pause -- with
+ * `text`. Safe to call even before the exchange has reached its pause
+ * checkpoint. Throws (404 `unknown_exchange`) if the exchange already ended.
+ */
+export function respondToChatExchange(exchangeId: string, text: string): Promise<void> {
+  return exchangeControlPost("/v1/chat/completions/respond", { exchange_id: exchangeId, text });
+}
+
 /**
  * Streaming variant of `chatCompletion` for the `mcp_servers` tool-loop
  * path: each executed tool call arrives as its own SSE event the moment it
@@ -367,6 +430,17 @@ export async function chatCompletionStream(
  * the resolved deployment's chat template is known NOT to support real
  * tool-calling (see `AgentToolCallsUnsupportedTrace`) — known upfront from
  * the deployment's health state, unlike `onContextBudget`.
+ * Human-in-the-loop pause/resume (#383) is always requested on this call
+ * (`enable_ask_user: true` — this function is the Playground-only surface
+ * the whole mechanism is scoped to). `onExchangeId`, when given, fires ONCE,
+ * FIRST, before any other callback, with the fresh id this one exchange got
+ * — pass it to `pauseChatExchange` at any later point while the exchange is
+ * still running. `onAwaitingInput`, when given, fires every time the
+ * exchange pauses for a human answer (see `AgentAwaitingInputTrace`) —
+ * resolve it with `respondToChatExchange(exchangeId, text)`. A pause that
+ * times out server-side (`settings.mcp_ask_user_timeout_seconds`) surfaces
+ * as an ordinary thrown `ApiError` (`ask_user_timeout`), same as any other
+ * `error` event.
  * Resolves with the final completion once a `content` event lands; throws
  * on an `error` event or a connection that ends without either.
  */
@@ -381,6 +455,8 @@ export async function chatCompletionMcpStream(
   onUsage?: (usage: AgentUsageTrace) => void,
   onContextBudget?: (budget: AgentContextBudgetTrace) => void,
   onToolCallsUnsupported?: (warning: AgentToolCallsUnsupportedTrace) => void,
+  onExchangeId?: (exchangeId: string) => void,
+  onAwaitingInput?: (payload: AgentAwaitingInputTrace) => void,
 ): Promise<AgentChatResponse> {
   let res: Response;
   try {
@@ -396,6 +472,7 @@ export async function chatCompletionMcpStream(
         messages,
         stream: true,
         mcp_servers: mcpServers,
+        enable_ask_user: true,
         ...(sessionId ? { session_id: sessionId } : {}),
       }),
     });
@@ -475,6 +552,19 @@ export async function chatCompletionMcpStream(
           } else if (event.type === "tool_calls_unsupported") {
             if (onToolCallsUnsupported) {
               onToolCallsUnsupported({ message: String(event.message ?? "") });
+            }
+          } else if (event.type === "exchange") {
+            if (onExchangeId && typeof event.exchange_id === "string") {
+              onExchangeId(event.exchange_id);
+            }
+          } else if (event.type === "awaiting_input") {
+            if (onAwaitingInput) {
+              onAwaitingInput({
+                ...(typeof event.question === "string" ? { question: event.question } : {}),
+                ...(Array.isArray(event.choices)
+                  ? { choices: event.choices as string[] }
+                  : {}),
+              });
             }
           } else if (event.type === "content") {
             completion = event.completion as AgentChatResponse;

@@ -32,6 +32,7 @@ tool calls are ALL MCP-owned are executed server-side.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -64,6 +65,13 @@ class MCPConfigError(ValueError):
 
 class MCPUnavailableError(RuntimeError):
     """The optional ``mcp`` SDK is not installed in this environment."""
+
+
+class AskUserTimeoutError(RuntimeError):
+    """A paused exchange (``ask_user``, or a user-initiated pause) got no
+    answer within ``settings.mcp_ask_user_timeout_seconds`` — a closed tab
+    or an abandoned session must not hold the request (or the in-memory
+    registry entry below) open forever."""
 
 
 @dataclass(frozen=True)
@@ -334,6 +342,205 @@ TOOL_DISCIPLINE_DIRECTIVE = (
     "so directly instead of guessing."
 )
 
+# Human-in-the-loop pause/resume (#383): a synthetic tool, never routed to an
+# MCP server -- real MCP tools run as separate stdio subprocesses
+# (open_mcp_sessions), and a tool call blocking on an event only a LATER,
+# separate HTTP request can set doesn't cross that process boundary. ask_user
+# is instead intercepted entirely inside run_tool_loop/_stream_chat_with_mcp_tools,
+# in the same process, no subprocess involved. Advertised alongside real MCP
+# tools (appended to `tools`, never to `mcp_tools`/`mapping` -- see
+# run_tool_loop) only when the caller opted in (`exchange_id is not None`).
+ASK_USER_TOOL_NAME = "ask_user"
+
+ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": ASK_USER_TOOL_NAME,
+        "description": (
+            "Ask the human user a question and wait for their answer before "
+            "continuing. Only for something genuinely ambiguous or a decision "
+            "only the user can make -- not a substitute for a tool you already "
+            "have, and not habitual: a question every round is a worse "
+            "experience than doing your best with what you already know."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question to show the user.",
+                },
+                "choices": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional multiple-choice options. Omit for a free-text answer."
+                    ),
+                },
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+# Folded alongside TOOL_DISCIPLINE_DIRECTIVE (never replacing it -- existing
+# callers that never enable ask_user keep exactly TOOL_DISCIPLINE_DIRECTIVE's
+# text, unchanged) whenever a request opts into human-in-the-loop. Kept as
+# its own line rather than appended into TOOL_DISCIPLINE_DIRECTIVE itself: the
+# directive is a public constant several tests assert verbatim, and is folded
+# unconditionally whenever mcp_tools is non-empty -- unrelated to whether
+# ask_user is even offered this request.
+ASK_USER_DISCIPLINE_LINE = (
+    "You also have an ask_user tool. Use it ONLY when a request is genuinely "
+    "ambiguous or needs a decision only the human user can make -- never "
+    "habitually, and never in place of a tool you already have."
+)
+
+
+@dataclass
+class _PendingInput:
+    """One exchange's human-in-the-loop wait slot: the ``Event`` a paused
+    ``run_tool_loop`` awaits, plus the answer text it's set with. Registered
+    once per exchange (``open_pending_input``), re-armed in place for each
+    successive pause within that same exchange (a conversation can pause
+    more than once) rather than allocating a fresh registry entry per pause.
+    """
+
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    answer: str | None = None
+    # User-initiated pause (issue #383, as opposed to a model-issued
+    # ask_user call): set by `request_pause`, consumed by run_tool_loop at
+    # the top of its next round check -- the loop, not the request handler,
+    # owns actually suspending between rounds.
+    pause_requested: bool = False
+
+
+# In-memory registry, keyed by the per-exchange id `_stream_chat_with_mcp_tools`
+# mints (see its `exchange` SSE event) -- NOT a `channel` id reused from
+# elsewhere in this codebase (Inngest's realtime channels are a distinct,
+# unrelated concept): chat_api.py mints nothing per-request today, so this PR
+# adds that minting as part of wiring HITL in. Single-process only, same as
+# every other in-memory structure in this module (open_mcp_sessions'
+# per-request ClientSessions, the MCP server registry cache) -- a paused
+# exchange's `/respond` must land on the SAME api replica that is running its
+# SSE stream. Bounded lifetime: `open_pending_input`/`close_pending_input`
+# bracket exactly one exchange's `run_tool_loop` call, so an abandoned
+# exchange never accumulates entries beyond its own timeout.
+_pending_inputs: dict[str, _PendingInput] = {}
+
+
+def open_pending_input(exchange_id: str) -> None:
+    """Register a fresh wait slot for one exchange. Called once, before
+    `run_tool_loop` starts, by the caller that minted `exchange_id`."""
+    _pending_inputs[exchange_id] = _PendingInput()
+
+
+def close_pending_input(exchange_id: str) -> None:
+    """Drop the registry entry -- called from a `finally` once the exchange
+    ends (answered, timed out, errored, or the client disconnected) so an
+    abandoned exchange never leaks memory. A second call is a no-op."""
+    _pending_inputs.pop(exchange_id, None)
+
+
+def has_pending_input(exchange_id: str) -> bool:
+    """Whether `exchange_id` still has a live registry entry. Introspection
+    only (tests, and any future admin/debug surface) -- `run_tool_loop`
+    itself never needs to ask this; it holds the entry directly."""
+    return exchange_id in _pending_inputs
+
+
+def request_pause(exchange_id: str) -> bool:
+    """User-initiated pause: flags the exchange to suspend at its NEXT round
+    boundary (run_tool_loop checks this at the top of every round). Returns
+    False when no such exchange is registered -- already finished, wrong id,
+    or the caller never opted into human-in-the-loop for it."""
+    pending = _pending_inputs.get(exchange_id)
+    if pending is None:
+        return False
+    pending.pause_requested = True
+    return True
+
+
+def submit_pending_answer(exchange_id: str, text: str) -> bool:
+    """Resolve a paused exchange's wait with the user's answer -- for BOTH
+    entry points (an ask_user question, or a user-initiated pause), since by
+    the time an answer is being typed the exchange is in the exact same
+    awaiting-input state either way. Safe to call before `run_tool_loop`
+    actually reaches its `await`: `asyncio.Event.set()` is sticky, so the
+    eventual `wait()` returns immediately with this answer already in place.
+    Returns False when no such exchange is registered."""
+    pending = _pending_inputs.get(exchange_id)
+    if pending is None:
+        return False
+    pending.answer = text
+    pending.event.set()
+    return True
+
+
+def _parse_ask_user_arguments(arguments: Any) -> tuple[str, list[str] | None]:
+    """Same tolerant parsing as `execute_tool_call`'s arguments handling --
+    a small model's JSON is not always well-formed, and a malformed
+    `ask_user` call should degrade to a generic question, never raise."""
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments) if arguments.strip() else {}
+        except ValueError:
+            parsed = {}
+    elif isinstance(arguments, dict):
+        parsed = arguments
+    else:
+        parsed = {}
+    question = str(parsed.get("question") or "").strip() or "The model has a question for you."
+    choices_raw = parsed.get("choices")
+    choices = (
+        [str(c) for c in choices_raw] if isinstance(choices_raw, list) and choices_raw else None
+    )
+    return question, choices
+
+
+async def _await_pending_input(
+    exchange_id: str,
+    on_awaiting_input: Callable[[dict[str, Any]], None] | None,
+    *,
+    question: str | None = None,
+    choices: list[str] | None = None,
+) -> str:
+    """Suspend until `exchange_id`'s registry entry is resolved (or time out).
+
+    Fires `on_awaiting_input` once, with `{"question", "choices"}` when given
+    (a model-issued `ask_user` call) or `{}` (a user-initiated pause, no
+    question of its own -- the Playground renders a free-text "add context"
+    prompt instead of a picker). Raises `AskUserTimeoutError` -- never hangs
+    the request -- after `settings.mcp_ask_user_timeout_seconds` with no
+    answer. Returns `""` if the registry entry vanished concurrently (the
+    exchange was already torn down by its own `finally`), rather than waiting
+    on nothing forever.
+    """
+    pending = _pending_inputs.get(exchange_id)
+    if pending is None:
+        return ""
+    if on_awaiting_input is not None:
+        payload: dict[str, Any] = {}
+        if question is not None:
+            payload["question"] = question
+        if choices is not None:
+            payload["choices"] = choices
+        on_awaiting_input(payload)
+    timeout = get_settings().mcp_ask_user_timeout_seconds
+    try:
+        await asyncio.wait_for(pending.event.wait(), timeout=timeout)
+    except TimeoutError:
+        raise AskUserTimeoutError(
+            f"no answer arrived within {timeout:.0f}s -- the exchange was abandoned"
+        ) from None
+    answer = pending.answer or ""
+    # Re-arm for a possible LATER pause in the same exchange (a conversation
+    # can pause more than once) -- a fresh Event, since asyncio.Event has no
+    # `clear()`-and-still-usable-by-a-concurrent-waiter guarantee once set.
+    pending.event = asyncio.Event()
+    pending.answer = None
+    return answer
+
 # Stable prefix marking the one line of the system message _with_context_budget_line
 # owns -- lets it find-and-REPLACE its own line every round instead of
 # appending a new stale snapshot each time (which would make the model's
@@ -477,6 +684,8 @@ async def run_tool_loop(
     on_usage: Callable[[dict[str, Any]], None] | None = None,
     context_length_ceiling: int | None = None,
     on_context_budget: Callable[[dict[str, Any]], None] | None = None,
+    exchange_id: str | None = None,
+    on_awaiting_input: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -568,6 +777,41 @@ async def run_tool_loop(
     ``exceed_context_size_error`` from llama-server on some LATER round if
     the model doesn't act on its own budget awareness; this narrows that
     risk, it doesn't eliminate it.
+
+    ``exchange_id``, when given, opts this call into human-in-the-loop
+    pause/resume (#383) -- the caller must have already registered it with
+    ``open_pending_input`` (and must ``close_pending_input`` it once this
+    call returns or raises, typically from a ``finally``). Two things follow:
+
+    1. The synthetic ``ASK_USER_TOOL_SCHEMA`` is advertised to the model
+       alongside ``mcp_tools`` (never added to ``mcp_tools`` itself, so
+       ``TOOL_DISCIPLINE_DIRECTIVE``'s ``mcp_tools``-gated folding, and the
+       tests that assert its exact text, are unaffected). ``ASK_USER_DISCIPLINE_LINE``
+       is folded into the system message alongside it.
+    2. At the top of every round, a pending user-initiated pause
+       (``request_pause``) suspends the loop -- awaiting an answer via the
+       same registry entry a model-issued ``ask_user`` call would.
+
+    Neither path consumes one of ``max_iterations`` rounds or touches the
+    context-budget totals above -- only an actual ``post()`` call does
+    either, and both pause paths return control to the loop BEFORE the next
+    ``post()`` (or, for ``ask_user``, without an extra one at all -- the
+    round that produced the tool call already counted). The user's answer
+    folds in as a new ``role: "user"`` message (a pause) or as the
+    ``ask_user`` tool call's own ``role: "tool"`` result -- either way, it
+    only costs tokens on the NEXT real round, like any other message.
+
+    A pause that gets no answer within ``settings.mcp_ask_user_timeout_seconds``
+    raises ``AskUserTimeoutError`` -- propagated to the caller, never
+    swallowed, so the exchange fails loudly (an "error" SSE event on the
+    streaming surface) instead of hanging the request or leaking the
+    registry entry forever.
+
+    ``exchange_id=None`` (the default) disables all of the above: no
+    ``ask_user`` tool is advertised, and the per-round pause check is
+    skipped entirely -- today's behavior, byte-for-byte, for every existing
+    caller (the non-streaming ``mcp_servers`` chat path, the standalone
+    Agents surface). This mechanism ships Playground-only for now.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
@@ -577,9 +821,15 @@ async def run_tool_loop(
         eager_context = await _eager_list_context(sessions, mapping, on_tool_call)
         if eager_context:
             addendum = f"{addendum}\n\n{eager_context}"
+        if exchange_id is not None:
+            addendum = f"{addendum}\n\n{ASK_USER_DISCIPLINE_LINE}"
         messages = _with_system_addendum(messages, addendum)
         if on_system_addendum is not None:
             on_system_addendum(addendum)
+    elif exchange_id is not None:
+        messages = _with_system_addendum(messages, ASK_USER_DISCIPLINE_LINE)
+        if on_system_addendum is not None:
+            on_system_addendum(ASK_USER_DISCIPLINE_LINE)
     if context_length_ceiling is not None:
         messages = _with_context_budget_line(
             messages, _context_budget_line(0, context_length_ceiling)
@@ -590,10 +840,31 @@ async def run_tool_loop(
         for t in caller_tools
         if isinstance(t, dict) and isinstance(t.get("function"), dict)
     }
-    forward["tools"] = caller_tools + mcp_tools
+    forward["tools"] = (
+        caller_tools + mcp_tools + ([ASK_USER_TOOL_SCHEMA] if exchange_id is not None else [])
+    )
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     context_budget_warned = False
-    for _ in range(limit):
+    rounds_used = 0
+
+    def _is_known(name: str) -> bool:
+        return name in mapping or (exchange_id is not None and name == ASK_USER_TOOL_NAME)
+
+    while True:
+        if exchange_id is not None:
+            pending = _pending_inputs.get(exchange_id)
+            if pending is not None and pending.pause_requested:
+                # User-initiated pause: consume the flag and suspend right
+                # here, BEFORE the next post() -- this round slot, and this
+                # wait, cost nothing against max_iterations or the token
+                # budget above.
+                pending.pause_requested = False
+                answer = await _await_pending_input(exchange_id, on_awaiting_input)
+                messages.append({"role": "user", "content": answer})
+                continue
+        if rounds_used >= limit:
+            return None
+        rounds_used += 1
         forward["messages"] = messages
         completion = await post(forward)
         if not isinstance(completion, dict):
@@ -640,16 +911,17 @@ async def run_tool_loop(
             for call in (calls or [])
             if isinstance(call, dict)
         ]
-        all_mcp = bool(names) and all(name in mapping for name in names)
+        all_mcp = bool(names) and all(_is_known(name) for name in names)
         if not all_mcp:
             # Plain answer, or at least one caller-owned/unknown tool call:
             # this completion belongs to the caller. Unknown names ride the
             # same path deliberately — hallucinated tool names are the
             # caller's signal, not something to swallow server-side. But a
             # hallucinated name is only "caller-owned" fiction if the caller
-            # advertised tools at all; log the anomaly either way.
+            # advertised tools at all; log the anomaly either way. ask_user
+            # itself is never "unknown" when this exchange opted into it.
             for name in names:
-                if name and name not in mapping and name not in caller_tool_names:
+                if name and not _is_known(name) and name not in caller_tool_names:
                     logger.warning("model called unknown tool %r — returning to caller", name)
             if any(totals.values()):
                 completion = {**completion, "usage": dict(totals)}
@@ -662,6 +934,28 @@ async def run_tool_loop(
             function = call.get("function") or {}
             call_name = str(function.get("name"))
             call_arguments = function.get("arguments")
+            if call_name == ASK_USER_TOOL_NAME and exchange_id is not None:
+                question, ask_choices = _parse_ask_user_arguments(call_arguments)
+                call_started = time.monotonic()
+                answer = await _await_pending_input(
+                    exchange_id, on_awaiting_input, question=question, choices=ask_choices
+                )
+                if on_tool_call is not None:
+                    on_tool_call(
+                        ASK_USER_TOOL_NAME,
+                        True,
+                        int((time.monotonic() - call_started) * 1000),
+                        call_arguments,
+                        answer,
+                    )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "content": answer,
+                    }
+                )
+                continue
             call_started = time.monotonic()
             result_text = await execute_tool_call(sessions, mapping, call_name, call_arguments)
             if on_tool_call is not None:
@@ -679,4 +973,3 @@ async def run_tool_loop(
                     "content": result_text,
                 }
             )
-    return None

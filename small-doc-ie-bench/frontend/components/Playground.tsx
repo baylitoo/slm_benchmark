@@ -7,6 +7,7 @@ import {
   Fingerprint,
   ListOrdered,
   MessageSquare,
+  Pause,
   Play,
   Send,
   Sparkles,
@@ -26,6 +27,8 @@ import {
   triggerExtract,
   chatCompletionMcpStream,
   chatCompletionStream,
+  pauseChatExchange,
+  respondToChatExchange,
   listMcpServers,
   type McpRegisteredServer,
   embed,
@@ -60,6 +63,7 @@ import {
   type AgentUsageTrace,
   type AgentContextBudgetTrace,
   type AgentToolCallsUnsupportedTrace,
+  type AgentAwaitingInputTrace,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -324,6 +328,18 @@ export function ChatPanel({
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Human-in-the-loop pause/resume (#383) -- Playground-only, only reachable
+  // through the mcp_servers SSE surface (selectedMcp.length > 0). The
+  // exchange id arrives via chatCompletionMcpStream's onExchangeId callback
+  // shortly after the request starts; the Pause button stays disabled until
+  // it does. awaitingInput non-null means the exchange is genuinely paused
+  // (a model-issued ask_user question, or a confirmed user-initiated pause)
+  // and the answer modal should be showing.
+  const [activeExchangeId, setActiveExchangeId] = useState<string | undefined>(undefined);
+  const [pausing, setPausing] = useState(false);
+  const [awaitingInput, setAwaitingInput] = useState<AgentAwaitingInputTrace | null>(null);
+  const [answerText, setAnswerText] = useState("");
+  const [respondBusy, setRespondBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Index of a user message currently being edited (its content is loaded
@@ -674,6 +690,47 @@ export function ChatPanel({
     setInput("");
   }
 
+  // User-initiated pause (#383): only requests the pause -- the exchange's
+  // own onAwaitingInput callback (wired in attempt()) opens the answer modal
+  // once the loop actually reaches a round boundary and confirms it.
+  async function handlePause() {
+    if (!activeExchangeId || pausing) return;
+    setPausing(true);
+    try {
+      await pauseChatExchange(activeExchangeId);
+    } catch (e) {
+      const msg =
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Could not pause.";
+      setError(msg);
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  // Answers the currently-open awaitingInput prompt -- a model-issued
+  // ask_user question (free text or a picked choice) or a user-initiated
+  // pause's free-text context. Closes the modal optimistically; a failure
+  // (the exchange already timed out) surfaces as the usual error banner.
+  async function submitAnswer(text: string) {
+    if (!activeExchangeId) return;
+    setRespondBusy(true);
+    try {
+      await respondToChatExchange(activeExchangeId, text);
+      setAwaitingInput(null);
+      setAnswerText("");
+    } catch (e) {
+      const msg =
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Could not send your answer.";
+      setError(msg);
+    } finally {
+      setRespondBusy(false);
+    }
+  }
+
   async function attempt(
     next: ChatMsg[],
     payload: { role: string; content: unknown }[],
@@ -736,18 +793,40 @@ export function ChatPanel({
           liveToolCallsUnsupported = warning;
           patchLiveMsg();
         };
-        const res = await chatCompletionMcpStream(
-          model,
-          payload,
-          selectedMcp,
-          onToolCall,
-          docsSearchSessionIdRef.current,
-          onReasoning,
-          onSystemAddendum,
-          onUsage,
-          onContextBudget,
-          onToolCallsUnsupported,
-        );
+        // Human-in-the-loop (#383): the exchange id arrives first (before
+        // any round runs) and is what the Pause button signals; awaitingInput
+        // opens the answer modal every time the exchange actually pauses,
+        // for BOTH entry points (a model-issued ask_user question, or a
+        // confirmed user-initiated pause).
+        const onExchangeId = (id: string) => {
+          setActiveExchangeId(id);
+        };
+        const onAwaitingInput = (payload: AgentAwaitingInputTrace) => {
+          setAwaitingInput(payload);
+        };
+        let res: Awaited<ReturnType<typeof chatCompletionMcpStream>>;
+        try {
+          res = await chatCompletionMcpStream(
+            model,
+            payload,
+            selectedMcp,
+            onToolCall,
+            docsSearchSessionIdRef.current,
+            onReasoning,
+            onSystemAddendum,
+            onUsage,
+            onContextBudget,
+            onToolCallsUnsupported,
+            onExchangeId,
+            onAwaitingInput,
+          );
+        } finally {
+          // The exchange (and any still-open answer prompt) never outlives
+          // its own request -- cleared whether it finished, errored, or the
+          // model never actually paused at all.
+          setActiveExchangeId(undefined);
+          setAwaitingInput(null);
+        }
         const answer = res.choices?.[0]?.message?.content ?? "";
         const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
         // The live trace is only trustworthy when every reported tool call
@@ -1307,6 +1386,57 @@ export function ChatPanel({
           </div>
         </Dialog>
 
+        {/* Human-in-the-loop pause/resume (#383): a multiple-choice picker
+            when the model's ask_user call gave choices, a free-text box
+            otherwise (same shape for a model-issued question and a plain
+            user-initiated pause -- the latter never carries a question). */}
+        <Dialog
+          open={awaitingInput !== null}
+          onClose={() => setAwaitingInput(null)}
+          title={awaitingInput?.question ?? t("Add context")}
+          subtitle={
+            awaitingInput?.choices && awaitingInput.choices.length > 0
+              ? t("Pick one to resume the exchange.")
+              : t("The exchange is paused -- your answer resumes it.")
+          }
+        >
+          {awaitingInput?.choices && awaitingInput.choices.length > 0 ? (
+            <div className="flex flex-col gap-2">
+              {awaitingInput.choices.map((choice) => (
+                <Button
+                  key={choice}
+                  type="button"
+                  variant="secondary"
+                  disabled={respondBusy}
+                  onClick={() => void submitAnswer(choice)}
+                  className="justify-start"
+                >
+                  {choice}
+                </Button>
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <TextArea
+                rows={3}
+                value={answerText}
+                onChange={(e) => setAnswerText(e.target.value)}
+                placeholder={t("Type your answer…")}
+                autoFocus
+              />
+              <Button
+                type="button"
+                loading={respondBusy}
+                disabled={!answerText.trim()}
+                onClick={() => void submitAnswer(answerText)}
+              >
+                <Send className="h-4 w-4" />
+                <T>Send</T>
+              </Button>
+            </div>
+          )}
+        </Dialog>
+
         {error && <Alert tone="err">{error}</Alert>}
 
         {editingIndex !== null && (
@@ -1366,6 +1496,23 @@ export function ChatPanel({
             {extractionOn ? <Play className="h-4 w-4" /> : <Send className="h-4 w-4" />}
             {extractionOn ? "Run extraction" : "Send"}
           </Button>
+          {/* Human-in-the-loop (#383): only while a tool-calling exchange is
+              actually streaming (the plain token-stream path with no MCP
+              servers selected has no round boundary to pause at) -- appears
+              and disappears with busy, not merely enabled/disabled. */}
+          {busy && selectedMcp.length > 0 && (
+            <Button
+              type="button"
+              variant="secondary"
+              loading={pausing}
+              disabled={!activeExchangeId}
+              onClick={() => void handlePause()}
+              title={t("Pause and add context before the next round resumes")}
+            >
+              <Pause className="h-4 w-4" />
+              <T>Pause</T>
+            </Button>
+          )}
           <Button
             type="button"
             variant="secondary"
@@ -1377,6 +1524,9 @@ export function ChatPanel({
               lastRequestRef.current = null;
               setEditingIndex(null);
               setInput("");
+              setActiveExchangeId(undefined);
+              setAwaitingInput(null);
+              setAnswerText("");
             }}
             title="Clear the conversation"
           >

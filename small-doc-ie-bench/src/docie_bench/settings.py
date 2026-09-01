@@ -121,6 +121,16 @@ class Settings(BaseSettings):
     # warning. Fires once per exchange, the first round cumulative usage
     # crosses this fraction; never truncates or summarizes.
     mcp_context_budget_warn_fraction: float = Field(default=0.8, gt=0.0, le=1.0)
+    # Human-in-the-loop pause/resume (#383): how long run_tool_loop waits for
+    # an answer -- to the synthetic ask_user tool, or a user-initiated pause --
+    # before giving up. A paused exchange with a closed tab or an abandoned
+    # session must not hold its in-memory registry entry (or the request)
+    # open forever; on timeout the exchange fails cleanly with an "error" SSE
+    # event instead of hanging. Same plain mcp_* naming as the other MCP
+    # knobs above (mcp_tool_timeout_seconds, mcp_max_tool_iterations) --
+    # neither carries a DOCIE_-prefixed alias, that convention is reserved
+    # for the serving_* knobs below.
+    mcp_ask_user_timeout_seconds: float = Field(default=300.0, gt=0.0, le=3600.0)
 
     # Session-scoped document uploads (#296): a Playground attachment is written
     # here under a server-issued session id, isolated per conversation -- docs-search

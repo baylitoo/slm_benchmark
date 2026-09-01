@@ -86,6 +86,14 @@ class ChatCompletionRequest(BaseModel):
     stream: bool | None = None
     mcp_servers: list[_NonEmptyStr] | None = None
     session_id: str | None = None
+    # Human-in-the-loop pause/resume (#383): opt-in, per request -- a
+    # programmatic caller of this same endpoint has no human to pause for,
+    # so the synthetic ask_user tool and the Pause control's respond channel
+    # are never silently injected. Only meaningful together with
+    # ``mcp_servers`` + ``stream: true`` (``_stream_chat_with_mcp_tools``);
+    # ignored everywhere else, including the non-streaming ``mcp_servers``
+    # path and the standalone Agents surface, which never read it at all.
+    enable_ask_user: bool = False
 
 
 def _validation_error_to_openai(exc: RequestValidationError) -> JSONResponse:
@@ -334,6 +342,7 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
                 session_id,
                 tenant_id=tenant.tenant_id,
                 started=started,
+                enable_ask_user=payload.enable_ask_user,
             )
         outcome = await _chat_with_mcp_tools(
             client, url, headers, forward, profile, names, session_id
@@ -403,6 +412,7 @@ async def _post_upstream(
     body.pop("stream", None)
     body.pop("mcp_servers", None)
     body.pop("session_id", None)
+    body.pop("enable_ask_user", None)
     try:
         upstream = await client.post(
             url, json=body, headers=headers, timeout=profile.timeout_seconds
@@ -624,6 +634,7 @@ async def _stream_chat_with_mcp_tools(
     *,
     tenant_id: str,
     started: float,
+    enable_ask_user: bool = False,
 ) -> StreamingResponse:
     """SSE variant of ``_chat_with_mcp_tools``: each executed tool call is
     relayed to the client the moment it finishes, instead of the whole
@@ -635,6 +646,31 @@ async def _stream_chat_with_mcp_tools(
     stream for a tool-calling round) — a caller opts in by setting BOTH
     ``stream`` and ``mcp_servers``. Event shapes, one JSON object per
     ``data:`` frame:
+      ``{"type": "exchange", "exchange_id": <str>}`` — fired FIRST, before
+        any other event, ONLY when the request set ``enable_ask_user``
+        (#383). ``exchange_id`` is a fresh id minted for this one request —
+        NOT the caller's own ``session_id`` (which spans a whole
+        conversation) — and is the id a client uses with the sibling
+        ``POST /v1/chat/completions/pause`` and
+        ``.../respond`` endpoints below to pause this exchange, or answer an
+        ``awaiting_input`` event, while it's still running. Never fires when
+        ``enable_ask_user`` is unset — the registry/pause machinery is
+        opt-in per request, since a programmatic (non-Playground) caller of
+        this same endpoint has no human to pause for.
+      ``{"type": "awaiting_input", "question"?, "choices"?}`` — fired every
+        time ``run_tool_loop`` pauses waiting for a human answer (#383): a
+        model-issued ``ask_user`` tool call carries ``question`` (and
+        ``choices`` when the model gave any — render a picker; free text
+        otherwise), a user-initiated pause (``POST .../pause``) carries
+        neither — render a plain "add context" free-text box. The exchange
+        is genuinely suspended at this point (no further rounds, no further
+        tool calls) until ``POST /v1/chat/completions/respond`` answers it,
+        or ``settings.mcp_ask_user_timeout_seconds`` elapses and the
+        exchange ends with an ``error`` event instead. Can fire more than
+        once per exchange (a conversation may pause more than once) and can
+        interleave with ``tool_call``/``reasoning`` events from rounds
+        before and after it. Only ever fires when ``enable_ask_user`` was
+        set on the request.
       ``{"type": "system_addendum", "text": <addendum>}`` — fired once per
         request, before the first model round, when ``run_tool_loop`` folds
         ``TOOL_DISCIPLINE_DIRECTIVE`` (and any eager-list context) into the
@@ -692,18 +728,23 @@ async def _stream_chat_with_mcp_tools(
         when the verdict is ``True`` or unresolvable (``None``) — fail-open,
         same convention as ``context_budget``.
       ``{"type": "content", "completion": <final OpenAI-shaped completion>}``
-      ``{"type": "error", "error": {"message", "type", "code"}}``
+      ``{"type": "error", "error": {"message", "type", "code"}}`` — ``type``/
+        ``code`` is ``"ask_user_timeout"`` specifically when a pause got no
+        answer in time (#383); every other error keeps its existing
+        ``error_type`` (``mcp_server_unreachable``, ``mcp_tool_loop_exhausted``, …).
     Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
     convention ``_stream_chat_completions`` uses.
     """
     import asyncio
     import contextlib
+    import uuid
     from contextlib import AsyncExitStack
 
     from docie_bench import mcp_tools as mcp_mod
 
     context_length_ceiling = _context_length_for_profile(profile)
     tool_calls_supported = _tool_calls_supported_for_profile(profile)
+    exchange_id = uuid.uuid4().hex if enable_ask_user else None
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     class _QueueTraceSink(list[dict[str, Any]]):
@@ -719,6 +760,12 @@ async def _stream_chat_with_mcp_tools(
     async def drive() -> None:
         outcome: Any = None
         try:
+            if exchange_id is not None:
+                # Fired FIRST, before anything else -- a client needs this id
+                # to call POST .../pause at any later point in the exchange,
+                # including before the first round has even run.
+                mcp_mod.open_pending_input(exchange_id)
+                queue.put_nowait({"type": "exchange", "exchange_id": exchange_id})
             if tool_calls_supported is False:
                 queue.put_nowait(
                     {
@@ -774,7 +821,24 @@ async def _stream_chat_with_mcp_tools(
                         on_context_budget=lambda budget: queue.put_nowait(
                             {"type": "context_budget", **budget}
                         ),
+                        exchange_id=exchange_id,
+                        on_awaiting_input=(
+                            lambda payload: queue.put_nowait(
+                                {"type": "awaiting_input", **payload}
+                            )
+                        )
+                        if exchange_id is not None
+                        else None,
                     )
+            except mcp_mod.AskUserTimeoutError as exc:
+                # A paused exchange (ask_user, or a user-initiated pause) got
+                # no answer in time -- fail cleanly, never hang the request.
+                message = str(exc)
+                outcome = _openai_error(message, status_code=504, error_type="ask_user_timeout")
+                queue.put_nowait(
+                    {"type": "error", "error": _error_payload(message, "ask_user_timeout")}
+                )
+                return
             except Exception as exc:  # noqa: BLE001 - transport teardown failure
                 message = f"MCP session error: {exc}"
                 outcome = _openai_error(
@@ -824,6 +888,12 @@ async def _stream_chat_with_mcp_tools(
             )
             queue.put_nowait({"type": "error", "error": _error_payload(str(exc), "internal_error")})
         finally:
+            # Always reaped, on every exit path (answered, timed out, a
+            # different error, or the client disconnecting mid-CancelledError
+            # unwind) -- an abandoned exchange must never leak its registry
+            # entry, regardless of how it ended.
+            if exchange_id is not None:
+                mcp_mod.close_pending_input(exchange_id)
             _record_usage_outcome(profile.name, "chat", tenant_id, started, outcome)
             queue.put_nowait(None)
 
@@ -847,6 +917,73 @@ async def _stream_chat_with_mcp_tools(
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(body_iterator(), media_type="text/event-stream")
+
+
+class _ExchangePauseRequest(BaseModel):
+    """Body of ``POST /v1/chat/completions/pause`` (#383)."""
+
+    exchange_id: _NonEmptyStr
+
+
+class _ExchangeRespondRequest(BaseModel):
+    """Body of ``POST /v1/chat/completions/respond`` (#383)."""
+
+    exchange_id: _NonEmptyStr
+    text: str = ""
+
+
+def _unknown_exchange_error(exchange_id: str) -> JSONResponse:
+    return _openai_error(
+        f"no exchange {exchange_id!r} is awaiting input — it may have already "
+        "finished, timed out, or human-in-the-loop was never enabled for it",
+        status_code=404,
+        error_type="unknown_exchange",
+    )
+
+
+@router.post("/v1/chat/completions/pause")
+async def pause_chat_exchange(payload: _ExchangePauseRequest) -> Any:
+    """User-initiated pause (#383): flags the exchange named by
+    ``exchange_id`` (from that exchange's own ``exchange`` SSE event) to
+    suspend at its NEXT round boundary — usable at any point while the
+    exchange is running, including mid tool-search, since ``run_tool_loop``
+    checks for this at the top of every round. This endpoint only requests
+    the pause; the exchange's own SSE stream emits ``awaiting_input`` once
+    it actually takes effect, and that is what the Playground waits on
+    before showing its free-text prompt as active.
+
+    404s (``unknown_exchange``) when ``exchange_id`` names no exchange that
+    ever enabled human-in-the-loop, or one that already finished/timed out —
+    the in-memory registry entry is gone either way.
+    """
+    from docie_bench import mcp_tools as mcp_mod
+
+    if not mcp_mod.request_pause(payload.exchange_id):
+        return _unknown_exchange_error(payload.exchange_id)
+    return {"paused": True, "exchange_id": payload.exchange_id}
+
+
+@router.post("/v1/chat/completions/respond")
+async def respond_to_chat_exchange(payload: _ExchangeRespondRequest) -> Any:
+    """Answers a paused exchange's ``awaiting_input`` event (#383) — a
+    model-issued ``ask_user`` question, or a user-initiated pause (``POST
+    .../pause``) — with ``text``. Both resolve through this SAME endpoint:
+    by the time an answer is being typed, the exchange is in the identical
+    awaiting-input state either way.
+
+    Safe to call even before the exchange has actually reached its pause
+    checkpoint (e.g. right after ``POST .../pause``, before the current
+    round finishes) — the answer is recorded immediately and consumed the
+    moment ``run_tool_loop`` gets there, never dropped by the race.
+
+    404s (``unknown_exchange``) under the same conditions as ``.../pause``
+    above.
+    """
+    from docie_bench import mcp_tools as mcp_mod
+
+    if not mcp_mod.submit_pending_answer(payload.exchange_id, payload.text):
+        return _unknown_exchange_error(payload.exchange_id)
+    return {"accepted": True, "exchange_id": payload.exchange_id}
 
 
 @router.get("/v1/mcp/servers")
