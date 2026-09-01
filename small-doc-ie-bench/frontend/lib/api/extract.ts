@@ -75,22 +75,33 @@ export async function getRuns(eventId: string): Promise<InngestRun[]> {
 }
 
 /** Rasterize an uploaded PDF (or image) to PNG page-image data URLs a vision
- * model can read (POST /v1/studio/render-document). One data URL per page. */
+ * model can read (POST /v1/studio/render-document). One data URL per page.
+ * `pages`, when given, is an explicit list of 1-indexed page numbers to
+ * rasterize (e.g. `[1]` for a thumbnail preview) -- ONLY those pages render,
+ * cheaply, regardless of the document's total length, and the server's
+ * `max_pages` reject check does not apply. Omit it (the vision-send call
+ * site) to keep the existing contract: rasterize everything, reject if the
+ * document has more pages than the model will actually see. `total_pages` in
+ * the response is the document's TRUE page count, which can exceed
+ * `images.length` when a subset was requested. */
 export function renderDocument(
   contentB64: string,
   filename: string,
   dpi?: number,
-  maxPages?: number,
-): Promise<{ images: string[]; pages: number }> {
-  return request<{ images: string[]; pages: number }>("/v1/studio/render-document", {
-    method: "POST",
-    body: JSON.stringify({
-      content_b64: contentB64,
-      filename,
-      ...(dpi ? { dpi } : {}),
-      ...(maxPages ? { max_pages: maxPages } : {}),
-    }),
-  });
+  pages?: number[],
+): Promise<{ images: string[]; pages: number; total_pages: number }> {
+  return request<{ images: string[]; pages: number; total_pages: number }>(
+    "/v1/studio/render-document",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        content_b64: contentB64,
+        filename,
+        ...(dpi ? { dpi } : {}),
+        ...(pages ? { pages } : {}),
+      }),
+    },
+  );
 }
 
 /**

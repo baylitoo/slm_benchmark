@@ -31,6 +31,7 @@ def _render(b64: str, filename: str) -> dict:
 def test_png_returns_one_image_data_url() -> None:
     result = _render(_png_b64(), "photo.png")
     assert result["pages"] == 1
+    assert result["total_pages"] == 1
     assert len(result["images"]) == 1
     # Normalized to a PNG data URL a vision model accepts.
     assert result["images"][0].startswith("data:image/png;base64,")
@@ -49,31 +50,41 @@ def test_unsupported_suffix_is_400() -> None:
     assert exc.value.status_code == 400
 
 
-def _minimal_pdf_b64() -> str:
-    """A 1-page vector-text PDF (Helvetica) with correct xref offsets — its text
-    rasterizes sharper at higher DPI, so page-image size scales with DPI."""
-    stream = b"BT /F1 11 Tf 50 780 Td (Resume: Senior Engineer) Tj ET"
-    objs = [
-        b"<</Type/Catalog/Pages 2 0 R>>",
-        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
-        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R"
-        b"/Resources<</Font<</F1 5 0 R>>>>>>",
-        f"<</Length {len(stream)}>>stream\n".encode() + stream + b"\nendstream",
-        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
-    ]
+def _minimal_pdf_b64(*, page_count: int = 1) -> str:
+    """A vector-text PDF (Helvetica) with correct xref offsets, ``page_count``
+    pages — its text rasterizes sharper at higher DPI, so page-image size
+    scales with DPI."""
+    page_ids = list(range(3, 3 + page_count))
+    content_ids = list(range(page_ids[-1] + 1, page_ids[-1] + 1 + page_count))
+    font_id = content_ids[-1] + 1
+
+    objs: dict[int, bytes] = {
+        1: b"<</Type/Catalog/Pages 2 0 R>>",
+        2: f"<</Type/Pages/Kids[{' '.join(f'{pid} 0 R' for pid in page_ids)}]"
+        f"/Count {page_count}>>".encode(),
+        font_id: b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    }
+    for i, (page_id, content_id) in enumerate(zip(page_ids, content_ids, strict=True), 1):
+        stream = f"BT /F1 11 Tf 50 780 Td (Page {i}) Tj ET".encode()
+        objs[page_id] = (
+            f"<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents {content_id} 0 R"
+            f"/Resources<</Font<</F1 {font_id} 0 R>>>>>>".encode()
+        )
+        objs[content_id] = f"<</Length {len(stream)}>>stream\n".encode() + stream + b"\nendstream"
+
+    max_id = max(objs)
     out = io.BytesIO()
     out.write(b"%PDF-1.4\n")
-    offsets = []
-    for i, obj in enumerate(objs, 1):
-        offsets.append(out.tell())
-        out.write(f"{i} 0 obj\n".encode() + obj + b"\nendobj\n")
+    offsets: dict[int, int] = {}
+    for i in range(1, max_id + 1):
+        offsets[i] = out.tell()
+        out.write(f"{i} 0 obj\n".encode() + objs[i] + b"\nendobj\n")
     xref = out.tell()
-    out.write(f"xref\n0 {len(objs) + 1}\n".encode() + b"0000000000 65535 f \n")
-    for off in offsets:
-        out.write(f"{off:010d} 00000 n \n".encode())
+    out.write(f"xref\n0 {max_id + 1}\n".encode() + b"0000000000 65535 f \n")
+    for i in range(1, max_id + 1):
+        out.write(f"{offsets[i]:010d} 00000 n \n".encode())
     out.write(
-        f"trailer\n<</Size {len(objs) + 1}/Root 1 0 R>>\nstartxref\n{xref}\n".encode()
-        + b"%%EOF"
+        f"trailer\n<</Size {max_id + 1}/Root 1 0 R>>\nstartxref\n{xref}\n".encode() + b"%%EOF"
     )
     return base64.b64encode(out.getvalue()).decode("ascii")
 
@@ -103,3 +114,53 @@ def _render_dpi(b64: str, dpi: int) -> dict:
             tenant=None,  # type: ignore[arg-type]
         )
     )
+
+
+def test_multipage_pdf_thumbnail_with_explicit_page_succeeds() -> None:
+    # This is the reported bug: a page-1-only thumbnail preview (max_pages=1)
+    # against a multi-page PDF used to ALWAYS 400 -- load_document_images
+    # rasterized every page, then rejected because 5 > 1. Passing pages=[1]
+    # explicitly must render just that page, no reject, regardless of the
+    # document's true length.
+    pdf = _minimal_pdf_b64(page_count=5)
+    result = asyncio.run(
+        render_document(
+            RenderDocumentRequest(
+                content_b64=pdf, filename="doc.pdf", max_pages=1, pages=[1]
+            ),
+            tenant=None,  # type: ignore[arg-type]
+        )
+    )
+    assert result["pages"] == 1
+    assert len(result["images"]) == 1
+    # The response reports the PDF's TRUE page count even though only page 1
+    # was rendered -- len(images) alone would misleadingly say "1 page total".
+    assert result["total_pages"] == 5
+
+
+def test_multipage_pdf_without_explicit_pages_still_rejects_over_max_pages() -> None:
+    # Regression guard: the vision-send path's intentional policy (reject a
+    # document with more pages than the model will see, rather than silently
+    # truncating it) must still apply when `pages` is NOT given.
+    pdf = _minimal_pdf_b64(page_count=5)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            render_document(
+                RenderDocumentRequest(content_b64=pdf, filename="doc.pdf", max_pages=2),
+                tenant=None,  # type: ignore[arg-type]
+            )
+        )
+    assert exc.value.status_code == 400
+    assert "vision_max_pages is 2" in exc.value.detail
+
+
+def test_total_pages_reflects_true_count_when_all_pages_rendered() -> None:
+    pdf = _minimal_pdf_b64(page_count=3)
+    result = asyncio.run(
+        render_document(
+            RenderDocumentRequest(content_b64=pdf, filename="doc.pdf", max_pages=8),
+            tenant=None,  # type: ignore[arg-type]
+        )
+    )
+    assert result["pages"] == 3
+    assert result["total_pages"] == 3

@@ -100,6 +100,13 @@ class RenderDocumentRequest(BaseModel):
     # document text noticeably for small vision models, at a larger payload;
     # clamped below to keep a page from exploding into millions of pixels.
     dpi: int = 200
+    # Explicit 1-indexed page numbers to rasterize (e.g. a page-1 thumbnail
+    # preview, or a click-to-enlarge fetch of a specific range). When set,
+    # ONLY those pages are rendered and `max_pages` is not enforced -- the
+    # caller told us exactly what it wants. `None` (default) keeps the
+    # existing vision-send contract: rasterize everything, reject if it's
+    # more than `max_pages`.
+    pages: list[int] | None = None
 
 
 @router.post("/render-document")
@@ -129,26 +136,43 @@ async def render_document(
         raise HTTPException(status_code=400, detail=f"invalid base64 content: {exc}") from exc
     max_pages = max(1, min(int(payload.max_pages), 20))
     dpi = max(72, min(int(payload.dpi), 400))
+    pages = [int(p) for p in payload.pages] if payload.pages else None
     suffix = Path(payload.filename).suffix or ".pdf"
+    is_pdf = suffix.lower() == ".pdf"
 
-    def _render() -> list[str]:
+    def _render() -> tuple[list[str], int]:
         with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
             handle.write(raw)
             tmp = Path(handle.name)
         try:
-            return [
+            images = [
                 img.data_url()
-                for img in load_document_images(tmp, max_pages=max_pages, pdf_dpi=dpi)
+                for img in load_document_images(
+                    tmp, max_pages=max_pages, pdf_dpi=dpi, pages=pages
+                )
             ]
+            # The true page count, computed cheaply (no rasterization) via
+            # pdf_inspector -- `len(images)` is wrong/misleading once a caller
+            # can request a subset of pages. A non-PDF upload is just the one
+            # image.
+            total_pages = len(images)
+            if is_pdf:
+                try:
+                    import pdf_inspector
+
+                    total_pages = pdf_inspector.classify_pdf(str(tmp)).page_count
+                except Exception:  # noqa: BLE001, S110 - best-effort; fall back to len(images)
+                    pass
+            return images, total_pages
         finally:
             tmp.unlink(missing_ok=True)
 
     try:
-        images = await asyncio.to_thread(_render)
+        images, total_pages = await asyncio.to_thread(_render)
     except ValueError as exc:
         # Unsupported type / too many pages / empty PDF — a client error.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"images": images, "pages": len(images)}
+    return {"images": images, "pages": len(images), "total_pages": total_pages}
 
 
 class UploadSessionDocumentRequest(BaseModel):

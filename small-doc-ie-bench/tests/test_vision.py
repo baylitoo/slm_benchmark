@@ -85,6 +85,34 @@ def test_load_document_images_rejects_pdf_exceeding_max_pages(
         load_document_images(Path("scan.pdf"), max_pages=2)
 
 
+def test_load_document_images_explicit_pages_bypasses_max_pages_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A PDF with far more pages than max_pages must still succeed when the
+    # caller explicitly asks for a subset (e.g. a page-1 thumbnail preview) --
+    # the reject-on-too-many-pages policy only applies when the caller wants
+    # everything (pages=None).
+    captured: dict[str, object] = {}
+
+    class FakeParser:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def screenshot(self, path, *, page_numbers):
+            captured["page_numbers"] = page_numbers
+            # liteparse only rasterizes the requested page(s).
+            return [SimpleNamespace(page_num=1, width=8, height=6, image_bytes=b"png-page-1")]
+
+    monkeypatch.setattr("docie_bench.vision.LiteParse", FakeParser)
+
+    images = load_document_images(Path("scan.pdf"), max_pages=1, pages=[1])
+
+    assert captured["page_numbers"] == [1]
+    assert len(images) == 1
+    assert images[0].page == 1
+    assert images[0].data == b"png-page-1"
+
+
 @pytest.mark.asyncio
 async def test_openai_client_sends_multimodal_user_content() -> None:
     captured = {}

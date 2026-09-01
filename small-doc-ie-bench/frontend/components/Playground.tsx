@@ -70,6 +70,7 @@ import {
   Alert,
   Button,
   Card,
+  Dialog,
   Field,
   Segmented,
   Select,
@@ -343,6 +344,18 @@ export function ChatPanel({
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  // The PDF's true total page count (from the render-document response),
+  // even though the thumbnail only ever rasterizes page 1. Drives the
+  // enlarge modal's decision to fetch more pages. null for a non-PDF image
+  // attachment (or before a PDF preview has resolved).
+  const [previewTotalPages, setPreviewTotalPages] = useState<number | null>(null);
+  const [enlargeOpen, setEnlargeOpen] = useState(false);
+  const [enlargePages, setEnlargePages] = useState<string[]>([]);
+  const [enlargeLoading, setEnlargeLoading] = useState(false);
+  // Fetching every page of an arbitrarily long PDF for the enlarge modal
+  // would be slow and wasteful -- cap it at the same default the vision-send
+  // path already uses for "how many pages will the model actually see".
+  const ENLARGE_MAX_PAGES = 8;
   // PDF rasterization DPI — higher = sharper text (better for dense documents
   // / small vision models), larger payload. Only used for a PDF attachment in
   // CHAT mode (extraction rasterizes server-side via its own OCR backend).
@@ -351,7 +364,10 @@ export function ChatPanel({
   function clearAttachment() {
     if (preview?.startsWith("blob:")) URL.revokeObjectURL(preview);
     setPreview(null);
+    setPreviewTotalPages(null);
     setFile(null);
+    setEnlargeOpen(false);
+    setEnlargePages([]);
   }
 
   async function onAttach(f: File | null) {
@@ -360,20 +376,49 @@ export function ChatPanel({
     if (!f) return;
     if (f.type.startsWith("image/")) {
       setPreview(URL.createObjectURL(f));
+      setPreviewTotalPages(1);
       return;
     }
-    // PDF: rasterize page 1 (low DPI, single page) for a real visual preview
-    // — an <img> can't show a PDF directly. Best-effort: on failure the run
-    // still renders the pages when sent.
+    // PDF: rasterize page 1 only (low DPI, explicit page list) for a real
+    // visual preview — an <img> can't show a PDF directly. Explicit `pages`
+    // means this never rejects on page count, and never rasterizes more than
+    // the one page it needs. Best-effort: on failure the run still renders
+    // the pages when sent.
     setPreviewLoading(true);
     try {
       const b64 = await fileToBase64(f);
-      const { images } = await renderDocument(b64, f.name, 150, 1);
+      const { images, total_pages } = await renderDocument(b64, f.name, 150, [1]);
       setPreview(images[0] ?? null);
+      setPreviewTotalPages(total_pages);
     } catch {
       setPreview(null);
+      setPreviewTotalPages(null);
     } finally {
       setPreviewLoading(false);
+    }
+  }
+
+  async function onEnlargePreview() {
+    if (!preview) return;
+    setEnlargeOpen(true);
+    if (!file || !previewTotalPages || previewTotalPages <= 1) {
+      // Single-page (or unknown) doc — the thumbnail already has the whole
+      // document; no redundant fetch.
+      setEnlargePages(preview ? [preview] : []);
+      return;
+    }
+    setEnlargeLoading(true);
+    try {
+      const b64 = await fileToBase64(file);
+      const wanted = Math.min(previewTotalPages, ENLARGE_MAX_PAGES);
+      const pageNumbers = Array.from({ length: wanted }, (_, i) => i + 1);
+      const { images } = await renderDocument(b64, file.name, 200, pageNumbers);
+      setEnlargePages(images);
+    } catch {
+      // Best-effort — fall back to the single thumbnail already on screen.
+      setEnlargePages([preview]);
+    } finally {
+      setEnlargeLoading(false);
     }
   }
 
@@ -1163,11 +1208,18 @@ export function ChatPanel({
         {file && (
           <div className="flex items-start gap-3 rounded-md border border-border bg-muted/20 p-2">
             {preview ? (
-              <img
-                src={preview}
-                alt="attachment preview"
-                className="h-20 w-20 shrink-0 rounded-md border border-border object-cover"
-              />
+              <button
+                type="button"
+                onClick={onEnlargePreview}
+                aria-label={t("Enlarge attachment preview")}
+                className="h-20 w-20 shrink-0 cursor-pointer rounded-md border border-border transition hover:opacity-80"
+              >
+                <img
+                  src={preview}
+                  alt="attachment preview"
+                  className="h-full w-full rounded-md object-cover"
+                />
+              </button>
             ) : (
               // Thumbnail rendering is best-effort (see onAttach's catch) --
               // a failed/slow rasterization must never hide the DPI selector
@@ -1225,6 +1277,35 @@ export function ChatPanel({
             </div>
           </div>
         )}
+
+        <Dialog
+          open={enlargeOpen}
+          onClose={() => setEnlargeOpen(false)}
+          title={file?.name ?? "Attachment"}
+          subtitle={
+            previewTotalPages && previewTotalPages > 1
+              ? `${Math.min(previewTotalPages, ENLARGE_MAX_PAGES)} of ${previewTotalPages} pages shown`
+              : undefined
+          }
+          className="max-w-3xl"
+        >
+          <div className="max-h-[75vh] space-y-3 overflow-y-auto">
+            {enlargeLoading ? (
+              <p className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
+                <Spinner /> <T>Rendering pages…</T>
+              </p>
+            ) : (
+              enlargePages.map((src, i) => (
+                <img
+                  key={i}
+                  src={src}
+                  alt={`page ${i + 1}`}
+                  className="w-full rounded-md border border-border"
+                />
+              ))
+            )}
+          </div>
+        </Dialog>
 
         {error && <Alert tone="err">{error}</Alert>}
 

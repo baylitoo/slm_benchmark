@@ -21,7 +21,11 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listRoutingPolicies: vi.fn(),
     triggerExtract: vi.fn(),
     fileToBase64: vi.fn(async () => "ZmFrZQ=="),
-    renderDocument: vi.fn(async () => ({ images: ["data:image/png;base64,ZmFrZQ=="], pages: 1 })),
+    renderDocument: vi.fn(async () => ({
+      images: ["data:image/png;base64,ZmFrZQ=="],
+      pages: 1,
+      total_pages: 1,
+    })),
     uploadSessionDocument: vi.fn(),
   };
 });
@@ -171,6 +175,79 @@ describe("ChatPanel", () => {
     expect(screen.getByText("report.pdf")).toBeInTheDocument();
     expect(screen.getByText(/Render quality/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Describe this image/ })).toBeInTheDocument();
+  });
+
+  it("sets a preview thumbnail for a multi-page PDF (regression: used to always fail)", async () => {
+    // The bug: onAttach used to call renderDocument with max_pages=1, which
+    // rasterized every page THEN rejected any PDF with 2+ pages. Attaching a
+    // 5-page PDF must now succeed and show a real thumbnail, not "No preview".
+    vi.mocked(api.renderDocument).mockResolvedValueOnce({
+      images: ["data:image/png;base64,cGFnZTE="],
+      pages: 1,
+      total_pages: 5,
+    });
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const file = new File(["%PDF-fake"], "multipage.pdf", { type: "application/pdf" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+
+    const thumb = await screen.findByRole("button", { name: /Enlarge attachment preview/ });
+    expect(within(thumb).getByAltText("attachment preview")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,cGFnZTE=",
+    );
+    expect(screen.queryByText("No preview")).not.toBeInTheDocument();
+    // page 1 only, explicit page list -- no more max_pages misuse.
+    expect(api.renderDocument).toHaveBeenCalledWith("ZmFrZQ==", "multipage.pdf", 150, [1]);
+  });
+
+  it("opens an enlarge modal on thumbnail click and fetches the rest of a multi-page PDF", async () => {
+    vi.mocked(api.renderDocument).mockResolvedValueOnce({
+      images: ["data:image/png;base64,cGFnZTE="],
+      pages: 1,
+      total_pages: 3,
+    });
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const file = new File(["%PDF-fake"], "multipage.pdf", { type: "application/pdf" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+    const thumb = await screen.findByRole("button", { name: /Enlarge attachment preview/ });
+
+    vi.mocked(api.renderDocument).mockResolvedValueOnce({
+      images: ["data:image/png;base64,cGFnZTE=", "data:image/png;base64,cGFnZTI=", "data:image/png;base64,cGFnZTM="],
+      pages: 3,
+      total_pages: 3,
+    });
+    await user.click(thumb);
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    await waitFor(() => expect(api.renderDocument).toHaveBeenCalledTimes(2));
+    expect(api.renderDocument).toHaveBeenLastCalledWith("ZmFrZQ==", "multipage.pdf", 200, [1, 2, 3]);
+    await waitFor(() =>
+      expect(screen.getAllByRole("img").filter((img) => img.getAttribute("alt")?.startsWith("page "))).toHaveLength(3),
+    );
+  });
+
+  it("does not re-fetch pages opening the enlarge modal for a single-page PDF", async () => {
+    vi.mocked(api.renderDocument).mockResolvedValueOnce({
+      images: ["data:image/png;base64,cGFnZTE="],
+      pages: 1,
+      total_pages: 1,
+    });
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const file = new File(["%PDF-fake"], "onepage.pdf", { type: "application/pdf" });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, file);
+    const thumb = await screen.findByRole("button", { name: /Enlarge attachment preview/ });
+
+    await user.click(thumb);
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    // Only the one call made when attaching -- no redundant enlarge fetch.
+    expect(api.renderDocument).toHaveBeenCalledTimes(1);
   });
 
   it("populates the message input from the schema-derived preset the same way a generic preset does", async () => {
