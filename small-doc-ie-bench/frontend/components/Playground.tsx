@@ -59,6 +59,7 @@ import {
   type AgentToolCallTrace,
   type AgentUsageTrace,
   type AgentContextBudgetTrace,
+  type AgentToolCallsUnsupportedTrace,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -228,6 +229,12 @@ interface ChatMsg {
    * risk for the rest of THIS exchange, not a per-round log entry, so it's
    * a field on the message (like systemAddendum) rather than a TraceEntry. */
   contextBudgetWarning?: AgentContextBudgetTrace;
+  /** Fires AT MOST ONCE per exchange (#353), BEFORE any round runs -- unlike
+   * contextBudgetWarning, this is known upfront from the resolved
+   * deployment's own health state (its chat template does not support real
+   * tool-calling), not learned mid-exchange, so it renders ahead of the
+   * response content rather than after it. */
+  toolCallsUnsupportedWarning?: AgentToolCallsUnsupportedTrace;
 }
 
 type TraceEntry =
@@ -638,6 +645,7 @@ export function ChatPanel({
         const liveTrace: TraceEntry[] = [];
         let liveSystemAddendum: string | undefined;
         let liveContextBudget: AgentContextBudgetTrace | undefined;
+        let liveToolCallsUnsupported: AgentToolCallsUnsupportedTrace | undefined;
         const patchLiveMsg = () => {
           setMsgs((prev) => {
             const patch = {
@@ -647,6 +655,9 @@ export function ChatPanel({
               ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
               ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
               ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
+              ...(liveToolCallsUnsupported
+                ? { toolCallsUnsupportedWarning: liveToolCallsUnsupported }
+                : {}),
             };
             return prev.length <= next.length
               ? [...next, { role: "assistant", ...patch }]
@@ -676,6 +687,10 @@ export function ChatPanel({
           liveContextBudget = budget;
           patchLiveMsg();
         };
+        const onToolCallsUnsupported = (warning: AgentToolCallsUnsupportedTrace) => {
+          liveToolCallsUnsupported = warning;
+          patchLiveMsg();
+        };
         const res = await chatCompletionMcpStream(
           model,
           payload,
@@ -686,6 +701,7 @@ export function ChatPanel({
           onSystemAddendum,
           onUsage,
           onContextBudget,
+          onToolCallsUnsupported,
         );
         const answer = res.choices?.[0]?.message?.content ?? "";
         const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
@@ -710,6 +726,9 @@ export function ChatPanel({
           ...(finalTrace.length > 0 ? { trace: finalTrace } : {}),
           ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
           ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
+          ...(liveToolCallsUnsupported
+            ? { toolCallsUnsupportedWarning: liveToolCallsUnsupported }
+            : {}),
         };
         setMsgs((prev) =>
           prev.length <= next.length
@@ -1026,6 +1045,14 @@ export function ChatPanel({
                   m.role === "user" ? "items-end" : "items-start",
                 )}
               >
+                {m.toolCallsUnsupportedWarning && (
+                  <Alert tone="err" className="w-full max-w-[85%]">
+                    <span>
+                      <T>Tool-calling not supported:</T>{" "}
+                      {m.toolCallsUnsupportedWarning.message}
+                    </span>
+                  </Alert>
+                )}
                 <div
                   className={cn(
                     "max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",

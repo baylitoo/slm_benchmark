@@ -580,6 +580,31 @@ def _context_length_for_profile(profile: ModelProfile) -> int | None:
     return None
 
 
+def _tool_calls_supported_for_profile(profile: ModelProfile) -> bool | None:
+    """The resolved deployment's persisted ``tool_calls_supported`` verdict
+    (or ``None`` when unknown), for the pre-loop warning below.
+
+    Same live-deployment lookup as ``_context_length_for_profile`` — read
+    straight off ``deployments.json`` via ``_default_live_deployments()`` and
+    matched by ``profile.name`` — here for
+    ``DeploymentRecord.tool_calls_supported`` instead of
+    ``spec.launch.context_length``. That field is written by the reconciler
+    each health cycle from ``LlamaCppRuntime.health()``'s own ``GET /props``
+    check (``chat_template_caps.supports_tool_calls`` — see
+    ``runtime.llamacpp_tool_calls_mismatch``): ``True``/``False`` is the real
+    signal, ``None`` covers every "can't tell" case (non-llamacpp runtime, an
+    older llama-server build, an unresolvable profile, or no health cycle has
+    observed it yet) — fail open, same convention as
+    ``_context_length_for_profile``.
+    """
+    from docie_bench.serving.profile_resolver import _default_live_deployments
+
+    for record in _default_live_deployments():
+        if record.spec.name == profile.name:
+            return record.tool_calls_supported
+    return None
+
+
 def _sse_event(payload: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(payload)}\n\n".encode()
 
@@ -648,6 +673,24 @@ async def _stream_chat_with_mcp_tools(
         no prior warning. Never fires when the ceiling can't be resolved
         (an unknown/unpriceable deployment) — fail-open, same as every
         other fit/pricing gate in this codebase.
+      ``{"type": "tool_calls_unsupported", "message"}`` — fired AT MOST ONCE,
+        BEFORE the tool loop runs a single round, when the resolved
+        deployment's persisted ``tool_calls_supported`` (see
+        ``_tool_calls_supported_for_profile``) is explicitly ``False``: the
+        model's ACTUAL chat template does not support real tool-calling
+        (llama-server's own ``chat_template_caps.supports_tool_calls``),
+        regardless of what ``RuntimeFeature.TOOL_CALLS`` advertises. A round
+        of ``docs-search__list_files`` can still succeed even here — that
+        call is the framework's own eager pre-round listing
+        (``mcp_tools._eager_list_context``), not something the model itself
+        emitted — but every round after that needs the model to decide to
+        call a tool via its own chat template, which this deployment cannot
+        do; it will describe using a tool in prose instead of ever emitting a
+        real ``tool_calls`` field. Known upfront from the deployment's own
+        health state, not learned mid-exchange, unlike ``context_budget``
+        above — so it fires before ``run_tool_loop`` even starts. Never fires
+        when the verdict is ``True`` or unresolvable (``None``) — fail-open,
+        same convention as ``context_budget``.
       ``{"type": "content", "completion": <final OpenAI-shaped completion>}``
       ``{"type": "error", "error": {"message", "type", "code"}}``
     Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
@@ -660,6 +703,7 @@ async def _stream_chat_with_mcp_tools(
     from docie_bench import mcp_tools as mcp_mod
 
     context_length_ceiling = _context_length_for_profile(profile)
+    tool_calls_supported = _tool_calls_supported_for_profile(profile)
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     class _QueueTraceSink(list[dict[str, Any]]):
@@ -675,6 +719,18 @@ async def _stream_chat_with_mcp_tools(
     async def drive() -> None:
         outcome: Any = None
         try:
+            if tool_calls_supported is False:
+                queue.put_nowait(
+                    {
+                        "type": "tool_calls_unsupported",
+                        "message": (
+                            "This deployment's chat template does not support real "
+                            "tool-calling (llama-server reports "
+                            "chat_template_caps.supports_tool_calls=false) — the model "
+                            "may describe using tools instead of actually calling them."
+                        ),
+                    }
+                )
             specs = await _resolve_mcp_specs(server_names, session_id)
             if isinstance(specs, JSONResponse):
                 body = json.loads(bytes(specs.body))

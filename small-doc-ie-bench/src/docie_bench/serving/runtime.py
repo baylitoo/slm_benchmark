@@ -147,6 +147,13 @@ class HealthResult:
     status_code: int | None = None
     detail: str | None = None
     latency_seconds: float | None = None
+    # llama.cpp only (#353): the model's ACTUAL chat_template_caps.supports_tool_calls
+    # from GET /props (see llamacpp_tool_calls_mismatch), captured whenever
+    # chat_template_caps was present in the response. True/False is the real
+    # signal; None means undetermined -- an older llama-server build, an
+    # unreachable /props, or a runtime (vLLM, Ollama, ...) that never probes
+    # this at all. Every non-llamacpp adapter leaves this at the default None.
+    tool_calls_supported: bool | None = None
 
 
 class Process(Protocol):
@@ -711,6 +718,14 @@ class LlamaCppRuntime(RuntimeAdapter):
         deployment unhealthy, since the deployment genuinely IS up; it's the
         TOOL_CALLS advertisement that would be a lie for THIS model's actual
         chat template.
+
+        The raw ``chat_template_caps.supports_tool_calls`` verdict is also
+        captured onto the returned ``HealthResult.tool_calls_supported`` --
+        not just logged (#353) -- so a caller (the reconciler, then
+        ``chat_api``) can act on it instead of it only ever reaching a log
+        line nobody watches. Set whenever ``chat_template_caps`` was reported
+        at all, True/False either way -- a healthy, tool-call-CAPABLE model
+        gets ``True`` recorded explicitly, not left ``None``.
         """
         result = super().health(spec, timeout=timeout)
         if not result.healthy:
@@ -720,11 +735,15 @@ class LlamaCppRuntime(RuntimeAdapter):
         if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
             headers["Authorization"] = f"Bearer {api_key}"
         props = self._json_get(f"{base}/props", timeout, headers)
+        tool_calls_supported: bool | None = None
         if props is not None:
+            caps = props.get("chat_template_caps")
+            if isinstance(caps, dict) and isinstance(caps.get("supports_tool_calls"), bool):
+                tool_calls_supported = caps["supports_tool_calls"]
             mismatch = llamacpp_tool_calls_mismatch(props)
             if mismatch is not None:
                 logger.warning("%s (alias=%r, endpoint=%r)", mismatch, spec.alias, base)
-        return result
+        return replace(result, tool_calls_supported=tool_calls_supported)
 
     def slots(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> tuple[dict[str, Any], ...]:
         """llama-server's own ``GET /slots`` introspection (#315): per-slot

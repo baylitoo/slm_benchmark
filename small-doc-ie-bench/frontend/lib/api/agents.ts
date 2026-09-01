@@ -145,6 +145,17 @@ export interface AgentContextBudgetTrace {
   threshold_fraction: number;
 }
 
+/** Fires AT MOST ONCE per exchange (`tool_calls_unsupported`, #353), BEFORE
+ * the tool loop runs a single round -- unlike `AgentContextBudgetTrace`,
+ * this is known upfront from the resolved deployment's own health state
+ * (llama-server's `chat_template_caps.supports_tool_calls`), not learned
+ * mid-exchange. Means the model's chat template will never emit a real
+ * `tool_calls` field for this deployment, no matter what tools are offered
+ * -- it will describe using a tool in prose instead. */
+export interface AgentToolCallsUnsupportedTrace {
+  message: string;
+}
+
 /** One workflow step's outcome (#265; `name`/`routed_to` added #266) -- the
  * "Try it" trace view's per-step detail, alongside any tool calls that step
  * made. `routed_to` is set only for a classifier (`route`) step -- the name
@@ -333,8 +344,8 @@ export async function chatCompletionStream(
  * silently before anything reaches the caller. NOT the OpenAI token-stream
  * format — there is no meaningful token stream for a tool-calling round —
  * so this parses `{"type": "system_addendum"|"tool_call"|"reasoning"|
- * "usage"|"context_budget"|"content"|"error", ...}` frames, not
- * `choices[0].delta`.
+ * "usage"|"context_budget"|"tool_calls_unsupported"|"content"|"error", ...}`
+ * frames, not `choices[0].delta`.
  * `onReasoning`, when a reasoning-capable model's chat template emits one,
  * fires with that round's "why" (calling a tool, or the final answer)
  * BEFORE the tool call it precedes — answers "is there a hidden thinking
@@ -352,6 +363,10 @@ export async function chatCompletionStream(
  * threshold (see `AgentContextBudgetTrace`) — a warning that the exchange
  * is at risk of a hard context-overflow error on some later round, not a
  * per-round log entry.
+ * `onToolCallsUnsupported` fires AT MOST ONCE, BEFORE any round runs, when
+ * the resolved deployment's chat template is known NOT to support real
+ * tool-calling (see `AgentToolCallsUnsupportedTrace`) — known upfront from
+ * the deployment's health state, unlike `onContextBudget`.
  * Resolves with the final completion once a `content` event lands; throws
  * on an `error` event or a connection that ends without either.
  */
@@ -365,6 +380,7 @@ export async function chatCompletionMcpStream(
   onSystemAddendum?: (text: string) => void,
   onUsage?: (usage: AgentUsageTrace) => void,
   onContextBudget?: (budget: AgentContextBudgetTrace) => void,
+  onToolCallsUnsupported?: (warning: AgentToolCallsUnsupportedTrace) => void,
 ): Promise<AgentChatResponse> {
   let res: Response;
   try {
@@ -455,6 +471,10 @@ export async function chatCompletionMcpStream(
                 context_length: Number(event.context_length ?? 0),
                 threshold_fraction: Number(event.threshold_fraction ?? 0),
               });
+            }
+          } else if (event.type === "tool_calls_unsupported") {
+            if (onToolCallsUnsupported) {
+              onToolCallsUnsupported({ message: String(event.message ?? "") });
             }
           } else if (event.type === "content") {
             completion = event.completion as AgentChatResponse;
