@@ -33,6 +33,10 @@ from docie_bench.mcp_servers.docs_search import SUPPORTED_SUFFIXES
 from docie_bench.settings import get_settings
 
 _SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+# Anything outside this allowlist is dropped from the sanitized stem -- never
+# built into a regex substitution the client's filename could influence.
+_UNSAFE_STEM_CHARS = re.compile(r"[^a-zA-Z0-9._-]+")
+_MAX_STEM_LEN = 60
 
 
 class SessionDocumentError(ValueError):
@@ -48,6 +52,21 @@ def _root() -> Path:
 
 def _new_session_id() -> str:
     return uuid.uuid4().hex
+
+
+def _sanitize_stem(filename: str) -> str:
+    """The client's filename, minus its extension, made safe to live in a
+    server-controlled path segment: ``Path(...).name`` first (drops any
+    directory component -- the actual path-traversal guard), then every
+    character outside ``[a-zA-Z0-9._-]`` dropped (no ``../`` survives this
+    even if smuggled in via a name with no real path separators), collapsed
+    to a bounded length so a pathological filename can't blow up the
+    directory listing. An empty result (e.g. a filename that was ALL unsafe
+    characters) falls back to "document" rather than an empty path segment.
+    """
+    stem = Path(filename).stem
+    cleaned = _UNSAFE_STEM_CHARS.sub("_", stem).strip("._-")
+    return (cleaned or "document")[:_MAX_STEM_LEN]
 
 
 def _session_dir(session_id: str, *, create: bool) -> Path:
@@ -67,9 +86,13 @@ def save_document(session_id: str | None, filename: str, content: bytes) -> tupl
     ``session_id=None`` starts a new session (a fresh id is minted and
     returned); passing an id this function already returned adds another
     file to that SAME session. Returns ``(session_id, stored_name)`` --
-    ``stored_name`` is what docs-search's ``list_files`` will report, a
-    random name unrelated to ``filename`` (display metadata only, not
-    trusted for anything).
+    ``stored_name`` is what docs-search's ``list_files`` will report:
+    ``filename``'s own name, sanitized (see ``_sanitize_stem``), plus a
+    short random suffix for collision-safety -- readable in a trace/log
+    instead of a bare hex blob, while staying just as untrusted for path
+    resolution as the fully-random name it replaces (``resolve_document``
+    still resolves strictly inside the session directory regardless of what
+    this string looks like).
     """
     settings = get_settings()
     suffix = Path(filename).suffix.lower()
@@ -90,7 +113,7 @@ def save_document(session_id: str | None, filename: str, content: bytes) -> tupl
             f"session already has {existing} documents "
             f"(max {settings.mcp_session_documents_max_files})"
         )
-    stored_name = f"{uuid.uuid4().hex}{suffix}"
+    stored_name = f"{_sanitize_stem(filename)}-{uuid.uuid4().hex[:8]}{suffix}"
     (directory / stored_name).write_bytes(content)
     return sid, stored_name
 

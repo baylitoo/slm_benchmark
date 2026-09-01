@@ -27,6 +27,32 @@ def test_save_document_mints_a_fresh_session_id_when_none_given(session_root: Pa
     assert (session_root / session_id / stored_name).read_bytes() == b"%PDF-fake"
 
 
+def test_save_document_stored_name_is_semantic_not_a_bare_hash(session_root: Path) -> None:
+    _, stored_name = sd.save_document(None, "OJ_L_202401689_EN_TXT.pdf", b"%PDF-fake")
+    assert stored_name.startswith("OJ_L_202401689_EN_TXT-")
+    assert stored_name.endswith(".pdf")
+    # A short random suffix for collision-safety, not the old bare-uuid name.
+    stem = stored_name.removesuffix(".pdf").removeprefix("OJ_L_202401689_EN_TXT-")
+    assert len(stem) == 8
+
+
+def test_save_document_sanitizes_unsafe_characters_and_path_traversal(session_root: Path) -> None:
+    # Path(...).name already drops any directory component; the character
+    # allowlist then strips anything a raw substring check could miss.
+    _, stored_name = sd.save_document(None, "../../etc/passwd; rm -rf.pdf", b"%PDF-fake")
+    assert "/" not in stored_name
+    assert ".." not in stored_name
+    assert ";" not in stored_name
+    assert " " not in stored_name
+
+
+def test_save_document_falls_back_to_document_for_an_all_unsafe_filename(
+    session_root: Path,
+) -> None:
+    _, stored_name = sd.save_document(None, "????.pdf", b"%PDF-fake")
+    assert stored_name.startswith("document-")
+
+
 def test_save_document_adds_a_second_file_to_the_same_session(session_root: Path) -> None:
     session_id, first = sd.save_document(None, "a.pdf", b"one")
     same_id, second = sd.save_document(session_id, "b.txt", b"two")
