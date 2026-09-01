@@ -233,6 +233,7 @@ class OpenAICompatibleClient:
         chat_template_kwargs: dict[str, Any] | None = None,
         max_tokens: int | None = None,
         assistant_prefill: str | None = None,
+        request_logprobs: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         import time as _time
 
@@ -275,6 +276,13 @@ class OpenAICompatibleClient:
                 payload["response_format"] = response_format
             if self.profile.stop_sequences:
                 payload["stop"] = list(self.profile.stop_sequences)
+            if request_logprobs:
+                # Opt-in, llama.cpp-only per-token confidence signal (#335,
+                # see extract/logprob_confidence.py). Only the CHOSEN token's
+                # own logprob is needed for MIN-aggregation, not runner-up
+                # alternatives, so top_logprobs stays at the minimum (1).
+                payload["logprobs"] = True
+                payload["top_logprobs"] = 1
             payload.update(extra_body)
             if chat_template_kwargs:
                 merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
@@ -300,6 +308,7 @@ class OpenAICompatibleClient:
                 "docie_response_format_ladder": list(ladder),
                 "docie_max_tokens": output_budget,
                 "docie_assistant_prefill": assistant_prefill is not None,
+                "docie_request_logprobs": request_logprobs,
                 **(
                     {
                         "docie_system_prompt": system_prompt,

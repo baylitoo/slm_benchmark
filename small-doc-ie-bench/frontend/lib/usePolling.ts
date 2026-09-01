@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import useSWR from "swr";
 
 export interface PollingState<T> {
   data: T | null;
@@ -17,82 +18,76 @@ export interface PollingState<T> {
 }
 
 /**
- * Poll `fn` every `intervalMs`. The interval only runs while:
- *   - `enabled` is true (caller-controlled, e.g. the section is active), AND
- *   - the document is visible (auto-pauses on a hidden/background tab).
+ * Poll `fn` every `intervalMs`, backed by SWR instead of a hand-rolled
+ * `setInterval`/`visibilitychange` state machine (see `useAsync`'s docstring
+ * for the same lesson applied to one-shot fetches).
  *
- * A manual `refresh()` always fires regardless of those gates. The first load
- * sets `loading`; subsequent ticks set `refreshing` and keep stale data on
- * screen to avoid flicker.
+ * Unlike `useAsync`, callers here pass a plain function rather than a cache
+ * key and don't want cross-component cache sharing -- each call site is its
+ * own independent polling loop -- so the SWR key is a stable per-mount id
+ * from `useId()` rather than a shared string.
+ *
+ * - `refreshInterval: enabled ? intervalMs : 0` reproduces the enabled-gate
+ *   (SWR treats `0` as "don't poll").
+ * - SWR's default `refreshWhenHidden: false` pauses polling on a hidden tab,
+ *   same as the old `document.visibilitychange` listener.
+ * - `enabled` flipping false -> true (e.g. the caller's section becoming
+ *   active again, which does NOT touch tab visibility) forces one immediate
+ *   revalidation via `mutate()`, matching the old behavior of fetching right
+ *   away on re-activation instead of waiting out the rest of the interval.
+ * - `lastUpdated` has no SWR equivalent: tracked locally, stamped in the
+ *   `onSuccess` config callback.
+ * - `refresh()` is SWR's `mutate()`, which -- because the key is always the
+ *   same stable id regardless of `enabled` -- fires immediately even while
+ *   disabled, same as the old unconditional `run()`. It's wrapped in
+ *   `useCallback` to keep a stable identity across renders: at least one
+ *   caller (`Observability.tsx`'s `UsageCard`) depends on `refresh` in a
+ *   `useEffect` array to force a refetch when its window filter changes,
+ *   and a fresh function identity every render would re-fire that effect
+ *   on every render instead of only on real changes.
  */
 export function usePolling<T>(
   fn: () => Promise<T>,
   intervalMs = 4000,
   enabled = true,
 ): PollingState<T> {
-  const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState<unknown>(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
+  const key = useId();
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
-  const [live, setLive] = useState(false);
 
-  // Keep the latest fn without retriggering the effect each render.
+  // Keep the latest fn without retriggering a re-subscribe.
   const fnRef = useRef(fn);
   fnRef.current = fn;
-  const hasData = useRef(false);
-  const inFlight = useRef(false);
 
-  const run = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
-    if (hasData.current) setRefreshing(true);
-    try {
-      const result = await fnRef.current();
-      setData(result);
-      setError(null);
-      setLastUpdated(Date.now());
-      hasData.current = true;
-    } catch (e) {
-      setError(e);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-      inFlight.current = false;
-    }
-  }, []);
+  const { data, error, isLoading, isValidating, mutate } = useSWR<T>(
+    key,
+    () => fnRef.current(),
+    {
+      refreshInterval: enabled ? intervalMs : 0,
+      revalidateOnMount: enabled,
+      onSuccess: () => setLastUpdated(Date.now()),
+    },
+  );
 
+  // Force an immediate refetch when re-activated, rather than waiting for
+  // the next interval tick -- `revalidateOnMount` only fires once, at the
+  // very first render.
+  const wasEnabled = useRef(enabled);
   useEffect(() => {
-    let timer: ReturnType<typeof setInterval> | null = null;
+    if (enabled && !wasEnabled.current) void mutate();
+    wasEnabled.current = enabled;
+  }, [enabled, mutate]);
 
-    const start = () => {
-      if (timer != null) return;
-      setLive(true);
-      void run();
-      timer = setInterval(() => void run(), intervalMs);
-    };
-    const stop = () => {
-      setLive(false);
-      if (timer != null) {
-        clearInterval(timer);
-        timer = null;
-      }
-    };
+  const refresh = useCallback(() => {
+    void mutate();
+  }, [mutate]);
 
-    const sync = () => {
-      const visible =
-        typeof document === "undefined" || document.visibilityState === "visible";
-      if (enabled && visible) start();
-      else stop();
-    };
-
-    sync();
-    document.addEventListener("visibilitychange", sync);
-    return () => {
-      document.removeEventListener("visibilitychange", sync);
-      stop();
-    };
-  }, [enabled, intervalMs, run]);
-
-  return { data, error, loading, refreshing, lastUpdated, live, refresh: run };
+  return {
+    data: data ?? null,
+    error: error ?? null,
+    loading: isLoading,
+    refreshing: isValidating && !isLoading,
+    lastUpdated,
+    live: enabled,
+    refresh,
+  };
 }

@@ -1127,6 +1127,10 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
         raise ValueError("deploy event must include 'model'")
     cp = _serving_control_plane()
     runtime = data.get("runtime")
+    raw_n_parallel = data.get("n_parallel")
+    n_parallel = int(raw_n_parallel) if raw_n_parallel is not None else 1
+    raw_cache_reuse = data.get("cache_reuse")
+    cache_reuse = int(raw_cache_reuse) if raw_cache_reuse is not None else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1136,6 +1140,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             max_tokens=(
                 int(data["max_tokens"]) if data.get("max_tokens") is not None else None
             ),
+            n_parallel=n_parallel,
+            cache_reuse=cache_reuse,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1158,6 +1164,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             # Scale: a distinct record name for another replica of `model`
             # (control_plane.serve_store_model looks the weights up by `model`).
             deployment_name=str(raw_dep_name) if raw_dep_name else None,
+            n_parallel=n_parallel,
+            cache_reuse=cache_reuse,
         )
     return record
 
@@ -1165,6 +1173,16 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
 @serving_client.create_function(
     fn_id="serving-deploy",
     trigger=inngest.TriggerEvent(event="serving/deploy.requested"),
+    # Global (not per-model/per-host key), limit=1: unlike serving-load's
+    # LoadCoordinator, the deploy path (ControlPlane.serve/up ->
+    # _DefaultSupervisor.serve/serve_store_model) never checks RAM fit against
+    # other in-flight deploys before spawning. Serving is single-replica by
+    # construction (see _guard_deterministic_advertise and this fn's own
+    # docstring), so every deploy lands on the same node's RAM regardless of
+    # which model it names -- a per-model key would let two unrelated deploys
+    # spawn concurrently and jointly overcommit the host, which is exactly the
+    # gap this closes.
+    concurrency=[inngest.Concurrency(limit=1)],
 )
 async def deploy_model_job(ctx: inngest.Context) -> Any:
     """Deploy a model so it can serve the gateway/benchmark.
@@ -1939,8 +1957,21 @@ def _gc_studio_runs_sync() -> dict[str, int]:
         summary = {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
     # The serving-volume sweep needs no database — run it either way.
     summary.update(_gc_seed_leftovers_sync())
+    summary.update(_gc_session_documents_sync())
     logger.info("studio run GC: %s", summary)
     return summary
+
+
+def _gc_session_documents_sync() -> dict[str, int]:
+    """Prune stale session-scoped docs-search uploads (#296, blocking).
+
+    No client-triggered delete exists — a closed tab or crashed session
+    leaves nothing else to reclaim the directory a Playground attachment
+    was written into.
+    """
+    from docie_bench.mcp_session_documents import gc_stale_sessions
+
+    return {"deleted_session_documents": gc_stale_sessions()}
 
 
 async def _gc_studio_runs() -> dict[str, int]:
@@ -1953,7 +1984,9 @@ async def _gc_studio_runs() -> dict[str, int]:
     trigger=inngest.TriggerCron(cron="0 3 * * *"),
 )
 async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
-    """Nightly retention sweep for the Studio run index (rows + orphan blobs).
+    """Nightly retention sweep for the Studio run index (rows + orphan blobs),
+    stale seed-download staging dirs, and stale session-scoped docs-search
+    uploads (#296).
 
     Bounds unbounded run accumulation: deletes runs older than
     ``STUDIO_RUN_RETENTION_DAYS`` or beyond the newest ``STUDIO_RUN_RETENTION_MAX``,

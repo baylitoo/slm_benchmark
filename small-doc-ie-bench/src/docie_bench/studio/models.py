@@ -209,6 +209,11 @@ class UsageRecord(Base):
     # ok | error -- whether the surface answered the caller successfully.
     status: Mapped[str] = mapped_column(String(16), default="ok")
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    # Per-round MCP tool-call trace for an "agent" surface request that ran the
+    # tool loop -- [{"tool": "calc__add", "status": "ok"|"error",
+    # "latency_ms": int}, ...]. Null for every request that never touched a
+    # tool (every other surface, and a custom agent without options.mcp_servers).
+    tool_calls_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )

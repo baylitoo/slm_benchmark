@@ -25,6 +25,7 @@ import {
   Sparkles,
   FileText,
   FilePlus2,
+  Workflow,
 } from "lucide-react";
 import {
   ApiError,
@@ -41,9 +42,11 @@ import {
   getStore,
   isLiveDeployment,
   listDynamicSchemas,
+  listMcpServers,
   listRoutingPolicies,
   listSchemas,
   selectableDeployments,
+  testMcpServer,
   updateAgent,
   visionDeploymentNames,
   type AgentChatResponse,
@@ -51,6 +54,8 @@ import {
   type AgentTemplate,
   type AgentView,
   type DynamicSchemaSummary,
+  type McpRegisteredServer,
+  type McpTool,
   type RoutingPolicySummary,
   type StoreEntry,
 } from "@/lib/api";
@@ -63,6 +68,7 @@ import { Alert, Badge, Button, Card, Checkbox, ComingSoon, Field, Select, Skelet
 import { PageHeader } from "./patterns/PageHeader";
 import { Table, type Column } from "./patterns/Table";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
+import { ToolCallTrace } from "./ToolCallTrace";
 
 // The three document-extraction stages an "ocr" agent can run. Persisted as
 // options.mode; the UI is a picker over these.
@@ -111,6 +117,7 @@ const KIND_META: Record<AgentKind, { label: string; icon: React.ReactNode }> = {
   proxy_security: { label: "Security proxy", icon: <ShieldCheck className="h-5 w-5" /> },
   ocr: { label: "Document extraction", icon: <ScanText className="h-5 w-5" /> },
   custom: { label: "Custom", icon: <Wand2 className="h-5 w-5" /> },
+  workflow: { label: "Workflow", icon: <Workflow className="h-5 w-5" /> },
 };
 
 // Narrowed to this section, same trick Playground.tsx uses for its own
@@ -435,7 +442,7 @@ const SAMPLE_PII_TEXT =
   "Report prepared by Jean Dupont. Contact: jean.dupont@acme.fr or " +
   "+33 6 12 34 56 78. Refund to IBAN DE89 3704 0044 0532 0130 00.";
 
-function TryPanel({ agent }: { agent: AgentView }) {
+export function TryPanel({ agent }: { agent: AgentView }) {
   const isOcr = agent.kind === "ocr";
   const options = (agent.options ?? {}) as Record<string, unknown>;
   const ocrMode =
@@ -497,6 +504,8 @@ function TryPanel({ agent }: { agent: AgentView }) {
 
   const pii = result?.docie_agent?.pii;
   const content = result?.choices?.[0]?.message?.content;
+  const toolCalls = result?.docie_agent?.tool_calls ?? [];
+  const workflowSteps = result?.docie_agent?.steps ?? [];
 
   return (
     <div className="rounded-md border border-border bg-card p-3">
@@ -548,6 +557,38 @@ function TryPanel({ agent }: { agent: AgentView }) {
                 Sent upstream as: {pii?.placeholders?.join(" ")}
               </p>
             )}
+            {workflowSteps.length > 0 && (
+              <div>
+                <p className="mb-1 flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                  <Workflow className="h-3.5 w-3.5" />
+                  <T>Steps</T>
+                </p>
+                <ol className="space-y-1.5">
+                  {workflowSteps.map((step) => (
+                    <li
+                      key={step.step}
+                      className="rounded-md border border-border bg-muted/40 p-2 text-xs"
+                    >
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-muted-foreground">#{step.step + 1}</span>
+                        <span className="font-medium text-foreground">{step.model_profile}</span>
+                        {step.routed_to && (
+                          <span className="text-muted-foreground">
+                            <T>routed to</T> <span className="font-medium text-foreground">{step.routed_to}</span>
+                          </span>
+                        )}
+                      </div>
+                      {step.content && (
+                        <pre className="scroll-thin mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-card p-1.5 text-[11px] text-foreground/80">
+                          {step.content}
+                        </pre>
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+            <ToolCallTrace calls={toolCalls} />
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground"><T>Response</T></p>
               <pre className="scroll-thin max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed text-foreground/90">
@@ -613,7 +654,8 @@ function AgentDetails({ agent }: { agent: AgentView }) {
 // Create
 // ---------------------------------------------------------------------------
 
-function CreateView({
+// Exported for tests: rendered by Agents with its polled/async state.
+export function CreateView({
   templates,
   prefill,
   editAgent,
@@ -714,6 +756,65 @@ function CreateView({
   const [schemaName, setSchemaName] = useState("");
   const [schemaSheetOpen, setSchemaSheetOpen] = useState(false);
 
+  // custom-kind tool use: registered MCP servers this agent may call, plus an
+  // optional per-server tool allowlist (a server key is only sent when the
+  // operator has restricted it below the full live tool list).
+  const mcpRegistered = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
+  const [mcpServers, setMcpServers] = useState<string[]>([]);
+  const [mcpServerTools, setMcpServerTools] = useState<Record<string, McpTool[]>>({});
+  const [mcpToolTesting, setMcpToolTesting] = useState<string | null>(null);
+  const [mcpAllowlist, setMcpAllowlist] = useState<Record<string, string[]>>({});
+
+  async function toggleMcpServer(name: string) {
+    if (mcpServers.includes(name)) {
+      setMcpServers((prev) => prev.filter((n) => n !== name));
+      return;
+    }
+    setMcpServers((prev) => [...prev, name]);
+    if (mcpServerTools[name]) return;
+    setMcpToolTesting(name);
+    try {
+      const res = await testMcpServer(name);
+      setMcpServerTools((prev) => ({ ...prev, [name]: res.tools }));
+    } catch {
+      // Live tool listing is a convenience for the allowlist checkboxes only
+      // — the server is still selectable (unrestricted) without it.
+      setMcpServerTools((prev) => ({ ...prev, [name]: [] }));
+    } finally {
+      setMcpToolTesting(null);
+    }
+  }
+
+  // workflow-kind: a fixed, ordered sequence of steps (#265) -- each its own
+  // backing model + system prompt, optionally its own MCP tools too (kept
+  // out of the v1 step editor UI; settable via the API directly).
+  const [steps, setSteps] = useState<{ model_profile: string; system_prompt: string }[]>([
+    { model_profile: "", system_prompt: "" },
+  ]);
+
+  function addStep() {
+    setSteps((prev) => [...prev, { model_profile: "", system_prompt: "" }]);
+  }
+
+  function removeStep(index: number) {
+    setSteps((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function updateStep(index: number, patch: Partial<{ model_profile: string; system_prompt: string }>) {
+    setSteps((prev) => prev.map((step, i) => (i === index ? { ...step, ...patch } : step)));
+  }
+
+  function toggleMcpTool(server: string, tool: string) {
+    setMcpAllowlist((prev) => {
+      const known = (mcpServerTools[server] ?? []).map((t) => t.name);
+      const current = prev[server] ?? known;
+      const next = current.includes(tool)
+        ? current.filter((t) => t !== tool)
+        : [...current, tool];
+      return { ...prev, [server]: next };
+    });
+  }
+
   // Vision deployments (store family flagged vision) — the model picker for the
   // vision→structured stage.
   const visionModels = useMemo(() => {
@@ -759,6 +860,9 @@ function CreateView({
     if (typeof options.mode === "string") setMode(options.mode);
     if (typeof options.backend === "string") setOcrBackend(options.backend);
     if (typeof options.max_tokens === "number") setMaxTokens(String(options.max_tokens));
+    if (Array.isArray(options.steps) && options.steps.length > 0) {
+      setSteps((options.steps as unknown[]).map(toStepDraft));
+    }
   }, [prefill]);
 
   // Load an existing agent's full config for editing (name + template locked).
@@ -768,6 +872,7 @@ function CreateView({
       proxy_security: "proxy-security",
       ocr: "ocr-agent",
       custom: "custom",
+      workflow: "workflow-agent",
     };
     setTemplateId(templateForKind[editAgent.kind] ?? "custom");
     setName(editAgent.name);
@@ -790,6 +895,27 @@ function CreateView({
     setMaxTokens(typeof o.max_tokens === "number" ? String(o.max_tokens) : "");
     setVisionModel(typeof o.vision_model === "string" ? o.vision_model : "");
     setSchemaName(typeof o.schema === "string" ? o.schema : "");
+    const savedServers = Array.isArray(o.mcp_servers) ? (o.mcp_servers as unknown[]).map(String) : [];
+    setMcpServers(savedServers);
+    const savedAllowlist =
+      o.mcp_tools && typeof o.mcp_tools === "object" && !Array.isArray(o.mcp_tools)
+        ? (o.mcp_tools as Record<string, unknown>)
+        : {};
+    setMcpAllowlist(
+      Object.fromEntries(
+        Object.entries(savedAllowlist)
+          .filter(([, v]) => Array.isArray(v))
+          .map(([k, v]) => [k, (v as unknown[]).map(String)]),
+      ),
+    );
+    savedServers.forEach((serverName) => {
+      testMcpServer(serverName)
+        .then((res) => setMcpServerTools((prev) => ({ ...prev, [serverName]: res.tools })))
+        .catch(() => setMcpServerTools((prev) => ({ ...prev, [serverName]: [] })));
+    });
+    if (Array.isArray(o.steps) && o.steps.length > 0) {
+      setSteps((o.steps as unknown[]).map(toStepDraft));
+    }
     // Back-compat: an agent saved before `mode` derives it — extractor → the
     // OCR→LLM pipeline, otherwise plain OCR.
     const savedMode = o.mode;
@@ -855,10 +981,36 @@ function CreateView({
                     backend: ocrBackend,
                     language: ocrLanguage || null,
                   }
-            : {};
+            : kind === "custom"
+              ? {
+                  mcp_servers: mcpServers.length > 0 ? mcpServers : null,
+                  // A server is only listed here when the operator actually
+                  // restricted it below its full live tool list — otherwise
+                  // omitted, meaning "every tool this server exposes".
+                  mcp_tools: (() => {
+                    const restricted = mcpServers
+                      .map((server): [string, string[]] | null => {
+                        const known = (mcpServerTools[server] ?? []).map((t) => t.name);
+                        const selected = mcpAllowlist[server] ?? known;
+                        return selected.length < known.length ? [server, selected] : null;
+                      })
+                      .filter((entry): entry is [string, string[]] => entry !== null);
+                    return restricted.length > 0 ? Object.fromEntries(restricted) : null;
+                  })(),
+                }
+              : kind === "workflow"
+                ? {
+                    steps: steps
+                      .filter((s) => s.model_profile.trim())
+                      .map((s) => ({
+                        model_profile: s.model_profile.trim(),
+                        system_prompt: s.system_prompt.trim() || null,
+                      })),
+                  }
+                : {};
       if (editing && editAgent) {
         await updateAgent(editAgent.name, {
-          model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
+          model_profile: kind === "ocr" || kind === "workflow" ? null : modelProfile.trim() || null,
           system_prompt: systemPrompt.trim() || null,
           options,
         });
@@ -867,7 +1019,7 @@ function CreateView({
         const created = await createAgent({
           name: name.trim(),
           template: templateId,
-          model_profile: kind === "ocr" ? null : modelProfile.trim() || null,
+          model_profile: kind === "ocr" || kind === "workflow" ? null : modelProfile.trim() || null,
           system_prompt: systemPrompt.trim() || null,
           options,
         });
@@ -928,7 +1080,7 @@ function CreateView({
                 disabled={editing}
               />
             </Field>
-            {kind !== "ocr" && (
+            {kind !== "ocr" && kind !== "workflow" && (
               <Field
                 label="Backing model"
                 htmlFor="agent-model"
@@ -978,7 +1130,7 @@ function CreateView({
                 )}
               </Field>
             )}
-            {kind !== "ocr" && (
+            {kind !== "ocr" && kind !== "workflow" && (
               <Field
                 label="System prompt"
                 htmlFor="agent-prompt"
@@ -1364,6 +1516,132 @@ function CreateView({
             </Card>
           )}
 
+          {kind === "custom" && (
+            <Card
+              title="Tools"
+              subtitle="MCP servers this agent may call — the model gets their tools and the platform executes any it calls."
+            >
+              <div className="space-y-3">
+                {(mcpRegistered.data ?? []).length === 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    <T>
+                      No MCP servers are registered yet — enable one under Serving → MCP Tools.
+                    </T>
+                  </p>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5">
+                    {(mcpRegistered.data ?? []).map((server) => {
+                      const on = mcpServers.includes(server.name);
+                      return (
+                        <button
+                          key={server.name}
+                          type="button"
+                          aria-pressed={on}
+                          onClick={() => void toggleMcpServer(server.name)}
+                          className={cn(
+                            "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+                            on
+                              ? "border-accent bg-accent text-accent-foreground"
+                              : "border-border bg-card text-muted-foreground hover:text-foreground",
+                          )}
+                        >
+                          {server.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {mcpServers.map((server) => {
+                  const tools = mcpServerTools[server];
+                  const selected = mcpAllowlist[server] ?? tools?.map((t) => t.name) ?? [];
+                  return (
+                    <div key={server} className="rounded-md border border-border p-2">
+                      <p className="mb-1.5 text-xs font-medium text-foreground">{server}</p>
+                      {mcpToolTesting === server ? (
+                        <p className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <T>Listing tools…</T>
+                        </p>
+                      ) : tools === undefined ? null : tools.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">
+                          <T>
+                            Could not list this server's tools — it will still be usable,
+                            unrestricted.
+                          </T>
+                        </p>
+                      ) : (
+                        <div className="flex flex-wrap gap-x-4 gap-y-1">
+                          {tools.map((tool) => (
+                            <Checkbox
+                              key={tool.name}
+                              checked={selected.includes(tool.name)}
+                              onChange={() => toggleMcpTool(server, tool.name)}
+                              label={tool.name}
+                              title={tool.description}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+
+          {kind === "workflow" && (
+            <Card
+              title="Steps"
+              subtitle="A fixed, ordered pipeline — each step gets ONLY the previous step's answer as its input (the first step gets the caller's own messages)."
+            >
+              <div className="space-y-3">
+                {steps.map((step, index) => (
+                  <div key={index} className="rounded-md border border-border p-2">
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <p className="text-xs font-medium text-foreground">
+                        <T>Step</T> {index + 1}
+                      </p>
+                      {steps.length > 1 && (
+                        <button
+                          type="button"
+                          aria-label={`Remove step ${index + 1}`}
+                          onClick={() => removeStep(index)}
+                          className="text-muted-foreground hover:text-foreground"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                    <Select
+                      aria-label={`Step ${index + 1} model`}
+                      value={step.model_profile}
+                      onChange={(e) => updateStep(index, { model_profile: e.target.value })}
+                    >
+                      <option value="">Choose a model…</option>
+                      {chatDeployments.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </Select>
+                    <TextArea
+                      className="mt-2"
+                      rows={2}
+                      aria-label={`Step ${index + 1} system prompt`}
+                      value={step.system_prompt}
+                      onChange={(e) => updateStep(index, { system_prompt: e.target.value })}
+                      placeholder="What this step alone is responsible for…"
+                    />
+                  </div>
+                ))}
+                <Button type="button" variant="secondary" size="sm" onClick={addStep}>
+                  <PlusCircle className="h-3.5 w-3.5" />
+                  <T>Add step</T>
+                </Button>
+              </div>
+            </Card>
+          )}
+
           <Card title="Endpoint" subtitle="Created agents are addressable immediately.">
             <CopyLine
               label="base_url"
@@ -1389,6 +1667,16 @@ function CreateView({
 
 function errMessage(e: unknown): string {
   return toUserMessage(e);
+}
+
+/** One workflow step (#265), permissively parsed from an unknown value --
+ * a saved agent's/template's options.steps entry. */
+function toStepDraft(raw: unknown): { model_profile: string; system_prompt: string } {
+  const step = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    model_profile: typeof step.model_profile === "string" ? step.model_profile : "",
+    system_prompt: typeof step.system_prompt === "string" ? step.system_prompt : "",
+  };
 }
 
 /** Agent names are OpenAI model ids: normalize typing into the slug the

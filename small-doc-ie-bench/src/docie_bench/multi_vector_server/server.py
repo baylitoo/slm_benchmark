@@ -39,6 +39,8 @@ first caller.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Request
@@ -183,21 +185,24 @@ def create_multi_vector_app(
     backend: MultiVectorBackend | None = None,
 ) -> FastAPI:
     """Build the multi-vector rerank shim app. ``backend=None`` loads one at startup."""
-    app = FastAPI(
-        title="docie multi-vector",
-        summary="ColBERT / PyLate late-interaction retriever behind the rerank surface "
-        "(sentence-transformers MultiVectorEncoder, MaxSim scoring).",
-    )
-    app.state.backend = backend
-    app.state.model_id = model_id
 
-    @app.on_event("startup")
-    def load_model() -> None:
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Load at startup (not first request) so a missing/too-old extra or
         # missing weights fail the deploy immediately instead of 500ing the
         # first caller.
         if app.state.backend is None:
             app.state.backend = SentenceTransformersMultiVectorBackend(model_id)
+        yield
+
+    app = FastAPI(
+        title="docie multi-vector",
+        summary="ColBERT / PyLate late-interaction retriever behind the rerank surface "
+        "(sentence-transformers MultiVectorEncoder, MaxSim scoring).",
+        lifespan=lifespan,
+    )
+    app.state.backend = backend
+    app.state.model_id = model_id
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:

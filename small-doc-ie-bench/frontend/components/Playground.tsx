@@ -15,12 +15,14 @@ import {
   Upload,
   AlertCircle,
   FilePlus2,
+  Gauge,
   Paperclip,
+  Wrench,
   X,
 } from "lucide-react";
 import {
   triggerExtract,
-  chatCompletion,
+  chatCompletionMcpStream,
   chatCompletionStream,
   listMcpServers,
   type McpRegisteredServer,
@@ -28,6 +30,7 @@ import {
   rerank,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
+  visionDeploymentNames,
   getDeployments,
   getStore,
   getFamilies,
@@ -35,8 +38,10 @@ import {
   isLiveDeployment,
   fileToBase64,
   renderDocument,
+  uploadSessionDocument,
   listDynamicSchemas,
   listSchemas,
+  getSchemaFields,
   listRoutingPolicies,
   ApiError,
   ApiUnavailable,
@@ -49,6 +54,9 @@ import {
   type RerankResponse,
   type DynamicSchemaSummary,
   type RoutingPolicySummary,
+  type AgentToolCallTrace,
+  type AgentUsageTrace,
+  type AgentContextBudgetTrace,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -70,6 +78,7 @@ import {
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
+import { ToolCallItem } from "./ToolCallTrace";
 
 type PlaygroundMode = "chat" | "arena" | "embedrerank";
 
@@ -158,7 +167,12 @@ export function Playground({
       {/* Every mode stays mounted (hidden, never unmounted) so an in-flight
           extraction stream or a chat/arena history survives switching modes. */}
       <div hidden={mode !== "chat"}>
-        <ChatPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
+        <ChatPanel
+          deployments={deployments}
+          selectable={selectable}
+          store={store}
+          onNavigate={onNavigate}
+        />
       </div>
       <div hidden={mode !== "arena"}>
         <ArenaPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
@@ -192,7 +206,32 @@ interface ChatMsg {
   content: string;
   /** Only set when role === "extraction". */
   trigger?: TriggerResponse;
+  /** Only set on an assistant turn that ran MCP tools (selectedMcp). */
+  toolCalls?: AgentToolCallTrace[];
+  /** Reasoning-capable model's "why" for a round (calling a tool, or the
+   * final answer) -- only set when the chat template emits one separately
+   * from content/tool_calls. One entry per round that had any. */
+  reasoning?: string[];
+  /** toolCalls and reasoning above, interleaved in the order the SSE events
+   * actually arrived -- rendered as one chronological trace instead of two
+   * separate blocks that lose which reasoning step preceded which call. */
+  trace?: TraceEntry[];
+  /** The server-injected system-prompt addendum (TOOL_DISCIPLINE_DIRECTIVE,
+   * plus any eager-list context) that run_tool_loop folds on top of the
+   * caller's own system prompt -- fires once per request, not once per
+   * round, so it's a field on the message rather than a TraceEntry. */
+  systemAddendum?: string;
+  /** Fires AT MOST ONCE per exchange (#344): cumulative usage crossed the
+   * resolved deployment's context-budget warning threshold -- a standing
+   * risk for the rest of THIS exchange, not a per-round log entry, so it's
+   * a field on the message (like systemAddendum) rather than a TraceEntry. */
+  contextBudgetWarning?: AgentContextBudgetTrace;
 }
+
+type TraceEntry =
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool_call"; call: AgentToolCallTrace }
+  | { kind: "usage"; usage: AgentUsageTrace };
 
 // A cold store: model's first request can take a while to boot. Auto-retry a
 // bounded number of times (the backend's load trigger is idempotent — see
@@ -210,10 +249,12 @@ const VISION_PRESETS = [
 export function ChatPanel({
   deployments,
   selectable,
+  store,
   onNavigate,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   selectable: DeploymentRecord[];
+  store: ReturnType<typeof usePolling<StoreEntry[]>>;
   onNavigate?: NavigateToDeploy;
 }) {
   const { t } = useI18n();
@@ -245,9 +286,30 @@ export function ChatPanel({
     if (!chatNames.includes(model)) setModel(liveNames[0] ?? chatNames[0]);
   }, [chatNames, liveNames, model]);
 
+  const visionNames = useMemo(() => visionDeploymentNames(store.data), [store.data]);
+  const modelHasVision = visionNames.has(model);
+  // Explicit toggle, not implicit-forever: an image/PDF attachment only
+  // rides the message as image_url content when this is on. Defaults to
+  // following the deployment's own capability (vision model -> on), but the
+  // user can flip it off even for a vision model (it's the expensive path)
+  // -- and it MUST be off for a non-vision model, since llama-server 500s on
+  // image content with no mmproj rather than silently ignoring it.
+  const [visionEnabled, setVisionEnabled] = useState(false);
+  useEffect(() => {
+    setVisionEnabled(modelHasVision);
+  }, [model, modelHasVision]);
+
   const [system, setSystem] = useState("");
   const mcpServers = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
   const [selectedMcp, setSelectedMcp] = useState<string[]>([]);
+  // Server-issued once the first attachment is uploaded for docs-search
+  // (#296) -- carried for the rest of this conversation so every later
+  // upload/chat turn lands in the SAME session directory. Never invented
+  // client-side; reset with the rest of the chat state on Clear. A ref, not
+  // state: sendChat awaits the upload then immediately calls attempt() in
+  // the SAME turn, which needs the just-issued id synchronously -- state
+  // set this render wouldn't be visible until the next one.
+  const docsSearchSessionIdRef = useRef<string | undefined>(undefined);
   const [input, setInput] = useState("");
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [busy, setBusy] = useState(false);
@@ -303,6 +365,24 @@ export function ChatPanel({
     "routing-policies",
     listRoutingPolicies,
   );
+  // Field names for whichever schema is currently selected above -- used to
+  // build a schema-aware vision preset (see VISION_PRESETS below). A schema
+  // counts as "selected" only once it resolves against the lists this same
+  // picker already fetched (schemas.data / dynamicSchemas.data); this keeps
+  // the fresh-mount / no-schemas-configured case free of a preset that names
+  // fields nothing on the server actually recognizes.
+  const dynamicSchemaEntry = dynamicSchemaName
+    ? (dynamicSchemas.data ?? []).find((s) => s.name === dynamicSchemaName)
+    : undefined;
+  const builtinSchemaKnown =
+    !dynamicSchemaName && !!schemaName && (schemas.data ?? []).includes(schemaName);
+  const builtinSchemaFields = useAsync<string[]>(
+    `schema-fields:${builtinSchemaKnown ? schemaName : ""}`,
+    () => (builtinSchemaKnown ? getSchemaFields(schemaName) : Promise.resolve([])),
+  );
+  const selectedSchemaFields =
+    dynamicSchemaEntry?.spec.fields.map((f) => f.name) ??
+    (builtinSchemaKnown ? (builtinSchemaFields.data ?? []) : []);
   // "single" routes to the deployment picked above; "policy" runs a saved
   // routing policy (cheap stage first, escalate on the policy's own
   // confidence rules) — mutually exclusive with a single deployment, same as
@@ -404,22 +484,69 @@ export function ChatPanel({
       )
       .map((m) => ({ role: m.role, content: m.content }));
 
+    // Vision is now an explicit toggle (defaults to following the
+    // deployment's own capability, see the effect above) -- an image
+    // attachment with vision off has nothing to ride on (docs-search only
+    // accepts .pdf/.txt), and a PDF with vision off AND docs-search
+    // unselected has no path to reach the model either. Both are refused
+    // up front rather than silently sending a useless/erroring attachment
+    // (llama-server 500s on image content with no mmproj rather than
+    // ignoring it).
+    if (attached && !visionEnabled) {
+      if (!isPdfFile(attached)) {
+        setError(
+          "This deployment has no vision (or Vision is off) — image attachments need Vision on.",
+        );
+        return;
+      }
+      if (!selectedMcp.includes("docs-search")) {
+        setError(
+          "Vision is off and docs-search isn't selected — turn Vision on, or select docs-search so this PDF can be read.",
+        );
+        return;
+      }
+    }
+
     let newContent: unknown = trimmed;
     let displayLabel = trimmed;
     if (attached) {
       try {
         const b64 = await fileToBase64(attached);
-        const imageUrls = isPdfFile(attached)
-          ? (await renderDocument(b64, attached.name, dpi)).images
-          : [`data:${attached.type || "image/png"};base64,${b64}`];
-        if (imageUrls.length === 0) {
-          setError("The document produced no page images.");
-          return;
+        // Additive, not instead-of, when vision IS on: vision still reads
+        // the rendered page images below regardless. Only a real .pdf is
+        // worth indexing for docs-search (#296) — an image attachment has
+        // no text to search, and isn't a suffix docs-search accepts anyway.
+        if (isPdfFile(attached) && selectedMcp.includes("docs-search")) {
+          try {
+            const uploaded = await uploadSessionDocument(
+              b64,
+              attached.name,
+              docsSearchSessionIdRef.current,
+            );
+            docsSearchSessionIdRef.current = uploaded.session_id;
+          } catch {
+            // Best-effort: docs-search just won't see this file, vision
+            // still answers from the page images below either way.
+          }
         }
-        newContent = [
-          { type: "text", text: trimmed || "Describe this image." },
-          ...imageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
-        ];
+        if (visionEnabled) {
+          const imageUrls = isPdfFile(attached)
+            ? (await renderDocument(b64, attached.name, dpi)).images
+            : [`data:${attached.type || "image/png"};base64,${b64}`];
+          if (imageUrls.length === 0) {
+            setError("The document produced no page images.");
+            return;
+          }
+          newContent = [
+            { type: "text", text: trimmed || "Describe this image." },
+            ...imageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+          ];
+        } else {
+          // Vision off, PDF, docs-search selected (guarded above): the
+          // upload just made the real file searchable -- no image content
+          // to send, the model reads it via docs-search's tools instead.
+          newContent = trimmed || "Look up the attached document via docs-search.";
+        }
         displayLabel = trimmed || `📎 ${attached.name}`;
       } catch {
         setError("Could not read the attached file.");
@@ -448,10 +575,93 @@ export function ChatPanel({
   ) {
     try {
       if (selectedMcp.length > 0) {
-        // Tool exchange runs server-side; the final answer arrives in one piece.
-        const res = await chatCompletion(model, payload, selectedMcp);
+        // Each tool call arrives as its own SSE event the instant it
+        // finishes -- the trace renders progressively instead of the whole
+        // exchange completing silently behind "Waiting for the model…".
+        const liveToolCalls: AgentToolCallTrace[] = [];
+        const liveReasoning: string[] = [];
+        const liveUsage: AgentUsageTrace[] = [];
+        const liveTrace: TraceEntry[] = [];
+        let liveSystemAddendum: string | undefined;
+        let liveContextBudget: AgentContextBudgetTrace | undefined;
+        const patchLiveMsg = () => {
+          setMsgs((prev) => {
+            const patch = {
+              content: "",
+              toolCalls: [...liveToolCalls],
+              trace: [...liveTrace],
+              ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
+              ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
+              ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
+            };
+            return prev.length <= next.length
+              ? [...next, { role: "assistant", ...patch }]
+              : prev.map((m, i) => (i === next.length ? { ...m, ...patch } : m));
+          });
+        };
+        const onToolCall = (call: AgentToolCallTrace) => {
+          liveToolCalls.push(call);
+          liveTrace.push({ kind: "tool_call", call });
+          patchLiveMsg();
+        };
+        const onReasoning = (text: string) => {
+          liveReasoning.push(text);
+          liveTrace.push({ kind: "reasoning", text });
+          patchLiveMsg();
+        };
+        const onSystemAddendum = (text: string) => {
+          liveSystemAddendum = text;
+          patchLiveMsg();
+        };
+        const onUsage = (usage: AgentUsageTrace) => {
+          liveUsage.push(usage);
+          liveTrace.push({ kind: "usage", usage });
+          patchLiveMsg();
+        };
+        const onContextBudget = (budget: AgentContextBudgetTrace) => {
+          liveContextBudget = budget;
+          patchLiveMsg();
+        };
+        const res = await chatCompletionMcpStream(
+          model,
+          payload,
+          selectedMcp,
+          onToolCall,
+          docsSearchSessionIdRef.current,
+          onReasoning,
+          onSystemAddendum,
+          onUsage,
+          onContextBudget,
+        );
         const answer = res.choices?.[0]?.message?.content ?? "";
-        setMsgs([...next, { role: "assistant", content: answer || t("(empty response)") }]);
+        const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
+        // The live trace is only trustworthy when every reported tool call
+        // actually streamed as its own onToolCall event -- if the caller
+        // resolved with a completion's docie_agent.tool_calls that never
+        // streamed (e.g. a non-streaming response), fall back to reasoning
+        // then tool calls in report order rather than silently dropping them.
+        const finalTrace: TraceEntry[] =
+          toolCalls.length === liveToolCalls.length
+            ? liveTrace
+            : [
+                ...liveReasoning.map((text): TraceEntry => ({ kind: "reasoning", text })),
+                ...liveUsage.map((usage): TraceEntry => ({ kind: "usage", usage })),
+                ...toolCalls.map((call): TraceEntry => ({ kind: "tool_call", call })),
+              ];
+        const finalMsg: ChatMsg = {
+          role: "assistant",
+          content: answer || t("(empty response)"),
+          ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          ...(liveReasoning.length > 0 ? { reasoning: liveReasoning } : {}),
+          ...(finalTrace.length > 0 ? { trace: finalTrace } : {}),
+          ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
+          ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
+        };
+        setMsgs((prev) =>
+          prev.length <= next.length
+            ? [...next, finalMsg]
+            : prev.map((m, i) => (i === next.length ? finalMsg : m)),
+        );
         return;
       }
       let content = "";
@@ -659,6 +869,34 @@ export function ChatPanel({
           </div>
         )}
 
+        {model && !extractionOn && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              <T>Vision:</T>
+            </span>
+            <button
+              type="button"
+              aria-pressed={visionEnabled}
+              disabled={busy || !modelHasVision}
+              onClick={() => setVisionEnabled((v) => !v)}
+              title={
+                modelHasVision
+                  ? t("An attached image/PDF rides the message as page images.")
+                  : t("This deployment has no vision support (no mmproj).")
+              }
+              className={cn(
+                "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+                visionEnabled
+                  ? "border-accent bg-accent text-accent-foreground"
+                  : "border-border bg-card text-muted-foreground hover:text-foreground",
+                !modelHasVision && "cursor-not-allowed opacity-50",
+              )}
+            >
+              {visionEnabled ? <T>on</T> : <T>off</T>}
+            </button>
+          </div>
+        )}
+
         {(mcpServers.data ?? []).length > 0 && !extractionOn && (
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">
@@ -690,7 +928,7 @@ export function ChatPanel({
             })}
             {selectedMcp.length > 0 && (
               <span className="text-xs text-muted-foreground">
-                <T>tool answers arrive unstreamed</T>
+                <T>tool calls stream live; the final answer arrives in one piece</T>
               </span>
             )}
           </div>
@@ -723,7 +961,10 @@ export function ChatPanel({
             ) : (
               <div
                 key={i}
-                className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}
+                className={cn(
+                  "flex flex-col gap-1.5",
+                  m.role === "user" ? "items-end" : "items-start",
+                )}
               >
                 <div
                   className={cn(
@@ -735,6 +976,63 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.contextBudgetWarning && (
+                  <Alert tone="warn" className="w-full max-w-[85%]">
+                    <span>
+                      <T>Context budget warning:</T> {m.contextBudgetWarning.cumulative_tokens} /{" "}
+                      {m.contextBudgetWarning.context_length}{" "}
+                      <T>tokens used</T> ({Math.round(m.contextBudgetWarning.threshold_fraction * 100)}%{" "}
+                      <T>threshold</T>) —{" "}
+                      <T>this exchange is at risk of overflowing the deployment's context window.</T>
+                    </span>
+                  </Alert>
+                )}
+                {m.systemAddendum && (
+                  <details className="w-full max-w-[85%] rounded-md border border-border bg-muted/20 text-xs">
+                    <summary className="cursor-pointer px-2 py-1 font-medium text-muted-foreground hover:text-foreground">
+                      <T>System-prompt addendum</T>
+                    </summary>
+                    <pre className="scroll-thin max-h-48 overflow-auto whitespace-pre-wrap border-t border-border px-2 py-1.5 text-foreground/80">
+                      {m.systemAddendum}
+                    </pre>
+                  </details>
+                )}
+                {m.trace && m.trace.length > 0 && (
+                  <div className="w-full max-w-[85%] space-y-1.5">
+                    <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                      <Wrench className="h-3.5 w-3.5" />
+                      <T>Trace</T>
+                    </p>
+                    <ol className="space-y-1.5">
+                      {(() => {
+                        let toolIndex = -1;
+                        return m.trace.map((entry, i) =>
+                          entry.kind === "reasoning" ? (
+                            <li
+                              key={i}
+                              className="rounded-md border border-border bg-muted/20 px-2 py-1 text-xs italic text-muted-foreground"
+                            >
+                              {entry.text}
+                            </li>
+                          ) : entry.kind === "usage" ? (
+                            <li
+                              key={i}
+                              className="flex items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs text-muted-foreground"
+                            >
+                              <Gauge className="h-3.5 w-3.5" />
+                              <span>
+                                {entry.usage.round.prompt_tokens ?? 0} <T>prompt tokens</T> ·{" "}
+                                {entry.usage.cumulative.total_tokens ?? 0} <T>total</T>
+                              </span>
+                            </li>
+                          ) : (
+                            <ToolCallItem key={i} call={entry.call} index={++toolIndex} />
+                          ),
+                        );
+                      })()}
+                    </ol>
+                  </div>
+                )}
               </div>
             ),
           )}
@@ -786,7 +1084,12 @@ export function ChatPanel({
               )}
               {!extractionOn && file && (
                 <div className="flex flex-wrap gap-1">
-                  {VISION_PRESETS.map((p) => (
+                  {[
+                    ...VISION_PRESETS,
+                    ...(selectedSchemaFields.length > 0
+                      ? [`Extract: ${selectedSchemaFields.join(", ")}`]
+                      : []),
+                  ].map((p) => (
                     <button
                       key={p}
                       type="button"
@@ -847,6 +1150,7 @@ export function ChatPanel({
             onClick={() => {
               setMsgs([]);
               setError(null);
+              docsSearchSessionIdRef.current = undefined;
             }}
             title="Clear the conversation"
           >

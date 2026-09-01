@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from docie_bench.agents.api import (
     _client,
@@ -63,6 +66,61 @@ _SSE_USAGE_SCAN_LIMIT = 262_144
 # dependency per request, so declaring it again as a route parameter hands the
 # route the SAME authenticated TenantContext without a second quota acquire.
 TenantParam = Annotated[TenantContext, Depends(agents_tenant_guard)]
+
+_NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
+
+
+class ChatCompletionRequest(BaseModel):
+    """Body of ``POST /v1/chat/completions``.
+
+    Only the fields ``chat_completions`` itself reads and branches on are
+    declared -- ``extra="allow"`` is load-bearing, not incidental: the rest
+    of the OpenAI-compatible body (``messages``, ``temperature``, ``tools``,
+    ...) is forwarded upstream largely as-is (``forward = dict(body)``-style)
+    and must never be dropped or rejected by a closed schema.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: _NonEmptyStr
+    stream: bool | None = None
+    mcp_servers: list[_NonEmptyStr] | None = None
+    session_id: str | None = None
+
+
+def _validation_error_to_openai(exc: RequestValidationError) -> JSONResponse:
+    """Reformat FastAPI's ``{"detail": [...]}`` 422 shape into this
+    endpoint's existing ``_openai_error(...)`` 400 shape, which clients of
+    ``/v1/chat/completions`` already depend on."""
+    errors = exc.errors()
+    first = errors[0] if errors else None
+    if first is None:
+        message = "invalid request body"
+    else:
+        field = ".".join(str(part) for part in first["loc"] if part != "body")
+        msg = first.get("msg", "invalid request")
+        message = f"{field!r}: {msg}" if field else msg
+    return _openai_error(message, status_code=400, error_type="invalid_request_error")
+
+
+class _ChatCompletionsValidationRoute(APIRoute):
+    """Scoped to the single ``/v1/chat/completions`` route it's attached to
+    (via ``route_class_override`` on ``add_api_route`` below) -- every other
+    route on this router, and every other route in the app, keeps FastAPI's
+    default validation-error response untouched."""
+
+    def get_route_handler(
+        self,
+    ) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request) -> Response:
+            try:
+                return await original_route_handler(request)
+            except RequestValidationError as exc:
+                return _validation_error_to_openai(exc)
+
+        return custom_route_handler
 
 
 def _record_usage_outcome(
@@ -218,29 +276,8 @@ async def list_models() -> dict[str, Any]:
     }
 
 
-@router.post("/v1/chat/completions")
-async def chat_completions(request: Request, tenant: TenantParam) -> Any:
-    try:
-        body = await request.json()
-    except ValueError:
-        return _openai_error(
-            "request body must be valid JSON",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
-    if not isinstance(body, dict):
-        return _openai_error(
-            "request body must be a JSON object",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
-    model = str(body.get("model") or "")
-    if not model:
-        return _openai_error(
-            "missing required 'model' field (a deployment name or profile)",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
+async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) -> Any:
+    model = payload.model
     resolved = await _resolve_or_error(model)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -253,18 +290,14 @@ async def chat_completions(request: Request, tenant: TenantParam) -> Any:
             error_type="invalid_request_error",
         )
 
-    wants_stream = bool(body.get("stream"))
-    mcp_server_names = body.get("mcp_servers")
-    if mcp_server_names is not None and (
-        not isinstance(mcp_server_names, list)
-        or not all(isinstance(name, str) and name for name in mcp_server_names)
-    ):
-        return _openai_error(
-            "'mcp_servers' must be a list of registered MCP server names",
-            status_code=400,
-            error_type="invalid_request_error",
-        )
-    forward = dict(body)
+    wants_stream = bool(payload.stream)
+    mcp_server_names = payload.mcp_servers
+    session_id = payload.session_id
+    # exclude_unset: only fields the caller actually sent are forwarded --
+    # same as the old dict(body) -- so a field this model declares but the
+    # caller omitted (stream, mcp_servers, session_id) doesn't materialize
+    # as an explicit null in the upstream request.
+    forward = payload.model_dump(exclude_unset=True)
     forward["model"] = profile.model
     url = f"{profile.base_url}/chat/completions"
     headers = {
@@ -275,18 +308,26 @@ async def chat_completions(request: Request, tenant: TenantParam) -> Any:
     started = time.perf_counter()
 
     if mcp_server_names:
-        # The serving side drives the whole model<->tools exchange, so the
-        # response the caller gets is the FINAL answer — a token stream of
-        # intermediate tool_calls rounds has no meaningful SSE shape here.
+        names = [str(n) for n in mcp_server_names]
         if wants_stream:
-            return _openai_error(
-                "'mcp_servers' does not support 'stream': the server runs the "
-                "tool exchange and returns the final completion",
-                status_code=400,
-                error_type="invalid_request_error",
+            # Not the OpenAI token-stream format (there is no meaningful
+            # token stream for a tool-calling round) -- each executed tool
+            # call is relayed as its own SSE event as it finishes, so the
+            # caller sees the agentic search happening instead of only the
+            # final answer after everything completes silently.
+            return await _stream_chat_with_mcp_tools(
+                client,
+                url,
+                headers,
+                forward,
+                profile,
+                names,
+                session_id,
+                tenant_id=tenant.tenant_id,
+                started=started,
             )
         outcome = await _chat_with_mcp_tools(
-            client, url, headers, forward, profile, [str(n) for n in mcp_server_names]
+            client, url, headers, forward, profile, names, session_id
         )
         # run_tool_loop already summed usage across every tool round into the
         # final completion's usage block, so this one row carries the whole
@@ -321,6 +362,17 @@ async def chat_completions(request: Request, tenant: TenantParam) -> Any:
     return completion
 
 
+# route_class_override, not the @router.post(...) decorator (it doesn't expose
+# this kwarg) -- scopes _ChatCompletionsValidationRoute's OpenAI-shaped 400 to
+# this one route without touching any other route's default FastAPI 422.
+router.add_api_route(
+    "/v1/chat/completions",
+    chat_completions,
+    methods=["POST"],
+    route_class_override=_ChatCompletionsValidationRoute,
+)
+
+
 async def _post_upstream(
     client: httpx.AsyncClient,
     url: str,
@@ -341,6 +393,7 @@ async def _post_upstream(
     body = dict(forward)
     body.pop("stream", None)
     body.pop("mcp_servers", None)
+    body.pop("session_id", None)
     try:
         upstream = await client.post(
             url, json=body, headers=headers, timeout=profile.timeout_seconds
@@ -374,22 +427,27 @@ async def _post_upstream(
     return completion
 
 
-async def _chat_with_mcp_tools(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: dict[str, str],
-    forward: dict[str, Any],
-    profile: ModelProfile,
-    server_names: list[str],
-) -> Any:
-    """Serve one chat request with MCP tools: connect, advertise, loop.
+async def _resolve_mcp_specs(
+    server_names: list[str], session_id: str | None
+) -> list[Any] | JSONResponse:
+    """Registry lookup + the ``session_id`` docs-search directory override —
+    shared setup between the sync and SSE ``mcp_servers`` chat paths so the
+    registry-only security check and the session-scoped override (#296)
+    have exactly one implementation, not two that can drift.
 
     Registry-only security: every requested name must exist in
     ``settings.mcp_servers_config`` — the request can never point the server
     at an arbitrary URL or command. The ``mcp`` SDK being absent is a clean
     501 (the extra is optional), not an ImportError.
+
+    ``session_id``: when given and ``docs-search`` is among ``server_names``,
+    that server's spec is launched with its documents directory overridden
+    to this session's upload directory instead of the operator's shared
+    one — a Playground attachment uploaded via
+    ``POST /v1/studio/session-documents`` becomes searchable for this
+    conversation without ever touching the shared corpus.
     """
-    from contextlib import AsyncExitStack
+    from dataclasses import replace
 
     from docie_bench import mcp_tools as mcp_mod
 
@@ -411,8 +469,46 @@ async def _chat_with_mcp_tools(
         return _openai_error(str(exc), status_code=501, error_type="mcp_unavailable")
     specs = [registry[name] for name in server_names]
 
+    if session_id is not None and "docs-search" in server_names:
+        from docie_bench.mcp_servers.docs_search import DOCS_DIR_ENV
+        from docie_bench.mcp_session_documents import SessionDocumentError, session_documents_dir
+
+        try:
+            session_dir = session_documents_dir(session_id)
+        except SessionDocumentError as exc:
+            return _openai_error(str(exc), status_code=400, error_type="invalid_request_error")
+        specs = [
+            replace(spec, env={**spec.env, DOCS_DIR_ENV: str(session_dir)})
+            if spec.name == "docs-search"
+            else spec
+            for spec in specs
+        ]
+    return specs
+
+
+async def _chat_with_mcp_tools(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forward: dict[str, Any],
+    profile: ModelProfile,
+    server_names: list[str],
+    session_id: str | None = None,
+) -> Any:
+    """Serve one chat request with MCP tools: connect, advertise, loop."""
+    from contextlib import AsyncExitStack
+
+    from docie_bench import mcp_tools as mcp_mod
+
+    specs = await _resolve_mcp_specs(server_names, session_id)
+    if isinstance(specs, JSONResponse):
+        return specs
+
     async def post(body: dict[str, Any]) -> dict[str, Any] | JSONResponse:
         return await _post_upstream(client, url, headers, body, profile)
+
+    tool_call_trace: list[dict[str, Any]] = []
+    record_tool_call = mcp_mod.make_trace_recorder(tool_call_trace)
 
     try:
         async with AsyncExitStack() as stack:
@@ -425,7 +521,9 @@ async def _chat_with_mcp_tools(
                     status_code=502,
                     error_type="mcp_server_unreachable",
                 )
-            completion = await mcp_mod.run_tool_loop(post, forward, sessions, mapping, tools)
+            completion = await mcp_mod.run_tool_loop(
+                post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
+            )
     except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
         return _openai_error(
             f"MCP session error: {exc}",
@@ -445,7 +543,245 @@ async def _chat_with_mcp_tools(
     recency.stamp_served_profile(profile.name)
     if get_settings().fix_mojibake:
         completion = fix_completion_content(completion)
+    if tool_call_trace:
+        completion = {**completion, "docie_agent": {"tool_calls": tool_call_trace}}
     return completion
+
+
+def _context_length_for_profile(profile: ModelProfile) -> int | None:
+    """The resolved deployment's own ``context_length`` ceiling for
+    ``run_tool_loop``'s context-budget warning (#344), or ``None`` when it
+    can't be resolved.
+
+    Same lookup #333's batch fan-out capacity uses for ``n_parallel`` (both
+    read the live deployment record straight off ``deployments.json`` and
+    pull a field off ``spec.launch``) — here for ``context_length`` instead.
+    ``profile.name`` is the deployment's own name for a live-deployment
+    profile (``profile_resolver._synthesize_profile``); a profile that isn't
+    backed by one (a plain ``models.yaml`` entry, or the env fallback) has
+    no matching record, which is exactly the "unknown/unpriceable" case —
+    fail open, same convention as every other fit/pricing gate in this
+    codebase, rather than guess or block the request.
+    """
+    from docie_bench.serving.profile_resolver import _default_live_deployments
+
+    for record in _default_live_deployments():
+        if record.spec.name == profile.name:
+            return record.spec.launch.context_length
+    return None
+
+
+def _sse_event(payload: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def _error_payload(message: str, error_type: str) -> dict[str, Any]:
+    return {"message": message, "type": error_type, "code": error_type}
+
+
+async def _stream_chat_with_mcp_tools(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forward: dict[str, Any],
+    profile: ModelProfile,
+    server_names: list[str],
+    session_id: str | None,
+    *,
+    tenant_id: str,
+    started: float,
+) -> StreamingResponse:
+    """SSE variant of ``_chat_with_mcp_tools``: each executed tool call is
+    relayed to the client the moment it finishes, instead of the whole
+    multi-round exchange completing silently before anything is sent back —
+    "Waiting for the model…" with no visibility into the agentic search
+    actually running underneath it.
+
+    NOT the OpenAI streaming wire format (there is no meaningful token
+    stream for a tool-calling round) — a caller opts in by setting BOTH
+    ``stream`` and ``mcp_servers``. Event shapes, one JSON object per
+    ``data:`` frame:
+      ``{"type": "system_addendum", "text": <addendum>}`` — fired once per
+        request, before the first model round, when ``run_tool_loop`` folds
+        ``TOOL_DISCIPLINE_DIRECTIVE`` (and any eager-list context) into the
+        request's system message. This is real content injected on top of
+        whatever the caller's own system prompt says, but was never
+        surfaced anywhere until now — a one-time header, not a per-round
+        event. Note a docs-search request's eager-list ``tool_call`` event
+        (see ``_eager_list_context``) is emitted BEFORE this one, since that
+        listing call happens while the addendum text is still being built.
+      ``{"type": "tool_call", "tool", "status", "latency_ms", "arguments",
+        "result"}`` — same shape as the static ``docie_agent.tool_calls``
+        trace (#261/#262), so the frontend's existing ``ToolCallTrace``
+        component renders each one as it arrives instead of only after
+        the fact.
+      ``{"type": "reasoning", "text": <round's reasoning_content>}`` — a
+        reasoning-capable model's "why" for that round (calling a tool, or
+        the final answer), when the chat template emits one separately
+        from ``content``/``tool_calls``. Answers "is there a hidden
+        thinking step before the tool call" with the model's own words
+        instead of leaving it invisible.
+      ``{"type": "usage", "round": {...}, "cumulative": {...}}`` — that
+        round's own token usage plus the running cumulative totals through
+        this round (``run_tool_loop``'s ``on_usage``), the raw counts with
+        no context-window denominator. Lets a client show how much a live
+        agentic exchange is consuming before the final completion lands,
+        instead of only after the whole exchange finishes.
+      ``{"type": "context_budget", "cumulative_tokens", "context_length",
+        "threshold_fraction"}`` — fired AT MOST ONCE per exchange (#344),
+        the first round whose cumulative usage crosses
+        ``settings.mcp_context_budget_warn_fraction`` (default 80%) of the
+        resolved deployment's own ``context_length`` (see
+        ``_context_length_for_profile``). A WARNING only — a long agentic
+        exchange can otherwise run several real rounds before a LATER
+        round's cumulative usage exceeds the deployment's context window and
+        llama-server hard-400s, losing the whole in-progress exchange with
+        no prior warning. Never fires when the ceiling can't be resolved
+        (an unknown/unpriceable deployment) — fail-open, same as every
+        other fit/pricing gate in this codebase.
+      ``{"type": "content", "completion": <final OpenAI-shaped completion>}``
+      ``{"type": "error", "error": {"message", "type", "code"}}``
+    Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
+    convention ``_stream_chat_completions`` uses.
+    """
+    import asyncio
+    import contextlib
+    from contextlib import AsyncExitStack
+
+    from docie_bench import mcp_tools as mcp_mod
+
+    context_length_ceiling = _context_length_for_profile(profile)
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    class _QueueTraceSink(list[dict[str, Any]]):
+        """``make_trace_recorder`` only knows how to ``.append()`` to a
+        list — this subclass reuses its exact stringify/truncate formatting
+        while also pushing each entry onto the SSE queue the instant it's
+        recorded, without needing a second, separately-formatted event."""
+
+        def append(self, item: dict[str, Any]) -> None:
+            super().append(item)
+            queue.put_nowait({"type": "tool_call", **item})
+
+    async def drive() -> None:
+        outcome: Any = None
+        try:
+            specs = await _resolve_mcp_specs(server_names, session_id)
+            if isinstance(specs, JSONResponse):
+                body = json.loads(bytes(specs.body))
+                outcome = specs
+                queue.put_nowait({"type": "error", "error": body.get("error", body)})
+                return
+
+            async def post(body: dict[str, Any]) -> dict[str, Any] | JSONResponse:
+                return await _post_upstream(client, url, headers, body, profile)
+
+            trace = _QueueTraceSink()
+            record_tool_call = mcp_mod.make_trace_recorder(trace)
+            try:
+                async with AsyncExitStack() as stack:
+                    try:
+                        sessions = await mcp_mod.open_mcp_sessions(stack, specs)
+                        tools, mapping = await mcp_mod.collect_openai_tools(sessions)
+                    except Exception as exc:  # noqa: BLE001 - connect/handshake failure
+                        message = f"could not connect to MCP server(s): {exc}"
+                        outcome = _openai_error(
+                            message, status_code=502, error_type="mcp_server_unreachable"
+                        )
+                        error = _error_payload(message, "mcp_server_unreachable")
+                        queue.put_nowait({"type": "error", "error": error})
+                        return
+                    completion = await mcp_mod.run_tool_loop(
+                        post,
+                        forward,
+                        sessions,
+                        mapping,
+                        tools,
+                        on_tool_call=record_tool_call,
+                        on_reasoning=lambda text: queue.put_nowait(
+                            {"type": "reasoning", "text": text}
+                        ),
+                        on_system_addendum=lambda text: queue.put_nowait(
+                            {"type": "system_addendum", "text": text}
+                        ),
+                        on_usage=lambda usage: queue.put_nowait({"type": "usage", **usage}),
+                        context_length_ceiling=context_length_ceiling,
+                        on_context_budget=lambda budget: queue.put_nowait(
+                            {"type": "context_budget", **budget}
+                        ),
+                    )
+            except Exception as exc:  # noqa: BLE001 - transport teardown failure
+                message = f"MCP session error: {exc}"
+                outcome = _openai_error(
+                    message, status_code=502, error_type="mcp_server_unreachable"
+                )
+                queue.put_nowait(
+                    {"type": "error", "error": _error_payload(message, "mcp_server_unreachable")}
+                )
+                return
+            if completion is None:
+                message = (
+                    f"model kept calling tools for {get_settings().mcp_max_tool_iterations} "
+                    "rounds without a final answer — raise mcp_max_tool_iterations or "
+                    "simplify the request"
+                )
+                outcome = _openai_error(
+                    message, status_code=502, error_type="mcp_tool_loop_exhausted"
+                )
+                queue.put_nowait(
+                    {"type": "error", "error": _error_payload(message, "mcp_tool_loop_exhausted")}
+                )
+                return
+            if isinstance(completion, JSONResponse):
+                outcome = completion
+                body = json.loads(bytes(completion.body))
+                queue.put_nowait({"type": "error", "error": body.get("error", body)})
+                return
+            recency.stamp_served_profile(profile.name)
+            if get_settings().fix_mojibake:
+                completion = fix_completion_content(completion)
+            if trace:
+                completion = {**completion, "docie_agent": {"tool_calls": trace}}
+            outcome = completion
+            queue.put_nowait({"type": "content", "completion": completion})
+        except asyncio.CancelledError:
+            # The client disconnected (body_iterator's finally cancels us) --
+            # not a failure to report, just stop.
+            raise
+        except Exception as exc:  # noqa: BLE001 - last-resort net: an unexpected bug here must
+            # still reach the client as an error frame, never a silent early
+            # [DONE] with no explanation (that's strictly worse than a loud
+            # 500 -- it looks like the model just... stopped).
+            outcome = _openai_error(
+                f"unexpected error in the MCP tool loop: {exc}",
+                status_code=500,
+                error_type="internal_error",
+            )
+            queue.put_nowait({"type": "error", "error": _error_payload(str(exc), "internal_error")})
+        finally:
+            _record_usage_outcome(profile.name, "chat", tenant_id, started, outcome)
+            queue.put_nowait(None)
+
+    async def body_iterator() -> AsyncIterator[bytes]:
+        task = asyncio.create_task(drive())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield _sse_event(item)
+        finally:
+            if not task.done():
+                task.cancel()
+            # Only a cancellation WE just triggered (client disconnect) is
+            # expected here -- drive() itself already turned every other
+            # failure into an error frame before its sentinel, so nothing
+            # else should reach this await.
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(body_iterator(), media_type="text/event-stream")
 
 
 @router.get("/v1/mcp/servers")

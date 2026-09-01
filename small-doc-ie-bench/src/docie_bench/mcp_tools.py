@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -296,6 +297,173 @@ def _accumulate_usage(totals: dict[str, int], usage: Any) -> None:
             totals[key] += value
 
 
+# A tool's arguments/result can be arbitrarily large (a document, an OCR
+# dump) -- the trace rides the live completion response, so cap each field
+# rather than let one tool call balloon the payload. 4000 clipped routine
+# docs-search results (a read_document on a multi-page PDF, a search_text
+# with many hits) in practice (#284); 20000 covers those while still
+# bounding a truly pathological result.
+TRACE_TEXT_LIMIT = 20_000
+
+
+def _stringify_tool_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _truncate_trace_text(text: str) -> str:
+    if len(text) <= TRACE_TEXT_LIMIT:
+        return text
+    return text[:TRACE_TEXT_LIMIT] + f"… ({len(text)} chars total)"
+
+
+# Generic across every MCP server, not docs-search-specific: any server that
+# exposes a "list X" tool alongside tools that take one of X's identifiers as
+# an argument has the same failure mode -- a small model skips the listing
+# call, or invents a plausible-looking id instead of using one it actually
+# saw. A per-tool error message that includes the real listing (see
+# docs_search.resolve_document) helps a model self-correct AFTER a bad call,
+# but doesn't stop the first one; this directive is the upfront half of that
+# same fix.
+TOOL_DISCIPLINE_DIRECTIVE = (
+    "Tool discipline: when a tool takes an identifier (a path, id, or name) "
+    "that another tool lists, call the listing tool first and use one of its "
+    "results EXACTLY as returned. Never invent, guess, or construct an "
+    "identifier from other context. If the listing has nothing relevant, say "
+    "so directly instead of guessing."
+)
+
+# Stable prefix marking the one line of the system message _with_context_budget_line
+# owns -- lets it find-and-REPLACE its own line every round instead of
+# appending a new stale snapshot each time (which would make the model's
+# context problem worse while trying to warn it about one).
+_CONTEXT_BUDGET_PREFIX = "Context budget:"
+
+
+def _context_budget_line(used_tokens: int, ceiling: int) -> str:
+    """The model-facing budget line for this round's CURRENT standing.
+
+    The model is told about the budget from round 1 (0/ceiling) and this is
+    re-folded every round after, always reflecting the latest cumulative
+    total -- not a one-time warning near the wall, continuous awareness so
+    the model can pace itself across the whole exchange (#344, revised per
+    explicit feedback: a late warning alone isn't enough).
+    """
+    percent = round(100 * used_tokens / ceiling) if ceiling else 0
+    return (
+        f"{_CONTEXT_BUDGET_PREFIX} {used_tokens}/{ceiling} tokens used ({percent}%) in this "
+        "exchange so far. Pace yourself -- as this climbs, wrap up and answer with what you "
+        "have rather than continuing to call tools, unless one more targeted call is clearly "
+        "necessary to answer at all."
+    )
+
+
+def _with_system_addendum(messages: list[dict[str, Any]], addendum: str) -> list[dict[str, Any]]:
+    """Fold ``addendum`` into the request's system message — appended to the
+    caller's own system prompt if one exists, otherwise inserted as a new
+    one. Never adds a second ``system`` message: chat templates commonly
+    assume at most one, and merging keeps that true regardless of what the
+    caller supplied.
+    """
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = f"{content}\n\n{addendum}"
+                return messages
+    return [{"role": "system", "content": addendum}, *messages]
+
+
+def _with_context_budget_line(messages: list[dict[str, Any]], line: str) -> list[dict[str, Any]]:
+    """Fold ``line`` into the system message, REPLACING any previous budget
+    line (found via ``_CONTEXT_BUDGET_PREFIX``) rather than appending a new
+    one each round. The model always sees its CURRENT standing as one line,
+    never a growing history of stale snapshots eating its own budget.
+    """
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str):
+                text_lines = content.split("\n")
+                for i, existing in enumerate(text_lines):
+                    if existing.startswith(_CONTEXT_BUDGET_PREFIX):
+                        text_lines[i] = line
+                        message["content"] = "\n".join(text_lines)
+                        return messages
+                message["content"] = f"{content}\n\n{line}"
+                return messages
+    return [{"role": "system", "content": line}, *messages]
+
+
+async def _eager_list_context(
+    sessions: Mapping[str, ClientSession],
+    mapping: Mapping[str, tuple[str, str]],
+    on_tool_call: Callable[[str, bool, int, Any, str], None] | None,
+) -> str | None:
+    """Auto-call every advertised tool a catalog entry marks as its
+    ``eager_list_tool`` (docs-search's ``list_files``) once, up front, and
+    return their results as context text — or ``None`` if none apply.
+
+    The model then starts the request already knowing the real identifiers
+    for that server instead of discovering them (or inventing them) via a
+    tool call it may skip or get wrong. Complements ``TOOL_DISCIPLINE_DIRECTIVE``:
+    that's an instruction the model might ignore, this makes the listing
+    true regardless of whether it does. Reported through ``on_tool_call``
+    exactly like a model-issued call, same as a real one, so it shows up in
+    the trace instead of happening invisibly.
+    """
+    from docie_bench.mcp_catalog import CATALOG
+
+    lines: list[str] = []
+    for qualified_name, (server_name, tool_name) in mapping.items():
+        entry = CATALOG.get(server_name)
+        if entry is None or entry.eager_list_tool != tool_name:
+            continue
+        call_started = time.monotonic()
+        result = await execute_tool_call(sessions, mapping, qualified_name, {})
+        if on_tool_call is not None:
+            on_tool_call(
+                qualified_name,
+                not result.startswith("error:"),
+                int((time.monotonic() - call_started) * 1000),
+                {},
+                result,
+            )
+        lines.append(
+            f"{server_name}.{tool_name}() was already called for you. Its result -- "
+            f"the ONLY valid identifiers for {server_name} right now -- is:\n{result}\n"
+            f"Use one of these EXACTLY as returned whenever a {server_name} tool asks "
+            "for an identifier. Never modify, translate, or construct a different one."
+        )
+    return "\n\n".join(lines) if lines else None
+
+
+def make_trace_recorder(
+    trace: list[dict[str, Any]],
+) -> Callable[[str, bool, int, Any, str], None]:
+    """Build an ``on_tool_call`` callback that appends each call's outcome to
+    ``trace`` in the shared "Try it" trace shape (tool/status/latency_ms/
+    arguments/result). One instance of this shape is used by both the Agents
+    surface (#261/#262) and the generic ``mcp_servers`` chat surface, so a
+    caller's trace list always renders identically regardless of which
+    endpoint produced it.
+    """
+
+    def record(name: str, ok: bool, latency_ms: int, arguments: Any, result: str) -> None:
+        trace.append(
+            {
+                "tool": name,
+                "status": "ok" if ok else "error",
+                "latency_ms": latency_ms,
+                "arguments": _truncate_trace_text(_stringify_tool_value(arguments)),
+                "result": _truncate_trace_text(result),
+            }
+        )
+
+    return record
+
+
 async def run_tool_loop(
     post: Callable[[dict[str, Any]], Awaitable[Any]],
     body: Mapping[str, Any],
@@ -303,6 +471,12 @@ async def run_tool_loop(
     mapping: Mapping[str, tuple[str, str]],
     mcp_tools: list[dict[str, Any]],
     max_iterations: int | None = None,
+    on_tool_call: Callable[[str, bool, int, Any, str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
+    on_system_addendum: Callable[[str], None] | None = None,
+    on_usage: Callable[[dict[str, Any]], None] | None = None,
+    context_length_ceiling: int | None = None,
+    on_context_budget: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
@@ -312,10 +486,104 @@ async def run_tool_loop(
     the error object from ``post``, or ``None`` when ``max_iterations``
     rounds all ended in tool calls — the route maps that to an explicit 502
     rather than silently returning a half-finished exchange.
+
+    ``on_tool_call``, when given, is invoked synchronously right after each
+    executed tool call with ``(qualified_name, ok, latency_ms, arguments,
+    result)`` — ``arguments`` is exactly what the model sent (string or
+    object, unparsed), ``result`` the text handed back to the model. Pass
+    ``make_trace_recorder``'s output to collect a "Try it"-shaped trace
+    (#261/#262); both the Agents surface and the generic ``mcp_servers`` chat
+    surface use it.
+
+    Whenever ``mcp_tools`` is non-empty, ``TOOL_DISCIPLINE_DIRECTIVE`` is
+    folded into the request's system message before the first round — a
+    small model reliably skips a "call this first" tool docstring, so the
+    same instruction is repeated at the request level for every caller
+    automatically, not left to each caller's own system prompt. Any
+    catalog-declared ``eager_list_tool`` (docs-search's ``list_files``) is
+    also called once up front and its result folded in alongside it — see
+    ``_eager_list_context``.
+
+    ``on_reasoning``, when given, is invoked once per round with that
+    round's ``message.reasoning_content`` whenever it's a non-empty string —
+    a reasoning-capable model (LFM2.5's bundled chat template opens
+    ``<think>`` unconditionally) emits its "why" for calling a tool (or for
+    the final answer) in this SEPARATE field when ``--jinja`` is on;
+    ``message.content``/``tool_calls`` stay clean either way. Fires for
+    EVERY round, including the last one, so "is there a hidden thinking
+    step before the tool call, or does the model just formulate it
+    directly" has a real answer instead of that reasoning being silently
+    discarded.
+
+    ``on_system_addendum``, when given, is invoked exactly once — right
+    after the addendum above is folded into ``messages``, before the first
+    round ever runs — with the FULL addendum text actually used (directive
+    alone, or directive plus eager-list context). Only fires when
+    ``mcp_tools`` is non-empty, same condition that builds the addendum in
+    the first place; a request with no MCP tools in play never calls this.
+    This is real, load-bearing content injected on top of whatever system
+    prompt the caller supplied, but until now it was never surfaced
+    anywhere a caller could see it.
+
+    ``on_usage``, when given, is invoked once per round, right after that
+    round's ``completion.get("usage")`` is read, with a single dict:
+    ``{"round": <that round's own usage dict, or {} when absent>,
+    "cumulative": <running totals through this round>}``. Per-round shows
+    the cost of the last action; cumulative shows total consumption so
+    far — there is currently no other way to see how close a live agentic
+    exchange is getting to the deployment's context window without reading
+    the final completion's summed ``usage`` by hand after the whole
+    exchange already finished. Fires for EVERY round, including the last
+    one, same as ``on_reasoning``.
+
+    ``context_length_ceiling``, when given, is the resolved deployment's own
+    context window (its ``spec.launch.context_length`` deployment record) --
+    the caller resolves this BEFORE the loop starts, from the same
+    ``deployments.json`` this codebase already reads for capacity elsewhere.
+    ``None`` means the ceiling could not be resolved (an unknown/unpriceable
+    deployment, or a profile not backed by a live deployment record at all)
+    and the check below is skipped entirely -- fail-open, the same convention
+    every fit/pricing gate in this codebase uses for an unknowable value.
+
+    Whenever ``context_length_ceiling`` is known, the model is told about its
+    budget from the FIRST round on, not just warned once late: a
+    ``_CONTEXT_BUDGET_PREFIX``-marked line is folded into the system message
+    before round 1 (``0/ceiling``), then RE-FOLDED (replacing that same
+    line, never appended anew) after every round with the latest cumulative
+    total -- continuous awareness the model can pace itself against for the
+    whole exchange, not a single late warning near the wall.
+
+    Separately, ``on_context_budget``, when given, is invoked ONCE -- the
+    first round cumulative ``total_tokens`` reaches
+    ``settings.mcp_context_budget_warn_fraction`` (default 80%) of the
+    ceiling -- with ``{"cumulative_tokens": <int>, "context_length": <int>,
+    "threshold_fraction": <float>}``. This is the human/UI-facing mirror,
+    for a caller that wants a one-time actionable warning of its own (the
+    Playground renders it as a banner); it is independent of the continuous
+    model-facing line above, which happens regardless of whether this
+    callback is given.
+
+    Neither truncates, summarizes, or otherwise forces the exchange to end --
+    a cumulative total several real rounds deep can still hit a hard
+    ``exceed_context_size_error`` from llama-server on some LATER round if
+    the model doesn't act on its own budget awareness; this narrows that
+    risk, it doesn't eliminate it.
     """
     limit = max_iterations if max_iterations is not None else get_settings().mcp_max_tool_iterations
     forward = dict(body)
     messages = [dict(m) if isinstance(m, dict) else m for m in (forward.get("messages") or [])]
+    if mcp_tools:
+        addendum = TOOL_DISCIPLINE_DIRECTIVE
+        eager_context = await _eager_list_context(sessions, mapping, on_tool_call)
+        if eager_context:
+            addendum = f"{addendum}\n\n{eager_context}"
+        messages = _with_system_addendum(messages, addendum)
+        if on_system_addendum is not None:
+            on_system_addendum(addendum)
+    if context_length_ceiling is not None:
+        messages = _with_context_budget_line(
+            messages, _context_budget_line(0, context_length_ceiling)
+        )
     caller_tools = list(forward.get("tools") or [])
     caller_tool_names = {
         str(t.get("function", {}).get("name"))
@@ -324,18 +592,48 @@ async def run_tool_loop(
     }
     forward["tools"] = caller_tools + mcp_tools
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    context_budget_warned = False
     for _ in range(limit):
         forward["messages"] = messages
         completion = await post(forward)
         if not isinstance(completion, dict):
             return completion
-        _accumulate_usage(totals, completion.get("usage"))
+        round_usage = completion.get("usage")
+        _accumulate_usage(totals, round_usage)
+        if on_usage is not None:
+            on_usage(
+                {
+                    "round": round_usage if isinstance(round_usage, dict) else {},
+                    "cumulative": dict(totals),
+                }
+            )
+        if context_length_ceiling is not None:
+            # Model-facing: re-fold every round with the latest cumulative
+            # total, independent of the one-time human-facing signal below.
+            messages = _with_context_budget_line(
+                messages, _context_budget_line(totals["total_tokens"], context_length_ceiling)
+            )
+            if on_context_budget is not None and not context_budget_warned:
+                threshold_fraction = get_settings().mcp_context_budget_warn_fraction
+                if totals["total_tokens"] >= context_length_ceiling * threshold_fraction:
+                    context_budget_warned = True
+                    on_context_budget(
+                        {
+                            "cumulative_tokens": totals["total_tokens"],
+                            "context_length": context_length_ceiling,
+                            "threshold_fraction": threshold_fraction,
+                        }
+                    )
         choices = completion.get("choices")
         message = (
             choices[0].get("message")
             if isinstance(choices, list) and choices and isinstance(choices[0], dict)
             else None
         )
+        if on_reasoning is not None and isinstance(message, dict):
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                on_reasoning(reasoning)
         calls = message.get("tool_calls") if isinstance(message, dict) else None
         names = [
             str(call.get("function", {}).get("name", ""))
@@ -362,9 +660,18 @@ async def run_tool_loop(
             if not isinstance(call, dict):
                 continue
             function = call.get("function") or {}
-            result_text = await execute_tool_call(
-                sessions, mapping, str(function.get("name")), function.get("arguments")
-            )
+            call_name = str(function.get("name"))
+            call_arguments = function.get("arguments")
+            call_started = time.monotonic()
+            result_text = await execute_tool_call(sessions, mapping, call_name, call_arguments)
+            if on_tool_call is not None:
+                on_tool_call(
+                    call_name,
+                    not result_text.startswith("error:"),
+                    int((time.monotonic() - call_started) * 1000),
+                    call_arguments,
+                    result_text,
+                )
             messages.append(
                 {
                     "role": "tool",

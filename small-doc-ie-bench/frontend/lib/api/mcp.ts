@@ -63,3 +63,21 @@ export function testMcpServer(
 ): Promise<{ name: string; ok: boolean; tools: McpTool[] }> {
   return request(`/v1/mcp/servers/${encodeURIComponent(name)}/test`, { method: "POST" });
 }
+
+/** One Judge0 queue's worker-pool state (docker-compose's judge0-server,
+ * #264) — verified against Judge0's own GET /workers response shape. */
+export interface CodeInterpreterQueue {
+  queue: string;
+  size: number;
+  available: number;
+  idle: number;
+  working: number;
+  paused: number;
+  failed: number;
+}
+
+/** Only meaningful for the "code-interpreter" server (#264's sandboxed
+ * execution) — a status card nested in the MCP tab, not a new page. */
+export function getCodeInterpreterWorkers(): Promise<{ queues: CodeInterpreterQueue[] }> {
+  return request("/v1/mcp/servers/code-interpreter/workers");
+}
