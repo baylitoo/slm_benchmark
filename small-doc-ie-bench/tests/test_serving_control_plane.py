@@ -224,6 +224,22 @@ def test_up_bridges_store_entry_to_a_correct_llama_server_launch_spec(tmp_path: 
     assert command[-3:] == ("--jinja", "--mmproj", mmproj_posix)
 
 
+def test_up_threads_n_gpu_layers_into_launch_spec(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    _seed_nuextract3_store(root)
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json",
+        adapters={RuntimeKind.LLAMACPP: FakeAdapter()},
+    )
+    wrapper = _DefaultSupervisor(supervisor, planner=None, model_store_root=root)
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(plane.up("nuextract3", port=8088, n_gpu_layers=32))
+
+    launch = supervisor.get("nuextract3").spec.launch
+    assert launch.n_gpu_layers == 32
+
+
 def test_up_missing_entry_raises_with_store_root_and_seeding_pointer(tmp_path: Path) -> None:
     root = tmp_path / "models"
     supervisor = PersistentSupervisor(
@@ -533,6 +549,27 @@ def test_serve_allocates_and_skips_remote(tmp_path: Path) -> None:
     # REMOTE binds nothing locally -> no allocation, no probe, default port kept.
     assert backend.specs[-1].launch.port == 8000
     assert probe_calls == []
+
+
+def test_serve_threads_n_gpu_layers_into_launch_spec(tmp_path: Path) -> None:
+    del tmp_path
+    backend = _CaptureBackend()
+    wrapper = _DefaultSupervisor(
+        backend,
+        planner=None,
+        port_range=(8088, 8188),
+        port_probe=_always_free,
+        **_loopback_hosts(),
+    )
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+
+    asyncio.run(
+        plane.serve(
+            "org/model", name="llamacpp-dep", runtime="llamacpp", replicas=1, n_gpu_layers=32
+        )
+    )
+
+    assert backend.specs[-1].launch.n_gpu_layers == 32
 
 
 def test_serve_reallocates_on_immediate_exit(tmp_path: Path) -> None:
