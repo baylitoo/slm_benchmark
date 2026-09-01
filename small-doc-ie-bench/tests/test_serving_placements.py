@@ -110,6 +110,9 @@ _SERVE_RECORD: dict[str, Any] = {
 
 
 class _FakeServeControlPlane:
+    def __init__(self) -> None:
+        self.serve_calls: list[dict[str, Any]] = []
+
     async def serve(
         self,
         model: str,
@@ -120,7 +123,16 @@ class _FakeServeControlPlane:
         max_tokens: int | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        n_gpu_layers: int | None = None,
     ) -> dict[str, Any]:
+        self.serve_calls.append(
+            {
+                "model": model,
+                "n_parallel": n_parallel,
+                "cache_reuse": cache_reuse,
+                "n_gpu_layers": n_gpu_layers,
+            }
+        )
         return _SERVE_RECORD
 
 
@@ -144,6 +156,35 @@ def test_run_deploy_records_placement_for_runtime_deploys(
     assert placement["model_name"] == "invoice-extractor"
     assert placement["endpoint"] == "http://127.0.0.1:8088/v1"
     assert placement["state"] == "ready"
+
+
+def test_run_deploy_threads_n_gpu_layers_for_runtime_deploys(monkeypatch) -> None:
+    """The worker job (functions._run_deploy) must pull n_gpu_layers off the
+    event data the same way it already does for n_parallel/cache_reuse
+    (#248/#321) and forward it to the control plane's `serve`."""
+    from docie_bench.inngest import functions
+
+    db.dispose_engine()
+    fake_plane = _FakeServeControlPlane()
+    monkeypatch.setattr(functions, "_serving_control_plane", lambda: fake_plane)
+    asyncio.run(
+        functions._run_deploy(
+            {"model": "invoice-extractor", "runtime": "llamacpp", "n_gpu_layers": 32}
+        )
+    )
+
+    assert fake_plane.serve_calls[-1]["n_gpu_layers"] == 32
+
+
+def test_run_deploy_omits_n_gpu_layers_when_absent(monkeypatch) -> None:
+    from docie_bench.inngest import functions
+
+    db.dispose_engine()
+    fake_plane = _FakeServeControlPlane()
+    monkeypatch.setattr(functions, "_serving_control_plane", lambda: fake_plane)
+    asyncio.run(functions._run_deploy({"model": "invoice-extractor", "runtime": "llamacpp"}))
+
+    assert fake_plane.serve_calls[-1]["n_gpu_layers"] is None
 
 
 def test_run_deploy_survives_missing_database(monkeypatch) -> None:

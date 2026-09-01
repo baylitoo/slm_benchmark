@@ -1131,6 +1131,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     n_parallel = int(raw_n_parallel) if raw_n_parallel is not None else 1
     raw_cache_reuse = data.get("cache_reuse")
     cache_reuse = int(raw_cache_reuse) if raw_cache_reuse is not None else None
+    raw_n_gpu_layers = data.get("n_gpu_layers")
+    n_gpu_layers = int(raw_n_gpu_layers) if raw_n_gpu_layers is not None else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1142,6 +1144,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             ),
             n_parallel=n_parallel,
             cache_reuse=cache_reuse,
+            n_gpu_layers=n_gpu_layers,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1166,6 +1169,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             deployment_name=str(raw_dep_name) if raw_dep_name else None,
             n_parallel=n_parallel,
             cache_reuse=cache_reuse,
+            n_gpu_layers=n_gpu_layers,
         )
     return record
 

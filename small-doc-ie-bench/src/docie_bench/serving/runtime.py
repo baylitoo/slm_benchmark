@@ -92,6 +92,10 @@ class RuntimeLaunchSpec:
     # build_command never reads these.
     n_parallel: int = 1
     cache_reuse: int | None = None
+    # GPU offload (#362): None = operator didn't specify, use llama-server's
+    # own default; 0 is a legitimate "explicitly no offload" value, distinct
+    # from None.
+    n_gpu_layers: int | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -120,6 +124,8 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("n_parallel must be positive")
         if self.cache_reuse is not None and self.cache_reuse < 1:
             raise RuntimeConfigurationError("cache_reuse must be positive")
+        if self.n_gpu_layers is not None and self.n_gpu_layers < 0:
+            raise RuntimeConfigurationError("n_gpu_layers must not be negative")
 
 
 @dataclass(frozen=True)
@@ -700,6 +706,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--threads", str(spec.cpu_threads)])
         if spec.cache_reuse is not None:
             command.extend(["--cache-reuse", str(spec.cache_reuse)])
+        if spec.n_gpu_layers is not None:
+            command.extend(["--n-gpu-layers", str(spec.n_gpu_layers)])
         command.extend(spec.extra_args)
         return tuple(command)
 

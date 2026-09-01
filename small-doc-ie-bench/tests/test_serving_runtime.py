@@ -206,6 +206,70 @@ def test_launch_spec_rejects_invalid_n_parallel_and_cache_reuse() -> None:
         _spec(RuntimeKind.LLAMACPP, cache_reuse=0)
 
 
+def test_llamacpp_n_gpu_layers_default_is_byte_identical_to_before() -> None:
+    """n_gpu_layers=None (the default) must never emit --n-gpu-layers -- this
+    is the existing, already-tested default path (#362)."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        context_length=4096,
+        cpu_threads=12,
+    )
+
+    assert adapter.build_command(spec) == (
+        "llama-server",
+        "--model",
+        "C:/models/invoice.gguf",
+        "--alias",
+        "invoice",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--jinja",
+        "--ctx-size",
+        "4096",
+        "--threads",
+        "12",
+    )
+
+
+def test_llamacpp_n_gpu_layers_emits_flag() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        n_gpu_layers=32,
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--n-gpu-layers" in command
+    assert command[command.index("--n-gpu-layers") + 1] == "32"
+
+
+def test_llamacpp_n_gpu_layers_zero_is_explicit_no_offload_and_still_emits_flag() -> None:
+    """0 means "explicitly no offload", distinct from None ("use llama-server's
+    own default") -- it must still emit the flag."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        n_gpu_layers=0,
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--n-gpu-layers" in command
+    assert command[command.index("--n-gpu-layers") + 1] == "0"
+
+
+def test_launch_spec_rejects_negative_n_gpu_layers() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="n_gpu_layers"):
+        _spec(RuntimeKind.LLAMACPP, n_gpu_layers=-1)
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
