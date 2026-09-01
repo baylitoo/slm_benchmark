@@ -17,6 +17,8 @@ import {
   FilePlus2,
   Gauge,
   Paperclip,
+  Pencil,
+  RotateCcw,
   Wrench,
   X,
 } from "lucide-react";
@@ -315,6 +317,20 @@ export function ChatPanel({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Index of a user message currently being edited (its content is loaded
+  // into the main input box). null when nothing is being edited. Consumed by
+  // sendChat: submitting while this is set truncates msgs to everything
+  // BEFORE this index instead of appending to the full history (#343).
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  // The exact { next, payload } sendChat last handed to attempt() -- kept so
+  // Regenerate can replay the identical request (same messages array) rather
+  // than reconstructing it, which would risk drifting from what was actually
+  // sent (e.g. a multimodal attachment on that turn) (#343).
+  const lastRequestRef = useRef<{
+    next: ChatMsg[];
+    payload: { role: string; content: unknown }[];
+  } | null>(null);
 
   // --- Attachment (vision + extraction file input share one attach slot) ---
   const [file, setFile] = useState<File | null>(null);
@@ -475,10 +491,16 @@ export function ChatPanel({
     }
     setError(null);
 
+    // Editing an earlier user message (#343): everything from that message
+    // onward is dropped -- the edited text becomes the new next message, as
+    // if the conversation forked at that point. A plain send (editingIndex
+    // null) keeps the full history.
+    const baseMsgs = editingIndex !== null ? msgs.slice(0, editingIndex) : msgs;
+
     // Prior turns replay as plain text (an attachment from an earlier turn
     // isn't re-sent — only its display label is kept, same convention every
     // OpenAI-style chat playground uses for image history).
-    const priorHistory = msgs
+    const priorHistory = baseMsgs
       .filter((m): m is ChatMsg & { role: "user" | "assistant" } =>
         m.role === "user" || m.role === "assistant",
       )
@@ -554,9 +576,10 @@ export function ChatPanel({
       }
     }
 
-    const next: ChatMsg[] = [...msgs, { role: "user", content: displayLabel }];
+    const next: ChatMsg[] = [...baseMsgs, { role: "user", content: displayLabel }];
     setMsgs(next);
     setInput("");
+    setEditingIndex(null);
     clearAttachment();
     setBusy(true);
     const payload = [
@@ -564,8 +587,39 @@ export function ChatPanel({
       ...priorHistory,
       { role: "user", content: newContent },
     ];
+    lastRequestRef.current = { next, payload };
     await attempt(next, payload, 0);
     setBusy(false);
+  }
+
+  // Regenerate (#343): replays the exact same request the last completed
+  // turn sent -- same messages array, no new params -- and REPLACES the last
+  // assistant message with the new response instead of appending a
+  // duplicate. attempt() already does that replacement whenever the message
+  // at `next.length` exists, which is exactly the last assistant reply here.
+  async function regenerate() {
+    if (busy) return;
+    const last = lastRequestRef.current;
+    if (!last) return;
+    setError(null);
+    setBusy(true);
+    await attempt(last.next, last.payload, 0);
+    setBusy(false);
+  }
+
+  function startEdit(i: number) {
+    if (busy) return;
+    const target = msgs[i];
+    if (!target || target.role !== "user") return;
+    setEditingIndex(i);
+    setInput(target.content);
+    clearAttachment();
+    inputRef.current?.focus();
+  }
+
+  function cancelEdit() {
+    setEditingIndex(null);
+    setInput("");
   }
 
   async function attempt(
@@ -769,7 +823,13 @@ export function ChatPanel({
             <input
               type="checkbox"
               checked={extractionOn}
-              onChange={(e) => setExtractionOn(e.target.checked)}
+              onChange={(e) => {
+                setExtractionOn(e.target.checked);
+                // Extraction turns don't participate in edit/truncate — drop
+                // any in-progress chat-message edit rather than leaving it
+                // to silently apply (or not) to a mode it wasn't meant for.
+                if (e.target.checked) cancelEdit();
+              }}
               className="h-4 w-4 rounded border-border"
             />
             <Sparkles className="h-4 w-4 text-muted-foreground" />
@@ -976,6 +1036,30 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.role === "user" && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => startEdit(i)}
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    title={t("Edit this message and resend (drops everything after it)")}
+                  >
+                    <Pencil className="h-3 w-3" />
+                    <T>Edit</T>
+                  </button>
+                )}
+                {m.role === "assistant" && i === msgs.length - 1 && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void regenerate()}
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    title={t("Resend the same request and replace this answer")}
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    <T>Regenerate</T>
+                  </button>
+                )}
                 {m.contextBudgetWarning && (
                   <Alert tone="warn" className="w-full max-w-[85%]">
                     <span>
@@ -1107,6 +1191,24 @@ export function ChatPanel({
 
         {error && <Alert tone="err">{error}</Alert>}
 
+        {editingIndex !== null && (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5">
+              <Pencil className="h-3.5 w-3.5" />
+              <T>
+                Editing an earlier message — sending will drop everything after it.
+              </T>
+            </span>
+            <button
+              type="button"
+              onClick={cancelEdit}
+              className="shrink-0 font-medium text-muted-foreground hover:text-foreground"
+            >
+              <T>Cancel</T>
+            </button>
+          </div>
+        )}
+
         <div className="flex items-end gap-2">
           <label
             className={cn(
@@ -1124,6 +1226,7 @@ export function ChatPanel({
             />
           </label>
           <TextArea
+            ref={inputRef}
             rows={2}
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -1136,7 +1239,9 @@ export function ChatPanel({
             placeholder={
               extractionOn
                 ? "Paste document text, or attach a file (Enter to run)…"
-                : "Type a message, attach an image/PDF (Enter to send, Shift+Enter for a new line)…"
+                : editingIndex !== null
+                  ? "Edit your message (Enter to resend, Shift+Enter for a new line)…"
+                  : "Type a message, attach an image/PDF (Enter to send, Shift+Enter for a new line)…"
             }
           />
           <Button type="button" loading={busy} disabled={chatNames.length === 0} onClick={submit}>
@@ -1151,6 +1256,9 @@ export function ChatPanel({
               setMsgs([]);
               setError(null);
               docsSearchSessionIdRef.current = undefined;
+              lastRequestRef.current = null;
+              setEditingIndex(null);
+              setInput("");
             }}
             title="Clear the conversation"
           >
