@@ -316,6 +316,113 @@ def test_get_search_backend_rejects_unknown_name() -> None:
         docs_search.get_search_backend("vector")
 
 
+def test_get_search_backend_returns_hybrid(docs: Path) -> None:
+    hybrid_cls = docs_search.HybridSearchBackend
+    assert isinstance(docs_search.get_search_backend("hybrid"), hybrid_cls)
+    assert isinstance(docs_search.get_search_backend("HYBRID"), hybrid_cls)
+    # substring stays exactly what it was -- adding hybrid didn't touch it.
+    substring_cls = docs_search.SubstringSearchBackend
+    assert isinstance(docs_search.get_search_backend("substring"), substring_cls)
+
+
+def _mock_reranker(monkeypatch, handler) -> list:
+    """Patch ``httpx.post`` (used by ``docs_search._rerank``) to answer via
+    ``handler``, same MockTransport pattern as code_interpreter's tests."""
+    captured: list[httpx.Request] = []
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return handler(request)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: real_client(transport=httpx.MockTransport(wrapped)).post(url, **kw),
+    )
+    return captured
+
+
+def test_hybrid_backend_reranks_substring_candidates_by_semantic_score(
+    docs: Path, monkeypatch
+) -> None:
+    # Both files literally contain "widget" (substring's pre-filter can't
+    # tell "mentions it in passing" from "is actually about it" -- both hit,
+    # in a.txt-then-b.txt document order) but only b.txt's page is actually
+    # ABOUT a widget -- a semantic reranker should put it first, flipping
+    # substring's document-order result.
+    (docs / "a.txt").write_text("The gizmo costs 10 dollars and also needs a widget")
+    (docs / "b.txt").write_text("A widget is a small mechanical part used in gizmos")
+    monkeypatch.setenv(docs_search.RERANKER_URL_ENV, "http://reranker.local")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["query"] == "widget"
+        scored = [
+            (i, 0.9 if "small mechanical part" in doc else 0.1)
+            for i, doc in enumerate(body["documents"])
+        ]
+        ranked = sorted(scored, key=lambda pair: -pair[1])
+        return httpx.Response(
+            200,
+            json={"results": [{"index": i, "relevance_score": s} for i, s in ranked]},
+        )
+
+    captured = _mock_reranker(monkeypatch, handler)
+
+    # substring's pre-filter matches both files (they both literally contain
+    # "widget"), in a.txt-then-b.txt document order -- the reranker's scoring
+    # above should flip that to b.txt first.
+    result = docs_search.HybridSearchBackend().search("widget", ["a.txt", "b.txt"])
+
+    assert [m["path"] for m in result] == ["b.txt", "a.txt"]
+    assert len(captured) == 1
+
+
+def test_hybrid_backend_returns_empty_when_substring_prefilter_finds_nothing(
+    docs: Path, monkeypatch
+) -> None:
+    # A design choice (see #339): zero literal term overlap returns empty
+    # rather than embedding the whole corpus -- fast/cheap for the common
+    # "actually nothing matches" case, at the cost of missing a fully
+    # paraphrased query with no shared words at all (left to a future
+    # pure-vector backend). The reranker must never be called on this path.
+    (docs / "a.txt").write_text("completely unrelated content")
+    monkeypatch.setenv(docs_search.RERANKER_URL_ENV, "http://reranker.local")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("reranker must not be called when nothing pre-filtered")
+
+    _mock_reranker(monkeypatch, handler)
+
+    result = docs_search.HybridSearchBackend().search("nonexistent-term-xyz", ["a.txt"])
+
+    assert result == []
+
+
+def test_hybrid_backend_errors_clearly_when_reranker_url_is_unset(docs: Path, monkeypatch) -> None:
+    (docs / "a.txt").write_text("the invoice total is 400 EUR")
+    monkeypatch.delenv(docs_search.RERANKER_URL_ENV, raising=False)
+
+    with pytest.raises(docs_search.RerankerUnavailableError, match=docs_search.RERANKER_URL_ENV):
+        docs_search.HybridSearchBackend().search("invoice", ["a.txt"])
+
+
+def test_hybrid_backend_errors_clearly_when_reranker_is_unreachable(
+    docs: Path, monkeypatch
+) -> None:
+    (docs / "a.txt").write_text("the invoice total is 400 EUR")
+    monkeypatch.setenv(docs_search.RERANKER_URL_ENV, "http://reranker.local")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _mock_reranker(monkeypatch, handler)
+
+    with pytest.raises(docs_search.RerankerUnavailableError, match="reranker.local"):
+        docs_search.HybridSearchBackend().search("invoice", ["a.txt"])
+
+
 def test_search_documents_uses_the_backend_env_var(docs: Path, monkeypatch) -> None:
     (docs / "a.txt").write_text("the invoice total is 400 EUR")
 
@@ -666,6 +773,7 @@ def test_catalog_lists_entries_with_enabled_flag(client: TestClient, registry_pa
     assert docs_search_params == {
         "docs_dir",
         "backend",
+        "reranker_url",
         "snippet_window",
         "snippet_max_chars",
         "peek_char_budget",

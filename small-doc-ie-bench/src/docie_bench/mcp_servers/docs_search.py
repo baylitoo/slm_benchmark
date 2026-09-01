@@ -3,13 +3,15 @@ directory of documents. Run: ``python -m docie_bench.mcp_servers.docs_search``.
 
 The retrieval strategy is a ``SearchBackend`` (#282), the same
 factory-over-ABC shape ``docie_bench.ocr.factory`` already uses for OCR
-backends -- ``substring`` is the only one shipped so far (case-insensitive,
-over text already extracted via ``liteparse``), chosen so the point stays
-legible: a small (350M-class) model can drive real tool-choice / tool-args /
+backends -- ``substring`` (case-insensitive, over text already extracted
+via ``liteparse``) is the default, chosen so the point stays legible: a
+small (350M-class) model can drive real tool-choice / tool-args /
 answer-from-result agentic RAG instead of one-shot generation over a
-stuffed prompt. The seam exists so bm25/vector (e.g. against
-``multi_vector_server``)/hybrid backends can be added later without
-changing ``search_text``'s signature -- backend choice is an operator-set
+stuffed prompt. ``hybrid`` (#339) is a second backend behind the same
+call: it runs the substring match first as a cheap pre-filter, then reranks
+the hit pages by semantic similarity via ``multi_vector_server``'s
+``/v1/rerank`` -- useful when the query paraphrases the document rather
+than sharing its literal wording. Backend choice is an operator-set
 catalog param (``BACKEND_ENV``), never a per-call agent argument.
 
 Extraction itself is memoized per (path, mtime, size) via
@@ -61,6 +63,13 @@ from docie_bench.schemas.common import OCRBlock
 
 DOCS_DIR_ENV = "DOCIE_MCP_DOCS_SEARCH_DIR"
 BACKEND_ENV = "DOCIE_MCP_DOCS_SEARCH_BACKEND"
+# Base URL of a running multi_vector_server deployment -- only consulted by
+# HybridSearchBackend (BACKEND_ENV=hybrid). No default: unlike docs_dir/
+# backend, there's no sane fallback for "which reranker" the way there is a
+# compose-network address for judge0-server (code_interpreter.py), since a
+# multi_vector deployment's URL is assigned dynamically by the serving
+# control plane -- an operator who picks "hybrid" must supply it explicitly.
+RERANKER_URL_ENV = "DOCIE_MCP_DOCS_SEARCH_RERANKER_URL"
 # Operator-tunable, same shape as DOCS_DIR_ENV/BACKEND_ENV -- these tune how
 # much text one tool result feeds back into the model's context, not what
 # the model can ask for, so they're catalog params (see
@@ -235,11 +244,101 @@ class SubstringSearchBackend(SearchBackend):
         return matches
 
 
+class RerankerUnavailableError(RuntimeError):
+    """``BACKEND_ENV=hybrid`` but ``multi_vector_server`` isn't reachable --
+    either ``RERANKER_URL_ENV`` was never set, or it points at a URL that
+    refused the connection / errored / timed out. Raised, never swallowed:
+    the operator explicitly chose hybrid, so silently falling back to plain
+    substring results would look like a correct answer that's quietly
+    missing the semantic ranking they asked for -- a config error should
+    read as a config error."""
+
+
+class HybridSearchBackend(SearchBackend):
+    """Substring pre-filter (:class:`SubstringSearchBackend`, cheap, exact-
+    term) narrows the corpus to candidate hit pages, then
+    ``multi_vector_server``'s ``/v1/rerank`` reorders those candidates by
+    semantic similarity to ``query`` -- exact terms narrow the search space
+    before anything gets embedded, so a corpus-wide query never embeds every
+    page of every document (see #339's design comment).
+
+    If the substring pre-filter finds NOTHING, this returns an empty list
+    rather than falling back to embedding the whole corpus: a hybrid search
+    with zero literal term overlap between query and corpus is the rare
+    case (most paraphrases still share at least one distinctive word --
+    a name, an amount, a term), and unconditionally embedding every page of
+    every document on that miss would make the common case (a real
+    zero-hit search) silently expensive every time, trading a fast/cheap
+    "nothing matched" for a slow one on every miss. A future full "vector"
+    backend (embed everything, no pre-filter) is the place for that
+    fallback, not a special case bolted onto hybrid.
+    """
+
+    def search(self, query: str, targets: list[str]) -> list[dict[str, Any]]:
+        # Checked BEFORE running the substring pass, not after: a misconfigured
+        # RERANKER_URL_ENV must fail every hybrid search deterministically, not
+        # only the ones whose query happens to substring-match something --
+        # an operator smoke-testing with a miss query would otherwise see a
+        # clean empty result and conclude hybrid works when it can't actually
+        # rerank anything.
+        url = os.environ.get(RERANKER_URL_ENV)
+        if not url:
+            raise RerankerUnavailableError(
+                f"hybrid search backend needs {RERANKER_URL_ENV} set to a running "
+                "multi_vector_server deployment's base URL -- set it on the "
+                "docs-search MCP server's env before selecting BACKEND_ENV=hybrid."
+            )
+        candidates = SubstringSearchBackend().search(query, targets)
+        if not candidates:
+            return []
+        # Rerank against each candidate PAGE's full extracted text (page-level
+        # chunking, per #339's design comment) -- not the substring match's
+        # windowed snippet, which is anchored to the literal needle and may
+        # not represent the page's semantic content for a paraphrased query.
+        # The snippet returned to the caller still comes from the substring
+        # pass below, unchanged.
+        documents: list[str] = []
+        for match in candidates:
+            page_texts = _page_texts(resolve_document(match["path"]))
+            documents.append(page_texts.get(match["page"], match["snippet"]))
+        results = _rerank(query, documents, url)
+        return [candidates[result["index"]] for result in results]
+
+
+def _rerank(query: str, documents: list[str], url: str) -> list[dict[str, Any]]:
+    """POST to ``multi_vector_server``'s ``/v1/rerank`` (same wire contract
+    ``chat_api.py``'s ``/v1/rerank`` proxy forwards to, see
+    ``multi_vector_server/server.py``) and return its ``results`` --
+    ``[{"index": int, "relevance_score": float}, ...]``, sorted descending,
+    ``index`` into ``documents``. Any connection failure, timeout, or non-2xx
+    response becomes :class:`RerankerUnavailableError` -- a distinct,
+    recognizable error rather than a raw ``httpx`` exception leaking out of
+    a search tool call."""
+    import httpx
+
+    try:
+        response = httpx.post(
+            f"{url.rstrip('/')}/v1/rerank",
+            json={"query": query, "documents": documents},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RerankerUnavailableError(
+            f"hybrid search backend could not reach multi_vector_server at {url!r}: "
+            f"{exc} -- is it deployed and healthy?"
+        ) from exc
+    results: list[dict[str, Any]] = response.json()["results"]
+    return results
+
+
 def get_search_backend(name: str) -> SearchBackend:
     normalized = name.lower().strip()
     if normalized == "substring":
         return SubstringSearchBackend()
-    raise ValueError(f"Unknown search backend {name!r}. Expected: substring.")
+    if normalized == "hybrid":
+        return HybridSearchBackend()
+    raise ValueError(f"Unknown search backend {name!r}. Expected: substring, hybrid.")
 
 
 def docs_dir() -> Path:
