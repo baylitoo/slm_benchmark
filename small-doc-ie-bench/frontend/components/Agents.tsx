@@ -669,6 +669,18 @@ export function CreateView({
   const editing = editAgent !== null;
   const { toast } = useToast();
   const deployments = useAsync("deployments", getDeployments);
+  // Shared SWR key with the top-level Agents view's own "My Agents" list --
+  // reused here as the picker for a workflow step's {"agent": "<name>"}
+  // reference (#371 backend, #387 UI), not a separate fetch.
+  const savedAgents = useAsync<AgentView[]>("agents", getAgents);
+  // A step referencing its own agent is an obvious single-step
+  // self-reference the UI can trivially avoid offering -- the backend's
+  // step-execution budget (_MAX_WORKFLOW_STEPS) is still the real cycle
+  // guard, this is just defense in depth at the picker.
+  const referenceableAgents = useMemo(
+    () => (savedAgents.data ?? []).filter((a) => a.name !== editAgent?.name),
+    [savedAgents.data, editAgent],
+  );
   // Managed deployments, segmented by semantic type — every model an agent
   // uses is a deployment the platform orchestrates, picked (not typed).
   const chatDeployments = useMemo(
@@ -787,21 +799,50 @@ export function CreateView({
 
   // workflow-kind: a fixed, ordered sequence of steps (#265) -- each its own
   // backing model + system prompt, optionally its own MCP tools too (kept
-  // out of the v1 step editor UI; settable via the API directly).
-  const [steps, setSteps] = useState<{ model_profile: string; system_prompt: string }[]>([
-    { model_profile: "", system_prompt: "" },
+  // out of the v1 step editor UI; settable via the API directly). A step is
+  // either INLINE config or a {"agent": "<name>"} reference to another saved
+  // agent (#371 backend, #387 UI) -- a tagged union so the two shapes can't
+  // be mixed in one step.
+  const [steps, setSteps] = useState<WorkflowStepDraft[]>([
+    { kind: "inline", model_profile: "", system_prompt: "" },
   ]);
 
   function addStep() {
-    setSteps((prev) => [...prev, { model_profile: "", system_prompt: "" }]);
+    setSteps((prev) => [...prev, { kind: "inline", model_profile: "", system_prompt: "" }]);
   }
 
   function removeStep(index: number) {
     setSteps((prev) => prev.filter((_, i) => i !== index));
   }
 
-  function updateStep(index: number, patch: Partial<{ model_profile: string; system_prompt: string }>) {
-    setSteps((prev) => prev.map((step, i) => (i === index ? { ...step, ...patch } : step)));
+  // Switches a step between inline config and an agent reference, resetting
+  // it to that shape's blank defaults -- the two shapes don't share fields.
+  function setStepKind(index: number, kind: WorkflowStepDraft["kind"]) {
+    setSteps((prev) =>
+      prev.map((step, i) => {
+        if (i !== index || step.kind === kind) return step;
+        return kind === "inline"
+          ? { kind: "inline", model_profile: "", system_prompt: "" }
+          : { kind: "reference", agent: "" };
+      }),
+    );
+  }
+
+  function updateInlineStep(
+    index: number,
+    patch: Partial<{ model_profile: string; system_prompt: string }>,
+  ) {
+    setSteps((prev) =>
+      prev.map((step, i) => (i === index && step.kind === "inline" ? { ...step, ...patch } : step)),
+    );
+  }
+
+  function updateReferenceStep(index: number, agentName: string) {
+    setSteps((prev) =>
+      prev.map((step, i) =>
+        i === index && step.kind === "reference" ? { ...step, agent: agentName } : step,
+      ),
+    );
   }
 
   function toggleMcpTool(server: string, tool: string) {
@@ -1001,11 +1042,15 @@ export function CreateView({
               : kind === "workflow"
                 ? {
                     steps: steps
-                      .filter((s) => s.model_profile.trim())
-                      .map((s) => ({
-                        model_profile: s.model_profile.trim(),
-                        system_prompt: s.system_prompt.trim() || null,
-                      })),
+                      .filter((s) => (s.kind === "inline" ? s.model_profile.trim() : s.agent.trim()))
+                      .map((s) =>
+                        s.kind === "inline"
+                          ? {
+                              model_profile: s.model_profile.trim(),
+                              system_prompt: s.system_prompt.trim() || null,
+                            }
+                          : { agent: s.agent.trim() },
+                      ),
                   }
                 : {};
       if (editing && editAgent) {
@@ -1613,25 +1658,64 @@ export function CreateView({
                       )}
                     </div>
                     <Select
-                      aria-label={`Step ${index + 1} model`}
-                      value={step.model_profile}
-                      onChange={(e) => updateStep(index, { model_profile: e.target.value })}
+                      aria-label={`Step ${index + 1} source`}
+                      className="mb-2"
+                      value={step.kind}
+                      onChange={(e) => setStepKind(index, e.target.value as WorkflowStepDraft["kind"])}
                     >
-                      <option value="">Choose a model…</option>
-                      {chatDeployments.map((n) => (
-                        <option key={n} value={n}>
-                          {n}
-                        </option>
-                      ))}
+                      <option value="inline">Inline config</option>
+                      <option value="reference">Reference a saved agent</option>
                     </Select>
-                    <TextArea
-                      className="mt-2"
-                      rows={2}
-                      aria-label={`Step ${index + 1} system prompt`}
-                      value={step.system_prompt}
-                      onChange={(e) => updateStep(index, { system_prompt: e.target.value })}
-                      placeholder="What this step alone is responsible for…"
-                    />
+                    {step.kind === "reference" ? (
+                      <>
+                        <Select
+                          aria-label={`Step ${index + 1} agent`}
+                          value={step.agent}
+                          onChange={(e) => updateReferenceStep(index, e.target.value)}
+                        >
+                          <option value="">Choose a saved agent…</option>
+                          {referenceableAgents.map((a) => (
+                            <option key={a.name} value={a.name}>
+                              {a.display_name || a.name}
+                            </option>
+                          ))}
+                        </Select>
+                        {referenceableAgents.length === 0 && (
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            <T>No other saved agent to reference yet.</T>
+                          </p>
+                        )}
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          <T>
+                            Uses the referenced agent&apos;s own model and system prompt, kept in
+                            sync with it.
+                          </T>
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <Select
+                          aria-label={`Step ${index + 1} model`}
+                          value={step.model_profile}
+                          onChange={(e) => updateInlineStep(index, { model_profile: e.target.value })}
+                        >
+                          <option value="">Choose a model…</option>
+                          {chatDeployments.map((n) => (
+                            <option key={n} value={n}>
+                              {n}
+                            </option>
+                          ))}
+                        </Select>
+                        <TextArea
+                          className="mt-2"
+                          rows={2}
+                          aria-label={`Step ${index + 1} system prompt`}
+                          value={step.system_prompt}
+                          onChange={(e) => updateInlineStep(index, { system_prompt: e.target.value })}
+                          placeholder="What this step alone is responsible for…"
+                        />
+                      </>
+                    )}
                   </div>
                 ))}
                 <Button type="button" variant="secondary" size="sm" onClick={addStep}>
@@ -1669,11 +1753,24 @@ function errMessage(e: unknown): string {
   return toUserMessage(e);
 }
 
-/** One workflow step (#265), permissively parsed from an unknown value --
- * a saved agent's/template's options.steps entry. */
-function toStepDraft(raw: unknown): { model_profile: string; system_prompt: string } {
+/** One workflow step's create-form draft (#265; agent references #371): an
+ * INLINE {model_profile, system_prompt} definition, or a {"agent": name}
+ * reference to another saved agent -- the two shapes never mix in one step. */
+type WorkflowStepDraft =
+  | { kind: "inline"; model_profile: string; system_prompt: string }
+  | { kind: "reference"; agent: string };
+
+/** Permissively parses a saved agent's/template's options.steps entry (an
+ * unknown value) into a WorkflowStepDraft -- either shape may already be
+ * saved (#371), so an {"agent": ...} entry parses as a reference and
+ * everything else falls back to inline (defaulting to blank fields). */
+function toStepDraft(raw: unknown): WorkflowStepDraft {
   const step = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  if (typeof step.agent === "string" && step.agent) {
+    return { kind: "reference", agent: step.agent };
+  }
   return {
+    kind: "inline",
     model_profile: typeof step.model_profile === "string" ? step.model_profile : "",
     system_prompt: typeof step.system_prompt === "string" ? step.system_prompt : "",
   };

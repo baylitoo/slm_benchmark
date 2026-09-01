@@ -5,6 +5,7 @@ a stdio registry entry in configs/mcp-servers.json (see mcp_tools).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,17 @@ class CatalogParam:
     # (mcp_tools.save_registry_entry) -- same trust model as every other
     # catalog param, not a secrets-manager integration.
     secret: bool = False
+    # Display hint for the enable form's param widget:
+    # "text" (default) -- genuinely open-ended (paths, URLs, hostnames,
+    #   credentials), rendered as a free-typed TextInput.
+    # "number" -- rendered as TextInput type="number".
+    # "enum" -- a fixed value space (see `choices`), rendered as a <Select>.
+    # "model_profile" -- rendered as a <Select> of live chat-capable
+    #   deployments instead of free text, so picking the wrong profile name
+    #   is a config-time error, not a silent runtime failure.
+    kind: Literal["text", "number", "enum", "model_profile"] = "text"
+    # Only meaningful when kind="enum" -- the fixed set of valid values.
+    choices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,6 +129,8 @@ CATALOG: dict[str, CatalogEntry] = {
                         "needs reranker_url set). An unrecognized value is a "
                         "config error the first time search_text is called."
                     ),
+                    kind="enum",
+                    choices=("substring", "hybrid"),
                 ),
                 CatalogParam(
                     name="reranker_url",
@@ -140,6 +154,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "lower this if long-document searches are filling "
                         "the model's context across several rounds."
                     ),
+                    kind="number",
                 ),
                 CatalogParam(
                     name="snippet_max_chars",
@@ -149,6 +164,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "scattered hits on the same page merge into a large "
                         "span. Defaults to 4000 if left blank."
                     ),
+                    kind="number",
                 ),
                 CatalogParam(
                     name="peek_char_budget",
@@ -159,6 +175,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "the model at search_text instead. Defaults to 4000 "
                         "if left blank."
                     ),
+                    kind="number",
                 ),
                 CatalogParam(
                     name="note_max_chars",
@@ -169,6 +186,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "Defaults to 2000 if left blank; a note over the cap "
                         "is rejected, never truncated."
                     ),
+                    kind="number",
                 ),
                 CatalogParam(
                     name="max_notes_per_doc",
@@ -180,6 +198,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "to 100 if left blank; write_note past the cap is "
                         "rejected."
                     ),
+                    kind="number",
                 ),
             ),
         ),
@@ -242,6 +261,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "unless every caller always passes model_profile "
                         "explicitly."
                     ),
+                    kind="model_profile",
                 ),
                 CatalogParam(
                     name="api_base",
@@ -290,6 +310,7 @@ CATALOG: dict[str, CatalogEntry] = {
                     name="port",
                     env_var="DOCIE_MCP_SQL_AGENT_PORT",
                     description="PostgreSQL port. Defaults to 5432 if left blank.",
+                    kind="number",
                 ),
                 CatalogParam(
                     name="user",
@@ -317,6 +338,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "Max rows run_query returns before capping with a "
                         "notice. Defaults to 200 if left blank."
                     ),
+                    kind="number",
                 ),
             ),
         ),

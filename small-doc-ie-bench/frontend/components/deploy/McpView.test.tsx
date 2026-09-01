@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { McpView } from "@/components/deploy/McpView";
 import { ToastProvider } from "@/components/Toast";
 import * as api from "@/lib/api";
-import type { McpCatalogEntry } from "@/lib/api";
+import type { DeploymentRecord, McpCatalogEntry } from "@/lib/api";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -16,6 +16,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     disableMcpServer: vi.fn(),
     testMcpServer: vi.fn(),
     getCodeInterpreterWorkers: vi.fn(),
+    getDeployments: vi.fn(async () => []),
   };
 });
 
@@ -28,6 +29,14 @@ function makeEntry(overrides: Partial<McpCatalogEntry> = {}): McpCatalogEntry {
     params: [],
     enabled: false,
     ...overrides,
+  };
+}
+
+function makeDeployment(name: string): DeploymentRecord {
+  return {
+    spec: { name, launch: { runtime: "llama_cpp", model: `${name}.gguf` } },
+    state: "ready",
+    endpoint: "http://127.0.0.1:8081",
   };
 }
 
@@ -72,6 +81,8 @@ describe("McpView", () => {
             description: "Comma-separated hostnames",
             required: false,
             secret: false,
+            kind: "text",
+            choices: [],
           },
         ],
       }),
@@ -87,6 +98,95 @@ describe("McpView", () => {
     await waitFor(() =>
       expect(api.enableMcpServer).toHaveBeenCalledWith("web-fetch", {
         allowed_hosts: "docs.example.com",
+      }),
+    );
+  });
+
+  it("renders a number-kind param as a numeric input", async () => {
+    vi.mocked(api.listMcpCatalog).mockResolvedValue([
+      makeEntry({
+        name: "docs-search",
+        title: "Document Search",
+        tools: ["list_files", "read_document", "search_text"],
+        params: [
+          {
+            name: "snippet_window",
+            description: "Characters of context",
+            required: false,
+            secret: false,
+            kind: "number",
+            choices: [],
+          },
+        ],
+      }),
+    ]);
+    renderView();
+    const input = await screen.findByLabelText("docs-search snippet_window");
+    expect(input).toHaveAttribute("type", "number");
+  });
+
+  it("renders an enum-kind param as a select of its choices", async () => {
+    vi.mocked(api.listMcpCatalog).mockResolvedValue([
+      makeEntry({
+        name: "docs-search",
+        title: "Document Search",
+        tools: ["list_files", "read_document", "search_text"],
+        params: [
+          {
+            name: "backend",
+            description: "Retrieval strategy",
+            required: false,
+            secret: false,
+            kind: "enum",
+            choices: ["substring", "hybrid"],
+          },
+        ],
+      }),
+    ]);
+    vi.mocked(api.enableMcpServer).mockResolvedValue({ name: "docs-search", registered: true });
+    renderView();
+    const user = userEvent.setup();
+    const select = await screen.findByLabelText("docs-search backend");
+    expect(select.tagName).toBe("SELECT");
+    await user.selectOptions(select, "hybrid");
+    await user.click(screen.getByRole("button", { name: /enable/i }));
+    await waitFor(() =>
+      expect(api.enableMcpServer).toHaveBeenCalledWith("docs-search", { backend: "hybrid" }),
+    );
+  });
+
+  it("renders a model_profile-kind param as a select of live chat deployments", async () => {
+    vi.mocked(api.getDeployments).mockResolvedValue([
+      makeDeployment("lfm2.5-350m"),
+      makeDeployment("nuextract3"),
+    ]);
+    vi.mocked(api.listMcpCatalog).mockResolvedValue([
+      makeEntry({
+        name: "call-llm",
+        title: "Call LLM (sub-agent dispatch)",
+        tools: ["call_llm"],
+        params: [
+          {
+            name: "default_model_profile",
+            description: "model_profile every call_llm call dispatches to",
+            required: false,
+            secret: false,
+            kind: "model_profile",
+            choices: [],
+          },
+        ],
+      }),
+    ]);
+    vi.mocked(api.enableMcpServer).mockResolvedValue({ name: "call-llm", registered: true });
+    renderView();
+    const user = userEvent.setup();
+    const select = await screen.findByLabelText("call-llm default_model_profile");
+    expect(select.tagName).toBe("SELECT");
+    await user.selectOptions(select, "nuextract3");
+    await user.click(screen.getByRole("button", { name: /enable/i }));
+    await waitFor(() =>
+      expect(api.enableMcpServer).toHaveBeenCalledWith("call-llm", {
+        default_model_profile: "nuextract3",
       }),
     );
   });

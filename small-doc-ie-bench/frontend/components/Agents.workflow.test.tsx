@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { SWRConfig } from "swr";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,6 +20,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     testMcpServer: vi.fn(),
     createAgent: vi.fn(),
     agentChat: vi.fn(),
+    getAgents: vi.fn(async () => []),
   };
 });
 
@@ -46,14 +47,14 @@ const CUSTOM_TEMPLATE: AgentTemplate = {
   defaults: { system_prompt: "", options: {} },
 };
 
-function renderCreate() {
+function renderCreate(editAgent: AgentView | null = null) {
   return render(
     <SWRConfig value={{ provider: () => new Map() }}>
       <ToastProvider>
         <CreateView
           templates={[CUSTOM_TEMPLATE, WORKFLOW_TEMPLATE]}
           prefill={null}
-          editAgent={null}
+          editAgent={editAgent}
           onCreated={vi.fn()}
         />
       </ToastProvider>
@@ -127,6 +128,84 @@ describe("Agents CreateView — workflow-kind Steps section (#265)", () => {
 
     await user.click(screen.getByRole("button", { name: /remove step 2/i }));
     expect(screen.queryByText("Step 2")).not.toBeInTheDocument();
+  });
+});
+
+describe("Agents CreateView — workflow step agent references (#371)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getDeployments).mockResolvedValue([
+      makeDeployment("lfm2.5-350m"),
+      makeDeployment("qwen-mini"),
+    ]);
+    vi.mocked(api.getAgents).mockResolvedValue([
+      { name: "summarizer", kind: "custom", display_name: "Summarizer", options: {} },
+      { name: "chain", kind: "workflow", display_name: "Chain", options: {} },
+    ]);
+    vi.mocked(api.createAgent).mockResolvedValue({
+      name: "chain",
+      kind: "workflow",
+      display_name: "",
+      description: "",
+      model_profile: null,
+      system_prompt: null,
+      options: {},
+      enabled: true,
+      created_at: "",
+      updated_at: "",
+    });
+  });
+
+  it("toggling a step to 'Reference a saved agent' swaps the model/prompt fields for an agent picker", async () => {
+    renderCreate();
+    const user = userEvent.setup();
+    await user.selectOptions(await screen.findByLabelText("Template", { exact: false }), "Workflow Agent");
+
+    await user.selectOptions(await screen.findByLabelText("Step 1 source"), "reference");
+
+    expect(screen.queryByLabelText("Step 1 model")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Step 1 system prompt")).not.toBeInTheDocument();
+    expect(await screen.findByLabelText("Step 1 agent")).toBeInTheDocument();
+  });
+
+  it("submits a step that references a saved agent as {agent: name}", async () => {
+    renderCreate();
+    const user = userEvent.setup();
+    await user.selectOptions(await screen.findByLabelText("Template", { exact: false }), "Workflow Agent");
+    await user.type(screen.getByPlaceholderText("pii-proxy"), "chain");
+
+    await user.selectOptions(await screen.findByLabelText("Step 1 source"), "reference");
+    await user.selectOptions(await screen.findByLabelText("Step 1 agent"), "summarizer");
+
+    await user.click(screen.getByRole("button", { name: /create agent/i }));
+
+    const payload = vi.mocked(api.createAgent).mock.calls[0][0];
+    expect(payload.options).toEqual({ steps: [{ agent: "summarizer" }] });
+  });
+
+  it("loads a saved workflow agent whose step already uses the {agent: ...} shape", async () => {
+    const editAgent: AgentView = {
+      name: "chain",
+      kind: "workflow",
+      options: { steps: [{ agent: "summarizer" }] },
+    };
+    renderCreate(editAgent);
+
+    expect(await screen.findByLabelText("Step 1 source")).toHaveValue("reference");
+    expect(await screen.findByLabelText("Step 1 agent")).toHaveValue("summarizer");
+  });
+
+  it("excludes the agent's own name from the reference picker when editing it", async () => {
+    const editAgent: AgentView = {
+      name: "chain",
+      kind: "workflow",
+      options: { steps: [{ agent: "summarizer" }] },
+    };
+    renderCreate(editAgent);
+
+    const select = await screen.findByLabelText("Step 1 agent");
+    await screen.findByText("Summarizer");
+    expect(within(select).queryByText("Chain")).not.toBeInTheDocument();
   });
 });
 

@@ -10,6 +10,8 @@ export interface McpCatalogParam {
   description: string;
   required: boolean;
   secret: boolean;
+  kind: "text" | "number" | "enum" | "model_profile";
+  choices: string[];
 }
 
 export interface McpCatalogEntry {
