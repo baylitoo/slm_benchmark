@@ -110,10 +110,25 @@ CATALOG: dict[str, CatalogEntry] = {
                     name="backend",
                     env_var="DOCIE_MCP_DOCS_SEARCH_BACKEND",
                     description=(
-                        "Retrieval strategy (see docs_search.SearchBackend). "
-                        "Only 'substring' is implemented today; defaults to "
-                        "it if left blank. An unrecognized value is a config "
-                        "error the first time search_text is called."
+                        "Retrieval strategy (see docs_search.SearchBackend): "
+                        "'substring' (default, exact case-insensitive match) "
+                        "or 'hybrid' (substring pre-filter, then semantic "
+                        "rerank via a multi_vector_server deployment -- "
+                        "needs reranker_url set). An unrecognized value is a "
+                        "config error the first time search_text is called."
+                    ),
+                ),
+                CatalogParam(
+                    name="reranker_url",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_RERANKER_URL",
+                    description=(
+                        "Base URL of a running multi_vector_server deployment "
+                        "-- only consulted when backend='hybrid'. No default: "
+                        "a multi_vector deployment's URL is assigned by the "
+                        "serving control plane, not a fixed compose-network "
+                        "address. Required for hybrid; search_text fails "
+                        "clearly if it's unset or unreachable rather than "
+                        "silently falling back to substring."
                     ),
                 ),
                 CatalogParam(
