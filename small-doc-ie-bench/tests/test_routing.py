@@ -484,6 +484,81 @@ async def test_extraction_service_stage_dispatches_existing_service_contract() -
     assert service.calls == [("text", {"text": "invoice", "schema_name": "invoice"})]
 
 
+@pytest.mark.asyncio
+async def test_extraction_service_stage_populates_token_usage_and_cost_units() -> None:
+    """Regression test for #360: `StageResult` used to drop `response.usage`
+    entirely, so `token_usage`/`cost_units` always defaulted to `None`/`0.0`
+    for a real extraction and the `max_cost_units` budget gate below could
+    never fire. Both now come from the same `response.usage.total_tokens`.
+    """
+
+    class FakeService:
+        profile = SimpleNamespace(name="service")
+
+        async def extract_from_text(self, **kwargs: Any) -> ExtractionResponse:
+            return _response("service", tokens=42)
+
+    stage = ExtractionServiceStage("service", FakeService())
+
+    result = await stage.execute(RoutingRequest(operation="text", arguments={}))
+
+    assert result.token_usage == 42
+    assert result.cost_units == 42.0
+
+
+@pytest.mark.asyncio
+async def test_extraction_service_stage_degrades_honestly_without_usage() -> None:
+    """A response with no usage data (e.g. a client that never returns one)
+    must not crash the stage -- it degrades to the codebase's honest-null
+    convention: `token_usage=None`, `cost_units=0.0`.
+    """
+
+    class FakeService:
+        profile = SimpleNamespace(name="service")
+
+        async def extract_from_text(self, **kwargs: Any) -> ExtractionResponse:
+            response = _response("service")
+            return response.model_copy(update={"usage": None})
+
+    stage = ExtractionServiceStage("service", FakeService())
+
+    result = await stage.execute(RoutingRequest(operation="text", arguments={}))
+
+    assert result.token_usage is None
+    assert result.cost_units == 0.0
+
+
+@pytest.mark.asyncio
+async def test_max_cost_units_budget_actually_fires_from_real_usage() -> None:
+    """Before #360 this budget was dead code: `cost_units` never reflected
+    real usage, so `total_cost` always summed to 0.0 and `max_cost_units`
+    could never exceed it. Routed through `ExtractionServiceStage` (not
+    `FakeStage`, which lets a test hand-set `cost_units`), this proves the
+    gate now fires from genuine accumulated response usage.
+    """
+
+    class FakeService:
+        profile = SimpleNamespace(name="service")
+
+        async def extract_from_text(self, **kwargs: Any) -> ExtractionResponse:
+            return _response("service", valid=False, tokens=10)
+
+    stage = ExtractionServiceStage("service", FakeService())
+    router = ExtractionRouter(
+        stages=[stage],
+        policy=RoutingPolicy(
+            stages=[StagePolicy(name="service")],
+            budget=RoutingBudget(max_cost_units=5.0),
+        ),
+    )
+
+    result = await router.route(RoutingRequest(operation="text", arguments={}))
+
+    assert result.audit.budget_exhausted is True
+    assert result.audit.terminal_reason == "max_cost_units budget exhausted"
+    assert result.audit.cost_units == 10.0
+
+
 def test_policy_rejects_empty_duplicate_and_unregistered_stages() -> None:
     with pytest.raises(ValidationError, match="at least one stage"):
         RoutingPolicy(stages=[])
