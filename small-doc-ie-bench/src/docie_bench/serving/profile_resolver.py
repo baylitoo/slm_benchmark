@@ -369,6 +369,7 @@ def resolve_extraction_profile(
     models_config_path: str | Path = DEFAULT_MODELS_CONFIG,
     deployments: Sequence[DeploymentRecord] | None = None,
     settings: Settings | None = None,
+    session_id: str | None = None,
 ) -> ModelProfile:
     """Resolve one extraction request to a single ModelProfile (see module docstring).
 
@@ -377,6 +378,14 @@ def resolve_extraction_profile(
     :class:`ProfileResolutionError` on an unknown/not-ready explicit selector or a
     missing default — callers translate that to their surface (HTTP 400 / channel
     error). Never silently falls back to env for an explicit selector.
+
+    ``session_id``, when given, is forwarded to the ``store:<name>`` replica
+    pick (see ``placement_resolver.resolve_store_profile``) so repeat calls
+    for the same conversation land on the same replica instead of
+    round-robining turn to turn. It has no effect on any other resolution
+    path (``deployment``, a plain ``model_profile``, or the default) — those
+    are unaffected by this parameter, and omitting it reproduces the prior
+    behavior exactly.
     """
     settings = settings or get_settings()
     path = Path(models_config_path)
@@ -402,7 +411,9 @@ def resolve_extraction_profile(
     # ProfileResolutionError: callers map not-found/not-ready to 404/409) — an
     # explicit store: ref must never fall through to the yaml/env table.
     if model_profile and model_profile.startswith(STORE_PROFILE_PREFIX):
-        return resolve_store_profile(model_profile[len(STORE_PROFILE_PREFIX) :])
+        return resolve_store_profile(
+            model_profile[len(STORE_PROFILE_PREFIX) :], session_id=session_id
+        )
 
     table = build_profile_table(yaml_profiles, live)
 
