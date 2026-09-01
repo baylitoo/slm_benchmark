@@ -67,6 +67,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from docie_bench.mcp_servers.env_config import int_env
 from docie_bench.ocr.base import stable_block_id
 from docie_bench.schemas.common import BoundingBox, OCRBlock
 
@@ -96,18 +97,6 @@ _SNIPPET_WINDOW = 400
 # still too large.
 _SNIPPET_CHARS_MAX = 4000
 
-
-def _int_env(name: str, default: int) -> int:
-    """``default`` unless ``name`` is set to a valid int -- an unset or
-    malformed override falls back rather than crashing a tool call over an
-    operator typo in an env var."""
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
 
 # Keyed by (resolved path, mtime_ns, size) so a changed file misses rather
 # than serving stale blocks. Agentic search is expected to hit the SAME
@@ -248,8 +237,8 @@ def _windowed_snippet(text: str, needle: str) -> str:
     """Every occurrence of ``needle`` in ``text``, each with
     ``SNIPPET_WINDOW_ENV`` characters of context on both sides -- overlapping
     windows merge into one span instead of duplicating the shared text."""
-    window = _int_env(SNIPPET_WINDOW_ENV, _SNIPPET_WINDOW)
-    max_chars = _int_env(SNIPPET_MAX_CHARS_ENV, _SNIPPET_CHARS_MAX)
+    window = int_env(SNIPPET_WINDOW_ENV, _SNIPPET_WINDOW)
+    max_chars = int_env(SNIPPET_MAX_CHARS_ENV, _SNIPPET_CHARS_MAX)
     lower = text.lower()
     spans: list[tuple[int, int]] = []
     start = 0
@@ -440,7 +429,7 @@ def document_text(
         selected = page_numbers
     else:
         selected = []
-        budget = _int_env(PEEK_CHAR_BUDGET_ENV, PEEK_CHAR_BUDGET)
+        budget = int_env(PEEK_CHAR_BUDGET_ENV, PEEK_CHAR_BUDGET)
         for p in page_numbers:
             if selected and len(page_texts[p]) > budget:
                 break

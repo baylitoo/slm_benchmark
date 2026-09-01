@@ -129,6 +129,7 @@ export function McpView({ active = true }: { active?: boolean }) {
             {entry.params.map((param) => (
               <TextInput
                 key={param.name}
+                type={param.secret ? "password" : "text"}
                 aria-label={`${entry.name} ${param.name}`}
                 placeholder={param.description}
                 disabled={entry.enabled}

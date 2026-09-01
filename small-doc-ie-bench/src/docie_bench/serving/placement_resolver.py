@@ -133,13 +133,72 @@ def round_robin_choice(
     approximately uniform distribution across processes. When the live set
     changes size between calls (a replica died or scaled in/out), the modulo
     re-maps the counter and one endpoint may be skipped or repeated once —
-    acceptable for load balancing, never for session affinity (there is none).
+    acceptable for load balancing, but this function alone has no session
+    affinity (successive calls for the same conversation can land on
+    different replicas). See :func:`session_affinity_choice`, which layers
+    per-conversation pinning on top of this same rotation.
     """
     ordered = sorted(candidates, key=lambda p: str(p.get("name") or ""))
     with _ROUND_ROBIN_LOCK:
         index = _ROUND_ROBIN_COUNTERS.get(model_name, 0)
         _ROUND_ROBIN_COUNTERS[model_name] = index + 1
     return ordered[index % len(ordered)]
+
+
+# Session-affinity state: (model_name, session_id) -> pinned replica record
+# name. Guarded by the same lock discipline as the round-robin counters
+# above (a separate lock, since the two are never taken together). See
+# session_affinity_choice for the consistency model.
+_SESSION_AFFINITY_LOCK = threading.Lock()
+_SESSION_AFFINITY: dict[str, str] = {}
+
+
+def session_affinity_choice(
+    session_id: str, model_name: str, candidates: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """Pick a replica of ``model_name`` for ``session_id``, pinning later
+    turns of the same conversation to the same replica.
+
+    Each top-level ``/v1/chat/completions`` call is independently
+    round-robined by default, which can bounce a multi-turn conversation
+    across replicas turn to turn and defeat llama-server's prefix-KV cache.
+    Reusing the ``session_id`` already threaded through the Playground for
+    docs-search continuity gives this a free, request-visible affinity key.
+
+    CONSISTENCY MODEL (stated as honestly as round_robin_choice's own): the
+    pin map is process-local and in-memory. Each api/worker process pins
+    independently, a restart drops every pin (those sessions just
+    round-robin again from a cold start, same as a brand-new session), and
+    nothing is coordinated across processes — acceptable because
+    round_robin_choice already makes the same trade-off for load balancing.
+    The map also only grows (one entry per distinct ``session_id`` seen,
+    never evicted) until a process restart. Note also that
+    ``resolve_store_profile``'s single-live-replica shortcut bypasses this
+    function entirely, so a pin recorded while two replicas were live is not
+    refreshed during a window where only one survives — if the pinned
+    replica later revives, the stale pin still points at it, which is
+    correct routing either way.
+
+    Behavior:
+    - No existing pin for ``session_id``: falls back to
+      :func:`round_robin_choice` and records the pick as the new pin.
+    - An existing pin whose replica is still in ``candidates`` (still live):
+      returns that replica — deterministic reuse across turns.
+    - An existing pin whose replica is no longer live: falls back to
+      :func:`round_robin_choice` for THIS request and re-pins to the new
+      pick, so subsequent turns in the same session follow the replacement.
+    """
+    key = f"{model_name}:{session_id}"
+    with _SESSION_AFFINITY_LOCK:
+        pinned_name = _SESSION_AFFINITY.get(key)
+    if pinned_name is not None:
+        for candidate in candidates:
+            if str(candidate.get("name") or "") == pinned_name:
+                return candidate
+    choice = round_robin_choice(model_name, candidates)
+    with _SESSION_AFFINITY_LOCK:
+        _SESSION_AFFINITY[key] = str(choice.get("name") or "")
+    return choice
 
 
 def _record_activity_best_effort(name: str, catalog: ModelCatalog) -> None:
@@ -160,6 +219,7 @@ def resolve_store_profile(
     *,
     catalog: ModelCatalog | None = None,
     chooser: Callable[[Sequence[dict[str, Any]]], dict[str, Any]] | None = None,
+    session_id: str | None = None,
 ) -> ModelProfile:
     """Build the ModelProfile that extracts against a live placement of ``name``.
 
@@ -173,6 +233,14 @@ def resolve_store_profile(
     row's observed state each cycle, so a crashed replica leaves the rotation
     within one reconcile interval. A single-instance model has exactly one
     live row, so the pick is a no-op and behaviour is unchanged.
+
+    SESSION AFFINITY: when ``session_id`` is given (and no explicit
+    ``chooser`` is injected), the pick goes through
+    :func:`session_affinity_choice` instead of a bare round-robin, so later
+    turns of the same conversation land on the same replica and keep
+    llama-server's prefix-KV cache warm. A ``session_id`` of ``None`` (the
+    default) round-robins exactly as before — existing callers are
+    unaffected.
 
     Raises :class:`PlacementNotFoundError` when the model is not in the catalog
     or has no placement at all, and :class:`PlacementNotReadyError` when
@@ -210,6 +278,8 @@ def resolve_store_profile(
         placement = live[0]
     elif chooser is not None:
         placement = chooser(live)
+    elif session_id:
+        placement = session_affinity_choice(session_id, name, live)
     else:
         placement = round_robin_choice(name, live)
     _record_activity_best_effort(name, catalog)
@@ -249,4 +319,5 @@ __all__ = [
     "endpoint_is_loopback",
     "resolve_store_profile",
     "round_robin_choice",
+    "session_affinity_choice",
 ]

@@ -67,7 +67,12 @@ describe("McpView", () => {
         title: "Web fetch",
         tools: ["fetch"],
         params: [
-          { name: "allowed_hosts", description: "Comma-separated hostnames", required: false },
+          {
+            name: "allowed_hosts",
+            description: "Comma-separated hostnames",
+            required: false,
+            secret: false,
+          },
         ],
       }),
     ]);

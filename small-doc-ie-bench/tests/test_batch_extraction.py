@@ -12,12 +12,14 @@ JSONL/CSV materialization + the tenant-scoped download route.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import inspect
 import io
 import json
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -540,6 +542,300 @@ def test_download_results_is_tenant_scoped_and_409_before_settle(
         == 404
     )
     assert client.get("/v1/studio/batches/dl-1/results.xlsx", headers=_hdr()).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Fan-out: per-document steps run in ctx.group.parallel chunks sized to the
+# target deployment's live capacity (#333).
+# ---------------------------------------------------------------------------
+
+
+def test_fanout_width_falls_back_to_one_when_capacity_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+    # No deployment/model_profile selector at all -> nothing to look up.
+    assert functions._batch_fanout_width({}) == 1
+    # Selector names a deployment, but deployments.json doesn't exist yet.
+    assert functions._batch_fanout_width({"deployment": "dep-1"}) == 1
+    # deployments.json exists, but the record isn't live.
+    (tmp_path / "deployments.json").write_text(
+        json.dumps(
+            {
+                "deployments": {
+                    "dep-1": {
+                        "state": "cold",
+                        "endpoint": "",
+                        "spec": {"launch": {"n_parallel": 4}},
+                    }
+                }
+            }
+        )
+    )
+    assert functions._batch_fanout_width({"deployment": "dep-1"}) == 1
+
+
+def test_fanout_width_sums_n_parallel_across_live_replicas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+    (tmp_path / "deployments.json").write_text(
+        json.dumps(
+            {
+                "deployments": {
+                    "dep-1": {
+                        "state": "ready",
+                        "endpoint": "http://x:1",
+                        "spec": {"launch": {"n_parallel": 4}},
+                    },
+                    "dep-1-2": {
+                        "state": "ready",
+                        "endpoint": "http://x:2",
+                        "spec": {"launch": {"n_parallel": 4}},
+                    },
+                    # A third replica record that exists but isn't live: excluded.
+                    "dep-1-3": {
+                        "state": "cold",
+                        "endpoint": "",
+                        "spec": {"launch": {"n_parallel": 4}},
+                    },
+                    # Shares the prefix but isn't a replica of dep-1 (no -N suffix
+                    # match): must not be swept into the sum.
+                    "dep-1-other": {
+                        "state": "ready",
+                        "endpoint": "http://x:9",
+                        "spec": {"launch": {}},
+                    },
+                }
+            }
+        )
+    )
+    assert functions._batch_fanout_width({"deployment": "dep-1"}) == 8
+    # store:<name> selector: stripped the same way _autoload_target does.
+    assert functions._batch_fanout_width({"model_profile": "store:dep-1"}) == 8
+
+
+class _FakeStep:
+    """Mirrors the ``_FakeStep`` in test_inngest_seed.py: runs the step body
+    directly (no real memoization -- that machinery is the SDK's, not ours)."""
+
+    async def run(self, step_id: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        result = fn()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def send_event(self, step_id: str, event: Any) -> None:
+        return None
+
+
+class _FakeGroup:
+    """Stands in for ``ctx.group``: runs one chunk's callables CONCURRENTLY
+    via ``asyncio.gather``. This is what ``ctx.group.parallel`` achieves in
+    production through Inngest's own step-discovery/interrupt protocol (see
+    ``inngest._internal.step_lib.Group.parallel``); gathering here is the
+    cheapest faithful stand-in for exercising OUR chunking/dispatch logic
+    without standing up that whole request/response machinery.
+    """
+
+    def __init__(self) -> None:
+        self.chunk_sizes: list[int] = []
+
+    async def parallel(self, callables: Any, parallel_mode: Any = None) -> list[Any]:
+        self.chunk_sizes.append(len(callables))
+        return list(await asyncio.gather(*(cb() for cb in callables)))
+
+
+class _FakeEvent:
+    def __init__(self, data: dict[str, Any], event_id: str) -> None:
+        self.data = data
+        self.id = event_id
+
+
+class _FakeBatchCtx:
+    def __init__(self, data: dict[str, Any], event_id: str, group: Any = None) -> None:
+        self.event = _FakeEvent(data, event_id)
+        self.step = _FakeStep()
+        self.group = group if group is not None else _FakeGroup()
+
+
+async def _noop_ensure_live(step: Any, data: dict[str, Any], channel: str) -> None:
+    return None
+
+
+_batch_handler = cast(Any, functions.batch_extract_job)._handler
+
+
+@pytest.mark.asyncio
+async def test_batch_dispatches_a_full_capacity_chunk_together(
+    monkeypatch: pytest.MonkeyPatch, batch_database
+) -> None:
+    monkeypatch.setattr(functions, "_ensure_deployment_live", _noop_ensure_live)
+    monkeypatch.setattr(functions, "_batch_fanout_width", lambda data: 3)
+
+    # Only releases once 3 extractions are in flight AT THE SAME TIME -- if
+    # the chunk were dispatched one document at a time (the pre-#333 bug),
+    # this hangs and the surrounding wait_for turns that into a clean failure
+    # instead of a stuck test.
+    barrier = asyncio.Barrier(3)
+
+    async def fake_run_extraction(data: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.wait_for(barrier.wait(), timeout=2)
+        return {
+            "request_id": f"r-{data['filename']}",
+            "schema_name": "invoice",
+            "model_profile": "cheap",
+            "result": {},
+        }
+
+    monkeypatch.setattr(functions, "_run_extraction", fake_run_extraction)
+
+    filenames = ["a.pdf", "b.pdf", "c.pdf"]
+    inputs = [
+        {
+            "filename": fn,
+            "relkey": batch_database.put(
+                name=fn, content=fn.encode(), media_type="application/pdf"
+            ).relkey,
+        }
+        for fn in filenames
+    ]
+    data = {
+        "inputs": inputs,
+        "tenant_id": TENANT_A,
+        "schema_name": "invoice",
+        "model_profile": "cheap",
+        "channel": "batch:par-1",
+    }
+    ctx = _FakeBatchCtx(data, event_id="par-1")
+
+    result = await asyncio.wait_for(_batch_handler(ctx), timeout=5)
+
+    assert ctx.group.chunk_sizes == [3]  # one chunk, all 3 docs, not 3 chunks of 1
+    assert result["status"] == "completed"
+    run = get_batch_run("par-1", tenant_id=TENANT_A)
+    assert run["done_items"] == 3
+    assert run["failed_items"] == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_one_failure_in_a_chunk_does_not_lose_or_block_siblings(
+    monkeypatch: pytest.MonkeyPatch, batch_database
+) -> None:
+    monkeypatch.setattr(functions, "_ensure_deployment_live", _noop_ensure_live)
+    monkeypatch.setattr(functions, "_batch_fanout_width", lambda data: 3)
+
+    async def fake_run_extraction(data: dict[str, Any]) -> dict[str, Any]:
+        if data["filename"] == "corrupt.pdf":
+            raise RuntimeError("PDF has no pages")
+        return {
+            "request_id": f"r-{data['filename']}",
+            "schema_name": "invoice",
+            "model_profile": "cheap",
+            "result": {},
+        }
+
+    monkeypatch.setattr(functions, "_run_extraction", fake_run_extraction)
+
+    filenames = ["a.pdf", "corrupt.pdf", "c.pdf"]
+    inputs = [
+        {
+            "filename": fn,
+            "relkey": batch_database.put(
+                name=fn, content=fn.encode(), media_type="application/pdf"
+            ).relkey,
+        }
+        for fn in filenames
+    ]
+    data = {
+        "inputs": inputs,
+        "tenant_id": TENANT_A,
+        "schema_name": "invoice",
+        "model_profile": "cheap",
+        "channel": "batch:par-2",
+    }
+    ctx = _FakeBatchCtx(data, event_id="par-2")
+
+    result = await asyncio.wait_for(_batch_handler(ctx), timeout=5)
+
+    assert ctx.group.chunk_sizes == [3]  # the failure did not shrink the chunk
+    assert result["status"] == "completed"  # a per-doc failure != a run failure
+    run = get_batch_run("par-2", tenant_id=TENANT_A)
+    assert (run["done_items"], run["failed_items"]) == (2, 1)
+    statuses = {item["filename"]: item["status"] for item in run["items"]}
+    assert statuses == {"a.pdf": "done", "corrupt.pdf": "failed", "c.pdf": "done"}
+
+
+@pytest.mark.asyncio
+async def test_batch_final_outcomes_correct_regardless_of_chunk_result_order(
+    monkeypatch: pytest.MonkeyPatch, batch_database
+) -> None:
+    # A group whose parallel() hands back results in the REVERSE of submission
+    # order -- standing in for a completion order the SDK doesn't promise us.
+    class _ReversingGroup(_FakeGroup):
+        async def parallel(self, callables: Any, parallel_mode: Any = None) -> list[Any]:
+            self.chunk_sizes.append(len(callables))
+            return list(reversed(await asyncio.gather(*(cb() for cb in callables))))
+
+    monkeypatch.setattr(functions, "_ensure_deployment_live", _noop_ensure_live)
+    monkeypatch.setattr(functions, "_batch_fanout_width", lambda data: 2)
+
+    published: list[dict[str, Any]] = []
+
+    async def fake_publish(channel: str, topic: str, payload: Any) -> None:
+        if topic == functions.TOPIC_PROGRESS:
+            published.append(payload)
+
+    monkeypatch.setattr(functions, "publish", fake_publish)
+
+    async def fake_run_extraction(data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "request_id": f"r-{data['filename']}",
+            "schema_name": "invoice",
+            "model_profile": "cheap",
+            "result": {"invoice_number": {"value": f"INV-{data['filename']}"}},
+        }
+
+    monkeypatch.setattr(functions, "_run_extraction", fake_run_extraction)
+
+    filenames = ["a.pdf", "b.pdf"]  # positions 0, 1
+    inputs = [
+        {
+            "filename": fn,
+            "relkey": batch_database.put(
+                name=fn, content=fn.encode(), media_type="application/pdf"
+            ).relkey,
+        }
+        for fn in filenames
+    ]
+    data = {
+        "inputs": inputs,
+        "tenant_id": TENANT_A,
+        "schema_name": "invoice",
+        "model_profile": "cheap",
+        "channel": "batch:par-3",
+    }
+    ctx = _FakeBatchCtx(data, event_id="par-3", group=_ReversingGroup())
+
+    result = await asyncio.wait_for(_batch_handler(ctx), timeout=5)
+
+    # Progress published for b.pdf BEFORE a.pdf -- out of document order, and
+    # that is exactly the point: nothing downstream may assume otherwise.
+    assert [p["current"] for p in published] == ["b.pdf", "a.pdf"]
+
+    # Yet each document's own outcome is intact -- no cross-contamination
+    # between positions despite the scrambled arrival order.
+    run = get_batch_run("par-3", tenant_id=TENANT_A)
+    by_position = {item["position"]: item for item in run["items"]}
+    assert by_position[0]["filename"] == "a.pdf"
+    assert by_position[0]["status"] == "done"
+    assert by_position[1]["filename"] == "b.pdf"
+    assert by_position[1]["status"] == "done"
+
+    jsonl = batch_database.read(result["artifacts"][0]["relkey"]).decode()
+    rows = {json.loads(line)["filename"]: json.loads(line) for line in jsonl.strip().splitlines()}
+    assert rows["a.pdf"]["result"]["result"]["invoice_number"]["value"] == "INV-a.pdf"
+    assert rows["b.pdf"]["result"]["result"]["invoice_number"]["value"] == "INV-b.pdf"
 
 
 # ---------------------------------------------------------------------------

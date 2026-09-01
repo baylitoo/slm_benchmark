@@ -38,6 +38,7 @@ async def list_catalog() -> dict[str, Any]:
                         "name": p.name,
                         "description": p.description,
                         "required": p.required,
+                        "secret": p.secret,
                     }
                     for p in entry.params
                 ],

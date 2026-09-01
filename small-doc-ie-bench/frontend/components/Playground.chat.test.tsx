@@ -657,4 +657,85 @@ describe("ChatPanel", () => {
     expect(await screen.findByText("all fine")).toBeInTheDocument();
     expect(screen.queryByText(/Context budget warning/)).not.toBeInTheDocument();
   });
+
+  it("regenerates the last assistant message by replaying the same request and replacing it", async () => {
+    vi.mocked(api.chatCompletionStream)
+      .mockImplementationOnce(async (_model, _messages, onToken) => onToken("first answer"))
+      .mockImplementationOnce(async (_model, _messages, onToken) => onToken("second answer"));
+    renderChat();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/Type a message/), "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("first answer")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Regenerate" }));
+
+    expect(await screen.findByText("second answer")).toBeInTheDocument();
+    // Replaced, not duplicated: the old answer is gone and only one
+    // assistant bubble remains.
+    expect(screen.queryByText("first answer")).not.toBeInTheDocument();
+    expect(api.chatCompletionStream).toHaveBeenCalledTimes(2);
+    const [firstModel, firstMessages] = vi.mocked(api.chatCompletionStream).mock.calls[0];
+    const [secondModel, secondMessages] = vi.mocked(api.chatCompletionStream).mock.calls[1];
+    expect(secondModel).toBe(firstModel);
+    expect(secondMessages).toEqual(firstMessages);
+  });
+
+  it("edits an earlier user message, truncating everything after it and resending the edit", async () => {
+    vi.mocked(api.chatCompletionStream)
+      .mockImplementationOnce(async (_model, _messages, onToken) => onToken("answer one"))
+      .mockImplementationOnce(async (_model, _messages, onToken) => onToken("answer two"))
+      .mockImplementationOnce(async (_model, _messages, onToken) => onToken("answer three"));
+    renderChat();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/Type a message/), "first message");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("answer one")).toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText(/Type a message/), "second message");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("answer two")).toBeInTheDocument();
+
+    // Edit the FIRST user turn -- everything after it (the second turn) must
+    // be dropped once the edit is resent.
+    const editButtons = screen.getAllByRole("button", { name: "Edit" });
+    await user.click(editButtons[0]);
+    const input = screen.getByPlaceholderText(/Edit your message/);
+    expect(input).toHaveValue("first message");
+    await user.clear(input);
+    await user.type(input, "first message, edited");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("answer three")).toBeInTheDocument();
+    expect(screen.getByText("first message, edited")).toBeInTheDocument();
+    expect(screen.queryByText("first message")).not.toBeInTheDocument();
+    expect(screen.queryByText("second message")).not.toBeInTheDocument();
+    expect(screen.queryByText("answer two")).not.toBeInTheDocument();
+
+    expect(api.chatCompletionStream).toHaveBeenCalledTimes(3);
+    const [, thirdMessages] = vi.mocked(api.chatCompletionStream).mock.calls[2];
+    // Only the edited message is in the payload -- the truncated second turn
+    // never rides along as history.
+    expect(thirdMessages).toEqual([{ role: "user", content: "first message, edited" }]);
+  });
+
+  it("only offers Regenerate on the last assistant message, and Edit on every user message", async () => {
+    vi.mocked(api.chatCompletionStream)
+      .mockImplementationOnce(async (_model, _messages, onToken) => onToken("answer one"))
+      .mockImplementationOnce(async (_model, _messages, onToken) => onToken("answer two"));
+    renderChat();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/Type a message/), "first message");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("answer one")).toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText(/Type a message/), "second message");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("answer two")).toBeInTheDocument();
+
+    // Exactly one Regenerate control, on the last assistant message.
+    expect(screen.getAllByRole("button", { name: "Regenerate" })).toHaveLength(1);
+    // An Edit control on every user message.
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(2);
+  });
 });

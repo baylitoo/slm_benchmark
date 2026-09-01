@@ -9,6 +9,7 @@ export interface McpCatalogParam {
   name: string;
   description: string;
   required: boolean;
+  secret: boolean;
 }
 
 export interface McpCatalogEntry {

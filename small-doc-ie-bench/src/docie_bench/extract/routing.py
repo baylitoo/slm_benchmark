@@ -64,8 +64,15 @@ class ExtractionServiceStage:
             response = await self.service.extract_from_text(**request.arguments)
         else:
             response = await self.service.extract_from_file(**request.arguments)
+        # Both fields source from the same real completion usage so the
+        # `max_cost_units` budget gate (routing.py's RoutingBudget) has
+        # actual data to check against instead of always summing to 0 (#360).
+        # Not a pricing model -- 1 cost unit per token -- until a real one exists.
+        total_tokens = response.usage.total_tokens if response.usage is not None else None
         return StageResult(
             response=response,
+            token_usage=total_tokens,
+            cost_units=float(total_tokens) if total_tokens is not None else 0.0,
             metadata={"model_profile": response.model_profile},
         )
 

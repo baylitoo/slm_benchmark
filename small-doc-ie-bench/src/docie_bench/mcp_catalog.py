@@ -13,6 +13,11 @@ class CatalogParam:
     env_var: str
     description: str
     required: bool = False
+    # Display-only: masks the value as a password field in the enable form.
+    # The value still persists as plaintext env in the server registry file
+    # (mcp_tools.save_registry_entry) -- same trust model as every other
+    # catalog param, not a secrets-manager integration.
+    secret: bool = False
 
 
 @dataclass(frozen=True)
@@ -175,6 +180,7 @@ CATALOG: dict[str, CatalogEntry] = {
                         "than submitting code to an unauthenticated Judge0."
                     ),
                     required=True,
+                    secret=True,
                 ),
             ),
         ),
@@ -218,6 +224,62 @@ CATALOG: dict[str, CatalogEntry] = {
                     description=(
                         "API key for the loopback request when AUTH_REQUIRED "
                         "is on. Must be one of the operator's API_KEYS."
+                    ),
+                ),
+            ),
+        ),
+        CatalogEntry(
+            name="sql-agent",
+            title="SQL Agent (PostgreSQL)",
+            description=(
+                "Agentic querying over a live PostgreSQL database (e.g. an "
+                "ERP) -- discover tables, inspect a table's schema, then run "
+                "a read-only query. Every connection is opened with "
+                "Postgres's own default_transaction_read_only session "
+                "setting on, so a write is rejected by the server itself "
+                "even inside a CTE; the operator's DB user should still be "
+                "granted SELECT only, as defense in depth."
+            ),
+            module="docie_bench.mcp_servers.sql_agent",
+            tools=("list_tables", "describe_table", "run_query"),
+            eager_list_tool="list_tables",
+            params=(
+                CatalogParam(
+                    name="host",
+                    env_var="DOCIE_MCP_SQL_AGENT_HOST",
+                    description="PostgreSQL host.",
+                    required=True,
+                ),
+                CatalogParam(
+                    name="port",
+                    env_var="DOCIE_MCP_SQL_AGENT_PORT",
+                    description="PostgreSQL port. Defaults to 5432 if left blank.",
+                ),
+                CatalogParam(
+                    name="user",
+                    env_var="DOCIE_MCP_SQL_AGENT_USER",
+                    description="DB user -- should be granted SELECT only.",
+                    required=True,
+                ),
+                CatalogParam(
+                    name="password",
+                    env_var="DOCIE_MCP_SQL_AGENT_PASSWORD",
+                    description="DB password for the above user.",
+                    required=True,
+                    secret=True,
+                ),
+                CatalogParam(
+                    name="dbname",
+                    env_var="DOCIE_MCP_SQL_AGENT_DBNAME",
+                    description="Database name to connect to.",
+                    required=True,
+                ),
+                CatalogParam(
+                    name="row_limit",
+                    env_var="DOCIE_MCP_SQL_AGENT_ROW_LIMIT",
+                    description=(
+                        "Max rows run_query returns before capping with a "
+                        "notice. Defaults to 200 if left blank."
                     ),
                 ),
             ),
