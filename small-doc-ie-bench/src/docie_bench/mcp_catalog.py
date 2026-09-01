@@ -93,7 +93,7 @@ CATALOG: dict[str, CatalogEntry] = {
                 "actually found."
             ),
             module="docie_bench.mcp_servers.docs_search",
-            tools=("list_files", "read_document", "search_text"),
+            tools=("list_files", "read_document", "search_text", "write_note", "read_notes"),
             eager_list_tool="list_files",
             params=(
                 CatalogParam(
@@ -158,6 +158,27 @@ CATALOG: dict[str, CatalogEntry] = {
                         "'peek' (no page range) before it stops and points "
                         "the model at search_text instead. Defaults to 4000 "
                         "if left blank."
+                    ),
+                ),
+                CatalogParam(
+                    name="note_max_chars",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_NOTE_MAX_CHARS",
+                    description=(
+                        "Max characters for one write_note call -- a note is "
+                        "a short observation, not another full-text dump. "
+                        "Defaults to 2000 if left blank; a note over the cap "
+                        "is rejected, never truncated."
+                    ),
+                ),
+                CatalogParam(
+                    name="max_notes_per_doc",
+                    env_var="DOCIE_MCP_DOCS_SEARCH_MAX_NOTES_PER_DOC",
+                    description=(
+                        "Max notes write_note will accumulate per document "
+                        "-- notes are append-only and never evicted, so this "
+                        "is a hard ceiling, not a rolling window. Defaults "
+                        "to 100 if left blank; write_note past the cap is "
+                        "rejected."
                     ),
                 ),
             ),
