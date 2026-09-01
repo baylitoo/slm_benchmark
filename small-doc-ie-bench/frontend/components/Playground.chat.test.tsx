@@ -363,6 +363,7 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -376,6 +377,7 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
@@ -656,6 +658,68 @@ describe("ChatPanel", () => {
 
     expect(await screen.findByText("all fine")).toBeInTheDocument();
     expect(screen.queryByText(/Context budget warning/)).not.toBeInTheDocument();
+  });
+
+  it("renders a distinct banner when the deployment's chat template does not support tool-calling", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (
+        _model,
+        _messages,
+        _servers,
+        _onToolCall,
+        _sessionId,
+        _onReasoning,
+        _onSystemAddendum,
+        _onUsage,
+        _onContextBudget,
+        onToolCallsUnsupported,
+      ) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          onToolCallsUnsupported?.({
+            message:
+              "This deployment's chat template does not support real tool-calling " +
+              "(llama-server reports chat_template_caps.supports_tool_calls=false) — " +
+              "the model may describe using tools instead of actually calling them.",
+          });
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "read the pdf");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/Tool-calling not supported/)).toBeInTheDocument();
+    expect(screen.queryByText(/Context budget warning/)).not.toBeInTheDocument();
+
+    resolveCompletion({
+      choices: [{ message: { role: "assistant", content: "I don't have a tool for that" } }],
+    });
+    expect(await screen.findByText("I don't have a tool for that")).toBeInTheDocument();
+    // Standing warning for the rest of the exchange, same as contextBudgetWarning.
+    expect(screen.getByText(/Tool-calling not supported/)).toBeInTheDocument();
+  });
+
+  it("does not render the tool-calls-unsupported banner when the event never fires", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    vi.mocked(api.chatCompletionMcpStream).mockResolvedValue({
+      choices: [{ message: { role: "assistant", content: "all fine" } }],
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "quick question");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("all fine")).toBeInTheDocument();
+    expect(screen.queryByText(/Tool-calling not supported/)).not.toBeInTheDocument();
   });
 
   it("regenerates the last assistant message by replaying the same request and replacing it", async () => {

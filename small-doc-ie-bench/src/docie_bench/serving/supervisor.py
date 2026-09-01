@@ -174,6 +174,16 @@ class DeploymentRecord:
     # opened "ab" and accumulates across restarts). serialize=False for the same
     # reason: it churns every reconcile and is meaningless outside this process.
     log_offset: int = field(default=0, metadata={"serialize": False})
+    # llama.cpp only (#353): the last health cycle's
+    # HealthResult.tool_calls_supported -- the model's ACTUAL
+    # chat_template_caps.supports_tool_calls from llama-server's own
+    # GET /props, threaded through by observe_health. True/False is the real
+    # signal; None means undetermined (a non-llamacpp runtime, an older
+    # llama-server build, /props unreachable, or no health cycle has observed
+    # it yet). chat_api reads this to warn a caller BEFORE an agentic
+    # exchange starts that this deployment's chat template will never emit a
+    # real tool_calls field, no matter what RuntimeFeature.TOOL_CALLS claims.
+    tool_calls_supported: bool | None = None
 
     def __post_init__(self) -> None:
         if self.log_offset < 0:
@@ -377,7 +387,12 @@ class PersistentSupervisor:
             return record
 
     def observe_health(
-        self, name: str, *, healthy: bool, detail: str | None = None
+        self,
+        name: str,
+        *,
+        healthy: bool,
+        detail: str | None = None,
+        tool_calls_supported: bool | None = None,
     ) -> DeploymentRecord:
         """Record one health observation without spawn/kill side effects.
 
@@ -389,6 +404,13 @@ class PersistentSupervisor:
         transitions on misses are the caller's policy (fast-death via
         ``mark_failed``), so a transient blip never flips READY off and stops
         routing by itself.
+
+        ``tool_calls_supported`` mirrors the same HealthResult field (#353):
+        always written, healthy or not, so it reflects the LATEST cycle's
+        verdict -- a health miss (e.g. /props briefly unreachable) reverts it
+        to whatever the caller passes (typically None, "undetermined") rather
+        than keeping a stale claim, the same fail-open convention ``detail``/
+        ``last_error`` already follow.
         """
         with self._lock:
             record = self._get_live(name)
@@ -399,6 +421,7 @@ class PersistentSupervisor:
             else:
                 record.consecutive_health_failures += 1
                 record.last_error = detail or "health check failed"
+            record.tool_calls_supported = tool_calls_supported
             record.updated_at = self._clock()
             self._save()
             return record
@@ -761,4 +784,5 @@ def _record_from_dict(value: dict[str, Any]) -> DeploymentRecord:
         loaded_at=float(raw_loaded_at) if raw_loaded_at is not None else None,
         observed_phase=value.get("observed_phase"),
         observed_at=float(raw_observed_at) if raw_observed_at is not None else None,
+        tool_calls_supported=value.get("tool_calls_supported"),
     )

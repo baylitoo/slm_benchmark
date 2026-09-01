@@ -58,6 +58,9 @@ class ScriptedAdapter:
         self.healthy: dict[str, bool] = {}
         self.probe_log: list[str] = []
         self.probe_hook: Any = None  # optional callable(alias) for concurrency tests
+        # alias -> the scripted HealthResult.tool_calls_supported (#353),
+        # default None ("undetermined") like a non-llamacpp/older-build probe.
+        self.tool_calls_supported: dict[str, bool | None] = {}
 
     def start(self, spec: RuntimeLaunchSpec, *, log_path: Path | None = None) -> RuntimeProcess:
         del log_path
@@ -86,7 +89,9 @@ class ScriptedAdapter:
         if self.probe_hook is not None:
             self.probe_hook(spec.alias)
         if self.healthy.get(spec.alias, True):
-            return HealthResult(True, 200)
+            return HealthResult(
+                True, 200, tool_calls_supported=self.tool_calls_supported.get(spec.alias)
+            )
         return HealthResult(False, detail="connection refused")
 
 
@@ -161,6 +166,25 @@ def test_healthy_ready_deployment_publishes_hot_with_rss(tmp_path: Path) -> None
     assert observed.pid == record.pid
     assert observed.pid_create_time == SPAWN_CREATE_TIME
     assert published == [observations]
+
+
+def test_tool_calls_supported_is_persisted_on_the_deployment_record(tmp_path: Path) -> None:
+    # #353: the reconciler must thread HealthResult.tool_calls_supported
+    # through observe_health onto the persisted DeploymentRecord -- not just
+    # log it -- so chat_api can warn a caller before an agentic exchange
+    # even starts.
+    supervisor, adapter, reconciler, _ = _build(tmp_path)
+    adapter.tool_calls_supported["invoice"] = False
+    supervisor.deploy(_spec())
+
+    reconciler.run_cycle()
+
+    assert supervisor.get("invoice").tool_calls_supported is False
+
+    # A later cycle with the model reporting support flips it back.
+    adapter.tool_calls_supported["invoice"] = True
+    reconciler.run_cycle()
+    assert supervisor.get("invoice").tool_calls_supported is True
 
 
 def test_crashed_ready_deployment_fails_fast_without_respawn_when_fit_denies(

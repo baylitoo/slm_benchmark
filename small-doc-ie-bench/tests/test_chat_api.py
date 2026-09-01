@@ -899,6 +899,133 @@ def test_chat_mcp_stream_unresolvable_ceiling_skips_context_budget_check(
     assert [e for e in events if e["type"] == "context_budget"] == []
 
 
+def test_chat_mcp_stream_emits_tool_calls_unsupported_before_any_round(api, monkeypatch) -> None:
+    # #353: a deployment whose chat template is known NOT to support real
+    # tool-calling must warn the caller ONCE, BEFORE run_tool_loop runs a
+    # single round -- known upfront from the deployment's own health state.
+    from docie_bench import chat_api, mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    monkeypatch.setattr(chat_api, "_tool_calls_supported_for_profile", lambda profile: False)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+    ):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "read the pdf"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    unsupported_events = [e for e in events if e["type"] == "tool_calls_unsupported"]
+    assert len(unsupported_events) == 1
+    assert "chat_template_caps.supports_tool_calls=false" in unsupported_events[0]["message"]
+    # Fired before any other event (content included) -- known upfront, not
+    # learned mid-exchange.
+    assert events[0]["type"] == "tool_calls_unsupported"
+
+
+@pytest.mark.parametrize("verdict", [True, None])
+def test_chat_mcp_stream_skips_tool_calls_unsupported_when_true_or_unknown(
+    api, monkeypatch, verdict: bool | None
+) -> None:
+    from docie_bench import chat_api, mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    monkeypatch.setattr(chat_api, "_tool_calls_supported_for_profile", lambda profile: verdict)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+    ):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "read the pdf"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert [e for e in events if e["type"] == "tool_calls_unsupported"] == []
+
+
 def test_chat_mcp_stream_unregistered_server_sends_an_error_event(api) -> None:
     client, _ = api
     response = client.post(

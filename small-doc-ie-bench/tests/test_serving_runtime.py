@@ -239,6 +239,65 @@ def test_llamacpp_health_warns_on_capability_mismatch_but_stays_healthy(
     assert any("lfm2.5-vl-3b" in r.message for r in caplog.records)
 
 
+def test_llamacpp_health_records_tool_calls_supported_false() -> None:
+    # #353: the raw chat_template_caps.supports_tool_calls verdict must land
+    # on HealthResult.tool_calls_supported, not just a log line -- this is
+    # what lets the reconciler/chat_api act on it.
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {
+            "chat_template_caps": {"supports_tool_calls": False}
+        },
+    )
+    spec = _spec(RuntimeKind.LLAMACPP, alias="qwen3.8-2b-distill")
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.tool_calls_supported is False
+
+
+def test_llamacpp_health_records_tool_calls_supported_true() -> None:
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {
+            "chat_template_caps": {"supports_tool_calls": True}
+        },
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.tool_calls_supported is True
+
+
+@pytest.mark.parametrize(
+    "props",
+    [
+        {},  # older llama-server build: no chat_template_caps at all
+        {"chat_template_caps": {}},  # caps present, field itself absent
+        None,  # /props unreachable
+    ],
+)
+def test_llamacpp_health_leaves_tool_calls_supported_none_when_undetermined(
+    props: dict[str, Any] | None,
+) -> None:
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: props,
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.tool_calls_supported is None
+
+
 def test_llamacpp_slots_tolerates_a_missing_field_schema() -> None:
     # Schema varies by llama-server build (#315): one slot reports the full
     # shape (including build-dependent timing/cache fields), the other only
