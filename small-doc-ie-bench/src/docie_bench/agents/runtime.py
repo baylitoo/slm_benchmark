@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -346,6 +346,75 @@ async def _complete_structured_document(
     }
 
 
+def _prepare_vision_forward(
+    spec: AgentSpec, body: dict[str, Any], options: dict[str, Any], max_tokens: int | None
+) -> tuple[ModelProfile, dict[str, Any]]:
+    """Shared body prep for `ocr` vision mode with no schema -- a plain
+    forward, no grammar-constrained response_format -- used by both the
+    buffered (``_complete_ocr``) and real-streaming (``stream_ocr_vision``)
+    paths so they build the exact same upstream request."""
+    vision_selector = options.get("vision_model")
+    if not vision_selector:
+        raise AgentError(
+            f"agent {spec.name!r} is in vision mode but has no options.vision_model",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    upstream = _resolve_backing(str(vision_selector))
+    base = dict(body)
+    if max_tokens is not None:
+        base.setdefault("max_tokens", max_tokens)
+    if spec.system_prompt:
+        base["messages"] = [
+            {"role": "system", "content": spec.system_prompt},
+            *(base.get("messages") or []),
+        ]
+    if options.get("no_think"):
+        apply_no_think(base)
+    return upstream, base
+
+
+def ocr_agent_supports_raw_stream(spec: AgentSpec) -> bool:
+    """True for an ``ocr`` agent in vision mode with no ``options.schema`` —
+    a plain forward through ``_post_chat`` with no grammar-constrained
+    ``response_format``, so real per-token streaming is safe.
+
+    Every other ``ocr`` mode either runs through
+    ``_complete_structured_document``'s grammar-constrained
+    ``ExtractionService`` path (schema-backed vision, ``ocr_extract`` with a
+    schema or a ``policy:`` extractor) or has no upstream chat call to
+    stream at all (plain OCR text, or the schema-less OCR→LLM pipeline
+    adapter in ``serving/solutions.py``) — both stay non-streaming, see the
+    API layer's streaming-strategy docstring for why.
+    """
+    options = dict(spec.options)
+    mode = _resolve_ocr_mode(options)
+    return mode == "vision" and not options.get("schema")
+
+
+async def stream_ocr_vision(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> tuple[int, str, AsyncIterator[bytes]]:
+    """Real per-token SSE relay twin of ``_complete_ocr``'s vision/no-schema
+    branch. Caller (the API layer) must have already confirmed
+    ``ocr_agent_supports_raw_stream(spec)`` — re-checked here so a caller
+    that skips that gate gets a clear config error instead of this function
+    silently treating a non-vision/schema-backed agent as a plain forward.
+    """
+    options = dict(spec.options)
+    if not ocr_agent_supports_raw_stream(spec):
+        raise AgentError(
+            f"agent {spec.name!r} does not support real streaming in mode "
+            f"{_resolve_ocr_mode(options)!r} (grammar-constrained or local-only — see "
+            "ocr_agent_supports_raw_stream)",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    max_tokens = _generation_max_tokens(body, options)
+    upstream, base = _prepare_vision_forward(spec, body, options, max_tokens)
+    return await _post_chat_stream(upstream, base, http_client=http_client)
+
+
 async def _complete_ocr(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
@@ -356,16 +425,16 @@ async def _complete_ocr(
     # Schema-backed vision extraction uses the exact Playground pipeline:
     # document ingestion -> shared prompts/client -> grounding/validation.
     if mode == "vision":
-        vision_selector = options.get("vision_model")
-        if not vision_selector:
-            raise AgentError(
-                f"agent {spec.name!r} is in vision mode but has no options.vision_model",
-                status_code=500,
-                error_type="invalid_agent_config",
-            )
-        upstream = _resolve_backing(str(vision_selector))
         schema_name = options.get("schema")
         if schema_name:
+            vision_selector = options.get("vision_model")
+            if not vision_selector:
+                raise AgentError(
+                    f"agent {spec.name!r} is in vision mode but has no options.vision_model",
+                    status_code=500,
+                    error_type="invalid_agent_config",
+                )
+            upstream = _resolve_backing(str(vision_selector))
             return await _complete_structured_document(
                 spec=spec,
                 body=body,
@@ -379,16 +448,7 @@ async def _complete_ocr(
                 output_model=upstream.model,
                 max_tokens=max_tokens,
             )
-        base = dict(body)
-        if max_tokens is not None:
-            base.setdefault("max_tokens", max_tokens)
-        if spec.system_prompt:
-            base["messages"] = [
-                {"role": "system", "content": spec.system_prompt},
-                *(base.get("messages") or []),
-            ]
-        if options.get("no_think"):
-            apply_no_think(base)
+        upstream, base = _prepare_vision_forward(spec, body, options, max_tokens)
         completion = await _post_chat(upstream, base, http_client=http_client)
         completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind, "mode": mode}
         return completion
@@ -690,6 +750,17 @@ def _build_analyzer(
     return analyze, f"guard:{guard_profile.name}", guard_state
 
 
+def agent_wants_tool_loop(spec: AgentSpec) -> bool:
+    """Shallow, non-validating presence check of ``options.mcp_servers`` —
+    the same test ``_resolve_mcp_servers`` performs before its own type
+    validation. Exposed so the API layer can pick a streaming strategy (real
+    per-token relay vs per-round event relay) before validation or execution
+    has run; a malformed value still surfaces as a normal
+    ``invalid_agent_config`` error event once the request actually runs."""
+    raw = spec.options.get("mcp_servers")
+    return raw not in (None, [])
+
+
 def _resolve_mcp_servers(spec: AgentSpec) -> list[str]:
     """``options.mcp_servers`` — registry server names this agent may use as
     tool sources (registry-only, see mcp_tools.py: never a caller-supplied
@@ -899,6 +970,254 @@ async def _complete_with_tools(
     # possibility here.
     assert isinstance(completion, dict)
     return completion, tool_call_trace
+
+
+def _agent_error_event(exc: AgentError) -> dict[str, Any]:
+    return {
+        "type": "error",
+        "error": {"message": exc.message, "type": exc.error_type, "code": exc.error_type},
+    }
+
+
+async def _stream_with_tools(
+    spec: AgentSpec,
+    body: dict[str, Any],
+    server_names: list[str],
+    *,
+    http_client: httpx.AsyncClient,
+    step: int | None = None,
+    step_name: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Queue-relay twin of ``_complete_with_tools``: each executed tool call
+    is yielded as its own ``{"type": "tool_call", ...}`` event the moment it
+    finishes, then a final ``{"type": "content", "completion": ...}`` event
+    carries the raw completion (the caller attaches ``docie_agent`` — a
+    ``custom`` agent and a ``workflow`` step want different shapes there).
+    Never raises: every failure becomes a ``{"type": "error", ...}`` event
+    so the SSE stream always terminates cleanly, same convention
+    ``chat_api._stream_chat_with_mcp_tools`` uses.
+
+    ``step``/``step_name``, when given, tag every ``tool_call`` event so
+    ``stream_workflow``'s multi-step relay can attribute each call to the
+    step that made it — same tagging the buffered ``tool_call_trace``
+    already does in ``_complete_workflow``.
+
+    Implementation note: ``run_tool_loop``'s ``on_tool_call`` callback fires
+    synchronously from deep inside the loop, so the only way to yield an
+    event the instant it fires (without waiting for the whole exchange to
+    finish) is a producer/consumer queue — the same shape
+    ``chat_api._stream_chat_with_mcp_tools`` uses for the generic chat
+    surface, mirrored here rather than reused directly since this runtime
+    raises ``AgentError`` where that surface returns a ``JSONResponse``.
+    """
+    import asyncio
+    import contextlib
+    from contextlib import AsyncExitStack
+
+    from docie_bench import mcp_tools as mcp_mod
+    from docie_bench.settings import get_settings
+
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    tag: dict[str, Any] = {"step": step, "step_name": step_name} if step is not None else {}
+
+    class _QueueTraceSink(list[dict[str, Any]]):
+        def append(self, item: dict[str, Any]) -> None:
+            super().append(item)
+            queue.put_nowait({"type": "tool_call", **tag, **item})
+
+    async def drive() -> None:
+        try:
+            try:
+                upstream = _resolve_backing(spec.model_profile)
+                registry = mcp_mod.load_mcp_registry()
+            except AgentError as exc:
+                queue.put_nowait(_agent_error_event(exc))
+                return
+            except mcp_mod.MCPConfigError as exc:
+                queue.put_nowait(
+                    _agent_error_event(
+                        AgentError(str(exc), status_code=500, error_type="mcp_config_error")
+                    )
+                )
+                return
+            unknown = [name for name in server_names if name not in registry]
+            if unknown:
+                queue.put_nowait(
+                    _agent_error_event(
+                        AgentError(
+                            f"agent {spec.name!r} references unregistered MCP server(s): "
+                            f"{', '.join(unknown)} — register them first "
+                            "(see GET /v1/mcp/servers)",
+                            status_code=400,
+                            error_type="mcp_server_not_registered",
+                        )
+                    )
+                )
+                return
+            try:
+                mcp_mod._require_mcp()
+            except mcp_mod.MCPUnavailableError as exc:
+                queue.put_nowait(
+                    _agent_error_event(
+                        AgentError(str(exc), status_code=501, error_type="mcp_unavailable")
+                    )
+                )
+                return
+            specs = [registry[name] for name in server_names]
+
+            forward = dict(body)
+            if spec.system_prompt:
+                forward["messages"] = [
+                    {"role": "system", "content": spec.system_prompt},
+                    *(forward.get("messages") or []),
+                ]
+
+            async def post(round_body: dict[str, Any]) -> dict[str, Any]:
+                return await _post_chat(upstream, dict(round_body), http_client=http_client)
+
+            trace = _QueueTraceSink()
+            record_tool_call = mcp_mod.make_trace_recorder(trace)
+
+            config_error: AgentError | None = None
+            completion: dict[str, Any] | None = None
+            try:
+                async with AsyncExitStack() as stack:
+                    try:
+                        sessions = await mcp_mod.open_mcp_sessions(stack, specs)
+                        tools, mapping = await mcp_mod.collect_openai_tools(sessions)
+                    except Exception as exc:  # noqa: BLE001 - connect/handshake failure
+                        queue.put_nowait(
+                            _agent_error_event(
+                                AgentError(
+                                    f"could not connect to MCP server(s): {exc}",
+                                    status_code=502,
+                                    error_type="mcp_server_unreachable",
+                                )
+                            )
+                        )
+                        return
+                    try:
+                        allowed = _resolve_tool_allowlist(
+                            spec, server_names, mapping, separator=mcp_mod.TOOL_SEPARATOR
+                        )
+                    except AgentError as exc:
+                        config_error = exc
+                    else:
+                        if allowed is not None:
+                            tools = [t for t in tools if t["function"]["name"] in allowed]
+                            mapping = {
+                                name: target
+                                for name, target in mapping.items()
+                                if name in allowed
+                            }
+                        completion = await mcp_mod.run_tool_loop(
+                            post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
+                        )
+            except AgentError as exc:
+                # A mid-round upstream failure from `post` (_post_chat) --
+                # same `except AgentError: raise` _complete_with_tools has
+                # before its own generic Exception arm, so this streaming
+                # twin gives the SAME error_type for the SAME failure the
+                # non-streaming path would (whatever AsyncExitStack's own
+                # unwind lets through -- a live MCP session's task-group
+                # teardown can itself raise and shadow the original
+                # AgentError with a generic mcp_server_unreachable, same
+                # quirk both twins share; see the comment on `config_error`
+                # below and _complete_with_tools's docstring). Without this
+                # arm the two paths could diverge on an AgentError that
+                # DOES escape cleanly (e.g. a lighter mocked session).
+                queue.put_nowait(_agent_error_event(exc))
+                return
+            except Exception as exc:  # noqa: BLE001 - transport teardown failure
+                queue.put_nowait(
+                    _agent_error_event(
+                        AgentError(
+                            f"MCP session error: {exc}",
+                            status_code=502,
+                            error_type="mcp_server_unreachable",
+                        )
+                    )
+                )
+                return
+            if config_error is not None:
+                queue.put_nowait(_agent_error_event(config_error))
+                return
+            if completion is None:
+                queue.put_nowait(
+                    _agent_error_event(
+                        AgentError(
+                            f"model kept calling tools for "
+                            f"{get_settings().mcp_max_tool_iterations} rounds without a "
+                            "final answer",
+                            status_code=502,
+                            error_type="mcp_tool_loop_exhausted",
+                        )
+                    )
+                )
+                return
+            assert isinstance(completion, dict)
+            queue.put_nowait({"type": "content", "completion": completion})
+        finally:
+            queue.put_nowait(None)
+
+    task = asyncio.create_task(drive())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def stream_custom_with_tools(
+    spec: AgentSpec,
+    body: dict[str, Any],
+    server_names: list[str],
+    *,
+    http_client: httpx.AsyncClient,
+) -> AsyncIterator[dict[str, Any]]:
+    """Queue-relay twin of ``_complete_custom``'s tools branch: the final
+    ``content`` event carries the same ``docie_agent.tool_calls`` shape the
+    non-streaming path attaches."""
+    tool_calls: list[dict[str, Any]] = []
+    async for event in _stream_with_tools(spec, body, server_names, http_client=http_client):
+        if event["type"] == "tool_call":
+            tool_calls.append({k: v for k, v in event.items() if k != "type"})
+            yield event
+        elif event["type"] == "content":
+            completion = event["completion"]
+            docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind}
+            if tool_calls:
+                docie_agent["tool_calls"] = tool_calls
+            completion["docie_agent"] = docie_agent
+            yield {"type": "content", "completion": completion}
+        else:
+            yield event
+
+
+async def stream_agent_events(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> AsyncIterator[dict[str, Any]]:
+    """Entry point for the API layer's queue-based streaming strategy:
+    ``workflow`` (step-by-step relay) or ``custom`` with
+    ``options.mcp_servers`` (per-round tool-call relay). Never raises —
+    every failure becomes an ``{"type": "error", ...}`` event."""
+    if spec.kind == "workflow":
+        async for event in stream_workflow(spec, body, http_client=http_client):
+            yield event
+        return
+    try:
+        server_names = _resolve_mcp_servers(spec)
+    except AgentError as exc:
+        yield _agent_error_event(exc)
+        return
+    async for event in stream_custom_with_tools(spec, body, server_names, http_client=http_client):
+        yield event
 
 
 _MAX_WORKFLOW_STEPS = 16
@@ -1152,6 +1471,135 @@ async def _complete_workflow(
     return final
 
 
+async def stream_workflow(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> AsyncIterator[dict[str, Any]]:
+    """Queue-relay twin of ``_complete_workflow``: each step's completion is
+    yielded as its own ``{"type": "step", ...}`` event the moment that step
+    finishes, instead of the whole multi-step chain completing silently
+    before anything reaches the client — the "relay each step's completion
+    as it becomes available" design (#346), not real per-token streaming
+    (a later step's input IS the previous step's full answer, so there is
+    no meaningful token-by-token relay across the chain boundary). A step
+    with ``options.mcp_servers`` also relays its own ``tool_call`` events as
+    they happen, via ``_stream_with_tools``, tagged with that step. Never
+    raises — every failure becomes a ``{"type": "error", ...}`` event, and
+    a final ``{"type": "content", "completion": ...}`` event carries the
+    same synthesized completion (summed usage, ``docie_agent.steps``/
+    ``tool_calls``) ``_complete_workflow`` returns.
+    """
+    try:
+        steps, names, by_name = _resolve_workflow_steps(spec)
+    except AgentError as exc:
+        yield _agent_error_event(exc)
+        return
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    step_trace: list[dict[str, Any]] = []
+    tool_call_trace: list[dict[str, Any]] = []
+    chain_content: str | None = _last_message_content(body)
+    completion: dict[str, Any] | None = None
+    index = 0
+    visited = 0
+    try:
+        while True:
+            if visited >= _MAX_WORKFLOW_STEPS:
+                raise AgentError(
+                    f"agent {spec.name!r}: workflow exceeded {_MAX_WORKFLOW_STEPS} step "
+                    "executions — likely a routing loop",
+                    status_code=502,
+                    error_type="workflow_budget_exhausted",
+                )
+            step = steps[index]
+            step_name = names[index]
+            step_spec = spec.model_copy(
+                update={
+                    "model_profile": step["model_profile"],
+                    "system_prompt": step.get("system_prompt"),
+                    "options": {
+                        "mcp_servers": step.get("mcp_servers"),
+                        "mcp_tools": step.get("mcp_tools"),
+                    },
+                }
+            )
+            step_body = (
+                dict(body)
+                if visited == 0
+                else {"messages": [{"role": "user", "content": chain_content or ""}]}
+            )
+            server_names = _resolve_mcp_servers(step_spec)
+            if server_names:
+                completion = None
+                async for event in _stream_with_tools(
+                    step_spec,
+                    step_body,
+                    server_names,
+                    http_client=http_client,
+                    step=index,
+                    step_name=step_name,
+                ):
+                    if event["type"] == "tool_call":
+                        tool_call_trace.append(
+                            {k: v for k, v in event.items() if k != "type"}
+                        )
+                        yield event
+                    elif event["type"] == "error":
+                        yield event
+                        return
+                    elif event["type"] == "content":
+                        completion = event["completion"]
+                assert completion is not None  # _stream_with_tools always ends content or error
+            else:
+                completion = await _forward_chat(step_spec, step_body, http_client=http_client)
+            usage = completion.get("usage")
+            if isinstance(usage, dict):
+                for key in totals:
+                    value = usage.get(key)
+                    if isinstance(value, int):
+                        totals[key] += value
+            step_answer = _message_content(completion)
+            visited += 1
+            route = step.get("route")
+            if route is not None:
+                target_name = _resolve_route_target(
+                    step_answer, route, by_name, spec=spec, step_name=step_name
+                )
+                entry = {
+                    "step": index,
+                    "name": step_name,
+                    "model_profile": step["model_profile"],
+                    "content": step_answer,
+                    "routed_to": target_name,
+                }
+                step_trace.append(entry)
+                yield {"type": "step", **entry}
+                index = by_name[target_name]
+                continue
+            chain_content = step_answer
+            entry = {
+                "step": index,
+                "name": step_name,
+                "model_profile": step["model_profile"],
+                "content": step_answer,
+                "routed_to": None,
+            }
+            step_trace.append(entry)
+            yield {"type": "step", **entry}
+            index += 1
+            if index >= len(steps):
+                break
+    except AgentError as exc:
+        yield _agent_error_event(exc)
+        return
+    assert completion is not None  # _resolve_workflow_steps guarantees >=1 step
+    docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind, "steps": step_trace}
+    if tool_call_trace:
+        docie_agent["tool_calls"] = tool_call_trace
+    final = dict(completion)
+    final["usage"] = totals
+    final["docie_agent"] = docie_agent
+    yield {"type": "content", "completion": final}
+
+
 def _build_policy_router(spec: AgentSpec, policy_name: str) -> ExtractionRouter:
     """A saved routing policy as this agent's extraction executor.
 
@@ -1195,16 +1643,36 @@ def _resolve_backing(selector: str | None) -> ModelProfile:
     return profile
 
 
-async def _forward_chat(
-    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
-) -> dict[str, Any]:
-    upstream = _resolve_backing(spec.model_profile)
+def _prepare_forward_body(spec: AgentSpec, body: dict[str, Any]) -> dict[str, Any]:
+    """Inject the agent's system prompt (unchanged, both non-stream and
+    stream). Shared so ``_forward_chat``/``_forward_chat_stream`` build the
+    exact same upstream request."""
     if spec.system_prompt:
         body["messages"] = [
             {"role": "system", "content": spec.system_prompt},
             *(body.get("messages") or []),
         ]
+    return body
+
+
+async def _forward_chat(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> dict[str, Any]:
+    upstream = _resolve_backing(spec.model_profile)
+    body = _prepare_forward_body(spec, body)
     return await _post_chat(upstream, body, http_client=http_client)
+
+
+async def _forward_chat_stream(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> tuple[int, str, AsyncIterator[bytes]]:
+    """Real per-token SSE relay twin of ``_forward_chat`` — a plain
+    ``custom`` agent with no ``options.mcp_servers`` (the tool-calling round
+    needs a full completion either way, see ``_stream_with_tools``, so only
+    the tool-less forward gets real per-token streaming)."""
+    upstream = _resolve_backing(spec.model_profile)
+    body = _prepare_forward_body(spec, body)
+    return await _post_chat_stream(upstream, body, http_client=http_client)
 
 
 async def _post_chat(
@@ -1212,10 +1680,16 @@ async def _post_chat(
 ) -> dict[str, Any]:
     """POST an OpenAI chat request to a resolved passthrough upstream. The
     caller owns message/system-prompt/response_format shaping; this just sets
-    the model id, forces a non-streaming call, posts, and normalizes errors."""
+    the model id, forces a non-streaming call, posts, and normalizes errors.
+
+    Every caller here genuinely needs the full response body before it can
+    do anything useful with it (a tool-loop round decides whether to call a
+    tool or answer; a workflow step's answer feeds the next step or a
+    router; ``proxy_security`` must redact before a single token leaves the
+    process) — see ``_post_chat_stream`` for the sibling used by call sites
+    that don't share that constraint.
+    """
     body["model"] = upstream.model
-    # The API layer re-emits the final completion as a single SSE chunk for
-    # streaming clients; upstream is always asked for a plain completion.
     body.pop("stream", None)
     url = f"{upstream.base_url}/chat/completions"
     headers = {
@@ -1253,6 +1727,82 @@ async def _post_chat(
             error_type="upstream_error",
         )
     return completion
+
+
+async def _post_chat_stream(
+    upstream: ModelProfile, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> tuple[int, str, AsyncIterator[bytes]]:
+    """Real per-token proxy: forward ``stream: true`` and hand back the raw
+    upstream SSE bytes unbuffered, instead of ``_post_chat``'s
+    buffer-then-return-dict contract — the streaming twin for call sites
+    that have no post-processing pass requiring the full response (a plain
+    ``custom`` forward, an ``ocr`` agent's schema-less vision forward).
+    Ported from ``chat_api._stream_chat_completions`` (same shape, agents'
+    ``AgentError`` taxonomy instead of a ``JSONResponse``).
+
+    The connection and the upstream's own 4xx/5xx are resolved BEFORE any
+    byte is handed back — same "fail before the response starts" behavior
+    ``_post_chat`` has, so a connect failure or an upstream error still maps
+    to a normal ``AgentError`` (the API layer returns it as one JSON error
+    response) rather than starting a stream that immediately errors.
+    """
+    body["model"] = upstream.model
+    body["stream"] = True
+    # The API layer scans the relayed bytes for a trailing usage block to
+    # keep recording token counts on the usage ledger (see agents/api.py's
+    # _serve_raw_stream) -- llama-server/OpenAI only emit one when asked,
+    # same opt-in chat_api._stream_chat_completions sets.
+    stream_options = body.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    stream_options.setdefault("include_usage", True)
+    body["stream_options"] = stream_options
+    url = f"{upstream.base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {upstream.api_key}",
+        "Content-Type": "application/json",
+    }
+    stream_ctx = http_client.stream(
+        "POST", url, json=body, headers=headers, timeout=upstream.timeout_seconds
+    )
+    try:
+        response = await stream_ctx.__aenter__()
+    except httpx.RequestError as exc:
+        raise AgentError(
+            f"backing model upstream {upstream.base_url} is unreachable: {exc}",
+            status_code=502,
+            error_type="upstream_unavailable",
+        ) from exc
+    media_type = response.headers.get("content-type", "text/event-stream")
+    if response.status_code >= 400:
+        raw = await response.aread()
+        await stream_ctx.__aexit__(None, None, None)
+        raise AgentError(
+            f"backing model returned {response.status_code}: "
+            f"{raw[:300].decode('utf-8', 'replace')}",
+            status_code=response.status_code,
+            error_type="upstream_error",
+        )
+
+    async def body_iterator() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in response.aiter_raw():
+                yield chunk
+        finally:
+            await stream_ctx.__aexit__(None, None, None)
+
+    return response.status_code, media_type, body_iterator()
+
+
+async def stream_agent_raw(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> tuple[int, str, AsyncIterator[bytes]]:
+    """Entry point for the API layer's real per-token streaming strategy: a
+    plain ``custom`` forward (no ``options.mcp_servers``) or an ``ocr``
+    agent already confirmed by ``ocr_agent_supports_raw_stream``."""
+    if spec.kind == "ocr":
+        return await stream_ocr_vision(spec, body, http_client=http_client)
+    return await _forward_chat_stream(spec, body, http_client=http_client)
 
 
 # ---------------------------------------------------------------------------

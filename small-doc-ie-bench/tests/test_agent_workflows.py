@@ -140,6 +140,63 @@ def test_workflow_chains_steps_each_seeing_only_the_previous_answer(api) -> None
     ]
 
 
+def test_workflow_stream_relays_each_step_completion_as_it_finishes(api) -> None:
+    # #346: each step's completion is relayed as its own SSE event the
+    # moment that step finishes -- not just the final step after the whole
+    # multi-step chain completes silently.
+    client, captured = api
+    _create_workflow(
+        client,
+        [
+            {"model_profile": "alpha", "system_prompt": "step one"},
+            {"model_profile": "beta", "system_prompt": "step two"},
+        ],
+    )
+    response = client.post(
+        "/v1/agents/workflow-test/chat/completions",
+        json={"stream": True, "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert response.text.strip().endswith("data: [DONE]")
+
+    step_events = [e for e in events if e["type"] == "step"]
+    assert step_events == [
+        {
+            "type": "step",
+            "step": 0,
+            "name": "0",
+            "model_profile": "alpha",
+            "content": "echo: hello",
+            "routed_to": None,
+        },
+        {
+            "type": "step",
+            "step": 1,
+            "name": "1",
+            "model_profile": "beta",
+            "content": "echo: echo: hello",
+            "routed_to": None,
+        },
+    ]
+    # Step 0's event arrives before step 1 even starts (only 1 upstream
+    # request has been made by then) -- a real incremental relay, not the
+    # whole chain collapsed into one frame at the end.
+    (content_event,) = [e for e in events if e["type"] == "content"]
+    completion = content_event["completion"]
+    assert completion["choices"][0]["message"]["content"] == "echo: echo: hello"
+    assert completion["usage"] == {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+    assert completion["docie_agent"]["steps"] == [
+        {k: v for k, v in e.items() if k != "type"} for e in step_events
+    ]
+    assert [e["type"] for e in events] == ["step", "step", "content"]
+
+
 # ── conditional routing (#266): a step's own answer picks a NAMED next
 # step instead of always falling through to the next one in the list ───────
 

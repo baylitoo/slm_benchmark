@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import replace
 
 import httpx
@@ -127,10 +128,21 @@ def api(tmp_path, monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
 
     captured: list[httpx.Request] = []
 
+    async def _sse_chunks(last: str) -> AsyncIterator[bytes]:
+        for piece in ("echo", ": ", last):
+            yield f'data: {{"choices":[{{"delta":{{"content":"{piece}"}}}}]}}\n\n'.encode()
+        yield b"data: [DONE]\n\n"
+
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
         body = json.loads(request.content)
         last = body["messages"][-1]["content"]
+        if body.get("stream"):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=_sse_chunks(last),
+            )
         return httpx.Response(
             200,
             json={
@@ -710,6 +722,66 @@ def test_stream_wraps_completion_as_sse(api) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert "data: [DONE]" in response.text
+
+
+def test_proxy_security_agent_still_buffers_and_redacts_when_streaming(api) -> None:
+    # #346: proxy_security must NEVER regress to relaying raw, unredacted
+    # tokens -- it still fully buffers upstream, redacts, and only then
+    # emits the (single, faked) SSE chunk, exactly as before streaming was
+    # wired up for every other kind.
+    client, captured = api
+    _create_proxy(client, options={"mode": "placeholder", "restore_pii": False})
+    response = client.post(
+        "/v1/agents/pii-proxy/chat/completions",
+        json={
+            "model": "pii-proxy",
+            "stream": True,
+            "messages": [{"role": "user", "content": "email jean@acme.fr please"}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
+    sent = json.loads(captured[-1].content)
+    assert sent["messages"][-1]["content"] == "email [EMAIL_1] please"
+    assert "stream" not in sent  # upstream is still asked for a plain completion
+    # Exactly one data frame plus [DONE] -- never a real per-token relay.
+    frames = [line for line in response.text.splitlines() if line.startswith("data: ")]
+    assert len(frames) == 2
+    chunk = json.loads(frames[0][len("data: ") :])
+    assert "jean@acme.fr" not in chunk["choices"][0]["delta"]["content"]
+    assert "[EMAIL_1]" in chunk["choices"][0]["delta"]["content"]
+
+
+def test_custom_agent_stream_relays_real_incremental_chunks(api) -> None:
+    # A `custom` agent with no options.mcp_servers gets a REAL per-token
+    # relay of the upstream's own SSE frames -- not one faked chunk built
+    # after the full completion finishes.
+    client, captured = api
+    client.post(
+        "/v1/agents",
+        json={"name": "helper", "template": "custom", "model_profile": "alpha"},
+    )
+    with client.stream(
+        "POST",
+        "/v1/agents/helper/chat/completions",
+        json={"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [line for line in response.iter_lines() if line.startswith("data: ")]
+
+    assert events == [
+        'data: {"choices":[{"delta":{"content":"echo"}}]}',
+        'data: {"choices":[{"delta":{"content":": "}}]}',
+        'data: {"choices":[{"delta":{"content":"hi"}}]}',
+        "data: [DONE]",
+    ]
+    sent = json.loads(captured[-1].content)
+    assert sent["stream"] is True
+    assert sent["model"] == "up-alpha"
+    # Usage-ledger parity with the non-streaming path (#346): llama-server
+    # only emits a trailing usage frame when asked.
+    assert sent["stream_options"]["include_usage"] is True
 
 
 def test_update_and_delete_agent(api) -> None:
