@@ -805,7 +805,59 @@ async def test_run_tool_loop_returns_caller_owned_calls_untouched() -> None:
     assert calls[0]["function"]["name"] == "callers_own_lookup"
 
 
-async def test_run_tool_loop_exhaustion_returns_none() -> None:
+async def test_run_tool_loop_exhaustion_forces_a_final_answer_instead_of_none() -> None:
+    # #391: rounds 1..limit run exactly as before, full tools. Round `limit`
+    # ALSO ending in a tool call earns exactly one more round (limit + 1)
+    # with tools stripped down to caller_tools (empty here) -- a well-behaved
+    # fake post() honors that and answers in prose instead of calling a tool
+    # again.
+    posted: list[dict[str, Any]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(dict(body))  # snapshot -- `forward` is mutated in place each round
+        if len(posted) <= 3:
+            return _tool_calls_completion(
+                "calc__add",
+                '{"a": 1, "b": 1}',
+                {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            )
+        # Round 4 (limit + 1), the forced one: tools were stripped.
+        assert body["tools"] == []
+        return _final_completion(
+            "I couldn't finish, but 1+1=2 from what I already found.",
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+    forced: list[dict[str, Any]] = []
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "loop"}]}
+        result = await run_tool_loop(
+            post,
+            body,
+            sessions,
+            mapping,
+            tools,
+            max_iterations=3,
+            on_tool_budget_forced=forced.append,
+        )
+
+    assert len(posted) == 4  # 3 real rounds + exactly one forced round
+    assert posted[0]["tools"] != []  # round 1 kept its full tool set, unchanged
+    assert result["choices"][0]["message"]["content"].startswith("I couldn't finish")
+    assert result["usage"] == {"prompt_tokens": 4, "completion_tokens": 4, "total_tokens": 8}
+    assert forced == [{"rounds_used": 4, "max_iterations": 3}]
+
+
+async def test_run_tool_loop_forced_round_never_loops_even_if_post_ignores_stripped_tools() -> (
+    None
+):
+    # A defensive guarantee, not just the designed happy path (#391): even a
+    # broken/adversarial post() that keeps returning a real, routable
+    # tool_calls message on the forced round -- ignoring that mcp_tools was
+    # stripped from the request it was just handed -- must still terminate
+    # rather than loop forever.
     count = 0
 
     async def post(body: dict[str, Any]) -> dict[str, Any]:
@@ -823,8 +875,34 @@ async def test_run_tool_loop_exhaustion_returns_none() -> None:
         body = {"model": "m", "messages": [{"role": "user", "content": "loop"}]}
         result = await run_tool_loop(post, body, sessions, mapping, tools, max_iterations=3)
 
-    assert result is None
-    assert count == 3  # the bound is exact, not off-by-one
+    assert count == 4  # 3 real rounds + the one forced round, never a 5th
+    # Still returns the (mis-shaped) completion as the caller's problem now,
+    # never loops back to execute a tool call after the budget is spent.
+    assert result["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "calc__add"
+
+
+async def test_run_tool_loop_single_round_budget_still_gets_its_one_real_round() -> None:
+    # max_iterations=1 must NOT immediately treat round 1 as the forced
+    # round -- it's still a real, tools-available attempt, exactly as before
+    # #391. Only a round 1 that ALSO ends in a tool call earns the forced
+    # round 2.
+    posted: list[dict[str, Any]] = []
+
+    async def post(body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(dict(body))
+        return _final_completion(
+            "ok", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        )
+
+    async with _memory_session(_calc_server()) as session:
+        sessions = {"calc": session}
+        tools, mapping = await collect_openai_tools(sessions)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        result = await run_tool_loop(post, body, sessions, mapping, tools, max_iterations=1)
+
+    assert len(posted) == 1
+    assert posted[0]["tools"] != []  # round 1 had its real tools, not stripped
+    assert result["choices"][0]["message"]["content"] == "ok"
 
 
 # ---------------------------------------------- human-in-the-loop pause/resume (#383)

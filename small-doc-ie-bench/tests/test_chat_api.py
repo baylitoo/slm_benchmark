@@ -507,6 +507,7 @@ def test_chat_mcp_stream_relays_each_tool_call_as_its_own_sse_event(api, monkeyp
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         assert on_tool_call is not None
         on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
@@ -586,6 +587,7 @@ def test_chat_mcp_stream_relays_reasoning_content_as_its_own_sse_event(api, monk
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         assert on_reasoning is not None
         on_reasoning("the user asked for 1+2, so I should call calc.add")
@@ -652,6 +654,7 @@ def test_chat_mcp_stream_relays_system_addendum_as_its_own_sse_event_once(api, m
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         assert on_system_addendum is not None
         on_system_addendum(TOOL_DISCIPLINE_DIRECTIVE)
@@ -717,6 +720,7 @@ def test_chat_mcp_stream_relays_usage_as_its_own_sse_event(api, monkeypatch) -> 
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         assert on_usage is not None
         on_usage(
@@ -793,6 +797,7 @@ def test_chat_mcp_stream_relays_context_budget_as_its_own_sse_event(api, monkeyp
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         assert context_length_ceiling == 4096
         assert on_context_budget is not None
@@ -882,6 +887,7 @@ def test_chat_mcp_stream_unresolvable_ceiling_skips_context_budget_check(
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         seen_ceiling.append(context_length_ceiling)
         assert on_context_budget is not None  # still wired -- just never called
@@ -948,6 +954,7 @@ def test_chat_mcp_stream_emits_tool_calls_unsupported_before_any_round(api, monk
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
@@ -1016,6 +1023,7 @@ def test_chat_mcp_stream_skips_tool_calls_unsupported_when_true_or_unknown(
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
@@ -1104,6 +1112,7 @@ def test_chat_mcp_stream_mints_no_exchange_without_ask_user_opt_in(api, monkeypa
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         seen_exchange_ids.append(exchange_id)
         assert on_awaiting_input is None
@@ -1170,6 +1179,7 @@ def test_chat_mcp_stream_emits_exchange_event_first_when_ask_user_is_enabled(
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         seen_exchange_ids.append(exchange_id)
         assert exchange_id is not None
@@ -1237,6 +1247,7 @@ def test_chat_mcp_stream_relays_awaiting_input_as_its_own_sse_event(api, monkeyp
         on_context_budget=None,
         exchange_id=None,
         on_awaiting_input=None,
+        on_tool_budget_forced=None,
     ):
         assert on_awaiting_input is not None
         on_awaiting_input({"question": "which invoice?", "choices": ["A", "B"]})

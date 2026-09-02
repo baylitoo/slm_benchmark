@@ -727,6 +727,18 @@ async def _stream_chat_with_mcp_tools(
         above — so it fires before ``run_tool_loop`` even starts. Never fires
         when the verdict is ``True`` or unresolvable (``None``) — fail-open,
         same convention as ``context_budget``.
+      ``{"type": "tool_budget_forced_answer", "rounds_used", "max_iterations"}``
+        — fired AT MOST ONCE per exchange (#391), right before the LAST round
+        the tool-call budget allows: that round's tools are stripped down to
+        whatever the caller itself supplied (real MCP tools and ``ask_user``
+        both dropped) and the model is nudged to answer now using everything
+        already gathered, instead of the exchange previously hitting a 502
+        that discarded every prior round's tool results. The round after this
+        event is a normal ``content`` event, same as any other final answer —
+        this just tells the client THIS particular answer was forced by the
+        budget rather than a natural stopping point, worth a subtle "answered
+        with partial results" cue rather than being indistinguishable from a
+        model that simply finished on its own.
       ``{"type": "content", "completion": <final OpenAI-shaped completion>}``
       ``{"type": "error", "error": {"message", "type", "code"}}`` — ``type``/
         ``code`` is ``"ask_user_timeout"`` specifically when a pause got no
@@ -829,6 +841,9 @@ async def _stream_chat_with_mcp_tools(
                         )
                         if exchange_id is not None
                         else None,
+                        on_tool_budget_forced=lambda payload: queue.put_nowait(
+                            {"type": "tool_budget_forced_answer", **payload}
+                        ),
                     )
             except mcp_mod.AskUserTimeoutError as exc:
                 # A paused exchange (ask_user, or a user-initiated pause) got
