@@ -1339,19 +1339,20 @@ async def test_chat_mcp_stream_cancellation_during_a_pause_clears_the_registry()
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
+        # The MCP tool loop's post() now streams every round (see
+        # _post_upstream_streamed) -- the mock upstream answers with the
+        # SSE-delta shape, not one blocking JSON completion.
+        async def _chunks() -> AsyncIterator[bytes]:
+            frame = {
                 "id": "r1",
-                "object": "chat.completion",
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
+                        "delta": {
                             "role": "assistant",
-                            "content": None,
                             "tool_calls": [
                                 {
+                                    "index": 0,
                                     "id": "call_1",
                                     "type": "function",
                                     "function": {
@@ -1364,8 +1365,13 @@ async def test_chat_mcp_stream_cancellation_during_a_pause_clears_the_registry()
                         "finish_reason": "tool_calls",
                     }
                 ],
-                "usage": {},
-            },
+            }
+            yield f"data: {json.dumps(frame)}\n\n".encode()
+            yield b'data: {"choices": [], "usage": {}}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_chunks()
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -1912,3 +1918,495 @@ def test_mcp_servers_listing_redacts_secret_values(api, monkeypatch) -> None:
     assert entry["name"] == "docs"
     assert entry["headers"] == ["Authorization"]
     assert "topsecret" not in resp.text
+
+
+# ── _post_upstream_streamed: token-by-token MCP tool loop rounds (#389) ─────
+#
+# Real token streaming for the MCP tool loop's own upstream calls -- every
+# round used to be one blocking _post_upstream() POST, so a reasoning model's
+# thinking and its final answer both landed as one lump the instant
+# llama-server finished generating. These tests exercise the new streaming
+# `post` closure (_post_upstream_streamed) directly against a fake
+# multi-chunk SSE upstream -- the highest-risk part is tool-call fragment
+# accumulation (a wrong reconstruction silently breaks every agentic tool
+# call), so that gets a byte-identical comparison against the non-streaming
+# path's own output for the same logical content, not just an eyeballed
+# happy path.
+
+
+def _sse_body(*frames: dict) -> bytes:
+    body = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    return (body + "data: [DONE]\n\n").encode()
+
+
+@pytest.fixture
+def streamed_profile() -> ModelProfile:
+    return ModelProfile(
+        name="lfm2.5-350m", model="lfm2.5-350m-served", base_url="http://upstream/v1", api_key="k"
+    )
+
+
+async def test_post_upstream_streamed_accumulates_a_tool_call_split_across_many_chunks(
+    streamed_profile,
+) -> None:
+    # The highest-risk part (#389): function.name AND function.arguments
+    # split across several chunks -- realistic streaming, not one chunk per
+    # tool call -- reassembled and compared BYTE-IDENTICAL to what
+    # _post_upstream (the non-streaming path) returns for the same logical
+    # completion.
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream, _post_upstream_streamed
+
+    def streaming_handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "id": "c1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "get_", "arguments": ""},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "name": "invoice_total",
+                                        "arguments": '{"invoi',
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": 'ce_id": '}}
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": '"INV-7"}'}}
+                            ]
+                        },
+                    }
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    def non_streaming_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "c1",
+                "object": "chat.completion",
+                "model": "lfm2.5-350m-served",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_invoice_total",
+                                        "arguments": '{"invoice_id": "INV-7"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "total?"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(streaming_handler)) as client:
+        streamed = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(non_streaming_handler)) as client:
+        non_streamed = await _post_upstream(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile
+        )
+
+    assert isinstance(streamed, dict)
+    assert isinstance(non_streamed, dict)
+    assert streamed["choices"][0]["message"] == non_streamed["choices"][0]["message"]
+    assert streamed["choices"][0]["finish_reason"] == non_streamed["choices"][0]["finish_reason"]
+    assert streamed["choices"][0]["message"]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_invoice_total", "arguments": '{"invoice_id": "INV-7"}'},
+        }
+    ]
+    # A tool-call-only round never streams content/reasoning fragments.
+    assert queue.empty()
+
+
+async def test_post_upstream_streamed_accumulates_two_tool_calls_by_index(
+    streamed_profile,
+) -> None:
+    # Two tool calls in the same round, each streamed as its own fragment
+    # sequence -- the "index" keying, not arrival order, must keep them apart.
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "calc__add", "arguments": ""},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {"name": "calc__sub", "arguments": ""},
+                                },
+                            ],
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 1, "function": {"arguments": '{"a": 5, '}},
+                                {"index": 0, "function": {"arguments": '{"a": 1, '}},
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": '"b": 2}'}},
+                                {"index": 1, "function": {"arguments": '"b": 3}'}},
+                            ]
+                        },
+                    }
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "1+2 and 5-3?"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    tool_calls = result["choices"][0]["message"]["tool_calls"]
+    assert tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "calc__add", "arguments": '{"a": 1, "b": 2}'},
+        },
+        {
+            "id": "call_2",
+            "type": "function",
+            "function": {"name": "calc__sub", "arguments": '{"a": 5, "b": 3}'},
+        },
+    ]
+
+
+async def test_post_upstream_streamed_accumulates_reasoning_only_deltas(streamed_profile) -> None:
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "reasoning_content": "Let "}}
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "me "}}]},
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "think."}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    message = result["choices"][0]["message"]
+    assert message["reasoning_content"] == "Let me think."
+    assert message["content"] is None
+    assert "tool_calls" not in message
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert [e["type"] for e in events] == ["reasoning_delta", "reasoning_delta", "reasoning_delta"]
+    assert [e["text"] for e in events] == ["Let ", "me ", "think."]
+
+
+async def test_post_upstream_streamed_accumulates_content_only_deltas(streamed_profile) -> None:
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "lo"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "!"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    message = result["choices"][0]["message"]
+    assert message["content"] == "Hello!"
+    assert "reasoning_content" not in message
+    assert "tool_calls" not in message
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert [e["type"] for e in events] == ["content_delta", "content_delta", "content_delta"]
+    assert [e["text"] for e in events] == ["Hel", "lo", "!"]
+
+
+async def test_post_upstream_streamed_captures_usage_from_the_trailing_frame(
+    streamed_profile,
+) -> None:
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            },
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    assert result["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+
+
+async def test_post_upstream_streamed_upstream_error_status_maps_like_post_upstream(
+    streamed_profile,
+) -> None:
+    import asyncio
+
+    from fastapi.responses import JSONResponse
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="upstream kaboom")
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 500
+    body = json.loads(bytes(result.body))
+    assert body["error"]["type"] == "upstream_error"
+    assert "upstream kaboom" in body["error"]["message"]
+
+
+async def test_post_upstream_streamed_connection_error_maps_to_upstream_unavailable(
+    streamed_profile,
+) -> None:
+    import asyncio
+
+    from fastapi.responses import JSONResponse
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 502
+    body = json.loads(bytes(result.body))
+    assert body["error"]["type"] == "upstream_unavailable"
+
+
+def test_chat_mcp_stream_content_and_reasoning_deltas_precede_the_rounds_one_shot_events(
+    api, monkeypatch
+) -> None:
+    # #389, end to end through the real (unmocked) run_tool_loop: every
+    # content_delta/reasoning_delta for a round must land BEFORE that
+    # round's own usage/reasoning/content events, which are only built once
+    # the round's stream has fully ended.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    # run_tool_loop is left REAL here -- the point is exercising the actual
+    # streaming post() closure end to end, not a stand-in for it.
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "reasoning_content": "thinking "}}
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "it over"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "the "}}]},
+            {"choices": [{"index": 0, "delta": {"content": "answer"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    configure_http_transport(httpx.MockTransport(handler))
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert [e["type"] for e in events] == [
+        "reasoning_delta",
+        "reasoning_delta",
+        "content_delta",
+        "content_delta",
+        "usage",
+        "reasoning",
+        "content",
+    ]
+    reasoning_deltas = "".join(e["text"] for e in events if e["type"] == "reasoning_delta")
+    content_deltas = "".join(e["text"] for e in events if e["type"] == "content_delta")
+    assert reasoning_deltas == "thinking it over"
+    assert content_deltas == "the answer"
+    (reasoning_event,) = [e for e in events if e["type"] == "reasoning"]
+    assert reasoning_event["text"] == "thinking it over"
+    (content_event,) = [e for e in events if e["type"] == "content"]
+    assert content_event["completion"]["choices"][0]["message"]["content"] == "the answer"

@@ -464,6 +464,8 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -477,6 +479,8 @@ describe("ChatPanel", () => {
       ["docs-search"],
       expect.any(Function),
       "abc123",
+      expect.any(Function),
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
@@ -1053,5 +1057,76 @@ describe("ChatPanel", () => {
 
     resolveCompletion({ choices: [{ message: { role: "assistant", content: "done" } }] });
     expect(await screen.findByText("done")).toBeInTheDocument();
+  });
+
+  // ── content_delta / reasoning_delta: real token-by-token streaming (#389) ──
+
+  it("renders content_delta fragments live in the assistant bubble as they stream in", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (..._args) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          const onContentDelta = _args[12] as ((text: string) => void) | undefined;
+          onContentDelta?.("The ");
+          onContentDelta?.("total ");
+          onContentDelta?.("is 42 EUR.");
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "what's the total?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    // Visible WHILE the request is still in flight -- accumulated live from
+    // deltas, before the final content event ever lands.
+    expect(await screen.findByText("The total is 42 EUR.")).toBeInTheDocument();
+
+    resolveCompletion({
+      choices: [{ message: { role: "assistant", content: "The total is 42 EUR." } }],
+    });
+    expect(await screen.findByText("The total is 42 EUR.")).toBeInTheDocument();
+  });
+
+  it("renders reasoning_delta fragments live in the trace, replaced by that round's final reasoning entry", async () => {
+    vi.mocked(api.listMcpServers).mockResolvedValue([
+      { name: "docs-search", transport: "stdio", url: null, command: null, headers: null, env: null },
+    ]);
+    let resolveCompletion!: (value: api.AgentChatResponse) => void;
+    let onReasoning: ((text: string) => void) | undefined;
+    vi.mocked(api.chatCompletionMcpStream).mockImplementation(
+      (..._args) =>
+        new Promise((resolve) => {
+          resolveCompletion = resolve;
+          onReasoning = _args[5] as ((text: string) => void) | undefined;
+          const onReasoningDelta = _args[13] as ((text: string) => void) | undefined;
+          onReasoningDelta?.("Let ");
+          onReasoningDelta?.("me think");
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "docs-search" }));
+    await user.type(screen.getByPlaceholderText(/Type a message/), "what's the total?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    // The in-progress fragments, accumulated live -- before the round's
+    // own one-shot reasoning event has fired at all.
+    expect(await screen.findByText("Let me think")).toBeInTheDocument();
+
+    // The round's stream ends: the one-shot reasoning event carries the
+    // COMPLETE text, replacing the live in-progress entry rather than
+    // sitting alongside it.
+    onReasoning?.("Let me think it over.");
+    expect(await screen.findByText("Let me think it over.")).toBeInTheDocument();
+    expect(screen.queryByText("Let me think")).not.toBeInTheDocument();
+
+    resolveCompletion({ choices: [{ message: { role: "assistant", content: "42 EUR" } }] });
+    expect(await screen.findByText("42 EUR")).toBeInTheDocument();
+    expect(screen.getByText("Let me think it over.")).toBeInTheDocument();
   });
 });

@@ -406,9 +406,11 @@ export function respondToChatExchange(exchangeId: string, text: string): Promise
  * finishes (`onToolCall`), instead of the whole exchange completing
  * silently before anything reaches the caller. NOT the OpenAI token-stream
  * format — there is no meaningful token stream for a tool-calling round —
- * so this parses `{"type": "system_addendum"|"tool_call"|"reasoning"|
- * "usage"|"context_budget"|"tool_calls_unsupported"|"content"|"error", ...}`
- * frames, not `choices[0].delta`.
+ * so this parses `{"type": "content_delta"|"reasoning_delta"|
+ * "system_addendum"|"tool_call"|"reasoning"|"usage"|"context_budget"|
+ * "tool_calls_unsupported"|"content"|"error", ...}` frames, not
+ * `choices[0].delta` (though `content_delta`/`reasoning_delta` themselves
+ * now carry real per-round token deltas — see below).
  * `onReasoning`, when a reasoning-capable model's chat template emits one,
  * fires with that round's "why" (calling a tool, or the final answer)
  * BEFORE the tool call it precedes — answers "is there a hidden thinking
@@ -441,6 +443,15 @@ export function respondToChatExchange(exchangeId: string, text: string): Promise
  * times out server-side (`settings.mcp_ask_user_timeout_seconds`) surfaces
  * as an ordinary thrown `ApiError` (`ask_user_timeout`), same as any other
  * `error` event.
+ * `onContentDelta`/`onReasoningDelta` (#389), when given, fire as each
+ * round's upstream call streams real token-by-token deltas — every
+ * fragment for a round lands BEFORE that round's own `onUsage`/`onReasoning`
+ * calls above and before the final `content` resolution, which are still
+ * built from the round's fully-accumulated completion once its stream
+ * ends. Purely additive, for live incremental rendering — never a
+ * replacement for `onReasoning` or the resolved completion, which still
+ * carry the complete text (and, for the resolved completion,
+ * `docie_agent.tool_calls`).
  * Resolves with the final completion once a `content` event lands; throws
  * on an `error` event or a connection that ends without either.
  */
@@ -457,6 +468,8 @@ export async function chatCompletionMcpStream(
   onToolCallsUnsupported?: (warning: AgentToolCallsUnsupportedTrace) => void,
   onExchangeId?: (exchangeId: string) => void,
   onAwaitingInput?: (payload: AgentAwaitingInputTrace) => void,
+  onContentDelta?: (text: string) => void,
+  onReasoningDelta?: (text: string) => void,
 ): Promise<AgentChatResponse> {
   let res: Response;
   try {
@@ -530,6 +543,10 @@ export async function chatCompletionMcpStream(
           if (event.type === "tool_call") {
             const { type: _type, ...call } = event;
             onToolCall(call as unknown as AgentToolCallTrace);
+          } else if (event.type === "content_delta") {
+            if (onContentDelta && typeof event.text === "string") onContentDelta(event.text);
+          } else if (event.type === "reasoning_delta") {
+            if (onReasoningDelta && typeof event.text === "string") onReasoningDelta(event.text);
           } else if (event.type === "reasoning") {
             if (onReasoning && typeof event.text === "string") onReasoning(event.text);
           } else if (event.type === "system_addendum") {

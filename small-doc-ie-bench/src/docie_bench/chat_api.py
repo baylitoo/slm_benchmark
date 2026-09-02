@@ -20,6 +20,7 @@ tenant guard applies.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -623,6 +624,211 @@ def _error_payload(message: str, error_type: str) -> dict[str, Any]:
     return {"message": message, "type": error_type, "code": error_type}
 
 
+async def _post_upstream_streamed(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forward: dict[str, Any],
+    profile: ModelProfile,
+    queue: asyncio.Queue[dict[str, Any] | None],
+) -> dict[str, Any] | JSONResponse:
+    """Streaming counterpart to ``_post_upstream``, used ONLY by
+    ``_stream_chat_with_mcp_tools``'s ``post`` closure — every other caller
+    of ``run_tool_loop`` (the non-streaming ``mcp_servers`` chat path, the
+    standalone Agents surface) keeps using the blocking ``_post_upstream``,
+    completely unchanged. This is why a tool-calling round's reasoning and
+    final answer used to both land as one lump the instant llama-server
+    finished generating: every round was one non-streaming POST.
+
+    Same forwarding contract as ``_post_upstream`` — the same fields
+    (``mcp_servers``, ``session_id``, ``enable_ask_user``) are stripped,
+    the same profile/timeout apply — except the upstream call itself is
+    made with ``stream: true`` + ``stream_options: {"include_usage": true}``,
+    the exact convention ``_stream_chat_completions`` already established,
+    instead of one blocking non-streaming POST.
+
+    As each OpenAI-shaped SSE delta frame arrives, ``delta.content`` and
+    ``delta.reasoning_content`` fragments are pushed onto ``queue`` as
+    ``content_delta``/``reasoning_delta`` events — the SAME queue
+    ``_stream_chat_with_mcp_tools.drive()`` already writes its other events
+    to — for live rendering, while ``delta.tool_calls`` fragments accumulate
+    silently (standard OpenAI streaming tool-call accumulation: fragments
+    keyed by ``index``, ``function.name``/``function.arguments`` string
+    pieces concatenated as they arrive, ``arguments`` never parsed as JSON
+    here — that stays ``execute_tool_call``'s job once the round is whole).
+
+    Once the stream ends (``[DONE]``, or the upstream just closes the
+    connection), the accumulated pieces are reassembled into a completion
+    dict in EXACTLY the shape ``_post_upstream`` returns for an equivalent
+    non-streaming request — ``choices[0].message.{content, reasoning_content,
+    tool_calls}``, plus ``usage`` from the trailing frame when present.
+    ``run_tool_loop``'s tool-call-vs-final-answer detection, and every other
+    caller of ``post()``, are completely unaffected — fed by an accumulated
+    stream instead of a single blocking response.
+
+    Connection failures (before or during the stream) and 4xx/5xx upstream
+    responses map to the same OpenAI-shaped error dict ``_post_upstream``
+    returns for the same conditions — streaming must never regress error
+    handling to get token-by-token rendering.
+    """
+    body = dict(forward)
+    body.pop("mcp_servers", None)
+    body.pop("session_id", None)
+    body.pop("enable_ask_user", None)
+    body["stream"] = True
+    stream_options = body.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    stream_options.setdefault("include_usage", True)
+    body["stream_options"] = stream_options
+
+    stream_ctx = client.stream(
+        "POST", url, json=body, headers=headers, timeout=profile.timeout_seconds
+    )
+    try:
+        upstream = await stream_ctx.__aenter__()
+    except httpx.RequestError as exc:
+        return _openai_error(
+            f"upstream {profile.base_url} is unreachable: {exc}",
+            status_code=502,
+            error_type="upstream_unavailable",
+        )
+    try:
+        if upstream.status_code >= 400:
+            error_bytes = await upstream.aread()
+            return _openai_error(
+                f"upstream returned {upstream.status_code}: "
+                f"{error_bytes[:300].decode('utf-8', 'replace')}",
+                status_code=upstream.status_code,
+                error_type="upstream_error",
+            )
+
+        role = "assistant"
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        # Keyed by the fragment's own "index" (its position among this
+        # round's tool calls, NOT a byte offset) -- the OpenAI streaming
+        # tool-call contract, mirrored verbatim: the first fragment for a
+        # given index carries "id"/"type"/a name piece, every later
+        # fragment for that same index carries only more "arguments" text.
+        tool_call_fragments: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        usage: dict[str, Any] | None = None
+        completion_id = ""
+        model_name = str(body.get("model") or "")
+
+        async for line in upstream.aiter_lines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if payload in ("", "[DONE]"):
+                continue
+            try:
+                frame = json.loads(payload)
+            except ValueError:
+                continue
+            if not isinstance(frame, dict):
+                continue
+            frame_id = frame.get("id")
+            if isinstance(frame_id, str) and frame_id:
+                completion_id = frame_id
+            frame_model = frame.get("model")
+            if isinstance(frame_model, str) and frame_model:
+                model_name = frame_model
+            frame_usage = frame.get("usage")
+            if isinstance(frame_usage, dict):
+                # The OpenAI/llama-server streaming contract sends this on
+                # the TRAILING frame (stream_options.include_usage, set
+                # above) -- a later frame's usage always wins, but there is
+                # normally at most one.
+                usage = frame_usage
+            choices = frame.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            choice_finish = choice.get("finish_reason")
+            if isinstance(choice_finish, str) and choice_finish:
+                finish_reason = choice_finish
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            delta_role = delta.get("role")
+            if isinstance(delta_role, str) and delta_role:
+                role = delta_role
+            content_piece = delta.get("content")
+            if isinstance(content_piece, str) and content_piece:
+                content_parts.append(content_piece)
+                queue.put_nowait({"type": "content_delta", "text": content_piece})
+            reasoning_piece = delta.get("reasoning_content")
+            if isinstance(reasoning_piece, str) and reasoning_piece:
+                reasoning_parts.append(reasoning_piece)
+                queue.put_nowait({"type": "reasoning_delta", "text": reasoning_piece})
+            delta_tool_calls = delta.get("tool_calls")
+            if isinstance(delta_tool_calls, list):
+                for fragment in delta_tool_calls:
+                    if not isinstance(fragment, dict):
+                        continue
+                    index = fragment.get("index")
+                    if not isinstance(index, int):
+                        index = 0
+                    entry = tool_call_fragments.setdefault(
+                        index,
+                        {
+                            "id": None,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    fragment_id = fragment.get("id")
+                    if isinstance(fragment_id, str) and fragment_id:
+                        entry["id"] = fragment_id
+                    fragment_type = fragment.get("type")
+                    if isinstance(fragment_type, str) and fragment_type:
+                        entry["type"] = fragment_type
+                    function_fragment = fragment.get("function")
+                    if isinstance(function_fragment, dict):
+                        name_piece = function_fragment.get("name")
+                        if isinstance(name_piece, str):
+                            entry["function"]["name"] += name_piece
+                        # A raw JSON string streamed in pieces -- concatenate
+                        # as they arrive, never parse/validate until the
+                        # round is fully done (execute_tool_call's job, once
+                        # run_tool_loop has the whole thing).
+                        arguments_piece = function_fragment.get("arguments")
+                        if isinstance(arguments_piece, str):
+                            entry["function"]["arguments"] += arguments_piece
+    except httpx.RequestError as exc:
+        return _openai_error(
+            f"upstream {profile.base_url} is unreachable: {exc}",
+            status_code=502,
+            error_type="upstream_unavailable",
+        )
+    finally:
+        await stream_ctx.__aexit__(None, None, None)
+
+    message: dict[str, Any] = {
+        "role": role,
+        "content": "".join(content_parts) if content_parts else None,
+    }
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_call_fragments:
+        message["tool_calls"] = [tool_call_fragments[i] for i in sorted(tool_call_fragments)]
+
+    completion: dict[str, Any] = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "model": model_name,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+    }
+    if usage is not None:
+        completion["usage"] = usage
+    return completion
+
+
 async def _stream_chat_with_mcp_tools(
     client: httpx.AsyncClient,
     url: str,
@@ -680,6 +886,21 @@ async def _stream_chat_with_mcp_tools(
         event. Note a docs-search request's eager-list ``tool_call`` event
         (see ``_eager_list_context``) is emitted BEFORE this one, since that
         listing call happens while the addendum text is still being built.
+      ``{"type": "content_delta", "text": <fragment>}`` / ``{"type":
+        "reasoning_delta", "text": <fragment>}`` — real token-by-token
+        streaming this time: the ``post`` this function builds now streams
+        each round's upstream call (see ``_post_upstream_streamed``)
+        instead of ``_post_upstream``'s one blocking response, and every
+        fragment of that round's ``delta.content``/``delta.reasoning_content``
+        is pushed the instant it arrives, interleaved with each other in
+        emission order. Every delta for a round lands BEFORE that round's
+        own ``usage``, ``reasoning``, and ``tool_call``/``content`` events
+        below, which are still built from the round's fully-accumulated
+        completion once its stream ends — deltas are purely additive, for
+        live rendering only (the Playground appends each fragment to the
+        in-progress bubble as it streams), never a replacement for those
+        payloads (the final ``content`` event still carries the complete
+        ``docie_agent.tool_calls`` trace, etc).
       ``{"type": "tool_call", "tool", "status", "latency_ms", "arguments",
         "result"}`` — same shape as the static ``docie_agent.tool_calls``
         trace (#261/#262), so the frontend's existing ``ToolCallTrace``
@@ -735,7 +956,6 @@ async def _stream_chat_with_mcp_tools(
     Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
     convention ``_stream_chat_completions`` uses.
     """
-    import asyncio
     import contextlib
     import uuid
     from contextlib import AsyncExitStack
@@ -786,7 +1006,7 @@ async def _stream_chat_with_mcp_tools(
                 return
 
             async def post(body: dict[str, Any]) -> dict[str, Any] | JSONResponse:
-                return await _post_upstream(client, url, headers, body, profile)
+                return await _post_upstream_streamed(client, url, headers, body, profile, queue)
 
             trace = _QueueTraceSink()
             record_tool_call = mcp_mod.make_trace_recorder(trace)
