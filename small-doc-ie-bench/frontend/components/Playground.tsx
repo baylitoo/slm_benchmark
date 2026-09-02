@@ -748,12 +748,27 @@ export function ChatPanel({
         let liveSystemAddendum: string | undefined;
         let liveContextBudget: AgentContextBudgetTrace | undefined;
         let liveToolCallsUnsupported: AgentToolCallsUnsupportedTrace | undefined;
+        // content_delta/reasoning_delta (#389): real token-by-token
+        // fragments for the round currently streaming. liveContentText is
+        // the growing final-answer bubble text -- never reset, since a
+        // tool-calling round's content is normally empty and only the
+        // final round actually accumulates anything here. liveReasoningLive
+        // is that round's in-progress reasoning text, shown as the last
+        // trace entry until onReasoning's one-shot event (below) replaces it
+        // with the round's complete, final text and clears this back out.
+        let liveContentText = "";
+        let liveReasoningLive = "";
         const patchLiveMsg = () => {
           setMsgs((prev) => {
             const patch = {
-              content: "",
+              content: liveContentText,
               toolCalls: [...liveToolCalls],
-              trace: [...liveTrace],
+              trace: [
+                ...liveTrace,
+                ...(liveReasoningLive
+                  ? [{ kind: "reasoning" as const, text: liveReasoningLive }]
+                  : []),
+              ],
               ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
               ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
               ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
@@ -774,6 +789,17 @@ export function ChatPanel({
         const onReasoning = (text: string) => {
           liveReasoning.push(text);
           liveTrace.push({ kind: "reasoning", text });
+          // That round's delta fragments are now folded into this final,
+          // complete entry -- the live in-progress one is retired.
+          liveReasoningLive = "";
+          patchLiveMsg();
+        };
+        const onContentDelta = (text: string) => {
+          liveContentText += text;
+          patchLiveMsg();
+        };
+        const onReasoningDelta = (text: string) => {
+          liveReasoningLive += text;
           patchLiveMsg();
         };
         const onSystemAddendum = (text: string) => {
@@ -819,6 +845,8 @@ export function ChatPanel({
             onToolCallsUnsupported,
             onExchangeId,
             onAwaitingInput,
+            onContentDelta,
+            onReasoningDelta,
           );
         } finally {
           // The exchange (and any still-open answer prompt) never outlives
