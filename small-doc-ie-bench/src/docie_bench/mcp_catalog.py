@@ -47,6 +47,18 @@ class CatalogEntry:
     # knowing valid identifiers instead of discovering them (or inventing
     # them) via a tool call it may skip.
     eager_list_tool: str | None = None
+    # A multi-step USAGE PROTOCOL a tool's own JSON-schema description
+    # already documents but a small model reliably fails to extract --
+    # llama.cpp's --jinja rendering of `tools` is one dense inline JSON dump
+    # per server (verified against a real running LFM2.5 chat_template: tool
+    # descriptions get string-escaped and crammed into one "List of tools:
+    # [...]" system-prompt line), not readable prose a small model attends to
+    # well. `mcp_tools.run_tool_loop` folds this into the SAME clean,
+    # dedicated system-message channel `TOOL_DISCIPLINE_DIRECTIVE` already
+    # uses -- a model attends to that far more reliably than a schema
+    # description buried in a JSON blob. `None` (default): no promotion,
+    # the tool's own description is the only source, unchanged behavior.
+    usage_notes: str | None = None
 
 
 CATALOG: dict[str, CatalogEntry] = {
@@ -107,6 +119,23 @@ CATALOG: dict[str, CatalogEntry] = {
             module="docie_bench.mcp_servers.docs_search",
             tools=("list_files", "read_document", "search_text", "write_note", "read_notes"),
             eager_list_tool="list_files",
+            usage_notes=(
+                "docs-search reading protocol: call read_document ONCE with no "
+                "start_page/end_page first -- its total_pages tells you how long "
+                "the document really is, and a short document is answered "
+                "directly from that first call. On a longer document, call "
+                "search_text with a specific query to find which page(s) actually "
+                "answer the question, THEN call read_document again with "
+                "start_page/end_page set to those pages. Never guess a page range "
+                "on the first call -- you don't know it yet.\n"
+                "Notes protocol: call read_notes on a document before "
+                "re-analyzing it from scratch -- an earlier pass may already "
+                "have found (or flagged) something worth reusing. write_note is "
+                "for a short, page-anchored observation or discrepancy, never a "
+                "restatement of the page's own text -- if you're about to quote "
+                "more than a sentence or two into a note, that content belongs "
+                "in your answer, not the note."
+            ),
             params=(
                 CatalogParam(
                     name="docs_dir",
@@ -299,6 +328,18 @@ CATALOG: dict[str, CatalogEntry] = {
             module="docie_bench.mcp_servers.sql_agent",
             tools=("list_tables", "describe_table", "run_query"),
             eager_list_tool="list_tables",
+            usage_notes=(
+                "sql-agent querying protocol: ALWAYS call describe_table on a "
+                "table before writing a query against it -- never guess a "
+                "column name from its table name alone. Every connection is "
+                "read-only at the Postgres session level, so don't bother "
+                "attempting a write query -- it will be rejected by the "
+                "database itself, not silently ignored. If a question needs "
+                "data from more than one table, describe_table "
+                "each one first, then write a single query joining them -- "
+                "don't run several separate single-table queries and combine "
+                "the results yourself."
+            ),
             params=(
                 CatalogParam(
                     name="host",

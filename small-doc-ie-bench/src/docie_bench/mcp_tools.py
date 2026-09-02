@@ -617,6 +617,30 @@ def _with_context_budget_line(messages: list[dict[str, Any]], line: str) -> list
     return [{"role": "system", "content": line}, *messages]
 
 
+def _catalog_usage_notes(mapping: Mapping[str, tuple[str, str]]) -> str | None:
+    """Collect each server actually in play's own ``CatalogEntry.usage_notes``
+    -- a multi-step protocol a tool's own JSON-schema description already
+    documents but a small model reliably fails to extract (see
+    ``CatalogEntry.usage_notes``'s own docstring for why). Promoted into the
+    same clean, dedicated system-message channel ``TOOL_DISCIPLINE_DIRECTIVE``
+    already uses. One entry per distinct server, first-seen order, dedup'd so
+    a server with several tools doesn't repeat its note once per tool.
+    ``None`` when no involved server declares any.
+    """
+    from docie_bench.mcp_catalog import CATALOG
+
+    seen: set[str] = set()
+    lines: list[str] = []
+    for server_name, _tool_name in mapping.values():
+        if server_name in seen:
+            continue
+        seen.add(server_name)
+        entry = CATALOG.get(server_name)
+        if entry is not None and entry.usage_notes:
+            lines.append(entry.usage_notes)
+    return "\n\n".join(lines) if lines else None
+
+
 async def _eager_list_context(
     sessions: Mapping[str, ClientSession],
     mapping: Mapping[str, tuple[str, str]],
@@ -851,6 +875,9 @@ async def run_tool_loop(
     messages = [dict(m) if isinstance(m, dict) else m for m in (forward.get("messages") or [])]
     if mcp_tools:
         addendum = TOOL_DISCIPLINE_DIRECTIVE
+        usage_notes = _catalog_usage_notes(mapping)
+        if usage_notes:
+            addendum = f"{addendum}\n\n{usage_notes}"
         eager_context = await _eager_list_context(sessions, mapping, on_tool_call)
         if eager_context:
             addendum = f"{addendum}\n\n{eager_context}"
