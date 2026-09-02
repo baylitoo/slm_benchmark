@@ -24,7 +24,7 @@ import {
   X,
 } from "lucide-react";
 import {
-  triggerExtract,
+  extractStream,
   chatCompletionMcpStream,
   chatCompletionStream,
   pauseChatExchange,
@@ -51,7 +51,6 @@ import {
   ApiError,
   ApiUnavailable,
   ModelLoading,
-  type TriggerResponse,
   type ExtractRequest,
   type DeploymentRecord,
   type StoreEntry,
@@ -83,10 +82,11 @@ import {
   Badge,
   Spinner,
 } from "./ui";
-import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
 import { ToolCallItem } from "./ToolCallTrace";
+import { JsonView } from "./JsonView";
+import { RoutingSummary } from "./RoutingSummary";
 
 type PlaygroundMode = "chat" | "arena" | "embedrerank";
 
@@ -209,11 +209,24 @@ export function Playground({
 //     interleaved freely with ordinary chat turns.
 // ---------------------------------------------------------------------------
 
+/** Live-streaming state for a role === "extraction" message (#397): raw
+ * model-output text accumulated from `delta` SSE frames (a live preview
+ * ONLY — never parsed as the result), the current `phase` label if the
+ * server sent one, and the terminal outcome (`result` from the `result`
+ * frame, or `error`). `result`/`error` are mutually exclusive with the live
+ * buffer still being shown — once either is set, the buffer is done. */
+interface ExtractionLiveState {
+  phase?: string;
+  liveText: string;
+  result?: unknown;
+  error?: string;
+}
+
 interface ChatMsg {
   role: "user" | "assistant" | "status" | "extraction";
   content: string;
   /** Only set when role === "extraction". */
-  trigger?: TriggerResponse;
+  extraction?: ExtractionLiveState;
   /** Only set on an assistant turn that ran MCP tools (selectedMcp). */
   toolCalls?: AgentToolCallTrace[];
   /** Reasoning-capable model's "why" for a round (calling a tool, or the
@@ -526,21 +539,56 @@ export function ChatPanel({
     setInput("");
     clearAttachment();
     setBusy(true);
+
+    // `next` is msgs BEFORE the user turn + live extraction placeholder
+    // below get appended -- same convention attempt()'s patchLiveMsg uses,
+    // so a live patch always targets the placeholder's index (next.length)
+    // regardless of how many times setMsgs has re-rendered since.
+    const next: ChatMsg[] = [...msgs, { role: "user", content: displayLabel }];
+    setMsgs([
+      ...next,
+      {
+        role: "extraction",
+        content: dynamicSchemaName || schemaName || "invoice",
+        extraction: { liveText: "" },
+      },
+    ]);
+
+    let liveText = "";
+    const patchExtraction = (patch: Partial<ExtractionLiveState>) => {
+      setMsgs((prev) =>
+        prev.length <= next.length
+          ? prev
+          : prev.map((m, i) =>
+              i === next.length
+                ? { ...m, extraction: { ...(m.extraction ?? { liveText: "" }), ...patch } }
+                : m,
+            ),
+      );
+    };
+    const onDelta = (text: string) => {
+      liveText += text;
+      patchExtraction({ liveText });
+    };
+    const onReset = () => {
+      liveText = "";
+      patchExtraction({ liveText: "" });
+    };
+    const onPhase = (phase: string) => patchExtraction({ phase });
+
     try {
-      const res = await triggerExtract(payload);
-      setMsgs((prev) => [
-        ...prev,
-        { role: "user", content: displayLabel },
-        { role: "extraction", content: dynamicSchemaName || schemaName || "invoice", trigger: res },
-      ]);
-      toast({ title: "Extraction started", description: res.channel, tone: "success" });
+      const result = await extractStream(payload, onDelta, onReset, onPhase);
+      patchExtraction({ result });
     } catch (e) {
       const msg =
-        e instanceof ApiUnavailable
-          ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
-          : e instanceof ApiError || e instanceof Error
-            ? e.message
-            : "Something went wrong.";
+        e instanceof ModelLoading
+          ? e.message
+          : e instanceof ApiUnavailable
+            ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
+            : e instanceof ApiError || e instanceof Error
+              ? e.message
+              : "Something went wrong.";
+      patchExtraction({ error: msg });
       setError(msg);
       toast({ title: "Extraction failed", description: msg, tone: "error" });
     } finally {
@@ -1186,7 +1234,7 @@ export function ChatPanel({
                   <T>Extraction</T> · {m.content}
                 </div>
                 <div className="p-3">
-                  {m.trigger && <ResultPanel trigger={m.trigger} noun="extraction" />}
+                  {m.extraction && <ExtractionLiveView state={m.extraction} />}
                 </div>
               </div>
             ) : (
@@ -1563,6 +1611,36 @@ export function ChatPanel({
         </div>
       </div>
     </Card>
+  );
+}
+
+/** One extraction turn's SSE-driven body (#397): a live raw-text buffer
+ * while the model is still generating, swapped for the authoritative
+ * JsonView + RoutingSummary render the instant the terminal `result` frame
+ * lands (or an error banner for a terminal `error`). Never renders the live
+ * buffer once `result`/`error` is set — those are the ONLY things a caller
+ * should treat as the real outcome. */
+function ExtractionLiveView({ state }: { state: ExtractionLiveState }) {
+  if (state.error) return <Alert tone="err">{state.error}</Alert>;
+  if (state.result !== undefined) {
+    return (
+      <div className="space-y-2">
+        <RoutingSummary result={state.result} />
+        <JsonView value={state.result} />
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      <p className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Spinner /> <T>{state.phase ?? "Extracting…"}</T>
+      </p>
+      {state.liveText && (
+        <pre className="scroll-thin max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-2 text-xs text-muted-foreground">
+          {state.liveText}
+        </pre>
+      )}
+    </div>
   );
 }
 
