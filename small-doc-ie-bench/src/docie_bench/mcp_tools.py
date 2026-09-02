@@ -342,6 +342,20 @@ TOOL_DISCIPLINE_DIRECTIVE = (
     "so directly instead of guessing."
 )
 
+# #391: the round that would otherwise exhaust mcp_max_tool_iterations gets
+# its tools stripped (see run_tool_loop) instead of being allowed to call one
+# more time and hit a hard 502 -- every prior round's tool results are
+# already sitting in `messages`, discarding all of that for an error instead
+# of a best-effort answer is a worse outcome than answering with whatever was
+# actually found. This directive is folded in ONLY on that last round.
+TOOL_BUDGET_EXHAUSTED_DIRECTIVE = (
+    "You've reached the tool-call budget for this exchange -- no more tool "
+    "calls are available. Answer the user's original question now, using "
+    "only what you've already found in this conversation. If something is "
+    "still genuinely missing, say so plainly rather than guessing or "
+    "inventing it."
+)
+
 # Human-in-the-loop pause/resume (#383): a synthetic tool, never routed to an
 # MCP server -- real MCP tools run as separate stdio subprocesses
 # (open_mcp_sessions), and a tool call blocking on an event only a LATER,
@@ -686,15 +700,34 @@ async def run_tool_loop(
     on_context_budget: Callable[[dict[str, Any]], None] | None = None,
     exchange_id: str | None = None,
     on_awaiting_input: Callable[[dict[str, Any]], None] | None = None,
+    on_tool_budget_forced: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Drive the model↔tools exchange until a plain answer (or the bound).
 
     ``post`` is the caller's "one upstream completion" function; anything it
     returns that is not a dict (an error response) passes straight through.
-    Returns the final completion dict with ``usage`` summed across rounds,
-    the error object from ``post``, or ``None`` when ``max_iterations``
-    rounds all ended in tool calls — the route maps that to an explicit 502
-    rather than silently returning a half-finished exchange.
+    Returns the final completion dict with ``usage`` summed across rounds, or
+    the error object from ``post``.
+
+    ``max_iterations`` (or ``settings.mcp_max_tool_iterations``) is no longer
+    a hard wall that discards the whole exchange (#391). Rounds 1..limit run
+    exactly as before, full tools available every time. If round ``limit``
+    ALSO ends in a tool call, ONE more round (``limit + 1``, never more) runs
+    with tools stripped down to whatever the caller itself supplied (real MCP
+    tools and ``ask_user`` both dropped) and ``TOOL_BUDGET_EXHAUSTED_DIRECTIVE``
+    folded into the system message — forcing a plain answer built from
+    everything already gathered in ``messages`` across every prior round,
+    instead of a 502 that throws all of that work away. That forced round is
+    a hard stop regardless of what comes back (even a broken ``post()`` that
+    ignores the stripped tools and returns another tool-calls-shaped message
+    anyway) — it is returned as the final answer either way, never looped
+    back into. ``on_tool_budget_forced``, when given, is invoked once with
+    ``{"rounds_used", "max_iterations"}`` right before that round's ``post()``
+    call, so a caller can surface it transparently. A defensive ``return
+    None`` still exists below (matching every other fail-open guard in this
+    codebase) but is no longer reachable under normal operation — the forced
+    round always returns a real completion, or an error from ``post()``,
+    before the loop could ever reach it.
 
     ``on_tool_call``, when given, is invoked synchronously right after each
     executed tool call with ``(qualified_name, ok, latency_ms, arguments,
@@ -862,9 +895,25 @@ async def run_tool_loop(
                 answer = await _await_pending_input(exchange_id, on_awaiting_input)
                 messages.append({"role": "user", "content": answer})
                 continue
-        if rounds_used >= limit:
-            return None
+        if rounds_used >= limit + 1:
+            return None  # defensive fallback only -- see run_tool_loop's docstring
         rounds_used += 1
+        # Rounds 1..limit run exactly as before (full tools, byte-identical
+        # to pre-#391 behavior) -- only round limit+1 is forced, and only
+        # reached at all when round `limit` ALSO ended in a tool call.
+        is_forced_round = rounds_used == limit + 1
+        if is_forced_round:
+            # #391: every real round the budget allows has been used and the
+            # last one still ended in a tool call. Grant exactly one more,
+            # tools-stripped round to force a plain answer instead of letting
+            # this end in a 502 -- strip mcp_tools/ask_user down to whatever
+            # the caller itself supplied (untouched either way) and nudge the
+            # model to answer NOW with what's already in `messages` from
+            # every prior round, rather than discarding all of that.
+            forward["tools"] = caller_tools
+            messages = _with_system_addendum(messages, TOOL_BUDGET_EXHAUSTED_DIRECTIVE)
+            if on_tool_budget_forced is not None:
+                on_tool_budget_forced({"rounds_used": rounds_used, "max_iterations": limit})
         forward["messages"] = messages
         completion = await post(forward)
         if not isinstance(completion, dict):
@@ -912,7 +961,7 @@ async def run_tool_loop(
             if isinstance(call, dict)
         ]
         all_mcp = bool(names) and all(_is_known(name) for name in names)
-        if not all_mcp:
+        if not all_mcp or is_forced_round:
             # Plain answer, or at least one caller-owned/unknown tool call:
             # this completion belongs to the caller. Unknown names ride the
             # same path deliberately — hallucinated tool names are the
@@ -920,6 +969,15 @@ async def run_tool_loop(
             # hallucinated name is only "caller-owned" fiction if the caller
             # advertised tools at all; log the anomaly either way. ask_user
             # itself is never "unknown" when this exchange opted into it.
+            #
+            # `is_forced_round` short-circuits this unconditionally (#391):
+            # mcp_tools were stripped from `forward` above, so a well-behaved
+            # model structurally cannot emit one -- but nothing stops a
+            # broken/adversarial `post()` (or a model ignoring what it was
+            # actually offered) from returning a tool_calls-shaped message
+            # anyway, whose name still happens to resolve via `mapping`. This
+            # round is the hard stop either way: never loop back and execute
+            # it, just return whatever came back as the final answer.
             for name in names:
                 if name and not _is_known(name) and name not in caller_tool_names:
                     logger.warning("model called unknown tool %r — returning to caller", name)
