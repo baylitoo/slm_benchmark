@@ -272,6 +272,25 @@ const VISION_PRESETS = [
   "What is written in this document? Return it verbatim.",
 ];
 
+// A single attached file plus its own preview state -- an image resolves its
+// preview synchronously (object URL); a PDF resolves it async (rasterized
+// page-1 thumbnail via renderDocument), see loadPdfPreview.
+interface Attachment {
+  id: string;
+  file: File;
+  preview: string | null;
+  previewLoading: boolean;
+  /** The PDF's true total page count (from the render-document response),
+   * even though the thumbnail only ever rasterizes page 1. Drives the
+   * enlarge modal's decision to fetch more pages. null for a non-PDF image
+   * attachment (or before a PDF preview has resolved). */
+  previewTotalPages: number | null;
+}
+
+// Selecting more than this keeps the first N and shows an inline message --
+// never silently drops files, never hard-errors.
+const MAX_ATTACHMENTS = 10;
+
 // Exported for tests: rendered by Playground with its polled deployment state.
 export function ChatPanel({
   deployments,
@@ -370,17 +389,27 @@ export function ChatPanel({
   } | null>(null);
 
   // --- Attachment (vision + extraction file input share one attach slot) ---
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
-  // The PDF's true total page count (from the render-document response),
-  // even though the thumbnail only ever rasterizes page 1. Drives the
-  // enlarge modal's decision to fetch more pages. null for a non-PDF image
-  // attachment (or before a PDF preview has resolved).
-  const [previewTotalPages, setPreviewTotalPages] = useState<number | null>(null);
+  // Up to MAX_ATTACHMENTS files, each carrying its own preview state -- a
+  // plain generalization of the old single `file`/`preview` pair (see the
+  // N=1 case throughout: it reduces to exactly the old single-attachment
+  // behavior).
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  // Set when a picked selection exceeded MAX_ATTACHMENTS -- shown inline
+  // instead of silently dropping the extra files.
+  const [attachmentCapMessage, setAttachmentCapMessage] = useState<string | null>(null);
+  const attachmentSeq = useRef(0);
+  function nextAttachmentId(): string {
+    attachmentSeq.current += 1;
+    return `att-${attachmentSeq.current}`;
+  }
+
+  // Which attachment the enlarge modal is currently showing -- null when
+  // closed or when nothing is attached.
+  const [enlargeTargetId, setEnlargeTargetId] = useState<string | null>(null);
   const [enlargeOpen, setEnlargeOpen] = useState(false);
   const [enlargePages, setEnlargePages] = useState<string[]>([]);
   const [enlargeLoading, setEnlargeLoading] = useState(false);
+  const enlargeAttachment = attachments.find((a) => a.id === enlargeTargetId) ?? null;
   // Fetching every page of an arbitrarily long PDF for the enlarge modal
   // would be slow and wasteful -- cap it at the same default the vision-send
   // path already uses for "how many pages will the model actually see".
@@ -390,62 +419,104 @@ export function ChatPanel({
   // CHAT mode (extraction rasterizes server-side via its own OCR backend).
   const [dpi, setDpi] = useState(200);
 
-  function clearAttachment() {
-    if (preview?.startsWith("blob:")) URL.revokeObjectURL(preview);
-    setPreview(null);
-    setPreviewTotalPages(null);
-    setFile(null);
+  function clearAttachments() {
+    setAttachments((prev) => {
+      for (const a of prev) {
+        if (a.preview?.startsWith("blob:")) URL.revokeObjectURL(a.preview);
+      }
+      return [];
+    });
+    setAttachmentCapMessage(null);
     setEnlargeOpen(false);
+    setEnlargeTargetId(null);
     setEnlargePages([]);
   }
 
-  async function onAttach(f: File | null) {
-    clearAttachment();
-    setFile(f);
-    if (!f) return;
-    if (f.type.startsWith("image/")) {
-      setPreview(URL.createObjectURL(f));
-      setPreviewTotalPages(1);
-      return;
+  function removeAttachment(id: string) {
+    setAttachments((prev) => {
+      const target = prev.find((a) => a.id === id);
+      if (target?.preview?.startsWith("blob:")) URL.revokeObjectURL(target.preview);
+      return prev.filter((a) => a.id !== id);
+    });
+    if (enlargeTargetId === id) {
+      setEnlargeOpen(false);
+      setEnlargeTargetId(null);
+      setEnlargePages([]);
     }
+  }
+
+  async function loadPdfPreview(id: string, f: File) {
     // PDF: rasterize page 1 only (low DPI, explicit page list) for a real
     // visual preview — an <img> can't show a PDF directly. Explicit `pages`
     // means this never rejects on page count, and never rasterizes more than
     // the one page it needs. Best-effort: on failure the run still renders
     // the pages when sent.
-    setPreviewLoading(true);
     try {
       const b64 = await fileToBase64(f);
       const { images, total_pages } = await renderDocument(b64, f.name, 150, [1]);
-      setPreview(images[0] ?? null);
-      setPreviewTotalPages(total_pages);
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.id === id
+            ? { ...a, preview: images[0] ?? null, previewTotalPages: total_pages, previewLoading: false }
+            : a,
+        ),
+      );
     } catch {
-      setPreview(null);
-      setPreviewTotalPages(null);
-    } finally {
-      setPreviewLoading(false);
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.id === id ? { ...a, preview: null, previewTotalPages: null, previewLoading: false } : a,
+        ),
+      );
     }
   }
 
-  async function onEnlargePreview() {
-    if (!preview) return;
+  function onAttach(fileList: FileList | null) {
+    clearAttachments();
+    if (!fileList || fileList.length === 0) return;
+    const picked = Array.from(fileList);
+    const capped = picked.slice(0, MAX_ATTACHMENTS);
+    if (picked.length > MAX_ATTACHMENTS) {
+      setAttachmentCapMessage(
+        `Only the first ${MAX_ATTACHMENTS} files were attached (you picked ${picked.length}).`,
+      );
+    }
+    const initial: Attachment[] = capped.map((f) => {
+      const isImage = f.type.startsWith("image/");
+      return {
+        id: nextAttachmentId(),
+        file: f,
+        preview: isImage ? URL.createObjectURL(f) : null,
+        previewLoading: !isImage,
+        previewTotalPages: isImage ? 1 : null,
+      };
+    });
+    setAttachments(initial);
+    for (const a of initial) {
+      if (a.previewLoading) void loadPdfPreview(a.id, a.file);
+    }
+  }
+
+  async function onEnlargePreview(id: string) {
+    const att = attachments.find((a) => a.id === id);
+    if (!att?.preview) return;
+    setEnlargeTargetId(id);
     setEnlargeOpen(true);
-    if (!file || !previewTotalPages || previewTotalPages <= 1) {
+    if (!att.previewTotalPages || att.previewTotalPages <= 1) {
       // Single-page (or unknown) doc — the thumbnail already has the whole
       // document; no redundant fetch.
-      setEnlargePages(preview ? [preview] : []);
+      setEnlargePages([att.preview]);
       return;
     }
     setEnlargeLoading(true);
     try {
-      const b64 = await fileToBase64(file);
-      const wanted = Math.min(previewTotalPages, ENLARGE_MAX_PAGES);
+      const b64 = await fileToBase64(att.file);
+      const wanted = Math.min(att.previewTotalPages, ENLARGE_MAX_PAGES);
       const pageNumbers = Array.from({ length: wanted }, (_, i) => i + 1);
-      const { images } = await renderDocument(b64, file.name, 200, pageNumbers);
+      const { images } = await renderDocument(b64, att.file.name, 200, pageNumbers);
       setEnlargePages(images);
     } catch {
       // Best-effort — fall back to the single thumbnail already on screen.
-      setEnlargePages([preview]);
+      setEnlargePages([att.preview]);
     } finally {
       setEnlargeLoading(false);
     }
@@ -497,110 +568,150 @@ export function ChatPanel({
     return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
   }
 
+  function describeApiError(e: unknown): string {
+    return e instanceof ModelLoading
+      ? e.message
+      : e instanceof ApiUnavailable
+        ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
+        : e instanceof ApiError || e instanceof Error
+          ? e.message
+          : "Something went wrong.";
+  }
+
   async function runExtraction() {
     if (busy) return;
     const trimmed = input.trim();
-    const attached = file;
-    if (!trimmed && !attached) {
+    const attached = attachments;
+    if (!trimmed && attached.length === 0) {
       setError("Paste some document text first, or attach a file.");
       return;
     }
-    const payload: ExtractRequest = dynamicSchemaName
-      ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
-      : { schema_name: schemaName || "invoice" };
-    if (modelSource === "policy") {
-      if (!selectedPolicy) {
-        setError("Pick a routing policy, or switch back to a single model.");
-        return;
-      }
-      payload.routing_policy = selectedPolicy;
-    } else if (model) {
-      payload.deployment = model;
-    }
-    if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
-    if (language.trim()) payload.language = language.trim();
-
-    let displayLabel: string;
-    try {
-      if (attached) {
-        payload.content_b64 = await fileToBase64(attached);
-        payload.filename = attached.name;
-        displayLabel = `📎 ${attached.name}`;
-      } else {
-        payload.text = trimmed;
-        displayLabel = trimmed;
-      }
-    } catch {
-      setError("Could not read the attached file.");
+    if (modelSource === "policy" && !selectedPolicy) {
+      setError("Pick a routing policy, or switch back to a single model.");
       return;
     }
 
+    function buildPayload(): ExtractRequest {
+      const payload: ExtractRequest = dynamicSchemaName
+        ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
+        : { schema_name: schemaName || "invoice" };
+      if (modelSource === "policy") {
+        payload.routing_policy = selectedPolicy;
+      } else if (model) {
+        payload.deployment = model;
+      }
+      if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
+      if (language.trim()) payload.language = language.trim();
+      return payload;
+    }
+
     setError(null);
+
+    // One job per unit of work: the lone text-only job when nothing's
+    // attached, or one job per attached file -- each gets its OWN extraction
+    // run and its OWN live-streamed placeholder, same per-file call the app
+    // already makes for one file. N=0/N=1 both reduce to exactly the single
+    // call the pre-multi-attach code made.
+    type Job = { payload: ExtractRequest; displayLabel: string };
+    let jobs: Job[];
+    if (attached.length === 0) {
+      const payload = buildPayload();
+      payload.text = trimmed;
+      jobs = [{ payload, displayLabel: trimmed }];
+    } else {
+      try {
+        jobs = await Promise.all(
+          attached.map(async (a) => {
+            const payload = buildPayload();
+            payload.content_b64 = await fileToBase64(a.file);
+            payload.filename = a.file.name;
+            return { payload, displayLabel: `📎 ${a.file.name}` };
+          }),
+        );
+      } catch {
+        setError("Could not read the attached file.");
+        return;
+      }
+    }
+
     setInput("");
-    clearAttachment();
+    clearAttachments();
     setBusy(true);
 
-    // `next` is msgs BEFORE the user turn + live extraction placeholder
-    // below get appended -- same convention attempt()'s patchLiveMsg uses,
-    // so a live patch always targets the placeholder's index (next.length)
-    // regardless of how many times setMsgs has re-rendered since.
-    const next: ChatMsg[] = [...msgs, { role: "user", content: displayLabel }];
-    setMsgs([
-      ...next,
-      {
+    // Every job's user turn + live extraction placeholder is appended up
+    // front, so a live patch always targets a stable index (base.length +
+    // i*2 + 1) regardless of how many times setMsgs has re-rendered since,
+    // or how many of the OTHER jobs have already settled.
+    const base = msgs;
+    const newEntries: ChatMsg[] = [];
+    for (const job of jobs) {
+      newEntries.push({ role: "user", content: job.displayLabel });
+      newEntries.push({
         role: "extraction",
         content: dynamicSchemaName || schemaName || "invoice",
         extraction: { liveText: "" },
-      },
-    ]);
+      });
+    }
+    setMsgs([...base, ...newEntries]);
 
-    let liveText = "";
-    const patchExtraction = (patch: Partial<ExtractionLiveState>) => {
+    function patchExtractionAt(index: number, patch: Partial<ExtractionLiveState>) {
       setMsgs((prev) =>
-        prev.length <= next.length
+        prev.length <= index
           ? prev
           : prev.map((m, i) =>
-              i === next.length
+              i === index
                 ? { ...m, extraction: { ...(m.extraction ?? { liveText: "" }), ...patch } }
                 : m,
             ),
       );
-    };
-    const onDelta = (text: string) => {
-      liveText += text;
-      patchExtraction({ liveText });
-    };
-    const onReset = () => {
-      liveText = "";
-      patchExtraction({ liveText: "" });
-    };
-    const onPhase = (phase: string) => patchExtraction({ phase });
+    }
 
-    try {
-      const result = await extractStream(payload, onDelta, onReset, onPhase);
-      patchExtraction({ result });
-    } catch (e) {
+    const outcomes = await Promise.all(
+      jobs.map(async (job, i) => {
+        const index = base.length + i * 2 + 1;
+        let liveText = "";
+        const onDelta = (text: string) => {
+          liveText += text;
+          patchExtractionAt(index, { liveText });
+        };
+        const onReset = () => {
+          liveText = "";
+          patchExtractionAt(index, { liveText: "" });
+        };
+        const onPhase = (phase: string) => patchExtractionAt(index, { phase });
+        try {
+          const result = await extractStream(job.payload, onDelta, onReset, onPhase);
+          patchExtractionAt(index, { result });
+          return { ok: true as const };
+        } catch (e) {
+          const msg = describeApiError(e);
+          patchExtractionAt(index, { error: msg });
+          return { ok: false as const, msg };
+        }
+      }),
+    );
+
+    const failures = outcomes.filter((o): o is { ok: false; msg: string } => !o.ok);
+    if (failures.length > 0) {
+      // N=1: identical to the old single-attachment path -- the specific
+      // API error message, not a generic count.
       const msg =
-        e instanceof ModelLoading
-          ? e.message
-          : e instanceof ApiUnavailable
-            ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
-            : e instanceof ApiError || e instanceof Error
-              ? e.message
-              : "Something went wrong.";
-      patchExtraction({ error: msg });
+        jobs.length === 1
+          ? failures[0].msg
+          : failures.length === jobs.length
+            ? "All extraction requests failed."
+            : `${failures.length} of ${jobs.length} extraction requests failed.`;
       setError(msg);
       toast({ title: "Extraction failed", description: msg, tone: "error" });
-    } finally {
-      setBusy(false);
     }
+    setBusy(false);
   }
 
   async function sendChat() {
     if (busy) return;
     const trimmed = input.trim();
-    const attached = file;
-    if (!trimmed && !attached) return;
+    const attached = attachments;
+    if (!trimmed && attached.length === 0) return;
     if (!model) {
       setError("No deployment selected — deploy a model under Serving → Models first.");
       return;
@@ -630,8 +741,8 @@ export function ChatPanel({
     // up front rather than silently sending a useless/erroring attachment
     // (llama-server 500s on image content with no mmproj rather than
     // ignoring it).
-    if (attached && !visionEnabled) {
-      if (!isPdfFile(attached)) {
+    if (attached.length > 0 && !visionEnabled) {
+      if (attached.some((a) => !isPdfFile(a.file))) {
         setError(
           "This deployment has no vision (or Vision is off) — image attachments need Vision on.",
         );
@@ -647,45 +758,58 @@ export function ChatPanel({
 
     let newContent: unknown = trimmed;
     let displayLabel = trimmed;
-    if (attached) {
+    if (attached.length > 0) {
       try {
-        const b64 = await fileToBase64(attached);
-        // Additive, not instead-of, when vision IS on: vision still reads
-        // the rendered page images below regardless. Only a real .pdf is
-        // worth indexing for docs-search (#296) — an image attachment has
-        // no text to search, and isn't a suffix docs-search accepts anyway.
-        if (isPdfFile(attached) && selectedMcp.includes("docs-search")) {
-          try {
-            const uploaded = await uploadSessionDocument(
-              b64,
-              attached.name,
-              docsSearchSessionIdRef.current,
-            );
-            docsSearchSessionIdRef.current = uploaded.session_id;
-          } catch {
-            // Best-effort: docs-search just won't see this file, vision
-            // still answers from the page images below either way.
+        // Every attachment rides the SAME chat message -- one call, one
+        // result, same convention the app already uses for a multi-page PDF
+        // (all its page images ride one message too). Sequential, not
+        // Promise.all: the docs-search session id must chain in attachment
+        // order (see docsSearchSessionIdRef's own doc comment).
+        const allImageUrls: string[] = [];
+        for (const a of attached) {
+          const b64 = await fileToBase64(a.file);
+          // Additive, not instead-of, when vision IS on: vision still reads
+          // the rendered page images below regardless. Only a real .pdf is
+          // worth indexing for docs-search (#296) — an image attachment has
+          // no text to search, and isn't a suffix docs-search accepts anyway.
+          if (isPdfFile(a.file) && selectedMcp.includes("docs-search")) {
+            try {
+              const uploaded = await uploadSessionDocument(
+                b64,
+                a.file.name,
+                docsSearchSessionIdRef.current,
+              );
+              docsSearchSessionIdRef.current = uploaded.session_id;
+            } catch {
+              // Best-effort: docs-search just won't see this file, vision
+              // still answers from the page images below either way.
+            }
+          }
+          if (visionEnabled) {
+            const imageUrls = isPdfFile(a.file)
+              ? (await renderDocument(b64, a.file.name, dpi)).images
+              : [`data:${a.file.type || "image/png"};base64,${b64}`];
+            allImageUrls.push(...imageUrls);
           }
         }
         if (visionEnabled) {
-          const imageUrls = isPdfFile(attached)
-            ? (await renderDocument(b64, attached.name, dpi)).images
-            : [`data:${attached.type || "image/png"};base64,${b64}`];
-          if (imageUrls.length === 0) {
+          if (allImageUrls.length === 0) {
             setError("The document produced no page images.");
             return;
           }
           newContent = [
             { type: "text", text: trimmed || "Describe this image." },
-            ...imageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+            ...allImageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
           ];
         } else {
-          // Vision off, PDF, docs-search selected (guarded above): the
-          // upload just made the real file searchable -- no image content
-          // to send, the model reads it via docs-search's tools instead.
+          // Vision off, PDF(s), docs-search selected (guarded above): the
+          // upload(s) just made the real file(s) searchable -- no image
+          // content to send, the model reads them via docs-search's tools.
           newContent = trimmed || "Look up the attached document via docs-search.";
         }
-        displayLabel = trimmed || `📎 ${attached.name}`;
+        displayLabel =
+          trimmed ||
+          (attached.length === 1 ? `📎 ${attached[0].file.name}` : `📎 ${attached.length} files`);
       } catch {
         setError("Could not read the attached file.");
         return;
@@ -696,7 +820,7 @@ export function ChatPanel({
     setMsgs(next);
     setInput("");
     setEditingIndex(null);
-    clearAttachment();
+    clearAttachments();
     setBusy(true);
     const payload = [
       ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
@@ -729,7 +853,7 @@ export function ChatPanel({
     if (!target || target.role !== "user") return;
     setEditingIndex(i);
     setInput(target.content);
-    clearAttachment();
+    clearAttachments();
     inputRef.current?.focus();
   }
 
@@ -979,7 +1103,8 @@ export function ChatPanel({
     void (extractionOn ? runExtraction() : sendChat());
   }
 
-  const showVisionExtras = !extractionOn && file && !file.type.startsWith("image/");
+  const showVisionExtras =
+    !extractionOn && attachments.some((a) => !a.file.type.startsWith("image/"));
 
   return (
     <Card
@@ -1355,91 +1480,100 @@ export function ChatPanel({
           <div ref={bottomRef} />
         </div>
 
-        {previewLoading && (
+        {attachmentCapMessage && <Alert tone="warn">{attachmentCapMessage}</Alert>}
+        {attachments.some((a) => a.previewLoading) && (
           <p className="flex items-center gap-2 text-xs text-muted-foreground">
             <Spinner /> <T>Rendering preview…</T>
           </p>
         )}
-        {file && (
-          <div className="flex items-start gap-3 rounded-md border border-border bg-muted/20 p-2">
-            {preview ? (
-              <button
-                type="button"
-                onClick={onEnlargePreview}
-                aria-label={t("Enlarge attachment preview")}
-                className="h-20 w-20 shrink-0 cursor-pointer rounded-md border border-border transition hover:opacity-80"
-              >
-                <img
-                  src={preview}
-                  alt="attachment preview"
-                  className="h-full w-full rounded-md object-cover"
-                />
-              </button>
-            ) : (
-              // Thumbnail rendering is best-effort (see onAttach's catch) --
-              // a failed/slow rasterization must never hide the DPI selector
-              // or recommended-prompt presets below, which don't depend on
-              // it and are still fully usable without a visual thumbnail.
-              <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-[10px] text-muted-foreground">
-                <T>No preview</T>
+        {attachments.length > 0 && (
+          <div className="space-y-2 rounded-md border border-border bg-muted/20 p-2">
+            <div className="scroll-thin flex flex-wrap gap-2 overflow-x-auto">
+              {attachments.map((a) => (
+                <div
+                  key={a.id}
+                  className="flex items-start gap-2 rounded-md border border-border/60 bg-card/60 p-1.5"
+                >
+                  {a.preview ? (
+                    <button
+                      type="button"
+                      onClick={() => void onEnlargePreview(a.id)}
+                      aria-label={t("Enlarge attachment preview")}
+                      className="h-20 w-20 shrink-0 cursor-pointer rounded-md border border-border transition hover:opacity-80"
+                    >
+                      <img
+                        src={a.preview}
+                        alt="attachment preview"
+                        className="h-full w-full rounded-md object-cover"
+                      />
+                    </button>
+                  ) : (
+                    // Thumbnail rendering is best-effort (see loadPdfPreview's
+                    // catch) -- a failed/slow rasterization must never hide
+                    // the DPI selector or recommended-prompt presets below,
+                    // which don't depend on it and are still fully usable
+                    // without a visual thumbnail.
+                    <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-[10px] text-muted-foreground">
+                      <T>No preview</T>
+                    </div>
+                  )}
+                  <div className="flex max-w-[6rem] items-center gap-1 text-xs text-muted-foreground">
+                    <span className="truncate">{a.file.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeAttachment(a.id)}
+                      className="shrink-0 text-muted-foreground hover:text-foreground"
+                      aria-label={t("Remove attachment")}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {showVisionExtras && (
+              <label className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <span><T>Render quality</T></span>
+                <Select
+                  value={String(dpi)}
+                  onChange={(e) => setDpi(Number(e.target.value))}
+                  className="h-7 w-auto text-xs"
+                >
+                  <option value="150">150 DPI — faster, smaller</option>
+                  <option value="200">200 DPI — recommended</option>
+                  <option value="300">300 DPI — sharpest, heaviest</option>
+                </Select>
+              </label>
+            )}
+            {!extractionOn && (
+              <div className="flex flex-wrap gap-1">
+                {[
+                  ...VISION_PRESETS,
+                  ...(selectedSchemaFields.length > 0
+                    ? [`Extract: ${selectedSchemaFields.join(", ")}`]
+                    : []),
+                ].map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setInput(p)}
+                    className="rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                  >
+                    {p.length > 32 ? `${p.slice(0, 32)}…` : p}
+                  </button>
+                ))}
               </div>
             )}
-            <div className="min-w-0 flex-1 space-y-1">
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span className="truncate">{file?.name}</span>
-                <button
-                  type="button"
-                  onClick={clearAttachment}
-                  className="shrink-0 text-muted-foreground hover:text-foreground"
-                  aria-label={t("Remove attachment")}
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-              {showVisionExtras && (
-                <label className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <span><T>Render quality</T></span>
-                  <Select
-                    value={String(dpi)}
-                    onChange={(e) => setDpi(Number(e.target.value))}
-                    className="h-7 w-auto text-xs"
-                  >
-                    <option value="150">150 DPI — faster, smaller</option>
-                    <option value="200">200 DPI — recommended</option>
-                    <option value="300">300 DPI — sharpest, heaviest</option>
-                  </Select>
-                </label>
-              )}
-              {!extractionOn && file && (
-                <div className="flex flex-wrap gap-1">
-                  {[
-                    ...VISION_PRESETS,
-                    ...(selectedSchemaFields.length > 0
-                      ? [`Extract: ${selectedSchemaFields.join(", ")}`]
-                      : []),
-                  ].map((p) => (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => setInput(p)}
-                      className="rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
-                    >
-                      {p.length > 32 ? `${p.slice(0, 32)}…` : p}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
           </div>
         )}
 
         <Dialog
           open={enlargeOpen}
           onClose={() => setEnlargeOpen(false)}
-          title={file?.name ?? "Attachment"}
+          title={enlargeAttachment?.file.name ?? "Attachment"}
           subtitle={
-            previewTotalPages && previewTotalPages > 1
-              ? `${Math.min(previewTotalPages, ENLARGE_MAX_PAGES)} of ${previewTotalPages} pages shown`
+            enlargeAttachment?.previewTotalPages && enlargeAttachment.previewTotalPages > 1
+              ? `${Math.min(enlargeAttachment.previewTotalPages, ENLARGE_MAX_PAGES)} of ${enlargeAttachment.previewTotalPages} pages shown`
               : undefined
           }
           className="max-w-3xl"
@@ -1537,15 +1671,16 @@ export function ChatPanel({
           <label
             className={cn(
               "flex h-[4.5rem] shrink-0 cursor-pointer items-center justify-center rounded-md border border-dashed border-border px-3 text-muted-foreground transition hover:border-accent hover:text-foreground",
-              file && "border-accent text-accent",
+              attachments.length > 0 && "border-accent text-accent",
             )}
-            title="Attach an image or PDF"
+            title={`Attach up to ${MAX_ATTACHMENTS} images or PDFs`}
           >
             <Paperclip className="h-4 w-4" />
             <input
               type="file"
               accept=".pdf,image/*"
-              onChange={(e) => void onAttach(e.target.files?.[0] ?? null)}
+              multiple
+              onChange={(e) => onAttach(e.target.files)}
               className="sr-only"
             />
           </label>
