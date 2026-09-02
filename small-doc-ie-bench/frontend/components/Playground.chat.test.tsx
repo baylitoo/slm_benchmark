@@ -21,7 +21,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listDynamicSchemas: vi.fn(),
     getSchemaFields: vi.fn(),
     listRoutingPolicies: vi.fn(),
-    triggerExtract: vi.fn(),
+    extractStream: vi.fn(),
     fileToBase64: vi.fn(async () => "ZmFrZQ=="),
     renderDocument: vi.fn(async () => ({
       images: ["data:image/png;base64,ZmFrZQ=="],
@@ -31,15 +31,6 @@ vi.mock("@/lib/api", async (importOriginal) => {
     uploadSessionDocument: vi.fn(),
   };
 });
-
-// The extraction path mounts ResultPanel, which owns its own SSE/polling
-// connection -- irrelevant to what THIS suite tests (that ChatPanel routes
-// to /v1/extract and renders the returned trigger). Stub it to a marker.
-vi.mock("./ResultPanel", () => ({
-  ResultPanel: ({ trigger }: { trigger: { channel: string } }) => (
-    <div data-testid="result-panel">result-panel:{trigger.channel}</div>
-  ),
-}));
 
 function makeDeployment(name: string): DeploymentRecord {
   return {
@@ -267,39 +258,69 @@ describe("ChatPanel", () => {
     );
   });
 
-  it("routes Send to extraction when the toggle is on, and renders the result inline", async () => {
-    vi.mocked(api.triggerExtract).mockResolvedValue({
-      event_ids: ["e1"],
-      channel: "extract:e1",
-      topics: ["result"],
-    });
+  it("routes Send to extraction when the toggle is on, streams deltas live, and swaps to the JSON result", async () => {
+    let resolveStream!: (value: unknown) => void;
+    vi.mocked(api.extractStream).mockImplementation(
+      (_payload, onDelta) =>
+        new Promise((resolve) => {
+          resolveStream = resolve;
+          onDelta?.('{"invoice_number":');
+          onDelta?.(' "INV-1"}');
+        }),
+    );
     renderChat();
     const user = userEvent.setup();
     await user.click(screen.getByRole("checkbox"));
     await user.type(screen.getByPlaceholderText(/Paste document text/), "invoice body text");
     await user.click(screen.getByRole("button", { name: "Run extraction" }));
 
-    expect(await screen.findByTestId("result-panel")).toHaveTextContent("extract:e1");
-    expect(api.triggerExtract).toHaveBeenCalledWith(
+    // The raw delta buffer is visible WHILE the request is still in flight --
+    // accumulated live, before the terminal result event ever lands.
+    expect(await screen.findByText('{"invoice_number": "INV-1"}')).toBeInTheDocument();
+    expect(api.extractStream).toHaveBeenCalledWith(
       expect.objectContaining({
         schema_name: "invoice",
         deployment: "lfm2.5-350m",
         text: "invoice body text",
       }),
+      expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
     );
     // Chat's streaming path must NOT have been used for this turn.
     expect(api.chatCompletionStream).not.toHaveBeenCalled();
+
+    resolveStream({ invoice_number: { value: "INV-1" } });
+    // The raw delta text is replaced by the authoritative JsonView render of
+    // the terminal result -- never left showing the accumulated deltas.
+    await waitFor(() =>
+      expect(screen.queryByText('{"invoice_number": "INV-1"}')).not.toBeInTheDocument(),
+    );
+    expect(await screen.findByText(/"INV-1"/)).toBeInTheDocument();
+  });
+
+  it("clears the live buffer on a reset event before painting the retry's own deltas", async () => {
+    vi.mocked(api.extractStream).mockImplementation(async (_payload, onDelta, onReset) => {
+      onDelta?.("garbage-from-abandoned-attempt");
+      onReset?.();
+      onDelta?.('{"vendor_name": "Acme"}');
+      return { vendor_name: { value: "Acme" } };
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("checkbox"));
+    await user.type(screen.getByPlaceholderText(/Paste document text/), "body");
+    await user.click(screen.getByRole("button", { name: "Run extraction" }));
+
+    await screen.findByText(/"Acme"/);
+    expect(screen.queryByText(/garbage-from-abandoned-attempt/)).not.toBeInTheDocument();
   });
 
   it("routes extraction through a routing policy instead of the deployment when selected", async () => {
     vi.mocked(api.listRoutingPolicies).mockResolvedValue([
       { name: "cheap-first", policy: {}, created_at: "", updated_at: "" },
     ]);
-    vi.mocked(api.triggerExtract).mockResolvedValue({
-      event_ids: ["e2"],
-      channel: "extract:e2",
-      topics: ["result"],
-    });
+    vi.mocked(api.extractStream).mockResolvedValue({ ok: true });
     renderChat();
     const user = userEvent.setup();
     await user.click(screen.getByRole("checkbox"));
@@ -309,11 +330,14 @@ describe("ChatPanel", () => {
     await user.click(screen.getByRole("button", { name: "Run extraction" }));
 
     await waitFor(() =>
-      expect(api.triggerExtract).toHaveBeenCalledWith(
+      expect(api.extractStream).toHaveBeenCalledWith(
         expect.objectContaining({ routing_policy: "cheap-first" }),
+        expect.any(Function),
+        expect.any(Function),
+        expect.any(Function),
       ),
     );
-    const call = vi.mocked(api.triggerExtract).mock.calls[0][0];
+    const call = vi.mocked(api.extractStream).mock.calls[0][0];
     expect(call.deployment).toBeUndefined();
   });
 
@@ -326,11 +350,7 @@ describe("ChatPanel", () => {
         updated_at: "",
       },
     ]);
-    vi.mocked(api.triggerExtract).mockResolvedValue({
-      event_ids: ["e3"],
-      channel: "extract:e3",
-      topics: ["result"],
-    });
+    vi.mocked(api.extractStream).mockResolvedValue({ ok: true });
     renderChat();
     const user = userEvent.setup();
     await user.click(screen.getByRole("checkbox"));
@@ -345,8 +365,11 @@ describe("ChatPanel", () => {
     await user.click(screen.getByRole("button", { name: "Run extraction" }));
 
     await waitFor(() =>
-      expect(api.triggerExtract).toHaveBeenCalledWith(
+      expect(api.extractStream).toHaveBeenCalledWith(
         expect.objectContaining({ dynamic_schema_name: "purchase_order" }),
+        expect.any(Function),
+        expect.any(Function),
+        expect.any(Function),
       ),
     );
   });
@@ -360,11 +383,7 @@ describe("ChatPanel", () => {
         updated_at: "",
       },
     ]);
-    vi.mocked(api.triggerExtract).mockResolvedValue({
-      event_ids: ["e4"],
-      channel: "extract:e4",
-      topics: ["result"],
-    });
+    vi.mocked(api.extractStream).mockResolvedValue({ ok: true });
     renderChat();
     const user = userEvent.setup();
     await user.click(screen.getByRole("checkbox"));
@@ -375,11 +394,14 @@ describe("ChatPanel", () => {
     await user.click(screen.getByRole("button", { name: "Run extraction" }));
 
     await waitFor(() =>
-      expect(api.triggerExtract).toHaveBeenCalledWith(
+      expect(api.extractStream).toHaveBeenCalledWith(
         expect.objectContaining({ schema_name: "identity_card" }),
+        expect.any(Function),
+        expect.any(Function),
+        expect.any(Function),
       ),
     );
-    const call = vi.mocked(api.triggerExtract).mock.calls[0][0];
+    const call = vi.mocked(api.extractStream).mock.calls[0][0];
     expect(call.dynamic_schema_name).toBeUndefined();
   });
 
