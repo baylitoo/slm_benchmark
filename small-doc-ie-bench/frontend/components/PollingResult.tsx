@@ -69,8 +69,18 @@ export function PollingResult({
             /* no progress endpoint / not a seed — ignore */
           }
         }
+        // A run isn't truly settled until its output has actually landed --
+        // status can flip to "Completed" one tick before getRuns' own output
+        // field catches up, and stopping the poll loop right there means the
+        // UI is stuck showing "completed, this can take a while" forever,
+        // even though a later poll would have had the real result all along.
         const settled =
-          list.length > 0 && list.every((r) => statusIs(r, "Completed", "Failed", "Cancelled"));
+          list.length > 0 &&
+          list.every((r) =>
+            statusIs(r, "Completed")
+              ? r.output !== undefined
+              : statusIs(r, "Failed", "Cancelled")
+          );
         if (settled) {
           setDone(true);
           onSettled?.();
