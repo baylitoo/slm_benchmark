@@ -206,6 +206,42 @@ def test_launch_spec_rejects_invalid_n_parallel_and_cache_reuse() -> None:
         _spec(RuntimeKind.LLAMACPP, cache_reuse=0)
 
 
+def test_llamacpp_chat_template_file_emits_flag() -> None:
+    # #387: overrides the GGUF's own embedded chat_template -- e.g. patching
+    # tool-call rendering onto a checkpoint whose baked-in template lacks it
+    # (verified live against LFM2.5-350M's own /props this milestone).
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        chat_template_file="/templates/lfm2-with-tool-calls.jinja",
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--chat-template-file" in command
+    assert (
+        command[command.index("--chat-template-file") + 1]
+        == "/templates/lfm2-with-tool-calls.jinja"
+    )
+
+
+def test_llamacpp_omits_chat_template_file_flag_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--chat-template-file" not in command
+
+
+def test_launch_spec_rejects_empty_or_nul_chat_template_file() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="chat_template_file"):
+        _spec(RuntimeKind.LLAMACPP, chat_template_file="   ")
+    with pytest.raises(RuntimeConfigurationError, match="chat_template_file"):
+        _spec(RuntimeKind.LLAMACPP, chat_template_file="/bad\x00path.jinja")
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in

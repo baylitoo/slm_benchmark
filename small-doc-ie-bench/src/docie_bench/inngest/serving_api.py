@@ -855,6 +855,7 @@ class ScaleRequest(BaseModel):
     # not a llama.cpp hard limit.
     n_parallel: int = Field(default=1, ge=1, le=32)
     cache_reuse: int | None = Field(default=None, ge=1)
+    chat_template_file: str | None = None
 
 
 @router.post("/store/{name}/scale")
@@ -913,6 +914,8 @@ async def scale_store_model(
                 data["n_parallel"] = request.n_parallel
             if request.cache_reuse is not None:
                 data["cache_reuse"] = request.cache_reuse
+            if request.chat_template_file is not None:
+                data["chat_template_file"] = request.chat_template_file
             ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
             event_ids.extend(ids)
         return {
