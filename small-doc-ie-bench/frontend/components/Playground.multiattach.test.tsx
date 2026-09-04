@@ -9,8 +9,8 @@ import type { DeploymentRecord, StoreEntry } from "@/lib/api";
 import type { PollingState } from "@/lib/usePolling";
 
 // Multi-attach (up to 10 files per turn): each attached file gets its own
-// extraction run (N separate triggerExtract calls, N result cards) -- NOT
-// one call merging every file's content. Chat/vision keeps the existing
+// extraction run (N separate extractStream calls, N live result cards) --
+// NOT one call merging every file's content. Chat/vision keeps the existing
 // single-message convention: every attached image (or PDF page) rides the
 // SAME chat message as additional image_url parts, same as a multi-page PDF
 // already does today.
@@ -27,7 +27,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listDynamicSchemas: vi.fn(),
     getSchemaFields: vi.fn(),
     listRoutingPolicies: vi.fn(),
-    triggerExtract: vi.fn(),
+    extractStream: vi.fn(),
     fileToBase64: vi.fn(async () => "ZmFrZQ=="),
     renderDocument: vi.fn(async () => ({
       images: ["data:image/png;base64,ZmFrZQ=="],
@@ -37,12 +37,6 @@ vi.mock("@/lib/api", async (importOriginal) => {
     uploadSessionDocument: vi.fn(),
   };
 });
-
-vi.mock("./ResultPanel", () => ({
-  ResultPanel: ({ trigger }: { trigger: { channel: string } }) => (
-    <div data-testid="result-panel">result-panel:{trigger.channel}</div>
-  ),
-}));
 
 function makeDeployment(name: string): DeploymentRecord {
   return {
@@ -153,10 +147,8 @@ describe("ChatPanel multi-attach", () => {
   });
 
   it("fires one extraction call per attached file and renders one result card per file", async () => {
-    vi.mocked(api.triggerExtract).mockImplementation(async (payload) => ({
-      event_ids: [`e-${payload.filename}`],
-      channel: `extract:${payload.filename}`,
-      topics: ["result"],
+    vi.mocked(api.extractStream).mockImplementation(async (payload) => ({
+      invoice_number: { value: payload.filename },
     }));
     renderChat();
     const user = userEvent.setup();
@@ -166,14 +158,15 @@ describe("ChatPanel multi-attach", () => {
     await user.upload(input, files);
     await user.click(await screen.findByRole("button", { name: "Run extraction" }));
 
-    await waitFor(() => expect(api.triggerExtract).toHaveBeenCalledTimes(2));
-    const filenames = vi.mocked(api.triggerExtract).mock.calls.map((c) => c[0].filename).sort();
+    await waitFor(() => expect(api.extractStream).toHaveBeenCalledTimes(2));
+    const filenames = vi
+      .mocked(api.extractStream)
+      .mock.calls.map((c) => c[0].filename)
+      .sort();
     expect(filenames).toEqual(["invoice1.png", "invoice2.png"]);
 
-    const panels = await screen.findAllByTestId("result-panel");
-    expect(panels).toHaveLength(2);
-    expect(panels[0]).toHaveTextContent("extract:invoice1.png");
-    expect(panels[1]).toHaveTextContent("extract:invoice2.png");
+    expect(await screen.findByText(/"invoice1\.png"/)).toBeInTheDocument();
+    expect(await screen.findByText(/"invoice2\.png"/)).toBeInTheDocument();
 
     // Attachments are cleared once the run starts, same as the single-file
     // path.
@@ -181,7 +174,7 @@ describe("ChatPanel multi-attach", () => {
   });
 
   it("shows the specific API error, not a generic count, when a single attached file's extraction fails (N=1 regression guard)", async () => {
-    vi.mocked(api.triggerExtract).mockRejectedValue(new Error("schema not found"));
+    vi.mocked(api.extractStream).mockRejectedValue(new Error("schema not found"));
     renderChat();
     const user = userEvent.setup();
     await user.click(screen.getByRole("checkbox"));
@@ -190,17 +183,16 @@ describe("ChatPanel multi-attach", () => {
     await user.click(await screen.findByRole("button", { name: "Run extraction" }));
 
     // The specific API error message (not a generic "N of M failed" count)
-    // lands in the error banner, same as today's single-attachment path.
-    expect(await screen.findByRole("alert")).toHaveTextContent("schema not found");
+    // lands in the error banner AND the per-file live card, same as today's
+    // single-attachment path.
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts.length).toBeGreaterThan(0);
+    for (const alert of alerts) expect(alert).toHaveTextContent("schema not found");
     expect(screen.queryByText(/extraction requests failed/)).not.toBeInTheDocument();
   });
 
   it("routes a single attached file through extraction exactly as before (N=1 regression guard)", async () => {
-    vi.mocked(api.triggerExtract).mockResolvedValue({
-      event_ids: ["e1"],
-      channel: "extract:e1",
-      topics: ["result"],
-    });
+    vi.mocked(api.extractStream).mockResolvedValue({ invoice_number: { value: "solo-result" } });
     renderChat();
     const user = userEvent.setup();
     await user.click(screen.getByRole("checkbox"));
@@ -208,11 +200,14 @@ describe("ChatPanel multi-attach", () => {
     await user.upload(input, pngFile("solo.png"));
     await user.click(await screen.findByRole("button", { name: "Run extraction" }));
 
-    await waitFor(() => expect(api.triggerExtract).toHaveBeenCalledTimes(1));
-    expect(api.triggerExtract).toHaveBeenCalledWith(
+    await waitFor(() => expect(api.extractStream).toHaveBeenCalledTimes(1));
+    expect(api.extractStream).toHaveBeenCalledWith(
       expect.objectContaining({ schema_name: "invoice", deployment: "lfm2.5-350m", filename: "solo.png" }),
+      expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
     );
-    expect(await screen.findByTestId("result-panel")).toHaveTextContent("extract:e1");
+    expect(await screen.findByText(/"solo-result"/)).toBeInTheDocument();
   });
 
   it("sends multiple attached images as one chat message with one image_url per file", async () => {
