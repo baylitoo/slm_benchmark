@@ -121,6 +121,21 @@ class RuntimeLaunchSpec:
     # separately remember to enable it.
     cache_type_k: str | None = None
     cache_type_v: str | None = None
+    # llama.cpp only (#402): caps how many tokens a thinking/reasoning model
+    # can spend before it's forced to stop and answer -- -1 (the default)
+    # is unrestricted, 0 ends thinking immediately, N>0 is a hard token cap.
+    # Directly relevant to latency/cost: an unbounded reasoning model can
+    # spend an arbitrary number of tokens "thinking" before ever producing a
+    # usable answer, and interacts with the tool-budget-forced-answer
+    # guarantee (#391) -- a forced round still has to wait through however
+    # long the model wants to think before it answers. None omits the flag
+    # entirely, matching llama-server's own -1/unrestricted default.
+    reasoning_budget: int | None = None
+    # Text injected before the end-of-thinking tag when reasoning_budget runs
+    # out, so a budget-exhausted response reads as an intentional wrap-up
+    # rather than an abrupt cut-off thought. Only meaningful alongside
+    # reasoning_budget; validated together below.
+    reasoning_budget_message: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -161,6 +176,17 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError(
                 f"cache_type_v must be one of {sorted(_LLAMACPP_CACHE_TYPES)}"
             )
+        if self.reasoning_budget is not None and self.reasoning_budget < -1:
+            raise RuntimeConfigurationError("reasoning_budget must be -1, 0, or positive")
+        if self.reasoning_budget_message is not None:
+            if self.reasoning_budget is None:
+                raise RuntimeConfigurationError(
+                    "reasoning_budget_message requires reasoning_budget to be set"
+                )
+            if "\x00" in self.reasoning_budget_message:
+                raise RuntimeConfigurationError(
+                    "reasoning_budget_message must not contain NUL bytes"
+                )
 
 
 @dataclass(frozen=True)
@@ -746,6 +772,10 @@ class LlamaCppRuntime(RuntimeAdapter):
         # which isn't guaranteed to enable it on every backend).
         if spec.cache_type_k not in (None, "f16") or spec.cache_type_v not in (None, "f16"):
             command.extend(["--flash-attn", "on"])
+        if spec.reasoning_budget is not None:
+            command.extend(["--reasoning-budget", str(spec.reasoning_budget)])
+        if spec.reasoning_budget_message is not None:
+            command.extend(["--reasoning-budget-message", spec.reasoning_budget_message])
         if spec.context_length is not None:
             ctx_size = spec.context_length
             if spec.n_parallel > 1:
