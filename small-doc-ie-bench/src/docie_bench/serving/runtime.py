@@ -92,6 +92,20 @@ class RuntimeLaunchSpec:
     # build_command never reads these.
     n_parallel: int = 1
     cache_reuse: int | None = None
+    # llama.cpp only (#373): enables llama-server's POST /slots/<id>?action=
+    # save|restore HTTP API -- a slot's KV cache written to/read from a file
+    # under this directory, restorable near-instantly instead of
+    # reprocessing the full prompt on a cold replica. This field ONLY
+    # enables the API server-side; it does not implement any save-on-
+    # shutdown/restore-on-startup orchestration, garbage collection of
+    # abandoned slot files, or interaction with #337's session-affinity
+    # routing -- those remain open design questions (saved slot files scale
+    # linearly with conversation length, hundreds of MB to multiple GB for
+    # a long chat, a real disk-cost tradeoff on the modest hardware this
+    # framework targets) deliberately left for a follow-up. None (the
+    # default) omits the flag entirely -- no behavior change for any
+    # existing deployment.
+    slot_save_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -120,6 +134,10 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("n_parallel must be positive")
         if self.cache_reuse is not None and self.cache_reuse < 1:
             raise RuntimeConfigurationError("cache_reuse must be positive")
+        if self.slot_save_path is not None and not self.slot_save_path.strip():
+            raise RuntimeConfigurationError("slot_save_path must not be empty")
+        if self.slot_save_path is not None and "\x00" in self.slot_save_path:
+            raise RuntimeConfigurationError("slot_save_path must not contain NUL bytes")
 
 
 @dataclass(frozen=True)
@@ -692,6 +710,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             str(spec.port),
             "--jinja",
         ]
+        if spec.slot_save_path is not None:
+            command.extend(["--slot-save-path", spec.slot_save_path])
         if spec.context_length is not None:
             ctx_size = spec.context_length
             if spec.n_parallel > 1:
