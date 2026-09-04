@@ -20,6 +20,7 @@ import {
   Paperclip,
   Pencil,
   RotateCcw,
+  Square,
   Wrench,
   X,
 } from "lucide-react";
@@ -253,6 +254,10 @@ interface ChatMsg {
    * tool-calling), not learned mid-exchange, so it renders ahead of the
    * response content rather than after it. */
   toolCallsUnsupportedWarning?: AgentToolCallsUnsupportedTrace;
+  /** Set when Stop (#394) discarded the rest of this generation mid-round --
+   * whatever content/reasoning/tool calls had already streamed stand as the
+   * final message, just flagged so the truncation reads as intentional. */
+  stopped?: boolean;
 }
 
 type TraceEntry =
@@ -356,6 +361,11 @@ export function ChatPanel({
   // the SAME turn, which needs the just-issued id synchronously -- state
   // set this render wouldn't be visible until the next one.
   const docsSearchSessionIdRef = useRef<string | undefined>(undefined);
+  // Hard-stop (#394): a fresh controller per attempt() call, so Stop always
+  // aborts whichever generation is actually in flight right now -- distinct
+  // from Pause (#383), which suspends an exchange between rounds and can
+  // resume it; Stop discards the rest of the current round for good.
+  const abortRef = useRef<AbortController | null>(null);
   const [input, setInput] = useState("");
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [busy, setBusy] = useState(false);
@@ -862,6 +872,15 @@ export function ChatPanel({
     setInput("");
   }
 
+  // Hard-stop (#394): aborts the fetch/EventSource to whatever generation is
+  // in flight right now. The backend already tears the whole exchange down
+  // on client disconnect (body_iterator's finally cancels drive()'s task,
+  // which closes the httpx stream to llama-server) -- no server round-trip
+  // needed here, unlike Pause.
+  function handleStop() {
+    abortRef.current?.abort();
+  }
+
   // User-initiated pause (#383): only requests the pause -- the exchange's
   // own onAwaitingInput callback (wired in attempt()) opens the answer modal
   // once the loop actually reaches a round boundary and confirms it.
@@ -908,6 +927,8 @@ export function ChatPanel({
     payload: { role: string; content: unknown }[],
     retryCount: number,
   ) {
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       if (selectedMcp.length > 0) {
         // Each tool call arrives as its own SSE event the instant it
@@ -1019,6 +1040,7 @@ export function ChatPanel({
             onAwaitingInput,
             onContentDelta,
             onReasoningDelta,
+            controller.signal,
           );
         } finally {
           // The exchange (and any still-open answer prompt) never outlives
@@ -1070,9 +1092,17 @@ export function ChatPanel({
             : prev.map((m, i) => (i === next.length ? { role: "assistant", content } : m)),
         );
       };
-      await chatCompletionStream(model, payload, appendToken);
+      await chatCompletionStream(model, payload, appendToken, controller.signal);
       if (!content) setMsgs([...next, { role: "assistant", content: t("(empty response)") }]);
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        setMsgs((prev) =>
+          prev.length <= next.length
+            ? [...next, { role: "assistant", content: "", stopped: true }]
+            : prev.map((m, i) => (i === next.length ? { ...m, stopped: true } : m)),
+        );
+        return;
+      }
       if (e instanceof ModelLoading) {
         const willRetry = retryCount < MAX_LOAD_RETRIES;
         setMsgs([
@@ -1388,6 +1418,12 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.stopped && (
+                  <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                    <Square className="h-3 w-3" />
+                    <T>Stopped — generation was cut short.</T>
+                  </span>
+                )}
                 {m.role === "user" && (
                   <button
                     type="button"
@@ -1707,6 +1743,22 @@ export function ChatPanel({
             {extractionOn ? <Play className="h-4 w-4" /> : <Send className="h-4 w-4" />}
             {extractionOn ? "Run extraction" : "Send"}
           </Button>
+          {/* Hard-stop (#394): discards the rest of an in-flight chat
+              generation, keeping whatever already streamed -- distinct from
+              Pause below (suspend-and-resume). Chat only, not extraction:
+              extraction's own streaming send loop (#398/#399) is a separate
+              per-file flow with its own error/result handling. */}
+          {busy && !extractionOn && (
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleStop}
+              title={t("Stop generating and keep what's been said so far")}
+            >
+              <Square className="h-4 w-4" />
+              <T>Stop</T>
+            </Button>
+          )}
           {/* Human-in-the-loop (#383): only while a tool-calling exchange is
               actually streaming (the plain token-stream path with no MCP
               servers selected has no round boundary to pause at) -- appears
