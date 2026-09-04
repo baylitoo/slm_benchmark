@@ -277,6 +277,7 @@ export async function chatCompletionStream(
   model: string,
   messages: { role: string; content: unknown }[],
   onToken: (text: string) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   let res: Response;
   try {
@@ -288,8 +289,13 @@ export async function chatCompletionStream(
         ...authHeader(),
       },
       body: JSON.stringify({ model, messages, stream: true }),
+      signal,
     });
   } catch (e) {
+    // A caller-initiated abort (#394) must reach the caller as-is -- wrapping
+    // it in ApiUnavailable would make "the user clicked Stop" indistinguishable
+    // from "the network is actually down".
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
     throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
   }
 
@@ -470,6 +476,7 @@ export async function chatCompletionMcpStream(
   onAwaitingInput?: (payload: AgentAwaitingInputTrace) => void,
   onContentDelta?: (text: string) => void,
   onReasoningDelta?: (text: string) => void,
+  signal?: AbortSignal,
 ): Promise<AgentChatResponse> {
   let res: Response;
   try {
@@ -488,8 +495,13 @@ export async function chatCompletionMcpStream(
         enable_ask_user: true,
         ...(sessionId ? { session_id: sessionId } : {}),
       }),
+      signal,
     });
   } catch (e) {
+    // A caller-initiated abort (#394) must reach the caller as-is -- wrapping
+    // it in ApiUnavailable would make "the user clicked Stop" indistinguishable
+    // from "the network is actually down".
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
     throw new ApiUnavailable(0, e instanceof Error ? e.message : "Network error");
   }
 

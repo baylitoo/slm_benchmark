@@ -488,6 +488,7 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
+      expect.any(AbortSignal),
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -510,6 +511,7 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
+      expect.any(AbortSignal),
     );
   });
 
@@ -1150,5 +1152,50 @@ describe("ChatPanel", () => {
     resolveCompletion({ choices: [{ message: { role: "assistant", content: "42 EUR" } }] });
     expect(await screen.findByText("42 EUR")).toBeInTheDocument();
     expect(screen.getByText("Let me think it over.")).toBeInTheDocument();
+  });
+
+  it("Stop aborts an in-flight plain chat stream and keeps the partial text (#394)", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    let rejectStream!: (reason: unknown) => void;
+    vi.mocked(api.chatCompletionStream).mockImplementation((_model, _messages, onToken, signal) => {
+      capturedSignal = signal;
+      onToken("Partial ans");
+      return new Promise((_resolve, reject) => {
+        rejectStream = reject;
+      });
+    });
+    renderChat();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/Type a message/), "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const stopButton = await screen.findByRole("button", { name: "Stop" });
+    expect(await screen.findByText("Partial ans")).toBeInTheDocument();
+    await user.click(stopButton);
+
+    expect(capturedSignal?.aborted).toBe(true);
+    rejectStream(new DOMException("The user aborted a request.", "AbortError"));
+
+    expect(await screen.findByText(/Stopped/)).toBeInTheDocument();
+    expect(screen.getByText("Partial ans")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument());
+  });
+
+  it("does not show Stop while extraction is running (chat-only, #394)", async () => {
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("checkbox"));
+    vi.mocked(api.extractStream).mockImplementation(
+      () =>
+        new Promise(() => {
+          /* never resolves -- just needs to stay busy */
+        }),
+    );
+    await user.type(screen.getByPlaceholderText(/Paste document text/), "invoice body");
+    await user.click(screen.getByRole("button", { name: "Run extraction" }));
+
+    await waitFor(() => expect(api.extractStream).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
   });
 });
