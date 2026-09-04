@@ -471,16 +471,24 @@ export function ChatPanel({
   }
 
   function onAttach(fileList: FileList | null) {
-    clearAttachments();
     if (!fileList || fileList.length === 0) return;
     const picked = Array.from(fileList);
-    const capped = picked.slice(0, MAX_ATTACHMENTS);
-    if (picked.length > MAX_ATTACHMENTS) {
+    // A new pick ADDS to whatever's already attached, up to the total cap --
+    // it does not replace it. Multiple documents in one turn is the whole
+    // point of multi-attach; a picker that silently discards the first file
+    // the moment you attach a second one defeats it.
+    const room = Math.max(MAX_ATTACHMENTS - attachments.length, 0);
+    const capped = picked.slice(0, room);
+    if (picked.length > capped.length) {
       setAttachmentCapMessage(
-        `Only the first ${MAX_ATTACHMENTS} files were attached (you picked ${picked.length}).`,
+        capped.length === 0
+          ? `Already at the ${MAX_ATTACHMENTS}-file limit — remove one before attaching more.`
+          : `Only ${capped.length} more file${capped.length === 1 ? "" : "s"} could be added (limit is ${MAX_ATTACHMENTS} total).`,
       );
+    } else {
+      setAttachmentCapMessage(null);
     }
-    const initial: Attachment[] = capped.map((f) => {
+    const additions: Attachment[] = capped.map((f) => {
       const isImage = f.type.startsWith("image/");
       return {
         id: nextAttachmentId(),
@@ -490,8 +498,8 @@ export function ChatPanel({
         previewTotalPages: isImage ? 1 : null,
       };
     });
-    setAttachments(initial);
-    for (const a of initial) {
+    setAttachments((prev) => [...prev, ...additions]);
+    for (const a of additions) {
       if (a.previewLoading) void loadPdfPreview(a.id, a.file);
     }
   }
@@ -1680,7 +1688,14 @@ export function ChatPanel({
               type="file"
               accept=".pdf,image/*"
               multiple
-              onChange={(e) => onAttach(e.target.files)}
+              onChange={(e) => {
+                onAttach(e.target.files);
+                // Reset so picking the exact same filename again (a common
+                // "wait, I meant that one too" correction) still fires
+                // onChange -- the browser won't re-fire it if the input's
+                // value string didn't change.
+                e.target.value = "";
+              }}
               className="sr-only"
             />
           </label>

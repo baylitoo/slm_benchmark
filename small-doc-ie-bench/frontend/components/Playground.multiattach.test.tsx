@@ -125,7 +125,44 @@ describe("ChatPanel multi-attach", () => {
     expect(
       screen.getAllByRole("button", { name: /Enlarge attachment preview/ }),
     ).toHaveLength(10);
-    expect(screen.getByText(/Only the first 10 files were attached/)).toBeInTheDocument();
+    expect(screen.getByText(/Only 10 more files? could be added/)).toBeInTheDocument();
+  });
+
+  it("a second, separate pick ADDS to what's already attached, not replaces it", async () => {
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+
+    await user.upload(input, pngFile("first.png"));
+    expect(await screen.findByText("first.png")).toBeInTheDocument();
+
+    await user.upload(input, pngFile("second.png"));
+    expect(await screen.findByText("second.png")).toBeInTheDocument();
+    // The first pick must still be there -- this is the exact regression:
+    // a second pick used to wipe the attachment array instead of adding to it.
+    expect(screen.getByText("first.png")).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: /Enlarge attachment preview/ }),
+    ).toHaveLength(2);
+  });
+
+  it("a second pick beyond the remaining room is capped against the TOTAL, not the new pick alone", async () => {
+    renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
+    const user = userEvent.setup();
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+
+    await user.upload(input, Array.from({ length: 8 }, (_, i) => pngFile(`a${i}.png`)));
+    expect(await screen.findByText("a0.png")).toBeInTheDocument();
+
+    await user.upload(input, Array.from({ length: 5 }, (_, i) => pngFile(`b${i}.png`)));
+    expect(await screen.findByText("b0.png")).toBeInTheDocument();
+    // 8 already attached + room for only 2 more = 10 total.
+    expect(screen.getByText("b1.png")).toBeInTheDocument();
+    expect(screen.queryByText("b2.png")).not.toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: /Enlarge attachment preview/ }),
+    ).toHaveLength(10);
+    expect(screen.getByText(/Only 2 more files could be added/)).toBeInTheDocument();
   });
 
   it("removes a single attachment without disturbing the others", async () => {
