@@ -64,6 +64,7 @@ import {
   type AgentContextBudgetTrace,
   type AgentToolCallsUnsupportedTrace,
   type AgentAwaitingInputTrace,
+  type SamplingParams,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -351,6 +352,21 @@ export function ChatPanel({
   }, [model, modelHasVision]);
 
   const [system, setSystem] = useState("");
+  // Sampling overrides (#384) -- string state so an empty field reads as
+  // genuinely unset (never sent) rather than the frontend inventing its own
+  // numeric default that could silently diverge from llama-server's own.
+  const [temperature, setTemperature] = useState("");
+  const [topP, setTopP] = useState("");
+  const [minP, setMinP] = useState("");
+  const [repeatPenalty, setRepeatPenalty] = useState("");
+  function buildSamplingParams(): SamplingParams {
+    const params: SamplingParams = {};
+    if (temperature.trim()) params.temperature = Number(temperature);
+    if (topP.trim()) params.top_p = Number(topP);
+    if (minP.trim()) params.min_p = Number(minP);
+    if (repeatPenalty.trim()) params.repeat_penalty = Number(repeatPenalty);
+    return params;
+  }
   const mcpServers = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
   const [selectedMcp, setSelectedMcp] = useState<string[]>([]);
   // Server-issued once the first attachment is uploaded for docs-search
@@ -1049,6 +1065,7 @@ export function ChatPanel({
             onContentDelta,
             onReasoningDelta,
             controller.signal,
+            buildSamplingParams(),
           );
         } finally {
           // The exchange (and any still-open answer prompt) never outlives
@@ -1100,7 +1117,7 @@ export function ChatPanel({
             : prev.map((m, i) => (i === next.length ? { role: "assistant", content } : m)),
         );
       };
-      await chatCompletionStream(model, payload, appendToken, controller.signal);
+      await chatCompletionStream(model, payload, appendToken, controller.signal, buildSamplingParams());
       if (!content) setMsgs([...next, { role: "assistant", content: t("(empty response)") }]);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
@@ -1199,6 +1216,75 @@ export function ChatPanel({
             />
           </Field>
         </div>
+
+        {/* Sampling overrides (#384) -- collapsed by default so it doesn't
+            crowd the common case (bare defaults). Chat only: extraction
+            already forces temperature=0 for its own determinism guarantee
+            (see ExtractionService/chat_json) -- these controls apply to
+            Chat's Send only, disabled rather than hidden during Extraction
+            so their existence stays visible either way. */}
+        <details className="rounded-md border border-border bg-muted/20 text-sm">
+          <summary className="cursor-pointer px-3 py-2 font-medium text-muted-foreground hover:text-foreground">
+            <T>Sampling</T>
+          </summary>
+          <div className="grid gap-3 border-t border-border p-3 sm:grid-cols-4">
+            <Field label="Temperature" hint="0–2, unset = llama-server default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.1"
+                min="0"
+                max="2"
+                value={temperature}
+                onChange={(e) => setTemperature(e.target.value)}
+                placeholder="unset"
+                aria-label="Temperature"
+                disabled={extractionOn}
+              />
+            </Field>
+            <Field label="Top P" hint="0–1, unset = llama-server default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.05"
+                min="0"
+                max="1"
+                value={topP}
+                onChange={(e) => setTopP(e.target.value)}
+                placeholder="unset"
+                aria-label="Top P"
+                disabled={extractionOn}
+              />
+            </Field>
+            <Field label="Min P" hint="0–1, unset = llama-server default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.01"
+                min="0"
+                max="1"
+                value={minP}
+                onChange={(e) => setMinP(e.target.value)}
+                placeholder="unset"
+                aria-label="Min P"
+                disabled={extractionOn}
+              />
+            </Field>
+            <Field label="Repeat penalty" hint="typically 1.0–1.5, unset = default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.05"
+                min="1"
+                value={repeatPenalty}
+                onChange={(e) => setRepeatPenalty(e.target.value)}
+                placeholder="unset"
+                aria-label="Repeat penalty"
+                disabled={extractionOn}
+              />
+            </Field>
+          </div>
+        </details>
 
         <div className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-muted/20 px-3 py-2">
           <label className="flex items-center gap-2 text-sm">
