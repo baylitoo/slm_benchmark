@@ -206,6 +206,27 @@ def test_launch_spec_rejects_invalid_n_parallel_and_cache_reuse() -> None:
         _spec(RuntimeKind.LLAMACPP, cache_reuse=0)
 
 
+def test_llamacpp_metrics_enabled_emits_flag() -> None:
+    # #366: unlocks llama-server's own Prometheus-compatible GET /metrics --
+    # a different consumer than this app's in-app Observability tab (an
+    # operator's external monitoring stack, not this UI).
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", metrics_enabled=True)
+
+    command = adapter.build_command(spec)
+
+    assert "--metrics" in command
+
+
+def test_llamacpp_omits_metrics_flag_by_default() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--metrics" not in command
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
