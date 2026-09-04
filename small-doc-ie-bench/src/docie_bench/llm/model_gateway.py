@@ -177,8 +177,9 @@ class ModelGateway:
     async def execute(self, operation: Callable[[], Awaitable[T]]) -> T:
         await self._acquire()
         MODEL_GATEWAY_IN_FLIGHT.labels(self.profile.name, self.profile.model).inc()
+        is_probe = False
         try:
-            self._check_circuit()
+            is_probe = self._check_circuit()
             for attempt in range(1, self.profile.retry_max_attempts + 1):
                 try:
                     result = await operation()
@@ -210,6 +211,17 @@ class ModelGateway:
                     return result
             raise AssertionError("retry loop exited unexpectedly")
         finally:
+            # Single release point for the half-open probe token, covering
+            # every exit path -- success, a classified failure, a raw
+            # exception _classify_exception doesn't special-case, or a
+            # BaseException (asyncio.CancelledError from a client disconnect
+            # or the Playground's hard-stop) that skips the `except
+            # Exception` handler entirely. Scattering the release across
+            # _record_success/_record_failure (the previous shape) means
+            # each new kind of non-Exception exit reproduces the same
+            # forever-wedged-probe bug (#167) through a new trigger.
+            if is_probe:
+                self._state.half_open_in_flight = False
             MODEL_GATEWAY_IN_FLIGHT.labels(self.profile.name, self.profile.model).dec()
             self._release()
 
@@ -377,10 +389,15 @@ class ModelGateway:
     def _release(self) -> None:
         self._state.semaphore.release()
 
-    def _check_circuit(self) -> None:
+    def _check_circuit(self) -> bool:
+        """Raise if the circuit is open; otherwise return whether this call
+        just claimed the half-open recovery probe token. The caller (execute)
+        releases that token exactly once, in its `finally`, regardless of how
+        the call ends -- see the comment there for why the release must not
+        live in _record_success/_record_failure."""
         opened_at = self._state.circuit_opened_at
         if opened_at is None:
-            return
+            return False
         if self._monotonic() - opened_at < self.profile.circuit_breaker_reset_seconds:
             MODEL_GATEWAY_CIRCUIT_OPEN.labels(self.profile.name, self.profile.model).set(1)
             MODEL_GATEWAY_REQUESTS.labels(
@@ -399,17 +416,9 @@ class ModelGateway:
                 f"Circuit recovery probe is already running for model profile {self.profile.name!r}"
             )
         self._state.half_open_in_flight = True
+        return True
 
     def _record_failure(self, error: ModelGatewayError) -> None:
-        # Unconditional: a half-open recovery probe releases its token on ANY
-        # outcome, success or failure of any classification. Gating this
-        # behind the classification check below (as this line used to be)
-        # means a PERMANENT/CAPABILITY error during a probe leaves
-        # half_open_in_flight stuck True forever -- nothing else clears it
-        # except a successful call, which can never happen once every call
-        # is rejected with "probe already running" first. Permanently wedges
-        # an otherwise-healthy model until process restart.
-        self._state.half_open_in_flight = False
         if error.classification not in {
             ErrorClassification.TRANSIENT,
             ErrorClassification.RATE_LIMITED,
@@ -424,7 +433,6 @@ class ModelGateway:
     def _record_success(self) -> None:
         self._state.failures = 0
         self._state.circuit_opened_at = None
-        self._state.half_open_in_flight = False
         MODEL_GATEWAY_CIRCUIT_OPEN.labels(self.profile.name, self.profile.model).set(0)
 
     def _classify_exception(self, exc: Exception) -> ModelGatewayError:
