@@ -92,6 +92,15 @@ class RuntimeLaunchSpec:
     # build_command never reads these.
     n_parallel: int = 1
     cache_reuse: int | None = None
+    # llama.cpp only (#387): overrides the GGUF's own embedded chat_template
+    # with an operator-supplied Jinja file -- e.g. patching tool-call
+    # rendering onto a checkpoint whose baked-in template lacks it. Existence
+    # is the caller's responsibility (same as `model` itself); the #290
+    # health check re-verifies whatever template ends up live via GET /props
+    # automatically, since that check queries the running server, not the
+    # GGUF's static bytes -- an override gets exactly the same scrutiny a
+    # baked-in template does, with no extra code.
+    chat_template_file: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -120,6 +129,10 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("n_parallel must be positive")
         if self.cache_reuse is not None and self.cache_reuse < 1:
             raise RuntimeConfigurationError("cache_reuse must be positive")
+        if self.chat_template_file is not None and not self.chat_template_file.strip():
+            raise RuntimeConfigurationError("chat_template_file must not be empty")
+        if self.chat_template_file is not None and "\x00" in self.chat_template_file:
+            raise RuntimeConfigurationError("chat_template_file must not contain NUL bytes")
 
 
 @dataclass(frozen=True)
@@ -692,6 +705,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             str(spec.port),
             "--jinja",
         ]
+        if spec.chat_template_file is not None:
+            command.extend(["--chat-template-file", spec.chat_template_file])
         if spec.context_length is not None:
             ctx_size = spec.context_length
             if spec.n_parallel > 1:
