@@ -65,6 +65,14 @@ class RuntimeLaunchError(RuntimeError):
     pass
 
 
+# llama-server's own --cache-type-k/-v allowed values (#382), verified against
+# the live upstream tools/server/README.md -- shared by the draft-model
+# variants too, but those aren't wired here.
+_LLAMACPP_CACHE_TYPES = frozenset(
+    {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
+)
+
+
 @dataclass(frozen=True)
 class RuntimeLaunchSpec:
     runtime: RuntimeKind
@@ -101,6 +109,18 @@ class RuntimeLaunchSpec:
     # GGUF's static bytes -- an override gets exactly the same scrutiny a
     # baked-in template does, with no extra code.
     chat_template_file: str | None = None
+    # llama.cpp only (#382): quantizing the KV cache is a direct, mechanical
+    # RAM win on the RAM/VRAM-constrained boxes this framework targets --
+    # q8_0 roughly halves KV cache size vs. f16 with near-zero accuracy
+    # loss, q4_0 roughly quarters it with a small, model-dependent cost.
+    # None (the default) omits both flags entirely, matching llama-server's
+    # own f16 default byte-for-byte. --flash-attn is a *prerequisite* for
+    # KV quant below f16 to actually take effect (otherwise it's silently a
+    # no-op) -- build_command forces it on automatically whenever either
+    # cache type is quantized, rather than requiring the operator to
+    # separately remember to enable it.
+    cache_type_k: str | None = None
+    cache_type_v: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -133,6 +153,14 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("chat_template_file must not be empty")
         if self.chat_template_file is not None and "\x00" in self.chat_template_file:
             raise RuntimeConfigurationError("chat_template_file must not contain NUL bytes")
+        if self.cache_type_k is not None and self.cache_type_k not in _LLAMACPP_CACHE_TYPES:
+            raise RuntimeConfigurationError(
+                f"cache_type_k must be one of {sorted(_LLAMACPP_CACHE_TYPES)}"
+            )
+        if self.cache_type_v is not None and self.cache_type_v not in _LLAMACPP_CACHE_TYPES:
+            raise RuntimeConfigurationError(
+                f"cache_type_v must be one of {sorted(_LLAMACPP_CACHE_TYPES)}"
+            )
 
 
 @dataclass(frozen=True)
@@ -707,6 +735,17 @@ class LlamaCppRuntime(RuntimeAdapter):
         ]
         if spec.chat_template_file is not None:
             command.extend(["--chat-template-file", spec.chat_template_file])
+        if spec.cache_type_k is not None:
+            command.extend(["--cache-type-k", spec.cache_type_k])
+        if spec.cache_type_v is not None:
+            command.extend(["--cache-type-v", spec.cache_type_v])
+        # --flash-attn is a prerequisite for KV quant below f16 to actually
+        # apply -- otherwise the type flags above are silently a no-op.
+        # Forced on automatically rather than left to the operator to
+        # separately remember (or to llama-server's own "auto" default,
+        # which isn't guaranteed to enable it on every backend).
+        if spec.cache_type_k not in (None, "f16") or spec.cache_type_v not in (None, "f16"):
+            command.extend(["--flash-attn", "on"])
         if spec.context_length is not None:
             ctx_size = spec.context_length
             if spec.n_parallel > 1:
