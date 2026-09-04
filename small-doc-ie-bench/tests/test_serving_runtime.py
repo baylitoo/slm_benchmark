@@ -361,6 +361,37 @@ def test_launch_spec_rejects_reasoning_budget_message_without_a_budget() -> None
         _spec(RuntimeKind.LLAMACPP, reasoning_budget_message="Wrapping up.")
 
 
+def test_llamacpp_ngram_speculative_decoding_emits_flag() -> None:
+    # #400: ngram-simple/ngram-cache need no second model and no extra VRAM
+    # -- a strictly additive latency win on the RAM-constrained boxes this
+    # framework targets.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    for spec_type in ("ngram-simple", "ngram-cache"):
+        spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", spec_type=spec_type)
+        command = adapter.build_command(spec)
+        assert command[command.index("--spec-type") + 1] == spec_type
+
+
+def test_llamacpp_omits_spec_type_flag_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--spec-type" not in command
+
+
+def test_launch_spec_rejects_draft_model_speculative_types() -> None:
+    # The draft-model families (draft-simple, draft-eagle3, ...) need a
+    # second checkpoint loaded alongside the primary one -- deliberately not
+    # wired yet, so must be rejected rather than silently forwarded to a
+    # llama-server that then errors (or worse, no-ops) at process start.
+    with pytest.raises(RuntimeConfigurationError, match="spec_type"):
+        _spec(RuntimeKind.LLAMACPP, spec_type="draft-simple")
+    with pytest.raises(RuntimeConfigurationError, match="spec_type"):
+        _spec(RuntimeKind.LLAMACPP, spec_type="not-a-real-type")
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
