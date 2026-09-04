@@ -242,6 +242,66 @@ def test_launch_spec_rejects_empty_or_nul_chat_template_file() -> None:
         _spec(RuntimeKind.LLAMACPP, chat_template_file="/bad\x00path.jinja")
 
 
+def test_llamacpp_kv_cache_quant_emits_both_type_flags_and_forces_flash_attn() -> None:
+    # #382: q8_0/q4_0 KV cache quant is a direct RAM win on the constrained
+    # boxes this framework targets. --flash-attn is a prerequisite for the
+    # quant to actually apply, forced on automatically rather than left to
+    # the operator to separately remember.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        cache_type_k="q8_0",
+        cache_type_v="q8_0",
+    )
+
+    command = adapter.build_command(spec)
+
+    assert command[command.index("--cache-type-k") + 1] == "q8_0"
+    assert command[command.index("--cache-type-v") + 1] == "q8_0"
+    assert command[command.index("--flash-attn") + 1] == "on"
+
+
+def test_llamacpp_kv_cache_quant_on_only_one_side_still_forces_flash_attn() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", cache_type_k="q4_0")
+
+    command = adapter.build_command(spec)
+
+    assert "--cache-type-v" not in command
+    assert command[command.index("--flash-attn") + 1] == "on"
+
+
+def test_llamacpp_omits_kv_cache_flags_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--cache-type-k" not in command
+    assert "--cache-type-v" not in command
+    assert "--flash-attn" not in command
+
+
+def test_llamacpp_explicit_f16_cache_type_does_not_force_flash_attn() -> None:
+    # f16 is llama-server's own default -- an operator explicitly spelling it
+    # out is a no-op request, not a quantization request.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", cache_type_k="f16")
+
+    command = adapter.build_command(spec)
+
+    assert command[command.index("--cache-type-k") + 1] == "f16"
+    assert "--flash-attn" not in command
+
+
+def test_launch_spec_rejects_unknown_kv_cache_type() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="cache_type_k"):
+        _spec(RuntimeKind.LLAMACPP, cache_type_k="q2_k")
+    with pytest.raises(RuntimeConfigurationError, match="cache_type_v"):
+        _spec(RuntimeKind.LLAMACPP, cache_type_v="not-a-real-type")
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
