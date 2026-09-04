@@ -43,6 +43,11 @@ class DeployRequest(BaseModel):
     # build_command for those simply never reads it.
     n_parallel: int = Field(default=1, ge=1, le=32)
     cache_reuse: int | None = Field(default=None, ge=1)
+    # llama-server only (#387): overrides the GGUF's own embedded
+    # chat_template with an operator-supplied Jinja file path (must be
+    # reachable inside the serving container). Existence is the caller's
+    # responsibility, same as `model` itself.
+    chat_template_file: str | None = None
 
 
 async def _trigger_replicated_deploy(
@@ -102,6 +107,8 @@ async def _trigger_replicated_deploy(
             data["n_parallel"] = payload.n_parallel
         if payload.cache_reuse is not None:
             data["cache_reuse"] = payload.cache_reuse
+        if payload.chat_template_file is not None:
+            data["chat_template_file"] = payload.chat_template_file
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )

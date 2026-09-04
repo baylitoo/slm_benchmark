@@ -120,6 +120,7 @@ class _FakeServeControlPlane:
         max_tokens: int | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        chat_template_file: str | None = None,
     ) -> dict[str, Any]:
         return _SERVE_RECORD
 

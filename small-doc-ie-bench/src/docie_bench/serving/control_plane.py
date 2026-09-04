@@ -225,6 +225,7 @@ class Supervisor(Protocol):
         max_tokens: int | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        chat_template_file: str | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -236,6 +237,7 @@ class Supervisor(Protocol):
         max_tokens: int | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        chat_template_file: str | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -378,6 +380,7 @@ class ControlPlane:
         max_tokens: int | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        chat_template_file: str | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -397,6 +400,8 @@ class ControlPlane:
             kwargs["n_parallel"] = n_parallel
         if cache_reuse is not None:
             kwargs["cache_reuse"] = cache_reuse
+        if chat_template_file is not None:
+            kwargs["chat_template_file"] = chat_template_file
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -414,6 +419,7 @@ class ControlPlane:
         deployment_name: str | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        chat_template_file: str | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -433,6 +439,8 @@ class ControlPlane:
             kwargs["n_parallel"] = n_parallel
         if cache_reuse is not None:
             kwargs["cache_reuse"] = cache_reuse
+        if chat_template_file is not None:
+            kwargs["chat_template_file"] = chat_template_file
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -863,6 +871,7 @@ class _DefaultSupervisor:
         max_tokens: int | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        chat_template_file: str | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -889,6 +898,7 @@ class _DefaultSupervisor:
                     max_tokens=max_tokens,
                     n_parallel=n_parallel,
                     cache_reuse=cache_reuse,
+                    chat_template_file=chat_template_file,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -910,6 +920,7 @@ class _DefaultSupervisor:
                     max_tokens=max_tokens,
                     n_parallel=n_parallel,
                     cache_reuse=cache_reuse,
+                    chat_template_file=chat_template_file,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -941,6 +952,7 @@ class _DefaultSupervisor:
         deployment_name: str | None = None,
         n_parallel: int = 1,
         cache_reuse: int | None = None,
+        chat_template_file: str | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -1018,6 +1030,7 @@ class _DefaultSupervisor:
                     extra_args=launch_extra_args,
                     n_parallel=n_parallel,
                     cache_reuse=cache_reuse,
+                    chat_template_file=chat_template_file,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
