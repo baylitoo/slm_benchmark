@@ -72,6 +72,17 @@ _LLAMACPP_CACHE_TYPES = frozenset(
     {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 )
 
+# llama-server's --spec-type (#400) supports several draft-model families
+# too (draft-simple, draft-eagle3, ...), each needing a second checkpoint
+# loaded alongside the primary one -- a separate, bigger feature (model
+# pairing, VRAM budget for two models, tokenizer-family matching) than
+# wiring the flag itself. Scoped to the n-gram types for this first pass:
+# they speculate from n-grams already seen in the prompt/generation itself,
+# needing no second model and no extra VRAM -- a strictly additive latency
+# win on the RAM-constrained boxes this framework targets. Verified against
+# the live upstream tools/server/README.md.
+_LLAMACPP_NGRAM_SPEC_TYPES = frozenset({"ngram-simple", "ngram-cache"})
+
 
 @dataclass(frozen=True)
 class RuntimeLaunchSpec:
@@ -136,6 +147,12 @@ class RuntimeLaunchSpec:
     # rather than an abrupt cut-off thought. Only meaningful alongside
     # reasoning_budget; validated together below.
     reasoning_budget_message: str | None = None
+    # llama.cpp only (#400): n-gram speculative decoding -- a latency win
+    # with no second model and no extra VRAM. Restricted to the n-gram
+    # types only; the draft-model types (a second checkpoint, its own VRAM
+    # budget and tokenizer-family matching) are a separate, bigger feature
+    # deliberately not wired here.
+    spec_type: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -187,6 +204,12 @@ class RuntimeLaunchSpec:
                 raise RuntimeConfigurationError(
                     "reasoning_budget_message must not contain NUL bytes"
                 )
+        if self.spec_type is not None and self.spec_type not in _LLAMACPP_NGRAM_SPEC_TYPES:
+            raise RuntimeConfigurationError(
+                f"spec_type must be one of {sorted(_LLAMACPP_NGRAM_SPEC_TYPES)} "
+                "(draft-model speculative types need a second checkpoint and "
+                "aren't wired yet)"
+            )
 
 
 @dataclass(frozen=True)
@@ -776,6 +799,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--reasoning-budget", str(spec.reasoning_budget)])
         if spec.reasoning_budget_message is not None:
             command.extend(["--reasoning-budget-message", spec.reasoning_budget_message])
+        if spec.spec_type is not None:
+            command.extend(["--spec-type", spec.spec_type])
         if spec.context_length is not None:
             ctx_size = spec.context_length
             if spec.n_parallel > 1:
