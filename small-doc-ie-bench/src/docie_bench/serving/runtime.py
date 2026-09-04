@@ -92,6 +92,18 @@ class RuntimeLaunchSpec:
     # build_command never reads these.
     n_parallel: int = 1
     cache_reuse: int | None = None
+    # llama.cpp only (#366): unlocks llama-server's own Prometheus-compatible
+    # GET /metrics -- a DIFFERENT consumer than this app's in-app
+    # Observability tab (usage ledger, slots card): an operator's EXTERNAL
+    # monitoring stack (Grafana, alerting) scraping llama-server directly,
+    # working even when nobody has the Studio open. Purely an ops toggle --
+    # no per-request behavioral effect, and this framework doesn't consume
+    # /metrics itself (the existing /slots + usage-ledger machinery already
+    # covers in-app observability; reading /metrics too would just
+    # duplicate it). Same host:port as the rest of the API -- no new
+    # access-control surface beyond whatever already gates the deployment
+    # (api_key_env).
+    metrics_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -692,6 +704,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             str(spec.port),
             "--jinja",
         ]
+        if spec.metrics_enabled:
+            command.append("--metrics")
         if spec.context_length is not None:
             ctx_size = spec.context_length
             if spec.n_parallel > 1:
