@@ -302,6 +302,65 @@ def test_launch_spec_rejects_unknown_kv_cache_type() -> None:
         _spec(RuntimeKind.LLAMACPP, cache_type_v="not-a-real-type")
 
 
+def test_llamacpp_reasoning_budget_emits_flag() -> None:
+    # #402: caps how many tokens a thinking model spends before it's forced
+    # to answer -- timely given lfm2.5-1.2b-thinking is actively deployed
+    # this milestone.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", reasoning_budget=512)
+
+    command = adapter.build_command(spec)
+
+    assert command[command.index("--reasoning-budget") + 1] == "512"
+
+
+def test_llamacpp_reasoning_budget_zero_and_negative_one_are_valid() -> None:
+    # 0 = end thinking immediately, -1 = unrestricted -- both real,
+    # meaningful values per llama-server's own docs, not "unset".
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    for value in (0, -1):
+        spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", reasoning_budget=value)
+        command = adapter.build_command(spec)
+        assert command[command.index("--reasoning-budget") + 1] == str(value)
+
+
+def test_llamacpp_reasoning_budget_message_emits_alongside_budget() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        reasoning_budget=256,
+        reasoning_budget_message="Wrapping up my analysis now.",
+    )
+
+    command = adapter.build_command(spec)
+
+    assert (
+        command[command.index("--reasoning-budget-message") + 1]
+        == "Wrapping up my analysis now."
+    )
+
+
+def test_llamacpp_omits_reasoning_budget_flags_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--reasoning-budget" not in command
+    assert "--reasoning-budget-message" not in command
+
+
+def test_launch_spec_rejects_reasoning_budget_below_negative_one() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="reasoning_budget"):
+        _spec(RuntimeKind.LLAMACPP, reasoning_budget=-2)
+
+
+def test_launch_spec_rejects_reasoning_budget_message_without_a_budget() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="reasoning_budget_message"):
+        _spec(RuntimeKind.LLAMACPP, reasoning_budget_message="Wrapping up.")
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
