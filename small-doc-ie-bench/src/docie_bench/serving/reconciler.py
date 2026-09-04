@@ -94,8 +94,26 @@ from docie_bench.serving.throughput import (
     probe_applicability,
     probe_deployment,
 )
+from docie_bench.telemetry import DEPLOYMENT_HEALTHY, DEPLOYMENT_PHASE
 
 logger = logging.getLogger(__name__)
+
+# Every phase ObservedDeployment.phase can carry (see its docstring). Exporting
+# the full fixed set each cycle -- not just the observed one -- keeps a
+# deployment's OTHER phase series at 0 instead of stuck at its last nonzero
+# value forever after a transition (a Gauge never clears a label combo nobody
+# re-sets), which would otherwise let a stale "loading=1" outlive an actual
+# recovery to "hot".
+_DEPLOYMENT_PHASES = ("hot", "loading", "cold", "evicted", "failed")
+
+
+def _export_deployment_metrics(observations: list[ObservedDeployment]) -> None:
+    for observation in observations:
+        DEPLOYMENT_HEALTHY.labels(observation.name).set(1.0 if observation.health_ok else 0.0)
+        for phase in _DEPLOYMENT_PHASES:
+            DEPLOYMENT_PHASE.labels(observation.name, phase).set(
+                1.0 if phase == observation.phase else 0.0
+            )
 
 # create_time is stable for the lifetime of a process; allow a small slack for
 # float rounding across psutil reads.
@@ -503,6 +521,7 @@ class ServingReconciler:
         # Publish OUTSIDE the lock: observations are immutable snapshots and a
         # slow database must not block the lifecycle handlers.
         self._publisher(observations)
+        _export_deployment_metrics(observations)
         # Resource snapshot (PR-2), also outside the lock: pure measurement
         # (cgroup/psutil reads + footprint sidecar writes). Best-effort — a
         # measurement hiccup must never mark the repair cycle failed.
