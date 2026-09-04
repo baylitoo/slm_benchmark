@@ -20,7 +20,7 @@ UPSTREAM = ModelProfile(
 )
 
 
-@pytest.fixture()
+@pytest.fixture
 def api(monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
     def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
         if model_profile == "lfm2.5-350m":
@@ -178,6 +178,41 @@ def test_chat_requires_model(api) -> None:
         "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
     )
     assert response.status_code == 400
+
+
+def test_chat_malformed_body_is_openai_shaped_400(api) -> None:
+    """A body that isn't even valid JSON must still 400 in the SAME
+    OpenAI error shape as every hand-rolled ``_openai_error(...)`` in this
+    file, not FastAPI's default ``{"detail": [...]}`` validation shape."""
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        content=b"not json",
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert set(error) == {"message", "type", "code"}
+    assert error["type"] == "invalid_request_error"
+
+
+def test_chat_forwards_unrecognized_openai_fields_untouched(api) -> None:
+    """Fields this handler never inspects (temperature, top_p, ...) must
+    still reach the upstream verbatim -- the point of ``extra="allow"``."""
+    client, captured = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
+            "top_p": 0.9,
+        },
+    )
+    assert response.status_code == 200, response.text
+    sent = json.loads(captured[-1].content)
+    assert sent["temperature"] == 0.2
+    assert sent["top_p"] == 0.9
 
 
 def test_chat_stream_proxies_real_upstream_chunks(api) -> None:
@@ -435,21 +470,996 @@ def test_chat_forwards_tool_role_messages(api) -> None:
     assert json.loads(captured[-1].content)["messages"] == messages
 
 
-def test_chat_mcp_with_stream_is_400(api) -> None:
-    # The server drives the tool exchange, so only the FINAL completion has a
-    # meaningful shape -- streaming intermediate rounds is refused up front.
+def test_chat_mcp_stream_relays_each_tool_call_as_its_own_sse_event(api, monkeypatch) -> None:
+    # Each executed tool call arrives as its own SSE frame the moment it
+    # finishes, instead of the whole exchange completing silently before
+    # anything reaches the client ("Waiting for the model…" with zero
+    # visibility into the agentic search actually running).
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        assert on_tool_call is not None
+        on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
     client, _ = api
-    resp = client.post(
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    tool_events = [e for e in events if e["type"] == "tool_call"]
+    content_events = [e for e in events if e["type"] == "content"]
+    assert tool_events == [
+        {
+            "type": "tool_call",
+            "tool": "calc__add",
+            "status": "ok",
+            "latency_ms": 12,
+            "arguments": '{"a": 1, "b": 2}',
+            "result": "3",
+        }
+    ]
+    (content_event,) = content_events
+    assert content_event["completion"]["choices"][0]["message"]["content"] == "3"
+    assert response.text.strip().endswith("data: [DONE]")
+
+
+def test_chat_mcp_stream_relays_reasoning_content_as_its_own_sse_event(api, monkeypatch) -> None:
+    # A reasoning-capable model's "why" for calling a tool arrives as its
+    # own event too -- answers "is there a hidden thinking step" instead of
+    # silently discarding message.reasoning_content.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        assert on_reasoning is not None
+        on_reasoning("the user asked for 1+2, so I should call calc.add")
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (reasoning_event,) = [e for e in events if e["type"] == "reasoning"]
+    assert reasoning_event["text"] == "the user asked for 1+2, so I should call calc.add"
+
+
+def test_chat_mcp_stream_relays_system_addendum_as_its_own_sse_event_once(api, monkeypatch) -> None:
+    # run_tool_loop's TOOL_DISCIPLINE_DIRECTIVE (folded into the request's
+    # system message before the first round) is real, load-bearing content
+    # that was never surfaced anywhere -- it now arrives as its own one-time
+    # SSE event, with the exact addendum text, not a placeholder.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import TOOL_DISCIPLINE_DIRECTIVE, MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        assert on_system_addendum is not None
+        on_system_addendum(TOOL_DISCIPLINE_DIRECTIVE)
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    addendum_events = [e for e in events if e["type"] == "system_addendum"]
+    assert addendum_events == [{"type": "system_addendum", "text": TOOL_DISCIPLINE_DIRECTIVE}]
+
+
+def test_chat_mcp_stream_relays_usage_as_its_own_sse_event(api, monkeypatch) -> None:
+    # run_tool_loop's on_usage (per-round + cumulative token counts) arrives
+    # as its own event too -- lets a client show context consumption before
+    # the final completion lands, not only after the whole exchange finishes.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        assert on_usage is not None
+        on_usage(
+            {
+                "round": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "cumulative": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+        )
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (usage_event,) = [e for e in events if e["type"] == "usage"]
+    assert usage_event == {
+        "type": "usage",
+        "round": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "cumulative": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+
+
+def test_chat_mcp_stream_relays_context_budget_as_its_own_sse_event(api, monkeypatch) -> None:
+    # run_tool_loop's on_context_budget (#344) arrives as its own event too --
+    # a client warning that cumulative usage crossed the resolved
+    # deployment's context-window threshold, before the exchange runs out of
+    # room entirely.
+    from docie_bench import chat_api, mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    monkeypatch.setattr(chat_api, "_context_length_for_profile", lambda profile: 4096)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        assert context_length_ceiling == 4096
+        assert on_context_budget is not None
+        on_context_budget(
+            {
+                "cumulative_tokens": 3300,
+                "context_length": 4096,
+                "threshold_fraction": 0.8,
+            }
+        )
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (budget_event,) = [e for e in events if e["type"] == "context_budget"]
+    assert budget_event == {
+        "type": "context_budget",
+        "cumulative_tokens": 3300,
+        "context_length": 4096,
+        "threshold_fraction": 0.8,
+    }
+
+
+def test_chat_mcp_stream_unresolvable_ceiling_skips_context_budget_check(
+    api, monkeypatch, tmp_path
+) -> None:
+    # A profile with no matching live deployment record (a plain models.yaml
+    # profile, or -- as here -- the test's stub resolver) can't be priced
+    # against a context window at all; run_tool_loop must get None and never
+    # be asked to warn, rather than guess a ceiling or block the request.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    # No monkeypatch of _context_length_for_profile itself: the real lookup
+    # runs, against an empty DOCIE_SERVING_HOME (an isolated tmp_path, not
+    # this machine's real deployments.json -- whatever it happens to have
+    # deployed right now is irrelevant), so it deterministically finds no
+    # live deployment record named "lfm2.5-350m" and resolves to None -- the
+    # "can't be priced" path this test covers.
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    seen_ceiling: list[int | None] = []
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        seen_ceiling.append(context_length_ceiling)
+        assert on_context_budget is not None  # still wired -- just never called
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert seen_ceiling == [None]
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert [e for e in events if e["type"] == "context_budget"] == []
+
+
+def test_chat_mcp_stream_emits_tool_calls_unsupported_before_any_round(api, monkeypatch) -> None:
+    # #353: a deployment whose chat template is known NOT to support real
+    # tool-calling must warn the caller ONCE, BEFORE run_tool_loop runs a
+    # single round -- known upfront from the deployment's own health state.
+    from docie_bench import chat_api, mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    monkeypatch.setattr(chat_api, "_tool_calls_supported_for_profile", lambda profile: False)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "read the pdf"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    unsupported_events = [e for e in events if e["type"] == "tool_calls_unsupported"]
+    assert len(unsupported_events) == 1
+    assert "chat_template_caps.supports_tool_calls=false" in unsupported_events[0]["message"]
+    # Fired before any other event (content included) -- known upfront, not
+    # learned mid-exchange.
+    assert events[0]["type"] == "tool_calls_unsupported"
+
+
+@pytest.mark.parametrize("verdict", [True, None])
+def test_chat_mcp_stream_skips_tool_calls_unsupported_when_true_or_unknown(
+    api, monkeypatch, verdict: bool | None
+) -> None:
+    from docie_bench import chat_api, mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    monkeypatch.setattr(chat_api, "_tool_calls_supported_for_profile", lambda profile: verdict)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "read the pdf"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert [e for e in events if e["type"] == "tool_calls_unsupported"] == []
+
+
+def test_chat_mcp_stream_unregistered_server_sends_an_error_event(api) -> None:
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["ghost"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (error_event,) = events
+    assert error_event["type"] == "error"
+    assert "unregistered MCP server" in error_event["error"]["message"]
+
+
+# ── human-in-the-loop pause/resume (#383) ────────────────────────────────
+
+
+def test_chat_mcp_stream_mints_no_exchange_without_ask_user_opt_in(api, monkeypatch) -> None:
+    # enable_ask_user defaults False -- a caller that never opts in gets
+    # exactly today's behavior: no exchange id minted, no ask_user tool.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    seen_exchange_ids: list[str | None] = []
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        seen_exchange_ids.append(exchange_id)
+        assert on_awaiting_input is None
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert [e for e in events if e["type"] == "exchange"] == []
+    assert seen_exchange_ids == [None]
+
+
+def test_chat_mcp_stream_emits_exchange_event_first_when_ask_user_is_enabled(
+    api, monkeypatch
+) -> None:
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    seen_exchange_ids: list[str | None] = []
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        seen_exchange_ids.append(exchange_id)
+        assert exchange_id is not None
+        assert on_awaiting_input is not None
+        return {"choices": [{"message": {"role": "assistant", "content": "3"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+            "enable_ask_user": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    # exchange is the FIRST event, before anything else.
+    assert events[0]["type"] == "exchange"
+    assert events[0]["exchange_id"] == seen_exchange_ids[0]
+    # And the registry entry is gone once the exchange has finished.
+    assert not mcp_tools.has_pending_input(events[0]["exchange_id"])
+
+
+def test_chat_mcp_stream_relays_awaiting_input_as_its_own_sse_event(api, monkeypatch) -> None:
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post,
+        body,
+        sessions,
+        mapping,
+        tools,
+        on_tool_call=None,
+        on_reasoning=None,
+        on_system_addendum=None,
+        on_usage=None,
+        context_length_ceiling=None,
+        on_context_budget=None,
+        exchange_id=None,
+        on_awaiting_input=None,
+        on_tool_budget_forced=None,
+    ):
+        assert on_awaiting_input is not None
+        on_awaiting_input({"question": "which invoice?", "choices": ["A", "B"]})
+        return {"choices": [{"message": {"role": "assistant", "content": "picked A"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "which invoice?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+            "enable_ask_user": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (awaiting_event,) = [e for e in events if e["type"] == "awaiting_input"]
+    assert awaiting_event == {
+        "type": "awaiting_input",
+        "question": "which invoice?",
+        "choices": ["A", "B"],
+    }
+
+
+def test_chat_mcp_stream_ask_user_timeout_ends_the_exchange_with_an_error_event(
+    api, monkeypatch
+) -> None:
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(*args, **kwargs):
+        raise mcp_tools.AskUserTimeoutError("no answer arrived within 0s")
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    response = client.post(
         "/v1/chat/completions",
         json={
             "model": "lfm2.5-350m",
             "messages": [{"role": "user", "content": "hi"}],
             "mcp_servers": ["calc"],
             "stream": True,
+            "enable_ask_user": True,
         },
     )
-    assert resp.status_code == 400
-    assert "stream" in resp.json()["error"]["message"]
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    (error_event,) = [e for e in events if e["type"] == "error"]
+    assert error_event["error"]["type"] == "ask_user_timeout"
+    assert error_event["error"]["code"] == "ask_user_timeout"
+    # Never leaked -- cleaned up even though the exchange ended via an error.
+    exchange_event = next(e for e in events if e["type"] == "exchange")
+    assert not mcp_tools.has_pending_input(exchange_event["exchange_id"])
+
+
+async def test_chat_mcp_stream_cancellation_during_a_pause_clears_the_registry() -> None:
+    # A closed tab / abandoned request: the client disconnects while an
+    # exchange is genuinely paused, awaiting an answer nobody will ever send.
+    # The registry entry must not survive that.
+    import time
+
+    from docie_bench import mcp_tools
+    from docie_bench.chat_api import _stream_chat_with_mcp_tools
+    from docie_bench.llm.model_profiles import ModelProfile
+
+    profile = ModelProfile(
+        name="lfm2.5-350m", model="lfm2.5-350m-served", base_url="http://upstream/v1", api_key="k"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # The MCP tool loop's post() now streams every round (see
+        # _post_upstream_streamed) -- the mock upstream answers with the
+        # SSE-delta shape, not one blocking JSON completion.
+        async def _chunks() -> AsyncIterator[bytes]:
+            frame = {
+                "id": "r1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "ask_user",
+                                        "arguments": '{"question": "which invoice?"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(frame)}\n\n".encode()
+            yield b'data: {"choices": [], "usage": {}}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_chunks()
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resp = await _stream_chat_with_mcp_tools(
+            client,
+            "http://upstream/v1/chat/completions",
+            {},
+            {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]},
+            profile,
+            [],  # no real MCP servers needed for this
+            None,
+            tenant_id="t",
+            started=time.perf_counter(),
+            enable_ask_user=True,
+        )
+        gen = resp.body_iterator
+        exchange_id: str | None = None
+        async for chunk in gen:
+            line = bytes(chunk).decode()
+            if not line.startswith("data: ") or line.startswith("data: [DONE]"):
+                continue
+            event = json.loads(line[len("data: ") :].strip())
+            if event["type"] == "exchange":
+                exchange_id = event["exchange_id"]
+            elif event["type"] == "awaiting_input":
+                assert exchange_id is not None
+                assert mcp_tools.has_pending_input(exchange_id)
+                break  # simulate the client giving up mid-pause
+        assert exchange_id is not None
+        await gen.aclose()  # drives body_iterator's finally: cancel + await drive()
+        assert not mcp_tools.has_pending_input(exchange_id)
+
+
+def test_pause_endpoint_flags_a_registered_exchange_and_404s_for_unknown_ones(api) -> None:
+    from docie_bench import mcp_tools
+
+    mcp_tools.open_pending_input("exch-pause-route")
+    try:
+        client, _ = api
+        resp = client.post(
+            "/v1/chat/completions/pause", json={"exchange_id": "exch-pause-route"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"paused": True, "exchange_id": "exch-pause-route"}
+        assert mcp_tools._pending_inputs["exch-pause-route"].pause_requested is True
+    finally:
+        mcp_tools.close_pending_input("exch-pause-route")
+
+    resp = client.post("/v1/chat/completions/pause", json={"exchange_id": "no-such-exchange"})
+    assert resp.status_code == 404
+    assert resp.json()["error"]["type"] == "unknown_exchange"
+
+
+def test_respond_endpoint_resolves_a_registered_exchange_and_404s_for_unknown_ones(api) -> None:
+    from docie_bench import mcp_tools
+
+    mcp_tools.open_pending_input("exch-respond-route")
+    try:
+        client, _ = api
+        resp = client.post(
+            "/v1/chat/completions/respond",
+            json={"exchange_id": "exch-respond-route", "text": "use invoice A"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"accepted": True, "exchange_id": "exch-respond-route"}
+        pending = mcp_tools._pending_inputs["exch-respond-route"]
+        assert pending.answer == "use invoice A"
+        assert pending.event.is_set()
+    finally:
+        mcp_tools.close_pending_input("exch-respond-route")
+
+    resp = client.post(
+        "/v1/chat/completions/respond",
+        json={"exchange_id": "no-such-exchange", "text": "x"},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["type"] == "unknown_exchange"
 
 
 def test_chat_mcp_field_must_be_a_string_list(api) -> None:
@@ -514,6 +1524,170 @@ def test_chat_mcp_sdk_missing_is_501(api, monkeypatch) -> None:
     )
     assert resp.status_code == 501
     assert "'mcp' package" in resp.json()["error"]["message"]
+
+
+def test_chat_mcp_response_carries_the_tool_call_trace(api, monkeypatch) -> None:
+    # The Playground's Chat mode (and any other caller of the generic
+    # `mcp_servers` surface) needs the same "Try it" trace shape the Agents
+    # surface already returns -- `run_tool_loop`'s `on_tool_call` seam is
+    # shared via `mcp_tools.make_trace_recorder`.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None
+    ):
+        assert on_tool_call is not None
+        on_tool_call("calc__add", True, 12, {"a": 1, "b": 2}, "3")
+        return {
+            "id": "chatcmpl-1",
+            "choices": [{"message": {"role": "assistant", "content": "3"}}],
+        }
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+        },
+    )
+    assert resp.status_code == 200
+    trace = resp.json()["docie_agent"]["tool_calls"]
+    assert trace == [
+        {
+            "tool": "calc__add",
+            "status": "ok",
+            "latency_ms": 12,
+            "arguments": '{"a": 1, "b": 2}',
+            "result": "3",
+        }
+    ]
+
+
+def test_chat_mcp_session_id_points_docs_search_at_the_session_directory(
+    api, monkeypatch, tmp_path
+) -> None:
+    # A Playground attachment uploaded via POST /v1/studio/session-documents
+    # (#296) is only searchable if docs-search's spec is launched with its
+    # documents directory overridden to that session's upload directory.
+    from docie_bench import mcp_session_documents, mcp_tools
+    from docie_bench.mcp_servers.docs_search import DOCS_DIR_ENV
+    from docie_bench.mcp_tools import MCPServerSpec
+    from docie_bench.settings import get_settings
+
+    monkeypatch.setenv("MCP_SESSION_DOCUMENTS_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+
+    session_id, _ = mcp_session_documents.save_document(None, "invoice.pdf", b"%PDF-fake")
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "docs-search": MCPServerSpec(
+                name="docs-search", transport="streamable-http", url="http://x"
+            )
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    captured_specs: list[list] = []
+
+    async def fake_open_sessions(stack, specs):
+        captured_specs.append(specs)
+        return {"docs-search": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    async def fake_run_tool_loop(
+        post, body, sessions, mapping, tools, on_tool_call=None, on_reasoning=None
+    ):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    monkeypatch.setattr(mcp_tools, "run_tool_loop", fake_run_tool_loop)
+
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what's in the attached file?"}],
+            "mcp_servers": ["docs-search"],
+            "session_id": session_id,
+        },
+    )
+    assert resp.status_code == 200
+    (specs,) = captured_specs
+    (spec,) = specs
+    assert spec.env[DOCS_DIR_ENV] == str(tmp_path / session_id)
+    get_settings.cache_clear()
+
+
+def test_chat_mcp_unknown_session_id_is_400(api, monkeypatch) -> None:
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "docs-search": MCPServerSpec(
+                name="docs-search", transport="streamable-http", url="http://x"
+            )
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["docs-search"],
+            "session_id": "not-a-real-session",
+        },
+    )
+    assert resp.status_code == 400
+    assert "invalid session id" in resp.json()["error"]["message"]
+
+
+def test_chat_mcp_session_id_must_be_a_string(api) -> None:
+    client, _ = api
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "mcp_servers": ["calc"],
+            "session_id": 12345,
+        },
+    )
+    assert resp.status_code == 400
+    assert "session_id" in resp.json()["error"]["message"]
 
 
 # ── usage ledger: every resolved request writes one durable row ─────────────
@@ -755,3 +1929,495 @@ def test_mcp_servers_listing_redacts_secret_values(api, monkeypatch) -> None:
     assert entry["name"] == "docs"
     assert entry["headers"] == ["Authorization"]
     assert "topsecret" not in resp.text
+
+
+# ── _post_upstream_streamed: token-by-token MCP tool loop rounds (#389) ─────
+#
+# Real token streaming for the MCP tool loop's own upstream calls -- every
+# round used to be one blocking _post_upstream() POST, so a reasoning model's
+# thinking and its final answer both landed as one lump the instant
+# llama-server finished generating. These tests exercise the new streaming
+# `post` closure (_post_upstream_streamed) directly against a fake
+# multi-chunk SSE upstream -- the highest-risk part is tool-call fragment
+# accumulation (a wrong reconstruction silently breaks every agentic tool
+# call), so that gets a byte-identical comparison against the non-streaming
+# path's own output for the same logical content, not just an eyeballed
+# happy path.
+
+
+def _sse_body(*frames: dict) -> bytes:
+    body = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    return (body + "data: [DONE]\n\n").encode()
+
+
+@pytest.fixture
+def streamed_profile() -> ModelProfile:
+    return ModelProfile(
+        name="lfm2.5-350m", model="lfm2.5-350m-served", base_url="http://upstream/v1", api_key="k"
+    )
+
+
+async def test_post_upstream_streamed_accumulates_a_tool_call_split_across_many_chunks(
+    streamed_profile,
+) -> None:
+    # The highest-risk part (#389): function.name AND function.arguments
+    # split across several chunks -- realistic streaming, not one chunk per
+    # tool call -- reassembled and compared BYTE-IDENTICAL to what
+    # _post_upstream (the non-streaming path) returns for the same logical
+    # completion.
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream, _post_upstream_streamed
+
+    def streaming_handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "id": "c1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "get_", "arguments": ""},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "name": "invoice_total",
+                                        "arguments": '{"invoi',
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": 'ce_id": '}}
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": '"INV-7"}'}}
+                            ]
+                        },
+                    }
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    def non_streaming_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "c1",
+                "object": "chat.completion",
+                "model": "lfm2.5-350m-served",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_invoice_total",
+                                        "arguments": '{"invoice_id": "INV-7"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "total?"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(streaming_handler)) as client:
+        streamed = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(non_streaming_handler)) as client:
+        non_streamed = await _post_upstream(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile
+        )
+
+    assert isinstance(streamed, dict)
+    assert isinstance(non_streamed, dict)
+    assert streamed["choices"][0]["message"] == non_streamed["choices"][0]["message"]
+    assert streamed["choices"][0]["finish_reason"] == non_streamed["choices"][0]["finish_reason"]
+    assert streamed["choices"][0]["message"]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_invoice_total", "arguments": '{"invoice_id": "INV-7"}'},
+        }
+    ]
+    # A tool-call-only round never streams content/reasoning fragments.
+    assert queue.empty()
+
+
+async def test_post_upstream_streamed_accumulates_two_tool_calls_by_index(
+    streamed_profile,
+) -> None:
+    # Two tool calls in the same round, each streamed as its own fragment
+    # sequence -- the "index" keying, not arrival order, must keep them apart.
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "calc__add", "arguments": ""},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {"name": "calc__sub", "arguments": ""},
+                                },
+                            ],
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 1, "function": {"arguments": '{"a": 5, '}},
+                                {"index": 0, "function": {"arguments": '{"a": 1, '}},
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": '"b": 2}'}},
+                                {"index": 1, "function": {"arguments": '"b": 3}'}},
+                            ]
+                        },
+                    }
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "1+2 and 5-3?"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    tool_calls = result["choices"][0]["message"]["tool_calls"]
+    assert tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "calc__add", "arguments": '{"a": 1, "b": 2}'},
+        },
+        {
+            "id": "call_2",
+            "type": "function",
+            "function": {"name": "calc__sub", "arguments": '{"a": 5, "b": 3}'},
+        },
+    ]
+
+
+async def test_post_upstream_streamed_accumulates_reasoning_only_deltas(streamed_profile) -> None:
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "reasoning_content": "Let "}}
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "me "}}]},
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "think."}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    message = result["choices"][0]["message"]
+    assert message["reasoning_content"] == "Let me think."
+    assert message["content"] is None
+    assert "tool_calls" not in message
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert [e["type"] for e in events] == ["reasoning_delta", "reasoning_delta", "reasoning_delta"]
+    assert [e["text"] for e in events] == ["Let ", "me ", "think."]
+
+
+async def test_post_upstream_streamed_accumulates_content_only_deltas(streamed_profile) -> None:
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "lo"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "!"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    message = result["choices"][0]["message"]
+    assert message["content"] == "Hello!"
+    assert "reasoning_content" not in message
+    assert "tool_calls" not in message
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert [e["type"] for e in events] == ["content_delta", "content_delta", "content_delta"]
+    assert [e["text"] for e in events] == ["Hel", "lo", "!"]
+
+
+async def test_post_upstream_streamed_captures_usage_from_the_trailing_frame(
+    streamed_profile,
+) -> None:
+    import asyncio
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            },
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, dict)
+    assert result["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+
+
+async def test_post_upstream_streamed_upstream_error_status_maps_like_post_upstream(
+    streamed_profile,
+) -> None:
+    import asyncio
+
+    from fastapi.responses import JSONResponse
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="upstream kaboom")
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 500
+    body = json.loads(bytes(result.body))
+    assert body["error"]["type"] == "upstream_error"
+    assert "upstream kaboom" in body["error"]["message"]
+
+
+async def test_post_upstream_streamed_connection_error_maps_to_upstream_unavailable(
+    streamed_profile,
+) -> None:
+    import asyncio
+
+    from fastapi.responses import JSONResponse
+
+    from docie_bench.chat_api import _post_upstream_streamed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    forward = {"model": "lfm2.5-350m", "messages": [{"role": "user", "content": "hi"}]}
+    queue: asyncio.Queue = asyncio.Queue()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_upstream_streamed(
+            client, "http://upstream/v1/chat/completions", {}, forward, streamed_profile, queue
+        )
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 502
+    body = json.loads(bytes(result.body))
+    assert body["error"]["type"] == "upstream_unavailable"
+
+
+def test_chat_mcp_stream_content_and_reasoning_deltas_precede_the_rounds_one_shot_events(
+    api, monkeypatch
+) -> None:
+    # #389, end to end through the real (unmocked) run_tool_loop: every
+    # content_delta/reasoning_delta for a round must land BEFORE that
+    # round's own usage/reasoning/content events, which are only built once
+    # the round's stream has fully ended.
+    from docie_bench import mcp_tools
+    from docie_bench.mcp_tools import MCPServerSpec
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "calc": MCPServerSpec(name="calc", transport="streamable-http", url="http://x")
+        },
+    )
+    monkeypatch.setattr(mcp_tools, "_require_mcp", lambda: None)
+
+    async def fake_open_sessions(stack, specs):
+        return {"calc": object()}
+
+    async def fake_collect_tools(sessions):
+        return [], {}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open_sessions)
+    monkeypatch.setattr(mcp_tools, "collect_openai_tools", fake_collect_tools)
+    # run_tool_loop is left REAL here -- the point is exercising the actual
+    # streaming post() closure end to end, not a stand-in for it.
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = [
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "reasoning_content": "thinking "}}
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "it over"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "the "}}]},
+            {"choices": [{"index": 0, "delta": {"content": "answer"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_sse_body(*frames)
+        )
+
+    configure_http_transport(httpx.MockTransport(handler))
+    client, _ = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lfm2.5-350m",
+            "messages": [{"role": "user", "content": "what is 1+2?"}],
+            "mcp_servers": ["calc"],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.iter_lines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert [e["type"] for e in events] == [
+        "reasoning_delta",
+        "reasoning_delta",
+        "content_delta",
+        "content_delta",
+        "usage",
+        "reasoning",
+        "content",
+    ]
+    reasoning_deltas = "".join(e["text"] for e in events if e["type"] == "reasoning_delta")
+    content_deltas = "".join(e["text"] for e in events if e["type"] == "content_delta")
+    assert reasoning_deltas == "thinking it over"
+    assert content_deltas == "the answer"
+    (reasoning_event,) = [e for e in events if e["type"] == "reasoning"]
+    assert reasoning_event["text"] == "thinking it over"
+    (content_event,) = [e for e in events if e["type"] == "content"]
+    assert content_event["completion"]["choices"][0]["message"]["content"] == "the answer"

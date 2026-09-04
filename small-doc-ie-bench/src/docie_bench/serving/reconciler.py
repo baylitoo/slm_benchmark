@@ -590,7 +590,9 @@ class ServingReconciler:
             record.spec.launch, timeout=record.spec.health_timeout_seconds
         )
         if health.healthy:
-            record = self.supervisor.observe_health(name, healthy=True)
+            record = self.supervisor.observe_health(
+                name, healthy=True, tool_calls_supported=health.tool_calls_supported
+            )
             if self._idle_unload_due(record):
                 logger.info(
                     "deployment %s idle for > %.0fs: unloading (record + port kept, "
@@ -625,13 +627,20 @@ class ServingReconciler:
                     name, f"unresponsive after READY: {detail}", shutdown=True
                 )
                 return self._maybe_restart(name, record, allowed, reason)
-            record = self.supervisor.observe_health(name, healthy=False, detail=detail)
+            record = self.supervisor.observe_health(
+                name,
+                healthy=False,
+                detail=detail,
+                tool_calls_supported=health.tool_calls_supported,
+            )
             return self._observation(name, record, phase="loading", health_ok=False)
 
         # Never READY yet: a cold-loading GGUF. High tolerance — observe, never
         # kill; the record's own health_failure_threshold governs the deploy
         # path's degrade logic, not this loop.
-        record = self.supervisor.observe_health(name, healthy=False, detail=detail)
+        record = self.supervisor.observe_health(
+            name, healthy=False, detail=detail, tool_calls_supported=health.tool_calls_supported
+        )
         return self._observation(name, record, phase="loading", health_ok=False)
 
     def _observe_dead(

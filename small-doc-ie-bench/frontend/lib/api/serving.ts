@@ -13,7 +13,16 @@ export interface DeployRequest {
   port?: number;
   context_length?: number;
   max_tokens?: number;
+  /** TARGET total instances of the store model (default 1). >1 fans out one
+   * deploy per missing replica on auto-allocated ports — store-entry (Auto)
+   * deploys only, and incompatible with an explicit name/port. */
   replicas?: number;
+  /** llama-server request slots (default 1, meaningless for non-llamacpp
+   * runtimes). context_length is divided across slots by the runtime, so the
+   * caller must size context_length for a single slot's worth of context. */
+  n_parallel?: number;
+  /** llama-server --cache-reuse: min chunk size to reuse from KV cache. */
+  cache_reuse?: number;
   [k: string]: unknown;
 }
 
@@ -106,7 +115,7 @@ export interface DeploymentRecord {
     desired_state?: string;
     [k: string]: unknown;
   };
-  state?: string; // lifecycle: "running" | "stopped" | ...
+  state?: string; // lifecycle: "stopped" | "starting" | "ready" | "degraded" | "failed"
   pid?: number | null;
   endpoint?: string | null;
   restart_count?: number;
@@ -126,6 +135,12 @@ export interface DeploymentRecord {
    * observed_available=false when the database is unreachable. */
   observed?: ObservedPlacement | null;
   observed_available?: boolean;
+  /** The shared launch alias this record's requests are load-balanced behind
+   * (the base store name for a scaled model). */
+  replica_group?: string | null;
+  /** How many deployment records share `replica_group` right now (1 = not
+   * scaled). Derived server-side from the records, never stored. */
+  replicas?: number;
   [k: string]: unknown;
 }
 
@@ -197,6 +212,40 @@ export function getRuntimes(): Promise<RuntimeCapability[]> {
 
 export function getDeployments(): Promise<DeploymentRecord[]> {
   return request<DeploymentRecord[]>("/v1/serving/deployments");
+}
+
+/** One llama-server ``GET /slots`` entry, defensively normalized server-side
+ * (#315) -- the schema varies by build, so every field but `id` is optional
+ * and a field simply absent here means THIS build didn't report it, not an
+ * error. `prompt` is truncated server-side. */
+export interface LlamaCppSlot {
+  id?: number;
+  is_processing?: boolean;
+  n_ctx?: number;
+  prompt?: string;
+  id_task?: number;
+  n_past?: number;
+  n_remain?: number;
+  n_decoded?: number;
+  cache_n?: number;
+  prompt_n?: number;
+  prompt_ms?: number;
+  predicted_n?: number;
+  predicted_ms?: number;
+  tokens_per_second?: number;
+  next_token?: Record<string, boolean | number | string>;
+  [k: string]: unknown;
+}
+
+/** llama-server's own worker-pool-equivalent introspection (#315): per-slot
+ * prompt state, KV cache reuse, and (on builds that report it) prefill/
+ * decode timing, queried live and on demand -- same pattern as
+ * getCodeInterpreterWorkers's live call to Judge0's worker pool. 404s for a
+ * non-llama.cpp deployment or one with no live endpoint yet. */
+export function getDeploymentSlots(
+  name: string,
+): Promise<{ name: string; slots: LlamaCppSlot[] }> {
+  return request(`/v1/serving/deployments/${encodeURIComponent(name)}/slots`);
 }
 
 /** Live port-allocation view for the Deploy admin table (record-derived). */

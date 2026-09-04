@@ -7,6 +7,7 @@ import {
   Fingerprint,
   ListOrdered,
   MessageSquare,
+  Pause,
   Play,
   Send,
   Sparkles,
@@ -15,19 +16,27 @@ import {
   Upload,
   AlertCircle,
   FilePlus2,
+  Gauge,
   Paperclip,
+  Pencil,
+  RotateCcw,
+  Square,
+  Wrench,
   X,
 } from "lucide-react";
 import {
-  triggerExtract,
-  chatCompletion,
+  extractStream,
+  chatCompletionMcpStream,
   chatCompletionStream,
+  pauseChatExchange,
+  respondToChatExchange,
   listMcpServers,
   type McpRegisteredServer,
   embed,
   rerank,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
+  visionDeploymentNames,
   getDeployments,
   getStore,
   getFamilies,
@@ -35,13 +44,14 @@ import {
   isLiveDeployment,
   fileToBase64,
   renderDocument,
+  uploadSessionDocument,
   listDynamicSchemas,
   listSchemas,
+  getSchemaFields,
   listRoutingPolicies,
   ApiError,
   ApiUnavailable,
   ModelLoading,
-  type TriggerResponse,
   type ExtractRequest,
   type DeploymentRecord,
   type StoreEntry,
@@ -49,6 +59,12 @@ import {
   type RerankResponse,
   type DynamicSchemaSummary,
   type RoutingPolicySummary,
+  type AgentToolCallTrace,
+  type AgentUsageTrace,
+  type AgentContextBudgetTrace,
+  type AgentToolCallsUnsupportedTrace,
+  type AgentAwaitingInputTrace,
+  type SamplingParams,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -59,6 +75,7 @@ import {
   Alert,
   Button,
   Card,
+  Dialog,
   Field,
   Segmented,
   Select,
@@ -67,9 +84,11 @@ import {
   Badge,
   Spinner,
 } from "./ui";
-import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
+import { ToolCallItem } from "./ToolCallTrace";
+import { JsonView } from "./JsonView";
+import { RoutingSummary } from "./RoutingSummary";
 
 type PlaygroundMode = "chat" | "arena" | "embedrerank";
 
@@ -158,7 +177,12 @@ export function Playground({
       {/* Every mode stays mounted (hidden, never unmounted) so an in-flight
           extraction stream or a chat/arena history survives switching modes. */}
       <div hidden={mode !== "chat"}>
-        <ChatPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
+        <ChatPanel
+          deployments={deployments}
+          selectable={selectable}
+          store={store}
+          onNavigate={onNavigate}
+        />
       </div>
       <div hidden={mode !== "arena"}>
         <ArenaPanel deployments={deployments} selectable={selectable} onNavigate={onNavigate} />
@@ -187,12 +211,60 @@ export function Playground({
 //     interleaved freely with ordinary chat turns.
 // ---------------------------------------------------------------------------
 
+/** Live-streaming state for a role === "extraction" message (#397): raw
+ * model-output text accumulated from `delta` SSE frames (a live preview
+ * ONLY — never parsed as the result), the current `phase` label if the
+ * server sent one, and the terminal outcome (`result` from the `result`
+ * frame, or `error`). `result`/`error` are mutually exclusive with the live
+ * buffer still being shown — once either is set, the buffer is done. */
+interface ExtractionLiveState {
+  phase?: string;
+  liveText: string;
+  result?: unknown;
+  error?: string;
+}
+
 interface ChatMsg {
   role: "user" | "assistant" | "status" | "extraction";
   content: string;
   /** Only set when role === "extraction". */
-  trigger?: TriggerResponse;
+  extraction?: ExtractionLiveState;
+  /** Only set on an assistant turn that ran MCP tools (selectedMcp). */
+  toolCalls?: AgentToolCallTrace[];
+  /** Reasoning-capable model's "why" for a round (calling a tool, or the
+   * final answer) -- only set when the chat template emits one separately
+   * from content/tool_calls. One entry per round that had any. */
+  reasoning?: string[];
+  /** toolCalls and reasoning above, interleaved in the order the SSE events
+   * actually arrived -- rendered as one chronological trace instead of two
+   * separate blocks that lose which reasoning step preceded which call. */
+  trace?: TraceEntry[];
+  /** The server-injected system-prompt addendum (TOOL_DISCIPLINE_DIRECTIVE,
+   * plus any eager-list context) that run_tool_loop folds on top of the
+   * caller's own system prompt -- fires once per request, not once per
+   * round, so it's a field on the message rather than a TraceEntry. */
+  systemAddendum?: string;
+  /** Fires AT MOST ONCE per exchange (#344): cumulative usage crossed the
+   * resolved deployment's context-budget warning threshold -- a standing
+   * risk for the rest of THIS exchange, not a per-round log entry, so it's
+   * a field on the message (like systemAddendum) rather than a TraceEntry. */
+  contextBudgetWarning?: AgentContextBudgetTrace;
+  /** Fires AT MOST ONCE per exchange (#353), BEFORE any round runs -- unlike
+   * contextBudgetWarning, this is known upfront from the resolved
+   * deployment's own health state (its chat template does not support real
+   * tool-calling), not learned mid-exchange, so it renders ahead of the
+   * response content rather than after it. */
+  toolCallsUnsupportedWarning?: AgentToolCallsUnsupportedTrace;
+  /** Set when Stop (#394) discarded the rest of this generation mid-round --
+   * whatever content/reasoning/tool calls had already streamed stand as the
+   * final message, just flagged so the truncation reads as intentional. */
+  stopped?: boolean;
 }
+
+type TraceEntry =
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool_call"; call: AgentToolCallTrace }
+  | { kind: "usage"; usage: AgentUsageTrace };
 
 // A cold store: model's first request can take a while to boot. Auto-retry a
 // bounded number of times (the backend's load trigger is idempotent — see
@@ -206,14 +278,35 @@ const VISION_PRESETS = [
   "What is written in this document? Return it verbatim.",
 ];
 
+// A single attached file plus its own preview state -- an image resolves its
+// preview synchronously (object URL); a PDF resolves it async (rasterized
+// page-1 thumbnail via renderDocument), see loadPdfPreview.
+interface Attachment {
+  id: string;
+  file: File;
+  preview: string | null;
+  previewLoading: boolean;
+  /** The PDF's true total page count (from the render-document response),
+   * even though the thumbnail only ever rasterizes page 1. Drives the
+   * enlarge modal's decision to fetch more pages. null for a non-PDF image
+   * attachment (or before a PDF preview has resolved). */
+  previewTotalPages: number | null;
+}
+
+// Selecting more than this keeps the first N and shows an inline message --
+// never silently drops files, never hard-errors.
+const MAX_ATTACHMENTS = 10;
+
 // Exported for tests: rendered by Playground with its polled deployment state.
 export function ChatPanel({
   deployments,
   selectable,
+  store,
   onNavigate,
 }: {
   deployments: ReturnType<typeof usePolling<DeploymentRecord[]>>;
   selectable: DeploymentRecord[];
+  store: ReturnType<typeof usePolling<StoreEntry[]>>;
   onNavigate?: NavigateToDeploy;
 }) {
   const { t } = useI18n();
@@ -245,50 +338,221 @@ export function ChatPanel({
     if (!chatNames.includes(model)) setModel(liveNames[0] ?? chatNames[0]);
   }, [chatNames, liveNames, model]);
 
+  const visionNames = useMemo(() => visionDeploymentNames(store.data), [store.data]);
+  const modelHasVision = visionNames.has(model);
+  // Explicit toggle, not implicit-forever: an image/PDF attachment only
+  // rides the message as image_url content when this is on. Defaults to
+  // following the deployment's own capability (vision model -> on), but the
+  // user can flip it off even for a vision model (it's the expensive path)
+  // -- and it MUST be off for a non-vision model, since llama-server 500s on
+  // image content with no mmproj rather than silently ignoring it.
+  const [visionEnabled, setVisionEnabled] = useState(false);
+  useEffect(() => {
+    setVisionEnabled(modelHasVision);
+  }, [model, modelHasVision]);
+
   const [system, setSystem] = useState("");
+  // Sampling overrides (#384) -- string state so an empty field reads as
+  // genuinely unset (never sent) rather than the frontend inventing its own
+  // numeric default that could silently diverge from llama-server's own.
+  const [temperature, setTemperature] = useState("");
+  const [topP, setTopP] = useState("");
+  const [minP, setMinP] = useState("");
+  const [repeatPenalty, setRepeatPenalty] = useState("");
+  function buildSamplingParams(): SamplingParams {
+    const params: SamplingParams = {};
+    if (temperature.trim()) params.temperature = Number(temperature);
+    if (topP.trim()) params.top_p = Number(topP);
+    if (minP.trim()) params.min_p = Number(minP);
+    if (repeatPenalty.trim()) params.repeat_penalty = Number(repeatPenalty);
+    return params;
+  }
   const mcpServers = useAsync<McpRegisteredServer[]>("mcp-servers", listMcpServers);
   const [selectedMcp, setSelectedMcp] = useState<string[]>([]);
+  // Server-issued once the first attachment is uploaded for docs-search
+  // (#296) -- carried for the rest of this conversation so every later
+  // upload/chat turn lands in the SAME session directory. Never invented
+  // client-side; reset with the rest of the chat state on Clear. A ref, not
+  // state: sendChat awaits the upload then immediately calls attempt() in
+  // the SAME turn, which needs the just-issued id synchronously -- state
+  // set this render wouldn't be visible until the next one.
+  const docsSearchSessionIdRef = useRef<string | undefined>(undefined);
+  // Hard-stop (#394): a fresh controller per attempt() call, so Stop always
+  // aborts whichever generation is actually in flight right now -- distinct
+  // from Pause (#383), which suspends an exchange between rounds and can
+  // resume it; Stop discards the rest of the current round for good.
+  const abortRef = useRef<AbortController | null>(null);
   const [input, setInput] = useState("");
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Human-in-the-loop pause/resume (#383) -- Playground-only, only reachable
+  // through the mcp_servers SSE surface (selectedMcp.length > 0). The
+  // exchange id arrives via chatCompletionMcpStream's onExchangeId callback
+  // shortly after the request starts; the Pause button stays disabled until
+  // it does. awaitingInput non-null means the exchange is genuinely paused
+  // (a model-issued ask_user question, or a confirmed user-initiated pause)
+  // and the answer modal should be showing.
+  const [activeExchangeId, setActiveExchangeId] = useState<string | undefined>(undefined);
+  const [pausing, setPausing] = useState(false);
+  const [awaitingInput, setAwaitingInput] = useState<AgentAwaitingInputTrace | null>(null);
+  const [answerText, setAnswerText] = useState("");
+  const [respondBusy, setRespondBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Index of a user message currently being edited (its content is loaded
+  // into the main input box). null when nothing is being edited. Consumed by
+  // sendChat: submitting while this is set truncates msgs to everything
+  // BEFORE this index instead of appending to the full history (#343).
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  // The exact { next, payload } sendChat last handed to attempt() -- kept so
+  // Regenerate can replay the identical request (same messages array) rather
+  // than reconstructing it, which would risk drifting from what was actually
+  // sent (e.g. a multimodal attachment on that turn) (#343).
+  const lastRequestRef = useRef<{
+    next: ChatMsg[];
+    payload: { role: string; content: unknown }[];
+  } | null>(null);
 
   // --- Attachment (vision + extraction file input share one attach slot) ---
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
+  // Up to MAX_ATTACHMENTS files, each carrying its own preview state -- a
+  // plain generalization of the old single `file`/`preview` pair (see the
+  // N=1 case throughout: it reduces to exactly the old single-attachment
+  // behavior).
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  // Set when a picked selection exceeded MAX_ATTACHMENTS -- shown inline
+  // instead of silently dropping the extra files.
+  const [attachmentCapMessage, setAttachmentCapMessage] = useState<string | null>(null);
+  const attachmentSeq = useRef(0);
+  function nextAttachmentId(): string {
+    attachmentSeq.current += 1;
+    return `att-${attachmentSeq.current}`;
+  }
+
+  // Which attachment the enlarge modal is currently showing -- null when
+  // closed or when nothing is attached.
+  const [enlargeTargetId, setEnlargeTargetId] = useState<string | null>(null);
+  const [enlargeOpen, setEnlargeOpen] = useState(false);
+  const [enlargePages, setEnlargePages] = useState<string[]>([]);
+  const [enlargeLoading, setEnlargeLoading] = useState(false);
+  const enlargeAttachment = attachments.find((a) => a.id === enlargeTargetId) ?? null;
+  // Fetching every page of an arbitrarily long PDF for the enlarge modal
+  // would be slow and wasteful -- cap it at the same default the vision-send
+  // path already uses for "how many pages will the model actually see".
+  const ENLARGE_MAX_PAGES = 8;
   // PDF rasterization DPI — higher = sharper text (better for dense documents
   // / small vision models), larger payload. Only used for a PDF attachment in
   // CHAT mode (extraction rasterizes server-side via its own OCR backend).
   const [dpi, setDpi] = useState(200);
 
-  function clearAttachment() {
-    if (preview?.startsWith("blob:")) URL.revokeObjectURL(preview);
-    setPreview(null);
-    setFile(null);
+  function clearAttachments() {
+    setAttachments((prev) => {
+      for (const a of prev) {
+        if (a.preview?.startsWith("blob:")) URL.revokeObjectURL(a.preview);
+      }
+      return [];
+    });
+    setAttachmentCapMessage(null);
+    setEnlargeOpen(false);
+    setEnlargeTargetId(null);
+    setEnlargePages([]);
   }
 
-  async function onAttach(f: File | null) {
-    clearAttachment();
-    setFile(f);
-    if (!f) return;
-    if (f.type.startsWith("image/")) {
-      setPreview(URL.createObjectURL(f));
-      return;
+  function removeAttachment(id: string) {
+    setAttachments((prev) => {
+      const target = prev.find((a) => a.id === id);
+      if (target?.preview?.startsWith("blob:")) URL.revokeObjectURL(target.preview);
+      return prev.filter((a) => a.id !== id);
+    });
+    if (enlargeTargetId === id) {
+      setEnlargeOpen(false);
+      setEnlargeTargetId(null);
+      setEnlargePages([]);
     }
-    // PDF: rasterize page 1 (low DPI, single page) for a real visual preview
-    // — an <img> can't show a PDF directly. Best-effort: on failure the run
-    // still renders the pages when sent.
-    setPreviewLoading(true);
+  }
+
+  async function loadPdfPreview(id: string, f: File) {
+    // PDF: rasterize page 1 only (low DPI, explicit page list) for a real
+    // visual preview — an <img> can't show a PDF directly. Explicit `pages`
+    // means this never rejects on page count, and never rasterizes more than
+    // the one page it needs. Best-effort: on failure the run still renders
+    // the pages when sent.
     try {
       const b64 = await fileToBase64(f);
-      const { images } = await renderDocument(b64, f.name, 150, 1);
-      setPreview(images[0] ?? null);
+      const { images, total_pages } = await renderDocument(b64, f.name, 150, [1]);
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.id === id
+            ? { ...a, preview: images[0] ?? null, previewTotalPages: total_pages, previewLoading: false }
+            : a,
+        ),
+      );
     } catch {
-      setPreview(null);
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.id === id ? { ...a, preview: null, previewTotalPages: null, previewLoading: false } : a,
+        ),
+      );
+    }
+  }
+
+  function onAttach(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0) return;
+    const picked = Array.from(fileList);
+    // A new pick ADDS to whatever's already attached, up to the total cap --
+    // it does not replace it. Multiple documents in one turn is the whole
+    // point of multi-attach; a picker that silently discards the first file
+    // the moment you attach a second one defeats it.
+    const room = Math.max(MAX_ATTACHMENTS - attachments.length, 0);
+    const capped = picked.slice(0, room);
+    if (picked.length > capped.length) {
+      setAttachmentCapMessage(
+        capped.length === 0
+          ? `Already at the ${MAX_ATTACHMENTS}-file limit — remove one before attaching more.`
+          : `Only ${capped.length} more file${capped.length === 1 ? "" : "s"} could be added (limit is ${MAX_ATTACHMENTS} total).`,
+      );
+    } else {
+      setAttachmentCapMessage(null);
+    }
+    const additions: Attachment[] = capped.map((f) => {
+      const isImage = f.type.startsWith("image/");
+      return {
+        id: nextAttachmentId(),
+        file: f,
+        preview: isImage ? URL.createObjectURL(f) : null,
+        previewLoading: !isImage,
+        previewTotalPages: isImage ? 1 : null,
+      };
+    });
+    setAttachments((prev) => [...prev, ...additions]);
+    for (const a of additions) {
+      if (a.previewLoading) void loadPdfPreview(a.id, a.file);
+    }
+  }
+
+  async function onEnlargePreview(id: string) {
+    const att = attachments.find((a) => a.id === id);
+    if (!att?.preview) return;
+    setEnlargeTargetId(id);
+    setEnlargeOpen(true);
+    if (!att.previewTotalPages || att.previewTotalPages <= 1) {
+      // Single-page (or unknown) doc — the thumbnail already has the whole
+      // document; no redundant fetch.
+      setEnlargePages([att.preview]);
+      return;
+    }
+    setEnlargeLoading(true);
+    try {
+      const b64 = await fileToBase64(att.file);
+      const wanted = Math.min(att.previewTotalPages, ENLARGE_MAX_PAGES);
+      const pageNumbers = Array.from({ length: wanted }, (_, i) => i + 1);
+      const { images } = await renderDocument(b64, att.file.name, 200, pageNumbers);
+      setEnlargePages(images);
+    } catch {
+      // Best-effort — fall back to the single thumbnail already on screen.
+      setEnlargePages([att.preview]);
     } finally {
-      setPreviewLoading(false);
+      setEnlargeLoading(false);
     }
   }
 
@@ -303,6 +567,24 @@ export function ChatPanel({
     "routing-policies",
     listRoutingPolicies,
   );
+  // Field names for whichever schema is currently selected above -- used to
+  // build a schema-aware vision preset (see VISION_PRESETS below). A schema
+  // counts as "selected" only once it resolves against the lists this same
+  // picker already fetched (schemas.data / dynamicSchemas.data); this keeps
+  // the fresh-mount / no-schemas-configured case free of a preset that names
+  // fields nothing on the server actually recognizes.
+  const dynamicSchemaEntry = dynamicSchemaName
+    ? (dynamicSchemas.data ?? []).find((s) => s.name === dynamicSchemaName)
+    : undefined;
+  const builtinSchemaKnown =
+    !dynamicSchemaName && !!schemaName && (schemas.data ?? []).includes(schemaName);
+  const builtinSchemaFields = useAsync<string[]>(
+    `schema-fields:${builtinSchemaKnown ? schemaName : ""}`,
+    () => (builtinSchemaKnown ? getSchemaFields(schemaName) : Promise.resolve([])),
+  );
+  const selectedSchemaFields =
+    dynamicSchemaEntry?.spec.fields.map((f) => f.name) ??
+    (builtinSchemaKnown ? (builtinSchemaFields.data ?? []) : []);
   // "single" routes to the deployment picked above; "policy" runs a saved
   // routing policy (cheap stage first, escalate on the policy's own
   // confidence rules) — mutually exclusive with a single deployment, same as
@@ -320,125 +602,348 @@ export function ChatPanel({
     return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
   }
 
+  function describeApiError(e: unknown): string {
+    return e instanceof ModelLoading
+      ? e.message
+      : e instanceof ApiUnavailable
+        ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
+        : e instanceof ApiError || e instanceof Error
+          ? e.message
+          : "Something went wrong.";
+  }
+
   async function runExtraction() {
     if (busy) return;
     const trimmed = input.trim();
-    const attached = file;
-    if (!trimmed && !attached) {
+    const attached = attachments;
+    if (!trimmed && attached.length === 0) {
       setError("Paste some document text first, or attach a file.");
       return;
     }
-    const payload: ExtractRequest = dynamicSchemaName
-      ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
-      : { schema_name: schemaName || "invoice" };
-    if (modelSource === "policy") {
-      if (!selectedPolicy) {
-        setError("Pick a routing policy, or switch back to a single model.");
-        return;
-      }
-      payload.routing_policy = selectedPolicy;
-    } else if (model) {
-      payload.deployment = model;
-    }
-    if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
-    if (language.trim()) payload.language = language.trim();
-
-    let displayLabel: string;
-    try {
-      if (attached) {
-        payload.content_b64 = await fileToBase64(attached);
-        payload.filename = attached.name;
-        displayLabel = `📎 ${attached.name}`;
-      } else {
-        payload.text = trimmed;
-        displayLabel = trimmed;
-      }
-    } catch {
-      setError("Could not read the attached file.");
+    if (modelSource === "policy" && !selectedPolicy) {
+      setError("Pick a routing policy, or switch back to a single model.");
       return;
     }
 
-    setError(null);
-    setInput("");
-    clearAttachment();
-    setBusy(true);
-    try {
-      const res = await triggerExtract(payload);
-      setMsgs((prev) => [
-        ...prev,
-        { role: "user", content: displayLabel },
-        { role: "extraction", content: dynamicSchemaName || schemaName || "invoice", trigger: res },
-      ]);
-      toast({ title: "Extraction started", description: res.channel, tone: "success" });
-    } catch (e) {
-      const msg =
-        e instanceof ApiUnavailable
-          ? "The extract endpoint isn't reachable. Is the backend running and NEXT_PUBLIC_API_BASE correct?"
-          : e instanceof ApiError || e instanceof Error
-            ? e.message
-            : "Something went wrong.";
-      setError(msg);
-      toast({ title: "Extraction failed", description: msg, tone: "error" });
-    } finally {
-      setBusy(false);
+    function buildPayload(): ExtractRequest {
+      const payload: ExtractRequest = dynamicSchemaName
+        ? { schema_name: schemaName || "invoice", dynamic_schema_name: dynamicSchemaName }
+        : { schema_name: schemaName || "invoice" };
+      if (modelSource === "policy") {
+        payload.routing_policy = selectedPolicy;
+      } else if (model) {
+        payload.deployment = model;
+      }
+      if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
+      if (language.trim()) payload.language = language.trim();
+      return payload;
     }
-  }
 
-  async function sendChat() {
-    if (busy) return;
-    const trimmed = input.trim();
-    const attached = file;
-    if (!trimmed && !attached) return;
-    if (!model) {
-      setError("No deployment selected — deploy a model under Serving → Models first.");
-      return;
-    }
     setError(null);
 
-    // Prior turns replay as plain text (an attachment from an earlier turn
-    // isn't re-sent — only its display label is kept, same convention every
-    // OpenAI-style chat playground uses for image history).
-    const priorHistory = msgs
-      .filter((m): m is ChatMsg & { role: "user" | "assistant" } =>
-        m.role === "user" || m.role === "assistant",
-      )
-      .map((m) => ({ role: m.role, content: m.content }));
-
-    let newContent: unknown = trimmed;
-    let displayLabel = trimmed;
-    if (attached) {
+    // One job per unit of work: the lone text-only job when nothing's
+    // attached, or one job per attached file -- each gets its OWN extraction
+    // run and its OWN live-streamed placeholder, same per-file call the app
+    // already makes for one file. N=0/N=1 both reduce to exactly the single
+    // call the pre-multi-attach code made.
+    type Job = { payload: ExtractRequest; displayLabel: string };
+    let jobs: Job[];
+    if (attached.length === 0) {
+      const payload = buildPayload();
+      payload.text = trimmed;
+      jobs = [{ payload, displayLabel: trimmed }];
+    } else {
       try {
-        const b64 = await fileToBase64(attached);
-        const imageUrls = isPdfFile(attached)
-          ? (await renderDocument(b64, attached.name, dpi)).images
-          : [`data:${attached.type || "image/png"};base64,${b64}`];
-        if (imageUrls.length === 0) {
-          setError("The document produced no page images.");
-          return;
-        }
-        newContent = [
-          { type: "text", text: trimmed || "Describe this image." },
-          ...imageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
-        ];
-        displayLabel = trimmed || `📎 ${attached.name}`;
+        jobs = await Promise.all(
+          attached.map(async (a) => {
+            const payload = buildPayload();
+            payload.content_b64 = await fileToBase64(a.file);
+            payload.filename = a.file.name;
+            return { payload, displayLabel: `📎 ${a.file.name}` };
+          }),
+        );
       } catch {
         setError("Could not read the attached file.");
         return;
       }
     }
 
-    const next: ChatMsg[] = [...msgs, { role: "user", content: displayLabel }];
+    setInput("");
+    clearAttachments();
+    setBusy(true);
+
+    // Every job's user turn + live extraction placeholder is appended up
+    // front, so a live patch always targets a stable index (base.length +
+    // i*2 + 1) regardless of how many times setMsgs has re-rendered since,
+    // or how many of the OTHER jobs have already settled.
+    const base = msgs;
+    const newEntries: ChatMsg[] = [];
+    for (const job of jobs) {
+      newEntries.push({ role: "user", content: job.displayLabel });
+      newEntries.push({
+        role: "extraction",
+        content: dynamicSchemaName || schemaName || "invoice",
+        extraction: { liveText: "" },
+      });
+    }
+    setMsgs([...base, ...newEntries]);
+
+    function patchExtractionAt(index: number, patch: Partial<ExtractionLiveState>) {
+      setMsgs((prev) =>
+        prev.length <= index
+          ? prev
+          : prev.map((m, i) =>
+              i === index
+                ? { ...m, extraction: { ...(m.extraction ?? { liveText: "" }), ...patch } }
+                : m,
+            ),
+      );
+    }
+
+    const outcomes = await Promise.all(
+      jobs.map(async (job, i) => {
+        const index = base.length + i * 2 + 1;
+        let liveText = "";
+        const onDelta = (text: string) => {
+          liveText += text;
+          patchExtractionAt(index, { liveText });
+        };
+        const onReset = () => {
+          liveText = "";
+          patchExtractionAt(index, { liveText: "" });
+        };
+        const onPhase = (phase: string) => patchExtractionAt(index, { phase });
+        try {
+          const result = await extractStream(job.payload, onDelta, onReset, onPhase);
+          patchExtractionAt(index, { result });
+          return { ok: true as const };
+        } catch (e) {
+          const msg = describeApiError(e);
+          patchExtractionAt(index, { error: msg });
+          return { ok: false as const, msg };
+        }
+      }),
+    );
+
+    const failures = outcomes.filter((o): o is { ok: false; msg: string } => !o.ok);
+    if (failures.length > 0) {
+      // N=1: identical to the old single-attachment path -- the specific
+      // API error message, not a generic count.
+      const msg =
+        jobs.length === 1
+          ? failures[0].msg
+          : failures.length === jobs.length
+            ? "All extraction requests failed."
+            : `${failures.length} of ${jobs.length} extraction requests failed.`;
+      setError(msg);
+      toast({ title: "Extraction failed", description: msg, tone: "error" });
+    }
+    setBusy(false);
+  }
+
+  async function sendChat() {
+    if (busy) return;
+    const trimmed = input.trim();
+    const attached = attachments;
+    if (!trimmed && attached.length === 0) return;
+    if (!model) {
+      setError("No deployment selected — deploy a model under Serving → Models first.");
+      return;
+    }
+    setError(null);
+
+    // Editing an earlier user message (#343): everything from that message
+    // onward is dropped -- the edited text becomes the new next message, as
+    // if the conversation forked at that point. A plain send (editingIndex
+    // null) keeps the full history.
+    const baseMsgs = editingIndex !== null ? msgs.slice(0, editingIndex) : msgs;
+
+    // Prior turns replay as plain text (an attachment from an earlier turn
+    // isn't re-sent — only its display label is kept, same convention every
+    // OpenAI-style chat playground uses for image history).
+    const priorHistory = baseMsgs
+      .filter((m): m is ChatMsg & { role: "user" | "assistant" } =>
+        m.role === "user" || m.role === "assistant",
+      )
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    // Vision is now an explicit toggle (defaults to following the
+    // deployment's own capability, see the effect above) -- an image
+    // attachment with vision off has nothing to ride on (docs-search only
+    // accepts .pdf/.txt), and a PDF with vision off AND docs-search
+    // unselected has no path to reach the model either. Both are refused
+    // up front rather than silently sending a useless/erroring attachment
+    // (llama-server 500s on image content with no mmproj rather than
+    // ignoring it).
+    if (attached.length > 0 && !visionEnabled) {
+      if (attached.some((a) => !isPdfFile(a.file))) {
+        setError(
+          "This deployment has no vision (or Vision is off) — image attachments need Vision on.",
+        );
+        return;
+      }
+      if (!selectedMcp.includes("docs-search")) {
+        setError(
+          "Vision is off and docs-search isn't selected — turn Vision on, or select docs-search so this PDF can be read.",
+        );
+        return;
+      }
+    }
+
+    let newContent: unknown = trimmed;
+    let displayLabel = trimmed;
+    if (attached.length > 0) {
+      try {
+        // Every attachment rides the SAME chat message -- one call, one
+        // result, same convention the app already uses for a multi-page PDF
+        // (all its page images ride one message too). Sequential, not
+        // Promise.all: the docs-search session id must chain in attachment
+        // order (see docsSearchSessionIdRef's own doc comment).
+        const allImageUrls: string[] = [];
+        for (const a of attached) {
+          const b64 = await fileToBase64(a.file);
+          // Additive, not instead-of, when vision IS on: vision still reads
+          // the rendered page images below regardless. Only a real .pdf is
+          // worth indexing for docs-search (#296) — an image attachment has
+          // no text to search, and isn't a suffix docs-search accepts anyway.
+          if (isPdfFile(a.file) && selectedMcp.includes("docs-search")) {
+            try {
+              const uploaded = await uploadSessionDocument(
+                b64,
+                a.file.name,
+                docsSearchSessionIdRef.current,
+              );
+              docsSearchSessionIdRef.current = uploaded.session_id;
+            } catch {
+              // Best-effort: docs-search just won't see this file, vision
+              // still answers from the page images below either way.
+            }
+          }
+          if (visionEnabled) {
+            const imageUrls = isPdfFile(a.file)
+              ? (await renderDocument(b64, a.file.name, dpi)).images
+              : [`data:${a.file.type || "image/png"};base64,${b64}`];
+            allImageUrls.push(...imageUrls);
+          }
+        }
+        if (visionEnabled) {
+          if (allImageUrls.length === 0) {
+            setError("The document produced no page images.");
+            return;
+          }
+          newContent = [
+            { type: "text", text: trimmed || "Describe this image." },
+            ...allImageUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+          ];
+        } else {
+          // Vision off, PDF(s), docs-search selected (guarded above): the
+          // upload(s) just made the real file(s) searchable -- no image
+          // content to send, the model reads them via docs-search's tools.
+          newContent = trimmed || "Look up the attached document via docs-search.";
+        }
+        displayLabel =
+          trimmed ||
+          (attached.length === 1 ? `📎 ${attached[0].file.name}` : `📎 ${attached.length} files`);
+      } catch {
+        setError("Could not read the attached file.");
+        return;
+      }
+    }
+
+    const next: ChatMsg[] = [...baseMsgs, { role: "user", content: displayLabel }];
     setMsgs(next);
     setInput("");
-    clearAttachment();
+    setEditingIndex(null);
+    clearAttachments();
     setBusy(true);
     const payload = [
       ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
       ...priorHistory,
       { role: "user", content: newContent },
     ];
+    lastRequestRef.current = { next, payload };
     await attempt(next, payload, 0);
     setBusy(false);
+  }
+
+  // Regenerate (#343): replays the exact same request the last completed
+  // turn sent -- same messages array, no new params -- and REPLACES the last
+  // assistant message with the new response instead of appending a
+  // duplicate. attempt() already does that replacement whenever the message
+  // at `next.length` exists, which is exactly the last assistant reply here.
+  async function regenerate() {
+    if (busy) return;
+    const last = lastRequestRef.current;
+    if (!last) return;
+    setError(null);
+    setBusy(true);
+    await attempt(last.next, last.payload, 0);
+    setBusy(false);
+  }
+
+  function startEdit(i: number) {
+    if (busy) return;
+    const target = msgs[i];
+    if (!target || target.role !== "user") return;
+    setEditingIndex(i);
+    setInput(target.content);
+    clearAttachments();
+    inputRef.current?.focus();
+  }
+
+  function cancelEdit() {
+    setEditingIndex(null);
+    setInput("");
+  }
+
+  // Hard-stop (#394): aborts the fetch/EventSource to whatever generation is
+  // in flight right now. The backend already tears the whole exchange down
+  // on client disconnect (body_iterator's finally cancels drive()'s task,
+  // which closes the httpx stream to llama-server) -- no server round-trip
+  // needed here, unlike Pause.
+  function handleStop() {
+    abortRef.current?.abort();
+  }
+
+  // User-initiated pause (#383): only requests the pause -- the exchange's
+  // own onAwaitingInput callback (wired in attempt()) opens the answer modal
+  // once the loop actually reaches a round boundary and confirms it.
+  async function handlePause() {
+    if (!activeExchangeId || pausing) return;
+    setPausing(true);
+    try {
+      await pauseChatExchange(activeExchangeId);
+    } catch (e) {
+      const msg =
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Could not pause.";
+      setError(msg);
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  // Answers the currently-open awaitingInput prompt -- a model-issued
+  // ask_user question (free text or a picked choice) or a user-initiated
+  // pause's free-text context. Closes the modal optimistically; a failure
+  // (the exchange already timed out) surfaces as the usual error banner.
+  async function submitAnswer(text: string) {
+    if (!activeExchangeId) return;
+    setRespondBusy(true);
+    try {
+      await respondToChatExchange(activeExchangeId, text);
+      setAwaitingInput(null);
+      setAnswerText("");
+    } catch (e) {
+      const msg =
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Could not send your answer.";
+      setError(msg);
+    } finally {
+      setRespondBusy(false);
+    }
   }
 
   async function attempt(
@@ -446,12 +951,161 @@ export function ChatPanel({
     payload: { role: string; content: unknown }[],
     retryCount: number,
   ) {
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       if (selectedMcp.length > 0) {
-        // Tool exchange runs server-side; the final answer arrives in one piece.
-        const res = await chatCompletion(model, payload, selectedMcp);
+        // Each tool call arrives as its own SSE event the instant it
+        // finishes -- the trace renders progressively instead of the whole
+        // exchange completing silently behind "Waiting for the model…".
+        const liveToolCalls: AgentToolCallTrace[] = [];
+        const liveReasoning: string[] = [];
+        const liveUsage: AgentUsageTrace[] = [];
+        const liveTrace: TraceEntry[] = [];
+        let liveSystemAddendum: string | undefined;
+        let liveContextBudget: AgentContextBudgetTrace | undefined;
+        let liveToolCallsUnsupported: AgentToolCallsUnsupportedTrace | undefined;
+        // content_delta/reasoning_delta (#389): real token-by-token
+        // fragments for the round currently streaming. liveContentText is
+        // the growing final-answer bubble text -- never reset, since a
+        // tool-calling round's content is normally empty and only the
+        // final round actually accumulates anything here. liveReasoningLive
+        // is that round's in-progress reasoning text, shown as the last
+        // trace entry until onReasoning's one-shot event (below) replaces it
+        // with the round's complete, final text and clears this back out.
+        let liveContentText = "";
+        let liveReasoningLive = "";
+        const patchLiveMsg = () => {
+          setMsgs((prev) => {
+            const patch = {
+              content: liveContentText,
+              toolCalls: [...liveToolCalls],
+              trace: [
+                ...liveTrace,
+                ...(liveReasoningLive
+                  ? [{ kind: "reasoning" as const, text: liveReasoningLive }]
+                  : []),
+              ],
+              ...(liveReasoning.length > 0 ? { reasoning: [...liveReasoning] } : {}),
+              ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
+              ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
+              ...(liveToolCallsUnsupported
+                ? { toolCallsUnsupportedWarning: liveToolCallsUnsupported }
+                : {}),
+            };
+            return prev.length <= next.length
+              ? [...next, { role: "assistant", ...patch }]
+              : prev.map((m, i) => (i === next.length ? { ...m, ...patch } : m));
+          });
+        };
+        const onToolCall = (call: AgentToolCallTrace) => {
+          liveToolCalls.push(call);
+          liveTrace.push({ kind: "tool_call", call });
+          patchLiveMsg();
+        };
+        const onReasoning = (text: string) => {
+          liveReasoning.push(text);
+          liveTrace.push({ kind: "reasoning", text });
+          // That round's delta fragments are now folded into this final,
+          // complete entry -- the live in-progress one is retired.
+          liveReasoningLive = "";
+          patchLiveMsg();
+        };
+        const onContentDelta = (text: string) => {
+          liveContentText += text;
+          patchLiveMsg();
+        };
+        const onReasoningDelta = (text: string) => {
+          liveReasoningLive += text;
+          patchLiveMsg();
+        };
+        const onSystemAddendum = (text: string) => {
+          liveSystemAddendum = text;
+          patchLiveMsg();
+        };
+        const onUsage = (usage: AgentUsageTrace) => {
+          liveUsage.push(usage);
+          liveTrace.push({ kind: "usage", usage });
+          patchLiveMsg();
+        };
+        const onContextBudget = (budget: AgentContextBudgetTrace) => {
+          liveContextBudget = budget;
+          patchLiveMsg();
+        };
+        const onToolCallsUnsupported = (warning: AgentToolCallsUnsupportedTrace) => {
+          liveToolCallsUnsupported = warning;
+          patchLiveMsg();
+        };
+        // Human-in-the-loop (#383): the exchange id arrives first (before
+        // any round runs) and is what the Pause button signals; awaitingInput
+        // opens the answer modal every time the exchange actually pauses,
+        // for BOTH entry points (a model-issued ask_user question, or a
+        // confirmed user-initiated pause).
+        const onExchangeId = (id: string) => {
+          setActiveExchangeId(id);
+        };
+        const onAwaitingInput = (payload: AgentAwaitingInputTrace) => {
+          setAwaitingInput(payload);
+        };
+        let res: Awaited<ReturnType<typeof chatCompletionMcpStream>>;
+        try {
+          res = await chatCompletionMcpStream(
+            model,
+            payload,
+            selectedMcp,
+            onToolCall,
+            docsSearchSessionIdRef.current,
+            onReasoning,
+            onSystemAddendum,
+            onUsage,
+            onContextBudget,
+            onToolCallsUnsupported,
+            onExchangeId,
+            onAwaitingInput,
+            onContentDelta,
+            onReasoningDelta,
+            controller.signal,
+            buildSamplingParams(),
+          );
+        } finally {
+          // The exchange (and any still-open answer prompt) never outlives
+          // its own request -- cleared whether it finished, errored, or the
+          // model never actually paused at all.
+          setActiveExchangeId(undefined);
+          setAwaitingInput(null);
+        }
         const answer = res.choices?.[0]?.message?.content ?? "";
-        setMsgs([...next, { role: "assistant", content: answer || t("(empty response)") }]);
+        const toolCalls = res.docie_agent?.tool_calls ?? liveToolCalls;
+        // The live trace is only trustworthy when every reported tool call
+        // actually streamed as its own onToolCall event -- if the caller
+        // resolved with a completion's docie_agent.tool_calls that never
+        // streamed (e.g. a non-streaming response), fall back to reasoning
+        // then tool calls in report order rather than silently dropping them.
+        const finalTrace: TraceEntry[] =
+          toolCalls.length === liveToolCalls.length
+            ? liveTrace
+            : [
+                ...liveReasoning.map((text): TraceEntry => ({ kind: "reasoning", text })),
+                ...liveUsage.map((usage): TraceEntry => ({ kind: "usage", usage })),
+                ...toolCalls.map((call): TraceEntry => ({ kind: "tool_call", call })),
+              ];
+        const finalMsg: ChatMsg = {
+          role: "assistant",
+          content: answer || t("(empty response)"),
+          ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          ...(liveReasoning.length > 0 ? { reasoning: liveReasoning } : {}),
+          ...(finalTrace.length > 0 ? { trace: finalTrace } : {}),
+          ...(liveSystemAddendum ? { systemAddendum: liveSystemAddendum } : {}),
+          ...(liveContextBudget ? { contextBudgetWarning: liveContextBudget } : {}),
+          ...(liveToolCallsUnsupported
+            ? { toolCallsUnsupportedWarning: liveToolCallsUnsupported }
+            : {}),
+        };
+        setMsgs((prev) =>
+          prev.length <= next.length
+            ? [...next, finalMsg]
+            : prev.map((m, i) => (i === next.length ? finalMsg : m)),
+        );
         return;
       }
       let content = "";
@@ -463,9 +1117,17 @@ export function ChatPanel({
             : prev.map((m, i) => (i === next.length ? { role: "assistant", content } : m)),
         );
       };
-      await chatCompletionStream(model, payload, appendToken);
+      await chatCompletionStream(model, payload, appendToken, controller.signal, buildSamplingParams());
       if (!content) setMsgs([...next, { role: "assistant", content: t("(empty response)") }]);
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        setMsgs((prev) =>
+          prev.length <= next.length
+            ? [...next, { role: "assistant", content: "", stopped: true }]
+            : prev.map((m, i) => (i === next.length ? { ...m, stopped: true } : m)),
+        );
+        return;
+      }
       if (e instanceof ModelLoading) {
         const willRetry = retryCount < MAX_LOAD_RETRIES;
         setMsgs([
@@ -496,7 +1158,8 @@ export function ChatPanel({
     void (extractionOn ? runExtraction() : sendChat());
   }
 
-  const showVisionExtras = !extractionOn && file && !file.type.startsWith("image/");
+  const showVisionExtras =
+    !extractionOn && attachments.some((a) => !a.file.type.startsWith("image/"));
 
   return (
     <Card
@@ -554,12 +1217,87 @@ export function ChatPanel({
           </Field>
         </div>
 
+        {/* Sampling overrides (#384) -- collapsed by default so it doesn't
+            crowd the common case (bare defaults). Chat only: extraction
+            already forces temperature=0 for its own determinism guarantee
+            (see ExtractionService/chat_json) -- these controls apply to
+            Chat's Send only, disabled rather than hidden during Extraction
+            so their existence stays visible either way. */}
+        <details className="rounded-md border border-border bg-muted/20 text-sm">
+          <summary className="cursor-pointer px-3 py-2 font-medium text-muted-foreground hover:text-foreground">
+            <T>Sampling</T>
+          </summary>
+          <div className="grid gap-3 border-t border-border p-3 sm:grid-cols-4">
+            <Field label="Temperature" hint="0–2, unset = llama-server default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.1"
+                min="0"
+                max="2"
+                value={temperature}
+                onChange={(e) => setTemperature(e.target.value)}
+                placeholder="unset"
+                aria-label="Temperature"
+                disabled={extractionOn}
+              />
+            </Field>
+            <Field label="Top P" hint="0–1, unset = llama-server default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.05"
+                min="0"
+                max="1"
+                value={topP}
+                onChange={(e) => setTopP(e.target.value)}
+                placeholder="unset"
+                aria-label="Top P"
+                disabled={extractionOn}
+              />
+            </Field>
+            <Field label="Min P" hint="0–1, unset = llama-server default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.01"
+                min="0"
+                max="1"
+                value={minP}
+                onChange={(e) => setMinP(e.target.value)}
+                placeholder="unset"
+                aria-label="Min P"
+                disabled={extractionOn}
+              />
+            </Field>
+            <Field label="Repeat penalty" hint="typically 1.0–1.5, unset = default">
+              <TextInput
+                type="number"
+                inputMode="decimal"
+                step="0.05"
+                min="1"
+                value={repeatPenalty}
+                onChange={(e) => setRepeatPenalty(e.target.value)}
+                placeholder="unset"
+                aria-label="Repeat penalty"
+                disabled={extractionOn}
+              />
+            </Field>
+          </div>
+        </details>
+
         <div className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-muted/20 px-3 py-2">
           <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"
               checked={extractionOn}
-              onChange={(e) => setExtractionOn(e.target.checked)}
+              onChange={(e) => {
+                setExtractionOn(e.target.checked);
+                // Extraction turns don't participate in edit/truncate — drop
+                // any in-progress chat-message edit rather than leaving it
+                // to silently apply (or not) to a mode it wasn't meant for.
+                if (e.target.checked) cancelEdit();
+              }}
               className="h-4 w-4 rounded border-border"
             />
             <Sparkles className="h-4 w-4 text-muted-foreground" />
@@ -659,6 +1397,34 @@ export function ChatPanel({
           </div>
         )}
 
+        {model && !extractionOn && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              <T>Vision:</T>
+            </span>
+            <button
+              type="button"
+              aria-pressed={visionEnabled}
+              disabled={busy || !modelHasVision}
+              onClick={() => setVisionEnabled((v) => !v)}
+              title={
+                modelHasVision
+                  ? t("An attached image/PDF rides the message as page images.")
+                  : t("This deployment has no vision support (no mmproj).")
+              }
+              className={cn(
+                "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+                visionEnabled
+                  ? "border-accent bg-accent text-accent-foreground"
+                  : "border-border bg-card text-muted-foreground hover:text-foreground",
+                !modelHasVision && "cursor-not-allowed opacity-50",
+              )}
+            >
+              {visionEnabled ? <T>on</T> : <T>off</T>}
+            </button>
+          </div>
+        )}
+
         {(mcpServers.data ?? []).length > 0 && !extractionOn && (
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">
@@ -690,7 +1456,7 @@ export function ChatPanel({
             })}
             {selectedMcp.length > 0 && (
               <span className="text-xs text-muted-foreground">
-                <T>tool answers arrive unstreamed</T>
+                <T>tool calls stream live; the final answer arrives in one piece</T>
               </span>
             )}
           </div>
@@ -717,14 +1483,25 @@ export function ChatPanel({
                   <T>Extraction</T> · {m.content}
                 </div>
                 <div className="p-3">
-                  {m.trigger && <ResultPanel trigger={m.trigger} noun="extraction" />}
+                  {m.extraction && <ExtractionLiveView state={m.extraction} />}
                 </div>
               </div>
             ) : (
               <div
                 key={i}
-                className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}
+                className={cn(
+                  "flex flex-col gap-1.5",
+                  m.role === "user" ? "items-end" : "items-start",
+                )}
               >
+                {m.toolCallsUnsupportedWarning && (
+                  <Alert tone="err" className="w-full max-w-[85%]">
+                    <span>
+                      <T>Tool-calling not supported:</T>{" "}
+                      {m.toolCallsUnsupportedWarning.message}
+                    </span>
+                  </Alert>
+                )}
                 <div
                   className={cn(
                     "max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",
@@ -735,6 +1512,93 @@ export function ChatPanel({
                 >
                   {m.content}
                 </div>
+                {m.stopped && (
+                  <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                    <Square className="h-3 w-3" />
+                    <T>Stopped — generation was cut short.</T>
+                  </span>
+                )}
+                {m.role === "user" && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => startEdit(i)}
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    title={t("Edit this message and resend (drops everything after it)")}
+                  >
+                    <Pencil className="h-3 w-3" />
+                    <T>Edit</T>
+                  </button>
+                )}
+                {m.role === "assistant" && i === msgs.length - 1 && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void regenerate()}
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    title={t("Resend the same request and replace this answer")}
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    <T>Regenerate</T>
+                  </button>
+                )}
+                {m.contextBudgetWarning && (
+                  <Alert tone="warn" className="w-full max-w-[85%]">
+                    <span>
+                      <T>Context budget warning:</T> {m.contextBudgetWarning.cumulative_tokens} /{" "}
+                      {m.contextBudgetWarning.context_length}{" "}
+                      <T>tokens used</T> ({Math.round(m.contextBudgetWarning.threshold_fraction * 100)}%{" "}
+                      <T>threshold</T>) —{" "}
+                      <T>this exchange is at risk of overflowing the deployment's context window.</T>
+                    </span>
+                  </Alert>
+                )}
+                {m.systemAddendum && (
+                  <details className="w-full max-w-[85%] rounded-md border border-border bg-muted/20 text-xs">
+                    <summary className="cursor-pointer px-2 py-1 font-medium text-muted-foreground hover:text-foreground">
+                      <T>System-prompt addendum</T>
+                    </summary>
+                    <pre className="scroll-thin max-h-48 overflow-auto whitespace-pre-wrap border-t border-border px-2 py-1.5 text-foreground/80">
+                      {m.systemAddendum}
+                    </pre>
+                  </details>
+                )}
+                {m.trace && m.trace.length > 0 && (
+                  <div className="w-full max-w-[85%] space-y-1.5">
+                    <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                      <Wrench className="h-3.5 w-3.5" />
+                      <T>Trace</T>
+                    </p>
+                    <ol className="space-y-1.5">
+                      {(() => {
+                        let toolIndex = -1;
+                        return m.trace.map((entry, i) =>
+                          entry.kind === "reasoning" ? (
+                            <li
+                              key={i}
+                              className="rounded-md border border-border bg-muted/20 px-2 py-1 text-xs italic text-muted-foreground"
+                            >
+                              {entry.text}
+                            </li>
+                          ) : entry.kind === "usage" ? (
+                            <li
+                              key={i}
+                              className="flex items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs text-muted-foreground"
+                            >
+                              <Gauge className="h-3.5 w-3.5" />
+                              <span>
+                                {entry.usage.round.prompt_tokens ?? 0} <T>prompt tokens</T> ·{" "}
+                                {entry.usage.cumulative.total_tokens ?? 0} <T>total</T>
+                              </span>
+                            </li>
+                          ) : (
+                            <ToolCallItem key={i} call={entry.call} index={++toolIndex} />
+                          ),
+                        );
+                      })()}
+                    </ol>
+                  </div>
+                )}
               </div>
             ),
           )}
@@ -746,81 +1610,219 @@ export function ChatPanel({
           <div ref={bottomRef} />
         </div>
 
-        {previewLoading && (
+        {attachmentCapMessage && <Alert tone="warn">{attachmentCapMessage}</Alert>}
+        {attachments.some((a) => a.previewLoading) && (
           <p className="flex items-center gap-2 text-xs text-muted-foreground">
             <Spinner /> <T>Rendering preview…</T>
           </p>
         )}
-        {preview && (
-          <div className="flex items-start gap-3 rounded-md border border-border bg-muted/20 p-2">
-            <img
-              src={preview}
-              alt="attachment preview"
-              className="h-20 w-20 shrink-0 rounded-md border border-border object-cover"
-            />
-            <div className="min-w-0 flex-1 space-y-1">
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span className="truncate">{file?.name}</span>
-                <button
-                  type="button"
-                  onClick={clearAttachment}
-                  className="shrink-0 text-muted-foreground hover:text-foreground"
-                  aria-label={t("Remove attachment")}
+        {attachments.length > 0 && (
+          <div className="space-y-2 rounded-md border border-border bg-muted/20 p-2">
+            <div className="scroll-thin flex flex-wrap gap-2 overflow-x-auto">
+              {attachments.map((a) => (
+                <div
+                  key={a.id}
+                  className="flex items-start gap-2 rounded-md border border-border/60 bg-card/60 p-1.5"
                 >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-              {showVisionExtras && (
-                <label className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <span><T>Render quality</T></span>
-                  <Select
-                    value={String(dpi)}
-                    onChange={(e) => setDpi(Number(e.target.value))}
-                    className="h-7 w-auto text-xs"
-                  >
-                    <option value="150">150 DPI — faster, smaller</option>
-                    <option value="200">200 DPI — recommended</option>
-                    <option value="300">300 DPI — sharpest, heaviest</option>
-                  </Select>
-                </label>
-              )}
-              {!extractionOn && file && (
-                <div className="flex flex-wrap gap-1">
-                  {VISION_PRESETS.map((p) => (
+                  {a.preview ? (
                     <button
-                      key={p}
                       type="button"
-                      onClick={() => setInput(p)}
-                      className="rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                      onClick={() => void onEnlargePreview(a.id)}
+                      aria-label={t("Enlarge attachment preview")}
+                      className="h-20 w-20 shrink-0 cursor-pointer rounded-md border border-border transition hover:opacity-80"
                     >
-                      {p.length > 32 ? `${p.slice(0, 32)}…` : p}
+                      <img
+                        src={a.preview}
+                        alt="attachment preview"
+                        className="h-full w-full rounded-md object-cover"
+                      />
                     </button>
-                  ))}
+                  ) : (
+                    // Thumbnail rendering is best-effort (see loadPdfPreview's
+                    // catch) -- a failed/slow rasterization must never hide
+                    // the DPI selector or recommended-prompt presets below,
+                    // which don't depend on it and are still fully usable
+                    // without a visual thumbnail.
+                    <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-[10px] text-muted-foreground">
+                      <T>No preview</T>
+                    </div>
+                  )}
+                  <div className="flex max-w-[6rem] items-center gap-1 text-xs text-muted-foreground">
+                    <span className="truncate">{a.file.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeAttachment(a.id)}
+                      className="shrink-0 text-muted-foreground hover:text-foreground"
+                      aria-label={t("Remove attachment")}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 </div>
-              )}
+              ))}
             </div>
+            {showVisionExtras && (
+              <label className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <span><T>Render quality</T></span>
+                <Select
+                  value={String(dpi)}
+                  onChange={(e) => setDpi(Number(e.target.value))}
+                  className="h-7 w-auto text-xs"
+                >
+                  <option value="150">150 DPI — faster, smaller</option>
+                  <option value="200">200 DPI — recommended</option>
+                  <option value="300">300 DPI — sharpest, heaviest</option>
+                </Select>
+              </label>
+            )}
+            {!extractionOn && (
+              <div className="flex flex-wrap gap-1">
+                {[
+                  ...VISION_PRESETS,
+                  ...(selectedSchemaFields.length > 0
+                    ? [`Extract: ${selectedSchemaFields.join(", ")}`]
+                    : []),
+                ].map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setInput(p)}
+                    className="rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                  >
+                    {p.length > 32 ? `${p.slice(0, 32)}…` : p}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
+        <Dialog
+          open={enlargeOpen}
+          onClose={() => setEnlargeOpen(false)}
+          title={enlargeAttachment?.file.name ?? "Attachment"}
+          subtitle={
+            enlargeAttachment?.previewTotalPages && enlargeAttachment.previewTotalPages > 1
+              ? `${Math.min(enlargeAttachment.previewTotalPages, ENLARGE_MAX_PAGES)} of ${enlargeAttachment.previewTotalPages} pages shown`
+              : undefined
+          }
+          className="max-w-3xl"
+        >
+          <div className="max-h-[75vh] space-y-3 overflow-y-auto">
+            {enlargeLoading ? (
+              <p className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
+                <Spinner /> <T>Rendering pages…</T>
+              </p>
+            ) : (
+              enlargePages.map((src, i) => (
+                <img
+                  key={i}
+                  src={src}
+                  alt={`page ${i + 1}`}
+                  className="w-full rounded-md border border-border"
+                />
+              ))
+            )}
+          </div>
+        </Dialog>
+
+        {/* Human-in-the-loop pause/resume (#383): a multiple-choice picker
+            when the model's ask_user call gave choices, a free-text box
+            otherwise (same shape for a model-issued question and a plain
+            user-initiated pause -- the latter never carries a question). */}
+        <Dialog
+          open={awaitingInput !== null}
+          onClose={() => setAwaitingInput(null)}
+          title={awaitingInput?.question ?? t("Add context")}
+          subtitle={
+            awaitingInput?.choices && awaitingInput.choices.length > 0
+              ? t("Pick one to resume the exchange.")
+              : t("The exchange is paused -- your answer resumes it.")
+          }
+        >
+          {awaitingInput?.choices && awaitingInput.choices.length > 0 ? (
+            <div className="flex flex-col gap-2">
+              {awaitingInput.choices.map((choice) => (
+                <Button
+                  key={choice}
+                  type="button"
+                  variant="secondary"
+                  disabled={respondBusy}
+                  onClick={() => void submitAnswer(choice)}
+                  className="justify-start"
+                >
+                  {choice}
+                </Button>
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <TextArea
+                rows={3}
+                value={answerText}
+                onChange={(e) => setAnswerText(e.target.value)}
+                placeholder={t("Type your answer…")}
+                autoFocus
+              />
+              <Button
+                type="button"
+                loading={respondBusy}
+                disabled={!answerText.trim()}
+                onClick={() => void submitAnswer(answerText)}
+              >
+                <Send className="h-4 w-4" />
+                <T>Send</T>
+              </Button>
+            </div>
+          )}
+        </Dialog>
+
         {error && <Alert tone="err">{error}</Alert>}
+
+        {editingIndex !== null && (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5">
+              <Pencil className="h-3.5 w-3.5" />
+              <T>
+                Editing an earlier message — sending will drop everything after it.
+              </T>
+            </span>
+            <button
+              type="button"
+              onClick={cancelEdit}
+              className="shrink-0 font-medium text-muted-foreground hover:text-foreground"
+            >
+              <T>Cancel</T>
+            </button>
+          </div>
+        )}
 
         <div className="flex items-end gap-2">
           <label
             className={cn(
               "flex h-[4.5rem] shrink-0 cursor-pointer items-center justify-center rounded-md border border-dashed border-border px-3 text-muted-foreground transition hover:border-accent hover:text-foreground",
-              file && "border-accent text-accent",
+              attachments.length > 0 && "border-accent text-accent",
             )}
-            title="Attach an image or PDF"
+            title={`Attach up to ${MAX_ATTACHMENTS} images or PDFs`}
           >
             <Paperclip className="h-4 w-4" />
             <input
               type="file"
               accept=".pdf,image/*"
-              onChange={(e) => void onAttach(e.target.files?.[0] ?? null)}
+              multiple
+              onChange={(e) => {
+                onAttach(e.target.files);
+                // Reset so picking the exact same filename again (a common
+                // "wait, I meant that one too" correction) still fires
+                // onChange -- the browser won't re-fire it if the input's
+                // value string didn't change.
+                e.target.value = "";
+              }}
               className="sr-only"
             />
           </label>
           <TextArea
+            ref={inputRef}
             rows={2}
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -833,13 +1835,48 @@ export function ChatPanel({
             placeholder={
               extractionOn
                 ? "Paste document text, or attach a file (Enter to run)…"
-                : "Type a message, attach an image/PDF (Enter to send, Shift+Enter for a new line)…"
+                : editingIndex !== null
+                  ? "Edit your message (Enter to resend, Shift+Enter for a new line)…"
+                  : "Type a message, attach an image/PDF (Enter to send, Shift+Enter for a new line)…"
             }
           />
           <Button type="button" loading={busy} disabled={chatNames.length === 0} onClick={submit}>
             {extractionOn ? <Play className="h-4 w-4" /> : <Send className="h-4 w-4" />}
             {extractionOn ? "Run extraction" : "Send"}
           </Button>
+          {/* Hard-stop (#394): discards the rest of an in-flight chat
+              generation, keeping whatever already streamed -- distinct from
+              Pause below (suspend-and-resume). Chat only, not extraction:
+              extraction's own streaming send loop (#398/#399) is a separate
+              per-file flow with its own error/result handling. */}
+          {busy && !extractionOn && (
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleStop}
+              title={t("Stop generating and keep what's been said so far")}
+            >
+              <Square className="h-4 w-4" />
+              <T>Stop</T>
+            </Button>
+          )}
+          {/* Human-in-the-loop (#383): only while a tool-calling exchange is
+              actually streaming (the plain token-stream path with no MCP
+              servers selected has no round boundary to pause at) -- appears
+              and disappears with busy, not merely enabled/disabled. */}
+          {busy && selectedMcp.length > 0 && (
+            <Button
+              type="button"
+              variant="secondary"
+              loading={pausing}
+              disabled={!activeExchangeId}
+              onClick={() => void handlePause()}
+              title={t("Pause and add context before the next round resumes")}
+            >
+              <Pause className="h-4 w-4" />
+              <T>Pause</T>
+            </Button>
+          )}
           <Button
             type="button"
             variant="secondary"
@@ -847,6 +1884,13 @@ export function ChatPanel({
             onClick={() => {
               setMsgs([]);
               setError(null);
+              docsSearchSessionIdRef.current = undefined;
+              lastRequestRef.current = null;
+              setEditingIndex(null);
+              setInput("");
+              setActiveExchangeId(undefined);
+              setAwaitingInput(null);
+              setAnswerText("");
             }}
             title="Clear the conversation"
           >
@@ -855,6 +1899,36 @@ export function ChatPanel({
         </div>
       </div>
     </Card>
+  );
+}
+
+/** One extraction turn's SSE-driven body (#397): a live raw-text buffer
+ * while the model is still generating, swapped for the authoritative
+ * JsonView + RoutingSummary render the instant the terminal `result` frame
+ * lands (or an error banner for a terminal `error`). Never renders the live
+ * buffer once `result`/`error` is set — those are the ONLY things a caller
+ * should treat as the real outcome. */
+function ExtractionLiveView({ state }: { state: ExtractionLiveState }) {
+  if (state.error) return <Alert tone="err">{state.error}</Alert>;
+  if (state.result !== undefined) {
+    return (
+      <div className="space-y-2">
+        <RoutingSummary result={state.result} />
+        <JsonView value={state.result} />
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      <p className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Spinner /> <T>{state.phase ?? "Extracting…"}</T>
+      </p>
+      {state.liveText && (
+        <pre className="scroll-thin max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-2 text-xs text-muted-foreground">
+          {state.liveText}
+        </pre>
+      )}
+    </div>
   );
 }
 

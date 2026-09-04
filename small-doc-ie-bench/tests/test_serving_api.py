@@ -430,6 +430,80 @@ def test_store_reads_on_disk_without_a_catalog(serving_home: Path) -> None:
     assert by_name["lfm2.5-350m"]["family"] == "lfm2"
 
 
+# ── deployment slots: llama-server's own GET /slots, surfaced on demand ────
+
+
+def test_deployment_slots_route_returns_normalized_slots(
+    serving_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.inngest import serving_api
+
+    _seed_deployments(serving_home, {"lfm2": 8090})
+    seen: dict[str, object] = {}
+
+    def fake_fetch(endpoint: str, *, headers: dict | None = None, **kwargs: object) -> tuple:
+        seen["endpoint"] = endpoint
+        seen["headers"] = headers
+        return ({"id": 0, "is_processing": False},)
+
+    monkeypatch.setattr("docie_bench.serving.runtime.fetch_llamacpp_slots", fake_fetch)
+
+    payload = asyncio.run(serving_api.deployment_slots("lfm2"))
+
+    assert payload == {"name": "lfm2", "slots": [{"id": 0, "is_processing": False}]}
+    assert seen["endpoint"] == "http://127.0.0.1:8090/v1"
+
+
+def test_deployment_slots_route_404_for_non_llamacpp_deployment(serving_home: Path) -> None:
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import deployment_slots
+    from docie_bench.serving.runtime import (
+        HealthResult,
+        RuntimeKind,
+        RuntimeLaunchSpec,
+        RuntimeProcess,
+    )
+    from docie_bench.serving.supervisor import DeploymentSpec, PersistentSupervisor
+
+    class _FakeRemoteAdapter:
+        def start(self, spec: RuntimeLaunchSpec, *, log_path: Path | None = None) -> object:
+            del log_path
+            return RuntimeProcess(spec.runtime, spec.endpoint or "https://api.example/v1", None)
+
+        def is_running(self, pid: int | None) -> bool:
+            return True
+
+        def shutdown(self, pid: int | None, *, timeout: float = 10) -> None:
+            del pid, timeout
+
+        def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> object:
+            del spec, timeout
+            return HealthResult(True, 200)
+
+    supervisor = PersistentSupervisor(
+        serving_home / "deployments.json",
+        adapters={RuntimeKind.REMOTE: _FakeRemoteAdapter()},
+    )
+    supervisor.deploy(
+        DeploymentSpec(
+            name="remote-gpt",
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.REMOTE,
+                model="gpt-4",
+                alias="remote-gpt",
+                endpoint="https://api.example/v1",
+            ),
+        )
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(deployment_slots("remote-gpt"))
+
+    assert exc.value.status_code == 404
+    assert (exc.value.headers or {}).get("X-Docie-Error") == "not_found"
+
+
 def test_domain_404_carries_the_discriminator_header(serving_home: Path) -> None:
     """A lifecycle 404 for an unknown deployment is a DOMAIN answer, not
     "endpoint not built": the X-Docie-Error header is what stops the Studio

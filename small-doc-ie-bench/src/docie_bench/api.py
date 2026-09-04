@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from docie_bench.agents.api import router as agents_router
 from docie_bench.benchmark.routing_config import build_extraction_router
+from docie_bench.chat_api import _resolve_or_error, _sse_event
 from docie_bench.chat_api import router as chat_router
 from docie_bench.extract.routing import (
     ExtractionRouter,
@@ -80,7 +84,7 @@ from docie_bench.serving.profile_resolver import (
 )
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
-from docie_bench.storage.db import get_session_factory, init_engine
+from docie_bench.storage.db import dispose_engine, get_session_factory, init_engine
 from docie_bench.studio import usage_store
 from docie_bench.studio.routing_policies import (
     RoutingPolicyUnavailableError,
@@ -97,9 +101,23 @@ settings = get_settings()
 configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
 
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    init_engine()
+    sessions = get_session_factory()
+    configure_orchestrator(OrchestratorService(sessions) if sessions is not None else None)
+    settings.ocr_cache_dir.mkdir(parents=True, exist_ok=True)
+    settings.runs_dir.mkdir(parents=True, exist_ok=True)
+    settings.annotation_export_dir.mkdir(parents=True, exist_ok=True)
+    yield
+    dispose_engine()
+
+
 app = FastAPI(
     title="Small Document IE Benchmark API",
     version="0.1.0",
+    lifespan=lifespan,
 )
 # Privileged/destructive routers (worker lease ops + experiment control, studio
 # job triggers, serving control plane) are gated by tenant_guard at include time,
@@ -371,16 +389,6 @@ def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> Extrac
     )
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_engine()
-    sessions = get_session_factory()
-    configure_orchestrator(OrchestratorService(sessions) if sessions is not None else None)
-    settings.ocr_cache_dir.mkdir(parents=True, exist_ok=True)
-    settings.runs_dir.mkdir(parents=True, exist_ok=True)
-    settings.annotation_export_dir.mkdir(parents=True, exist_ok=True)
-
-
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -479,6 +487,174 @@ async def extract_file(
         tmp_path.unlink(missing_ok=True)
     response = _finalize_outcome(outcome, routing_policy=routing_policy)
     return finalize_response(response, tenant_id=tenant.tenant_id)
+
+
+class ExtractStreamRequest(BaseModel):
+    """Body of ``POST /v1/extract/stream`` (#397) — same fields the
+    Playground already builds for ``POST /v1/studio/extract`` (Inngest), so
+    the frontend swaps one URL for the other with no payload change."""
+
+    text: str | None = None
+    content_b64: str | None = None
+    filename: str | None = None
+    schema_name: str = "invoice"
+    dynamic_schema_name: str | None = None
+    deployment: str | None = None
+    model_profile: str | None = None
+    routing_policy: str | None = None
+    ocr_backend: str | None = None
+    language: str | None = None
+
+
+@app.post("/v1/extract/stream")
+async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency) -> Response:
+    """SSE counterpart to ``/v1/extract/text`` + ``/v1/extract/file`` for the
+    Playground ONLY (#397) — resolves and runs a direct (non-Inngest)
+    extraction exactly like those two routes, except the model call itself
+    streams: ``{"type": "delta", "text": ...}`` frames arrive as the raw
+    model output streams in (RAW, pre-normalization text — a live preview,
+    never something to parse as the result), a ``{"type": "reset"}`` frame
+    clears the buffer when ``chat_json`` abandons an attempt and retries
+    (response-format downgrade or a gateway-level transient retry), and
+    exactly one ``{"type": "result", "result": <ExtractionResponse>}`` frame
+    carries the same post-processed, redacted, audited response
+    ``/v1/extract/text``/``/v1/extract/file`` return — NuExtract
+    normalization, schema rehydration, and grounding all still run after the
+    stream ends; the frontend must render that event, never its own
+    accumulated deltas, as the actual result. A routed extraction
+    (``routing_policy``) has no per-model streaming hook to thread through a
+    multi-stage router, so it runs blocking like the sync routes and skips
+    straight to the ``result`` frame — still additive, just without a live
+    preview for that one path. Terminated by ``data: [DONE]\\n\\n``, the
+    same convention every other SSE surface here uses.
+
+    A cold/evicted deployment auto-reloads and answers a plain HTTP 202
+    (``_resolve_or_error``, same behavior ``/v1/chat/completions`` already
+    gives the Playground's Chat/Vision pickers for a bare deployment name) —
+    resolved BEFORE the stream starts, so that's an ordinary HTTP response,
+    not an SSE frame.
+    """
+    if not payload.text and not payload.content_b64:
+        raise HTTPException(status_code=422, detail="Provide either 'text' or 'content_b64'")
+    if payload.text is not None and len(payload.text) > settings.max_text_chars:
+        raise HTTPException(status_code=413, detail="Text content exceeds configured limit")
+    if payload.routing_policy and (payload.model_profile or payload.deployment):
+        raise HTTPException(
+            status_code=400,
+            detail="'routing_policy' is mutually exclusive with 'model_profile'/"
+            "'deployment': a policy names its model profiles per stage",
+        )
+
+    schema_name = payload.schema_name
+    schema_mode = "static"
+    dynamic_schema: dict[str, Any] | None = None
+    if payload.dynamic_schema_name:
+        from docie_bench.studio.dynamic_schemas import get_dynamic_schema
+
+        saved = get_dynamic_schema(payload.dynamic_schema_name)
+        if saved is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"dynamic schema {payload.dynamic_schema_name!r} not found",
+            )
+        schema_mode = "dynamic"
+        dynamic_schema = saved["spec"]
+        schema_name = payload.dynamic_schema_name
+
+    content: bytes | None = None
+    suffix = ".pdf"
+    if payload.content_b64:
+        import base64
+        import binascii
+
+        try:
+            content = base64.b64decode(payload.content_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"invalid base64 content: {exc}") from exc
+        suffix = Path(payload.filename or "document.pdf").suffix or ".pdf"
+
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    def on_delta(text: str) -> None:
+        queue.put_nowait({"type": "delta", "text": text})
+
+    def on_reset() -> None:
+        queue.put_nowait({"type": "reset"})
+
+    if payload.routing_policy:
+        executor: ExtractionService | ExtractionRouter = await resolve_extraction_executor(
+            model_profile=None, routing_policy=payload.routing_policy
+        )
+    else:
+        resolved = await _resolve_or_error(payload.deployment or payload.model_profile or "")
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        executor = ExtractionService(resolved, on_delta=on_delta, on_reset=on_reset)
+
+    async def drive() -> None:
+        error: dict[str, Any] | None = None
+        try:
+            queue.put_nowait({"type": "phase", "phase": "processing"})
+            if payload.text is not None:
+                outcome = await executor.extract_from_text(
+                    text=payload.text,
+                    ocr_blocks=None,
+                    schema_name=schema_name,
+                    schema_mode=schema_mode,
+                    dynamic_schema=dynamic_schema,
+                    language=payload.language,
+                    document_hash=hash_bytes(payload.text.encode("utf-8")),
+                    metadata={"source": "playground_stream"},
+                )
+            else:
+                assert content is not None
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(content)
+                    tmp_path = Path(tmp.name)
+                try:
+                    outcome = await executor.extract_from_file(
+                        path=tmp_path,
+                        ocr_backend_name=payload.ocr_backend or settings.default_ocr_backend,
+                        schema_name=schema_name,
+                        schema_mode=schema_mode,
+                        dynamic_schema=dynamic_schema,
+                        language=payload.language,
+                        metadata={
+                            "source": "playground_stream",
+                            "filename": payload.filename or "document",
+                        },
+                    )
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+            response = _finalize_outcome(outcome, routing_policy=payload.routing_policy)
+            response = finalize_response(response, tenant_id=tenant.tenant_id)
+            queue.put_nowait({"type": "result", "result": response.model_dump(mode="json")})
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            error = {"message": detail, "type": "extraction_error", "code": str(exc.status_code)}
+        except Exception as exc:  # noqa: BLE001 - must reach the client as an error frame
+            error = {"message": str(exc), "type": "internal_error", "code": "internal_error"}
+        finally:
+            if error is not None:
+                queue.put_nowait({"type": "error", "error": error})
+            queue.put_nowait(None)
+
+    async def body_iterator() -> AsyncIterator[bytes]:
+        task = asyncio.create_task(drive())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield _sse_event(item)
+        finally:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(body_iterator(), media_type="text/event-stream")
 
 
 @app.post("/v1/benchmarks/run")

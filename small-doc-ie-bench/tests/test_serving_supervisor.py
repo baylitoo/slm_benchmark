@@ -432,6 +432,27 @@ def test_record_observation_persists_liveness_verdict(tmp_path: Path) -> None:
     assert supervisor.get("invoice").state == LifecycleState.READY
 
 
+def test_observe_health_persists_tool_calls_supported_across_reload(tmp_path: Path) -> None:
+    """#353: HealthResult.tool_calls_supported threads through observe_health
+    onto the record and survives a reload (deployments.json), the same
+    persistence contract as observed_phase above."""
+    state_path = tmp_path / "state.json"
+    adapter = FakeAdapter()
+    supervisor = PersistentSupervisor(state_path, adapters={RuntimeKind.VLLM: adapter})
+    supervisor.deploy(_deployment())
+
+    record = supervisor.observe_health("invoice", healthy=True, tool_calls_supported=False)
+    assert record.tool_calls_supported is False
+
+    reloaded = PersistentSupervisor(state_path, adapters={RuntimeKind.VLLM: adapter})
+    assert reloaded.get("invoice").tool_calls_supported is False
+
+    # A miss (e.g. /props briefly unreachable) reverts to undetermined,
+    # never keeps a stale claim around.
+    supervisor.observe_health("invoice", healthy=False, detail="unreachable")
+    assert supervisor.get("invoice").tool_calls_supported is None
+
+
 def test_get_returns_a_defensive_copy(tmp_path: Path) -> None:
     supervisor = PersistentSupervisor(
         tmp_path / "state.json", adapters={RuntimeKind.VLLM: FakeAdapter()}

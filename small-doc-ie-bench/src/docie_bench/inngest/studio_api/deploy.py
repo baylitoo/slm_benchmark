@@ -34,13 +34,98 @@ class DeployRequest(BaseModel):
     # Default output budget inherited by Playground/Agents through the live
     # deployment profile. It does not change the runtime context window.
     max_tokens: int | None = Field(default=None, ge=1, le=131_072)
-    replicas: int = 1
+    # TARGET total instances of this store model (idempotent with the scale
+    # endpoint's semantics): >1 fans out one deploy per missing replica, each
+    # on its own auto-allocated port, load-balanced behind the model id.
+    replicas: int = Field(default=1, ge=1, le=16)
+    # llama-server request slots (#248/#321). 32 is an operator sanity ceiling,
+    # not a llama.cpp hard limit. Meaningless for non-llamacpp runtimes; the
+    # build_command for those simply never reads it.
+    n_parallel: int = Field(default=1, ge=1, le=32)
+    cache_reuse: int | None = Field(default=None, ge=1)
+    # llama-server only (#387): overrides the GGUF's own embedded
+    # chat_template with an operator-supplied Jinja file path (must be
+    # reachable inside the serving container). Existence is the caller's
+    # responsibility, same as `model` itself.
+    chat_template_file: str | None = None
+
+
+async def _trigger_replicated_deploy(
+    payload: DeployRequest, tenant: TenantDependency
+) -> _shared.TriggerResponse:
+    """Fan out a ``replicas > 1`` deploy: one ordinary deploy event per missing
+    replica (``<model>``, ``<model>-2``, …), sharing one progress channel.
+
+    ``replicas`` is the TARGET total for the store model — the same idempotent
+    semantics as ``POST /v1/serving/store/{name}/scale``, and the same RAM
+    admission gate (N x per-instance footprint against the live sizing
+    budget). Store-entry (Auto) deploys only: the explicit-runtime supervisor
+    runs exactly one instance per deployment, and an explicit name/port cannot
+    apply to N auto-named, auto-ported instances.
+    """
+    from docie_bench.inngest.serving_api import (
+        admit_replica_ram,
+        existing_deployment_names,
+    )
+    from docie_bench.serving.control_plane import replica_names_to_add
+
+    if payload.runtime:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "replicas > 1 requires a store-entry (Auto) deploy — an "
+                "explicit-runtime deployment runs exactly one instance; deploy "
+                "it several times under distinct names instead"
+            ),
+        )
+    if payload.name or payload.port is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "replicas > 1 auto-names each instance (<model>, <model>-2, …) "
+                "on auto-allocated ports — drop the explicit deployment "
+                "name/port to deploy replicas"
+            ),
+        )
+    existing = await existing_deployment_names()
+    to_add = replica_names_to_add(payload.model, existing, payload.replicas)
+    admit_replica_ram(
+        payload.model, len(to_add), payload.context_length, n_parallel=payload.n_parallel
+    )
+    channel = f"deploy:{uuid.uuid4().hex}"
+    event_ids: list[str] = []
+    for deployment_name in to_add:
+        data: dict[str, Any] = {
+            "model": payload.model,
+            "deployment_name": deployment_name,
+            "context_length": payload.context_length,
+            "channel": channel,
+        }
+        if payload.max_tokens is not None:
+            data["max_tokens"] = payload.max_tokens
+        if payload.n_parallel > 1:
+            data["n_parallel"] = payload.n_parallel
+        if payload.cache_reuse is not None:
+            data["cache_reuse"] = payload.cache_reuse
+        if payload.chat_template_file is not None:
+            data["chat_template_file"] = payload.chat_template_file
+        ids = await send_or_503(
+            inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
+        )
+        event_ids.extend(ids)
+    _shared._record_event_owners(event_ids, tenant.tenant_id)
+    # Already at/above the target: empty event_ids, nothing spawned (idempotent).
+    return _shared.TriggerResponse(
+        event_ids=event_ids, channel=channel, topics=_shared.DEFAULT_TOPICS
+    )
 
 
 @router.post("/deploy", response_model=_shared.TriggerResponse)
 async def trigger_deploy(
     payload: DeployRequest, tenant: TenantDependency
 ) -> _shared.TriggerResponse:
+    if payload.replicas > 1:
+        return await _trigger_replicated_deploy(payload, tenant)
     channel = f"deploy:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel

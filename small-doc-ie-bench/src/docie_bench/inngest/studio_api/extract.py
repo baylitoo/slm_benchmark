@@ -100,6 +100,13 @@ class RenderDocumentRequest(BaseModel):
     # document text noticeably for small vision models, at a larger payload;
     # clamped below to keep a page from exploding into millions of pixels.
     dpi: int = 200
+    # Explicit 1-indexed page numbers to rasterize (e.g. a page-1 thumbnail
+    # preview, or a click-to-enlarge fetch of a specific range). When set,
+    # ONLY those pages are rendered and `max_pages` is not enforced -- the
+    # caller told us exactly what it wants. `None` (default) keeps the
+    # existing vision-send contract: rasterize everything, reject if it's
+    # more than `max_pages`.
+    pages: list[int] | None = None
 
 
 @router.post("/render-document")
@@ -129,23 +136,88 @@ async def render_document(
         raise HTTPException(status_code=400, detail=f"invalid base64 content: {exc}") from exc
     max_pages = max(1, min(int(payload.max_pages), 20))
     dpi = max(72, min(int(payload.dpi), 400))
+    pages = [int(p) for p in payload.pages] if payload.pages else None
     suffix = Path(payload.filename).suffix or ".pdf"
+    is_pdf = suffix.lower() == ".pdf"
 
-    def _render() -> list[str]:
+    def _render() -> tuple[list[str], int]:
         with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
             handle.write(raw)
             tmp = Path(handle.name)
         try:
-            return [
+            images = [
                 img.data_url()
-                for img in load_document_images(tmp, max_pages=max_pages, pdf_dpi=dpi)
+                for img in load_document_images(
+                    tmp, max_pages=max_pages, pdf_dpi=dpi, pages=pages
+                )
             ]
+            # The true page count, computed cheaply (no rasterization) via
+            # pdf_inspector -- `len(images)` is wrong/misleading once a caller
+            # can request a subset of pages. A non-PDF upload is just the one
+            # image.
+            total_pages = len(images)
+            if is_pdf:
+                try:
+                    import pdf_inspector
+
+                    total_pages = pdf_inspector.classify_pdf(str(tmp)).page_count
+                except Exception:  # noqa: BLE001, S110 - best-effort; fall back to len(images)
+                    pass
+            return images, total_pages
         finally:
             tmp.unlink(missing_ok=True)
 
     try:
-        images = await asyncio.to_thread(_render)
+        images, total_pages = await asyncio.to_thread(_render)
     except ValueError as exc:
         # Unsupported type / too many pages / empty PDF — a client error.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"images": images, "pages": len(images)}
+    return {"images": images, "pages": len(images), "total_pages": total_pages}
+
+
+class UploadSessionDocumentRequest(BaseModel):
+    """Add a document to a session-scoped directory docs-search can search
+    for THIS conversation only (#296)."""
+
+    content_b64: str
+    filename: str
+    # None starts a new session (a fresh id is minted and returned); an id
+    # this endpoint already returned adds another document to that SAME
+    # session. Any other value is rejected — never a client-invented id.
+    session_id: str | None = None
+
+
+class UploadSessionDocumentResponse(BaseModel):
+    session_id: str
+    stored_name: str
+
+
+@router.post("/session-documents", response_model=UploadSessionDocumentResponse)
+async def upload_session_document(
+    payload: UploadSessionDocumentRequest, tenant: TenantDependency
+) -> UploadSessionDocumentResponse:
+    """Upload a file docs-search can see during this conversation only.
+
+    The Playground calls this alongside render-document when docs-search is
+    selected: docs-search's real corpus is a separate, operator-controlled
+    directory an attachment otherwise never reaches (render-document only
+    ever produces page images for vision, nothing docs-search can read).
+    See ``mcp_session_documents`` and ``chat_api._chat_with_mcp_tools``'s
+    per-request env override that points docs-search at this session's
+    directory instead of the shared one.
+    """
+    del tenant  # authenticated principal required; session id IS the scope
+    import base64
+    import binascii
+
+    from docie_bench.mcp_session_documents import SessionDocumentError, save_document
+
+    try:
+        raw = base64.b64decode(payload.content_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid base64 content: {exc}") from exc
+    try:
+        session_id, stored_name = save_document(payload.session_id, payload.filename, raw)
+    except SessionDocumentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return UploadSessionDocumentResponse(session_id=session_id, stored_name=stored_name)

@@ -5,7 +5,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,10 @@ from typing import Any
 import httpx
 
 from docie_bench.extract.grounding import ground_evidence
+from docie_bench.extract.logprob_confidence import (
+    attach_model_confidence,
+    compute_field_confidences,
+)
 from docie_bench.extract.validators import validate_extraction
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
@@ -234,6 +238,14 @@ class ExtractionService:
         profiles: Mapping[str, ModelProfile] | None = None,
         disable_thinking: bool = False,
         max_tokens: int | None = None,
+        # Additive, opt-in live preview (#397), threaded straight through to
+        # OpenAICompatibleClient.chat_json for the extraction call ONLY (not
+        # the dynamic-schema proposer call, a different JSON shape the
+        # Playground buffer must never be confused with). Default None means
+        # every existing caller (Benchmark, Batch, Review, the sync /v1/extract
+        # routes) keeps taking chat_json's unchanged blocking path.
+        on_delta: Callable[[str], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
     ) -> None:
         self.profile = profile
         self.proposer_profile = proposer_profile
@@ -244,6 +256,8 @@ class ExtractionService:
         self.profiles = profiles or {}
         self.disable_thinking = disable_thinking
         self.max_tokens = max_tokens
+        self.on_delta = on_delta
+        self.on_reset = on_reset
 
     async def extract_from_text(
         self,
@@ -469,6 +483,11 @@ class ExtractionService:
             profiles=self.profiles,
             disable_thinking=self.disable_thinking or bool(options.get("no_think")),
             max_tokens=self.max_tokens,
+            # The actual JSON-producing model call happens on the INNER
+            # service, not this OCR-only pipeline profile -- the live
+            # preview belongs on that call.
+            on_delta=self.on_delta,
+            on_reset=self.on_reset,
         )
         response = await extractor_service.extract_from_text(
             text=None,
@@ -632,9 +651,14 @@ class ExtractionService:
                 language=language,
                 metadata=metadata,
             )
+        # Opt-in (#335): llama.cpp-only per-token logprob confidence. Both the
+        # request flag AND the declared runtime must agree -- an unlabeled or
+        # non-llama.cpp profile never gets `logprobs` on the wire, regardless
+        # of the flag (see ModelProfile.runtime/.logprob_confidence).
+        want_logprobs = self.profile.logprob_confidence and self.profile.runtime == "llamacpp"
         client = OpenAICompatibleClient(self.profile)
         try:
-            raw, usage_dict, _raw_response = await client.chat_json(
+            raw, usage_dict, raw_response = await client.chat_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 schema_name=schema_name,
@@ -654,16 +678,35 @@ class ExtractionService:
                     and self.profile.prompt_profile == "strict_extraction_v1"
                     else None
                 ),
+                request_logprobs=want_logprobs,
+                on_delta=self.on_delta,
+                on_reset=self.on_reset,
             )
             effective_style = getattr(client, "last_response_format_style", None)
         finally:
             await client.aclose()
+        # Snapshot BEFORE any reshaping: `raw` here is exactly the FLAT dict
+        # the model generated (matches `generation_schema`'s unwrapped shape),
+        # which is what field-value substrings must be located against. Both
+        # NuExtract normalization and schema rehydration below rebuild new
+        # dicts rather than mutating `raw` in place, so this reference stays
+        # untouched by them.
+        field_confidences: dict[str, float | None] = (
+            compute_field_confidences(raw, raw_response) if want_logprobs else {}
+        )
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
         raw = rehydrate_extraction_result(raw, schema)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
+        if field_confidences:
+            # Attached to the plain validated dict, not a Pydantic field on
+            # TextField/MoneyField/etc: `model_confidence` is ad-hoc metadata
+            # this round, so any path that re-validates a stored result back
+            # through those wrapper models (extra="ignore" by default) will
+            # silently drop it again. Acceptable for this opt-in signal.
+            attach_model_confidence(normalized, field_confidences)
         if derived_subtotal:
             # The model didn't report a subtotal; it was computed here from
             # total_ttc - vat_amount, not read off the document. Without this,

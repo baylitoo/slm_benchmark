@@ -113,6 +113,35 @@ class Settings(BaseSettings):
     mcp_max_tool_iterations: int = Field(default=8, ge=1, le=64)
     # Per-response read timeout for MCP client sessions (list_tools/call_tool).
     mcp_tool_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    # Fraction of the resolved deployment's context_length at which
+    # run_tool_loop's on_context_budget warning fires (#344) -- a long
+    # agentic exchange otherwise runs several real rounds before a LATER
+    # round's cumulative usage exceeds the deployment's context window and
+    # llama-server 400s, losing the whole in-progress exchange with no prior
+    # warning. Fires once per exchange, the first round cumulative usage
+    # crosses this fraction; never truncates or summarizes.
+    mcp_context_budget_warn_fraction: float = Field(default=0.8, gt=0.0, le=1.0)
+    # Human-in-the-loop pause/resume (#383): how long run_tool_loop waits for
+    # an answer -- to the synthetic ask_user tool, or a user-initiated pause --
+    # before giving up. A paused exchange with a closed tab or an abandoned
+    # session must not hold its in-memory registry entry (or the request)
+    # open forever; on timeout the exchange fails cleanly with an "error" SSE
+    # event instead of hanging. Same plain mcp_* naming as the other MCP
+    # knobs above (mcp_tool_timeout_seconds, mcp_max_tool_iterations) --
+    # neither carries a DOCIE_-prefixed alias, that convention is reserved
+    # for the serving_* knobs below.
+    mcp_ask_user_timeout_seconds: float = Field(default=300.0, gt=0.0, le=3600.0)
+
+    # Session-scoped document uploads (#296): a Playground attachment is written
+    # here under a server-issued session id, isolated per conversation -- docs-search
+    # is pointed at THIS directory for that request instead of the shared operator
+    # corpus, so it can search a file the model wasn't otherwise given no way to
+    # discover. Size/MIME caps reuse max_upload_mb/allowed_upload_mime_types (the
+    # existing generic upload limits); max_files and max_age bound disk usage
+    # across many uploads within one session and across abandoned sessions.
+    mcp_session_documents_root: Path = Path("data/session-docs")
+    mcp_session_documents_max_files: int = Field(default=20, ge=1, le=500)
+    mcp_session_documents_max_age_hours: int = Field(default=24, ge=1, le=720)
 
     # Durable, addressable artifact store for Studio benchmark runs. Must resolve
     # to the SAME location on every replica that reads it (a shared volume or an

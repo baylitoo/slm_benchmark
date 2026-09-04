@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -135,6 +136,79 @@ def _deployment_is_live(record: dict[str, Any]) -> bool:
     return record.get("state") == "ready" and bool(record.get("endpoint"))
 
 
+def _deployment_selector_name(data: dict[str, Any]) -> str | None:
+    """The deployment record name an event's ``deployment``/``model_profile``
+    selector points at, with any ``store:`` prefix stripped -- else None.
+
+    Shared by autoload target resolution and the batch fan-out capacity
+    lookup: both need "which deployment record does this job's selector
+    name", and a ``store:<name>`` selector routes via the placement of the
+    deployment record ``<name>`` (``serve_store_model`` names the record
+    after the store entry), so the prefix must be stripped identically in
+    both places.
+    """
+    candidate = data.get("deployment") or data.get("model_profile")
+    if not candidate:
+        return None
+    name = str(candidate)
+    if name.startswith(STORE_PROFILE_PREFIX):
+        name = name[len(STORE_PROFILE_PREFIX) :]
+    return name
+
+
+def _read_all_deployments() -> dict[str, dict[str, Any]]:
+    """Every raw deployment record from the shared deployments.json, or {}.
+
+    Best-effort mirror of :func:`_read_deployment`'s single-record read (any
+    hiccup reads as "no deployments" so a capacity lookup can never fail an
+    extraction) -- needed here because fan-out capacity sums OVER a
+    deployment's scaled replicas (``base``, ``base-2``, ``base-3``, ...,
+    see ``control_plane.replica_deployment_name``), not one record.
+    """
+    try:
+        payload = json.loads((_serving_home() / "deployments.json").read_text(encoding="utf-8"))
+        deployments = payload.get("deployments")
+        return deployments if isinstance(deployments, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _batch_fanout_width(data: dict[str, Any]) -> int:
+    """How many documents to extract at once for this batch's target deployment.
+
+    Width = total concurrent-request capacity of the target deployment's LIVE
+    replicas: each live replica's llama-server slot count
+    (``spec.launch.n_parallel``, default 1 -- see ``RuntimeLaunchSpec`` and
+    ``control_plane.serve``/``serve_store_model``), summed over every live
+    record matching the ``base``/``base-2``/``base-3``/... replica naming
+    convention (``control_plane.replica_deployment_name``). Batches process
+    ``inputs`` in chunks of this width via ``ctx.group.parallel`` so fan-out
+    tracks what the deployment can actually run at once instead of a fixed
+    or unbounded guess.
+
+    Falls back to width 1 (today's sequential behaviour) whenever the target
+    can't be resolved to any live deployment record -- an unpriceable/unknown
+    deployment must never guess a wide fan-out.
+    """
+    name = _deployment_selector_name(data)
+    if name is None:
+        return 1
+    records = _read_all_deployments()
+    if not records:
+        return 1
+    pattern = re.compile(rf"^{re.escape(name)}(?:-\d+)?$")
+    capacity = 0
+    for record_name, record in records.items():
+        if not isinstance(record, dict) or not pattern.match(record_name):
+            continue
+        if not _deployment_is_live(record):
+            continue
+        launch = (record.get("spec") or {}).get("launch") or {}
+        n_parallel = launch.get("n_parallel")
+        capacity += n_parallel if isinstance(n_parallel, int) and n_parallel > 0 else 1
+    return capacity if capacity > 0 else 1
+
+
 def _autoload_target(data: dict[str, Any]) -> tuple[str, float] | None:
     """(deployment name, size-aware wait budget) when a load must precede the
     extraction — else None (PR-4 cold-start-on-demand, design §4).
@@ -162,13 +236,9 @@ def _autoload_target(data: dict[str, Any]) -> tuple[str, float] | None:
     """
     from docie_bench.serving.lifecycle import load_timeout_s
 
-    explicit = data.get("deployment")
-    candidate = explicit or data.get("model_profile")
-    if not candidate:
+    name = _deployment_selector_name(data)
+    if name is None:
         return None
-    name = str(candidate)
-    if name.startswith(STORE_PROFILE_PREFIX):
-        name = name[len(STORE_PROFILE_PREFIX) :]
     record = _read_deployment(name)
     if record is None or _deployment_is_live(record):
         return None
@@ -918,6 +988,13 @@ async def batch_extract_job(ctx: inngest.Context) -> dict[str, Any]:
     run's terminal status is ``completed`` with ``failed_items > 0``, not a
     dead job. Only a whole-run error (claim failed, deployment never came
     up) marks the run ``failed``.
+
+    Fan-out: ``inputs`` runs in chunks of ``_batch_fanout_width`` documents,
+    each chunk dispatched together via ``ctx.group.parallel`` so Inngest's
+    server can run them concurrently instead of one at a time -- width
+    matches the target deployment's live capacity (falls back to 1, i.e.
+    fully sequential, when that can't be determined). Still one memoized
+    step per document either way.
     """
     from docie_bench.studio.batch_store import (
         BatchStoreUnavailableError,
@@ -977,27 +1054,58 @@ async def batch_extract_job(ctx: inngest.Context) -> dict[str, Any]:
         await _ensure_deployment_live(ctx.step, data, channel)
 
         outcomes: list[dict[str, Any]] = []
-        for position, item in enumerate(inputs):
 
-            async def _one(
-                item: dict[str, Any] = item, position: int = position
-            ) -> dict[str, Any]:
-                return await _batch_extract_one(data, item, position)
+        async def _width() -> int:
+            return _batch_fanout_width(data)
 
-            one = await ctx.step.run(f"doc-{position}", _one)
-            outcomes.append(one)
-            done = sum(1 for o in outcomes if o["status"] == "done")
-            await publish(
-                channel,
-                TOPIC_PROGRESS,
-                {
-                    "total": len(inputs),
-                    "done": done,
-                    "failed": len(outcomes) - done,
-                    "current": item["filename"],
-                    "percent": round(100 * len(outcomes) / max(len(inputs), 1), 1),
-                },
+        # Its own memoized step -- like plan-autoload above, evaluated outside
+        # a step this would re-read deployments.json on every replay (this
+        # function replays at least once per chunk) and could reshuffle chunk
+        # boundaries mid-batch if capacity changes between replays, which
+        # would make the step graph non-deterministic across retries.
+        width: int = await ctx.step.run("fanout-width", _width)
+        positioned = list(enumerate(inputs))
+        for start in range(0, len(positioned), width):
+            chunk = positioned[start : start + width]
+
+            def _step_call(item: dict[str, Any], position: int) -> Any:
+                async def _one() -> dict[str, Any]:
+                    return await _batch_extract_one(data, item, position)
+
+                return lambda: ctx.step.run(f"doc-{position}", _one)
+
+            # ctx.group.parallel collects a ResponseInterrupt per not-yet-
+            # memoized step, so the server can schedule this chunk's steps
+            # concurrently instead of one at a time; a real (non-interrupt)
+            # exception from one callable would abort the whole group before
+            # the others are even discovered. That never happens here: _one
+            # only ever calls _batch_extract_one, which never raises (a bad
+            # document is caught INSIDE it and returned as a "failed"
+            # outcome) -- so partial-failure isolation survives unchanged.
+            chunk_outcomes = await ctx.group.parallel(
+                tuple(_step_call(item, position) for position, item in chunk)
             )
+            # Width matches the target's live capacity (or falls back to 1),
+            # so this chunk's steps run concurrently via Inngest's own
+            # server-side scheduling -- see ``_batch_fanout_width``. Progress
+            # is published per outcome as this chunk resolves; nothing here
+            # assumes document order, so it stays correct even if a future
+            # SDK version (or ``parallel_mode=RACE``) returns chunk results
+            # in a different order than submitted.
+            for outcome in chunk_outcomes:
+                outcomes.append(outcome)
+                done = sum(1 for o in outcomes if o["status"] == "done")
+                await publish(
+                    channel,
+                    TOPIC_PROGRESS,
+                    {
+                        "total": len(inputs),
+                        "done": done,
+                        "failed": len(outcomes) - done,
+                        "current": outcome["filename"],
+                        "percent": round(100 * len(outcomes) / max(len(inputs), 1), 1),
+                    },
+                )
 
         async def _write() -> list[dict[str, Any]]:
             return _batch_write_results(outcomes)
@@ -1127,6 +1235,12 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
         raise ValueError("deploy event must include 'model'")
     cp = _serving_control_plane()
     runtime = data.get("runtime")
+    raw_n_parallel = data.get("n_parallel")
+    n_parallel = int(raw_n_parallel) if raw_n_parallel is not None else 1
+    raw_cache_reuse = data.get("cache_reuse")
+    cache_reuse = int(raw_cache_reuse) if raw_cache_reuse is not None else None
+    raw_chat_template_file = data.get("chat_template_file")
+    chat_template_file = str(raw_chat_template_file) if raw_chat_template_file else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1136,6 +1250,9 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             max_tokens=(
                 int(data["max_tokens"]) if data.get("max_tokens") is not None else None
             ),
+            n_parallel=n_parallel,
+            cache_reuse=cache_reuse,
+            chat_template_file=chat_template_file,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1158,6 +1275,9 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             # Scale: a distinct record name for another replica of `model`
             # (control_plane.serve_store_model looks the weights up by `model`).
             deployment_name=str(raw_dep_name) if raw_dep_name else None,
+            n_parallel=n_parallel,
+            cache_reuse=cache_reuse,
+            chat_template_file=chat_template_file,
         )
     return record
 
@@ -1165,6 +1285,16 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
 @serving_client.create_function(
     fn_id="serving-deploy",
     trigger=inngest.TriggerEvent(event="serving/deploy.requested"),
+    # Global (not per-model/per-host key), limit=1: unlike serving-load's
+    # LoadCoordinator, the deploy path (ControlPlane.serve/up ->
+    # _DefaultSupervisor.serve/serve_store_model) never checks RAM fit against
+    # other in-flight deploys before spawning. Serving is single-replica by
+    # construction (see _guard_deterministic_advertise and this fn's own
+    # docstring), so every deploy lands on the same node's RAM regardless of
+    # which model it names -- a per-model key would let two unrelated deploys
+    # spawn concurrently and jointly overcommit the host, which is exactly the
+    # gap this closes.
+    concurrency=[inngest.Concurrency(limit=1)],
 )
 async def deploy_model_job(ctx: inngest.Context) -> Any:
     """Deploy a model so it can serve the gateway/benchmark.
@@ -1939,8 +2069,21 @@ def _gc_studio_runs_sync() -> dict[str, int]:
         summary = {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
     # The serving-volume sweep needs no database — run it either way.
     summary.update(_gc_seed_leftovers_sync())
+    summary.update(_gc_session_documents_sync())
     logger.info("studio run GC: %s", summary)
     return summary
+
+
+def _gc_session_documents_sync() -> dict[str, int]:
+    """Prune stale session-scoped docs-search uploads (#296, blocking).
+
+    No client-triggered delete exists — a closed tab or crashed session
+    leaves nothing else to reclaim the directory a Playground attachment
+    was written into.
+    """
+    from docie_bench.mcp_session_documents import gc_stale_sessions
+
+    return {"deleted_session_documents": gc_stale_sessions()}
 
 
 async def _gc_studio_runs() -> dict[str, int]:
@@ -1953,7 +2096,9 @@ async def _gc_studio_runs() -> dict[str, int]:
     trigger=inngest.TriggerCron(cron="0 3 * * *"),
 )
 async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
-    """Nightly retention sweep for the Studio run index (rows + orphan blobs).
+    """Nightly retention sweep for the Studio run index (rows + orphan blobs),
+    stale seed-download staging dirs, and stale session-scoped docs-search
+    uploads (#296).
 
     Bounds unbounded run accumulation: deletes runs older than
     ``STUDIO_RUN_RETENTION_DAYS`` or beyond the newest ``STUDIO_RUN_RETENTION_MAX``,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import importlib.metadata
 import importlib.util
+import json
+import logging
 import os
 import shutil
 import subprocess
@@ -18,6 +20,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import psutil
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeKind(StrEnum):
@@ -41,6 +45,7 @@ class LifecycleState(StrEnum):
 class RuntimeFeature(StrEnum):
     BATCHING = "batching"
     EMBEDDINGS = "embeddings"
+    LOGPROBS = "logprobs"
     LORA = "lora"
     QUANTIZATION = "quantization"
     STRUCTURED_OUTPUT = "structured_output"
@@ -83,6 +88,19 @@ class RuntimeLaunchSpec:
     api_key_env: str | None = None
     extra_args: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
+    # llama.cpp-specific multi-slot launch flags (#248/#321): other runtimes'
+    # build_command never reads these.
+    n_parallel: int = 1
+    cache_reuse: int | None = None
+    # llama.cpp only (#387): overrides the GGUF's own embedded chat_template
+    # with an operator-supplied Jinja file -- e.g. patching tool-call
+    # rendering onto a checkpoint whose baked-in template lacks it. Existence
+    # is the caller's responsibility (same as `model` itself); the #290
+    # health check re-verifies whatever template ends up live via GET /props
+    # automatically, since that check queries the running server, not the
+    # GGUF's static bytes -- an override gets exactly the same scrutiny a
+    # baked-in template does, with no extra code.
+    chat_template_file: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -107,6 +125,14 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("extra_args must not contain NUL bytes")
         if any("\x00" in key or "\x00" in value for key, value in self.env.items()):
             raise RuntimeConfigurationError("environment entries must not contain NUL bytes")
+        if self.n_parallel < 1:
+            raise RuntimeConfigurationError("n_parallel must be positive")
+        if self.cache_reuse is not None and self.cache_reuse < 1:
+            raise RuntimeConfigurationError("cache_reuse must be positive")
+        if self.chat_template_file is not None and not self.chat_template_file.strip():
+            raise RuntimeConfigurationError("chat_template_file must not be empty")
+        if self.chat_template_file is not None and "\x00" in self.chat_template_file:
+            raise RuntimeConfigurationError("chat_template_file must not contain NUL bytes")
 
 
 @dataclass(frozen=True)
@@ -134,6 +160,13 @@ class HealthResult:
     status_code: int | None = None
     detail: str | None = None
     latency_seconds: float | None = None
+    # llama.cpp only (#353): the model's ACTUAL chat_template_caps.supports_tool_calls
+    # from GET /props (see llamacpp_tool_calls_mismatch), captured whenever
+    # chat_template_caps was present in the response. True/False is the real
+    # signal; None means undetermined -- an older llama-server build, an
+    # unreachable /props, or a runtime (vLLM, Ollama, ...) that never probes
+    # this at all. Every non-llamacpp adapter leaves this at the default None.
+    tool_calls_supported: bool | None = None
 
 
 class Process(Protocol):
@@ -179,6 +212,173 @@ def _default_health_get(url: str, timeout: float, headers: Mapping[str, str]) ->
     )
 
 
+def _default_json_get(
+    url: str, timeout: float, headers: Mapping[str, str]
+) -> dict[str, Any] | None:
+    """Best-effort GET+JSON-decode -- ``None`` on any failure (unreachable,
+    non-200, not JSON). Used for capability-drift checks that must never
+    turn a genuinely healthy deployment unhealthy just because an optional
+    diagnostic endpoint is unavailable."""
+    request = urllib.request.Request(url, headers=dict(headers))  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            if not (200 <= response.status < 300):
+                return None
+            body = response.read()
+    except (OSError, urllib.error.URLError):
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+JsonGet = Callable[[str, float, Mapping[str, str]], "dict[str, Any] | None"]
+
+SlotsGet = Callable[[str, float, Mapping[str, str]], "list[dict[str, Any]] | None"]
+
+
+def _default_slots_get(
+    url: str, timeout: float, headers: Mapping[str, str]
+) -> list[dict[str, Any]] | None:
+    """Best-effort GET+JSON-decode for ``GET /slots`` -- unlike ``/props``
+    (a single JSON object), llama-server's own ``/slots`` returns a JSON
+    ARRAY, one entry per processing slot. ``None`` on any failure
+    (unreachable, non-200, not a JSON array): the same never-fail contract as
+    ``_default_json_get`` -- a diagnostic endpoint that is disabled
+    (``--no-slots``) or absent on an older build must never read as an error.
+    """
+    request = urllib.request.Request(url, headers=dict(headers))  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            if not (200 <= response.status < 300):
+                return None
+            body = response.read()
+    except (OSError, urllib.error.URLError):
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+# Optional numeric fields llama-server MAY report per slot, varying by build
+# (#315): some builds surface only prompt/cache state, others add per-slot
+# prefill/decode timing directly on the slot entry (rather than only in a
+# completion response's separate "timings" object). Every one of these is
+# genuinely optional -- absence is normal, never an error.
+_SLOT_NUMERIC_FIELDS = (
+    "id_task",
+    "n_past",
+    "n_remain",
+    "n_decoded",
+    "cache_n",
+    "prompt_n",
+    "prompt_ms",
+    "predicted_n",
+    "predicted_ms",
+    "tokens_per_second",
+)
+
+_NEXT_TOKEN_FIELDS = (
+    "has_next_token",
+    "has_new_line",
+    "n_remain",
+    "n_decoded",
+    "stopped_eos",
+    "stopped_limit",
+    "stopped_word",
+    "stopping_word",
+)
+
+
+def normalize_llamacpp_slot(slot: Mapping[str, Any]) -> dict[str, Any]:
+    """Defensively project one raw ``GET /slots`` entry down to what the
+    Observability slots card understands (#315).
+
+    llama-server's ``/slots`` schema is NOT fixed across builds -- some
+    report only prompt/cache state, others add per-slot prefill/decode
+    timing, and field names have shifted release to release. Every field read
+    here is optional and type-checked before use: a missing or unexpectedly-
+    typed field is silently skipped, never raised on, so an older/newer/
+    unknown llama-server build degrades to a smaller card instead of breaking
+    the query.
+    """
+    def _is_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    normalized: dict[str, Any] = {}
+    if _is_int(slot.get("id")):
+        normalized["id"] = slot["id"]
+    if isinstance(slot.get("is_processing"), bool):
+        normalized["is_processing"] = slot["is_processing"]
+    if _is_int(slot.get("n_ctx")):
+        normalized["n_ctx"] = slot["n_ctx"]
+    prompt = slot.get("prompt")
+    if isinstance(prompt, str):
+        normalized["prompt"] = prompt[:200]
+    for key in _SLOT_NUMERIC_FIELDS:
+        value = slot.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            normalized[key] = value
+    next_token = slot.get("next_token")
+    if isinstance(next_token, Mapping):
+        normalized["next_token"] = {
+            key: next_token[key]
+            for key in _NEXT_TOKEN_FIELDS
+            if key in next_token and isinstance(next_token[key], (bool, int, float, str))
+        }
+    return normalized
+
+
+def fetch_llamacpp_slots(
+    endpoint: str,
+    *,
+    timeout: float = 2,
+    headers: Mapping[str, str] | None = None,
+    slots_get: SlotsGet = _default_slots_get,
+) -> tuple[dict[str, Any], ...]:
+    """Query and normalize llama-server's ``GET /slots`` from a bare endpoint
+    string -- no ``RuntimeLaunchSpec`` needed. This is the seam the
+    Observability API route calls directly against a deployment's already-
+    resolved ``endpoint`` (#315), and what ``LlamaCppRuntime.slots`` delegates
+    to for callers that do have a spec. Never raises -- see
+    ``_default_slots_get`` / ``normalize_llamacpp_slot``.
+    """
+    base = endpoint.rstrip("/").removesuffix("/v1")
+    raw = slots_get(f"{base}/slots", timeout, dict(headers or {}))
+    if raw is None:
+        return ()
+    return tuple(normalize_llamacpp_slot(slot) for slot in raw)
+
+
+def llamacpp_tool_calls_mismatch(props: Mapping[str, Any]) -> str | None:
+    """Compare llama-server's own ``GET /props`` report against
+    ``RuntimeFeature.TOOL_CALLS`` (#290): ``LlamaCppRuntime.features``
+    declares tool-calling support unconditionally, but the model's ACTUAL
+    chat template is what decides whether that's true, per llama.cpp's own
+    ``chat_template_caps.supports_tool_calls`` (see
+    ``common/jinja/caps.h``/``caps.cpp`` -- the exact keys this checks
+    against). ``None`` means no mismatch (or the field wasn't reported,
+    an older llama-server build); a string is the loud warning to log.
+    """
+    caps = props.get("chat_template_caps")
+    if not isinstance(caps, dict) or "supports_tool_calls" not in caps:
+        return None
+    if caps.get("supports_tool_calls") is False:
+        return (
+            "llama-server reports chat_template_caps.supports_tool_calls=false for "
+            "this model's ACTUAL chat template, but LlamaCppRuntime advertises "
+            "RuntimeFeature.TOOL_CALLS -- a request with 'tools' set will not get "
+            "structured tool_calls back from this deployment"
+        )
+    return None
+
+
 class RuntimeAdapter:
     kind: RuntimeKind
     executable_names: tuple[str, ...] = ()
@@ -191,11 +391,13 @@ class RuntimeAdapter:
         popen_factory: PopenFactory = subprocess.Popen,
         run_command: RunCommand = subprocess.run,
         health_get: HealthGet = _default_health_get,
+        json_get: JsonGet = _default_json_get,
         which: Callable[[str], str | None] = shutil.which,
     ) -> None:
         self._popen_factory = popen_factory
         self._run_command = run_command
         self._health_get = health_get
+        self._json_get = json_get
         self._which = which
         self._processes: dict[int, Process] = {}
 
@@ -460,10 +662,15 @@ class VLLMRuntime(RuntimeAdapter):
 class LlamaCppRuntime(RuntimeAdapter):
     kind = RuntimeKind.LLAMACPP
     executable_names = ("llama-server",)
+    # LOGPROBS (#335): llama-server's /v1/chat/completions supports OpenAI-shaped
+    # logprobs/top_logprobs. Advertised here for llama.cpp only this round --
+    # vLLM/Ollama parity is unverified, so they deliberately don't get it (see
+    # extract.logprob_confidence, gated on ModelProfile.runtime == "llamacpp").
     features = frozenset(
         {
             RuntimeFeature.BATCHING,
             RuntimeFeature.EMBEDDINGS,
+            RuntimeFeature.LOGPROBS,
             RuntimeFeature.LORA,
             RuntimeFeature.QUANTIZATION,
             RuntimeFeature.STRUCTURED_OUTPUT,
@@ -471,6 +678,10 @@ class LlamaCppRuntime(RuntimeAdapter):
             RuntimeFeature.VISION,
         }
     )
+
+    def __init__(self, *, slots_get: SlotsGet = _default_slots_get, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._slots_get = slots_get
 
     def validate(self, spec: RuntimeLaunchSpec) -> None:
         super().validate(spec)
@@ -492,13 +703,77 @@ class LlamaCppRuntime(RuntimeAdapter):
             spec.host,
             "--port",
             str(spec.port),
+            "--jinja",
         ]
+        if spec.chat_template_file is not None:
+            command.extend(["--chat-template-file", spec.chat_template_file])
         if spec.context_length is not None:
-            command.extend(["--ctx-size", str(spec.context_length)])
+            ctx_size = spec.context_length
+            if spec.n_parallel > 1:
+                # llama-server splits --ctx-size across slots (effective
+                # per-slot context = ctx_size / n_parallel), so the total
+                # budget must be scaled up to give each slot the configured
+                # context_length.
+                ctx_size = spec.context_length * spec.n_parallel
+            command.extend(["--ctx-size", str(ctx_size)])
+        if spec.n_parallel > 1:
+            command.extend(["--parallel", str(spec.n_parallel)])
         if spec.cpu_threads is not None:
             command.extend(["--threads", str(spec.cpu_threads)])
+        if spec.cache_reuse is not None:
+            command.extend(["--cache-reuse", str(spec.cache_reuse)])
         command.extend(spec.extra_args)
         return tuple(command)
+
+    def health(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> HealthResult:
+        """The base ``/health`` check, plus a capability-drift check (#290):
+        only once the process is actually healthy, query ``GET /props`` and
+        compare its ``chat_template_caps`` against what ``features``
+        advertises. A mismatch is logged loudly -- never turns a healthy
+        deployment unhealthy, since the deployment genuinely IS up; it's the
+        TOOL_CALLS advertisement that would be a lie for THIS model's actual
+        chat template.
+
+        The raw ``chat_template_caps.supports_tool_calls`` verdict is also
+        captured onto the returned ``HealthResult.tool_calls_supported`` --
+        not just logged (#353) -- so a caller (the reconciler, then
+        ``chat_api``) can act on it instead of it only ever reaching a log
+        line nobody watches. Set whenever ``chat_template_caps`` was reported
+        at all, True/False either way -- a healthy, tool-call-CAPABLE model
+        gets ``True`` recorded explicitly, not left ``None``.
+        """
+        result = super().health(spec, timeout=timeout)
+        if not result.healthy:
+            return result
+        base = self.endpoint(spec).removesuffix("/v1")
+        headers: dict[str, str] = {}
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            headers["Authorization"] = f"Bearer {api_key}"
+        props = self._json_get(f"{base}/props", timeout, headers)
+        tool_calls_supported: bool | None = None
+        if props is not None:
+            caps = props.get("chat_template_caps")
+            if isinstance(caps, dict) and isinstance(caps.get("supports_tool_calls"), bool):
+                tool_calls_supported = caps["supports_tool_calls"]
+            mismatch = llamacpp_tool_calls_mismatch(props)
+            if mismatch is not None:
+                logger.warning("%s (alias=%r, endpoint=%r)", mismatch, spec.alias, base)
+        return replace(result, tool_calls_supported=tool_calls_supported)
+
+    def slots(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> tuple[dict[str, Any], ...]:
+        """llama-server's own ``GET /slots`` introspection (#315): per-slot
+        prompt state, KV cache reuse, and (on builds that report it)
+        prefill/decode timing -- mirrors the ``GET /props`` call already in
+        ``health()``. Never raises and never affects health: an unreachable
+        or malformed ``/slots`` response yields an empty tuple, the same
+        never-fail contract as the ``/props`` capability check above.
+        """
+        headers: dict[str, str] = {}
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            headers["Authorization"] = f"Bearer {api_key}"
+        return fetch_llamacpp_slots(
+            self.endpoint(spec), timeout=timeout, headers=headers, slots_get=self._slots_get
+        )
 
 
 class OllamaRuntime(RuntimeAdapter):

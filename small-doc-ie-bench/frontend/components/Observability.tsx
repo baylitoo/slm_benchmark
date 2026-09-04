@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import {
   BarChart3,
   ExternalLink,
@@ -10,6 +10,10 @@ import {
   HardDrive,
   Activity,
   TrendingUp,
+  ChevronRight,
+  ChevronDown,
+  Cpu,
+  RefreshCw,
 } from "lucide-react";
 import { GRAFANA_URL, GRAFANA_DASHBOARD_URL, INNGEST_URL, METRICS_URL } from "@/lib/env";
 import {
@@ -17,6 +21,8 @@ import {
   getOcrCacheStats,
   getActivity,
   getUsageSummary,
+  getDeployments,
+  getDeploymentSlots,
   ApiError,
   type ReviewMetricsView,
   type OcrCacheStatsView,
@@ -25,6 +31,8 @@ import {
   type UsageDeployment,
   type UsageSummaryView,
   type UsageWindow,
+  type DeploymentRecord,
+  type LlamaCppSlot,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Card, Badge } from "./ui";
@@ -35,6 +43,7 @@ const REVIEW_POLL_MS = 10000;
 const OCR_CACHE_POLL_MS = 15000;
 const ACTIVITY_POLL_MS = 15000;
 const USAGE_POLL_MS = 15000;
+const SLOTS_DEPLOYMENTS_POLL_MS = 15000;
 
 const USAGE_WINDOWS: UsageWindow[] = ["24h", "7d", "30d"];
 
@@ -105,6 +114,7 @@ export function Observability({
           <ReviewQueueCard active={active} onNavigate={onNavigate} />
           <OcrCacheCard active={active} />
           <ActivityCard active={active} onNavigate={onNavigate} />
+          <SlotsCard active={active} />
         </div>
         <UsageCard active={active} />
         <Card
@@ -375,6 +385,157 @@ function ActivityCard({
   );
 }
 
+/** Exported for direct unit testing, same pattern as {@link formatCount}. */
+export function llamaCppRunningDeploymentNames(records: DeploymentRecord[]): string[] {
+  // "ready" is the live-serving state every backend record actually uses
+  // (catalog.py/dashboard.py/placement_resolver.py) -- "running" never
+  // occurs, so this filter matched nothing against a real deployment.
+  return records
+    .filter((r) => r.spec?.launch?.runtime === "llamacpp" && r.state === "ready")
+    .map((r) => r.spec?.name)
+    .filter((name): name is string => Boolean(name));
+}
+
+/** One deployment's slots, fetched on demand (not eagerly for every
+ * deployment on page load) -- mirrors McpView's CodeInterpreterWorkers:
+ * collapsed by default, a click expands and triggers the live GET /slots
+ * query, a refresh icon re-queries. Every slot field is optional (#315):
+ * this only ever renders what the specific llama-server build reported. */
+function SlotRow({ name }: { name: string }) {
+  const [open, setOpen] = useState(false);
+  const [slots, setSlots] = useState<LlamaCppSlot[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await getDeploymentSlots(name);
+      setSlots(res.slots);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function toggle() {
+    const next = !open;
+    setOpen(next);
+    if (next && slots === null && !loading) void load();
+  }
+
+  return (
+    <div className="rounded-md border border-border bg-muted/40 p-2 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={toggle}
+          className="flex min-w-0 items-center gap-1 font-medium text-foreground hover:text-accent"
+        >
+          {open ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+          )}
+          <span className="truncate" title={name}>
+            {name}
+          </span>
+        </button>
+        {open && (
+          <button
+            type="button"
+            aria-label={`Refresh ${name} slots`}
+            onClick={() => void load()}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-1.5 space-y-1 pl-5">
+          {error ? (
+            <p className="text-destructive">
+              <T>Couldn&apos;t reach this deployment.</T> {error}
+            </p>
+          ) : loading && slots === null ? (
+            <p className="text-muted-foreground">
+              <T>Loading…</T>
+            </p>
+          ) : !slots || slots.length === 0 ? (
+            <p className="text-muted-foreground">
+              <T>No slots reported.</T>
+            </p>
+          ) : (
+            slots.map((slot, i) => (
+              <div key={slot.id ?? i} className="flex flex-wrap items-center gap-2">
+                <Badge tone={slot.is_processing ? "info" : "neutral"}>
+                  slot {slot.id ?? i} · {slot.is_processing ? "busy" : "idle"}
+                </Badge>
+                {slot.n_ctx != null && (
+                  <span className="text-muted-foreground">ctx {slot.n_ctx}</span>
+                )}
+                {slot.cache_n != null && (
+                  <span className="text-muted-foreground">cache {slot.cache_n}</span>
+                )}
+                {slot.prompt_ms != null && (
+                  <span className="text-muted-foreground">
+                    prefill {formatLatency(slot.prompt_ms)}
+                  </span>
+                )}
+                {slot.predicted_ms != null && (
+                  <span className="text-muted-foreground">
+                    decode {formatLatency(slot.predicted_ms)}
+                  </span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SlotsCard({ active }: { active: boolean }) {
+  const deployments = usePolling<DeploymentRecord[]>(
+    getDeployments,
+    SLOTS_DEPLOYMENTS_POLL_MS,
+    active,
+  );
+  const names = llamaCppRunningDeploymentNames(deployments.data ?? []);
+
+  return (
+    <Card
+      icon={<Cpu className="h-5 w-5" />}
+      title="llama.cpp slots"
+      subtitle="Per-slot prompt state and cache/timing straight from each deployment's own GET /slots — expand a deployment to query it live."
+    >
+      {deployments.error ? (
+        <p className="text-sm text-muted-foreground">
+          Couldn&apos;t load deployments. Is the API reachable?
+        </p>
+      ) : deployments.loading ? (
+        <p className="text-sm text-muted-foreground">
+          <T>Loading…</T>
+        </p>
+      ) : names.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          <T>No running llama.cpp deployments.</T>
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {names.map((name) => (
+            <SlotRow key={name} name={name} />
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 /** Compact token/request count: 950 -> "950", 12_400 -> "12.4k", 3_200_000 -> "3.2M". */
 export function formatCount(value: number): string {
   if (value < 1000) return `${value}`;
@@ -395,6 +556,7 @@ function totalTokens(entry: UsageDeployment): number {
 // Exported for Observability.test.tsx -- rendered only by this page.
 export function UsageCard({ active }: { active: boolean }) {
   const [usageWindow, setUsageWindow] = useState<UsageWindow>("24h");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const fetchUsage = useCallback(() => getUsageSummary(usageWindow), [usageWindow]);
   const usage = usePolling<UsageSummaryView>(fetchUsage, USAGE_POLL_MS, active);
   const { refresh } = usage;
@@ -498,40 +660,118 @@ export function UsageCard({ active }: { active: boolean }) {
                 </tr>
               </thead>
               <tbody>
-                {entries.map((entry) => (
-                  <tr key={entry.deployment} className="border-b border-border/60 last:border-0">
-                    <td className="max-w-[220px] truncate py-1.5 pr-3 font-medium text-foreground">
-                      {entry.deployment}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatCount(entry.requests)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {entry.errors > 0 ? (
-                        <Badge tone="err">{formatCount(entry.errors)}</Badge>
-                      ) : (
-                        <span className="text-muted-foreground">0</span>
+                {entries.map((entry) => {
+                  const hasTools = entry.tool_calls.length > 0;
+                  const isOpen = expanded.has(entry.deployment);
+                  return (
+                    <Fragment key={entry.deployment}>
+                      <tr className="border-b border-border/60 last:border-0">
+                        <td className="max-w-[220px] py-1.5 pr-3 font-medium text-foreground">
+                          <div className="flex items-center gap-1">
+                            {hasTools ? (
+                              <button
+                                type="button"
+                                aria-label={
+                                  isOpen
+                                    ? `Collapse ${entry.deployment} tool calls`
+                                    : `Expand ${entry.deployment} tool calls`
+                                }
+                                onClick={() =>
+                                  setExpanded((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(entry.deployment)) {
+                                      next.delete(entry.deployment);
+                                    } else {
+                                      next.add(entry.deployment);
+                                    }
+                                    return next;
+                                  })
+                                }
+                                className="shrink-0 text-muted-foreground hover:text-foreground"
+                              >
+                                {isOpen ? (
+                                  <ChevronDown className="h-3.5 w-3.5" />
+                                ) : (
+                                  <ChevronRight className="h-3.5 w-3.5" />
+                                )}
+                              </button>
+                            ) : (
+                              <span className="w-3.5 shrink-0" />
+                            )}
+                            <span className="truncate" title={entry.deployment}>
+                              {entry.deployment}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatCount(entry.requests)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {entry.errors > 0 ? (
+                            <Badge tone="err">{formatCount(entry.errors)}</Badge>
+                          ) : (
+                            <span className="text-muted-foreground">0</span>
+                          )}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatCount(entry.prompt_tokens)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatCount(entry.completion_tokens)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatLatency(entry.avg_latency_ms)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {formatLatency(entry.p95_latency_ms)}
+                        </td>
+                        <td className="py-1.5 text-right text-xs text-muted-foreground">
+                          {entry.last_used_at
+                            ? `${formatAge(secondsAgo(entry.last_used_at))} ago`
+                            : "n/a"}
+                        </td>
+                      </tr>
+                      {hasTools && isOpen && (
+                        <tr className="border-b border-border/60 last:border-0">
+                          <td colSpan={8} className="bg-muted/40 py-2 pl-8 pr-3">
+                            <table className="w-full max-w-md text-left text-xs">
+                              <thead>
+                                <tr className="text-muted-foreground">
+                                  <th className="pb-1 pr-3 font-medium"><T>Tool</T></th>
+                                  <th className="pb-1 pr-3 text-right font-medium"><T>Calls</T></th>
+                                  <th className="pb-1 pr-3 text-right font-medium"><T>Errors</T></th>
+                                  <th className="pb-1 text-right font-medium"><T>Avg latency</T></th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {entry.tool_calls.map((tool) => (
+                                  <tr key={tool.tool}>
+                                    <td className="max-w-[200px] truncate py-0.5 pr-3 font-medium text-foreground">
+                                      {tool.tool}
+                                    </td>
+                                    <td className="py-0.5 pr-3 text-right tabular-nums">
+                                      {formatCount(tool.calls)}
+                                    </td>
+                                    <td className="py-0.5 pr-3 text-right tabular-nums">
+                                      {tool.errors > 0 ? (
+                                        <Badge tone="err">{formatCount(tool.errors)}</Badge>
+                                      ) : (
+                                        <span className="text-muted-foreground">0</span>
+                                      )}
+                                    </td>
+                                    <td className="py-0.5 text-right tabular-nums">
+                                      {formatLatency(tool.avg_latency_ms)}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
                       )}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatCount(entry.prompt_tokens)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatCount(entry.completion_tokens)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatLatency(entry.avg_latency_ms)}
-                    </td>
-                    <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {formatLatency(entry.p95_latency_ms)}
-                    </td>
-                    <td className="py-1.5 text-right text-xs text-muted-foreground">
-                      {entry.last_used_at
-                        ? `${formatAge(secondsAgo(entry.last_used_at))} ago`
-                        : "n/a"}
-                    </td>
-                  </tr>
-                ))}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>

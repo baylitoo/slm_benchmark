@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from docie_bench.agents import runtime
 from docie_bench.agents.registry import (
     AgentConflictError,
     AgentNotFoundError,
@@ -36,7 +37,13 @@ from docie_bench.agents.runtime import AgentError, complete_agent
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.agents.templates import AGENT_TEMPLATES, template_by_id
 from docie_bench.security import TenantContext, get_quota_manager
+from docie_bench.studio import usage_store
 from docie_bench.telemetry import AGENT_LATENCY, AGENT_PII_DETECTED, AGENT_REQUESTS
+
+# Bound on the disposable usage-frame scan buffer for a raw-relayed stream
+# (see _serve_raw_stream) -- mirrors chat_api._SSE_USAGE_SCAN_LIMIT: a
+# single SSE line ought to be at most one completion frame's worth of JSON.
+_SSE_USAGE_SCAN_LIMIT = 262_144
 
 
 async def agents_tenant_guard(
@@ -212,7 +219,94 @@ async def list_agent_models() -> dict[str, Any]:
     }
 
 
-async def _serve_completion(spec: AgentSpec, request: Request) -> Any:
+def _record_agent_usage(
+    spec: AgentSpec, tenant: TenantContext, started: float, outcome: Any
+) -> None:
+    """One usage-ledger row per agent completion (#261) — the same seam
+    chat_api._record_usage_outcome uses for the generic surfaces, with the
+    agent NAME as ``deployment`` so the Usage view's per-deployment grouping
+    lines each agent up on its own row. ``tool_calls`` rides along when the
+    request ran the tool loop — never present on an error outcome or a
+    tool-less agent.
+
+    The completion's own ``docie_agent.tool_calls`` (#262) carries each
+    call's full ``arguments``/``result`` for the live "Try it" trace view;
+    only ``tool``/``status``/``latency_ms`` are persisted here — the ledger
+    is an aggregate stats table (``usage_store.aggregate_usage``), not a
+    place to durably store arbitrary tool payloads (a document, an OCR
+    dump) on every request.
+    """
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    status = "error" if isinstance(outcome, AgentError) else "ok"
+    if isinstance(outcome, dict):
+        usage = outcome.get("usage")
+        if isinstance(usage, dict):
+            raw_prompt = usage.get("prompt_tokens")
+            raw_completion = usage.get("completion_tokens")
+            prompt_tokens = raw_prompt if isinstance(raw_prompt, int) else None
+            completion_tokens = raw_completion if isinstance(raw_completion, int) else None
+        docie_agent = outcome.get("docie_agent")
+        if isinstance(docie_agent, dict):
+            raw_calls = docie_agent.get("tool_calls")
+            if isinstance(raw_calls, list):
+                tool_calls = [
+                    {
+                        "tool": c.get("tool"),
+                        "status": c.get("status"),
+                        "latency_ms": c.get("latency_ms"),
+                    }
+                    for c in raw_calls
+                    if isinstance(c, dict)
+                ]
+    usage_store.record_usage(
+        deployment=spec.name,
+        surface="agent",
+        tenant_id=tenant.tenant_id,
+        latency_ms=int((time.monotonic() - started) * 1000),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        status=status,
+        tool_calls=tool_calls,
+    )
+
+
+def _agent_stream_strategy(spec: AgentSpec) -> str:
+    """Which streaming strategy a ``stream: true`` request against this
+    agent gets: ``"raw"`` (real per-token SSE relay of the upstream's own
+    chunks), ``"queue"`` (a per-round/per-step JSON event relay — no
+    meaningful token stream exists across a tool-calling round or a
+    workflow step boundary), or ``"buffered"`` (the legacy behavior: the
+    full response is awaited, then re-emitted as ONE SSE chunk).
+
+    ``proxy_security`` always needs the complete response buffered before
+    it can redact PII — streaming raw, unredacted tokens to the client and
+    fixing it up after the fact isn't an option, so it stays ``"buffered"``
+    regardless of ``stream``. Grammar-constrained structured extraction
+    (``ocr_extract``/``vision`` with a schema, or a ``policy:`` extractor)
+    runs through ``_complete_structured_document``'s ``ExtractionService``,
+    a code path with no streaming hookup at all (and, per #346's design
+    review, grammar-constrained JSON is not a good streaming candidate
+    regardless — see the PR description) — also ``"buffered"``. Plain
+    ``ocr`` OCR-only/pipeline modes have no upstream chat call to stream in
+    the first place (a local OCR backend, or ``serving/solutions.py``'s
+    separate ``PipelineSolution`` adapter) — also ``"buffered"``, since
+    faking one SSE chunk around an already-instant local result is exactly
+    right there, not a compromise.
+    """
+    if spec.kind == "proxy_security":
+        return "buffered"
+    if spec.kind == "custom":
+        return "queue" if runtime.agent_wants_tool_loop(spec) else "raw"
+    if spec.kind == "workflow":
+        return "queue"
+    if spec.kind == "ocr" and runtime.ocr_agent_supports_raw_stream(spec):
+        return "raw"
+    return "buffered"
+
+
+async def _serve_completion(spec: AgentSpec, request: Request, tenant: TenantContext) -> Any:
     try:
         body = await request.json()
     except ValueError:
@@ -229,6 +323,16 @@ async def _serve_completion(spec: AgentSpec, request: Request) -> Any:
         )
     wants_stream = bool(body.get("stream"))
     started = time.monotonic()
+
+    if wants_stream:
+        strategy = _agent_stream_strategy(spec)
+        if strategy == "raw":
+            return await _serve_raw_stream(spec, body, tenant, started)
+        if strategy == "queue":
+            return await _serve_queue_stream(spec, body, tenant, started)
+        # strategy == "buffered": fall through to the full-buffer path below,
+        # same as every non-streaming request, then fake a single SSE chunk.
+
     try:
         completion = await complete_agent(spec, body, http_client=_client())
     except AgentError as exc:
@@ -236,13 +340,121 @@ async def _serve_completion(spec: AgentSpec, request: Request) -> Any:
         # upstream_error, ...) — the Observability dashboard groups on it.
         AGENT_REQUESTS.labels(spec.name, spec.kind, exc.error_type).inc()
         AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
+        _record_agent_usage(spec, tenant, started, exc)
         return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
     AGENT_REQUESTS.labels(spec.name, spec.kind, "ok").inc()
     AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
     _record_pii_metrics(spec.name, completion)
+    _record_agent_usage(spec, tenant, started, completion)
     if wants_stream:
         return _single_chunk_sse(completion)
     return JSONResponse(completion)
+
+
+def _sse_event(payload: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+async def _serve_raw_stream(
+    spec: AgentSpec, body: dict[str, Any], tenant: TenantContext, started: float
+) -> Any:
+    """Real per-token SSE relay: the upstream's own streaming chunks are
+    forwarded to the client as they arrive, instead of being buffered and
+    re-emitted as one fake chunk. Connection/upstream-4xx failures are
+    resolved before any byte is relayed, so those still map to a normal
+    JSON error response — only a genuine mid-stream event stream ever
+    reaches ``StreamingResponse`` here.
+    """
+    try:
+        status_code, media_type, byte_iterator = await runtime.stream_agent_raw(
+            spec, dict(body), http_client=_client()
+        )
+    except AgentError as exc:
+        AGENT_REQUESTS.labels(spec.name, spec.kind, exc.error_type).inc()
+        AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
+        _record_agent_usage(spec, tenant, started, exc)
+        return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
+
+    async def relay() -> AsyncIterator[bytes]:
+        # Bytes are relayed to the caller completely unchanged; a SECOND,
+        # disposable line-buffer is fed the same bytes to look for the
+        # final frame's usage block, mirroring
+        # chat_api._stream_chat_completions -- this must never become a
+        # de-facto buffering point for what the client receives.
+        usage: dict[str, Any] | None = None
+        parse_buffer: bytearray | None = bytearray()
+        try:
+            async for chunk in byte_iterator:
+                yield chunk
+                if parse_buffer is not None:
+                    parse_buffer += chunk
+                    if len(parse_buffer) > _SSE_USAGE_SCAN_LIMIT:
+                        parse_buffer = None
+                        continue
+                    *lines, parse_buffer = parse_buffer.split(b"\n")
+                    parse_buffer = bytearray(parse_buffer)
+                    for raw_line in lines:
+                        line = bytes(raw_line).strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = line[len(b"data:") :].strip()
+                        if payload in (b"", b"[DONE]"):
+                            continue
+                        try:
+                            frame = json.loads(payload)
+                        except ValueError:
+                            continue
+                        if isinstance(frame, dict) and isinstance(frame.get("usage"), dict):
+                            usage = frame["usage"]
+        finally:
+            AGENT_REQUESTS.labels(spec.name, spec.kind, "ok").inc()
+            AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
+            outcome = {"usage": usage} if usage is not None else {}
+            _record_agent_usage(spec, tenant, started, outcome)
+
+    return StreamingResponse(relay(), status_code=status_code, media_type=media_type)
+
+
+async def _serve_queue_stream(
+    spec: AgentSpec, body: dict[str, Any], tenant: TenantContext, started: float
+) -> Any:
+    """Per-round/per-step JSON event relay (a ``custom`` agent with
+    ``options.mcp_servers``, or a ``workflow``) — see
+    ``runtime.stream_agent_events`` for the event vocabulary
+    (``tool_call``/``step``/``content``/``error``). Never raises: every
+    failure surfaces as its own ``error`` event so the stream always
+    terminates with ``data: [DONE]``, same convention
+    ``chat_api._stream_chat_with_mcp_tools`` uses.
+    """
+
+    async def relay() -> AsyncIterator[bytes]:
+        outcome: dict[str, Any] | AgentError | None = None
+        try:
+            async for event in runtime.stream_agent_events(spec, dict(body), http_client=_client()):
+                if event["type"] == "content":
+                    completion = event["completion"]
+                    outcome = completion
+                    _record_pii_metrics(spec.name, completion)
+                elif event["type"] == "error":
+                    error = event["error"]
+                    outcome = AgentError(
+                        str(error.get("message", "")),
+                        status_code=500,
+                        error_type=str(error.get("type") or "internal_error"),
+                    )
+                yield _sse_event(event)
+        finally:
+            label = outcome.error_type if isinstance(outcome, AgentError) else "ok"
+            AGENT_REQUESTS.labels(spec.name, spec.kind, label).inc()
+            AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
+            if outcome is None:
+                outcome = AgentError(
+                    "stream ended with no content", status_code=500, error_type="internal_error"
+                )
+            _record_agent_usage(spec, tenant, started, outcome)
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(relay(), media_type="text/event-stream")
 
 
 def _record_pii_metrics(agent_name: str, completion: dict[str, Any]) -> None:
@@ -259,9 +471,13 @@ def _record_pii_metrics(agent_name: str, completion: dict[str, Any]) -> None:
 
 
 @router.post("/chat/completions")
-async def agents_chat_completions(request: Request) -> Any:
+async def agents_chat_completions(
+    request: Request, tenant: Annotated[TenantContext, Depends(agents_tenant_guard)]
+) -> Any:
     # Peek at the model field for routing; _serve_completion re-reads the body
-    # (Starlette caches it, so the double read is free).
+    # (Starlette caches it, so the double read is free). Redeclaring
+    # agents_tenant_guard here reuses the router-level dependency's cached
+    # result for this request rather than re-authenticating.
     try:
         body = await request.json()
     except ValueError:
@@ -283,7 +499,7 @@ async def agents_chat_completions(request: Request) -> Any:
         )
     except AgentRegistryError as exc:
         raise _http_error(exc) from exc
-    return await _serve_completion(spec, request)
+    return await _serve_completion(spec, request, tenant)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +544,9 @@ async def agent_models(name: str) -> dict[str, Any]:
 
 
 @router.post("/{name}/chat/completions")
-async def agent_chat_completions(name: str, request: Request) -> Any:
+async def agent_chat_completions(
+    name: str, request: Request, tenant: Annotated[TenantContext, Depends(agents_tenant_guard)]
+) -> Any:
     try:
         spec = _registry().get(name)
     except AgentNotFoundError:
@@ -339,7 +557,7 @@ async def agent_chat_completions(name: str, request: Request) -> Any:
         )
     except AgentRegistryError as exc:
         raise _http_error(exc) from exc
-    return await _serve_completion(spec, request)
+    return await _serve_completion(spec, request, tenant)
 
 
 def _single_chunk_sse(completion: dict[str, Any]) -> StreamingResponse:

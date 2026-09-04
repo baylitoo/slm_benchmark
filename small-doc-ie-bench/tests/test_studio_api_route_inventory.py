@@ -25,6 +25,9 @@ import docie_bench.api as api
 EXPECTED_STUDIO_ROUTES = {
     ("POST", "/v1/studio/extract"),
     ("POST", "/v1/studio/render-document"),
+    # Session-scoped docs-search uploads (#296): a Playground attachment
+    # becomes searchable for the CURRENT conversation only.
+    ("POST", "/v1/studio/session-documents"),
     ("GET", "/v1/studio/datasets"),
     ("POST", "/v1/studio/datasets/{name}/validate"),
     ("GET", "/v1/studio/model-profiles"),
@@ -73,4 +76,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 36
+    assert len(EXPECTED_STUDIO_ROUTES) == 37

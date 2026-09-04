@@ -1,17 +1,23 @@
 "use client";
 
-import { useState } from "react";
-import { Plug, Wrench } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Plug, RefreshCw, Wrench } from "lucide-react";
 import {
+  deploymentModelType,
   disableMcpServer,
   enableMcpServer,
+  getCodeInterpreterWorkers,
+  getDeployments,
   listMcpCatalog,
+  selectableDeployments,
   testMcpServer,
+  type CodeInterpreterQueue,
   type McpCatalogEntry,
+  type McpCatalogParam,
   type McpTool,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
-import { Alert, Badge, Button, Spinner, TextInput } from "../ui";
+import { Alert, Badge, Button, Select, Spinner, TextInput } from "../ui";
 import { useToast } from "../Toast";
 import { T } from "@/lib/i18n";
 
@@ -22,6 +28,18 @@ import { T } from "@/lib/i18n";
 
 export function McpView({ active = true }: { active?: boolean }) {
   const catalog = useAsync<McpCatalogEntry[]>("mcp-catalog", listMcpCatalog);
+  // Only fetched for the "model_profile" param kind (call-llm's
+  // default_model_profile) — a select of live chat-capable deployments so a
+  // typo'd profile name is a config-time error, not a silent call_llm failure.
+  const deployments = useAsync("deployments", getDeployments);
+  const chatDeployments = useMemo(
+    () =>
+      selectableDeployments(deployments.data ?? [])
+        .filter((d) => deploymentModelType(d) === "chat")
+        .map((d) => d.spec?.name)
+        .filter((n): n is string => !!n),
+    [deployments.data],
+  );
   const { toast } = useToast();
   const [busy, setBusy] = useState<string | null>(null);
   const [params, setParams] = useState<Record<string, Record<string, string>>>({});
@@ -123,17 +141,19 @@ export function McpView({ active = true }: { active?: boolean }) {
                 </Badge>
               ))}
             </div>
+            {entry.name === "code-interpreter" && entry.enabled && <CodeInterpreterWorkers />}
             {entry.params.map((param) => (
-              <TextInput
+              <McpParamInput
                 key={param.name}
-                aria-label={`${entry.name} ${param.name}`}
-                placeholder={param.description}
+                entryName={entry.name}
+                param={param}
                 disabled={entry.enabled}
                 value={params[entry.name]?.[param.name] ?? ""}
-                onChange={(e) =>
+                chatDeployments={chatDeployments}
+                onChange={(value) =>
                   setParams((prev) => ({
                     ...prev,
-                    [entry.name]: { ...prev[entry.name], [param.name]: e.target.value },
+                    [entry.name]: { ...prev[entry.name], [param.name]: value },
                   }))
                 }
               />
@@ -172,6 +192,138 @@ export function McpView({ active = true }: { active?: boolean }) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// One catalog param's enable-form widget, branched on `param.kind`:
+// "number" is a TextInput with type="number"; "enum" and "model_profile"
+// are a <Select> (fixed choices, or live chat deployments respectively);
+// "text" (default) is the original free-typed TextInput, secret-masking
+// included.
+function McpParamInput({
+  entryName,
+  param,
+  disabled,
+  value,
+  chatDeployments,
+  onChange,
+}: {
+  entryName: string;
+  param: McpCatalogParam;
+  disabled: boolean;
+  value: string;
+  chatDeployments: string[];
+  onChange: (value: string) => void;
+}) {
+  const label = `${entryName} ${param.name}`;
+  if (param.kind === "enum") {
+    return (
+      <Select
+        aria-label={label}
+        title={param.description}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="" />
+        {param.choices.map((choice) => (
+          <option key={choice} value={choice}>
+            {choice}
+          </option>
+        ))}
+      </Select>
+    );
+  }
+  if (param.kind === "model_profile") {
+    return (
+      <Select
+        aria-label={label}
+        title={param.description}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="" />
+        {chatDeployments.map((name) => (
+          <option key={name} value={name}>
+            {name}
+          </option>
+        ))}
+      </Select>
+    );
+  }
+  return (
+    <TextInput
+      type={param.kind === "number" ? "number" : param.secret ? "password" : "text"}
+      aria-label={label}
+      placeholder={param.description}
+      disabled={disabled}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    />
+  );
+}
+
+// Judge0's own worker-pool/queue status (#264), nested here rather than a
+// new page: an operator enabling code-interpreter wants to know whether its
+// sandbox is actually staffed, not just that the MCP handshake succeeded.
+function CodeInterpreterWorkers() {
+  const [queues, setQueues] = useState<CodeInterpreterQueue[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await getCodeInterpreterWorkers();
+      setQueues(res.queues);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div className="rounded-md border border-border bg-muted/40 p-2 text-xs">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="font-medium text-muted-foreground">
+          <T>Sandbox worker pool</T>
+        </span>
+        <button
+          type="button"
+          aria-label="Refresh worker pool"
+          onClick={() => void load()}
+          className="text-muted-foreground hover:text-foreground"
+        >
+          <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+        </button>
+      </div>
+      {error ? (
+        <p className="text-destructive"><T>Couldn&apos;t reach the sandbox.</T> {error}</p>
+      ) : queues === null ? (
+        <p className="text-muted-foreground"><T>Loading…</T></p>
+      ) : (
+        <div className="space-y-1">
+          {queues.map((q) => (
+            <div key={q.queue} className="flex items-center gap-3">
+              <span className="w-16 shrink-0 truncate">{q.queue}</span>
+              <Badge tone={q.available > 0 ? "ok" : "warn"}>{q.available} workers</Badge>
+              <span className="text-muted-foreground">
+                {q.idle} idle · {q.working} working · {q.size} queued
+              </span>
+              {q.failed > 0 && <Badge tone="err">{q.failed} failed</Badge>}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

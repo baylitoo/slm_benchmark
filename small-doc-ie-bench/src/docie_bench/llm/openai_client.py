@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -222,6 +223,127 @@ class OpenAICompatibleClient:
         except json.JSONDecodeError:
             return False
 
+    async def _post_chat_streamed(
+        self, payload: dict[str, Any], on_delta: Callable[[str], None]
+    ) -> tuple[httpx.Response, dict[str, Any]]:
+        """Streaming counterpart to the plain ``self._client.post(...)`` call
+        below -- same request, ``stream: true`` + ``stream_options`` added
+        (the convention ``chat_api._post_upstream_streamed`` already
+        established), each ``delta.content`` fragment pushed to ``on_delta``
+        the instant it arrives.
+
+        Returns ``(resp, data)`` where ``resp`` is the real ``httpx.Response``
+        (its body read via ``aread()`` before returning on a >=400 status, so
+        ``resp.text``/``.status_code`` behave exactly like the non-streaming
+        path's response for the caller's existing error handling) and
+        ``data`` is a dict reconstructed to EXACTLY the shape
+        ``resp.json()`` returns for an equivalent non-streaming request
+        (``choices[0].message.{content, reasoning_content}``, ``usage`` from
+        the trailing frame, ``choices[0].logprobs`` when the caller asked for
+        per-token logprobs) -- so every line below this method that consumes
+        ``data`` needs no branching of its own.
+
+        ``content`` is always a string (``""`` when the stream produced zero
+        content deltas), never ``None`` -- a zero-content stream must clean
+        to empty and hit the SAME response-format downgrade the blocking
+        path takes for an empty 200, not a hard "content must be text" raise
+        that would bypass the negotiation ladder entirely.
+        """
+        body = dict(payload)
+        body["stream"] = True
+        stream_options = dict(body.get("stream_options") or {})
+        stream_options.setdefault("include_usage", True)
+        body["stream_options"] = stream_options
+
+        async with self._client.stream("POST", "/chat/completions", json=body) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+                return resp, {}
+
+            role = "assistant"
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            logprobs_parts: list[dict[str, Any]] = []
+            finish_reason: str | None = None
+            usage: dict[str, Any] | None = None
+            completion_id = ""
+            model_name = str(payload.get("model") or "")
+
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[len("data:") :].strip()
+                if chunk in ("", "[DONE]"):
+                    continue
+                try:
+                    frame = json.loads(chunk)
+                except ValueError:
+                    continue
+                if not isinstance(frame, dict):
+                    continue
+                frame_id = frame.get("id")
+                if isinstance(frame_id, str) and frame_id:
+                    completion_id = frame_id
+                frame_model = frame.get("model")
+                if isinstance(frame_model, str) and frame_model:
+                    model_name = frame_model
+                frame_usage = frame.get("usage")
+                if isinstance(frame_usage, dict):
+                    # Sent on the TRAILING frame (stream_options.include_usage,
+                    # set above) -- a later frame's usage always wins, but
+                    # there is normally at most one.
+                    usage = frame_usage
+                choices = frame.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    continue
+                choice_finish = choice.get("finish_reason")
+                if isinstance(choice_finish, str) and choice_finish:
+                    finish_reason = choice_finish
+                choice_logprobs = choice.get("logprobs")
+                if isinstance(choice_logprobs, dict):
+                    lp_content = choice_logprobs.get("content")
+                    if isinstance(lp_content, list):
+                        logprobs_parts.extend(
+                            entry for entry in lp_content if isinstance(entry, dict)
+                        )
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                delta_role = delta.get("role")
+                if isinstance(delta_role, str) and delta_role:
+                    role = delta_role
+                content_piece = delta.get("content")
+                if isinstance(content_piece, str) and content_piece:
+                    content_parts.append(content_piece)
+                    on_delta(content_piece)
+                reasoning_piece = delta.get("reasoning_content")
+                if isinstance(reasoning_piece, str) and reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+
+            message: dict[str, Any] = {"role": role, "content": "".join(content_parts)}
+            if reasoning_parts:
+                message["reasoning_content"] = "".join(reasoning_parts)
+            choice_data: dict[str, Any] = {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+            if logprobs_parts:
+                choice_data["logprobs"] = {"content": logprobs_parts}
+            data: dict[str, Any] = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "model": model_name,
+                "choices": [choice_data],
+            }
+            if usage is not None:
+                data["usage"] = usage
+            return resp, data
+
     async def chat_json(
         self,
         *,
@@ -233,6 +355,23 @@ class OpenAICompatibleClient:
         chat_template_kwargs: dict[str, Any] | None = None,
         max_tokens: int | None = None,
         assistant_prefill: str | None = None,
+        request_logprobs: bool = False,
+        # Additive, opt-in live preview (#397): raw content-delta fragments
+        # for the CURRENT attempt, pushed as they stream in. Never a
+        # replacement for this method's return value -- chat_json still
+        # post-processes the model's raw output (negotiation ladder,
+        # mojibake fix, JSON cleanup) after the stream ends, and that
+        # processed result is the only thing callers should treat as
+        # authoritative. `on_delta=None` (the default) takes the exact same
+        # blocking, non-streaming code path this method always has.
+        on_delta: Callable[[str], None] | None = None,
+        # Fires when a PREVIOUS attempt already streamed deltas and a new
+        # attempt (a response-format downgrade, a reasoning-disable retry, or
+        # a gateway-level transient retry) is about to start -- the caller
+        # must clear its live buffer, or it keeps painting fragments from an
+        # abandoned attempt alongside the new one. Never fires before the
+        # very first delta of the whole call.
+        on_reset: Callable[[], None] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         import time as _time
 
@@ -275,6 +414,13 @@ class OpenAICompatibleClient:
                 payload["response_format"] = response_format
             if self.profile.stop_sequences:
                 payload["stop"] = list(self.profile.stop_sequences)
+            if request_logprobs:
+                # Opt-in, llama.cpp-only per-token confidence signal (#335,
+                # see extract/logprob_confidence.py). Only the CHOSEN token's
+                # own logprob is needed for MIN-aggregation, not runner-up
+                # alternatives, so top_logprobs stays at the minimum (1).
+                payload["logprobs"] = True
+                payload["top_logprobs"] = 1
             payload.update(extra_body)
             if chat_template_kwargs:
                 merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
@@ -300,6 +446,7 @@ class OpenAICompatibleClient:
                 "docie_response_format_ladder": list(ladder),
                 "docie_max_tokens": output_budget,
                 "docie_assistant_prefill": assistant_prefill is not None,
+                "docie_request_logprobs": request_logprobs,
                 **(
                     {
                         "docie_system_prompt": system_prompt,
@@ -311,6 +458,17 @@ class OpenAICompatibleClient:
                 "docie_image_count": len(image_urls or []),
             },
         )
+
+        # Shared across every operation() invocation, INCLUDING one the
+        # gateway's own transient-error retry re-enters from scratch (ladder
+        # position 0 again) -- a single-element list so the closures below
+        # can mutate it; a plain outer variable can't be reassigned from a
+        # nested function without `nonlocal` scattered through two closures.
+        streamed_any_delta = [False]
+
+        def delta_cb(text: str) -> None:
+            streamed_any_delta[0] = True
+            on_delta(text)  # type: ignore[misc]  # only called when on_delta is not None
 
         async def operation() -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
             # Walk the negotiation ladder: HTTP/transport failures raise (so the
@@ -331,7 +489,21 @@ class OpenAICompatibleClient:
                     force_disable_reasoning=force_disable_reasoning,
                     use_prefill=use_prefill,
                 )
-                resp = await self._client.post("/chat/completions", json=request_payload)
+                streamed_data: dict[str, Any] | None = None
+                if on_delta is None:
+                    resp = await self._client.post("/chat/completions", json=request_payload)
+                else:
+                    # A previous attempt (in THIS call, or a prior gateway-
+                    # level retry that re-entered operation() from scratch)
+                    # already streamed deltas the caller rendered -- this
+                    # fresh attempt must not paint alongside them.
+                    if streamed_any_delta[0]:
+                        if on_reset is not None:
+                            on_reset()
+                        streamed_any_delta[0] = False
+                    resp, streamed_data = await self._post_chat_streamed(
+                        request_payload, delta_cb
+                    )
                 llm_latency_ms = int((_time.perf_counter() - t0) * 1000)
 
                 if resp.status_code >= 400:
@@ -397,12 +569,15 @@ class OpenAICompatibleClient:
                         },
                     )
                     raise classify_response_error(resp)
-                try:
-                    data = resp.json()
-                except ValueError as exc:
-                    raise InvalidModelResponseError(
-                        "Model endpoint returned invalid JSON"
-                    ) from exc
+                if on_delta is None:
+                    try:
+                        data = resp.json()
+                    except ValueError as exc:
+                        raise InvalidModelResponseError(
+                            "Model endpoint returned invalid JSON"
+                        ) from exc
+                else:
+                    data = streamed_data or {}
                 try:
                     message = data["choices"][0]["message"]
                     content = message["content"]
