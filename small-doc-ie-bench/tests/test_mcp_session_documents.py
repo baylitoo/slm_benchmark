@@ -102,6 +102,26 @@ def test_save_document_enforces_the_per_session_file_count_cap(
         get_settings.cache_clear()
 
 
+def test_save_document_file_count_cap_ignores_summary_sidecars(
+    session_root: Path, monkeypatch
+) -> None:
+    # A doc_summarization sidecar ("<name>.summary.json", #430) sits in the
+    # same session directory as the document it describes -- counting it
+    # against the cap would silently halve how many documents a session can
+    # actually hold once summarization is enabled.
+    monkeypatch.setenv("MCP_SESSION_DOCUMENTS_MAX_FILES", "2")
+    get_settings.cache_clear()
+    try:
+        session_id, stored_name = sd.save_document(None, "a.pdf", b"1")
+        (session_root / session_id / f"{stored_name}.summary.json").write_text(
+            '{"state": "ready", "summary": "x"}', encoding="utf-8"
+        )
+        sd.save_document(session_id, "b.pdf", b"2")  # must not raise
+        assert len(list((session_root / session_id).glob("*"))) == 3
+    finally:
+        get_settings.cache_clear()
+
+
 def test_session_documents_dir_resolves_an_issued_session(session_root: Path) -> None:
     session_id, _ = sd.save_document(None, "a.pdf", b"x")
     assert sd.session_documents_dir(session_id) == session_root / session_id

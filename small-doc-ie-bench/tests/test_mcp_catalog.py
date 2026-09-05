@@ -205,6 +205,38 @@ def test_list_documents_only_lists_supported_files_recursively(docs: Path) -> No
     assert docs_search.list_documents() == ["a.txt", "sub/b.pdf"]
 
 
+def test_list_files_with_summaries_omits_summary_when_no_sidecar(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+    assert docs_search.list_files_with_summaries() == [{"path": "a.txt"}]
+
+
+def test_list_files_with_summaries_reports_ready_and_pending_states(docs: Path) -> None:
+    (docs / "a.txt").write_text("hello")
+    (docs / "b.txt").write_text("world")
+    (docs / "c.txt").write_text("nope")
+    docs_search.write_summary_state(docs / "a.txt", "ready", "An invoice from Acme Corp.")
+    docs_search.write_summary_state(docs / "b.txt", "summarizing")
+    docs_search.write_summary_state(docs / "c.txt", "failed")
+    assert docs_search.list_files_with_summaries() == [
+        {"path": "a.txt", "summary": "An invoice from Acme Corp."},
+        {"path": "b.txt", "summary": "(summarizing...)"},
+        {"path": "c.txt"},
+    ]
+
+
+def test_read_summary_is_none_for_a_document_with_no_sidecar(docs: Path) -> None:
+    doc = docs / "a.txt"
+    doc.write_text("hello")
+    assert docs_search.read_summary(doc) is None
+
+
+def test_read_summary_survives_a_corrupt_sidecar_file(docs: Path) -> None:
+    doc = docs / "a.txt"
+    doc.write_text("hello")
+    docs_search.summary_sidecar_path(doc).write_text("not json", encoding="utf-8")
+    assert docs_search.read_summary(doc) is None
+
+
 def test_resolve_document_rejects_escape_attempts(docs: Path) -> None:
     (docs / "a.txt").write_text("hello")
     # A POSIX-rooted path isn't `.is_absolute()` on a Windows test runner (no
