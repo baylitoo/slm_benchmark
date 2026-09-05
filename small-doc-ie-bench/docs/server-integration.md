@@ -53,12 +53,25 @@ exists and requires nothing beyond the API key each app already has:
 GET /v1/studio/runs/{event_id}
 ```
 
-For an extraction event (no durable DB row) this proxies Inngest's own
-`GET /v1/events/{id}/runs` (`src/docie_bench/inngest/studio_api/runs.py`),
-tenant-scoped by the ownership check above. Poll it until the run's status is
-terminal; the function's return value — the full extraction result, same
-shape as every other extraction response — is under `output` on the
-completed run entry.
+For an extraction event this is backed by a durable result row
+(`ExtractionRunResult`, `src/docie_bench/studio/extraction_results.py`) that
+`extract_document` writes on completion, tenant-scoped by the ownership
+check above. Poll it until the run's status is terminal; the function's
+return value — the full extraction result, same shape as every other
+extraction response — is under `output` on the completed run entry.
+
+**Correction (fixed in PR #419, previously wrong in this doc):** this
+endpoint originally proxied Inngest's own `GET /v1/events/{id}/runs` for
+extraction runs, on the assumption (grounded in Inngest's official Cloud
+docs) that its response carries `output` on completion. A real integration
+test against this project's self-hosted `inngest start` server found that
+assumption false — the self-hosted REST API does not reliably carry
+`output`, so a plain HTTP poller got status updates but never the actual
+result. `extract_document` now records its own outcome durably instead of
+depending on Inngest's proxy for it; the Inngest proxy is now only a
+fallback for a still-running extraction's interim status. The response
+shape (`[0].status` / `[0].output`) is unchanged, so the reference client
+below did not need to change.
 
 Reference client (plain `requests`, no Inngest SDK):
 
@@ -106,11 +119,12 @@ curl -sS "$BASE/runs/$EVENT_ID" -H "X-API-Key: $API_KEY"
 # repeat until status is terminal, then read .[0].output
 ```
 
-**Not independently verified this session:** the exact `status` string casing
-returned by the Inngest proxy (`Completed`/`Failed`/... above is Inngest's
-documented convention, read from code, not exercised against a live stack —
-no docker/live-model calls were run in this session). Confirm the exact
-values once against a running stack before hardening the poll-loop check.
+The durable-result path returns exactly `"Completed"` or `"Failed"` (set by
+DocIE's own code, not Inngest's), so the reference client's status check is
+authoritative for a finished run. The `"Cancelled"` value in the client only
+applies to the (now fallback-only) still-running proxy path, whose exact
+string casing is Inngest's own convention and was not independently
+re-verified this session.
 
 If a future need for push-style delivery (no polling) emerges, `GET
 /v1/studio/realtime-token` mints an Inngest realtime subscription JWT for the
@@ -123,9 +137,14 @@ caller that already has an Inngest SDK.
 
 `POST /schemas/dynamic` takes a `DynamicSchemaSpec`
 (`src/docie_bench/schemas/dynamic.py`): a `document_type` name plus a flat
-list of fields, each `string | date | number | money | object | list`. An
-`object`/`list` field nests its own field list one level deep (list = list of
-that nested shape).
+list of fields, each `string | date | number | money | object | list`.
+`object` nests a fixed, non-repeated group (e.g. a `contact` block); `list`
+nests a repeated group. Nesting recurses arbitrarily — a `list` can nest
+another `list` (e.g. `skills[].items[]`, a skill category containing a list
+of skill strings) — there is no depth cap in the code, only the `max_length=40`
+item-count cap on each individual field list (root fields ≤40, and each
+nested object/list's own children ≤40 independently — not a global recursive
+node-count budget).
 
 Both target schemas were authored and round-tripped in-process (spec →
 validated pydantic model → NuExtract template) as part of this audit — this
@@ -184,11 +203,19 @@ traded against losing per-item evidence) if ADBI's consumers end up wanting
 flatter JSON — that decision is intentionally left open here rather than
 built unilaterally.
 
-**Not run this session:** live extraction against a real sample CV/contract
-through a deployed model (no docker/live-model calls in this session, per
-standing project constraint). The spec/model/template round-trip above is
-verified; the model's actual field-level accuracy on real resumes/contracts
-is not.
+**Update:** ADBI registered their real `resume`, `contract`, and `kbis`
+schemas live (`POST /schemas/dynamic` against a running stack, not just the
+in-process construction check above) as their first integration test — all
+three registered clean, including a `resume` with a `contact` object block
+and a two-level `skills[].items[]` nesting, confirming both the `object`
+type and multi-level list nesting above are real, not just spec-compiled.
+Live extraction *accuracy* against real sample documents (as opposed to
+schema registration) is still their own team's evaluation to run — in
+particular, budget real eval time on any long free-text field before
+trusting it in a downstream matching/ranking algorithm; long free-text
+fields with no fixed vocabulary are typically the weakest spot for small
+extraction models, a caution based on the field's shape, not a measured
+result.
 
 ## 4. Is one DocIE instance fit to serve all four apps concurrently?
 
