@@ -31,6 +31,7 @@ from docie_bench.serving.catalog import (
 from docie_bench.serving.resources import (
     DEFAULT_CONTEXT_LENGTH,
     KV_CACHE_BYTES_PER_TOKEN,
+    LFM2_KV_CACHE_BYTES_PER_TOKEN,
     RUNTIME_OVERHEAD_BYTES,
     FootprintStore,
     NodeMemory,
@@ -181,12 +182,44 @@ def test_predicted_footprint_is_the_planner_formula() -> None:
     )
 
 
-def test_footprint_is_max_of_observed_and_predicted() -> None:
-    """The design's calibration rule: trust the measurement once there is one,
-    fall back to the formula for models never yet run — never the minimum."""
+def test_footprint_prefers_a_calibrated_observation_over_the_formula() -> None:
+    """A calibrated observed_steady_rss has already passed
+    ResourceTracker._calibrate's own stabilization gate (N consecutive hot
+    cycles, non-climbing RSS) -- it is ground truth, so it replaces the
+    formula's guess in EITHER direction, not just when it's higher. Only
+    with no calibration at all (never run) does the formula's guess stand."""
     assert footprint_bytes(3 * GIB, None) == 3 * GIB  # never run: formula
-    assert footprint_bytes(3 * GIB, 2 * GIB) == 3 * GIB  # fresh mmap'd RSS below prediction
-    assert footprint_bytes(3 * GIB, 5 * GIB) == 5 * GIB  # measurement wins
+    assert footprint_bytes(3 * GIB, 2 * GIB) == 2 * GIB  # calibrated observation wins low
+    assert footprint_bytes(3 * GIB, 5 * GIB) == 5 * GIB  # calibrated observation wins high
+
+
+def test_lfm2_family_uses_its_own_much_smaller_kv_cache_constant() -> None:
+    """LFM2/LFM2.5 is a hybrid conv+attention architecture -- most layers are
+    short gated convolutions with no growing KV state at all, and the real
+    attention layers use GQA (8 KV heads). The generic constant is a real
+    overestimate for it (derived from LiquidAI's own published config.json
+    for 350M/1.2B/2.6B -- see the constant's own comment for the math)."""
+    assert LFM2_KV_CACHE_BYTES_PER_TOKEN < KV_CACHE_BYTES_PER_TOKEN
+    weights = 1 * GIB
+    context = 65_536
+    generic = predict_footprint_bytes(weights, context_length=context)
+    lfm2 = predict_footprint_bytes(weights, context_length=context, family="lfm2")
+    lfm2_vl = predict_footprint_bytes(weights, context_length=context, family="lfm2_vl")
+    assert lfm2 < generic
+    assert lfm2 == lfm2_vl  # same LLM backbone shape; mmproj is priced separately
+    assert lfm2 == weights + LFM2_KV_CACHE_BYTES_PER_TOKEN * context + RUNTIME_OVERHEAD_BYTES
+
+
+def test_unknown_or_missing_family_keeps_the_generic_constant() -> None:
+    weights = 1 * GIB
+    context = 8192
+    baseline = predict_footprint_bytes(weights, context_length=context)
+    assert predict_footprint_bytes(weights, context_length=context, family=None) == baseline
+    assert (
+        predict_footprint_bytes(weights, context_length=context, family="openai_chat")
+        == baseline
+    )
+    assert predict_footprint_bytes(weights, context_length=context, family="vllm") == baseline
 
 
 def test_weights_come_from_store_size_or_stat_never_the_registry(tmp_path: Path) -> None:
