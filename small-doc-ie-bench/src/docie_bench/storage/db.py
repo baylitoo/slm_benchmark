@@ -350,6 +350,12 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.usage_store import ensure_usage_record_table
 
     ensure_usage_record_table(_engine)
+    # Same race again: extraction_run_results is new (durable extraction
+    # outcome the plain-HTTP polling fallback reads before ever touching the
+    # Inngest proxy).
+    from docie_bench.studio.extraction_results import ensure_extraction_result_table
+
+    ensure_extraction_result_table(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:
