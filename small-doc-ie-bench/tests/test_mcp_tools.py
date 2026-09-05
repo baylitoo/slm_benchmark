@@ -340,6 +340,10 @@ async def test_run_tool_loop_eagerly_lists_docs_search_files_before_the_first_ro
     # over an earlier system note and call list_files again anyway -- an
     # explicit prohibition, not just information, heads that off.
     assert "do not call list_files again" in system_content.lower()
+    # list_files now returns objects (path + optional summary, #430) rather
+    # than bare strings -- without this, a model could pass a whole entry,
+    # or its `summary` field, as if it were the identifier.
+    assert "never the whole object and never a different field" in system_content.lower()
 
 
 async def test_run_tool_loop_skips_eager_listing_when_no_catalog_entry_declares_one() -> None:
