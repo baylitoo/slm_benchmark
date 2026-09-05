@@ -210,7 +210,12 @@ async def upload_session_document(
     import base64
     import binascii
 
-    from docie_bench.mcp_session_documents import SessionDocumentError, save_document
+    from docie_bench.doc_summarization import spawn_summarize_document
+    from docie_bench.mcp_session_documents import (
+        SessionDocumentError,
+        save_document,
+        session_documents_dir,
+    )
 
     try:
         raw = base64.b64decode(payload.content_b64, validate=True)
@@ -220,4 +225,9 @@ async def upload_session_document(
         session_id, stored_name = save_document(payload.session_id, payload.filename, raw)
     except SessionDocumentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Fire-and-forget: a quick description in list_files is enrichment, not
+    # something this upload response should block on (see doc_summarization
+    # module docstring). No-ops immediately if doc_summary_model is unset.
+    document_path = session_documents_dir(session_id) / stored_name
+    spawn_summarize_document(document_path)
     return UploadSessionDocumentResponse(session_id=session_id, stored_name=stored_name)
