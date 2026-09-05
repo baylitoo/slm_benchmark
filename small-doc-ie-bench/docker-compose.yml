@@ -396,8 +396,18 @@ services:
     image: prom/prometheus:v2.55.0
     profiles: ["observability"]
     volumes:
-      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./infra/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      # A single directory mount, not one bind mount per file: if a bind
+      # mount's HOST source path does not exist yet, Docker auto-creates it
+      # as an empty DIRECTORY before starting the container. Adding rules.yml
+      # here as its own file mount hit exactly that on a deploy platform that
+      # copies the built repo into a persistent host directory on every
+      # deploy (Coolify) -- a container start that raced ahead of that copy
+      # left a stray `rules.yml` directory, and every deploy afterward failed
+      # trying to copy the real file on top of it (`docker cp`: "cannot
+      # overwrite directory with non-directory"). The whole directory has
+      # existed since before this compose file did, so mounting it as one
+      # unit never hits the missing-source auto-mkdir path.
+      - ./infra/prometheus:/etc/prometheus:ro
     ports:
       # Bound to loopback only (127.0.0.1): Prometheus ships with no auth of
       # its own, so publishing it to 0.0.0.0 hands out raw metrics + its
