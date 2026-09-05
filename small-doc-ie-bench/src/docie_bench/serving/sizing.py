@@ -262,19 +262,23 @@ def price_model(
     """(predicted, calibrated, working footprint) for one store row.
 
     ``predicted`` from the PR-2 formula (store ``size_bytes`` or on-disk stat,
-    mmproj-aware); ``calibrated`` from the steady-state RSS sidecar keyed by
-    the store entry's launch model path; working footprint =
-    ``max(calibrated, predicted)`` — the tracker's calibration rule. All three
-    are ``None``-honest: a model with no known weights AND no calibration is
+    mmproj-aware, family-aware per-token KV cost -- see
+    ``resources._kv_cache_bytes_per_token``); ``calibrated`` from the
+    steady-state RSS sidecar keyed by the store entry's launch model path;
+    working footprint favors a calibrated observation over the formula once
+    one exists (see ``resources.footprint_bytes``). All three are
+    ``None``-honest: a model with no known weights AND no calibration is
     unpriceable, never zero.
     """
     model_path = row.get("model_path")
+    family = row.get("family")
     predicted = predicted_footprint_for_model(
         size_bytes=row.get("size_bytes"),
         model_path=str(model_path) if model_path else None,
         context_length=context_length,
         n_parallel=n_parallel,
         mmproj_bytes=_mmproj_bytes(row),
+        family=str(family) if family else None,
     )
     calibrated = footprints.get(str(model_path)) if model_path else None
     if predicted is None and calibrated is None:

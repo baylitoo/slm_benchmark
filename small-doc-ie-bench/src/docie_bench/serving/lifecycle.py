@@ -131,7 +131,8 @@ def _predicted_for(launch: RuntimeLaunchSpec) -> int | None:
 
 
 def price_launch(launch: RuntimeLaunchSpec, footprints: FootprintStore) -> int | None:
-    """``max(calibrated steady RSS, predicted)`` for a launch — THE currency.
+    """The calibrated footprint for a launch (see ``resources.footprint_bytes``)
+    — THE currency.
 
     Shared by the fit gate ("what a candidate needs") and eviction pricing
     ("what a victim frees"), so the two can never drift. ``None`` =
