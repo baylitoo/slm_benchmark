@@ -187,6 +187,34 @@ def test_tool_calls_supported_is_persisted_on_the_deployment_record(tmp_path: Pa
     assert supervisor.get("invoice").tool_calls_supported is True
 
 
+def test_run_cycle_exports_deployment_metrics(tmp_path: Path) -> None:
+    """Each cycle must export the deployment's health/phase as Prometheus
+    gauges (docie_deployment_healthy / docie_deployment_phase) -- otherwise a
+    stuck extraction or a wedged deployment has no metric an alert can fire
+    on before a caller's request to it times out silently."""
+    from docie_bench.serving.reconciler import _DEPLOYMENT_PHASES
+    from docie_bench.telemetry import DEPLOYMENT_HEALTHY, DEPLOYMENT_PHASE
+
+    supervisor, adapter, reconciler, _ = _build(tmp_path, fit=(False, "would OOM"))
+    record = supervisor.deploy(_spec())
+    reconciler.run_cycle()  # observe hot
+
+    assert DEPLOYMENT_HEALTHY.labels("invoice")._value.get() == 1.0
+    assert DEPLOYMENT_PHASE.labels("invoice", "hot")._value.get() == 1.0
+    for phase in _DEPLOYMENT_PHASES:
+        if phase != "hot":
+            assert DEPLOYMENT_PHASE.labels("invoice", phase)._value.get() == 0.0
+
+    adapter.crash(record.pid)
+    reconciler.run_cycle()  # dead pid -> fast-fail, restart withheld (fit denies)
+
+    assert DEPLOYMENT_HEALTHY.labels("invoice")._value.get() == 0.0
+    assert DEPLOYMENT_PHASE.labels("invoice", "failed")._value.get() == 1.0
+    # The stale "hot=1" from the previous cycle must be cleared, not just left
+    # unset -- a Gauge never resets a label combo nobody re-sets.
+    assert DEPLOYMENT_PHASE.labels("invoice", "hot")._value.get() == 0.0
+
+
 def test_crashed_ready_deployment_fails_fast_without_respawn_when_fit_denies(
     tmp_path: Path,
 ) -> None:

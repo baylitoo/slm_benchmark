@@ -546,6 +546,7 @@ services:
     profiles: ["observability"]
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
     ports:
       # Bound to loopback only (127.0.0.1): Prometheus ships with no auth of
       # its own, so publishing it to 0.0.0.0 hands out raw metrics + its

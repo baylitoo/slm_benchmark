@@ -46,6 +46,7 @@ from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 from docie_bench.serving.seed_progress import clear_progress, write_progress
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
+from docie_bench.studio.extraction_results import record_extraction_result
 
 logger = logging.getLogger("docie_bench.inngest.functions")
 
@@ -560,6 +561,7 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
     """
     data = dict(ctx.event.data or {})
     channel = str(data.get("channel") or f"run:{ctx.event.id}")
+    tenant_id = str(data.get("tenant_id") or "anonymous")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "schema": data.get("schema_name")})
     try:
@@ -567,8 +569,17 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
         result = await ctx.step.run("extract", lambda: _run_extraction(data))
     except Exception as exc:  # noqa: BLE001 - surface error to the channel then re-raise
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+        # Durable counterpart to the realtime error topic above -- see
+        # ExtractionRunResult's docstring for why GET /v1/studio/runs/{id}
+        # needs this rather than relying on Inngest's own proxy.
+        record_extraction_result(
+            event_id=ctx.event.id, tenant_id=tenant_id, status="failed", error=str(exc)
+        )
         raise
     await publish(channel, TOPIC_RESULT, result)
+    record_extraction_result(
+        event_id=ctx.event.id, tenant_id=tenant_id, status="completed", output=result
+    )
     return result
 
 
