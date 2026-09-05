@@ -132,7 +132,12 @@ async def summarize_document(
         return
 
     try:
-        page_texts = extract_page_texts(document_path)
+        # extract_page_texts (liteparse + OCR fallback) is seconds-to-minutes
+        # of blocking work on a scanned PDF -- this task runs on the SAME
+        # event loop serving every other request, so it must not run this
+        # inline (same hazard studio_api.extract.render_document's rasterize
+        # already offloads via asyncio.to_thread).
+        page_texts = await asyncio.to_thread(extract_page_texts, document_path)
     except Exception:
         logger.exception("doc summarization: text extraction failed for %s", document_path)
         write_summary_state(document_path, "failed")
