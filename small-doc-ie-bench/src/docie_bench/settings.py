@@ -143,6 +143,20 @@ class Settings(BaseSettings):
     mcp_session_documents_max_files: int = Field(default=20, ge=1, le=500)
     mcp_session_documents_max_age_hours: int = Field(default=24, ge=1, le=720)
 
+    # Upload-time rolling summarization (#430): fires when a session document
+    # is saved, so docs-search's list_files can pair a filename with a quick
+    # description instead of the model (or the Playground's attachment
+    # thumbnail) needing to open the file cold. Unset by default -- there is
+    # no universally-right model size for this (a 350M profile suits it, a
+    # bigger one works too, none is also a valid choice for an environment
+    # that hasn't deployed a summarizer), so the feature stays off until an
+    # operator names a live ``store:`` (or models.yaml) profile here. Sized
+    # in pages, not characters, so the loop reads with the same page-anchored
+    # unit the rest of docs-search already uses.
+    doc_summary_model: str | None = None
+    doc_summary_chunk_pages: int = Field(default=4, ge=1, le=20)
+    doc_summary_max_chars: int = Field(default=600, ge=100, le=4000)
+
     # Durable, addressable artifact store for Studio benchmark runs. Must resolve
     # to the SAME location on every replica that reads it (a shared volume or an
     # S3/MinIO mount) — the worker writes here and the api/web replicas read back

@@ -81,6 +81,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -90,6 +91,8 @@ from typing import Any
 from docie_bench.mcp_servers.env_config import int_env
 from docie_bench.ocr.base import stable_block_id
 from docie_bench.schemas.common import BoundingBox, OCRBlock
+
+logger = logging.getLogger(__name__)
 
 DOCS_DIR_ENV = "DOCIE_MCP_DOCS_SEARCH_DIR"
 BACKEND_ENV = "DOCIE_MCP_DOCS_SEARCH_BACKEND"
@@ -420,7 +423,7 @@ class HybridSearchBackend(SearchBackend):
         # pass below, unchanged.
         documents: list[str] = []
         for match in candidates:
-            page_texts = _page_texts(resolve_document(match["path"]))
+            page_texts = extract_page_texts(resolve_document(match["path"]))
             documents.append(page_texts.get(match["page"], match["snippet"]))
         results = _rerank(query, documents, url)
         return [candidates[result["index"]] for result in results]
@@ -513,6 +516,49 @@ def list_documents() -> list[str]:
     )
 
 
+# Rolling-summarization sidecar (#430, see doc_summarization.py). Defined
+# HERE, not there, deliberately: this module runs as a fresh, minimal-env
+# subprocess per chat request (see module docstring) and list_files (below)
+# must cheaply check every document's sidecar on every call; doc_summarization
+# pulls in the full serving stack (profile/placement resolution) to actually
+# GENERATE a summary, which is real weight this subprocess should never have
+# to import just to read one small JSON file back. doc_summarization imports
+# these three from here instead, keeping the dependency direction one-way.
+_SUMMARY_SIDECAR_SUFFIX = ".summary.json"
+
+
+def summary_sidecar_path(document_path: Path) -> Path:
+    return document_path.with_name(document_path.name + _SUMMARY_SIDECAR_SUFFIX)
+
+
+def read_summary(document_path: Path) -> dict[str, Any] | None:
+    """The sidecar's current state for ``document_path``, or ``None`` if
+    summarization was never triggered for it. ``state`` is one of
+    ``"summarizing"``, ``"ready"``, ``"unavailable"`` (no summarizer
+    configured/live), ``"failed"`` (extraction or the model call errored)."""
+    sidecar = summary_sidecar_path(document_path)
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_summary_state(document_path: Path, state: str, summary: str | None = None) -> None:
+    """Write the sidecar. Swallows (and logs) ``OSError`` -- the caller is
+    ``doc_summarization.summarize_document``, a fire-and-forget background
+    job with no one left to handle an exception; a write failure here just
+    means the sidecar stays stale/missing, same as if summarization had
+    never been configured."""
+    sidecar = summary_sidecar_path(document_path)
+    try:
+        sidecar.write_text(json.dumps({"state": state, "summary": summary}), encoding="utf-8")
+    except OSError:
+        logger.exception("doc summarization: could not write sidecar for %s", document_path)
+
+
 def append_note(path: str, page: int, note: str) -> dict[str, Any]:
     """Append one page-anchored note about ``path`` to its persistent note
     file, oldest-first (see ``_notes_dir``/``_notes_path`` for where and how
@@ -583,11 +629,17 @@ PEEK_CHAR_BUDGET = 4000
 MAX_EXPLICIT_RANGE_PAGES = 5
 
 
-def _page_texts(path: Path) -> dict[int, str]:
+def extract_page_texts(path: Path) -> dict[int, str]:
     """Extracted text grouped by page number, in reading order. Shared by
-    ``document_text`` (page-windowed) and ``_full_document_text`` (whole
-    document, for a resource read) so both agree on how pages are
-    assembled from the underlying OCR blocks."""
+    ``document_text`` (page-windowed), ``_full_document_text`` (whole
+    document, for a resource read) and ``search_documents``'s hybrid rerank
+    path so all three agree on how pages are assembled from the underlying
+    OCR blocks. Public (no leading underscore) because
+    ``doc_summarization.summarize_document`` also needs raw per-page text,
+    called from the API process right after an upload -- outside any
+    docs-search MCP subprocess and its per-request ``DOCS_DIR_ENV``
+    override -- so it takes the document's real path directly rather than
+    going through ``resolve_document``/``docs_dir()``."""
     blocks = _extracted_blocks(path)
     pages: dict[int, list[str]] = {}
     for block in blocks:
@@ -607,7 +659,7 @@ def _full_document_text(relative: str) -> str:
     how it uses a large result (page through it, summarize it, discard
     it)."""
     path = resolve_document(relative)
-    page_texts = _page_texts(path)
+    page_texts = extract_page_texts(path)
     return "\n\n".join(page_texts[p] for p in sorted(page_texts))
 
 
@@ -628,7 +680,7 @@ def document_text(
     wider than that.
     """
     path = resolve_document(relative)
-    page_texts = _page_texts(path)
+    page_texts = extract_page_texts(path)
     page_numbers = sorted(page_texts)
     total_pages = len(page_numbers)
 
@@ -701,20 +753,52 @@ def search_documents(query: str, path: str | None = None) -> list[dict[str, Any]
     return get_search_backend(backend_name).search(query, targets)
 
 
+def list_files_with_summaries() -> list[dict[str, Any]]:
+    """``list_documents()``, each entry paired with its summarization
+    sidecar's state when one exists (see ``read_summary``) -- backs the
+    ``list_files`` tool. A pending/failed/unconfigured sidecar renders as
+    "(summarizing...)" or is omitted entirely rather than surfacing an
+    internal state string a model has no use for."""
+    root = docs_dir()
+    entries: list[dict[str, Any]] = []
+    for relative in list_documents():
+        entry: dict[str, Any] = {"path": relative}
+        sidecar = read_summary(root / relative)
+        if sidecar is not None:
+            state = sidecar.get("state")
+            if state == "ready" and sidecar.get("summary"):
+                entry["summary"] = sidecar["summary"]
+            elif state == "summarizing":
+                entry["summary"] = "(summarizing...)"
+            # "unavailable"/"failed": omit -- same as no sidecar at all.
+        entries.append(entry)
+    return entries
+
+
 def build_server() -> Any:
     from mcp.server.mcpserver import MCPServer
 
     server = MCPServer("docie-docs-search")
 
     @server.tool()
-    def list_files() -> list[str]:
+    def list_files() -> list[dict[str, Any]]:
         """List every readable document (.pdf/.txt) under the shared
-        documents directory, as paths relative to it. ALWAYS call this
-        first, before read_document or search_text -- these tools only see
-        this fixed directory, never a file attached elsewhere in the
-        conversation. If the file you're looking for isn't in this list, it
-        genuinely isn't available here; say so instead of guessing a path."""
-        return list_documents()
+        documents directory. Each entry's `path` is relative to it and is
+        the ONLY valid identifier for read_document/search_text/write_note/
+        read_notes -- use it EXACTLY as given, never a different field or an
+        invented one. ALWAYS call this first, before read_document or
+        search_text -- these tools only see this fixed directory, never a
+        file attached elsewhere in the conversation. If the file you're
+        looking for isn't in this list, it genuinely isn't available here;
+        say so instead of guessing a path.
+
+        `summary` (when present) is a short auto-generated description of
+        that document, or "(summarizing...)" while one is still being
+        generated -- use it to decide which document is relevant before
+        spending a read_document/search_text call on it. Its absence means
+        no summary exists yet or none is configured for this deployment,
+        never that the document itself is unavailable."""
+        return list_files_with_summaries()
 
     @server.tool()
     def read_document(
