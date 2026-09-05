@@ -336,6 +336,10 @@ async def test_run_tool_loop_eagerly_lists_docs_search_files_before_the_first_ro
     assert call[0] == "docs-search__list_files"
     assert call[1] is True
     assert "a.txt" in call[4]
+    # A small model can weigh the user's own "list the files first" instruction
+    # over an earlier system note and call list_files again anyway -- an
+    # explicit prohibition, not just information, heads that off.
+    assert "do not call list_files again" in system_content.lower()
 
 
 async def test_run_tool_loop_skips_eager_listing_when_no_catalog_entry_declares_one() -> None:

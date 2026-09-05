@@ -679,7 +679,10 @@ async def _eager_list_context(
             f"{server_name}.{tool_name}() was already called for you. Its result -- "
             f"the ONLY valid identifiers for {server_name} right now -- is:\n{result}\n"
             f"Use one of these EXACTLY as returned whenever a {server_name} tool asks "
-            "for an identifier. Never modify, translate, or construct a different one."
+            "for an identifier. Never modify, translate, or construct a different one. "
+            f"Do NOT call {tool_name} again this turn, even if the user's own message "
+            f"asks you to list files first -- that step is already done; {tool_name} "
+            "would return this exact same list again, wasting a round on nothing new."
         )
     return "\n\n".join(lines) if lines else None
 
