@@ -614,10 +614,15 @@ def list_notes(path: str) -> list[dict[str, Any]]:
 # stops accumulating pages once their combined text would exceed this many
 # characters -- character budget, not a page count, because page density
 # varies wildly (a dense two-column legal page can hold 10x a sparse one).
-# Sized to comfortably fit a small model's context alongside everything
-# else in the conversation, while still being long enough to see a
-# document's structure (title, table of contents, opening section).
-PEEK_CHAR_BUDGET = 4000
+# ~3000 tokens at ~4 chars/token -- NOT the ~8000 tokens asked for: an
+# 8000-token peek result alone would already exceed common 8192-ctx llama.cpp
+# slot deployments (this framework's own default serving profile) before the
+# system prompt, tool schemas, or the user's question are even counted --
+# llama-server would 400 or truncate the round, not "work better". This is
+# sized to leave real headroom in an 8K-context deployment while still being
+# meaningfully bigger than before. A deployment running larger-context
+# models can raise it via PEEK_CHAR_BUDGET_ENV.
+PEEK_CHAR_BUDGET = 12_000
 
 # An explicit start_page/end_page range used to be trusted as-is, unbounded --
 # a model asking for e.g. start_page=1, end_page=40 on a long document could

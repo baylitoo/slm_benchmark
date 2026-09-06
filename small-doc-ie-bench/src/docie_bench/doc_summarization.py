@@ -70,7 +70,14 @@ from docie_bench.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-_SUMMARY_MAX_TOKENS = 300
+# A fixed max_tokens disconnected from doc_summary_max_chars would silently
+# under-generate (truncate before reaching the char cap) whenever an
+# operator raises that setting -- derived instead, at a conservative ~3
+# chars/token so denser/punctuation-heavy text doesn't get cut off mid-cap.
+# Floor keeps a very small max_chars setting from starving the model of
+# room to finish even one sentence.
+_MIN_SUMMARY_MAX_TOKENS = 150
+
 # Bounds on the load-on-demand poll below -- never wait longer than this
 # regardless of what trigger_deployment_load's own ETA estimate says, so a
 # stuck/failed deploy doesn't strand this background task indefinitely.
@@ -110,7 +117,7 @@ async def _summarize_chunk(
         "model": profile.model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
-        "max_tokens": _SUMMARY_MAX_TOKENS,
+        "max_tokens": max(_MIN_SUMMARY_MAX_TOKENS, max_chars // 3),
     }
     headers = {"Authorization": f"Bearer {profile.api_key}", "Content-Type": "application/json"}
     response = await client.post(
