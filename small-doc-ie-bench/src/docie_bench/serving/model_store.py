@@ -199,7 +199,7 @@ FAMILIES: dict[str, FamilyContract] = {
         needs_mmproj=False,
         vision=False,
         default_temperature=0.0,  # extraction-deterministic (Liquid's 0.1 is a chat rec)
-        default_max_tokens=900,
+        default_max_tokens=4096,
         default_timeout_seconds=180.0,
         ollama_faithful=True,  # standard template; Ollama auto-extracts the embedded one
     ),

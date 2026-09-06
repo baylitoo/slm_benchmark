@@ -207,7 +207,7 @@ profiles:
     response_format_style: json_object
     temperature: 0.0
     top_p: 1.0
-    max_tokens: 900
+    max_tokens: 4096
     timeout_seconds: 120
     prompt_profile: strict_extraction_v1
 
@@ -291,7 +291,7 @@ profiles:
     api_key: local-not-used
     response_format_style: openai_json_schema
     temperature: 0.0
-    max_tokens: 900
+    max_tokens: 4096
     timeout_seconds: 180
     prompt_profile: strict_extraction_v1
 
@@ -301,7 +301,7 @@ profiles:
     api_key: local-not-used
     response_format_style: openai_json_schema
     temperature: 0.0
-    max_tokens: 900
+    max_tokens: 4096
     timeout_seconds: 180
     prompt_profile: strict_extraction_v1
 
@@ -311,7 +311,7 @@ profiles:
     api_key: local-not-used
     response_format_style: openai_json_schema
     temperature: 0.0
-    max_tokens: 1024
+    max_tokens: 4096
     timeout_seconds: 240
     prompt_profile: strict_extraction_v1
 
