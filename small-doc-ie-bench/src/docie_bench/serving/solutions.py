@@ -31,6 +31,7 @@ from docie_bench.llm.prompts import (
     OCR_TRANSCRIPTION_SYSTEM_PROMPT,
     OCR_TRANSCRIPTION_USER_PROMPT,
 )
+from docie_bench.llm.reasoning import apply_native_reasoning, uses_native_reasoning
 from docie_bench.ocr.factory import get_ocr_backend
 from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, load_document_images
@@ -286,12 +287,15 @@ class PipelineSolution:
         if self.extractor.stop_sequences:
             llm_request.setdefault("stop", list(self.extractor.stop_sequences))
         llm_request.pop("stream", None)  # the gateway re-streams the final completion
-        if self.no_think:
+        native_reasoning = uses_native_reasoning(self.extractor)
+        if native_reasoning:
+            apply_native_reasoning(llm_request)
+        elif self.no_think:
             apply_no_think(llm_request)
         # Suppress a reasoning extractor's <think>-then-empty-{} on a structured
         # call by prefilling the JSON open brace — model-agnostic, cooperates
-        # with the grammar. Applied whenever the extraction is schema-constrained.
-        prefilled = wants_json_schema(llm_request.get("response_format"))
+        # with the grammar. Native reasoning checkpoints retain their generation prompt.
+        prefilled = not native_reasoning and wants_json_schema(llm_request.get("response_format"))
         if prefilled:
             prefill_json_object(llm_request)
         url = f"{self.extractor.base_url}/chat/completions"

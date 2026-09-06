@@ -434,3 +434,42 @@ async def test_truncated_think_without_length_finish_reason_still_downgrades() -
     # Downgraded through the full ladder (json_schema -> json_object -> none)
     # before raising, unlike the finish_reason == "length" fail-fast case.
     assert styles_seen == ["json_schema", "json_object", "none"]
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+async def test_lfm26_native_reasoning_preserves_prompt_and_never_retries_off(
+    truncated: bool,
+) -> None:
+    import json
+
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {
+                "content": "" if truncated else '{"invoice_number": "INV-1"}',
+                "reasoning_content": "consider the invoice",
+            }, "finish_reason": "length" if truncated else "stop"}],
+        })
+
+    client = await _client(_profile(model="lfm2.5-2.6b", max_tokens=4096), handler)
+    try:
+        operation = client.chat_json(
+            system_prompt="system", user_prompt="user", schema_name="test",
+            schema={"type": "object"}, assistant_prefill="{",
+            chat_template_kwargs={"enable_thinking": False, "other": "kept"},
+        )
+        if truncated:
+            with pytest.raises(InvalidModelResponseError, match="native reasoning enabled"):
+                await operation
+        else:
+            result, _, _ = await operation
+            assert result == {"invoice_number": "INV-1"}
+    finally:
+        await client.aclose()
+    assert len(requests) == 1
+    assert requests[0]["max_tokens"] == 4096
+    assert requests[0]["messages"][-1]["role"] == "user"
+    assert requests[0]["chat_template_kwargs"] == {"enable_thinking": True, "other": "kept"}
+    assert "reasoning_effort" not in requests[0]

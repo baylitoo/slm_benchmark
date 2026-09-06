@@ -18,6 +18,7 @@ from docie_bench.llm.model_gateway import (
 )
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
+from docie_bench.llm.reasoning import apply_native_reasoning, uses_native_reasoning
 from docie_bench.llm.response_format import (
     build_response_format,
     is_generic_style,
@@ -378,6 +379,10 @@ class OpenAICompatibleClient:
         self._gateway.client = self._client
         await self._gateway.validate_request(needs_vision=bool(image_urls))
         ladder = self._negotiated_ladder()
+        native_reasoning = uses_native_reasoning(self.profile)
+        if native_reasoning:
+            # A JSON prefill bypasses this checkpoint's trained thinking prompt.
+            assistant_prefill = None
         declared_style = self.profile.response_format_style
         user_content: str | list[dict[str, Any]] = user_prompt
         if image_urls:
@@ -426,7 +431,9 @@ class OpenAICompatibleClient:
                 merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
                 merged_template_kwargs.update(chat_template_kwargs)
                 payload["chat_template_kwargs"] = merged_template_kwargs
-            if force_disable_reasoning:
+            if native_reasoning:
+                apply_native_reasoning(payload)
+            elif force_disable_reasoning:
                 merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
                 merged_template_kwargs["enable_thinking"] = False
                 payload["chat_template_kwargs"] = merged_template_kwargs
@@ -638,6 +645,12 @@ class OpenAICompatibleClient:
                         not cleaned.strip() or unclosed_think
                     )
                     if output_budget_exhausted:
+                        if native_reasoning:
+                            raise InvalidModelResponseError(
+                                f"Generation exhausted max_tokens ({output_budget}) "
+                                "before producing usable JSON with native reasoning enabled; "
+                                "increase the output budget or configure a reasoning token budget"
+                            ) from exc
                         reasoning_already_disabled = (
                             force_disable_reasoning
                             or request_payload.get("reasoning_effort") == "none"
