@@ -255,7 +255,20 @@ async def _complete_structured_document(
     threading them (documented limitation, not hacked around here).
     """
     schema_mode, dynamic_schema = _resolve_extraction_schema(schema_name)
-    raw, suffix = _extract_document(body)
+    try:
+        raw, suffix = _extract_document(body)
+    except SolutionError as exc:
+        # Unlike extract_from_file below, this call sat OUTSIDE any try/except
+        # -- a request with no image_url part at all (e.g. the OpenAI
+        # file/file_data content-part convention, which this OCR path does
+        # not support) raised SolutionError straight through FastAPI as an
+        # unhandled 500, instead of the clean 400 every other malformed-input
+        # case here gets. Found via a real integration test hitting exactly
+        # this gap (schema-having agents only -- the schema-less branch below
+        # already wraps its own SolutionError-raising call correctly).
+        raise AgentError(
+            exc.message, status_code=exc.status_code, error_type=exc.error_type
+        ) from exc
     with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
         handle.write(raw)
         path = Path(handle.name)
