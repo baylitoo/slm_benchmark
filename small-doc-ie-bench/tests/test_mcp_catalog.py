@@ -303,7 +303,9 @@ def _multi_page_extractor(monkeypatch, page_count: int, chars_per_page: int):
     monkeypatch.setattr(ocr_factory, "get_ocr_backend", lambda name: _Stub())
 
 
-_BIG_PAGE_CHARS = 2000
+# 4 pages x this must exceed PEEK_CHAR_BUDGET (32_000) for the "peek truncates
+# a long document" test below to still actually exercise truncation.
+_BIG_PAGE_CHARS = 10_000
 
 
 def test_document_text_peeks_a_long_document_instead_of_returning_it_whole(

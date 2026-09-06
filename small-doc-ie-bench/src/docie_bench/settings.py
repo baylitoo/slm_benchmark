@@ -155,7 +155,10 @@ class Settings(BaseSettings):
     # page-anchored unit the rest of docs-search already uses.
     doc_summary_model: str | None = "store:lfm2.5-350m"
     doc_summary_chunk_pages: int = Field(default=4, ge=1, le=20)
-    doc_summary_max_chars: int = Field(default=600, ge=100, le=4000)
+    # A more extensive running summary (~2000 chars, ~500 tokens) than a
+    # one-line description -- enough room to actually cover an invoice's line
+    # items or a contract's clauses across chunks, not just name the document.
+    doc_summary_max_chars: int = Field(default=2000, ge=100, le=4000)
 
     # Durable, addressable artifact store for Studio benchmark runs. Must resolve
     # to the SAME location on every replica that reads it (a shared volume or an
