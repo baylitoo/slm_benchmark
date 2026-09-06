@@ -9,12 +9,22 @@ time, including "still summarizing", rather than the upload route blocking
 until a summary lands.
 
 Deliberately model-size-agnostic: the target profile is an operator setting
-(``Settings.doc_summary_model``, e.g. ``"store:lfm2.5-350m"`` or
-``"store:lfm2.5-2.6b"``), not a name baked in here, and resolves through the
-same ``resolve_extraction_profile`` every chat/extract route already uses --
-so pointing this at a bigger deployed model needs a config change, not a
-code change. Unset (the default) makes ``summarize_document`` a no-op:
-this is enrichment, not a hard dependency docs-search needs to function.
+(``Settings.doc_summary_model``, default ``"store:lfm2.5-350m"``), not a
+name baked in here, and resolves through the same ``resolve_extraction_profile``
+every chat/extract route already uses -- so pointing this at a bigger
+deployed model (e.g. ``"store:lfm2.5-2.6b"``) needs a config change, not a
+code change. Empty/unset makes ``summarize_document`` a no-op: this is
+enrichment, not a hard dependency docs-search needs to function.
+
+The default profile is a ``store:`` model, which is very likely NOT already
+live the first time an upload fires this (nothing else may have deployed
+it yet). Mirrors ``chat_api._resolve_or_error``'s own load-on-demand seam:
+on ``PlacementNotFoundError``/``PlacementNotReadyError``, fires
+``trigger_deployment_load`` (same event a first chat request against that
+model would fire) and then polls ``resolve_extraction_profile`` until it
+comes up or a bounded timeout elapses -- safe here specifically because
+this runs detached from any request a user is actually waiting on, unlike
+the HTTP route this pattern is borrowed from.
 
 The summary is built ROLLING, chunk_pages pages at a time (default 4, see
 ``Settings.doc_summary_chunk_pages``) -- each call folds the running summary
@@ -39,12 +49,16 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from fastapi import HTTPException
 
+from docie_bench.inngest.serving_api import trigger_deployment_load
 from docie_bench.mcp_servers.docs_search import (
     extract_page_texts,
     write_summary_state,
 )
+from docie_bench.serving.catalog import CatalogUnavailableError
 from docie_bench.serving.placement_resolver import (
+    STORE_PROFILE_PREFIX,
     PlacementNotFoundError,
     PlacementNotReadyError,
 )
@@ -57,6 +71,11 @@ from docie_bench.settings import get_settings
 logger = logging.getLogger(__name__)
 
 _SUMMARY_MAX_TOKENS = 300
+# Bounds on the load-on-demand poll below -- never wait longer than this
+# regardless of what trigger_deployment_load's own ETA estimate says, so a
+# stuck/failed deploy doesn't strand this background task indefinitely.
+_MAX_LOAD_WAIT_SECONDS = 300.0
+_LOAD_POLL_INTERVAL_SECONDS = 3.0
 
 # asyncio only holds a WEAK reference to a task it didn't create via
 # ensure_future-with-a-kept-handle -- an unreferenced task can be garbage
@@ -104,6 +123,63 @@ async def _summarize_chunk(
     return content.strip()[:max_chars]
 
 
+async def _resolve_loading_on_demand(model_name: str, document_path: Path) -> Any | None:
+    """``resolve_extraction_profile``, firing the deployment's own
+    load-on-demand event and polling if it isn't live yet.
+
+    Returns ``None`` if the model was never a real catalog entry (nothing to
+    trigger), or if it didn't come up within ``_MAX_LOAD_WAIT_SECONDS`` --
+    either way the caller writes an appropriate sidecar state itself.
+    """
+    try:
+        return resolve_extraction_profile(model_profile=model_name)
+    except (ProfileResolutionError, CatalogUnavailableError) as exc:
+        logger.info("doc summarization: %r is not routable: %s", model_name, exc)
+        return None
+    except (PlacementNotFoundError, PlacementNotReadyError) as exc:
+        logger.info("doc summarization: %s not live yet for %s: %s", model_name, document_path, exc)
+
+    store_name = (
+        model_name[len(STORE_PROFILE_PREFIX) :]
+        if model_name.startswith(STORE_PROFILE_PREFIX)
+        else None
+    )
+    triggered = None
+    if store_name:
+        try:
+            triggered = await trigger_deployment_load(store_name)
+        except HTTPException as exc:
+            # trigger_deployment_load's "never deployed yet" branch fires the
+            # deploy event via send_or_503, unguarded -- a send failure there
+            # raises straight through rather than returning None like every
+            # other "nothing to trigger" case this function already handles.
+            logger.info("doc summarization: failed to trigger a load for %s: %s", model_name, exc)
+    if triggered is None:
+        return None
+    _, eta_seconds = triggered
+    deadline = min(eta_seconds * 2, _MAX_LOAD_WAIT_SECONDS)
+    elapsed = 0.0
+    while elapsed < deadline:
+        await asyncio.sleep(_LOAD_POLL_INTERVAL_SECONDS)
+        elapsed += _LOAD_POLL_INTERVAL_SECONDS
+        try:
+            return resolve_extraction_profile(model_profile=model_name)
+        except (
+            PlacementNotFoundError,
+            PlacementNotReadyError,
+            ProfileResolutionError,
+            CatalogUnavailableError,
+        ):
+            continue
+    logger.info(
+        "doc summarization: %s never became ready within %.0fs for %s",
+        model_name,
+        deadline,
+        document_path,
+    )
+    return None
+
+
 async def summarize_document(
     document_path: Path, *, http_client: httpx.AsyncClient | None = None
 ) -> None:
@@ -119,15 +195,29 @@ async def summarize_document(
     every chunk's call rather than opening a fresh connection pool per
     chunk of the same document.
     """
+    try:
+        await _summarize_document_impl(document_path, http_client=http_client)
+    except Exception:
+        # Last-resort backstop for the "never raises" promise above: every
+        # anticipated failure is already handled inside the impl (a written
+        # sidecar state per case), but an unanticipated one must still not
+        # escape as an unhandled exception on a detached task -- and must
+        # not leave the sidecar stuck on "summarizing" forever, which is
+        # what list_files would otherwise show indefinitely.
+        logger.exception("doc summarization: unexpected failure for %s", document_path)
+        write_summary_state(document_path, "failed")
+
+
+async def _summarize_document_impl(
+    document_path: Path, *, http_client: httpx.AsyncClient | None = None
+) -> None:
     settings = get_settings()
     model_name = settings.doc_summary_model
     if not model_name:
         return
     write_summary_state(document_path, "summarizing")
-    try:
-        profile = resolve_extraction_profile(model_profile=model_name)
-    except (PlacementNotFoundError, PlacementNotReadyError, ProfileResolutionError) as exc:
-        logger.info("doc summarization skipped for %s: %s", document_path, exc)
+    profile = await _resolve_loading_on_demand(model_name, document_path)
+    if profile is None:
         write_summary_state(document_path, "unavailable")
         return
 

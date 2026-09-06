@@ -146,14 +146,14 @@ class Settings(BaseSettings):
     # Upload-time rolling summarization (#430): fires when a session document
     # is saved, so docs-search's list_files can pair a filename with a quick
     # description instead of the model (or the Playground's attachment
-    # thumbnail) needing to open the file cold. Unset by default -- there is
-    # no universally-right model size for this (a 350M profile suits it, a
-    # bigger one works too, none is also a valid choice for an environment
-    # that hasn't deployed a summarizer), so the feature stays off until an
-    # operator names a live ``store:`` (or models.yaml) profile here. Sized
-    # in pages, not characters, so the loop reads with the same page-anchored
-    # unit the rest of docs-search already uses.
-    doc_summary_model: str | None = None
+    # thumbnail) needing to open the file cold. Defaults to the 350M profile
+    # (cheap enough to fire on every upload; doc_summarization's own
+    # load-on-demand seam brings it up on the first request if it isn't
+    # already live) -- set to "" to disable, or to a different store:/
+    # models.yaml profile (e.g. a bigger deployed model) to use that instead.
+    # Sized in pages, not characters, so the loop reads with the same
+    # page-anchored unit the rest of docs-search already uses.
+    doc_summary_model: str | None = "store:lfm2.5-350m"
     doc_summary_chunk_pages: int = Field(default=4, ge=1, le=20)
     doc_summary_max_chars: int = Field(default=600, ge=100, le=4000)
 

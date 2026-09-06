@@ -11,7 +11,10 @@ import pytest
 from docie_bench.doc_summarization import summarize_document
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.mcp_servers import docs_search
-from docie_bench.serving.placement_resolver import PlacementNotFoundError
+from docie_bench.serving.placement_resolver import (
+    PlacementNotFoundError,
+    PlacementNotReadyError,
+)
 from docie_bench.settings import get_settings
 
 PROFILE = ModelProfile(
@@ -36,7 +39,12 @@ def _completion(text: str) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"message": {"content": text}}]})
 
 
-async def test_summarize_document_is_a_noop_when_unconfigured(tmp_path: Path) -> None:
+async def test_summarize_document_is_a_noop_when_explicitly_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # doc_summary_model defaults to "store:lfm2.5-350m" -- explicitly unset
+    # it here rather than relying on the default to represent "disabled".
+    monkeypatch.setenv("DOC_SUMMARY_MODEL", "")
     get_settings.cache_clear()
     doc = tmp_path / "a.txt"
     doc.write_text("hello")
@@ -45,13 +53,111 @@ async def test_summarize_document_is_a_noop_when_unconfigured(tmp_path: Path) ->
     get_settings.cache_clear()
 
 
-async def test_summarize_document_marks_unavailable_when_profile_does_not_resolve(
+async def test_summarize_document_marks_unavailable_when_model_is_not_a_catalog_entry(
     enabled: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
         raise PlacementNotFoundError(f"no placement for {model_profile!r}")
 
+    async def fake_trigger(_name: str) -> None:
+        return None  # not a real catalog entry -- nothing to load
+
     monkeypatch.setattr("docie_bench.doc_summarization.resolve_extraction_profile", fake_resolver)
+    monkeypatch.setattr("docie_bench.doc_summarization.trigger_deployment_load", fake_trigger)
+    doc = tmp_path / "a.txt"
+    doc.write_text("hello")
+    await summarize_document(doc)
+    assert docs_search.read_summary(doc) == {"state": "unavailable", "summary": None}
+
+
+async def test_summarize_document_fires_load_on_demand_and_waits_for_it_to_come_up(
+    enabled: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The default profile is a store: model that's very likely not live yet
+    # the first time an upload fires this -- mirrors chat_api's own
+    # load-on-demand seam instead of just giving up.
+    monkeypatch.setattr("docie_bench.doc_summarization._LOAD_POLL_INTERVAL_SECONDS", 0.01)
+    attempts = {"n": 0}
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise PlacementNotReadyError("still loading")
+        return PROFILE
+
+    async def fake_trigger(name: str) -> tuple[str, float]:
+        assert name == "lfm2.5-350m"  # "store:" prefix stripped
+        return (name, 1.0)
+
+    monkeypatch.setattr("docie_bench.doc_summarization.resolve_extraction_profile", fake_resolver)
+    monkeypatch.setattr("docie_bench.doc_summarization.trigger_deployment_load", fake_trigger)
+    monkeypatch.setattr(
+        "docie_bench.doc_summarization.extract_page_texts", lambda _path: {1: "page one"}
+    )
+
+    doc = tmp_path / "a.txt"
+    doc.write_text("hello")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: _completion("a summary")))
+    await summarize_document(doc, http_client=client)
+    await client.aclose()
+
+    assert attempts["n"] >= 3
+    assert docs_search.read_summary(doc) == {"state": "ready", "summary": "a summary"}
+
+
+async def test_summarize_document_marks_unavailable_when_trigger_send_fails(
+    enabled: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from fastapi import HTTPException
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        raise PlacementNotFoundError(f"no placement for {model_profile!r}")
+
+    async def fake_trigger(_name: str) -> tuple[str, float]:
+        # trigger_deployment_load's own "never deployed yet" branch fires
+        # send_or_503 unguarded -- a transport failure there surfaces as
+        # this exception rather than returning None.
+        raise HTTPException(status_code=503, detail="inngest send failed")
+
+    monkeypatch.setattr("docie_bench.doc_summarization.resolve_extraction_profile", fake_resolver)
+    monkeypatch.setattr("docie_bench.doc_summarization.trigger_deployment_load", fake_trigger)
+    doc = tmp_path / "a.txt"
+    doc.write_text("hello")
+    await summarize_document(doc)
+    assert docs_search.read_summary(doc) == {"state": "unavailable", "summary": None}
+
+
+async def test_summarize_document_never_raises_and_marks_failed_on_a_surprise_error(
+    enabled: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def exploding_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        raise RuntimeError("something nobody anticipated")
+
+    monkeypatch.setattr(
+        "docie_bench.doc_summarization.resolve_extraction_profile", exploding_resolver
+    )
+    doc = tmp_path / "a.txt"
+    doc.write_text("hello")
+    await summarize_document(doc)  # must not raise
+    assert docs_search.read_summary(doc)["state"] == "failed"
+
+
+async def test_summarize_document_marks_unavailable_when_load_never_completes(
+    enabled: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("docie_bench.doc_summarization._LOAD_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr("docie_bench.doc_summarization._MAX_LOAD_WAIT_SECONDS", 0.05)
+
+    def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
+        raise PlacementNotReadyError("still loading")
+
+    async def fake_trigger(name: str) -> tuple[str, float]:
+        return (name, 0.02)
+
+    monkeypatch.setattr("docie_bench.doc_summarization.resolve_extraction_profile", fake_resolver)
+    monkeypatch.setattr("docie_bench.doc_summarization.trigger_deployment_load", fake_trigger)
+
     doc = tmp_path / "a.txt"
     doc.write_text("hello")
     await summarize_document(doc)

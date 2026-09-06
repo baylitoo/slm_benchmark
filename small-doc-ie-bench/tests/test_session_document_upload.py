@@ -19,6 +19,11 @@ from docie_bench.settings import get_settings
 @pytest.fixture
 def session_root(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_SESSION_DOCUMENTS_ROOT", str(tmp_path))
+    # Upload-mechanics tests, not summarization tests -- doc_summary_model
+    # now defaults to a live profile (#430), which would otherwise fire a
+    # real background job per upload and race these tests' own file-count
+    # assertions with an unrelated .summary.json sidecar.
+    monkeypatch.setenv("DOC_SUMMARY_MODEL", "")
     get_settings.cache_clear()
     yield tmp_path
     get_settings.cache_clear()
