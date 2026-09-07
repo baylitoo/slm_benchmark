@@ -8,9 +8,8 @@ afterward. This module is the save/list/fetch/delete side of that gap; the
 Studio API routes and the extraction-request wiring are separate call sites.
 
 Shared operator config, like ``models.yaml``/``data/datasets.yaml`` -- no
-tenant scoping, no version/lifecycle field, create-only for v1 (a mistake is
-cheap to fix with delete + recreate, since this is a real table, not a text
-file to splice). See ``DynamicSchema`` (studio/models.py) for the storage
+tenant scoping, no version/lifecycle field. Edits preserve the saved identifier
+and creation time. See ``DynamicSchema`` (studio/models.py) for the storage
 shape and why each of those cuts was made.
 """
 
@@ -125,6 +124,23 @@ def list_dynamic_schemas() -> list[dict[str, Any]]:
             return []
         rows = session.execute(select(DynamicSchema).order_by(DynamicSchema.name)).scalars()
         return [_to_dict(row) for row in rows]
+
+
+def update_dynamic_schema(name: str, spec: DynamicSchemaSpec) -> dict[str, Any]:
+    """Replace a saved definition without changing its identifier or creation time."""
+    if spec.document_type != name:
+        raise ValueError("document_type must match the saved schema name")
+    with session_scope() as session:
+        if session is None:
+            raise DynamicSchemaUnavailableError("Dynamic schemas require DATABASE_URL")
+        row = session.execute(
+            select(DynamicSchema).where(DynamicSchema.name == name).with_for_update()
+        ).scalar_one_or_none()
+        if row is None:
+            raise DynamicSchemaNotFoundError(f"schema {name!r} does not exist")
+        row.spec_json = spec.model_dump(mode="json")
+        session.flush()
+        return _to_dict(row)
 
 
 def get_dynamic_schema(name: str) -> dict[str, Any] | None:
