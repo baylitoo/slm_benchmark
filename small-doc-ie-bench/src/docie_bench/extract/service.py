@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -657,6 +658,23 @@ class ExtractionService:
         # of the flag (see ModelProfile.runtime/.logprob_confidence).
         want_logprobs = self.profile.logprob_confidence and self.profile.runtime == "llamacpp"
         client = OpenAICompatibleClient(self.profile)
+        # build_response_format's own "nuextract3" branch resolves a template
+        # PURELY from schema_name, via a static lookup (llm.prompts._NUEXTRACT_TEMPLATES)
+        # that only ever knew about the built-in schemas -- a dynamic schema's
+        # freshly-built nuextract_template (line ~608 above) never reached it,
+        # so every dynamic-schema extraction through nuextract3 silently sent
+        # an EMPTY template (nothing to extract -> every field comes back
+        # null). chat_json's chat_template_kwargs is MERGED on top of
+        # build_response_format's own extra_body (see build_payload), so
+        # overriding "template" here for this one case is enough -- the
+        # static-schema path (nuextract_template is None) is untouched.
+        extra_template_kwargs: dict[str, Any] = {}
+        if self.disable_thinking:
+            extra_template_kwargs["enable_thinking"] = False
+        if self.profile.prompt_profile == "nuextract3" and nuextract_template is not None:
+            extra_template_kwargs["template"] = json.dumps(
+                nuextract_template, ensure_ascii=False
+            )
         try:
             raw, usage_dict, raw_response = await client.chat_json(
                 system_prompt=system_prompt,
@@ -664,9 +682,7 @@ class ExtractionService:
                 schema_name=schema_name,
                 schema=generation_schema,
                 image_urls=[image.data_url() for image in images] if images else None,
-                chat_template_kwargs=(
-                    {"enable_thinking": False} if self.disable_thinking else None
-                ),
+                chat_template_kwargs=extra_template_kwargs or None,
                 max_tokens=self.max_tokens,
                 # LFM2.5's bundled template opens <think> unconditionally and
                 # ignores enable_thinking/reasoning_effort. Continuing an

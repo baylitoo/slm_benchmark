@@ -192,6 +192,54 @@ async def test_dynamic_schema_inference_extracts_unseen_type_and_can_be_reused(m
 
 
 @pytest.mark.asyncio
+async def test_nuextract3_dynamic_schema_sends_its_real_template_not_an_empty_one(
+    monkeypatch,
+) -> None:
+    """Regression: build_response_format's "nuextract3" branch resolves its
+    out-of-band template PURELY from schema_name, via a static lookup that
+    only ever knew about the built-in schemas (llm.prompts._NUEXTRACT_TEMPLATES).
+    A dynamic (user-defined) schema's freshly-built template
+    (DynamicTemplateBuilder.build_nuextract_template) never reached that
+    lookup, so every dynamic-schema extraction through nuextract3 silently
+    sent an EMPTY template -- nothing telling the model what to extract, so
+    every field came back null. Fixed by threading the dynamic template
+    through chat_json's chat_template_kwargs, which merges on top of
+    build_response_format's own (empty) one."""
+    calls: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        async def chat_json(self, **kwargs: Any) -> tuple[dict[str, Any], None, dict[str, Any]]:
+            calls.append(kwargs)
+            return {
+                "document_type": "adbi_resume",
+                "name": {"value": "Jane Doe", "evidence_ids": ["b1"], "confidence": 0.9},
+            }, None, {}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("docie_bench.extract.service.OpenAICompatibleClient", FakeClient)
+    service = ExtractionService(_profile(prompt_profile="nuextract3"))
+
+    await service.extract_from_text(
+        text="Jane Doe, Senior Engineer",
+        ocr_blocks=None,
+        schema_name="adbi_resume",
+        schema_mode="dynamic",
+        dynamic_schema={
+            "document_type": "adbi_resume",
+            "fields": [{"name": "name", "type": "string"}],
+        },
+    )
+
+    sent_template = json.loads(calls[0]["chat_template_kwargs"]["template"])
+    assert sent_template == {"name": {"value": "verbatim-string"}}
+
+
+@pytest.mark.asyncio
 async def test_nuextract_dynamic_inference_requires_proposer_or_reused_schema() -> None:
     service = ExtractionService(_profile(prompt_profile="nuextract_v1"))
     with pytest.raises(ValueError, match="instruction-following proposer"):
