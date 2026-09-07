@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -330,7 +331,8 @@ class ExtractionService:
             )
         if self.profile.vision:
             t0 = time.perf_counter()
-            images = load_document_images(
+            images = await asyncio.to_thread(
+                load_document_images,
                 path,
                 max_pages=self.profile.vision_max_pages,
                 pdf_dpi=self.profile.vision_pdf_dpi,
@@ -357,7 +359,8 @@ class ExtractionService:
         if ocr_backend_name.lower().strip() == "vision":
             raise ValueError("ocr_backend='vision' requires a model profile with vision: true")
         t0 = time.perf_counter()
-        ocr_result = processor_from_settings(get_settings()).process(
+        ocr_result = await asyncio.to_thread(
+            processor_from_settings(get_settings()).process,
             path,
             backend_name=ocr_backend_name,
             language=language,
@@ -459,7 +462,8 @@ class ExtractionService:
         else:
             backend_name = str(options.get("ocr_backend", "tesseract"))
             ocr_language = options.get("language") or language
-            ocr_result = processor_from_settings(get_settings()).process(
+            ocr_result = await asyncio.to_thread(
+                processor_from_settings(get_settings()).process,
                 path,
                 backend_name=backend_name,
                 language=ocr_language,
@@ -521,8 +525,11 @@ class ExtractionService:
         request data URI because its input is already an HTTP request, not
         a file on disk.
         """
-        images = load_document_images(
-            path, max_pages=vision.vision_max_pages, pdf_dpi=vision.vision_pdf_dpi
+        images = await asyncio.to_thread(
+            load_document_images,
+            path,
+            max_pages=vision.vision_max_pages,
+            pdf_dpi=vision.vision_pdf_dpi,
         )
         content: list[dict[str, Any]] = [
             {"type": "text", "text": OCR_TRANSCRIPTION_USER_PROMPT}
