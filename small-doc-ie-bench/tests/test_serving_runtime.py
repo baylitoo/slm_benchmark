@@ -135,6 +135,33 @@ def test_llamacpp_requires_gguf_and_builds_cpu_flags() -> None:
     assert adapter.probe(_spec(RuntimeKind.LLAMACPP)).compatible is False
 
 
+def test_llamacpp_does_not_duplicate_jinja_when_extra_args_already_carries_it() -> None:
+    """serve_store_model's family-routed deploys carry their own "--jinja" via
+    family_launch_args/extra_args (model_store.FAMILIES) for every text/vision
+    family -- build_command's own default must not ALSO append it, which used
+    to produce a literal duplicate flag on the launched command line
+    (llama-server logs "argument '--jinja' specified multiple times" and
+    silently keeps only the last value)."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        extra_args=("--jinja",),
+    )
+    command = adapter.build_command(spec)
+    assert command.count("--jinja") == 1
+
+
+def test_llamacpp_still_defaults_jinja_on_for_a_bare_spec() -> None:
+    """A direct RuntimeLaunchSpec construction with no extra_args at all (e.g.
+    control_plane.serve()'s advanced/uncommon usage, README-documented) must
+    still get --jinja by default -- only a spec that ALREADY carries it should
+    skip the duplicate."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+    assert "--jinja" in adapter.build_command(spec)
+
+
 def test_llamacpp_n_parallel_default_is_byte_identical_to_before() -> None:
     """n_parallel=1 (the default) must never emit --parallel and must never
     scale --ctx-size -- this is the existing, already-tested default path."""

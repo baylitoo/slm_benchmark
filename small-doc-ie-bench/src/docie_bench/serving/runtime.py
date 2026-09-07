@@ -757,8 +757,17 @@ class LlamaCppRuntime(RuntimeAdapter):
             spec.host,
             "--port",
             str(spec.port),
-            "--jinja",
         ]
+        # Default on for a bare RuntimeLaunchSpec (e.g. `docie serve`'s direct
+        # construction, README-documented advanced usage, see control_plane.py's
+        # serve()) -- but every family-routed store deploy (serve_store_model)
+        # already carries its own "--jinja" via family_launch_args/extra_args
+        # when its FamilyContract wants it, so appending it here UNCONDITIONALLY
+        # duplicated the flag on every one of those launches (llama-server logs
+        # "argument '--jinja' specified multiple times" and silently keeps only
+        # the last value -- harmless today only because both values agree).
+        if "--jinja" not in spec.extra_args:
+            command.append("--jinja")
         if spec.chat_template_file is not None:
             command.extend(["--chat-template-file", spec.chat_template_file])
         if spec.cache_type_k is not None:
