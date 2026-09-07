@@ -98,14 +98,45 @@ KV_CACHE_BYTES_PER_TOKEN = 65_536
 # LLM backbone's own KV cache shape is unchanged).
 LFM2_KV_CACHE_BYTES_PER_TOKEN = 16_384
 
-_LFM2_FAMILIES = frozenset({"lfm2", "lfm2_vl"})
+# XHToken Spark-X2.5 (1.7B, ggml-org/llama.cpp#27868, merged 2026-09-06):
+# a DIFFERENT hybrid shape than LFM2 -- sliding-window attention mixed with
+# full attention, not conv layers, so this is not "zero KV state" the way
+# LFM2's non-attention layers are. Derived from the model's own published
+# config.json: 28 layers, only 7 tagged "full_attention" (the rest
+# "sliding_attention", window=512), GQA with 2 KV heads, head_dim=256.
+# bytes_per_token = 2 (K+V) x num_full_attention_layers x num_key_value_heads
+# x head_dim x 2 (f16) = 2*7*2*256*2 = 14,336.
+# The 21 sliding-window layers are NOT truly zero-cost like LFM2's conv
+# layers -- each holds a real, bounded (window=512) KV state once past the
+# window, independent of context length beyond it. Folding them into the
+# ~0 approximation (same simplification LFM2 uses) is safe here because
+# that bounded contribution tops out at ~21 MiB total (21 layers x 512
+# tokens x 2 x 2 x 256 x 2 bytes) -- negligible next to RUNTIME_OVERHEAD_BYTES
+# (512 MiB) already budgeted per instance, not a meaningful underestimate at
+# any context length this framework actually deploys at.
+SPARK2_5_KV_CACHE_BYTES_PER_TOKEN = 14_336
+
+# Family -> its own verified per-token KV-cache constant. A family absent
+# here (including "openai_chat", shared by many non-hybrid dense-attention
+# archs) falls back to the generic KV_CACHE_BYTES_PER_TOKEN ceiling --
+# correct for those, since only a hybrid architecture with a family of its
+# own (added specifically to carry this distinction, see model_store.FAMILIES)
+# has a cheaper real cost worth tracking separately.
+_FAMILY_KV_CACHE_BYTES_PER_TOKEN: dict[str, int] = {
+    "lfm2": LFM2_KV_CACHE_BYTES_PER_TOKEN,
+    "lfm2_vl": LFM2_KV_CACHE_BYTES_PER_TOKEN,
+    "spark2_5": SPARK2_5_KV_CACHE_BYTES_PER_TOKEN,
+}
 
 
 def _kv_cache_bytes_per_token(family: str | None) -> int:
     """The per-token KV-cache constant for ``family``, falling back to the
     generic constant for every family without a verified constant of its
     own (including ``None`` -- no family info available for this pricing)."""
-    return LFM2_KV_CACHE_BYTES_PER_TOKEN if family in _LFM2_FAMILIES else KV_CACHE_BYTES_PER_TOKEN
+    if family is None:
+        return KV_CACHE_BYTES_PER_TOKEN
+    return _FAMILY_KV_CACHE_BYTES_PER_TOKEN.get(family, KV_CACHE_BYTES_PER_TOKEN)
+
 
 # Fixed llama-server runtime slab on top of weights + KV (arena, buffers;
 # design doc §2 brackets it 0.3-0.5 GB — take the conservative top end).
@@ -630,6 +661,7 @@ __all__ = [
     "DEFAULT_DEPLOY_CONTEXT_LENGTH",
     "KV_CACHE_BYTES_PER_TOKEN",
     "LFM2_KV_CACHE_BYTES_PER_TOKEN",
+    "SPARK2_5_KV_CACHE_BYTES_PER_TOKEN",
     "RUNTIME_OVERHEAD_BYTES",
     "FootprintStore",
     "NodeMemory",

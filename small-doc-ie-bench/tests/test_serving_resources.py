@@ -33,6 +33,7 @@ from docie_bench.serving.resources import (
     KV_CACHE_BYTES_PER_TOKEN,
     LFM2_KV_CACHE_BYTES_PER_TOKEN,
     RUNTIME_OVERHEAD_BYTES,
+    SPARK2_5_KV_CACHE_BYTES_PER_TOKEN,
     FootprintStore,
     NodeMemory,
     NodeSnapshot,
@@ -208,6 +209,21 @@ def test_lfm2_family_uses_its_own_much_smaller_kv_cache_constant() -> None:
     assert lfm2 < generic
     assert lfm2 == lfm2_vl  # same LLM backbone shape; mmproj is priced separately
     assert lfm2 == weights + LFM2_KV_CACHE_BYTES_PER_TOKEN * context + RUNTIME_OVERHEAD_BYTES
+
+
+def test_spark2_5_family_uses_its_own_smaller_kv_cache_constant() -> None:
+    """Spark-X2.5 is a hybrid sliding-window/full-attention architecture --
+    only 7 of 28 layers are "full_attention" (the rest are bounded-window
+    sliding attention), GQA with 2 KV heads -- a real, cheaper cost than the
+    generic dense-attention ceiling (derived from the model's own published
+    config.json -- see the constant's own comment for the math)."""
+    assert SPARK2_5_KV_CACHE_BYTES_PER_TOKEN < KV_CACHE_BYTES_PER_TOKEN
+    weights = 1 * GIB
+    context = 65_536
+    generic = predict_footprint_bytes(weights, context_length=context)
+    spark = predict_footprint_bytes(weights, context_length=context, family="spark2_5")
+    assert spark < generic
+    assert spark == weights + SPARK2_5_KV_CACHE_BYTES_PER_TOKEN * context + RUNTIME_OVERHEAD_BYTES
 
 
 def test_unknown_or_missing_family_keeps_the_generic_constant() -> None:

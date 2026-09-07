@@ -203,6 +203,31 @@ FAMILIES: dict[str, FamilyContract] = {
         default_timeout_seconds=180.0,
         ollama_faithful=True,  # standard template; Ollama auto-extracts the embedded one
     ),
+    # XHToken Spark-X2.5 (1.7B, arch_registry.py). A standard instruct model
+    # from the extraction client's point of view -- response_format rides
+    # openai_json_schema like lfm2, needing no chat_template_kwargs -- but
+    # its GGUF chat template renders genuine tool-call XML (<tool_call>...),
+    # unlike LFM2.5-1.2B-Thinking's baked template (which needed a manual
+    # chat_template_file override, see #407), so tools=True should hold
+    # out-of-the-box PROVIDED the template renders faithfully under
+    # llama-server's --jinja (verify at deploy, not assumed here). Own family
+    # rather than folded into "openai_chat" for the same reason as "lfm2":
+    # its hybrid sliding-window/full-attention shape needs its own KV-cache
+    # sizing constant (serving.resources.SPARK2_5_KV_CACHE_BYTES_PER_TOKEN).
+    "spark2_5": FamilyContract(
+        name="spark2_5",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja",),
+        tools=True,
+        needs_mmproj=False,
+        vision=False,
+        default_temperature=0.0,
+        default_max_tokens=4096,  # matches lfm2's own default (#435)
+        default_timeout_seconds=180.0,
+        ollama_faithful=True,
+    ),
     # LiquidAI LFM2.5-VL (1.6B). SigLIP2 encoder + connector on the LFM2 backbone;
     # ships a projector, so `needs_mmproj=True` (family_launch_args appends
     # `--mmproj <path>` automatically -> ("--jinja", "--mmproj", <path>)). KEY diff
