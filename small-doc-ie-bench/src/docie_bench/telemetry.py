@@ -148,3 +148,19 @@ REVIEW_QUEUE_DEPTH = Gauge(
     "Current review queue depth by status",
     ["status"],
 )
+
+# The reconciler already computes a rich per-cycle liveness verdict
+# (ObservedDeployment: phase, health_ok) but never exported it -- an operator
+# had no metric to catch a stuck/wedged deployment before a caller's request
+# to it timed out. Exported once per cycle from ServingReconciler.run_cycle.
+DEPLOYMENT_HEALTHY = Gauge(
+    "docie_deployment_healthy",
+    "1 if this deployment's last reconciler observation was healthy, else 0",
+    ["name"],
+)
+
+DEPLOYMENT_PHASE = Gauge(
+    "docie_deployment_phase",
+    "1 for this deployment's current reconciler phase, 0 for every other phase",
+    ["name", "phase"],
+)

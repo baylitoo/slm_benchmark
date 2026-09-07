@@ -20,8 +20,10 @@ tenant guard applies.
 
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -35,6 +37,7 @@ from docie_bench.agents.api import (
 from docie_bench.inngest.serving_api import trigger_deployment_load
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_completion_content
+from docie_bench.security import TenantContext
 from docie_bench.serving import recency
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
@@ -47,8 +50,60 @@ from docie_bench.serving.profile_resolver import (
     resolve_extraction_profile,
 )
 from docie_bench.settings import get_settings
+from docie_bench.studio import usage_store
 
 router = APIRouter(tags=["chat"], dependencies=[Depends(agents_tenant_guard)])
+
+# Bound on the disposable usage-frame scan buffer (see _stream_chat_completions):
+# a single SSE line ought to be at most one completion frame's worth of JSON.
+# Past this, give up scanning for a usage block rather than growing unboundedly.
+_SSE_USAGE_SCAN_LIMIT = 262_144
+
+# Same dependency the router already guards with -- FastAPI caches a repeated
+# dependency per request, so declaring it again as a route parameter hands the
+# route the SAME authenticated TenantContext without a second quota acquire.
+TenantParam = Annotated[TenantContext, Depends(agents_tenant_guard)]
+
+
+def _record_usage_outcome(
+    profile_name: str,
+    surface: str,
+    tenant_id: str,
+    started: float,
+    outcome: Any,
+) -> None:
+    """One usage-ledger row for a request that RESOLVED to a deployment.
+
+    The single per-surface seam: called once per non-streaming request with
+    whatever the surface is about to return -- a completion dict (status
+    ``ok``, token counts lifted from its OpenAI ``usage`` block when present)
+    or an error ``JSONResponse`` (status ``error``, no tokens). The streaming
+    chat path records its own row (``_stream_chat_completions``): tokens land
+    there too when the upstream's final SSE frame carries a usage block,
+    ``None`` otherwise. ``record_usage`` never raises -- a ledger hiccup
+    cannot fail the request it describes.
+    """
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    status = "ok"
+    if isinstance(outcome, JSONResponse):
+        status = "error"
+    elif isinstance(outcome, dict):
+        usage = outcome.get("usage")
+        if isinstance(usage, dict):
+            raw_prompt = usage.get("prompt_tokens")
+            raw_completion = usage.get("completion_tokens")
+            prompt_tokens = raw_prompt if isinstance(raw_prompt, int) else None
+            completion_tokens = raw_completion if isinstance(raw_completion, int) else None
+    usage_store.record_usage(
+        deployment=profile_name,
+        surface=surface,
+        tenant_id=tenant_id,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        status=status,
+    )
 
 
 def _loading_response(triggered: tuple[str, float]) -> JSONResponse:
@@ -164,7 +219,7 @@ async def list_models() -> dict[str, Any]:
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> Any:
+async def chat_completions(request: Request, tenant: TenantParam) -> Any:
     try:
         body = await request.json()
     except ValueError:
@@ -217,6 +272,7 @@ async def chat_completions(request: Request) -> Any:
         "Content-Type": "application/json",
     }
     client: httpx.AsyncClient = _client()
+    started = time.perf_counter()
 
     if mcp_server_names:
         # The serving side drives the whole model<->tools exchange, so the
@@ -229,16 +285,29 @@ async def chat_completions(request: Request) -> Any:
                 status_code=400,
                 error_type="invalid_request_error",
             )
-        return await _chat_with_mcp_tools(
+        outcome = await _chat_with_mcp_tools(
             client, url, headers, forward, profile, [str(n) for n in mcp_server_names]
         )
+        # run_tool_loop already summed usage across every tool round into the
+        # final completion's usage block, so this one row carries the whole
+        # exchange's token cost.
+        _record_usage_outcome(profile.name, "chat", tenant.tenant_id, started, outcome)
+        return outcome
 
     if wants_stream:
         return await _stream_chat_completions(
-            client, url, headers, forward, profile.timeout_seconds, profile.name
+            client,
+            url,
+            headers,
+            forward,
+            profile.timeout_seconds,
+            profile.name,
+            tenant_id=tenant.tenant_id,
+            started=started,
         )
 
     completion = await _post_upstream(client, url, headers, forward, profile)
+    _record_usage_outcome(profile.name, "chat", tenant.tenant_id, started, completion)
     if isinstance(completion, JSONResponse):
         return completion
     # PR-4 recency: this surface serves traffic too — stamp last_served like
@@ -258,11 +327,16 @@ async def _post_upstream(
     headers: dict[str, str],
     forward: dict[str, Any],
     profile: ModelProfile,
+    *,
+    error_hint: str = "",
 ) -> dict[str, Any] | JSONResponse:
     """One non-streaming upstream completion, errors mapped to OpenAI shape.
 
-    Shared by the plain chat path and every round of the MCP tool loop —
-    same forwarding, same error taxonomy, regardless of which path posts.
+    Shared by the plain chat path, every round of the MCP tool loop, and the
+    embeddings/rerank forwards — same forwarding, same error taxonomy,
+    regardless of which path posts. ``error_hint`` lets a surface append its
+    own diagnosis to an upstream 4xx/5xx (e.g. "is this deployment an
+    embedding model?") without owning a copy of the whole error ladder.
     """
     body = dict(forward)
     body.pop("stream", None)
@@ -279,7 +353,7 @@ async def _post_upstream(
         )
     if upstream.status_code >= 400:
         return _openai_error(
-            f"upstream returned {upstream.status_code}: {upstream.text[:300]}",
+            f"upstream returned {upstream.status_code}: {upstream.text[:300]}{error_hint}",
             status_code=upstream.status_code,
             error_type="upstream_error",
         )
@@ -410,6 +484,9 @@ async def _stream_chat_completions(
     forward: dict[str, Any],
     timeout: float,
     profile_name: str,
+    *,
+    tenant_id: str,
+    started: float,
 ) -> Any:
     """Real token-by-token proxy: forward raw SSE bytes as the upstream emits
     them, instead of buffering the full completion first. Ported from the
@@ -418,38 +495,90 @@ async def _stream_chat_completions(
     No mojibake repair here (unlike the non-streaming path): a fix-up needs
     the full decoded string, and a multi-byte UTF-8 sequence can straddle a
     chunk boundary. The gateway's proven streaming path skips it too.
+
+    Usage accounting: bytes are relayed to the caller completely unchanged
+    (this must never become a de-facto buffering point), but a SECOND,
+    disposable line-buffer is fed the same bytes to look for the final
+    ``data: {...}`` frame's ``usage`` block — the OpenAI/llama-server
+    streaming contract sends one when the request carries
+    ``stream_options: {"include_usage": true}`` (set below if the caller
+    didn't already ask for it). If no such frame ever arrives (older
+    llama-server, a caller that stripped the option back out, a dropped
+    connection), the row falls back to ``tokens=None`` exactly as before —
+    this is pure upside, never a regression.
     """
     forward["stream"] = True
+    stream_options = forward.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    stream_options.setdefault("include_usage", True)
+    forward["stream_options"] = stream_options
     stream_ctx = client.stream("POST", url, json=forward, headers=headers, timeout=timeout)
     try:
         upstream = await stream_ctx.__aenter__()
     except httpx.RequestError as exc:
-        return _openai_error(
+        error = _openai_error(
             f"upstream {url} is unreachable: {exc}",
             status_code=502,
             error_type="upstream_unavailable",
         )
+        _record_usage_outcome(profile_name, "chat", tenant_id, started, error)
+        return error
     media_type = upstream.headers.get("content-type", "text/event-stream")
     if upstream.status_code >= 400:
         body_bytes = await upstream.aread()
         await stream_ctx.__aexit__(None, None, None)
         detail = body_bytes[:300].decode("utf-8", "replace")
-        return _openai_error(
+        error = _openai_error(
             f"upstream returned {upstream.status_code}: {detail}",
             status_code=upstream.status_code,
             error_type="upstream_error",
         )
+        _record_usage_outcome(profile_name, "chat", tenant_id, started, error)
+        return error
     # PR-4 recency, see the non-streaming path's comment above — a stream
     # that gets this far has an accepted upstream connection, which counts
     # as this deployment serving traffic.
     recency.stamp_served_profile(profile_name)
 
     async def body_iterator() -> AsyncIterator[bytes]:
+        usage: dict[str, Any] | None = None
+        parse_buffer: bytearray | None = bytearray()
         try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
+                # Byte-level scan of a COPY of what was just relayed -- never
+                # holds up delivery, never touches the bytes handed to the
+                # caller. Splitting on b"\n" is safe even mid multi-byte UTF-8
+                # character: continuation bytes are 0x80-0xBF, never 0x0A.
+                if parse_buffer is not None:
+                    parse_buffer += chunk
+                    if len(parse_buffer) > _SSE_USAGE_SCAN_LIMIT:
+                        # Give up silently; any usage already parsed stands.
+                        parse_buffer = None
+                        continue
+                    *lines, parse_buffer = parse_buffer.split(b"\n")
+                    parse_buffer = bytearray(parse_buffer)
+                    for raw_line in lines:
+                        line = bytes(raw_line).strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = line[len(b"data:") :].strip()
+                        if payload in (b"", b"[DONE]"):
+                            continue
+                        try:
+                            frame = json.loads(payload)
+                        except ValueError:
+                            continue
+                        if isinstance(frame, dict) and isinstance(frame.get("usage"), dict):
+                            usage = frame["usage"]
         finally:
             await stream_ctx.__aexit__(None, None, None)
+            # ``usage`` is populated only when the upstream's final SSE frame
+            # actually carried a usage block (stream_options.include_usage,
+            # set above) -- otherwise this is None exactly as before the fix.
+            outcome = {"usage": usage} if usage is not None else None
+            _record_usage_outcome(profile_name, "chat", tenant_id, started, outcome)
 
     return StreamingResponse(
         body_iterator(), status_code=upstream.status_code, media_type=media_type
@@ -457,7 +586,7 @@ async def _stream_chat_completions(
 
 
 @router.post("/v1/embeddings")
-async def embeddings(request: Request) -> Any:
+async def embeddings(request: Request, tenant: TenantParam) -> Any:
     """OpenAI embeddings over an embedding deployment (llama-server --embedding).
 
     Body: ``model`` (deployment/profile) + ``input`` (string or list). Forwarded
@@ -505,37 +634,24 @@ async def embeddings(request: Request) -> Any:
         "Content-Type": "application/json",
     }
     client: httpx.AsyncClient = _client()
-    try:
-        upstream = await client.post(
-            url, json=forward, headers=headers, timeout=profile.timeout_seconds
-        )
-    except httpx.RequestError as exc:
-        return _openai_error(
-            f"upstream {profile.base_url} is unreachable: {exc}",
-            status_code=502,
-            error_type="upstream_unavailable",
-        )
-    if upstream.status_code >= 400:
-        return _openai_error(
-            f"upstream returned {upstream.status_code}: {upstream.text[:300]} "
-            "(is this deployment an embedding model, served with --embedding?)",
-            status_code=upstream.status_code,
-            error_type="upstream_error",
-        )
-    try:
-        result = upstream.json()
-    except ValueError:
-        return _openai_error(
-            "upstream returned a non-JSON response",
-            status_code=502,
-            error_type="upstream_error",
-        )
+    started = time.perf_counter()
+    result = await _post_upstream(
+        client,
+        url,
+        headers,
+        forward,
+        profile,
+        error_hint=" (is this deployment an embedding model, served with --embedding?)",
+    )
+    _record_usage_outcome(profile.name, "embed", tenant.tenant_id, started, result)
+    if isinstance(result, JSONResponse):
+        return result
     recency.stamp_served_profile(profile.name)  # PR-4 recency, see chat_completions
     return result
 
 
 @router.post("/v1/rerank")
-async def rerank(request: Request) -> Any:
+async def rerank(request: Request, tenant: TenantParam) -> Any:
     """Rerank documents against a query over a reranker deployment.
 
     Two families answer this surface with one wire contract: ``reranker`` (a
@@ -597,32 +713,19 @@ async def rerank(request: Request) -> Any:
         "Content-Type": "application/json",
     }
     client: httpx.AsyncClient = _client()
-    try:
-        upstream = await client.post(
-            url, json=forward, headers=headers, timeout=profile.timeout_seconds
-        )
-    except httpx.RequestError as exc:
-        return _openai_error(
-            f"upstream {profile.base_url} is unreachable: {exc}",
-            status_code=502,
-            error_type="upstream_unavailable",
-        )
-    if upstream.status_code >= 400:
-        return _openai_error(
-            f"upstream returned {upstream.status_code}: {upstream.text[:300]} "
-            "(is this deployment a reranker? family 'reranker' = llama-server "
-            "--reranking --embedding --pooling rank; family 'multi_vector' = the "
-            "sentence-transformers MultiVectorEncoder runtime)",
-            status_code=upstream.status_code,
-            error_type="upstream_error",
-        )
-    try:
-        result = upstream.json()
-    except ValueError:
-        return _openai_error(
-            "upstream returned a non-JSON response",
-            status_code=502,
-            error_type="upstream_error",
-        )
+    started = time.perf_counter()
+    result = await _post_upstream(
+        client,
+        url,
+        headers,
+        forward,
+        profile,
+        error_hint=" (is this deployment a reranker? family 'reranker' = llama-server "
+        "--reranking --embedding --pooling rank; family 'multi_vector' = the "
+        "sentence-transformers MultiVectorEncoder runtime)",
+    )
+    _record_usage_outcome(profile.name, "rerank", tenant.tenant_id, started, result)
+    if isinstance(result, JSONResponse):
+        return result
     recency.stamp_served_profile(profile.name)  # PR-4 recency, see chat_completions
     return result

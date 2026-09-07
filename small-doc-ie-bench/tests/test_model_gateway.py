@@ -254,6 +254,51 @@ async def test_circuit_breaker_rejects_then_allows_recovery_probe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_circuit_breaker_recovers_after_probe_is_cancelled() -> None:
+    """A cancelled recovery probe (client disconnect / hard-stop while the
+    probe request is in flight) must not wedge the circuit open forever
+    either -- CancelledError is a BaseException, so it bypasses the
+    `except Exception` handler that normally releases half_open_in_flight
+    (see test_circuit_breaker_recovers_after_permanent_error_during_probe for
+    the classification-based version of this same failure shape, fixed by
+    #167). Without a dedicated CancelledError handler, cancellation reproduces
+    the identical permanently-wedged symptom through a different trigger."""
+    now = 0.0
+    status = 503  # trips the breaker (transient)
+    cancel = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if cancel:
+            raise asyncio.CancelledError
+        if status == 200:
+            return _completion('{"ok": true}')
+        return httpx.Response(status, text="failing")
+
+    client = await _client(
+        _profile(circuit_breaker_failure_threshold=1, circuit_breaker_reset_seconds=10),
+        handler,
+    )
+    client._gateway._monotonic = lambda: now
+    try:
+        with pytest.raises(ModelGatewayError, match="503"):
+            await _chat(client)  # trips the breaker (transient failure)
+
+        now = 11  # cooldown elapsed -- this call becomes the half-open probe
+        cancel = True  # the probe itself is cancelled mid-flight
+        with pytest.raises(asyncio.CancelledError):
+            await _chat(client)
+
+        # Without the fix: half_open_in_flight stays True, so every call
+        # from here on raises CircuitOpenError ("recovery probe is already
+        # running") forever, even though nothing is actually running.
+        cancel = False
+        status = 200
+        assert await _chat(client) == {"ok": True}
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_recovers_after_permanent_error_during_probe() -> None:
     """A non-transient (PERMANENT/CAPABILITY) error during the half-open
     recovery probe must not wedge the circuit open forever. _record_failure

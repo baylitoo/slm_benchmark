@@ -779,6 +779,71 @@ def test_event_runs_proxy_is_tenant_scoped_for_extraction(tmp_path: Path, monkey
     assert owned.json() == [{"status": "Completed"}]
 
 
+def test_event_runs_serves_durable_extraction_result_without_the_inngest_proxy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A real integration test against this project's self-hosted Inngest
+    server found that its run-status API does not reliably carry `output`
+    (Inngest's own docs describe the Cloud-hosted API, not self-hosted
+    parity) -- so once ``extract_document`` has recorded its own outcome, the
+    route must serve THAT and never even touch the Inngest proxy, regardless
+    of what the proxy would have returned."""
+    from docie_bench import security
+    from docie_bench.storage.db import dispose_engine, init_engine
+    from docie_bench.studio.extraction_results import record_extraction_result
+
+    db_path = tmp_path / "s.db"
+    store, _ = _make_store(db_path, tmp_path / "b")
+    store.record_event_owner(event_id="evy", tenant_id="tenant-a")
+    monkeypatch.setattr(studio_api._shared, "default_run_store", lambda: store)
+
+    class _UnreachableAsyncClient(_FakeAsyncClient):
+        async def get(self, _url: str, headers: dict | None = None):  # noqa: ANN201
+            raise AssertionError("Inngest proxy must not be called once a durable result exists")
+
+    monkeypatch.setattr(studio_api.runs.httpx, "AsyncClient", _UnreachableAsyncClient)
+
+    # record_extraction_result uses the global session_scope(), which needs
+    # init_engine pointed at the SAME sqlite file _make_store's RunStore uses.
+    init_engine(f"sqlite:///{db_path}")
+    try:
+        record_extraction_result(
+            event_id="evy",
+            tenant_id="tenant-a",
+            status="completed",
+            output={"name": {"value": "Ada"}},
+        )
+
+        manager = TenantQuotaManager(
+            api_keys={"secret-a": "tenant-a", "secret-b": "tenant-b"},
+            auth_required=True,
+            requests_per_window=100,
+            window_seconds=60,
+            max_concurrent=10,
+        )
+        monkeypatch.setattr(security, "get_quota_manager", lambda: manager)
+        client = TestClient(api.app)
+
+        resp = client.get("/v1/studio/runs/evy", headers={"X-API-Key": "secret-a"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == [
+            {
+                "run_id": "evy",
+                "status": "Completed",
+                "output": {"name": {"value": "Ada"}},
+                "error": None,
+            }
+        ]
+
+        # Cross-tenant is still 404, not the durable result leaking either.
+        assert (
+            client.get("/v1/studio/runs/evy", headers={"X-API-Key": "secret-b"}).status_code == 404
+        )
+    finally:
+        dispose_engine()
+
+
 # ---------------------------------------------------------------------------
 # Finding 4: a terminally-failed run is re-runnable (key rotates); duplicates dedup
 # ---------------------------------------------------------------------------

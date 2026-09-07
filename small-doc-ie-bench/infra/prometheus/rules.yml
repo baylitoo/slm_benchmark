@@ -1,0 +1,51 @@
+groups:
+  - name: docie-serving
+    rules:
+      - alert: DocieDeploymentUnhealthy
+        expr: docie_deployment_healthy == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Deployment {{ $labels.name }} has failed its health check for 5m"
+          description: >-
+            docie_deployment_healthy has been 0 for deployment {{ $labels.name }}
+            for at least 5 minutes. Check its lifecycle phase
+            (docie_deployment_phase) and the reconciler logs for the last_error.
+
+      - alert: DocieDeploymentFailed
+        expr: docie_deployment_phase{phase="failed"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Deployment {{ $labels.name }} is FAILED"
+          description: >-
+            The reconciler has declared {{ $labels.name }} failed (restart
+            budget exhausted, restart policy 'never', or a repeated fit-check
+            denial) and stopped retrying it automatically.
+
+      - alert: DocieModelCircuitOpen
+        expr: docie_model_gateway_circuit_open == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker open for {{ $labels.model_profile }}/{{ $labels.model }}"
+          description: >-
+            The circuit breaker has stayed open for at least 5 minutes for
+            model profile {{ $labels.model_profile }} (model {{ $labels.model
+            }}) -- every extraction routed to it is being rejected without
+            reaching the endpoint.
+
+      - alert: DocieModelQueueSaturated
+        expr: docie_model_gateway_queue_depth > 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Requests queued for {{ $labels.model_profile }}/{{ $labels.model }}"
+          description: >-
+            Requests have been queued behind {{ $labels.model_profile }}'s
+            concurrency limit for at least 3 minutes -- callers are waiting on
+            capacity, not just seeing occasional bursts.

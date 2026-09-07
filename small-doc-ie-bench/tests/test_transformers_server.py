@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from docie_bench.transformers_server.server import (
+    _processor_is_multimodal,
     create_transformers_app,
     split_prompt,
     to_transformers_messages,
@@ -105,6 +106,27 @@ def test_multimodal_request_reaches_backend(tf_client) -> None:
     assert response.status_code == 200
     messages = backend.calls[-1][0]
     assert messages[0]["content"][1]["type"] == "image_url"
+
+
+def test_generate_failure_is_a_clean_openai_error_not_a_crash(tf_client) -> None:
+    # A custom-code checkpoint (trust_remote_code) whose calling convention
+    # diverges from the standard apply_chat_template contract this shim
+    # assumes generically fails INSIDE generate() -- e.g. an AttributeError,
+    # not a ValueError. That must still come back OpenAI-shaped, not an
+    # unhandled 500 with a bare traceback.
+    client, backend = tf_client
+
+    def broken_generate(messages, *, max_tokens, temperature):
+        raise AttributeError("'OvisModel' object has no attribute 'apply_chat_template'")
+
+    backend.generate = broken_generate
+    response = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["type"] == "backend_error"
+    assert "apply_chat_template" in body["error"]["message"]
 
 
 def test_empty_messages_is_400(tf_client) -> None:
@@ -204,6 +226,34 @@ def test_to_transformers_passes_string_content_through() -> None:
     tf_messages, image_urls = to_transformers_messages(messages)
     assert tf_messages == messages
     assert image_urls == []
+
+
+# ── vision detection: processor SHAPE, not which AutoClass succeeded ────────
+
+
+class _FakeVlmProcessor:
+    """Shaped like a real transformers ProcessorMixin composition (e.g. a
+    Qwen2-VL or a custom-code VLM's processor) -- carries image_processor."""
+
+    def __init__(self) -> None:
+        self.image_processor = object()
+        self.tokenizer = object()
+
+
+class _FakeTextTokenizer:
+    """A bare tokenizer (AutoTokenizer fallback) -- no image_processor."""
+
+
+def test_processor_is_multimodal_true_for_a_vlm_processor() -> None:
+    assert _processor_is_multimodal(_FakeVlmProcessor()) is True
+
+
+def test_processor_is_multimodal_false_for_a_bare_tokenizer() -> None:
+    # This is the case that used to be misclassified: a custom-code VLM
+    # registered only under AutoModelForCausalLM (Ovis's known pattern)
+    # still loads a real multimodal processor, so this check must key off
+    # the PROCESSOR's own shape, not which AutoModel constructor succeeded.
+    assert _processor_is_multimodal(_FakeTextTokenizer()) is False
 
 
 def test_to_transformers_preserves_multi_image_order() -> None:

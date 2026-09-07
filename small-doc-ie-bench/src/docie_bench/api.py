@@ -81,6 +81,7 @@ from docie_bench.serving.profile_resolver import (
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
 from docie_bench.storage.db import get_session_factory, init_engine
+from docie_bench.studio import usage_store
 from docie_bench.studio.routing_policies import (
     RoutingPolicyUnavailableError,
     get_routing_policy,
@@ -341,6 +342,20 @@ def validate_text_request(payload: ExtractTextRequest) -> None:
 
 def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> ExtractionResponse:
     record_extraction(response, tenant_id=tenant_id)
+    # Usage ledger (GET /v1/studio/usage): the one seam both extract routes
+    # funnel through with the full response in hand — model latency, token
+    # usage, and the RESOLVED profile name. Success-only by construction (an
+    # errored extraction raises before reaching here); best-effort, never
+    # raises. Chat/embed/rerank record their own rows in chat_api.py.
+    usage_store.record_usage(
+        deployment=response.model_profile,
+        surface="extract",
+        tenant_id=tenant_id,
+        latency_ms=response.latency_ms,
+        prompt_tokens=response.usage.prompt_tokens if response.usage else None,
+        completion_tokens=response.usage.completion_tokens if response.usage else None,
+        status="ok",
+    )
     # PR-4 recency (review fix): the direct API extract endpoints serve
     # traffic too, so they must stamp last_served like the worker path — or a
     # deployment driven only through this surface reads as idle forever and

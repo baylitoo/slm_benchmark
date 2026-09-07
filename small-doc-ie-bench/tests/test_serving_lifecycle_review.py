@@ -185,7 +185,8 @@ def test_api_extract_surface_stamps_recency(
 
     monkeypatch.setattr(api_module, "record_extraction", lambda *args, **kwargs: None)
     monkeypatch.setattr(api_module.settings, "redacted_response_fields", "")
-    response = SimpleNamespace(model_profile="invoice", result={})
+    # usage/latency_ms: finalize_response also feeds the usage ledger now.
+    response = SimpleNamespace(model_profile="invoice", result={}, usage=None, latency_ms=0)
 
     api_module.finalize_response(response, tenant_id="tenant-a")  # type: ignore[arg-type]
 
@@ -203,7 +204,10 @@ def test_api_extract_surface_stamps_store_profiles_too(
 
     monkeypatch.setattr(api_module, "record_extraction", lambda *args, **kwargs: None)
     monkeypatch.setattr(api_module.settings, "redacted_response_fields", "")
-    response = SimpleNamespace(model_profile="store:invoice", result={})
+    # usage/latency_ms: finalize_response also feeds the usage ledger now.
+    response = SimpleNamespace(
+        model_profile="store:invoice", result={}, usage=None, latency_ms=0
+    )
 
     api_module.finalize_response(response, tenant_id="tenant-a")  # type: ignore[arg-type]
 

@@ -61,6 +61,22 @@ def test_unknown_arch_with_mmproj_suggests_vision() -> None:
     assert v.verdict == "needs_family" and v.family == "lfm2_vl"
 
 
+def test_qwen35_vision_gguf_carries_a_runtime_note() -> None:
+    # A GGUF of a Qwen3.5-VL checkpoint (e.g. a small OCR fine-tune) reports
+    # the "qwen35" backbone with a projector attached -- supported via the
+    # mmproj-upgrade path (default lfm2_vl; vision_ocr fits a free-text OCR
+    # model better, an operator choice, not auto-picked). llama.cpp's Qwen3.5
+    # vision support is recent enough to still need the runtime caveat.
+    v = resolve_family("qwen35", has_gguf=True, has_safetensors=False, has_mmproj=True)
+    assert v.verdict == "supported" and v.family == "lfm2_vl"
+    assert v.runtime_note and "llama.cpp#19468" in v.runtime_note
+    # The plain text path (no projector) is long-established chat serving --
+    # same recency caveat still applies, since dense/MoE text support landed
+    # in the very same PR.
+    text = resolve_family("qwen35", has_gguf=True, has_safetensors=False, has_mmproj=False)
+    assert text.family == "openai_chat" and text.runtime_note is not None
+
+
 def test_qwen35_nuextract3_confirmed_by_base_model_lineage() -> None:
     # NuExtract3 shares the qwen35 backbone but needs its own contract.
     # "confirmed" tier: cardData.base_model traces lineage back to NuExtract,

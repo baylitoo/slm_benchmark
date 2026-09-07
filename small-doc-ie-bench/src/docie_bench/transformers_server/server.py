@@ -100,6 +100,23 @@ def split_prompt(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
     return messages, image_urls
 
 
+def _processor_is_multimodal(processor: Any) -> bool:
+    """Does this processor actually carry an image processor?
+
+    NOT "did ``AutoModelForImageTextToText`` happen to accept this
+    checkpoint" — a custom-code VLM (``config.json`` ``auto_map``) whose
+    class is registered only under ``AutoModelForCausalLM`` (a common,
+    older pattern predating the image-text-to-text auto class — e.g. the
+    Ovis family) fails that constructor and falls back to plain causal-LM
+    loading even though it IS multimodal. ``ProcessorMixin``'s standard
+    composition names a VLM processor's sub-component ``image_processor``
+    regardless of which AutoModel class loaded the model, so this signal is
+    reliable across both native and custom-code checkpoints; a bare
+    tokenizer (the text-only fallback above) never has one.
+    """
+    return getattr(processor, "image_processor", None) is not None
+
+
 def to_transformers_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -140,12 +157,14 @@ def to_transformers_messages(
 class HfTransformersBackend:
     """AutoModel backend (lazy import — the heavyweight last-resort path).
 
-    Loads the processor + model once at construction. Vision is auto-detected:
-    a checkpoint that loads under ``AutoModelForImageTextToText`` is served
-    multimodal; everything else falls back to ``AutoModelForCausalLM`` (text).
-    ``trust_remote_code`` is OFF by default — a custom-code checkpoint
-    (``config.json`` ``auto_map``) must opt in explicitly, since it executes
-    arbitrary repo Python on the serving node.
+    Loads the processor + model once at construction. ``self.vision`` reflects
+    whether the loaded PROCESSOR carries an image processor (see
+    ``_processor_is_multimodal``) — not which AutoModel constructor happened
+    to succeed, which misclassifies a custom-code VLM registered only under
+    ``AutoModelForCausalLM`` as text-only. ``trust_remote_code`` is OFF by
+    default — a custom-code checkpoint (``config.json`` ``auto_map``) must
+    opt in explicitly, since it executes arbitrary repo Python on the
+    serving node.
     """
 
     def __init__(self, model_id: str, *, trust_remote_code: bool = False) -> None:
@@ -173,7 +192,6 @@ class HfTransformersBackend:
 
         self.model_id = model_id
         self._torch = torch
-        self.vision = False
         self._processor = None
         # Prefer a full processor (carries the multimodal chat template); fall
         # back to a bare tokenizer for text-only checkpoints without one.
@@ -186,7 +204,9 @@ class HfTransformersBackend:
                 model_id, trust_remote_code=trust_remote_code
             )
 
-        # Try the image-text-to-text head first (VLMs); fall back to causal LM.
+        # Try the image-text-to-text head first (VLMs); fall back to causal LM
+        # — a custom-code VLM registered only under AutoModelForCausalLM (see
+        # _processor_is_multimodal's docstring) lands here too, correctly.
         self._model = None
         if image_text_cls is not None:
             try:
@@ -195,7 +215,6 @@ class HfTransformersBackend:
                     trust_remote_code=trust_remote_code,
                     torch_dtype="auto",
                 )
-                self.vision = True
             except (ValueError, OSError, KeyError):
                 self._model = None
         if self._model is None:
@@ -205,6 +224,7 @@ class HfTransformersBackend:
                 torch_dtype="auto",
             )
         self._model.eval()
+        self.vision = _processor_is_multimodal(self._processor)
 
     def _images(self, image_urls: list[str]) -> list[Any]:
         if not image_urls:
@@ -372,6 +392,19 @@ def create_transformers_app(
         except ValueError as exc:
             return _openai_error(
                 str(exc), status_code=400, error_type="invalid_request_error"
+            )
+        except Exception as exc:  # noqa: BLE001 - see docstring: any backend failure
+            # must reach the caller as an OpenAI-shaped error, never an
+            # unhandled 500. A custom-code checkpoint (trust_remote_code)
+            # whose calling convention diverges from the standard
+            # apply_chat_template(images=...) contract this shim assumes
+            # generically (a real risk for last-resort onboarding) fails
+            # HERE, not at import time — this is the honest failure mode,
+            # not a crash with no actionable message.
+            return _openai_error(
+                f"the transformers backend failed to generate a response: {exc}",
+                status_code=500,
+                error_type="backend_error",
             )
 
         return JSONResponse(

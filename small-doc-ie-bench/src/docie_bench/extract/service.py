@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -315,7 +316,17 @@ class ExtractionService:
             )
         if self.profile.vision:
             t0 = time.perf_counter()
-            images = load_document_images(
+            # asyncio.to_thread: PDF rasterization is CPU-bound and synchronous
+            # (pdfium). Called inline it blocks this event loop for the whole
+            # page-render duration -- on a self-hosted Inngest Connect worker
+            # that starves the WebSocket's lease-renewal heartbeat on a dense
+            # document, which the gateway then reads as a dead worker
+            # ("Failed to extend lease" / "Connection closed abnormally"),
+            # triggering a full function retry that redoes this same blocking
+            # work again. Confirmed via a real load test (ADBI-platform
+            # integration), not a theoretical concern.
+            images = await asyncio.to_thread(
+                load_document_images,
                 path,
                 max_pages=self.profile.vision_max_pages,
                 pdf_dpi=self.profile.vision_pdf_dpi,
@@ -342,7 +353,12 @@ class ExtractionService:
         if ocr_backend_name.lower().strip() == "vision":
             raise ValueError("ocr_backend='vision' requires a model profile with vision: true")
         t0 = time.perf_counter()
-        ocr_result = processor_from_settings(get_settings()).process(
+        # asyncio.to_thread: see the vision branch above -- OCR (tesseract/
+        # paddleocr) is CPU-bound and synchronous; called inline it blocks
+        # this event loop long enough to starve a self-hosted Inngest Connect
+        # worker's lease-renewal heartbeat on a dense document.
+        ocr_result = await asyncio.to_thread(
+            processor_from_settings(get_settings()).process,
             path,
             backend_name=ocr_backend_name,
             language=language,
@@ -444,7 +460,10 @@ class ExtractionService:
         else:
             backend_name = str(options.get("ocr_backend", "tesseract"))
             ocr_language = options.get("language") or language
-            ocr_result = processor_from_settings(get_settings()).process(
+            # asyncio.to_thread: same event-loop-blocking hazard as the
+            # non-pipeline OCR call above.
+            ocr_result = await asyncio.to_thread(
+                processor_from_settings(get_settings()).process,
                 path,
                 backend_name=backend_name,
                 language=ocr_language,
@@ -501,8 +520,13 @@ class ExtractionService:
         request data URI because its input is already an HTTP request, not
         a file on disk.
         """
-        images = load_document_images(
-            path, max_pages=vision.vision_max_pages, pdf_dpi=vision.vision_pdf_dpi
+        # asyncio.to_thread: same event-loop-blocking hazard as the other
+        # load_document_images call above.
+        images = await asyncio.to_thread(
+            load_document_images,
+            path,
+            max_pages=vision.vision_max_pages,
+            pdf_dpi=vision.vision_pdf_dpi,
         )
         content: list[dict[str, Any]] = [
             {"type": "text", "text": OCR_TRANSCRIPTION_USER_PROMPT}
