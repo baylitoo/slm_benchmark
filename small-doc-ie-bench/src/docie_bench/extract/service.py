@@ -706,6 +706,7 @@ class ExtractionService:
                 on_reset=self.on_reset,
             )
             effective_style = getattr(client, "last_response_format_style", None)
+            queue_wait_ms = getattr(client, "last_queue_wait_ms", None)
         finally:
             await client.aclose()
         # Snapshot BEFORE any reshaping: `raw` here is exactly the FLAT dict
@@ -751,6 +752,17 @@ class ExtractionService:
                 "docie_model_profile": self.profile.name,
                 "docie_doc_id": metadata.get("doc_id"),
                 "docie_latency_ms": latency_ms,
+                # Time spent waiting for the ModelGateway's per-(base_url,
+                # model) semaphore before the HTTP call to the model even
+                # started -- separates queueing from generation. Everything
+                # else in docie_latency_ms not accounted for here is prompt
+                # construction, the model call itself, and post-processing
+                # (rehydration/grounding/validation), which stay lumped
+                # together as "generation" -- not worth a further split.
+                "docie_queue_wait_ms": queue_wait_ms,
+                "docie_generation_ms": (
+                    max(latency_ms - queue_wait_ms, 0) if queue_wait_ms is not None else None
+                ),
                 "docie_valid": validation.valid,
                 "docie_errors": validation.errors,
                 "docie_warnings": validation.warnings,
@@ -775,6 +787,7 @@ class ExtractionService:
                 else None
             ),
             response_format_style=effective_style,
+            queue_wait_ms=queue_wait_ms,
             ocr_blocks=blocks or None,
         )
 

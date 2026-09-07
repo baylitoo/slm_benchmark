@@ -379,6 +379,42 @@ async def test_shared_per_model_concurrency_and_queue_limit() -> None:
     assert max_active == 1
 
 
+@pytest.mark.asyncio
+async def test_last_queue_wait_ms_reflects_actual_semaphore_wait() -> None:
+    """Regression: extraction's latency log/response lumped queue wait and
+    generation time into one docie_latency_ms, with no way to tell whether a
+    slow request was stuck behind other requests or genuinely slow to
+    generate. OpenAICompatibleClient.last_queue_wait_ms should be ~0 for a
+    call that acquires the semaphore immediately, and reflect the real wait
+    for a call stuck behind another one holding it."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await release.wait()
+        return _completion()
+
+    profile = _profile(max_concurrency=1, queue_limit=1)
+    first = await _client(profile, handler)
+    second = await _client(profile, handler)
+    first_task = asyncio.create_task(_chat(first))
+    try:
+        await entered.wait()
+        second_task = asyncio.create_task(_chat(second))
+        await asyncio.sleep(0.05)  # second is now parked waiting on the semaphore
+        release.set()
+        await first_task
+        await second_task
+    finally:
+        release.set()
+        await first.aclose()
+        await second.aclose()
+
+    assert first.last_queue_wait_ms < 20
+    assert second.last_queue_wait_ms >= 40
+
+
 def test_model_profile_loads_gateway_controls(tmp_path: Path) -> None:
     config = tmp_path / "models.yaml"
     config.write_text(

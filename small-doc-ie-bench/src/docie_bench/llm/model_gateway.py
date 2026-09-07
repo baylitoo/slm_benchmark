@@ -173,6 +173,12 @@ class ModelGateway:
         self._state = _state_for(profile)
         self._capabilities: ModelCapabilities | None = None
         self._capability_lock = asyncio.Lock()
+        # Per-call, not per-(base_url, model): unlike self._state (shared,
+        # keyed in _STATES across every ModelGateway for this profile), a
+        # ModelGateway instance is constructed fresh per request (see
+        # OpenAICompatibleClient.__init__), so this is safe to read right
+        # after execute() returns without racing a concurrent caller.
+        self.last_wait_seconds: float = 0.0
 
     async def execute(self, operation: Callable[[], Awaitable[T]]) -> T:
         await self._acquire()
@@ -382,8 +388,9 @@ class ModelGateway:
             MODEL_GATEWAY_QUEUE_DEPTH.labels(self.profile.name, self.profile.model).set(
                 self._state.waiting
             )
+            self.last_wait_seconds = self._monotonic() - started
             MODEL_GATEWAY_WAIT.labels(self.profile.name, self.profile.model).observe(
-                self._monotonic() - started
+                self.last_wait_seconds
             )
 
     def _release(self) -> None:

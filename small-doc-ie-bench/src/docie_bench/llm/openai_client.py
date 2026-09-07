@@ -153,6 +153,14 @@ class OpenAICompatibleClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    @property
+    def last_queue_wait_ms(self) -> int:
+        """Time the most recent chat_json call spent waiting for the
+        ModelGateway's per-(base_url, model) semaphore, before its HTTP call
+        even started -- separates queueing from actual generation time in a
+        latency breakdown (see extract/service.py's extraction_complete log)."""
+        return int(self._gateway.last_wait_seconds * 1000)
+
     async def discover_capabilities(self, *, force: bool = False) -> ModelCapabilities:
         self._gateway.client = self._client
         return await self._gateway.discover_capabilities(force=force)

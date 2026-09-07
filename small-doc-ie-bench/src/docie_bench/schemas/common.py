@@ -83,6 +83,11 @@ class ExtractionResponse(BaseModel):
     # extraction (after any negotiation downgrade); distinguishes constrained
     # from unconstrained decoding in predictions. None for non-LLM adapters.
     response_format_style: str | None = None
+    # Time this extraction's model call spent waiting for the ModelGateway's
+    # per-(base_url, model) semaphore before its HTTP call started -- None
+    # for non-LLM adapters (e.g. the router's audit stages don't set it),
+    # separating queueing from actual generation time in `latency_ms`.
+    queue_wait_ms: int | None = None
     # The OCR blocks this extraction was grounded against (empty for
     # vision-only or manual-text extractions with no OCR step). Internal-only
     # plumbing into the review queue (storage/audit.py), NOT part of the
