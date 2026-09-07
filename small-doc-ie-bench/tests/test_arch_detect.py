@@ -77,6 +77,17 @@ def test_qwen35_vision_gguf_carries_a_runtime_note() -> None:
     assert text.family == "openai_chat" and text.runtime_note is not None
 
 
+def test_resolve_spark2_5_arch_carries_a_runtime_note() -> None:
+    # XHToken Spark-X2.5 (1.7B): a hybrid sliding-window/full-attention text
+    # arch that landed in llama.cpp very recently (ggml-org/llama.cpp#27868).
+    # Own family (not "openai_chat") purely for the KV-cache sizing distinction.
+    v = resolve_family("spark2_5", has_gguf=True, has_safetensors=False, has_mmproj=False)
+    assert v.verdict == "supported"
+    assert v.family == "spark2_5"
+    assert v.runtime_note is not None
+    assert "llama.cpp#27868" in v.runtime_note
+
+
 def test_qwen35_nuextract3_confirmed_by_base_model_lineage() -> None:
     # NuExtract3 shares the qwen35 backbone but needs its own contract.
     # "confirmed" tier: cardData.base_model traces lineage back to NuExtract,

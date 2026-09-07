@@ -46,6 +46,13 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "phi3": "openai_chat",
     "stablelm": "openai_chat",
     "lfm2": "lfm2",
+    # XHToken Spark-X2.5 (1.7B): a hybrid sliding-window/full-attention
+    # backbone (ggml-org/llama.cpp#27868, merged 2026-09-06) -- own family
+    # (not lumped into "openai_chat") purely so the KV-cache sizing engine
+    # (serving.resources) can price its real, much cheaper per-token cost
+    # instead of the generic dense-attention ceiling, same reason "lfm2" is
+    # its own family and not just "openai_chat" underneath.
+    "spark2_5": "spark2_5",
     # vision (need an mmproj projector)
     "qwen2vl": "lfm2_vl",
     "qwen2_vl": "lfm2_vl",
@@ -111,6 +118,13 @@ DEFAULT_VISION_FAMILY = "lfm2_vl"
 # a "supported" verdict is honest ("rebuild the serving image if it won't
 # load"). Keyed by arch → the note shown to the operator.
 RUNTIME_NOTES: dict[str, str] = {
+    "spark2_5": (
+        "serving needs a llama-server built after ggml-org/llama.cpp#27868 "
+        "(merged 2026-09-06, Spark-X2.5 support) — rebuild the serving image "
+        "if the deploy fails to load. The published GGUF was converted with "
+        "the model author's own llama.cpp fork; verify it loads against "
+        "mainline before relying on it in production."
+    ),
     "unlimited-ocr": (
         "serving needs a llama-server built after ggml-org/llama.cpp#24969 "
         "(2026-06-24) — rebuild the serving image if the deploy fails to load"
