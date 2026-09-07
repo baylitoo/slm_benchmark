@@ -66,18 +66,53 @@ describe("SchemaBuilderSheet", () => {
 });
 
 
-it("creates resume lists from one item definition each", async () => {
-  createDynamicSchema.mockResolvedValue({ name: "resume" });
+it("creates the complete ADBI resume starter with variable-length nested lists", async () => {
+  createDynamicSchema.mockResolvedValue({ name: "adbi_resume" });
   render(<SchemaBuilderSheet open onClose={vi.fn()} onCreated={vi.fn()} />);
   await userEvent.click(screen.getByRole("button", { name: "Use resume starter" }));
+  expect(screen.getByPlaceholderText("purchase_order")).toHaveValue("adbi_resume");
   await userEvent.click(screen.getByRole("button", { name: "Save schema" }));
   const spec = createDynamicSchema.mock.calls.at(-1)![0];
-  expect(spec.document_type).toBe("resume");
-  expect(spec.fields.find((f: { name: string }) => f.name === "experience")).toMatchObject({
-    type: "list", fields: [{ name: "company" }, { name: "role" }, { name: "start_date" }, { name: "end_date" }, { name: "description" }],
-  });
-  expect(spec.fields.find((f: { name: string }) => f.name === "education").type).toBe("list");
+  expect(spec.document_type).toBe("adbi_resume");
+  // Strip optional guidance to verify the exact field/type contract on the wire.
+  const structure = (fields: import("@/lib/api").DynamicFieldSpec[]): unknown => fields.map((field) => ({
+    name: field.name, type: field.type,
+    ...(field.fields ? { fields: structure(field.fields) } : {}),
+  }));
+  expect(structure(spec.fields)).toEqual([
+    { name: "name", type: "string" },
+    { name: "title", type: "string" },
+    { name: "years_experience", type: "number" },
+    { name: "contact", type: "object", fields: [
+      { name: "email", type: "string" }, { name: "phone", type: "string" },
+      { name: "linkedin", type: "string" }, { name: "github", type: "string" },
+      { name: "location", type: "string" },
+    ] },
+    { name: "experience", type: "list", fields: [
+      { name: "company", type: "string" }, { name: "title", type: "string" },
+      { name: "start_date", type: "date" }, { name: "end_date", type: "date" },
+      { name: "location", type: "string" }, { name: "description", type: "string" },
+      { name: "env_technique", type: "string" },
+    ] },
+    { name: "education", type: "list", fields: [
+      { name: "degree", type: "string" }, { name: "institution", type: "string" },
+      { name: "year", type: "string" },
+    ] },
+    { name: "skills", type: "list", fields: [
+      { name: "category", type: "string" },
+      { name: "items", type: "list", fields: [{ name: "item", type: "string" }] },
+    ] },
+    { name: "languages", type: "list", fields: [
+      { name: "language", type: "string" }, { name: "level", type: "string" },
+    ] },
+    { name: "certifications", type: "list", fields: [
+      { name: "name", type: "string" }, { name: "issuer", type: "string" },
+      { name: "year", type: "string" },
+    ] },
+    { name: "interests", type: "list", fields: [{ name: "interest", type: "string" }] },
+  ]);
 });
+
 
 it("edits nested objects and lists without flattening their item structure", async () => {
   updateDynamicSchema.mockResolvedValue({ name: "resume" });

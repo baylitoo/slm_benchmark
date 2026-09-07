@@ -7,27 +7,48 @@ Built-in schemas are available for inspection and remain read-only.
 Choose **New schema → Use resume starter** to begin with this structure:
 
 ```text
-resume: {
-  full_name: string
+adbi_resume: {
+  name: string
+  title: string
+  years_experience: number
+  contact: {
+    email: string
+    phone: string
+    linkedin: string
+    github: string
+    location: string
+  }
   experience: list<{
     company: string
-    role: string
+    title: string
     start_date: date
     end_date: date
+    location: string
     description: string
+    env_technique: string
   }>
   education: list<{
-    institution: string
     degree: string
-    start_date: date
-    end_date: date
+    institution: string
+    year: string
   }>
+  skills: list<{
+    category: string
+    items: list<{ item: string }>
+  }>
+  languages: list<{ language: string, level: string }>
+  certifications: list<{ name: string, issuer: string, year: string }>
+  interests: list<{ interest: string }>
 }
 ```
 
 A list defines the fields of **one item**, not the number of items to extract.
-Define `company` and `role` once; the model can return zero, one, or many
-experiences according to the document. Do not add numbered fields such as
+Define `company` and `title` once; the model can return zero, one, or many
+experiences according to the document. The starter covers the ADBI resume field
+structure, including grouped skills and mission-specific technical stacks. It
+defines what to request; extraction completeness still depends on the model and
+document. Existing saved schemas are not replaced when the starter changes.
+Do not add numbered fields such as
 `experience_1` and `experience_2`.
 
 Use **Object (group of fields)** for a single nested group, or **List of objects**
