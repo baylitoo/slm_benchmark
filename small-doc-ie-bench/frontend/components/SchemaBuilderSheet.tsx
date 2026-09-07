@@ -21,18 +21,39 @@ const TYPES: { value: DynamicFieldType; label: string }[] = [
 const isContainer = (field: DynamicFieldSpec) => field.type === "object" || field.type === "list";
 
 export const RESUME_SCHEMA: DynamicSchemaSpec = {
-  document_type: "resume",
+  document_type: "adbi_resume",
   fields: [
-    { name: "full_name", type: "string" },
+    { name: "name", type: "string" },
+    { name: "title", type: "string" },
+    { name: "years_experience", type: "number" },
+    { name: "contact", type: "object", fields: [
+      { name: "email", type: "string" }, { name: "phone", type: "string" },
+      { name: "linkedin", type: "string" }, { name: "github", type: "string" },
+      { name: "location", type: "string" },
+    ] },
     { name: "experience", type: "list", description: "All work experiences in the document.", fields: [
-      { name: "company", type: "string" }, { name: "role", type: "string" },
+      { name: "company", type: "string" }, { name: "title", type: "string" },
       { name: "start_date", type: "date" }, { name: "end_date", type: "date" },
-      { name: "description", type: "string" },
+      { name: "location", type: "string" },
+      { name: "description", type: "string", description: "Complete responsibilities and achievements for this experience, including text spanning multiple lines." },
+      { name: "env_technique", type: "string", description: "Stack technique / environnement technologique de la mission" },
     ] },
     { name: "education", type: "list", description: "All education entries in the document.", fields: [
-      { name: "institution", type: "string" }, { name: "degree", type: "string" },
-      { name: "start_date", type: "date" }, { name: "end_date", type: "date" },
+      { name: "degree", type: "string" }, { name: "institution", type: "string" },
+      { name: "year", type: "string" },
     ] },
+    { name: "skills", type: "list", fields: [
+      { name: "category", type: "string" },
+      { name: "items", type: "list", fields: [{ name: "item", type: "string" }] },
+    ] },
+    { name: "languages", type: "list", fields: [
+      { name: "language", type: "string" }, { name: "level", type: "string" },
+    ] },
+    { name: "certifications", type: "list", fields: [
+      { name: "name", type: "string" }, { name: "issuer", type: "string" },
+      { name: "year", type: "string" },
+    ] },
+    { name: "interests", type: "list", fields: [{ name: "interest", type: "string" }] },
   ],
 };
 
@@ -169,7 +190,7 @@ export function SchemaBuilderSheet({ open, onClose, onCreated, initialSpec, edit
       </div>
       <fieldset disabled={submitting} className="space-y-5">
         {!editName && !initialSpec && <Button type="button" variant="secondary" size="sm"
-          onClick={() => { setDocumentType("resume"); setFields(structuredClone(RESUME_SCHEMA.fields)); setError(null); }}>
+          onClick={() => { setDocumentType(RESUME_SCHEMA.document_type); setFields(structuredClone(RESUME_SCHEMA.fields)); setError(null); }}>
           <T>Use resume starter</T>
         </Button>}
         <Field label="Document type" required hint={editName
