@@ -166,3 +166,63 @@ def test_extraction_with_unknown_dynamic_schema_name_raises(
                 {"text": "some text", "tenant_id": "t1", "dynamic_schema_name": "does_not_exist"}
             )
         )
+
+
+def test_edits_saved_schema_and_compiles_variable_nested_lists(client: TestClient) -> None:
+    from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
+
+    client.post("/v1/studio/schemas/dynamic", json=_payload("resume"))
+    original = client.get("/v1/studio/schemas/dynamic/resume").json()
+    spec = {"document_type": "resume", "fields": [
+        {"name": "experience", "type": "list", "fields": [
+            {"name": "company", "type": "string"},
+            {"name": "projects", "type": "list", "fields": [
+                {"name": "title", "type": "string"},
+            ]},
+        ]},
+        {"name": "education", "type": "list", "fields": [
+            {"name": "school", "type": "object", "fields": [
+                {"name": "name", "type": "string"},
+            ]},
+        ]},
+    ]}
+    response = client.put("/v1/studio/schemas/dynamic/resume", json=spec)
+    assert response.status_code == 200
+    saved = response.json()
+    assert saved["created_at"] == original["created_at"]
+    assert saved["updated_at"] != original["updated_at"]
+    assert len(client.get("/v1/studio/schemas/dynamic").json()) == 1
+    fetched = client.get("/v1/studio/schemas/dynamic/resume").json()
+    assert fetched["spec"] == saved["spec"]
+    model = DynamicTemplateBuilder.build_model(DynamicSchemaSpec.model_validate(fetched["spec"]))
+    # The same item definition accepts empty, single, and many repeated items.
+    for size in (0, 1, 5):
+        parsed = model.model_validate({
+            "experience": [{"company": {"value": "Acme"}, "projects": [
+                {"title": {"value": "A"}}, {"title": {"value": "B"}},
+            ]} for _ in range(size)],
+            "education": [{"school": {"name": {"value": "University"}}}],
+        })
+        assert len(parsed.experience) == size
+        assert len(parsed.education) == 1
+
+
+def test_update_unknown_schema_is_404(client: TestClient) -> None:
+    response = client.put("/v1/studio/schemas/dynamic/invoice_custom", json=_payload())
+    assert response.status_code == 404
+    assert response.headers["X-Docie-Error"] == "not_found"
+
+
+def test_invalid_update_preserves_original(client: TestClient) -> None:
+    client.post("/v1/studio/schemas/dynamic", json=_payload())
+    original = client.get("/v1/studio/schemas/dynamic/invoice_custom").json()
+    for invalid in (_payload("different_name"), {"document_type": "invoice_custom", "fields": []}):
+        response = client.put("/v1/studio/schemas/dynamic/invoice_custom", json=invalid)
+        assert response.status_code == 422
+        assert client.get("/v1/studio/schemas/dynamic/invoice_custom").json() == original
+
+
+def test_update_without_database_is_503(client: TestClient) -> None:
+    dispose_engine()
+    response = client.put("/v1/studio/schemas/dynamic/invoice_custom", json=_payload())
+    assert response.status_code == 503

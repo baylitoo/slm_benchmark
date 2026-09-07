@@ -2,13 +2,15 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { createDynamicSchema } = vi.hoisted(() => ({
+const { createDynamicSchema, updateDynamicSchema } = vi.hoisted(() => ({
   createDynamicSchema: vi.fn(),
+  updateDynamicSchema: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/api")>()),
   createDynamicSchema,
+  updateDynamicSchema,
 }));
 
 import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
@@ -16,6 +18,7 @@ import { SchemaBuilderSheet } from "./SchemaBuilderSheet";
 describe("SchemaBuilderSheet", () => {
   beforeEach(() => {
     createDynamicSchema.mockReset();
+    updateDynamicSchema.mockReset();
   });
 
   it("creates a reusable schema and returns its name", async () => {
@@ -60,4 +63,54 @@ describe("SchemaBuilderSheet", () => {
     expect(await screen.findByText(/reserved name/)).toBeInTheDocument();
     expect(createDynamicSchema).not.toHaveBeenCalled();
   });
+});
+
+
+it("creates resume lists from one item definition each", async () => {
+  createDynamicSchema.mockResolvedValue({ name: "resume" });
+  render(<SchemaBuilderSheet open onClose={vi.fn()} onCreated={vi.fn()} />);
+  await userEvent.click(screen.getByRole("button", { name: "Use resume starter" }));
+  await userEvent.click(screen.getByRole("button", { name: "Save schema" }));
+  const spec = createDynamicSchema.mock.calls.at(-1)![0];
+  expect(spec.document_type).toBe("resume");
+  expect(spec.fields.find((f: { name: string }) => f.name === "experience")).toMatchObject({
+    type: "list", fields: [{ name: "company" }, { name: "role" }, { name: "start_date" }, { name: "end_date" }, { name: "description" }],
+  });
+  expect(spec.fields.find((f: { name: string }) => f.name === "education").type).toBe("list");
+});
+
+it("edits nested objects and lists without flattening their item structure", async () => {
+  updateDynamicSchema.mockResolvedValue({ name: "resume" });
+  const initialSpec = { document_type: "resume", fields: [{ name: "profile", type: "object" as const, fields: [
+    { name: "experience", type: "list" as const, description: "All jobs", fields: [
+      { name: "company", type: "string" as const, description: "Employer" },
+    ] },
+  ] }] };
+  render(<SchemaBuilderSheet open initialSpec={initialSpec} editName="resume" onClose={vi.fn()} onCreated={vi.fn()} />);
+  expect(screen.getByPlaceholderText("purchase_order")).toBeDisabled();
+  await userEvent.click(screen.getByRole("button", { name: "Add field to profile.experience" }));
+  await userEvent.type(screen.getByRole("textbox", { name: "Name for profile.experience.field 2" }), "projects");
+  await userEvent.selectOptions(screen.getByRole("combobox", { name: "Type for profile.experience.projects" }), "list");
+  await userEvent.type(screen.getByRole("textbox", { name: "Name for profile.experience.projects.field 1" }), "title");
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  expect(updateDynamicSchema).toHaveBeenCalledWith("resume", { document_type: "resume", fields: [
+    { name: "profile", type: "object", fields: [
+      { name: "experience", type: "list", description: "All jobs", fields: [
+        { name: "company", type: "string", description: "Employer" },
+        { name: "projects", type: "list", fields: [{ name: "title", type: "string" }] },
+      ] },
+    ] },
+  ] });
+});
+
+it("rejects duplicate names inside a nested item", async () => {
+  createDynamicSchema.mockClear();
+  render(<SchemaBuilderSheet open onClose={vi.fn()} onCreated={vi.fn()} initialSpec={{
+    document_type: "resume", fields: [{ name: "experience", type: "list", fields: [
+      { name: "company", type: "string" }, { name: "company", type: "string" },
+    ] }],
+  }} />);
+  await userEvent.click(screen.getByRole("button", { name: "Save schema" }));
+  expect(await screen.findByText(/must be unique/)).toBeInTheDocument();
+  expect(createDynamicSchema).not.toHaveBeenCalled();
 });

@@ -86,10 +86,9 @@ class DynamicSchema(Base):
     Studio's schema builder.
 
     Shared operator config like ``models.yaml``/``data/datasets.yaml`` -- no
-    ``tenant_id``, unlike ``StudioRun``'s per-tenant scoping. Create-only for now
-    (409 on a duplicate ``name``): no version/lifecycle field, matching the "save
-    and reuse by name" scope of this first slice -- not the full draft/published
-    versioning the original roadmap brief described. ``name`` doubles as
+    ``tenant_id``, unlike ``StudioRun``'s per-tenant scoping. Creation rejects a
+    duplicate name; edits replace the definition in place without a version or
+    lifecycle field. ``name`` doubles as
     ``DynamicSchemaSpec.document_type`` (both already share the same snake_case
     pattern), so a saved schema's own name IS the identifier extraction requests
     reference.

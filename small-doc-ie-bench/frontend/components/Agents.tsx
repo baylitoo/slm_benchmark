@@ -874,7 +874,7 @@ export function CreateView({
   // Built-in and operator-created schemas available for structured output.
   const schemas = useAsync<string[]>("schemas", listSchemas);
   const dynamicSchemas = useAsync<DynamicSchemaSummary[]>(
-    "agent-dynamic-schemas",
+    "dynamic-schemas",
     listDynamicSchemas,
   );
   const dynamicSchemaNames = useMemo(

@@ -32,15 +32,13 @@ export function getSchemaFields(name: string): Promise<string[]> {
 // static SCHEMA_REGISTRY above.
 // ---------------------------------------------------------------------------
 
-export type DynamicFieldType = "string" | "date" | "number" | "money" | "list";
+export type DynamicFieldType = "string" | "date" | "number" | "money" | "object" | "list";
 
 export interface DynamicFieldSpec {
   name: string;
   type: DynamicFieldType;
   description?: string | null;
-  /** Only meaningful when type === "list" -- one flat level of scalar
-   * sub-fields (line-items style). Arbitrary nesting/object fields are not
-   * exposed by this UI slice; still reachable via a hand-authored POST body. */
+  /** Object properties, or the structure of ONE item in a variable-length list. */
   fields?: DynamicFieldSpec[];
 }
 
@@ -74,6 +72,19 @@ export function deleteDynamicSchema(name: string): Promise<{ deleted: string }> 
     `/v1/studio/schemas/dynamic/${encodeURIComponent(name)}`,
     { method: "DELETE" },
   );
+}
+
+export function updateDynamicSchema(
+  name: string, spec: DynamicSchemaSpec,
+): Promise<DynamicSchemaSummary> {
+  return request<DynamicSchemaSummary>(
+    `/v1/studio/schemas/dynamic/${encodeURIComponent(name)}`,
+    { method: "PUT", body: JSON.stringify(spec) },
+  );
+}
+
+export function getSchemaDefinition(name: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/v1/schemas/${encodeURIComponent(name)}`);
 }
 
 // ---------------------------------------------------------------------------
