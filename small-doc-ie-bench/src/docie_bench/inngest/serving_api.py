@@ -866,6 +866,7 @@ class ScaleRequest(BaseModel):
     reasoning_budget: int | None = Field(default=None, ge=-1)
     reasoning_budget_message: str | None = None
     flash_attn: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 @router.post("/store/{name}/scale")
@@ -946,6 +947,8 @@ async def scale_store_model(
                 data["reasoning_budget_message"] = request.reasoning_budget_message
             if request.flash_attn is not None:
                 data["flash_attn"] = request.flash_attn
+            if request.timeout_seconds is not None:
+                data["timeout_seconds"] = request.timeout_seconds
             ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
             event_ids.extend(ids)
         return {

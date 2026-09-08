@@ -265,6 +265,7 @@ def _synthesize_profile(
             base_url=base_url,
             kind="passthrough",
             max_tokens=launch.max_tokens or match.max_tokens,
+            timeout_seconds=launch.timeout_seconds or match.timeout_seconds,
             deployment_slot_count=launch.n_parallel,
         )
 
@@ -286,7 +287,7 @@ def _synthesize_profile(
         stop_sequences=traits.stop_sequences,
         temperature=traits.temperature,
         max_tokens=launch.max_tokens or traits.max_tokens,
-        timeout_seconds=traits.timeout_seconds,
+        timeout_seconds=launch.timeout_seconds or traits.timeout_seconds,
         deployment_slot_count=launch.n_parallel,
     )
 

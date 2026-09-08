@@ -92,6 +92,7 @@ class RuntimeLaunchSpec:
     # generation metadata, not a llama-server process flag; callers may still
     # override it per request.
     max_tokens: int | None = None
+    timeout_seconds: float | None = None
     cpu_threads: int | None = None
     cpu_threads_batch: int | None = None
     tensor_parallel_size: int = 1
@@ -157,6 +158,8 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("context_length must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
             raise RuntimeConfigurationError("max_tokens must be positive")
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise RuntimeConfigurationError("timeout_seconds must be positive")
         if self.cpu_threads is not None and self.cpu_threads < 1:
             raise RuntimeConfigurationError("cpu_threads must be positive")
         if self.cpu_threads_batch is not None and self.cpu_threads_batch < 1:
