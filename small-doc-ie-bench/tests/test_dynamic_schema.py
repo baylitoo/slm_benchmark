@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -248,4 +249,74 @@ async def test_nuextract_dynamic_inference_requires_proposer_or_reused_schema() 
             ocr_blocks=None,
             schema_name="unknown",
             schema_mode="dynamic",
+        )
+
+
+@pytest.mark.asyncio
+async def test_parallel_extraction_bounds_fanout_to_deployment_slots(monkeypatch) -> None:
+    in_flight = 0
+    peak = 0
+
+    class FakeClient:
+        last_response_format_style = "json_schema"
+        last_queue_wait_ms = 0
+
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        async def chat_json(self, **kwargs: Any) -> tuple[dict[str, Any], None, dict[str, Any]]:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            props = kwargs["schema"]["properties"]
+            out = {k: ([] if "items" in str(v) else {"value": "x"}) for k, v in props.items()}
+            return out, None, {}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("docie_bench.extract.service.OpenAICompatibleClient", FakeClient)
+    profile = ModelProfile(
+        name="t", model="m", base_url="http://t", api_key="k",
+        max_concurrency=4, deployment_slot_count=1,
+    )
+    service = ExtractionService(profile)
+    fields = [{"name": "name", "type": "string"}] + [
+        {"name": f"list{i}", "type": "list", "fields": [{"name": "v", "type": "string"}]}
+        for i in range(6)
+    ]
+    response = await service.extract_from_text(
+        text="x", ocr_blocks=None, schema_name="doc", schema_mode="dynamic",
+        dynamic_schema={"document_type": "doc", "fields": fields}, parallel_extraction=True,
+    )
+    assert response.validation.valid
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_extraction_group_failure_surfaces_as_plain_exception(monkeypatch) -> None:
+    from docie_bench.llm.model_gateway import ModelQueueFullError
+
+    class FakeClient:
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        async def chat_json(self, **kwargs: Any) -> tuple[dict[str, Any], None, dict[str, Any]]:
+            raise ModelQueueFullError("Queue wait timed out")
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("docie_bench.extract.service.OpenAICompatibleClient", FakeClient)
+    service = ExtractionService(_profile())
+    with pytest.raises(ModelQueueFullError):
+        await service.extract_from_text(
+            text="x", ocr_blocks=None, schema_name="doc", schema_mode="dynamic",
+            dynamic_schema={"document_type": "doc", "fields": [
+                {"name": "a", "type": "string"},
+                {"name": "b", "type": "list", "fields": [{"name": "v", "type": "string"}]},
+            ]},
+            parallel_extraction=True,
         )

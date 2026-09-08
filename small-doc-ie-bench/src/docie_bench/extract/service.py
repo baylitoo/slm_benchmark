@@ -881,11 +881,18 @@ class ExtractionService:
                     want_logprobs=want_logprobs,
                 )
 
-            # TaskGroup, not gather: any group failing cancels its siblings
-            # and raises -- a split extraction fails as a whole, same
-            # all-or-nothing contract the single-call path already had.
-            async with asyncio.TaskGroup() as tg:
-                tasks = [tg.create_task(_run_group(group)) for group in groups]
+            slots = self.profile.deployment_slot_count or 1
+            fanout = asyncio.Semaphore(max(1, min(slots, self.profile.max_concurrency)))
+
+            async def _bounded(field_names: list[str]) -> Any:
+                async with fanout:
+                    return await _run_group(field_names)
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    tasks = [tg.create_task(_bounded(group)) for group in groups]
+            except* Exception as eg:
+                raise eg.exceptions[0] from None
             group_results = [task.result() for task in tasks]
 
             raw = {}
