@@ -102,6 +102,38 @@ def test_failed_auth_attempts_are_rate_limited_per_client_ip() -> None:
     assert after_window.value.status_code == 401
 
 
+def test_security_events_are_logged(caplog: pytest.LogCaptureFixture) -> None:
+    # #449: before this, a rejected auth attempt, a rate-limit hit, or a
+    # concurrency-limit hit left NO trace anywhere except the HTTPException
+    # returned to the caller -- no way to detect or reconstruct a
+    # brute-force/scanning attempt after the fact.
+    manager = TenantQuotaManager(
+        api_keys={"a": "tenant-a"},
+        auth_required=True,
+        requests_per_window=1,
+        window_seconds=60,
+        max_concurrent=1,
+        auth_failure_requests_per_window=1,
+    )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(HTTPException):
+            manager.authenticate("wrong", "10.0.0.9", now=0)
+        assert any("authentication failed" in r.message for r in caplog.records)
+
+        caplog.clear()
+        with pytest.raises(HTTPException) as exc:
+            manager.authenticate("wrong", "10.0.0.9", now=0)
+        assert exc.value.status_code == 429
+        assert any("brute-force" in r.message for r in caplog.records)
+
+        caplog.clear()
+        tenant = manager.authenticate("a")
+        manager.acquire(tenant, now=10)
+        with pytest.raises(HTTPException):
+            manager.acquire(tenant, now=10)
+        assert any("concurrency limit exceeded" in r.message for r in caplog.records)
+
+
 def test_auth_failure_limit_of_zero_disables_the_check() -> None:
     manager = TenantQuotaManager(
         api_keys={},

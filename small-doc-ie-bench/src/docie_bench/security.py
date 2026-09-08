@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import threading
 import time
 from collections import defaultdict, deque
@@ -14,6 +15,8 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, Header, HTTPException, Request, UploadFile
 
 from docie_bench.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 MIME_BY_SUFFIX = {
     ".pdf": "application/pdf",
@@ -111,6 +114,13 @@ class TenantQuotaManager:
                 if hmac.compare_digest(api_key, configured_key):
                     return TenantContext(tenant_id=tenant_id, authenticated=True)
         if self.auth_required:
+            # #449: this is the only trace a rejected auth attempt leaves
+            # anywhere -- there was previously no way to detect or
+            # reconstruct a brute-force/scanning attempt after the fact.
+            logger.warning(
+                "authentication failed",
+                extra={"docie_client_host": client_host or "unknown"},
+            )
             self._record_auth_failure(client_host, now=now)
             raise HTTPException(
                 status_code=401,
@@ -158,8 +168,22 @@ class TenantQuotaManager:
                 max_concurrent > 0
                 and self._concurrent[context.tenant_id] >= max_concurrent
             ):
+                logger.warning(
+                    "tenant concurrency limit exceeded",
+                    extra={
+                        "docie_tenant_id": context.tenant_id,
+                        "docie_quota": quota,
+                    },
+                )
                 raise HTTPException(status_code=429, detail="Tenant concurrency limit exceeded")
             if requests_per_window > 0 and len(requests) >= requests_per_window:
+                logger.warning(
+                    "tenant rate limit exceeded",
+                    extra={
+                        "docie_tenant_id": context.tenant_id,
+                        "docie_quota": quota,
+                    },
+                )
                 raise HTTPException(
                     status_code=429,
                     detail=(
@@ -188,6 +212,13 @@ class TenantQuotaManager:
             while failures and failures[0] <= cutoff:
                 failures.popleft()
             if len(failures) >= self.auth_failure_requests_per_window:
+                logger.warning(
+                    "auth failure rate limit exceeded -- possible brute-force attempt",
+                    extra={
+                        "docie_client_host": bucket_key,
+                        "docie_failure_count": len(failures),
+                    },
+                )
                 raise HTTPException(
                     status_code=429,
                     detail="Too many failed authentication attempts",
