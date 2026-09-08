@@ -50,6 +50,7 @@ class DeployRequest(BaseModel):
     chat_template_file: str | None = None
     batch_size: int | None = Field(default=None, ge=1)
     ubatch_size: int | None = Field(default=None, ge=1)
+    numa: str | None = None
 
 
 async def _trigger_replicated_deploy(
@@ -115,6 +116,8 @@ async def _trigger_replicated_deploy(
             data["batch_size"] = payload.batch_size
         if payload.ubatch_size is not None:
             data["ubatch_size"] = payload.ubatch_size
+        if payload.numa is not None:
+            data["numa"] = payload.numa
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )

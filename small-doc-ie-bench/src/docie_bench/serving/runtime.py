@@ -71,6 +71,7 @@ class RuntimeLaunchError(RuntimeError):
 _LLAMACPP_CACHE_TYPES = frozenset(
     {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 )
+_LLAMACPP_NUMA_MODES = frozenset({"distribute", "isolate", "numactl"})
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,7 @@ class RuntimeLaunchSpec:
     # rather than an abrupt cut-off thought. Only meaningful alongside
     # reasoning_budget; validated together below.
     reasoning_budget_message: str | None = None
+    numa: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -193,6 +195,10 @@ class RuntimeLaunchSpec:
                 raise RuntimeConfigurationError(
                     "reasoning_budget_message must not contain NUL bytes"
                 )
+        if self.numa is not None and self.numa not in _LLAMACPP_NUMA_MODES:
+            raise RuntimeConfigurationError(
+                f"numa must be one of {sorted(_LLAMACPP_NUMA_MODES)}"
+            )
 
 
 @dataclass(frozen=True)
@@ -810,6 +816,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--batch-size", str(spec.batch_size)])
         if spec.ubatch_size is not None:
             command.extend(["--ubatch-size", str(spec.ubatch_size)])
+        if spec.numa is not None:
+            command.extend(["--numa", spec.numa])
         command.extend(spec.extra_args)
         return tuple(command)
 

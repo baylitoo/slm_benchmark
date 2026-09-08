@@ -228,6 +228,7 @@ class Supervisor(Protocol):
         chat_template_file: str | None = None,
         batch_size: int | None = None,
         ubatch_size: int | None = None,
+        numa: str | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -242,6 +243,7 @@ class Supervisor(Protocol):
         chat_template_file: str | None = None,
         batch_size: int | None = None,
         ubatch_size: int | None = None,
+        numa: str | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -387,6 +389,7 @@ class ControlPlane:
         chat_template_file: str | None = None,
         batch_size: int | None = None,
         ubatch_size: int | None = None,
+        numa: str | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -412,6 +415,8 @@ class ControlPlane:
             kwargs["batch_size"] = batch_size
         if ubatch_size is not None:
             kwargs["ubatch_size"] = ubatch_size
+        if numa is not None:
+            kwargs["numa"] = numa
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -432,6 +437,7 @@ class ControlPlane:
         chat_template_file: str | None = None,
         batch_size: int | None = None,
         ubatch_size: int | None = None,
+        numa: str | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -457,6 +463,8 @@ class ControlPlane:
             kwargs["batch_size"] = batch_size
         if ubatch_size is not None:
             kwargs["ubatch_size"] = ubatch_size
+        if numa is not None:
+            kwargs["numa"] = numa
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -890,6 +898,7 @@ class _DefaultSupervisor:
         chat_template_file: str | None = None,
         batch_size: int | None = None,
         ubatch_size: int | None = None,
+        numa: str | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -919,6 +928,7 @@ class _DefaultSupervisor:
                     chat_template_file=chat_template_file,
                     batch_size=batch_size,
                     ubatch_size=ubatch_size,
+                    numa=numa,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -943,6 +953,7 @@ class _DefaultSupervisor:
                     chat_template_file=chat_template_file,
                     batch_size=batch_size,
                     ubatch_size=ubatch_size,
+                    numa=numa,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -977,6 +988,7 @@ class _DefaultSupervisor:
         chat_template_file: str | None = None,
         batch_size: int | None = None,
         ubatch_size: int | None = None,
+        numa: str | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -1057,6 +1069,7 @@ class _DefaultSupervisor:
                     chat_template_file=chat_template_file,
                     batch_size=batch_size,
                     ubatch_size=ubatch_size,
+                    numa=numa,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
