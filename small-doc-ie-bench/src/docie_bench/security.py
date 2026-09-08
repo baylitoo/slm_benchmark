@@ -69,6 +69,7 @@ class TenantQuotaManager:
         max_concurrent: int,
         anonymous_requests_per_window: int = 0,
         anonymous_max_concurrent: int = 0,
+        auth_failure_requests_per_window: int = 0,
     ) -> None:
         self.api_keys = api_keys
         self.auth_required = auth_required
@@ -88,16 +89,29 @@ class TenantQuotaManager:
         # LAN-exposed dev instance had no request bounding at all.
         self.anonymous_requests_per_window = anonymous_requests_per_window
         self.anonymous_max_concurrent = anonymous_max_concurrent
+        # #448: bucketed per client IP, checked BEFORE a bad/missing key can
+        # even raise 401 -- a wrong key must not get an unlimited number of
+        # free guesses just because it never reaches the (separate, post-auth)
+        # tenant rate limiter below.
+        self.auth_failure_requests_per_window = auth_failure_requests_per_window
         self._requests: dict[str, deque[float]] = defaultdict(deque)
         self._concurrent: dict[str, int] = defaultdict(int)
+        self._auth_failures: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
-    def authenticate(self, api_key: str | None, client_host: str | None = None) -> TenantContext:
+    def authenticate(
+        self,
+        api_key: str | None,
+        client_host: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> TenantContext:
         if api_key:
             for configured_key, tenant_id in self.api_keys.items():
                 if hmac.compare_digest(api_key, configured_key):
                     return TenantContext(tenant_id=tenant_id, authenticated=True)
         if self.auth_required:
+            self._record_auth_failure(client_host, now=now)
             raise HTTPException(
                 status_code=401,
                 detail="A valid API key is required",
@@ -158,6 +172,29 @@ class TenantQuotaManager:
             requests.append(current)
             self._concurrent[context.tenant_id] += 1
 
+    def _record_auth_failure(self, client_host: str | None, *, now: float | None = None) -> None:
+        """Raise 429 once a client IP has failed auth too many times within
+        the window -- checked BEFORE the caller's 401 (a rejected attempt
+        must never be free to retry unboundedly), and entirely separate from
+        the post-auth per-tenant limiter, which a bad key never reaches."""
+        if self.auth_failure_requests_per_window <= 0:
+            return
+        bucket_key = client_host or "unknown"
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._prune_locked()
+            failures = self._auth_failures[bucket_key]
+            cutoff = now - self.window_seconds
+            while failures and failures[0] <= cutoff:
+                failures.popleft()
+            if len(failures) >= self.auth_failure_requests_per_window:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed authentication attempts",
+                    headers={"Retry-After": str(self.window_seconds)},
+                )
+            failures.append(now)
+
     def _prune_locked(self) -> None:
         """Bound the bucket dicts (caller holds the lock).
 
@@ -166,6 +203,11 @@ class TenantQuotaManager:
         the in-flight concurrency counts, which must stay balanced for
         ``release``).
         """
+        if len(self._auth_failures) >= _MAX_TRACKED_BUCKETS:
+            for key in [k for k, q in self._auth_failures.items() if not q]:
+                del self._auth_failures[key]
+            while len(self._auth_failures) >= _MAX_TRACKED_BUCKETS:
+                self._auth_failures.pop(next(iter(self._auth_failures)))
         if len(self._requests) < _MAX_TRACKED_BUCKETS:
             return
         for key in [k for k, q in self._requests.items() if not q]:
@@ -275,6 +317,7 @@ def get_quota_manager() -> TenantQuotaManager:
         max_concurrent=settings.tenant_max_concurrent_requests,
         anonymous_requests_per_window=settings.anonymous_rate_limit_requests,
         anonymous_max_concurrent=settings.anonymous_max_concurrent_requests,
+        auth_failure_requests_per_window=settings.auth_failure_rate_limit_requests,
     )
 
 

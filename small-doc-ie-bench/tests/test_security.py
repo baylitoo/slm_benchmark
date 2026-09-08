@@ -69,6 +69,54 @@ def test_authentication_and_quotas_are_isolated_per_tenant() -> None:
     manager.acquire(tenant_a, now=71)
 
 
+def test_failed_auth_attempts_are_rate_limited_per_client_ip() -> None:
+    manager = TenantQuotaManager(
+        api_keys={"a": "tenant-a"},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=100,
+        auth_failure_requests_per_window=3,
+    )
+    for _ in range(3):
+        with pytest.raises(HTTPException) as exc:
+            manager.authenticate("wrong", "10.0.0.9", now=0)
+        assert exc.value.status_code == 401
+
+    # The 4th attempt from the SAME IP is rate-limited, not just rejected --
+    # unlike a bare bad key, this must never reach the per-tenant limiter
+    # (there IS no tenant yet) and must be a 429, not another 401.
+    with pytest.raises(HTTPException) as blocked:
+        manager.authenticate("wrong", "10.0.0.9", now=0)
+    assert blocked.value.status_code == 429
+
+    # A DIFFERENT client IP is unaffected -- one noisy attacker must not
+    # lock out every other caller.
+    with pytest.raises(HTTPException) as other_ip:
+        manager.authenticate("wrong", "10.0.0.10", now=0)
+    assert other_ip.value.status_code == 401
+
+    # The window rolling forward clears the bucket.
+    with pytest.raises(HTTPException) as after_window:
+        manager.authenticate("wrong", "10.0.0.9", now=61)
+    assert after_window.value.status_code == 401
+
+
+def test_auth_failure_limit_of_zero_disables_the_check() -> None:
+    manager = TenantQuotaManager(
+        api_keys={},
+        auth_required=True,
+        requests_per_window=100,
+        window_seconds=60,
+        max_concurrent=100,
+        auth_failure_requests_per_window=0,
+    )
+    for _ in range(50):
+        with pytest.raises(HTTPException) as exc:
+            manager.authenticate("wrong", "10.0.0.9", now=0)
+        assert exc.value.status_code == 401
+
+
 def test_authenticated_reads_do_not_consume_inference_quota() -> None:
     manager = TenantQuotaManager(
         api_keys={"a": "tenant-a"},
@@ -117,6 +165,7 @@ def test_auth_off_keeps_anonymous_throttling(monkeypatch: pytest.MonkeyPatch) ->
         tenant_max_concurrent_requests=1,
         anonymous_rate_limit_requests=3,
         anonymous_max_concurrent_requests=2,
+        auth_failure_rate_limit_requests=20,
     )
     monkeypatch.setattr(security, "get_settings", lambda: fake_settings)
     security.get_quota_manager.cache_clear()

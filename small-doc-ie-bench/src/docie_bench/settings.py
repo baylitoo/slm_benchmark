@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     # turn off request bounding. 0 disables the respective check.
     anonymous_rate_limit_requests: int = Field(default=600, ge=0)
     anonymous_max_concurrent_requests: int = Field(default=16, ge=0)
+    # #448: a WRONG/missing API key used to short-circuit straight to a 401,
+    # before the tenant rate limiter (below it) was ever reached -- unlimited
+    # concurrent guesses at full network throughput. Bucketed per client IP,
+    # over the same rate_limit_window_seconds. 0 disables the check.
+    auth_failure_rate_limit_requests: int = Field(default=20, ge=0)
     enable_benchmark_api: bool = False
 
     redacted_response_fields: str = ""
