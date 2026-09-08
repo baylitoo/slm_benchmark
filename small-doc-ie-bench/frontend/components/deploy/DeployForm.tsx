@@ -44,6 +44,8 @@ import { PortsAdmin } from "./PortsAdmin";
 // Deploy form (model picker + scoped runtime + advanced + progress)
 // ---------------------------------------------------------------------------
 
+const LLAMACPP_CACHE_TYPES = ["f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"] as const;
+
 export function DeployForm({
   store,
   active,
@@ -76,6 +78,12 @@ export function DeployForm({
   const [batchSize, setBatchSize] = useState("");
   const [ubatchSize, setUbatchSize] = useState("");
   const [numa, setNuma] = useState("");
+  const [cacheReuse, setCacheReuse] = useState("");
+  const [chatTemplateFile, setChatTemplateFile] = useState("");
+  const [cacheTypeK, setCacheTypeK] = useState("");
+  const [cacheTypeV, setCacheTypeV] = useState("");
+  const [reasoningBudget, setReasoningBudget] = useState("");
+  const [reasoningBudgetMessage, setReasoningBudgetMessage] = useState("");
   const [cpuThreads, setCpuThreads] = useState("");
   const [cpuThreadsBatch, setCpuThreadsBatch] = useState("");
 
@@ -155,6 +163,14 @@ export function DeployForm({
         ...(showNParallel && batchSize.trim() ? { batch_size: Number(batchSize) } : {}),
         ...(showNParallel && ubatchSize.trim() ? { ubatch_size: Number(ubatchSize) } : {}),
         ...(showNParallel && numa ? { numa } : {}),
+        ...(showNParallel && cacheReuse.trim() ? { cache_reuse: Number(cacheReuse) } : {}),
+        ...(showNParallel && chatTemplateFile.trim() ? { chat_template_file: chatTemplateFile.trim() } : {}),
+        ...(showNParallel && cacheTypeK ? { cache_type_k: cacheTypeK } : {}),
+        ...(showNParallel && cacheTypeV ? { cache_type_v: cacheTypeV } : {}),
+        ...(showNParallel && reasoningBudget.trim() ? { reasoning_budget: Number(reasoningBudget) } : {}),
+        ...(showNParallel && reasoningBudget.trim() && reasoningBudgetMessage.trim()
+          ? { reasoning_budget_message: reasoningBudgetMessage.trim() }
+          : {}),
         ...(showNParallel && cpuThreads.trim() ? { cpu_threads: Number(cpuThreads) } : {}),
         ...(showNParallel && cpuThreadsBatch.trim() ? { cpu_threads_batch: Number(cpuThreadsBatch) } : {}),
       };
@@ -374,6 +390,42 @@ export function DeployForm({
                       <option value="isolate">isolate</option>
                       <option value="numactl">numactl</option>
                     </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Cache reuse" hint="--cache-reuse: min token span to reuse from the KV prefix.">
+                    <TextInput type="number" min={1} value={cacheReuse} onChange={(e) => setCacheReuse(e.target.value)} placeholder="off" aria-label="Cache reuse" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Chat template file" hint="Jinja file path inside the serving container; overrides the GGUF template.">
+                    <TextInput value={chatTemplateFile} onChange={(e) => setChatTemplateFile(e.target.value)} placeholder="(embedded template)" aria-label="Chat template file" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="KV cache type (K)" hint="Quantized KV cache; non-f16 auto-enables --flash-attn.">
+                    <Select value={cacheTypeK} onChange={(e) => setCacheTypeK(e.target.value)} aria-label="KV cache type (K)">
+                      <option value="">f16 (default)</option>
+                      {LLAMACPP_CACHE_TYPES.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="KV cache type (V)" hint="Same tradeoff as K.">
+                    <Select value={cacheTypeV} onChange={(e) => setCacheTypeV(e.target.value)} aria-label="KV cache type (V)">
+                      <option value="">f16 (default)</option>
+                      {LLAMACPP_CACHE_TYPES.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Reasoning budget" hint="--reasoning-budget: max thinking tokens. -1 unbounded, 0 disables thinking.">
+                    <TextInput type="number" min={-1} value={reasoningBudget} onChange={(e) => setReasoningBudget(e.target.value)} placeholder="unbounded" aria-label="Reasoning budget" />
+                  </Field>
+                )}
+                {showNParallel && reasoningBudget.trim() && (
+                  <Field label="Reasoning budget message" hint="Injected before the end-of-thinking tag on cutoff.">
+                    <TextInput value={reasoningBudgetMessage} onChange={(e) => setReasoningBudgetMessage(e.target.value)} placeholder="(none)" aria-label="Reasoning budget message" />
                   </Field>
                 )}
                 {showNParallel && (

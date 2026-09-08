@@ -23,6 +23,21 @@ export interface DeployRequest {
   n_parallel?: number;
   /** llama-server --cache-reuse: min chunk size to reuse from KV cache. */
   cache_reuse?: number;
+  /** llama-server only: overrides the GGUF's own embedded chat_template with
+   * an operator-supplied Jinja file path, reachable inside the serving
+   * container. */
+  chat_template_file?: string;
+  /** llama-server --cache-type-k/-v: quantized KV cache (#382). Omit for the
+   * f16 default; a non-f16 value auto-enables --flash-attn. */
+  cache_type_k?: string;
+  cache_type_v?: string;
+  /** llama-server --reasoning-budget (#402): max tokens a reasoning model
+   * spends thinking before being forced to answer. -1 unbounded-but-tracked,
+   * 0 disables thinking. */
+  reasoning_budget?: number;
+  /** Text injected right before the end-of-thinking tag when reasoning_budget
+   * forces a cutoff. Requires reasoning_budget to be set. */
+  reasoning_budget_message?: string;
   [k: string]: unknown;
 }
 
