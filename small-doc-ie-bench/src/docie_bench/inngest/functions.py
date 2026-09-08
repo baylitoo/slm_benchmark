@@ -1284,6 +1284,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     )
     raw_flash_attn = data.get("flash_attn")
     flash_attn = str(raw_flash_attn) if raw_flash_attn else None
+    raw_timeout = data.get("timeout_seconds")
+    timeout_seconds = float(raw_timeout) if raw_timeout is not None else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1306,6 +1308,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             reasoning_budget=reasoning_budget,
             reasoning_budget_message=reasoning_budget_message,
             flash_attn=flash_attn,
+            timeout_seconds=timeout_seconds,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1341,6 +1344,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             reasoning_budget=reasoning_budget,
             reasoning_budget_message=reasoning_budget_message,
             flash_attn=flash_attn,
+            timeout_seconds=timeout_seconds,
         )
     return record
 

@@ -236,6 +236,7 @@ class Supervisor(Protocol):
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
         flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -258,6 +259,7 @@ class Supervisor(Protocol):
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
         flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -411,6 +413,7 @@ class ControlPlane:
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
         flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -452,6 +455,8 @@ class ControlPlane:
             kwargs["reasoning_budget_message"] = reasoning_budget_message
         if flash_attn is not None:
             kwargs["flash_attn"] = flash_attn
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -480,6 +485,7 @@ class ControlPlane:
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
         flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -521,6 +527,8 @@ class ControlPlane:
             kwargs["reasoning_budget_message"] = reasoning_budget_message
         if flash_attn is not None:
             kwargs["flash_attn"] = flash_attn
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -962,6 +970,7 @@ class _DefaultSupervisor:
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
         flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -999,6 +1008,7 @@ class _DefaultSupervisor:
                     reasoning_budget=reasoning_budget,
                     reasoning_budget_message=reasoning_budget_message,
                     flash_attn=flash_attn,
+                    timeout_seconds=timeout_seconds,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -1031,6 +1041,7 @@ class _DefaultSupervisor:
                     reasoning_budget=reasoning_budget,
                     reasoning_budget_message=reasoning_budget_message,
                     flash_attn=flash_attn,
+                    timeout_seconds=timeout_seconds,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -1073,6 +1084,7 @@ class _DefaultSupervisor:
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
         flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -1161,6 +1173,7 @@ class _DefaultSupervisor:
                     reasoning_budget=reasoning_budget,
                     reasoning_budget_message=reasoning_budget_message,
                     flash_attn=flash_attn,
+                    timeout_seconds=timeout_seconds,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,

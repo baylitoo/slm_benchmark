@@ -85,6 +85,7 @@ export function DeployForm({
   const [reasoningBudget, setReasoningBudget] = useState("");
   const [reasoningBudgetMessage, setReasoningBudgetMessage] = useState("");
   const [flashAttn, setFlashAttn] = useState("");
+  const [timeoutSeconds, setTimeoutSeconds] = useState("");
   const [cpuThreads, setCpuThreads] = useState("");
   const [cpuThreadsBatch, setCpuThreadsBatch] = useState("");
 
@@ -173,6 +174,7 @@ export function DeployForm({
           ? { reasoning_budget_message: reasoningBudgetMessage.trim() }
           : {}),
         ...(showNParallel && flashAttn ? { flash_attn: flashAttn } : {}),
+        ...(timeoutSeconds.trim() ? { timeout_seconds: Number(timeoutSeconds) } : {}),
         ...(showNParallel && cpuThreads.trim() ? { cpu_threads: Number(cpuThreads) } : {}),
         ...(showNParallel && cpuThreadsBatch.trim() ? { cpu_threads_batch: Number(cpuThreadsBatch) } : {}),
       };
@@ -316,6 +318,12 @@ export function DeployForm({
                     onChange={(e) => setContextLength(e.target.value)}
                     placeholder="8192"
                   />
+                </Field>
+                <Field
+                  label="Request timeout (s)"
+                  hint="Per-request generation timeout. Blank = family default (180s). Must stay below your client's own timeout."
+                >
+                  <TextInput type="number" min={1} value={timeoutSeconds} onChange={(e) => setTimeoutSeconds(e.target.value)} placeholder="180" aria-label="Request timeout (s)" />
                 </Field>
                 <Field
                   label="Default max output tokens"

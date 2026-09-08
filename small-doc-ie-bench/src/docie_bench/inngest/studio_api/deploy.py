@@ -69,6 +69,7 @@ class DeployRequest(BaseModel):
     # this at validation, not here — the API layer doesn't duplicate it).
     reasoning_budget_message: str | None = None
     flash_attn: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 async def _trigger_replicated_deploy(
@@ -150,6 +151,8 @@ async def _trigger_replicated_deploy(
             data["reasoning_budget_message"] = payload.reasoning_budget_message
         if payload.flash_attn is not None:
             data["flash_attn"] = payload.flash_attn
+        if payload.timeout_seconds is not None:
+            data["timeout_seconds"] = payload.timeout_seconds
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )
