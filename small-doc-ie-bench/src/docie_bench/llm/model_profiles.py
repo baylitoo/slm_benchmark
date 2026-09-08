@@ -46,6 +46,19 @@ class ModelProfile:
     # are served by a local adapter. `options` carries adapter-specific config.
     kind: str = "passthrough"
     options: Mapping[str, Any] = field(default_factory=dict)
+    # Best-effort, self-declared deployment runtime backing `base_url` (e.g.
+    # "llamacpp", "vllm", "ollama", "remote") -- mirrors DeployRequest.runtime's
+    # plain-string idiom (inngest/studio_api/deploy.py), not verified against
+    # the live endpoint. None/unset means unknown; runtime-gated request
+    # features (see `logprob_confidence`) treat unknown as "not llama.cpp"
+    # rather than guessing, so they fail closed on an unlabeled profile.
+    runtime: str | None = None
+    # Opt-in (#335): request llama-server's per-token logprobs on extraction
+    # calls and surface a MIN-aggregated per-field `model_confidence` (see
+    # extract/logprob_confidence.py). Off by default -- extra token-count and
+    # payload-size cost at scale -- and only takes effect when `runtime` is
+    # also declared "llamacpp"; the call site checks both.
+    logprob_confidence: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in VALID_PROFILE_KINDS:
@@ -130,6 +143,8 @@ def load_model_profiles(path: str | Path) -> dict[str, ModelProfile]:
             queue_timeout_seconds=float(cfg.get("queue_timeout_seconds", 30)),
             kind=kind,
             options=dict(cfg.get("options") or {}),
+            runtime=cfg.get("runtime"),
+            logprob_confidence=bool(cfg.get("logprob_confidence", False)),
         )
     return profiles
 

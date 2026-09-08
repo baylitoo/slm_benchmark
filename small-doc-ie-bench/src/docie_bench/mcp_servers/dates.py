@@ -5,9 +5,12 @@ dateutil. Run: ``python -m docie_bench.mcp_servers.dates``.
 from __future__ import annotations
 
 import datetime as dt
+import os
 from typing import Any
 
 from dateutil import parser as dateutil_parser
+
+FIXED_TODAY_ENV = "DOCIE_MCP_DATES_FIXED_TODAY"
 
 
 def parse_date_text(text: str, dayfirst: bool = False) -> str:
@@ -27,7 +30,20 @@ def diff_days(start: str, end: str) -> dict[str, Any]:
 
 
 def current_date() -> str:
-    return dt.date.today().isoformat()
+    """Today's date, ISO 8601. Reads the live wall-clock date unless the
+    operator pins one via ``DOCIE_MCP_DATES_FIXED_TODAY`` -- e.g. a benchmark
+    harness that needs date-relative reasoning (overdue checks, days-until-due)
+    to be reproducible across runs on different calendar days."""
+    fixed = os.environ.get(FIXED_TODAY_ENV)
+    if fixed is None:
+        return dt.date.today().isoformat()
+    try:
+        return dt.date.fromisoformat(fixed).isoformat()
+    except ValueError as exc:
+        raise ValueError(
+            f"{FIXED_TODAY_ENV} is set to {fixed!r}, which is not a valid ISO 8601 "
+            "date (YYYY-MM-DD)"
+        ) from exc
 
 
 def build_server() -> Any:

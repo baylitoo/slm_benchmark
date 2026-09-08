@@ -65,8 +65,18 @@ export function getActivity(): Promise<ActivityView> {
 
 export type UsageWindow = "24h" | "7d" | "30d";
 
+/** One tool's call/error counts + average latency, folded from every agent
+ * request in the window that ran the MCP tool loop (surface "agent" only). */
+export interface UsageToolCall {
+  tool: string;
+  calls: number;
+  errors: number;
+  avg_latency_ms: number | null;
+}
+
 /** One deployment/profile's aggregates over the requested window, folded at
- * read time from the raw usage_records ledger. */
+ * read time from the raw usage_records ledger. ``tool_calls`` is only ever
+ * non-empty for an agent that ran MCP tools during the window. */
 export interface UsageDeployment {
   deployment: string;
   requests: number;
@@ -76,6 +86,7 @@ export interface UsageDeployment {
   avg_latency_ms: number | null;
   p95_latency_ms: number | null;
   last_used_at: string | null;
+  tool_calls: UsageToolCall[];
 }
 
 export interface UsageSummaryView {

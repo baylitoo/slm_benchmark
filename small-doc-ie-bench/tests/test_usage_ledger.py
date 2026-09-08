@@ -105,11 +105,13 @@ def test_percentile_nearest_rank() -> None:
 
 def test_aggregate_usage_folds_per_deployment() -> None:
     now = dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC)
-    rows: list[tuple[str, str, int | None, int | None, int, dt.datetime | None]] = [
-        ("lfm2.5-350m", "ok", 10, 5, 100, now - dt.timedelta(minutes=5)),
-        ("lfm2.5-350m", "ok", 20, 10, 200, now),
-        ("lfm2.5-350m", "error", None, None, 300, now - dt.timedelta(minutes=1)),
-        ("nuextract3", "ok", None, None, 50, now - dt.timedelta(hours=1)),
+    rows: list[
+        tuple[str, str, int | None, int | None, int, dt.datetime | None, list[dict] | None]
+    ] = [
+        ("lfm2.5-350m", "ok", 10, 5, 100, now - dt.timedelta(minutes=5), None),
+        ("lfm2.5-350m", "ok", 20, 10, 200, now, None),
+        ("lfm2.5-350m", "error", None, None, 300, now - dt.timedelta(minutes=1), None),
+        ("nuextract3", "ok", None, None, 50, now - dt.timedelta(hours=1), None),
     ]
     busiest, other = aggregate_usage(rows)
     assert busiest["deployment"] == "lfm2.5-350m"  # sorted by requests desc
@@ -128,8 +130,44 @@ def test_aggregate_usage_folds_per_deployment() -> None:
 def test_aggregate_usage_handles_naive_timestamps() -> None:
     # sqlite hands back naive datetimes; they must normalize, not TypeError.
     naive = dt.datetime(2026, 8, 25, 12, 0)
-    (entry,) = aggregate_usage([("lfm2.5-350m", "ok", 1, 1, 10, naive)])
+    (entry,) = aggregate_usage([("lfm2.5-350m", "ok", 1, 1, 10, naive, None)])
     assert entry["last_used_at"] == "2026-08-25T12:00:00+00:00"
+
+
+def test_aggregate_usage_folds_tool_calls_per_deployment() -> None:
+    # Two "helper" agent rows, each with its own tool-call trace -- folded
+    # into per-tool calls/errors/avg_latency, busiest tool first.
+    rows: list[
+        tuple[str, str, int | None, int | None, int, dt.datetime | None, list[dict] | None]
+    ] = [
+        (
+            "helper",
+            "ok",
+            10,
+            5,
+            100,
+            None,
+            [
+                {"tool": "calc__add", "status": "ok", "latency_ms": 20},
+                {"tool": "calc__subtract", "status": "error", "latency_ms": 40},
+            ],
+        ),
+        (
+            "helper",
+            "ok",
+            10,
+            5,
+            100,
+            None,
+            [{"tool": "calc__add", "status": "ok", "latency_ms": 30}],
+        ),
+        ("other", "ok", 1, 1, 10, None, None),  # no tool calls -- must not crash the fold
+    ]
+    (helper, other) = sorted(aggregate_usage(rows), key=lambda e: e["deployment"])
+    add, subtract = helper["tool_calls"]
+    assert add == {"tool": "calc__add", "calls": 2, "errors": 0, "avg_latency_ms": 25.0}
+    assert subtract == {"tool": "calc__subtract", "calls": 1, "errors": 1, "avg_latency_ms": 40.0}
+    assert other["tool_calls"] == []
 
 
 # ── store: record + summary against a real (sqlite) database ────────────────
@@ -160,6 +198,23 @@ def test_record_and_summarize_roundtrip(usage_database) -> None:
     assert entry["avg_latency_ms"] == 300.0
     assert entry["p95_latency_ms"] == 480.0
     assert entry["last_used_at"] is not None
+
+
+def test_record_and_summarize_roundtrip_carries_tool_calls(usage_database) -> None:
+    assert record_usage(
+        deployment="helper",
+        surface="agent",
+        tenant_id=TENANT_A,
+        latency_ms=250,
+        prompt_tokens=30,
+        completion_tokens=12,
+        tool_calls=[{"tool": "calc__add", "status": "ok", "latency_ms": 15}],
+    )
+    (entry,) = usage_summary(tenant_id=TENANT_A, window_hours=24)
+    assert entry["deployment"] == "helper"
+    assert entry["tool_calls"] == [
+        {"tool": "calc__add", "calls": 1, "errors": 0, "avg_latency_ms": 15.0}
+    ]
 
 
 def test_summary_respects_the_window(usage_database) -> None:

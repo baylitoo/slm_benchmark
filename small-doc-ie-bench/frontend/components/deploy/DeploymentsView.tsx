@@ -253,26 +253,11 @@ interface ScalableGroup {
   running: number;
 }
 
-// The replica to remove when scaling a model down: the highest numeric suffix
-// (`base-3` before `base-2` before the bare `base`), so scale-down peels off
-// the last instance added and keeps the base while replicas remain.
-function highestReplicaName(records: DeploymentRecord[]): string | null {
-  const names = records
-    .map((r) => r.spec?.name)
-    .filter((n): n is string => Boolean(n));
-  if (names.length === 0) return null;
-  const suffix = (n: string) => {
-    const m = n.match(/-(\d+)$/);
-    return m ? parseInt(m[1], 10) : 1;
-  };
-  return [...names].sort((a, b) => suffix(b) - suffix(a))[0];
-}
-
 // The scale panel: one row per store model that has live deployments — deploy
-// or remove an instance in place, without hunting the flat table below. Reuses
-// the same endpoints the rest of the tab uses (scaleStoreModel / delete). Scale
-// up is best-effort against RAM; the Sizing tab is the fit-aware surface and the
-// reconciler is the runtime backstop.
+// or remove an instance in place, without hunting the flat table below. Both
+// directions go through the scale endpoint: up is RAM-admission-checked
+// server-side (N x per-instance footprint; a provable deficit is a clear 422),
+// down drains the highest-suffix replica via the real delete path.
 function ScaledModelsPanel({
   groups,
   onChanged,
@@ -331,19 +316,28 @@ function ScaleRow({
   }
 
   async function scaleDown() {
-    const victim = highestReplicaName(group.records);
-    if (!victim) return;
-    if (!window.confirm(`Remove one instance of "${group.base}" (delete "${victim}")?`))
+    const target = group.total - 1;
+    if (target < 1) return;
+    if (
+      !window.confirm(
+        `Scale "${group.base}" down to ${target} instance${target === 1 ? "" : "s"}? The most recently added replica is stopped and removed.`,
+      )
+    )
       return;
     setBusy("down");
     try {
-      await deleteDeployment(victim);
-      toast({ title: "Removing 1 instance", description: victim, tone: "success" });
+      const res = await scaleStoreModel(group.base, target);
+      const removed = res.removing ?? [];
+      toast({
+        title: removed.length > 0 ? "Removing 1 instance" : "Already at target",
+        description: removed.join(", ") || group.base,
+        tone: "success",
+      });
       onChanged();
     } catch (err) {
       toast({
         title: "Scale down failed",
-        description: errText(err, "Delete failed."),
+        description: errText(err, "Scale failed."),
         tone: "error",
       });
     } finally {
@@ -585,7 +579,20 @@ export function DeploymentsView({
       key: "name",
       header: "Name",
       sortAccessor: (r) => r.spec?.name ?? "",
-      render: (r) => <span className="font-medium text-foreground">{r.spec?.name ?? "—"}</span>,
+      render: (r) => (
+        <span className="inline-flex items-center gap-1.5">
+          <span className="font-medium text-foreground">{r.spec?.name ?? "—"}</span>
+          {(r.replicas ?? 1) > 1 && (
+            <Badge tone="info">
+              <span
+                title={`One of ${r.replicas} replicas load-balanced behind "${r.replica_group ?? r.spec?.name}"`}
+              >
+                ×{r.replicas}
+              </span>
+            </Badge>
+          )}
+        </span>
+      ),
     },
     {
       key: "model",

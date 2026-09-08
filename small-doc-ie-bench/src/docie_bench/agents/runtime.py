@@ -36,6 +36,7 @@ from docie_bench.extract.routing import (
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.mcp_servers.calculator import check_sum
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
@@ -85,6 +86,8 @@ async def complete_agent(
         return await _complete_ocr(spec, body, http_client=http_client)
     if spec.kind == "proxy_security":
         return await _complete_proxy(spec, body, http_client=http_client)
+    if spec.kind == "workflow":
+        return await _complete_workflow(spec, body, http_client=http_client)
     return await _complete_custom(spec, body, http_client=http_client)
 
 
@@ -165,6 +168,53 @@ def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
         for key, item in value.items()
         if key not in omitted
     }
+
+
+def _money_amount(value: Any) -> float | None:
+    """A MoneyField's numeric amount from the rich (pre-flatten) validated
+    result — ``{"amount": "12.50", "currency": "EUR", ...}`` — or ``None``
+    when the field is absent, null, or unparseable."""
+    if not isinstance(value, dict) or value.get("amount") is None:
+        return None
+    try:
+        return float(value["amount"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _invoice_sum_check(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Best-effort, server-side verification of an invoice-shaped extraction's
+    arithmetic: ``line_items[].line_total`` summed and compared against a
+    stated total, via calculator's ``check_sum`` — the plain function
+    (see ``mcp_servers/calculator.py``), called directly with no MCP session
+    and no tool loop. This never alters the extraction; it only annotates it.
+
+    Targets the one field shape ``InvoiceExtraction`` (and any dynamic schema
+    that happens to reuse the same field names) exposes: a ``line_items``
+    list of ``line_total`` MoneyFields plus a ``subtotal`` MoneyField —
+    ``subtotal`` is what a pre-tax line-item sum should equal, so it's
+    preferred over ``total_ttc`` (which also includes VAT) when both are
+    present. Any other schema shape — ``identity_card``, a dynamic schema
+    without these field names, or an invoice with no summable amounts — is a
+    silent no-op: this never raises, it just doesn't attach a ``sum_check``.
+    """
+    line_items = result.get("line_items")
+    if not isinstance(line_items, list) or not line_items:
+        return None
+    amounts = [
+        amount
+        for item in line_items
+        if isinstance(item, dict)
+        and (amount := _money_amount(item.get("line_total"))) is not None
+    ]
+    if not amounts:
+        return None
+    total_field = "subtotal" if _money_amount(result.get("subtotal")) is not None else "total_ttc"
+    claimed_total = _money_amount(result.get(total_field))
+    if claimed_total is None:
+        return None
+    outcome = check_sum(amounts, claimed_total)
+    return {**outcome, "total_field": total_field, "line_item_count": len(amounts)}
 
 
 async def _complete_structured_document(
@@ -273,6 +323,9 @@ async def _complete_structured_document(
     }
     if routing_audit is not None:
         docie_agent["routing"] = routing_audit
+    sum_check = _invoice_sum_check(response.result)
+    if sum_check is not None:
+        docie_agent["sum_check"] = sum_check
     return {
         "id": f"chatcmpl-agent-{response.request_id}",
         "object": "chat.completion",
@@ -637,12 +690,466 @@ def _build_analyzer(
     return analyze, f"guard:{guard_profile.name}", guard_state
 
 
+def _resolve_mcp_servers(spec: AgentSpec) -> list[str]:
+    """``options.mcp_servers`` — registry server names this agent may use as
+    tool sources (registry-only, see mcp_tools.py: never a caller-supplied
+    URL/command). Empty/absent means no tools — the existing bare-forward
+    behavior, unchanged for every agent that doesn't opt in."""
+    raw = spec.options.get("mcp_servers")
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or not all(isinstance(n, str) and n for n in raw):
+        raise AgentError(
+            f"agent {spec.name!r}: options.mcp_servers must be a list of registered "
+            "MCP server names",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    return raw
+
+
+def _resolve_tool_allowlist(
+    spec: AgentSpec,
+    server_names: list[str],
+    mapping: dict[str, tuple[str, str]],
+    *,
+    separator: str,
+) -> set[str] | None:
+    """``options.mcp_tools`` — an optional ``{server_name: [tool_name, ...]}``
+    restricting which of a server's tools this agent may use, instead of
+    every tool the server happens to expose. ``None`` means unrestricted
+    (every listed tool allowed) — the default for an agent that only set
+    ``mcp_servers``. Validated against the SERVER's own live tool list
+    (``mapping``, from ``collect_openai_tools``) so a stale or typo'd tool
+    name is a clear config error, not a silent no-op.
+    """
+    raw = spec.options.get("mcp_tools")
+    if raw in (None, {}):
+        return None
+    if not isinstance(raw, dict):
+        raise AgentError(
+            f"agent {spec.name!r}: options.mcp_tools must be an object of "
+            "{server_name: [tool_name, ...]}",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    allowed: set[str] = set()
+    for server_name, tool_names in raw.items():
+        if server_name not in server_names:
+            raise AgentError(
+                f"agent {spec.name!r}: options.mcp_tools names server {server_name!r}, "
+                "which is not in options.mcp_servers",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        if not isinstance(tool_names, list) or not all(
+            isinstance(t, str) and t for t in tool_names
+        ):
+            raise AgentError(
+                f"agent {spec.name!r}: options.mcp_tools[{server_name!r}] must be a "
+                "list of tool names",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        for tool_name in tool_names:
+            qualified = f"{server_name}{separator}{tool_name}"
+            if qualified not in mapping:
+                raise AgentError(
+                    f"agent {spec.name!r}: options.mcp_tools names tool {tool_name!r} "
+                    f"on server {server_name!r}, which does not exist on that server",
+                    status_code=500,
+                    error_type="invalid_agent_config",
+                )
+            allowed.add(qualified)
+    return allowed
+
+
 async def _complete_custom(
     spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
 ) -> dict[str, Any]:
-    completion = await _forward_chat(spec, dict(body), http_client=http_client)
-    completion["docie_agent"] = {"agent": spec.name, "kind": spec.kind}
+    server_names = _resolve_mcp_servers(spec)
+    docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind}
+    if server_names:
+        completion, tool_calls = await _complete_with_tools(
+            spec, dict(body), server_names, http_client=http_client
+        )
+        if tool_calls:
+            docie_agent["tool_calls"] = tool_calls
+    else:
+        completion = await _forward_chat(spec, dict(body), http_client=http_client)
+    completion["docie_agent"] = docie_agent
     return completion
+
+
+async def _complete_with_tools(
+    spec: AgentSpec,
+    body: dict[str, Any],
+    server_names: list[str],
+    *,
+    http_client: httpx.AsyncClient,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """A ``custom`` agent with ``options.mcp_servers`` set: connect, advertise
+    the servers' tools, and run the same bounded model<->tools loop the
+    generic chat surface uses (``chat_api._chat_with_mcp_tools``) — reused
+    here via ``mcp_tools.run_tool_loop`` rather than duplicated, so both
+    surfaces share one loop implementation and one error taxonomy.
+
+    Returns ``(completion, tool_call_trace)`` — the trace (#261/#262) is
+    every tool call this request actually executed, in order, each entry
+    ``{"tool": qualified_name, "status": "ok"|"error", "latency_ms": int,
+    "arguments": str, "result": str}`` (the latter two truncated at
+    ``mcp_tools.TRACE_TEXT_LIMIT``). Empty when the model never called a tool.
+    """
+    from contextlib import AsyncExitStack
+
+    from docie_bench import mcp_tools as mcp_mod
+    from docie_bench.settings import get_settings
+
+    upstream = _resolve_backing(spec.model_profile)
+    try:
+        registry = mcp_mod.load_mcp_registry()
+    except mcp_mod.MCPConfigError as exc:
+        raise AgentError(str(exc), status_code=500, error_type="mcp_config_error") from exc
+    unknown = [name for name in server_names if name not in registry]
+    if unknown:
+        raise AgentError(
+            f"agent {spec.name!r} references unregistered MCP server(s): "
+            f"{', '.join(unknown)} — register them first (see GET /v1/mcp/servers)",
+            status_code=400,
+            error_type="mcp_server_not_registered",
+        )
+    try:
+        mcp_mod._require_mcp()
+    except mcp_mod.MCPUnavailableError as exc:
+        raise AgentError(str(exc), status_code=501, error_type="mcp_unavailable") from exc
+    specs = [registry[name] for name in server_names]
+
+    forward = dict(body)
+    if spec.system_prompt:
+        forward["messages"] = [
+            {"role": "system", "content": spec.system_prompt},
+            *(forward.get("messages") or []),
+        ]
+
+    async def post(round_body: dict[str, Any]) -> dict[str, Any]:
+        return await _post_chat(upstream, dict(round_body), http_client=http_client)
+
+    tool_call_trace: list[dict[str, Any]] = []
+    record_tool_call = mcp_mod.make_trace_recorder(tool_call_trace)
+
+    # A config error (a bad allowlist) is captured rather than raised INSIDE
+    # the AsyncExitStack body: raising there would propagate the exception
+    # through the MCP session/task-group teardown machinery, which can
+    # itself raise during unwind (anyio cancellation) and shadow the
+    # original AgentError with a generic 502 -- confirmed empirically, not
+    # theoretical. Deferring the raise to after the stack closes cleanly
+    # sidesteps that race entirely.
+    config_error: AgentError | None = None
+    completion: dict[str, Any] | None = None
+    try:
+        async with AsyncExitStack() as stack:
+            try:
+                sessions = await mcp_mod.open_mcp_sessions(stack, specs)
+                tools, mapping = await mcp_mod.collect_openai_tools(sessions)
+            except Exception as exc:  # noqa: BLE001 - connect/handshake failure is a gateway error
+                raise AgentError(
+                    f"could not connect to MCP server(s): {exc}",
+                    status_code=502,
+                    error_type="mcp_server_unreachable",
+                ) from exc
+            try:
+                allowed = _resolve_tool_allowlist(
+                    spec, server_names, mapping, separator=mcp_mod.TOOL_SEPARATOR
+                )
+            except AgentError as exc:
+                config_error = exc
+            else:
+                if allowed is not None:
+                    # Filter BOTH the advertised list and the routing map: a
+                    # disallowed tool must never be advertised to the model,
+                    # and even a hallucinated call to a real-but-disallowed
+                    # name must fall through run_tool_loop's "not all_mcp"
+                    # branch (returned to the caller, never executed) rather
+                    # than being honored.
+                    tools = [t for t in tools if t["function"]["name"] in allowed]
+                    mapping = {
+                        name: target for name, target in mapping.items() if name in allowed
+                    }
+                completion = await mcp_mod.run_tool_loop(
+                    post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
+                )
+    except AgentError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
+        raise AgentError(
+            f"MCP session error: {exc}", status_code=502, error_type="mcp_server_unreachable"
+        ) from exc
+    if config_error is not None:
+        raise config_error
+    if completion is None:
+        raise AgentError(
+            f"model kept calling tools for {get_settings().mcp_max_tool_iterations} rounds "
+            "without a final answer",
+            status_code=502,
+            error_type="mcp_tool_loop_exhausted",
+        )
+    # run_tool_loop's only non-dict, non-None return is whatever `post` itself
+    # returned as an error object -- but _post_chat never returns one, it
+    # raises AgentError instead (caught above). A dict is the only remaining
+    # possibility here.
+    assert isinstance(completion, dict)
+    return completion, tool_call_trace
+
+
+_MAX_WORKFLOW_STEPS = 16
+
+
+def _resolve_workflow_steps(
+    spec: AgentSpec,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
+    """``options.steps`` — a non-empty, ORDERED list of
+    ``{model_profile, system_prompt?, mcp_servers?, mcp_tools?, name?, route?}``
+    steps (#265, route added #266). Each step's shape mirrors a ``custom``
+    agent's own model_profile/options exactly, so the SAME per-step spec can
+    drive ``_resolve_mcp_servers``/``_complete_with_tools``/``_forward_chat``
+    unchanged (see ``_complete_workflow``).
+
+    Every step is addressable by name — its own ``name`` if given, else its
+    list index as a string — so a ``route`` step (a cheap classifier) can
+    jump to any other step instead of only the next one in the list.
+    """
+    raw = spec.options.get("steps")
+    if not isinstance(raw, list) or not raw:
+        raise AgentError(
+            f"agent {spec.name!r}: options.steps must be a non-empty list of "
+            "{model_profile, system_prompt?, mcp_servers?, mcp_tools?} steps",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    steps: list[dict[str, Any]] = []
+    names: list[str] = []
+    by_name: dict[str, int] = {}
+    for index, raw_step in enumerate(raw):
+        if not isinstance(raw_step, dict) or not raw_step.get("model_profile"):
+            raise AgentError(
+                f"agent {spec.name!r}: options.steps[{index}] must be an object "
+                "with a non-empty model_profile",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        raw_name = raw_step.get("name")
+        name = str(raw_name) if isinstance(raw_name, str) and raw_name else str(index)
+        if name in by_name:
+            raise AgentError(
+                f"agent {spec.name!r}: options.steps has a duplicate step name {name!r}",
+                status_code=500,
+                error_type="invalid_agent_config",
+            )
+        by_name[name] = index
+        names.append(name)
+        steps.append(raw_step)
+    return steps, names, by_name
+
+
+def _resolve_route_target(
+    answer: str | None,
+    route: Any,
+    by_name: dict[str, int],
+    *,
+    spec: AgentSpec,
+    step_name: str,
+) -> str:
+    """A ``route`` step is a cheap classifier: match its OWN answer against
+    ``route.routes`` (``{label: target_step_name}``) by substring, in
+    declaration order, falling back to ``route.default`` — never an exact
+    match, since a small model's answer is rarely just the bare label
+    ("Label: billing", "billing.", ...). Fails closed (an ``AgentError``,
+    not a silent guess) when nothing matches and there is no default, or
+    when the resolved target step name doesn't exist."""
+    if not isinstance(route, dict):
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} route must be an object",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    routes = route.get("routes")
+    if not isinstance(routes, dict) or not routes:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} route.routes must be a "
+            "non-empty object of {label: step_name}",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    haystack = (answer or "").lower()
+    target: str | None = None
+    for label, candidate in routes.items():
+        needle = str(label).strip().lower()
+        if needle and needle in haystack:
+            target = candidate
+            break
+    if target is None:
+        default = route.get("default")
+        target = default if isinstance(default, str) and default else None
+    if target is None:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} classifier answered "
+            f"{answer!r}, which matches no route label and no default is configured",
+            status_code=502,
+            error_type="workflow_unroutable",
+        )
+    if target not in by_name:
+        raise AgentError(
+            f"agent {spec.name!r}: step {step_name!r} routes to {target!r}, which "
+            "is not the name of any step in options.steps",
+            status_code=500,
+            error_type="invalid_agent_config",
+        )
+    return target
+
+
+def _message_content(completion: dict[str, Any]) -> str | None:
+    choices = completion.get("choices")
+    message = (
+        choices[0].get("message")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+        else None
+    )
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, str) else None
+
+
+def _last_message_content(body: dict[str, Any]) -> str | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
+    return content if isinstance(content, str) else None
+
+
+async def _complete_workflow(
+    spec: AgentSpec, body: dict[str, Any], *, http_client: httpx.AsyncClient
+) -> dict[str, Any]:
+    """A ``workflow`` agent (#265): a fixed, ORDERED sequence of steps, each
+    its own model_profile + prompt (+ optional MCP tools from #259), run
+    server-side in one request — the "prompt chaining" pattern, deliberately
+    narrow so a small (350M-class) model handles one well-scoped sub-task
+    per step instead of the whole request in one shot.
+
+    Step 1 receives the caller's own messages unchanged; each LATER step
+    receives only the last SUBSTANTIVE step's answer as its single user
+    message — not the accumulated history, not the original request. A
+    step may carry a ``route`` (#266): instead of falling through to the
+    next step in the list, it's a cheap classifier whose own answer picks
+    a NAMED step to jump to next (see ``_resolve_route_target``) — the
+    classifier's answer itself is never chained forward, since it's a
+    label ("billing"), not content. A flat step-execution budget
+    (``_MAX_WORKFLOW_STEPS``) guards against a routing loop.
+
+    Usage sums across every step executed (same contract the MCP tool loop
+    already uses); every step's own model/content, its route target (if
+    any), and any tool calls it made ride
+    ``docie_agent.steps``/``docie_agent.tool_calls`` for the "Try it" trace
+    view (#262) — each tool-call entry is tagged with the ``step``/
+    ``step_name`` that made it, so a multi-step workflow's calls aren't
+    flattened into one unattributed list.
+    """
+    steps, names, by_name = _resolve_workflow_steps(spec)
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    step_trace: list[dict[str, Any]] = []
+    tool_call_trace: list[dict[str, Any]] = []
+    # Seeded from the caller's own request so a `route` step landing at
+    # index 0 still hands the target step real content, not "" -- a
+    # classifier's job is to pick a destination, never to replace content.
+    chain_content: str | None = _last_message_content(body)
+    completion: dict[str, Any] | None = None
+    index = 0
+    visited = 0
+    while True:
+        if visited >= _MAX_WORKFLOW_STEPS:
+            raise AgentError(
+                f"agent {spec.name!r}: workflow exceeded {_MAX_WORKFLOW_STEPS} step "
+                "executions — likely a routing loop",
+                status_code=502,
+                error_type="workflow_budget_exhausted",
+            )
+        step = steps[index]
+        step_name = names[index]
+        step_spec = spec.model_copy(
+            update={
+                "model_profile": step["model_profile"],
+                "system_prompt": step.get("system_prompt"),
+                "options": {
+                    "mcp_servers": step.get("mcp_servers"),
+                    "mcp_tools": step.get("mcp_tools"),
+                },
+            }
+        )
+        step_body = (
+            dict(body)
+            if visited == 0
+            else {"messages": [{"role": "user", "content": chain_content or ""}]}
+        )
+        server_names = _resolve_mcp_servers(step_spec)
+        if server_names:
+            completion, step_tool_calls = await _complete_with_tools(
+                step_spec, step_body, server_names, http_client=http_client
+            )
+            # _complete_with_tools is kind-agnostic (a `custom` agent has no
+            # notion of "step") -- tag which step made each call here, at
+            # the workflow-specific call site, so the trace doesn't flatten
+            # a multi-step workflow's tool calls into one unattributed list.
+            for call in step_tool_calls:
+                call["step"] = index
+                call["step_name"] = step_name
+            tool_call_trace.extend(step_tool_calls)
+        else:
+            completion = await _forward_chat(step_spec, step_body, http_client=http_client)
+        usage = completion.get("usage")
+        if isinstance(usage, dict):
+            for key in totals:
+                value = usage.get(key)
+                if isinstance(value, int):
+                    totals[key] += value
+        step_answer = _message_content(completion)
+        visited += 1
+        route = step.get("route")
+        if route is not None:
+            target_name = _resolve_route_target(
+                step_answer, route, by_name, spec=spec, step_name=step_name
+            )
+            step_trace.append(
+                {
+                    "step": index,
+                    "name": step_name,
+                    "model_profile": step["model_profile"],
+                    "content": step_answer,
+                    "routed_to": target_name,
+                }
+            )
+            index = by_name[target_name]
+            continue
+        chain_content = step_answer
+        step_trace.append(
+            {
+                "step": index,
+                "name": step_name,
+                "model_profile": step["model_profile"],
+                "content": step_answer,
+                "routed_to": None,
+            }
+        )
+        index += 1
+        if index >= len(steps):
+            break
+    assert completion is not None  # _resolve_workflow_steps guarantees >=1 step
+    docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind, "steps": step_trace}
+    if tool_call_trace:
+        docie_agent["tool_calls"] = tool_call_trace
+    final = dict(completion)
+    final["usage"] = totals
+    final["docie_agent"] = docie_agent
+    return final
 
 
 def _build_policy_router(spec: AgentSpec, policy_name: str) -> ExtractionRouter:

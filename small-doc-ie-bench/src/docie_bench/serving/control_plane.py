@@ -223,6 +223,8 @@ class Supervisor(Protocol):
         runtime: str | None,
         replicas: int,
         max_tokens: int | None = None,
+        n_parallel: int = 1,
+        cache_reuse: int | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -232,6 +234,8 @@ class Supervisor(Protocol):
         port: int | None,
         context_length: int,
         max_tokens: int | None = None,
+        n_parallel: int = 1,
+        cache_reuse: int | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -372,6 +376,8 @@ class ControlPlane:
         runtime: str | None = None,
         replicas: int = 1,
         max_tokens: int | None = None,
+        n_parallel: int = 1,
+        cache_reuse: int | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -387,6 +393,10 @@ class ControlPlane:
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if n_parallel != 1:
+            kwargs["n_parallel"] = n_parallel
+        if cache_reuse is not None:
+            kwargs["cache_reuse"] = cache_reuse
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -402,6 +412,8 @@ class ControlPlane:
         context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
         max_tokens: int | None = None,
         deployment_name: str | None = None,
+        n_parallel: int = 1,
+        cache_reuse: int | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -410,13 +422,17 @@ class ControlPlane:
         # flowing on the scale-1 worker while a large GGUF loads.
         # ``deployment_name`` (scale) names the record while ``name`` stays the
         # store-entry lookup — see serve_store_model.
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "port": port,
             "context_length": context_length,
             "deployment_name": deployment_name,
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if n_parallel != 1:
+            kwargs["n_parallel"] = n_parallel
+        if cache_reuse is not None:
+            kwargs["cache_reuse"] = cache_reuse
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -845,6 +861,8 @@ class _DefaultSupervisor:
         runtime: str | None,
         replicas: int,
         max_tokens: int | None = None,
+        n_parallel: int = 1,
+        cache_reuse: int | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -869,6 +887,8 @@ class _DefaultSupervisor:
                     model=model,
                     alias=deployment_name,
                     max_tokens=max_tokens,
+                    n_parallel=n_parallel,
+                    cache_reuse=cache_reuse,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -888,6 +908,8 @@ class _DefaultSupervisor:
                     alias=deployment_name,
                     port=chosen,
                     max_tokens=max_tokens,
+                    n_parallel=n_parallel,
+                    cache_reuse=cache_reuse,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -917,6 +939,8 @@ class _DefaultSupervisor:
         context_length: int = DEFAULT_DEPLOY_CONTEXT_LENGTH,
         max_tokens: int | None = None,
         deployment_name: str | None = None,
+        n_parallel: int = 1,
+        cache_reuse: int | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -992,6 +1016,8 @@ class _DefaultSupervisor:
                     context_length=context_length,
                     max_tokens=max_tokens,
                     extra_args=launch_extra_args,
+                    n_parallel=n_parallel,
+                    cache_reuse=cache_reuse,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -1230,6 +1256,32 @@ def replica_names_to_add(
             existing.add(candidate)
         index += 1
     return names
+
+
+def replica_names_to_remove(
+    base: str, existing_names: Iterable[str], target_total: int
+) -> list[str]:
+    """The replica record names to DELETE to bring ``base`` down to
+    ``target_total`` deployments — the scale-down mirror of
+    :func:`replica_names_to_add`.
+
+    Victims are picked highest suffix first (``base-3`` before ``base-2``
+    before the bare ``base``), so scaling down peels off the most recently
+    added instance and the canonical bare-name record survives while any
+    replica remains (a ``target_total >= 1`` can therefore never remove the
+    bare ``base``). Already at/below the target returns ``[]`` — scaling is
+    idempotent in both directions.
+    """
+    pattern = _replica_re(base)
+    matched: list[tuple[int, str]] = []
+    for candidate in set(existing_names):
+        found = pattern.match(candidate)
+        if found:
+            index = int(found.group(1)) if found.group(1) else 1
+            matched.append((index, candidate))
+    matched.sort(reverse=True)
+    delta = max(0, len(matched) - max(target_total, 0))
+    return [name for _index, name in matched[:delta]]
 
 
 def to_data(value: object) -> object:

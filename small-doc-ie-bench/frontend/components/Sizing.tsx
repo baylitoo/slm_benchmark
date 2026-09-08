@@ -438,6 +438,9 @@ function WhatIf({ data }: { data: SizingView | null }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<WhatIfView | null>(null);
+  // Call-level (mirrors the server's WhatIfRequest.n_parallel): prices every
+  // staged row under the same llama-server slot count, not per-row.
+  const [nParallel, setNParallel] = useState("1");
 
   function addRow() {
     setStaged((s) => [
@@ -479,9 +482,14 @@ function WhatIf({ data }: { data: SizingView | null }) {
       setError("Stage at least one model first.");
       return;
     }
+    const parallel = Number(nParallel);
+    if (!Number.isInteger(parallel) || parallel < 1 || parallel > 32) {
+      setError("Parallel slots must be a whole number between 1 and 32.");
+      return;
+    }
     setSubmitting(true);
     try {
-      setResult(await whatifSizing(plan));
+      setResult(await whatifSizing(plan, parallel));
     } catch (err) {
       setError(
         toUserMessage(err, {
@@ -553,7 +561,7 @@ function WhatIf({ data }: { data: SizingView | null }) {
           </div>
         ))}
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="secondary"
             size="sm"
@@ -562,6 +570,21 @@ function WhatIf({ data }: { data: SizingView | null }) {
           >
             <Plus className="h-4 w-4" /> Add model
           </Button>
+          <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <T>Parallel slots</T>
+            <TextInput
+              type="number"
+              min={1}
+              max={32}
+              value={nParallel}
+              onChange={(e) => {
+                setNParallel(e.target.value);
+                setResult(null);
+              }}
+              className="h-8 w-16 text-xs"
+              aria-label="Parallel slots"
+            />
+          </label>
           <Button size="sm" onClick={check} loading={submitting} disabled={staged.length === 0}>
             <Scale className="h-4 w-4" /> Check fit
           </Button>

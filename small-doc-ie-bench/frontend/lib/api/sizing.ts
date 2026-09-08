@@ -93,18 +93,23 @@ export function getSizing(): Promise<SizingView> {
   return request<SizingView>("/v1/serving/sizing");
 }
 
-/** Price a hypothetical deployment mix — fits or an explicit deficit. */
-export function whatifSizing(plan: WhatIfPlanEntry[]): Promise<WhatIfView> {
+/** Price a hypothetical deployment mix — fits or an explicit deficit.
+ * `n_parallel` is call-level (mirrors the server's WhatIfRequest field): every
+ * row in the plan is priced under the same llama-server slot count. */
+export function whatifSizing(
+  plan: WhatIfPlanEntry[],
+  n_parallel?: number,
+): Promise<WhatIfView> {
   return request<WhatIfView>("/v1/serving/sizing/whatif", {
     method: "POST",
-    body: JSON.stringify({ plan }),
+    body: JSON.stringify({ plan, ...(n_parallel && n_parallel > 1 ? { n_parallel } : {}) }),
   });
 }
 
 /**
  * Result of scaling a store model to a target replica count
- * (POST /v1/serving/store/{name}/scale). Idempotent: `adding` is empty when the
- * model is already at/above the requested target.
+ * (POST /v1/serving/store/{name}/scale). Idempotent both ways: `adding` and
+ * `removing` are empty when the model is already at the requested target.
  */
 export interface ScaleResult {
   model: string;
@@ -112,17 +117,22 @@ export interface ScaleResult {
   target: number;
   /** Deployments of this model that already existed when scaling. */
   current: number;
-  /** New deployment names spun up (empty when already at target). */
+  /** New deployment names spun up (empty when already at/above target). */
   adding: string[];
+  /** Replica names being drained/deleted (scale-down; highest suffix first,
+   * the bare base record always survives). */
+  removing?: string[];
   event_ids: string[];
   channel: string | null;
   [k: string]: unknown;
 }
 
 /**
- * Scale a store model to a TARGET TOTAL replica count (idempotent): at or above
- * the target the server spawns nothing. `replicas` is the absolute target, not
- * a delta — callers add the desired count to the running instances.
+ * Scale a store model to a TARGET TOTAL replica count (idempotent). Above the
+ * current count, the server RAM-checks N x the per-instance footprint and fans
+ * out one deploy per missing replica (a provable deficit is a 422); below it,
+ * the server drains surplus replicas via the real delete path. `replicas` is
+ * the absolute target, not a delta.
  */
 export function scaleStoreModel(name: string, replicas: number): Promise<ScaleResult> {
   return request<ScaleResult>(

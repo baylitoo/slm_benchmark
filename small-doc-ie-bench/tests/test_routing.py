@@ -16,11 +16,14 @@ from docie_bench.extract.routing import (
     RoutingRequest,
     RoutingRule,
     RuleCondition,
+    StageEvaluation,
     StagePolicy,
     StageResult,
     StageSelector,
 )
 from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation, Usage
+
+_UNSET = object()
 
 
 def _response(
@@ -28,21 +31,23 @@ def _response(
     *,
     valid: bool = True,
     confidence: float = 0.9,
+    model_confidence: Any = _UNSET,
     warnings: list[str] | None = None,
     tokens: int = 10,
 ) -> ExtractionResponse:
+    field: dict[str, Any] = {
+        "value": "INV-1",
+        "confidence": confidence,
+        "evidence_ids": ["b1"],
+    }
+    if model_confidence is not _UNSET:
+        field["model_confidence"] = model_confidence
     return ExtractionResponse(
         request_id=f"request-{profile}",
         schema_name="invoice",
         model_profile=profile,
         document_hash=None,
-        result={
-            "invoice_number": {
-                "value": "INV-1",
-                "confidence": confidence,
-                "evidence_ids": ["b1"],
-            }
-        },
+        result={"invoice_number": field},
         validation=ExtractionValidation(valid=valid, warnings=warnings or []),
         usage=Usage(total_tokens=tokens),
         latency_ms=1,
@@ -534,3 +539,187 @@ def test_policy_can_be_loaded_from_declarative_data() -> None:
 
     assert policy.stages[0].rules[0].decision is RouteDecision.ACCEPT
     assert policy.budget.max_total_tokens == 100
+
+
+def test_rule_condition_matches_on_model_confidence_alone() -> None:
+    condition = RuleCondition(min_model_confidence=-0.5)
+    high = StageEvaluation(status="success", avg_model_confidence=-0.1)
+    low = StageEvaluation(status="success", avg_model_confidence=-0.9)
+    unknown = StageEvaluation(status="success", avg_model_confidence=None)
+
+    assert condition.matches(high)
+    assert not condition.matches(low)
+    # Same conservative treatment `min_confidence` already gives an unknown
+    # grounding confidence: an unset signal never satisfies a threshold.
+    assert not condition.matches(unknown)
+
+
+def test_rule_condition_with_both_thresholds_requires_both_to_pass() -> None:
+    condition = RuleCondition(min_confidence=0.8, min_model_confidence=-0.5)
+
+    # Grounding confidence is fine but the model's own confidence is low:
+    # the AND-combination correctly fails, proving "escalate if EITHER
+    # signal is too low" falls out of RuleCondition.matches()'s existing
+    # every-set-predicate-must-pass semantics with no new combinator.
+    assert not condition.matches(
+        StageEvaluation(status="success", avg_confidence=0.95, avg_model_confidence=-0.9)
+    )
+    # And the reverse: model confidence is fine but grounding is low.
+    assert not condition.matches(
+        StageEvaluation(status="success", avg_confidence=0.2, avg_model_confidence=-0.1)
+    )
+    # Only when both clear their threshold does the rule match.
+    assert condition.matches(
+        StageEvaluation(status="success", avg_confidence=0.95, avg_model_confidence=-0.1)
+    )
+
+
+def test_min_model_confidence_rejects_positive_and_out_of_range_values() -> None:
+    with pytest.raises(ValidationError):
+        RuleCondition(min_model_confidence=0.5)
+    # 0.0 itself is a valid (if degenerate) log-probability.
+    RuleCondition(min_model_confidence=0.0)
+
+
+@pytest.mark.asyncio
+async def test_avg_model_confidence_is_none_when_result_carries_no_signal() -> None:
+    """Always-computed, not rule-gated: cheap tree walk, same as `avg_confidence`.
+
+    A response whose fields never got a `model_confidence` key at all (the
+    opt-in logprob feature was never used for this request) resolves to
+    `avg_model_confidence=None` regardless of whether any rule asked for it.
+    """
+    stage = FakeStage("primary", response=_response("primary"))
+    router = ExtractionRouter(
+        stages=[stage],
+        policy=RoutingPolicy(stages=[StagePolicy(name="primary", rules=[_accept_valid()])]),
+    )
+
+    result = await router.route(RoutingRequest(operation="text", arguments={}))
+
+    assert result.audit.stages[0].avg_model_confidence is None
+
+
+@pytest.mark.asyncio
+async def test_low_model_confidence_escalates_even_when_grounded() -> None:
+    # Well-grounded (confidence=0.99) but the model itself was unsure
+    # (model_confidence=-3.5, below the -1.0 gate): the accept rule requires
+    # BOTH signals, so this falls through to the stage's default decision.
+    stage = FakeStage(
+        "primary", response=_response("primary", confidence=0.99, model_confidence=-3.5)
+    )
+    router = ExtractionRouter(
+        stages=[stage],
+        policy=RoutingPolicy(
+            stages=[
+                StagePolicy(
+                    name="primary",
+                    rules=[
+                        RoutingRule(
+                            when=RuleCondition(
+                                status="success",
+                                validation_valid=True,
+                                min_model_confidence=-1.0,
+                            ),
+                            decision=RouteDecision.ACCEPT,
+                            reason="both signals clear",
+                        )
+                    ],
+                    default_decision=RouteDecision.ESCALATE,
+                    default_reason="model was unsure despite being grounded",
+                )
+            ]
+        ),
+    )
+
+    result = await router.route(RoutingRequest(operation="text", arguments={}))
+
+    assert result.audit.terminal_decision is RouteDecision.ESCALATE
+    assert result.audit.stages[0].avg_confidence == 0.99
+    assert result.audit.stages[0].avg_model_confidence == -3.5
+
+
+@pytest.mark.asyncio
+async def test_all_nested_schema_falls_through_to_escalation() -> None:
+    """Documented-not-a-bug case (#345): a schema whose fields are all
+    nested/list-valued always resolves `model_confidence: None` per #335's
+    coverage (only top-level scalars are resolved). A rule requiring
+    `min_model_confidence` predictably never matches such a schema, and the
+    stage falls through to its default decision -- this is expected, not a
+    regression, until #335's nested-field coverage expands.
+    """
+    response = ExtractionResponse(
+        request_id="request-nested",
+        schema_name="invoice",
+        model_profile="primary",
+        document_hash=None,
+        result={
+            "total": {
+                "value": {"amount": "100.00", "currency": "EUR"},
+                "confidence": 0.9,
+                "evidence_ids": ["b1"],
+                "model_confidence": None,
+            },
+            "line_items": [
+                {
+                    "value": "widget",
+                    "confidence": 0.9,
+                    "evidence_ids": ["b2"],
+                    "model_confidence": None,
+                }
+            ],
+        },
+        validation=ExtractionValidation(valid=True, warnings=[]),
+        usage=Usage(total_tokens=10),
+        latency_ms=1,
+    )
+    stage = FakeStage("primary", response=response)
+    router = ExtractionRouter(
+        stages=[stage],
+        policy=RoutingPolicy(
+            stages=[
+                StagePolicy(
+                    name="primary",
+                    rules=[
+                        RoutingRule(
+                            when=RuleCondition(
+                                status="success",
+                                validation_valid=True,
+                                min_model_confidence=-2.0,
+                            ),
+                            decision=RouteDecision.ACCEPT,
+                            reason="both signals clear",
+                        )
+                    ],
+                    default_decision=RouteDecision.ESCALATE,
+                    default_reason="model confidence unavailable for this schema",
+                )
+            ]
+        ),
+    )
+
+    result = await router.route(RoutingRequest(operation="text", arguments={}))
+
+    assert result.audit.stages[0].avg_model_confidence is None
+    assert result.audit.terminal_decision is RouteDecision.ESCALATE
+    assert result.audit.terminal_reason == "model confidence unavailable for this schema"
+
+
+@pytest.mark.asyncio
+async def test_min_confidence_only_rules_are_unaffected_by_model_confidence_field() -> None:
+    """Existing grounding-only policies see no behavior change: an
+    unset `min_model_confidence` never gates a rule, whether or not the
+    response happens to carry `model_confidence` values.
+    """
+    stage = FakeStage(
+        "primary", response=_response("primary", confidence=0.9, model_confidence=-9.9)
+    )
+    router = ExtractionRouter(
+        stages=[stage],
+        policy=RoutingPolicy(stages=[StagePolicy(name="primary", rules=[_accept_valid(0.8)])]),
+    )
+
+    result = await router.route(RoutingRequest(operation="text", arguments={}))
+
+    assert result.audit.terminal_decision is RouteDecision.ACCEPT
+    assert result.audit.stages[0].avg_confidence == 0.9

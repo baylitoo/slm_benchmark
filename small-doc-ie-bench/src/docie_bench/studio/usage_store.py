@@ -67,6 +67,21 @@ def ensure_usage_record_table(engine: Engine) -> bool:
         connection.execute(CreateTable(usage_table, if_not_exists=True))
         for index in usage_table.indexes:
             connection.execute(CreateIndex(index, if_not_exists=True))
+        # Forward migration for tables created before tool_calls_json existed
+        # (#261) -- same ADD-COLUMN-if-missing shape as ensure_batch_tables.
+        # Nullable, no rewrite.
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text(
+                    "ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS tool_calls_json JSON"
+                )
+            )
+        else:
+            present = {col["name"] for col in sa_inspect(connection).get_columns("usage_records")}
+            if "tool_calls_json" not in present:
+                connection.execute(
+                    sa_text("ALTER TABLE usage_records ADD COLUMN tool_calls_json JSON")
+                )
     return not existed
 
 
@@ -79,6 +94,7 @@ def record_usage(
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
     status: str = "ok",
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Insert one usage row. Best-effort by contract: NEVER raises.
 
@@ -102,6 +118,7 @@ def record_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     status=status if status in ("ok", "error") else "error",
+                    tool_calls_json=tool_calls or None,
                 )
             )
         return True
@@ -124,20 +141,52 @@ def percentile(sorted_values: list[int], fraction: float) -> float | None:
     return float(sorted_values[index])
 
 
-def aggregate_usage(
-    rows: list[tuple[str, str, int | None, int | None, int, dt.datetime | None]],
-) -> list[dict[str, Any]]:
+def _fold_tool_calls(
+    per_tool: dict[str, dict[str, Any]], tool_calls: list[dict[str, Any]]
+) -> None:
+    for call in tool_calls:
+        name = call.get("tool")
+        if not isinstance(name, str) or not name:
+            continue
+        stats = per_tool.setdefault(name, {"calls": 0, "errors": 0, "latencies": []})
+        stats["calls"] += 1
+        if call.get("status") == "error":
+            stats["errors"] += 1
+        latency = call.get("latency_ms")
+        if isinstance(latency, int):
+            stats["latencies"].append(latency)
+
+
+UsageRow = tuple[
+    str, str, int | None, int | None, int, dt.datetime | None, list[dict[str, Any]] | None
+]
+
+
+def aggregate_usage(rows: list[UsageRow]) -> list[dict[str, Any]]:
     """Fold raw ``(deployment, status, prompt_tokens, completion_tokens,
-    latency_ms, created_at)`` rows into one summary entry per deployment.
+    latency_ms, created_at, tool_calls_json)`` rows into one summary entry per
+    deployment.
 
     Pure (no database) so the p95/averaging math is unit-testable. Output is
     sorted by request count descending -- busiest deployment first, which is
-    the order the Usage table renders in.
+    the order the Usage table renders in. ``tool_calls`` folds every row's MCP
+    tool-call trace (agent surface only, see ``UsageRecord.tool_calls_json``)
+    into per-tool call/error counts and average latency -- the Observability
+    Usage view's expandable per-agent detail.
     """
     grouped: dict[str, dict[str, Any]] = {}
     latencies: dict[str, list[int]] = {}
     last_used: dict[str, dt.datetime] = {}
-    for deployment, status, prompt_tokens, completion_tokens, latency_ms, created_at in rows:
+    tool_stats: dict[str, dict[str, dict[str, Any]]] = {}
+    for (
+        deployment,
+        status,
+        prompt_tokens,
+        completion_tokens,
+        latency_ms,
+        created_at,
+        tool_calls,
+    ) in rows:
         entry = grouped.setdefault(
             deployment,
             {
@@ -149,6 +198,7 @@ def aggregate_usage(
                 "avg_latency_ms": None,
                 "p95_latency_ms": None,
                 "last_used_at": None,
+                "tool_calls": [],
             },
         )
         entry["requests"] += 1
@@ -164,12 +214,28 @@ def aggregate_usage(
                 created_at = created_at.replace(tzinfo=dt.UTC)
             if deployment not in last_used or created_at > last_used[deployment]:
                 last_used[deployment] = created_at
+        if tool_calls:
+            _fold_tool_calls(tool_stats.setdefault(deployment, {}), tool_calls)
     for deployment, values in latencies.items():
         values.sort()
         grouped[deployment]["avg_latency_ms"] = round(sum(values) / len(values), 1)
         grouped[deployment]["p95_latency_ms"] = percentile(values, 0.95)
     for deployment, stamp in last_used.items():
         grouped[deployment]["last_used_at"] = stamp.isoformat()
+    for deployment, per_tool in tool_stats.items():
+        grouped[deployment]["tool_calls"] = [
+            {
+                "tool": name,
+                "calls": stats["calls"],
+                "errors": stats["errors"],
+                "avg_latency_ms": (
+                    round(sum(stats["latencies"]) / len(stats["latencies"]), 1)
+                    if stats["latencies"]
+                    else None
+                ),
+            }
+            for name, stats in sorted(per_tool.items(), key=lambda kv: -kv[1]["calls"])
+        ]
     return sorted(grouped.values(), key=lambda entry: (-entry["requests"], entry["deployment"]))
 
 
@@ -191,24 +257,12 @@ def usage_summary(*, tenant_id: str, window_hours: int) -> list[dict[str, Any]]:
                 UsageRecord.completion_tokens,
                 UsageRecord.latency_ms,
                 UsageRecord.created_at,
+                UsageRecord.tool_calls_json,
             )
             .where(UsageRecord.tenant_id == tenant_id)
             .where(UsageRecord.created_at >= since)
         ).all()
-        return aggregate_usage(
-            [
-                (
-                    deployment,
-                    status,
-                    prompt_tokens,
-                    completion_tokens,
-                    latency_ms,
-                    created_at,
-                )
-                for deployment, status, prompt_tokens, completion_tokens, latency_ms, created_at
-                in rows
-            ]
-        )
+        return aggregate_usage([tuple(row) for row in rows])
 
 
 __all__ = [

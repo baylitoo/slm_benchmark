@@ -71,6 +71,66 @@ AGENT_TEMPLATES: list[dict[str, Any]] = [
         ),
         "defaults": {"system_prompt": "", "options": {}},
     },
+    {
+        "id": "docs-search-agent",
+        "kind": "custom",
+        "display_name": "Document Search Agent",
+        "description": (
+            "Agentic RAG demo: wires a custom agent to the Document Search "
+            "MCP server (enable it under MCP servers first — see the "
+            "catalog) so even a small model searches a directory of "
+            "documents before answering, instead of guessing from a "
+            "stuffed prompt. Every tool call is visible in Try it (#262) "
+            "and the Observability usage ledger (#261)."
+        ),
+        "defaults": {
+            "system_prompt": (
+                "You are a document search assistant. You do not know the "
+                "contents of any document from memory. Before answering, "
+                "call list_files to see what is available, then use "
+                "search_text or read_document to find the actual answer. "
+                "Cite which document and page your answer came from. If "
+                "nothing relevant is found, say so plainly instead of "
+                "guessing."
+            ),
+            "options": {"mcp_servers": ["docs-search"], "mcp_tools": None},
+        },
+    },
+    {
+        "id": "workflow-agent",
+        "kind": "workflow",
+        "display_name": "Workflow Agent",
+        "description": (
+            "Prompt chaining (#265): a fixed, ORDERED sequence of steps, "
+            "each its own backing model and system prompt. One request "
+            "runs the whole sequence server-side — each step after the "
+            "first receives only the previous step's answer, not the "
+            "original request. Built to prove small (350M-class) models "
+            "handle narrow sub-tasks reliably in a pipeline even where one "
+            "model doing the whole thing in one shot would struggle."
+        ),
+        "defaults": {
+            "system_prompt": None,
+            "options": {
+                "steps": [
+                    {
+                        "model_profile": "",
+                        "system_prompt": (
+                            "Extract the key facts from the input as a short "
+                            "bullet list. Output only the bullets."
+                        ),
+                    },
+                    {
+                        "model_profile": "",
+                        "system_prompt": (
+                            "Using only the bullet list you were given, write "
+                            "a one-paragraph summary."
+                        ),
+                    },
+                ]
+            },
+        },
+    },
 ]
 
 

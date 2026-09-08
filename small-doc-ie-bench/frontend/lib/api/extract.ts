@@ -92,3 +92,26 @@ export function renderDocument(
     }),
   });
 }
+
+/**
+ * Make an uploaded file searchable via the docs-search MCP server for THIS
+ * conversation only (POST /v1/studio/session-documents). `sessionId` is
+ * server-issued: omit it on the first upload of a conversation and pass the
+ * returned `session_id` on every later upload/chat turn in that same
+ * conversation — the id is a capability the backend must have issued, never
+ * one the client invents.
+ */
+export function uploadSessionDocument(
+  contentB64: string,
+  filename: string,
+  sessionId?: string,
+): Promise<{ session_id: string; stored_name: string }> {
+  return request<{ session_id: string; stored_name: string }>("/v1/studio/session-documents", {
+    method: "POST",
+    body: JSON.stringify({
+      content_b64: contentB64,
+      filename,
+      ...(sessionId ? { session_id: sessionId } : {}),
+    }),
+  });
+}

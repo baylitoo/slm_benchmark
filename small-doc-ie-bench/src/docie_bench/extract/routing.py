@@ -76,6 +76,10 @@ class RuleCondition(BaseModel):
     status: Literal["success", "error"] | None = None
     validation_valid: bool | None = None
     min_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Raw natural-log probability from `extract/logprob_confidence.py` (#335),
+    # NOT the 0-1 `min_confidence` scale -- deliberately not renormalized, so
+    # there's no meaningful lower bound the way there's an upper bound of 0.
+    min_model_confidence: float | None = Field(default=None, le=0.0)
     max_warnings: int | None = Field(default=None, ge=0)
 
     def matches(self, evaluation: StageEvaluation) -> bool:
@@ -88,6 +92,15 @@ class RuleCondition(BaseModel):
             return False
         if self.min_confidence is not None and (
             evaluation.avg_confidence is None or evaluation.avg_confidence < self.min_confidence
+        ):
+            return False
+        # Same conservative "unknown confidence never matches" treatment as
+        # `min_confidence` above: an operator who sets both fields on one
+        # rule gets "escalate if EITHER signal is too low" for free, since
+        # this method already ANDs every configured predicate.
+        if self.min_model_confidence is not None and (
+            evaluation.avg_model_confidence is None
+            or evaluation.avg_model_confidence < self.min_model_confidence
         ):
             return False
         return self.max_warnings is None or evaluation.warning_count <= self.max_warnings
@@ -208,6 +221,7 @@ class StageEvaluation(BaseModel):
     status: Literal["success", "error"]
     validation_valid: bool | None = None
     avg_confidence: float | None = None
+    avg_model_confidence: float | None = None
     warning_count: int = 0
 
 
@@ -219,6 +233,7 @@ class StageAudit(BaseModel):
     latency_ms: int
     validation_valid: bool | None = None
     avg_confidence: float | None = None
+    avg_model_confidence: float | None = None
     warning_count: int = 0
     total_tokens: int = 0
     cost_units: float = 0.0
@@ -367,6 +382,7 @@ class ExtractionRouter:
                 latency_ms=_elapsed_ms(stage_started),
                 validation_valid=evaluation.validation_valid,
                 avg_confidence=evaluation.avg_confidence,
+                avg_model_confidence=evaluation.avg_model_confidence,
                 warning_count=evaluation.warning_count,
                 total_tokens=stage_tokens,
                 cost_units=result.cost_units if result else 0.0,
@@ -495,36 +511,58 @@ class ExtractionRouter:
 def _evaluate_result(result: StageResult) -> StageEvaluation:
     response = result.response
     if response is None:
-        confidence = result.metadata.get("confidence")
         return StageEvaluation(
             status="success",
-            avg_confidence=(
-                float(confidence)
-                if isinstance(confidence, int | float) and not isinstance(confidence, bool)
-                else None
-            ),
+            avg_confidence=_numeric_metadata(result.metadata, "confidence"),
+            avg_model_confidence=_numeric_metadata(result.metadata, "model_confidence"),
         )
-    confidences = _collect_confidences(response.result)
+    confidences = _collect_key_values(response.result, "confidence")
+    # Always computed alongside `confidences`, whether or not the active
+    # policy's rules reference `min_model_confidence`: the tree walk is as
+    # cheap as the existing `confidence` one, and computing it unconditionally
+    # avoids threading policy/rule knowledge into result evaluation just to
+    # decide whether to bother. `None` here (no policy opted in, or every
+    # field in this schema is nested/list-valued per #335's coverage) is
+    # indistinguishable at this layer -- both correctly leave a rule with
+    # `min_model_confidence` set unmatched.
+    model_confidences = _collect_key_values(response.result, "model_confidence")
     return StageEvaluation(
         status="success",
         validation_valid=response.validation.valid,
         avg_confidence=round(sum(confidences) / len(confidences), 4) if confidences else None,
+        avg_model_confidence=(
+            round(sum(model_confidences) / len(model_confidences), 4)
+            if model_confidences
+            else None
+        ),
         warning_count=len(response.validation.warnings),
     )
 
 
-def _collect_confidences(value: Any) -> list[float]:
+def _numeric_metadata(metadata: dict[str, Any], key: str) -> float | None:
+    value = metadata.get(key)
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def _collect_key_values(value: Any, key: str) -> list[float]:
+    """Walk an extraction result tree collecting every numeric ``key``.
+
+    Shared by ``confidence`` (grounding, `extract/grounding.py`) and
+    ``model_confidence`` (generation-time, `extract/logprob_confidence.py`)
+    -- both live as sibling keys in the same ``{value, evidence_ids, ...}``
+    field wrapper, so the same tree shape applies to either.
+    """
     if isinstance(value, list):
-        return [confidence for item in value for confidence in _collect_confidences(item)]
+        return [found for item in value for found in _collect_key_values(item, key)]
     if not isinstance(value, dict):
         return []
-    confidences = []
-    confidence = value.get("confidence")
-    if isinstance(confidence, int | float) and not isinstance(confidence, bool):
-        confidences.append(float(confidence))
+    found_values = []
+    found = value.get(key)
+    if isinstance(found, int | float) and not isinstance(found, bool):
+        found_values.append(float(found))
     for child in value.values():
-        confidences.extend(_collect_confidences(child))
-    return confidences
+        found_values.extend(_collect_key_values(child, key))
+    return found_values
 
 
 def _usage_tokens(response: ExtractionResponse | None) -> int:

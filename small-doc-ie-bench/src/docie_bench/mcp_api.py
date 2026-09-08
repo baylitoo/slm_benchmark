@@ -118,3 +118,35 @@ async def test_server(name: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - any connect/handshake failure is the diagnostic
         raise HTTPException(status_code=502, detail=f"could not connect: {exc}") from exc
     return {"name": name, "ok": True, "tools": tools}
+
+
+@router.get("/v1/mcp/servers/{name}/workers")
+async def code_interpreter_workers(name: str) -> dict[str, Any]:
+    """Judge0's own worker-pool/queue introspection (docker-compose's
+    judge0-server, #264), surfaced as a status card nested in the Studio's
+    MCP tab rather than a new page. Only meaningful for the code-interpreter
+    server — 404s for anything else so the UI can render "not applicable"
+    instead of a broken card."""
+    if name != "code-interpreter":
+        raise HTTPException(status_code=404, detail=f"server {name!r} has no worker-pool status")
+    spec = _registry().get(name)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"server {name!r} is not registered")
+    from docie_bench.mcp_servers import code_interpreter
+
+    url = spec.env.get(code_interpreter.URL_ENV) or code_interpreter._DEFAULT_URL
+    token = spec.env.get(code_interpreter.TOKEN_ENV)
+    if not token:
+        raise HTTPException(
+            status_code=422,
+            detail=f"server {name!r} has no {code_interpreter.TOKEN_ENV} configured",
+        )
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{url}/workers", headers={"X-Auth-Token": token})
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"could not reach judge0: {exc}") from exc
+    return {"name": name, "queues": response.json()}

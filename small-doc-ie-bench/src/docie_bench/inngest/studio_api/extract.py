@@ -149,3 +149,51 @@ async def render_document(
         # Unsupported type / too many pages / empty PDF — a client error.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"images": images, "pages": len(images)}
+
+
+class UploadSessionDocumentRequest(BaseModel):
+    """Add a document to a session-scoped directory docs-search can search
+    for THIS conversation only (#296)."""
+
+    content_b64: str
+    filename: str
+    # None starts a new session (a fresh id is minted and returned); an id
+    # this endpoint already returned adds another document to that SAME
+    # session. Any other value is rejected — never a client-invented id.
+    session_id: str | None = None
+
+
+class UploadSessionDocumentResponse(BaseModel):
+    session_id: str
+    stored_name: str
+
+
+@router.post("/session-documents", response_model=UploadSessionDocumentResponse)
+async def upload_session_document(
+    payload: UploadSessionDocumentRequest, tenant: TenantDependency
+) -> UploadSessionDocumentResponse:
+    """Upload a file docs-search can see during this conversation only.
+
+    The Playground calls this alongside render-document when docs-search is
+    selected: docs-search's real corpus is a separate, operator-controlled
+    directory an attachment otherwise never reaches (render-document only
+    ever produces page images for vision, nothing docs-search can read).
+    See ``mcp_session_documents`` and ``chat_api._chat_with_mcp_tools``'s
+    per-request env override that points docs-search at this session's
+    directory instead of the shared one.
+    """
+    del tenant  # authenticated principal required; session id IS the scope
+    import base64
+    import binascii
+
+    from docie_bench.mcp_session_documents import SessionDocumentError, save_document
+
+    try:
+        raw = base64.b64decode(payload.content_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid base64 content: {exc}") from exc
+    try:
+        session_id, stored_name = save_document(payload.session_id, payload.filename, raw)
+    except SessionDocumentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return UploadSessionDocumentResponse(session_id=session_id, stored_name=stored_name)

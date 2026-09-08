@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-AgentKind = Literal["proxy_security", "ocr", "custom"]
+AgentKind = Literal["proxy_security", "ocr", "custom", "workflow"]
 
 _NAME_RE = r"^[a-z0-9][a-z0-9._-]{0,62}$"
 
@@ -51,6 +51,37 @@ class AgentSpec(BaseModel):
           via generic GBNF, not its bespoke chat_template_kwargs path.
       Back-compat: an agent saved before ``mode`` existed derives it — an
       ``extractor`` present means ``ocr_extract``, otherwise ``ocr``.
+    * ``custom`` — a passthrough chat agent (system prompt + backing model).
+      Optional ``mcp_servers`` (list of registered MCP server names, see
+      ``GET /v1/mcp/servers``) turns on tool use: the agent runs the same
+      bounded model<->tools loop the generic chat surface uses, advertising
+      each server's tools and executing any tool_calls the model returns.
+      Absent/empty means the original bare-forward behavior, unchanged.
+      Optional ``mcp_tools`` (``{server_name: [tool_name, ...]}``) restricts
+      a server to a named subset of its tools instead of exposing all of
+      them — validated against the server's own live tool list, so a typo'd
+      or stale name is a clear config error rather than a silent no-op.
+    * ``workflow`` — a fixed, ORDERED sequence of steps (``options.steps``,
+      a non-empty list), each ``{model_profile: str, system_prompt?: str,
+      mcp_servers?: list[str], mcp_tools?: dict, name?: str, route?: dict}``
+      — the same per-step shape a ``custom`` agent's top-level
+      fields/options use. One request runs every step server-side: the
+      first step receives the caller's own messages, and each later step
+      receives only the last SUBSTANTIVE step's answer as its single user
+      message ("prompt chaining" — a small model handling one narrow
+      sub-task per step). A step may carry a ``name`` (defaults to its
+      list index) so it can be a jump target, and a ``route``
+      (``{routes: {label: step_name}, default?: step_name}``): a step
+      with ``route`` is a cheap classifier whose own answer is matched
+      (by substring, in declaration order) against ``routes`` to pick the
+      NEXT step by name instead of falling through the list — its own
+      answer is a label, never chained forward as content. Unmatched with
+      no ``default`` fails the request (``workflow_unroutable``); a
+      step-execution budget guards against a routing loop. The top-level
+      ``model_profile``/``system_prompt`` are unused (each step carries its
+      own); the final (non-routing) step's answer is the response, with
+      every step's content, route target, and tool calls available via
+      ``docie_agent.steps`` (the "Try it" trace view, #262).
     """
 
     name: str = Field(pattern=_NAME_RE, max_length=63)

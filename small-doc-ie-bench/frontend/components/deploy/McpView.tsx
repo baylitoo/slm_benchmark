@@ -1,12 +1,14 @@
 "use client";
 
-import { useState } from "react";
-import { Plug, Wrench } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Plug, RefreshCw, Wrench } from "lucide-react";
 import {
   disableMcpServer,
   enableMcpServer,
+  getCodeInterpreterWorkers,
   listMcpCatalog,
   testMcpServer,
+  type CodeInterpreterQueue,
   type McpCatalogEntry,
   type McpTool,
 } from "@/lib/api";
@@ -123,6 +125,7 @@ export function McpView({ active = true }: { active?: boolean }) {
                 </Badge>
               ))}
             </div>
+            {entry.name === "code-interpreter" && entry.enabled && <CodeInterpreterWorkers />}
             {entry.params.map((param) => (
               <TextInput
                 key={param.name}
@@ -172,6 +175,69 @@ export function McpView({ active = true }: { active?: boolean }) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// Judge0's own worker-pool/queue status (#264), nested here rather than a
+// new page: an operator enabling code-interpreter wants to know whether its
+// sandbox is actually staffed, not just that the MCP handshake succeeded.
+function CodeInterpreterWorkers() {
+  const [queues, setQueues] = useState<CodeInterpreterQueue[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await getCodeInterpreterWorkers();
+      setQueues(res.queues);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div className="rounded-md border border-border bg-muted/40 p-2 text-xs">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="font-medium text-muted-foreground">
+          <T>Sandbox worker pool</T>
+        </span>
+        <button
+          type="button"
+          aria-label="Refresh worker pool"
+          onClick={() => void load()}
+          className="text-muted-foreground hover:text-foreground"
+        >
+          <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+        </button>
+      </div>
+      {error ? (
+        <p className="text-destructive"><T>Couldn&apos;t reach the sandbox.</T> {error}</p>
+      ) : queues === null ? (
+        <p className="text-muted-foreground"><T>Loading…</T></p>
+      ) : (
+        <div className="space-y-1">
+          {queues.map((q) => (
+            <div key={q.queue} className="flex items-center gap-3">
+              <span className="w-16 shrink-0 truncate">{q.queue}</span>
+              <Badge tone={q.available > 0 ? "ok" : "warn"}>{q.available} workers</Badge>
+              <span className="text-muted-foreground">
+                {q.idle} idle · {q.working} working · {q.size} queued
+              </span>
+              {q.failed > 0 && <Badge tone="err">{q.failed} failed</Badge>}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -27,7 +27,9 @@ with the same ``predict`` signature.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Request
@@ -237,19 +239,21 @@ def create_encoder_app(
     (``backend_kind="auto"`` picks GLiNER2 for GLiNER2 model ids)."""
     labels_default = list(default_labels or DEFAULT_LABELS)
 
-    app = FastAPI(
-        title="docie encoder",
-        summary="Encoder (token-classification) model behind the OpenAI chat surface.",
-    )
-    app.state.backend = backend
-    app.state.model_id = model_id
-
-    @app.on_event("startup")
-    def load_model() -> None:
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Load at startup (not first request) so a missing extra/weights fails
         # the deploy immediately instead of 500ing the first caller.
         if app.state.backend is None:
             app.state.backend = build_backend(model_id, backend_kind)
+        yield
+
+    app = FastAPI(
+        title="docie encoder",
+        summary="Encoder (token-classification) model behind the OpenAI chat surface.",
+        lifespan=lifespan,
+    )
+    app.state.backend = backend
+    app.state.model_id = model_id
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
