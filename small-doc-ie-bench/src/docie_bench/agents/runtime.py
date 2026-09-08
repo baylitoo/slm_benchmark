@@ -129,6 +129,10 @@ def _generation_max_tokens(body: dict[str, Any], options: dict[str, Any]) -> int
     return raw
 
 
+def _parallel_extraction(body: dict[str, Any], options: dict[str, Any]) -> bool:
+    return bool(body.get("parallel_extraction", options.get("parallel_extraction")))
+
+
 def _resolve_extraction_schema(schema_name: str) -> tuple[str, dict[str, Any] | None]:
     """Return ExtractionService's schema mode and optional saved specification."""
     from docie_bench.schemas.extraction import schema_json
@@ -463,7 +467,7 @@ async def _complete_ocr(
                 mode=mode,
                 output_model=upstream.model,
                 max_tokens=max_tokens,
-                parallel_extraction=bool(options.get("parallel_extraction")),
+                parallel_extraction=_parallel_extraction(body, options),
             )
         upstream, base = _prepare_vision_forward(spec, body, options, max_tokens)
         completion = await _post_chat(upstream, base, http_client=http_client)
@@ -509,7 +513,7 @@ async def _complete_ocr(
                 max_tokens=max_tokens,
                 executor=router,
                 policy_name=policy_name,
-                parallel_extraction=bool(options.get("parallel_extraction")),
+                parallel_extraction=_parallel_extraction(body, options),
             )
         extractor = _resolve_backing(extractor_selector)
         profiles[extractor.name] = extractor
@@ -552,7 +556,7 @@ async def _complete_ocr(
                 mode=mode,
                 output_model=extractor.model,
                 max_tokens=max_tokens,
-                parallel_extraction=bool(options.get("parallel_extraction")),
+                parallel_extraction=_parallel_extraction(body, options),
             )
     else:
         kind = "ocr"
