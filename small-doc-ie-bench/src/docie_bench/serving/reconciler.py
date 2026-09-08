@@ -276,6 +276,11 @@ class ObservedDeployment:
     ttft_ms: float | None = None
     throughput_measured_at: dt.datetime | None = None
     throughput_source: str | None = None
+    # The real slot count observed via GET /slots (see HealthResult.slot_count)
+    # -- None whenever not live or undetermined. Never carried forward from a
+    # stale cycle: a deployment that stops being live publishes None here,
+    # same policy as the throughput fields.
+    slot_count: int | None = None
 
 
 def default_fit_check(
@@ -354,6 +359,7 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
                 ttft_ms=observed.ttft_ms,
                 throughput_measured_at=observed.throughput_measured_at,
                 throughput_source=observed.throughput_source,
+                slot_count=observed.slot_count,
             )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: observed state not published (repair-only cycle)")
@@ -625,7 +631,9 @@ class ServingReconciler:
             self._was_ready.add(name)
             self._misses[name] = 0
             record = self._credit_healthy_cycle(name, record)
-            return self._observation(name, record, phase="hot", health_ok=True)
+            return self._observation(
+                name, record, phase="hot", health_ok=True, slot_count=health.slot_count
+            )
 
         self._healthy_streak.pop(name, None)  # any miss restarts the streak
         detail = health.detail or f"health check returned status {health.status_code}"
@@ -950,6 +958,7 @@ class ServingReconciler:
         phase: str,
         health_ok: bool,
         last_error: str | None = None,
+        slot_count: int | None = None,
     ) -> ObservedDeployment:
         live = phase == "hot"
         rss = 0
@@ -984,6 +993,7 @@ class ServingReconciler:
             ttft_ms=ttft_ms,
             throughput_measured_at=throughput_at,
             throughput_source=throughput_source,
+            slot_count=slot_count,
         )
 
 

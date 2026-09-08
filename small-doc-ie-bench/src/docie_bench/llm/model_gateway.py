@@ -123,6 +123,28 @@ def _state_for(profile: ModelProfile) -> _GatewayState:
             queue_limit=profile.queue_limit,
         )
         _STATES[key] = state
+        # Once per (base_url, model), at semaphore-sizing time -- not per
+        # request. deployment_slot_count is the reconciler's last GET /slots
+        # observation (None for a models.yaml profile, or before the first
+        # observation): a deployment with fewer real slots than the profile
+        # admits concurrent requests just serializes them behind the real
+        # slot(s), each waiting out the ones ahead of it in full.
+        slots = profile.deployment_slot_count
+        if slots is not None and profile.max_concurrency > slots:
+            logger.warning(
+                "model profile %r admits %d concurrent requests but its deployment "
+                "reports only %d real slot(s) -- concurrent requests will serialize "
+                "behind the deployment rather than run in parallel",
+                profile.name,
+                profile.max_concurrency,
+                slots,
+                extra={
+                    "docie_model_profile": profile.name,
+                    "docie_model": profile.model,
+                    "docie_max_concurrency": profile.max_concurrency,
+                    "docie_deployment_slot_count": slots,
+                },
+            )
     return state
 
 

@@ -249,6 +249,18 @@ class HealthResult:
     # unreachable /props, or a runtime (vLLM, Ollama, ...) that never probes
     # this at all. Every non-llamacpp adapter leaves this at the default None.
     tool_calls_supported: bool | None = None
+    # llama.cpp only: the real number of processing slots this deployment is
+    # actually running with (GET /slots array length -- one entry per real
+    # slot), NOT the --parallel value it was launched with. Distinct on
+    # purpose: a manually-restarted or externally-managed process could be
+    # running with a different slot count than its launch spec claims, and
+    # this is meant to be ground truth for the concurrency-mismatch warning
+    # (see model_gateway._state_for). None whenever unreachable/undetermined
+    # (an unhealthy deployment, --no-slots, an older build, a non-llamacpp
+    # runtime) -- a slot count of 0 is never a valid state, so an empty
+    # /slots response is indistinguishable from "couldn't observe" and both
+    # collapse to None here.
+    slot_count: int | None = None
 
 
 class Process(Protocol):
@@ -877,7 +889,11 @@ class LlamaCppRuntime(RuntimeAdapter):
             mismatch = llamacpp_tool_calls_mismatch(props)
             if mismatch is not None:
                 logger.warning("%s (alias=%r, endpoint=%r)", mismatch, spec.alias, base)
-        return replace(result, tool_calls_supported=tool_calls_supported)
+        observed_slots = self.slots(spec, timeout=timeout)
+        slot_count = len(observed_slots) or None
+        return replace(
+            result, tool_calls_supported=tool_calls_supported, slot_count=slot_count
+        )
 
     def slots(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> tuple[dict[str, Any], ...]:
         """llama-server's own ``GET /slots`` introspection (#315): per-slot

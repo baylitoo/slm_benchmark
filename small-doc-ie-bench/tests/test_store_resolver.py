@@ -75,6 +75,32 @@ def test_resolve_store_llama_server_default_style(_sqlite_catalog: None) -> None
     assert ENGINE_DEFAULT_STYLE["llama-server"] == "openai_json_schema"
 
 
+def test_resolve_store_surfaces_the_observed_slot_count(_sqlite_catalog: None) -> None:
+    # slot_count is reconciler-owned (record_placement never sets it, only
+    # publish_observed does) -- a freshly-placed deployment resolves with
+    # deployment_slot_count=None until the reconciler's first observation.
+    _seed("qwen2.5-1.5b", family="openai_chat")
+    _place("qwen2.5-1.5b", engine="llama-server")
+
+    assert resolve_store_profile("qwen2.5-1.5b").deployment_slot_count is None
+
+    ModelCatalog().publish_observed(
+        "qwen2.5-1.5b",
+        engine="llama-server",
+        state="ready",
+        endpoint=_ENDPOINT,
+        phase="hot",
+        pid=1,
+        pid_create_time=0.0,
+        rss_bytes=0,
+        health_ok=True,
+        last_error=None,
+        slot_count=4,
+    )
+
+    assert resolve_store_profile("qwen2.5-1.5b").deployment_slot_count == 4
+
+
 def test_resolve_store_records_activity(_sqlite_catalog: None) -> None:
     """Every live resolution bumps model_activity — the signal a future
     autoscale-up decision would read (see catalog.ModelActivity)."""

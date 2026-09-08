@@ -233,6 +233,7 @@ async def _complete_structured_document(
     max_tokens: int | None,
     executor: ExtractionService | ExtractionRouter | None = None,
     policy_name: str | None = None,
+    parallel_extraction: bool = False,
 ) -> dict[str, Any]:
     """Run an Agent document through the same extraction path as Playground.
 
@@ -289,6 +290,7 @@ async def _complete_structured_document(
             dynamic_schema=dynamic_schema,
             language=language,
             metadata={"agent": spec.name},
+            parallel_extraction=parallel_extraction,
         )
     except ModelGatewayError as exc:
         raise AgentError(
@@ -461,6 +463,7 @@ async def _complete_ocr(
                 mode=mode,
                 output_model=upstream.model,
                 max_tokens=max_tokens,
+                parallel_extraction=bool(options.get("parallel_extraction")),
             )
         upstream, base = _prepare_vision_forward(spec, body, options, max_tokens)
         completion = await _post_chat(upstream, base, http_client=http_client)
@@ -506,6 +509,7 @@ async def _complete_ocr(
                 max_tokens=max_tokens,
                 executor=router,
                 policy_name=policy_name,
+                parallel_extraction=bool(options.get("parallel_extraction")),
             )
         extractor = _resolve_backing(extractor_selector)
         profiles[extractor.name] = extractor
@@ -548,6 +552,7 @@ async def _complete_ocr(
                 mode=mode,
                 output_model=extractor.model,
                 max_tokens=max_tokens,
+                parallel_extraction=bool(options.get("parallel_extraction")),
             )
     else:
         kind = "ocr"

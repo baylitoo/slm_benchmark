@@ -480,6 +480,45 @@ def test_llamacpp_health_leaves_tool_calls_supported_none_when_undetermined(
     assert result.tool_calls_supported is None
 
 
+def test_llamacpp_health_records_slot_count_from_slots_endpoint() -> None:
+    # Ground truth for model_gateway's concurrency-mismatch warning: the REAL
+    # slot count observed via GET /slots, not the --parallel launch value
+    # (which can drift from what a manually-restarted process actually runs
+    # with).
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {},
+        slots_get=lambda url, timeout, headers: [
+            {"id": 0, "is_processing": False},
+            {"id": 1, "is_processing": True},
+            {"id": 2, "is_processing": False},
+            {"id": 3, "is_processing": False},
+        ],
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.slot_count == 4
+
+
+def test_llamacpp_health_leaves_slot_count_none_when_slots_endpoint_unreachable() -> None:
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {},
+        slots_get=lambda url, timeout, headers: None,
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.slot_count is None
+
+
 def test_llamacpp_slots_tolerates_a_missing_field_schema() -> None:
     # Schema varies by llama-server build (#315): one slot reports the full
     # shape (including build-dependent timing/cache fields), the other only
@@ -531,9 +570,12 @@ def test_llamacpp_slots_never_raises_on_query_failure_and_never_touches_health()
     spec = _spec(RuntimeKind.LLAMACPP)
 
     assert adapter.slots(spec) == ()
-    # health() doesn't even query /slots -- a slots-query failure must never
-    # be able to flip an otherwise-healthy deployment to unhealthy.
-    assert adapter.health(spec).healthy is True
+    # health() DOES query /slots too (to populate slot_count), but a
+    # slots-query failure must never be able to flip an otherwise-healthy
+    # deployment to unhealthy -- only ever degrades slot_count to None.
+    result = adapter.health(spec)
+    assert result.healthy is True
+    assert result.slot_count is None
 
 
 def test_fetch_llamacpp_slots_works_from_a_bare_endpoint_string() -> None:
