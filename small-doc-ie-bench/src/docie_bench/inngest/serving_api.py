@@ -51,6 +51,7 @@ LOAD_EVENT = "serving/load.requested"
 UNLOAD_EVENT = "serving/unload.requested"
 REPAIR_EVENT = "serving/repair.requested"
 RECONFIGURE_EVENT = "serving/reconfigure.requested"
+RESIZE_EVENT = "serving/resize.requested"
 PIN_EVENT = "serving/pin.requested"
 # Scaling reuses the ordinary single-deploy job (deploy_model_job) — the scale
 # endpoint just fans out one deploy event per new replica name.
@@ -767,6 +768,83 @@ async def scale_store_model(
         "event_ids": event_ids,
         "channel": channel,
     }
+
+
+class ResizeRequest(BaseModel):
+    """Body of POST /store/{name}/resize — the TARGET context window."""
+
+    context_length: int = Field(ge=128, le=1_048_576)
+
+
+@router.post("/store/{name}/resize")
+async def resize_store_model(
+    name: str, request: ResizeRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    """Change a live store deployment's context window with zero downtime.
+
+    Two-tier RAM honesty, same split as ``/sizing`` vs the worker's live fit
+    gate: this synchronous pre-check prices ONE instance at the new context
+    length against the last published node snapshot — the SAME engine
+    ``/sizing/whatif`` uses — and returns 422 with the deficit up front when
+    it would not fit, WITHOUT touching the running deployment. A missing or
+    stale snapshot fails open here (nothing to judge against yet) rather than
+    blocking the request; the actual resize runs on the ``serving`` service,
+    which re-checks against LIVE measured memory (the authoritative gate,
+    correct cgroup, holds the Popen handles) before spawning anything — this
+    pre-check is a fast, honest convenience, never a substitute for it.
+
+    422 also covers a deployment whose runtime does not honor a context
+    override (only llama.cpp does) — checked before the RAM pre-check so an
+    unsupported deployment never even prices a plan.
+    """
+    del tenant
+    try:
+        status = await _control_plane().deployment_status(name)
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+    launch = (status.get("spec") or {}).get("launch") or {} if isinstance(status, dict) else {}
+    if str(launch.get("runtime") or "") != "llamacpp":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"deployment {name!r} runs the {launch.get('runtime')!r} runtime, "
+                f"which does not accept a context-length override (only llama.cpp "
+                f"honors --ctx-size)"
+            ),
+        )
+    model_name = str(launch.get("alias") or name)
+
+    from docie_bench.serving.resources import FootprintStore
+    from docie_bench.serving.sizing import UnknownModelError, UnpriceableModelError, compute_whatif
+
+    models, snapshot, placements, _detail = _sizing_inputs()
+    if models:
+        try:
+            report = compute_whatif(
+                models,
+                snapshot,
+                [
+                    {
+                        "model": model_name,
+                        "instances": 1,
+                        "context_length": request.context_length,
+                    }
+                ],
+                placements,
+                footprints=FootprintStore(),
+                margin_fraction=get_settings().serving_sizing_margin_fraction,
+            )
+        except (UnknownModelError, UnpriceableModelError):
+            report = None
+        if report is not None and report.ok is False:
+            raise HTTPException(status_code=422, detail=report.as_dict())
+
+    return await _fire_lifecycle_event(
+        name,
+        event=RESIZE_EVENT,
+        prefix="resize",
+        extra={"context_length": request.context_length},
+    )
 
 
 class RepairRequest(BaseModel):

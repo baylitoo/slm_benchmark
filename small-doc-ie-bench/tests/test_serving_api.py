@@ -443,3 +443,116 @@ def test_domain_404_carries_the_discriminator_header(serving_home: Path) -> None
 
     assert exc.value.status_code == 404
     assert (exc.value.headers or {}).get("X-Docie-Error") == "not_found"
+
+
+# ── resize endpoint: RAM pre-check + event fire ─────────────────────────────
+
+
+def _seed_priceable_catalog(name: str, size_bytes: int) -> None:
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.model_store import StoreEntry
+
+    ModelCatalog().upsert(
+        StoreEntry(name=name, family="openai_chat", model_path=Path(f"/models/{name}/model.gguf")),
+        size_bytes=size_bytes,
+    )
+
+
+def _resize(name: str, context_length: int):
+    from docie_bench.inngest.serving_api import ResizeRequest, resize_store_model
+
+    return asyncio.run(
+        resize_store_model(name, ResizeRequest(context_length=context_length), tenant=None)
+    )
+
+
+def test_resize_fires_event_when_it_fits(
+    serving_home: Path, sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.inngest import serving_api
+    from docie_bench.serving.catalog import ModelCatalog
+
+    _seed_deployments(serving_home, {"svc": 8090})
+    _seed_priceable_catalog("svc", 2 * 1024**3)
+    ModelCatalog().publish_node_snapshot(
+        total_bytes=16 * 1024**3, free_bytes=12 * 1024**3, source="cgroup", sum_rss_bytes=0
+    )
+    sent: list[object] = []
+
+    async def fake_send(event: object) -> list[str]:
+        sent.append(event)
+        return ["evt-resize"]
+
+    monkeypatch.setattr(serving_api.inngest_client, "send", fake_send)
+
+    result = _resize("svc", 32768)
+
+    assert result["name"] == "svc"
+    assert result["channel"].startswith("resize:")
+    assert len(sent) == 1
+    assert sent[0].name == "serving/resize.requested"  # type: ignore[attr-defined]
+    assert sent[0].data["context_length"] == 32768  # type: ignore[attr-defined]
+
+
+def test_resize_returns_422_with_deficit_when_it_does_not_fit(
+    serving_home: Path, sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi import HTTPException
+
+    from docie_bench.inngest import serving_api
+    from docie_bench.serving.catalog import ModelCatalog
+
+    _seed_deployments(serving_home, {"svc": 8090})
+    _seed_priceable_catalog("svc", 2 * 1024**3)
+    ModelCatalog().publish_node_snapshot(
+        total_bytes=1 * 1024**3, free_bytes=1024, source="cgroup", sum_rss_bytes=0
+    )
+    sent: list[object] = []
+
+    async def fake_send(event: object) -> list[str]:
+        sent.append(event)
+        return ["evt-resize"]
+
+    monkeypatch.setattr(serving_api.inngest_client, "send", fake_send)
+
+    with pytest.raises(HTTPException) as excinfo:
+        _resize("svc", 1_048_576)
+
+    assert excinfo.value.status_code == 422
+    assert excinfo.value.detail["ok"] is False
+    assert excinfo.value.detail["deficit_bytes"] > 0
+    assert sent == []  # never fired -- the running deployment was never touched
+
+
+def test_resize_rejects_non_llamacpp_runtime(serving_home: Path) -> None:
+    from fastapi import HTTPException
+
+    from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
+    from docie_bench.serving.supervisor import DeploymentSpec, PersistentSupervisor
+
+    supervisor = PersistentSupervisor(
+        serving_home / "deployments.json", adapters={RuntimeKind.ENCODER: _FakeAdapter()}
+    )
+    supervisor.deploy(
+        DeploymentSpec(
+            name="guard",
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.ENCODER, model="org/gliner", alias="guard", port=8090
+            ),
+        )
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        _resize("guard", 4096)
+
+    assert excinfo.value.status_code == 422
+    assert "does not accept a context-length override" in str(excinfo.value.detail)
+
+
+def test_resize_404_for_unknown_deployment(serving_home: Path) -> None:
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        _resize("no-such-deployment", 4096)
+
+    assert excinfo.value.status_code == 404

@@ -9,8 +9,10 @@ import {
   Pin,
   PinOff,
   Pencil,
+  Gauge,
   RefreshCw,
   Trash2,
+  CheckCircle2,
 } from "lucide-react";
 import {
   getPorts,
@@ -21,6 +23,8 @@ import {
   scaleStoreModel,
   repairDeployment,
   updateDeployment,
+  resizeDeployment,
+  whatifSizing,
   getDeploymentLogs,
   deploymentModelType,
   formatBytes,
@@ -28,6 +32,7 @@ import {
   type StoreEntry,
   type PortsView as PortsViewData,
   type DeploymentRecord,
+  type WhatIfView,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
@@ -427,6 +432,11 @@ export function DeploymentsView({
   const [editContextLength, setEditContextLength] = useState("");
   const [editMaxTokens, setEditMaxTokens] = useState("");
   const [editError, setEditError] = useState<string | null>(null);
+  const [resizing, setResizing] = useState<DeploymentRecord | null>(null);
+  const [resizeContextLength, setResizeContextLength] = useState("");
+  const [resizeError, setResizeError] = useState<string | null>(null);
+  const [resizePreview, setResizePreview] = useState<WhatIfView | null>(null);
+  const [resizePreviewLoading, setResizePreviewLoading] = useState(false);
 
   function openEditor(record: DeploymentRecord) {
     setEditing(record);
@@ -474,6 +484,77 @@ export function DeploymentsView({
         toUserMessage(err, {
           unavailable: "Deployment editing isn't available on this server.",
           fallback: "Could not update the deployment.",
+        }),
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function openResizer(record: DeploymentRecord) {
+    setResizing(record);
+    setResizeContextLength(String(record.spec?.launch?.context_length ?? 8192));
+    setResizeError(null);
+    setResizePreview(null);
+  }
+
+  // Live RAM estimate before confirming: mirrors the Sizing tab's what-if
+  // preview (same engine, same margin) -- priced as ONE instance at the
+  // target context length, since that is what briefly coexists with the
+  // running instance during the zero-downtime handoff. Debounced so typing
+  // a new value doesn't fire a request per keystroke.
+  useEffect(() => {
+    if (!resizing) return;
+    const modelName = resizing.spec?.launch?.alias ?? resizing.spec?.name;
+    const value = Number(resizeContextLength);
+    if (!modelName || !Number.isInteger(value) || value < 128 || value > 1_048_576) {
+      setResizePreview(null);
+      return;
+    }
+    let cancelled = false;
+    setResizePreviewLoading(true);
+    const timer = setTimeout(() => {
+      whatifSizing([{ model: modelName, instances: 1, context_length: value }])
+        .then((result) => {
+          if (!cancelled) setResizePreview(result);
+        })
+        .catch(() => {
+          if (!cancelled) setResizePreview(null);
+        })
+        .finally(() => {
+          if (!cancelled) setResizePreviewLoading(false);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [resizing, resizeContextLength]);
+
+  async function confirmResize() {
+    const name = resizing?.spec?.name;
+    if (!name) return;
+    const contextLength = Number(resizeContextLength);
+    if (!Number.isInteger(contextLength) || contextLength < 128 || contextLength > 1_048_576) {
+      setResizeError("Context window must be an integer between 128 and 1,048,576 tokens.");
+      return;
+    }
+    setBusy(`${name}:resize`);
+    setResizeError(null);
+    try {
+      await resizeDeployment(name, contextLength);
+      toast({
+        title: "Resize requested",
+        description: `${name} · ${contextLength.toLocaleString()} token context`,
+        tone: "success",
+      });
+      setResizing(null);
+      deployments.refresh();
+    } catch (err) {
+      setResizeError(
+        toUserMessage(err, {
+          unavailable: "Deployment resizing isn't available on this server.",
+          fallback: "Could not resize the deployment.",
         }),
       );
     } finally {
@@ -707,6 +788,17 @@ export function DeploymentsView({
             >
               <Pencil className="h-3.5 w-3.5" />
             </Button>
+            {r.spec?.launch?.runtime === "llamacpp" && (
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={busy !== null}
+                title="Resize: change context window with zero-downtime drain-and-relaunch"
+                onClick={() => openResizer(r)}
+              >
+                <Gauge className="h-3.5 w-3.5" />
+              </Button>
+            )}
             <Button
               size="sm"
               variant="ghost"
@@ -927,7 +1019,104 @@ export function DeploymentsView({
           {editError && <Alert tone="err">{editError}</Alert>}
         </div>
       </Dialog>
+
+      <Dialog
+        open={resizing !== null}
+        onClose={() => {
+          if (busy?.endsWith(":resize")) return;
+          setResizing(null);
+          setResizeError(null);
+        }}
+        title="Resize deployment"
+        subtitle={resizing?.spec?.name}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => setResizing(null)}
+              disabled={busy?.endsWith(":resize")}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={confirmResize}
+              loading={busy === `${resizing?.spec?.name}:resize`}
+              disabled={resizePreview?.ok === false}
+            >
+              Resize (zero downtime)
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <Alert tone="info">
+            <T>
+              A new-sized instance is started on its own port and proven healthy BEFORE
+              routing switches to it — the current instance keeps serving until then, and
+              only stops once the handoff is complete.
+            </T>
+          </Alert>
+          <Field
+            label="Target context window"
+            htmlFor="resize-deployment-context"
+            hint="llama-server cannot resize its KV cache in place, so a larger window drains a new instance rather than restarting this one in a gap."
+          >
+            <TextInput
+              id="resize-deployment-context"
+              type="number"
+              min={128}
+              max={1_048_576}
+              step={128}
+              value={resizeContextLength}
+              onChange={(e) => setResizeContextLength(e.target.value)}
+            />
+          </Field>
+          <ResizePreview loading={resizePreviewLoading} result={resizePreview} />
+          {resizeError && <Alert tone="err">{resizeError}</Alert>}
+        </div>
+      </Dialog>
     </div>
+  );
+}
+
+// Live RAM estimate before confirming a resize — mirrors the Sizing tab's
+// what-if verdict (same engine, same margin, same honesty rules: `ok=null`
+// means no live snapshot to judge against, never a fabricated pass/fail).
+function ResizePreview({
+  loading,
+  result,
+}: {
+  loading: boolean;
+  result: WhatIfView | null;
+}) {
+  if (loading && !result) {
+    return <p className="text-xs text-muted-foreground"><T>Checking RAM…</T></p>;
+  }
+  if (!result) return null;
+  if (result.ok == null) {
+    return (
+      <Alert tone="warn">
+        <T>No live capacity measurement to judge this against yet</T>
+        {result.detail ? ` (${result.detail})` : ""}.
+      </Alert>
+    );
+  }
+  if (result.ok) {
+    return (
+      <p className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">
+        <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+        <span>
+          <T>Fits</T> — needs {formatBytes(result.total_predicted_bytes)};{" "}
+          {formatBytes(result.remaining_bytes)} <T>would remain above the safety margin</T>.
+        </span>
+      </p>
+    );
+  }
+  return (
+    <Alert tone="err">
+      <T>Does not fit</T> — needs {formatBytes(result.total_predicted_bytes)}, which is{" "}
+      {formatBytes(result.deficit_bytes)} <T>more than the deployable budget</T>.
+    </Alert>
   );
 }
 
