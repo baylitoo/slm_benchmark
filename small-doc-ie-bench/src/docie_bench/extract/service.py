@@ -232,6 +232,13 @@ def hash_file(path: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
+def _data_urls(images: list[DocumentImage]) -> list[str]:
+    """Base64-encode every page image -- synchronous, CPU-bound for a
+    many-page document, so callers run this through asyncio.to_thread rather
+    than call DocumentImage.data_url() directly in a loop on the event loop."""
+    return [image.data_url() for image in images]
+
+
 class ExtractionService:
     def __init__(
         self,
@@ -353,7 +360,7 @@ class ExtractionService:
                 schema_mode=schema_mode,
                 dynamic_schema=dynamic_schema,
                 language=language,
-                document_hash=hash_file(path),
+                document_hash=await asyncio.to_thread(hash_file, path),
                 metadata=metadata or {},
             )
         if ocr_backend_name.lower().strip() == "vision":
@@ -458,7 +465,7 @@ class ExtractionService:
             # didn't come through a registered OCR backend (see its own
             # text_to_blocks(..., source="manual") call).
             blocks = text_to_blocks(text, source="manual")
-            document_hash = hash_file(path)
+            document_hash = await asyncio.to_thread(hash_file, path)
         else:
             backend_name = str(options.get("ocr_backend", "tesseract"))
             ocr_language = options.get("language") or language
@@ -535,7 +542,8 @@ class ExtractionService:
             {"type": "text", "text": OCR_TRANSCRIPTION_USER_PROMPT}
         ]
         content += [
-            {"type": "image_url", "image_url": {"url": image.data_url()}} for image in images
+            {"type": "image_url", "image_url": {"url": url}}
+            for url in await asyncio.to_thread(_data_urls, images)
         ]
         request = {
             "model": vision.model,
@@ -682,13 +690,14 @@ class ExtractionService:
             extra_template_kwargs["template"] = json.dumps(
                 nuextract_template, ensure_ascii=False
             )
+        image_urls = await asyncio.to_thread(_data_urls, images) if images else None
         try:
             raw, usage_dict, raw_response = await client.chat_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 schema_name=schema_name,
                 schema=generation_schema,
-                image_urls=[image.data_url() for image in images] if images else None,
+                image_urls=image_urls,
                 chat_template_kwargs=extra_template_kwargs or None,
                 max_tokens=self.max_tokens,
                 # LFM2.5's bundled template opens <think> unconditionally and
