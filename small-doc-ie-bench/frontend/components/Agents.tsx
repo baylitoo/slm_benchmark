@@ -759,6 +759,11 @@ export function CreateView({
   // Suppress a reasoning model's think channel (enable_thinking=false) so it
   // emits the answer directly instead of rambling past the token budget.
   const [noThink, setNoThink] = useState(false);
+  // Split a schema's list-typed fields into independent groups and extract
+  // them concurrently through the same deployment (design #444). Opt-in --
+  // most schemas have a list field, so this changes the call pattern for
+  // most extractions once turned on; off by default everywhere.
+  const [parallelExtraction, setParallelExtraction] = useState(false);
   // Blank inherits the backing deployment/profile default. A caller may still
   // override this per OpenAI request with max_tokens.
   const [maxTokens, setMaxTokens] = useState("");
@@ -933,6 +938,7 @@ export function CreateView({
     setOcrExtractor(typeof o.extractor === "string" ? o.extractor : "");
     setOcrModel(typeof o.ocr_model === "string" ? o.ocr_model : "");
     setNoThink(o.no_think === true);
+    setParallelExtraction(o.parallel_extraction === true);
     setMaxTokens(typeof o.max_tokens === "number" ? String(o.max_tokens) : "");
     setVisionModel(typeof o.vision_model === "string" ? o.vision_model : "");
     setSchemaName(typeof o.schema === "string" ? o.schema : "");
@@ -1002,6 +1008,7 @@ export function CreateView({
                   vision_model: visionModel || null,
                   schema: schemaName || null,
                   no_think: noThink,
+                  parallel_extraction: parallelExtraction,
                   max_tokens: maxTokens.trim() ? Number(maxTokens) : null,
                 }
               : ocrMode === "ocr_extract"
@@ -1015,6 +1022,7 @@ export function CreateView({
                     extractor: ocrExtractor || null,
                     schema: schemaName || null,
                     no_think: noThink,
+                    parallel_extraction: parallelExtraction,
                     max_tokens: maxTokens.trim() ? Number(maxTokens) : null,
                   }
                 : {
@@ -1545,6 +1553,20 @@ export function CreateView({
                         <T>Disable thinking (reasoning models)</T>
                         <span className="block text-muted-foreground">
                           <T>Uses native reasoning controls when supported and an assistant JSON continuation for templates that ignore them.</T>
+                        </span>
+                      </span>
+                    </label>
+                    <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground/90">
+                      <input
+                        type="checkbox"
+                        checked={parallelExtraction}
+                        onChange={(e) => setParallelExtraction(e.target.checked)}
+                        className="mt-0.5 h-3.5 w-3.5"
+                      />
+                      <span>
+                        <T>Parallel extraction</T>
+                        <span className="block text-muted-foreground">
+                          <T>Splits the schema's list fields (experience, line items, ...) into independent groups extracted concurrently. Faster on a schema with several list fields; no effect otherwise. Needs the deployment to actually run more than one slot to pay off.</T>
                         </span>
                       </span>
                     </label>

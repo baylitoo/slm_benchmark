@@ -239,6 +239,64 @@ def _data_urls(images: list[DocumentImage]) -> list[str]:
     return [image.data_url() for image in images]
 
 
+def _is_array_field(field_schema: dict[str, Any]) -> bool:
+    """True for a top-level field whose flattened JSON-schema type is
+    ``array`` -- a static schema's list field is a bare
+    ``{"type": "array", ...}``; a dynamic schema's is Optional by
+    construction (every field defaults to None) and wraps that same shape in
+    ``anyOf`` alongside a ``null`` branch. Both are checked."""
+    if field_schema.get("type") == "array":
+        return True
+    for branch in field_schema.get("anyOf", ()):
+        if isinstance(branch, dict) and branch.get("type") == "array":
+            return True
+    return False
+
+
+def _split_schema_into_groups(generation_schema: dict[str, Any]) -> list[list[str]] | None:
+    """Split a flattened generation schema's top-level fields into
+    independently-extractable groups (design #444): every list-typed field
+    becomes its own group; every remaining field (scalars, nested objects)
+    forms one shared base group. ``document_type``/``extraction_notes``
+    never appear here -- flatten_schema_json already strips them, they're
+    reattached during post-processing (_normalize_nuextract_raw /
+    rehydrate_extraction_result), so no group needs to "own" them.
+
+    Returns None when the result would be a single group -- nothing to
+    parallelize, the caller keeps the existing one-call path unchanged.
+    """
+    properties = generation_schema.get("properties")
+    if not isinstance(properties, dict) or len(properties) < 2:
+        return None
+    list_fields = [
+        name
+        for name, spec in properties.items()
+        if isinstance(spec, dict) and _is_array_field(spec)
+    ]
+    other_fields = [name for name in properties if name not in list_fields]
+    groups: list[list[str]] = []
+    if other_fields:
+        groups.append(other_fields)
+    groups.extend([name] for name in list_fields)
+    if len(groups) < 2:
+        return None
+    return groups
+
+
+def _subset_schema(generation_schema: dict[str, Any], field_names: list[str]) -> dict[str, Any]:
+    """Narrow a flattened generation schema down to just ``field_names`` --
+    the per-group schema a split extraction's chat_json call is compiled
+    against. Keeps every other top-level schema key (additionalProperties,
+    type, ...) unchanged; only properties/required are subset."""
+    subset = {**generation_schema, "properties": {
+        name: generation_schema["properties"][name] for name in field_names
+    }}
+    required = generation_schema.get("required")
+    if isinstance(required, list):
+        subset["required"] = [name for name in required if name in field_names]
+    return subset
+
+
 class ExtractionService:
     def __init__(
         self,
@@ -279,6 +337,7 @@ class ExtractionService:
         language: str | None = None,
         document_hash: str | None = None,
         metadata: dict[str, str] | None = None,
+        parallel_extraction: bool = False,
     ) -> ExtractionResponse:
         blocks = (
             ocr_blocks
@@ -306,6 +365,7 @@ class ExtractionService:
             language=language,
             document_hash=document_hash,
             metadata=metadata or {},
+            parallel_extraction=parallel_extraction,
         )
 
     async def extract_from_file(
@@ -318,6 +378,7 @@ class ExtractionService:
         dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None = None,
         language: str | None = None,
         metadata: dict[str, str] | None = None,
+        parallel_extraction: bool = False,
     ) -> ExtractionResponse:
         # kind="ocr" (no extractor -- just OCR text as the "completion", per
         # serving.solutions.OcrSolution) is NOT handled here: it falls through
@@ -335,6 +396,7 @@ class ExtractionService:
                 dynamic_schema=dynamic_schema,
                 language=language,
                 metadata=metadata or {},
+                parallel_extraction=parallel_extraction,
             )
         if self.profile.vision:
             t0 = time.perf_counter()
@@ -362,6 +424,7 @@ class ExtractionService:
                 language=language,
                 document_hash=await asyncio.to_thread(hash_file, path),
                 metadata=metadata or {},
+                parallel_extraction=parallel_extraction,
             )
         if ocr_backend_name.lower().strip() == "vision":
             raise ValueError("ocr_backend='vision' requires a model profile with vision: true")
@@ -398,6 +461,7 @@ class ExtractionService:
             language=language,
             document_hash=ocr_result.artifact.document_hash,
             metadata=metadata or {},
+            parallel_extraction=parallel_extraction,
         )
 
     async def _extract_pipeline(
@@ -409,6 +473,7 @@ class ExtractionService:
         dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
         language: str | None,
         metadata: dict[str, str],
+        parallel_extraction: bool = False,
     ) -> ExtractionResponse:
         """kind="pipeline": OCR the document, then extract with the configured
         `options.extractor` profile -- the benchmark-side counterpart to
@@ -510,6 +575,7 @@ class ExtractionService:
             language=language,
             document_hash=document_hash,
             metadata=metadata,
+            parallel_extraction=parallel_extraction,
         )
         # Report as the pipeline profile the caller asked to benchmark, not
         # the inner extractor -- matches what predictions.jsonl/metrics key
@@ -589,50 +655,34 @@ class ExtractionService:
             text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
         return fix_mojibake(str(text or "")) or ""
 
-    async def _extract_blocks(
+    async def _extract_group(
         self,
         *,
+        field_names: list[str] | None,
+        generation_schema: dict[str, Any],
+        nuextract_template: dict[str, Any] | None,
         blocks: list[OCRBlock],
-        images: list[DocumentImage] | None = None,
+        images: list[DocumentImage] | None,
+        image_urls: list[str] | None,
         schema_name: str,
-        schema_mode: str,
-        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
         language: str | None,
-        document_hash: str | None,
         metadata: dict[str, str],
-    ) -> ExtractionResponse:
-        request_id = str(uuid.uuid4())
-        started = time.perf_counter()
-        dynamic_spec: DynamicSchemaSpec | None = None
-        model_cls = None
-        nuextract_template = None
-        if schema_mode == "dynamic":
-            if isinstance(dynamic_schema, DynamicSchemaSpec):
-                dynamic_spec = dynamic_schema
-            elif dynamic_schema is not None:
-                dynamic_spec = DynamicSchemaSpec.model_validate(dynamic_schema)
-            else:
-                if not blocks:
-                    raise ValueError(
-                        "Dynamic schema inference requires OCR text; supply a reusable "
-                        "dynamic_schema for vision-only extraction"
-                    )
-                dynamic_spec = await self._propose_schema(blocks=blocks, language=language)
-            schema_name = dynamic_spec.document_type
-            model_cls = DynamicTemplateBuilder.build_model(dynamic_spec)
-            schema = model_cls.model_json_schema()
-            nuextract_template = DynamicTemplateBuilder.build_nuextract_template(dynamic_spec)
-        elif schema_mode == "static":
-            if dynamic_schema is not None:
-                raise ValueError("dynamic_schema can only be supplied when schema_mode='dynamic'")
-            schema = schema_json(schema_name)
-        else:
-            raise ValueError("schema_mode must be 'static' or 'dynamic'")
-        # Keep two explicit contracts. The rich Pydantic schema is the internal
-        # validation/audit shape. The compact value schema is what the model
-        # sees and what structured decoders compile; the rich schema contains
-        # regexes and wrapper defaults that llama.cpp cannot turn into GBNF.
-        generation_schema = flatten_schema_json(schema)
+        want_logprobs: bool,
+    ) -> tuple[
+        dict[str, Any], dict[str, Any] | None, str | None, int | None, dict[str, float | None]
+    ]:
+        """Run one chat_json call over ``generation_schema`` -- the unit of
+        work fanned out across a split extraction's groups (design #444), or
+        called once directly for an unsplit one. ``field_names=None`` marks
+        the unsplit path (every field, streaming allowed); a split call's
+        caller has already narrowed ``generation_schema``/``nuextract_template``
+        to just its group's fields (see _split_schema_into_groups /
+        _subset_schema) -- nothing here re-derives the split.
+
+        Returns (raw, usage_dict, effective_style, queue_wait_ms,
+        field_confidences) -- everything _extract_blocks needs to merge
+        across groups without this method knowing whether it's one of many.
+        """
         if self.profile.prompt_profile == "nuextract3":
             # NuExtract3 gets the template out-of-band via chat_template_kwargs
             # (the `nuextract3` response style), so the prompt carries only the
@@ -667,19 +717,14 @@ class ExtractionService:
                 language=language,
                 metadata=metadata,
             )
-        # Opt-in (#335): llama.cpp-only per-token logprob confidence. Both the
-        # request flag AND the declared runtime must agree -- an unlabeled or
-        # non-llama.cpp profile never gets `logprobs` on the wire, regardless
-        # of the flag (see ModelProfile.runtime/.logprob_confidence).
-        want_logprobs = self.profile.logprob_confidence and self.profile.runtime == "llamacpp"
         client = OpenAICompatibleClient(self.profile)
         # build_response_format's own "nuextract3" branch resolves a template
         # PURELY from schema_name, via a static lookup (llm.prompts._NUEXTRACT_TEMPLATES)
         # that only ever knew about the built-in schemas -- a dynamic schema's
-        # freshly-built nuextract_template (line ~608 above) never reached it,
-        # so every dynamic-schema extraction through nuextract3 silently sent
-        # an EMPTY template (nothing to extract -> every field comes back
-        # null). chat_json's chat_template_kwargs is MERGED on top of
+        # freshly-built nuextract_template never reached it, so every
+        # dynamic-schema extraction through nuextract3 silently sent an EMPTY
+        # template (nothing to extract -> every field comes back null).
+        # chat_json's chat_template_kwargs is MERGED on top of
         # build_response_format's own extra_body (see build_payload), so
         # overriding "template" here for this one case is enough -- the
         # static-schema path (nuextract_template is None) is untouched.
@@ -690,7 +735,6 @@ class ExtractionService:
             extra_template_kwargs["template"] = json.dumps(
                 nuextract_template, ensure_ascii=False
             )
-        image_urls = await asyncio.to_thread(_data_urls, images) if images else None
         try:
             raw, usage_dict, raw_response = await client.chat_json(
                 system_prompt=system_prompt,
@@ -711,8 +755,14 @@ class ExtractionService:
                     else None
                 ),
                 request_logprobs=want_logprobs,
-                on_delta=self.on_delta,
-                on_reset=self.on_reset,
+                # A split extraction's groups run concurrently -- N interleaved
+                # streams would garble one live preview, so streaming only
+                # ever wires up on the unsplit path (field_names is None);
+                # _extract_blocks itself also refuses to split when a
+                # streaming callback is present, so this is a second,
+                # independent guard, not the only one.
+                on_delta=self.on_delta if field_names is None else None,
+                on_reset=self.on_reset if field_names is None else None,
             )
             effective_style = getattr(client, "last_response_format_style", None)
             queue_wait_ms = getattr(client, "last_queue_wait_ms", None)
@@ -720,13 +770,147 @@ class ExtractionService:
             await client.aclose()
         # Snapshot BEFORE any reshaping: `raw` here is exactly the FLAT dict
         # the model generated (matches `generation_schema`'s unwrapped shape),
-        # which is what field-value substrings must be located against. Both
-        # NuExtract normalization and schema rehydration below rebuild new
-        # dicts rather than mutating `raw` in place, so this reference stays
-        # untouched by them.
+        # which is what field-value substrings must be located against.
         field_confidences: dict[str, float | None] = (
             compute_field_confidences(raw, raw_response) if want_logprobs else {}
         )
+        return raw, usage_dict, effective_style, queue_wait_ms, field_confidences
+
+    async def _extract_blocks(
+        self,
+        *,
+        blocks: list[OCRBlock],
+        images: list[DocumentImage] | None = None,
+        schema_name: str,
+        schema_mode: str,
+        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
+        language: str | None,
+        document_hash: str | None,
+        metadata: dict[str, str],
+        parallel_extraction: bool = False,
+    ) -> ExtractionResponse:
+        request_id = str(uuid.uuid4())
+        started = time.perf_counter()
+        dynamic_spec: DynamicSchemaSpec | None = None
+        model_cls = None
+        nuextract_template = None
+        if schema_mode == "dynamic":
+            if isinstance(dynamic_schema, DynamicSchemaSpec):
+                dynamic_spec = dynamic_schema
+            elif dynamic_schema is not None:
+                dynamic_spec = DynamicSchemaSpec.model_validate(dynamic_schema)
+            else:
+                if not blocks:
+                    raise ValueError(
+                        "Dynamic schema inference requires OCR text; supply a reusable "
+                        "dynamic_schema for vision-only extraction"
+                    )
+                dynamic_spec = await self._propose_schema(blocks=blocks, language=language)
+            schema_name = dynamic_spec.document_type
+            model_cls = DynamicTemplateBuilder.build_model(dynamic_spec)
+            schema = model_cls.model_json_schema()
+            nuextract_template = DynamicTemplateBuilder.build_nuextract_template(dynamic_spec)
+        elif schema_mode == "static":
+            if dynamic_schema is not None:
+                raise ValueError("dynamic_schema can only be supplied when schema_mode='dynamic'")
+            schema = schema_json(schema_name)
+        else:
+            raise ValueError("schema_mode must be 'static' or 'dynamic'")
+        # Keep two explicit contracts. The rich Pydantic schema is the internal
+        # validation/audit shape. The compact value schema is what the model
+        # sees and what structured decoders compile; the rich schema contains
+        # regexes and wrapper defaults that llama.cpp cannot turn into GBNF.
+        generation_schema = flatten_schema_json(schema)
+        # Opt-in (#335): llama.cpp-only per-token logprob confidence. Both the
+        # request flag AND the declared runtime must agree -- an unlabeled or
+        # non-llama.cpp profile never gets `logprobs` on the wire, regardless
+        # of the flag (see ModelProfile.runtime/.logprob_confidence).
+        want_logprobs = self.profile.logprob_confidence and self.profile.runtime == "llamacpp"
+        image_urls = await asyncio.to_thread(_data_urls, images) if images else None
+
+        # Design #444: split a schema's list-typed top-level fields into
+        # independent groups and fan them out concurrently, each through the
+        # SAME gateway semaphore (no new limiter). Opt-in per request
+        # (parallel_extraction) -- most real schemas have a list field, so an
+        # always-on split would silently change the call pattern (and
+        # benchmark timing) for nearly every extraction. Streaming also
+        # forces the unsplit path -- N concurrent groups would interleave
+        # into one garbled live preview.
+        groups = (
+            None
+            if not parallel_extraction or self.on_delta is not None or self.on_reset is not None
+            else _split_schema_into_groups(generation_schema)
+        )
+        if groups is None:
+            raw, usage_dict, effective_style, queue_wait_ms, field_confidences = (
+                await self._extract_group(
+                    field_names=None,
+                    generation_schema=generation_schema,
+                    nuextract_template=nuextract_template,
+                    blocks=blocks,
+                    images=images,
+                    image_urls=image_urls,
+                    schema_name=schema_name,
+                    language=language,
+                    metadata=metadata,
+                    want_logprobs=want_logprobs,
+                )
+            )
+        else:
+
+            async def _run_group(
+                field_names: list[str],
+            ) -> tuple[
+                dict[str, Any], dict[str, Any] | None, str | None, int | None,
+                dict[str, float | None],
+            ]:
+                return await self._extract_group(
+                    field_names=field_names,
+                    generation_schema=_subset_schema(generation_schema, field_names),
+                    nuextract_template=(
+                        {k: v for k, v in nuextract_template.items() if k in field_names}
+                        if nuextract_template is not None
+                        else None
+                    ),
+                    blocks=blocks,
+                    images=images,
+                    image_urls=image_urls,
+                    schema_name=schema_name,
+                    language=language,
+                    metadata=metadata,
+                    want_logprobs=want_logprobs,
+                )
+
+            # TaskGroup, not gather: any group failing cancels its siblings
+            # and raises -- a split extraction fails as a whole, same
+            # all-or-nothing contract the single-call path already had.
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(_run_group(group)) for group in groups]
+            group_results = [task.result() for task in tasks]
+
+            raw = {}
+            field_confidences = {}
+            effective_style = None
+            usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            usage_seen = False
+            queue_waits: list[int] = []
+            for group_raw, group_usage, group_style, group_wait, group_conf in group_results:
+                raw.update(group_raw)
+                field_confidences.update(group_conf)
+                if effective_style is None:
+                    effective_style = group_style
+                if group_wait is not None:
+                    queue_waits.append(group_wait)
+                if isinstance(group_usage, dict):
+                    usage_seen = True
+                    for key in usage_totals:
+                        usage_totals[key] += group_usage.get(key) or 0
+            usage_dict = usage_totals if usage_seen else None
+            # Groups run concurrently -- their waits overlap, so the total
+            # queued time a caller actually experienced is the LONGEST one
+            # waited, not the sum (summing would double-count overlapping time).
+            queue_wait_ms = max(queue_waits) if queue_waits else None
+
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
