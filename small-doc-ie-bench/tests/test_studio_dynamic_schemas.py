@@ -168,6 +168,114 @@ def test_extraction_with_unknown_dynamic_schema_name_raises(
         )
 
 
+# ---------------------------------------------------------------------------
+# #462: "test this schema" -- an UNSAVED candidate spec run through the exact
+# same extraction path inline, nothing written to the registry.
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_accepts_an_inline_unsaved_dynamic_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from docie_bench.inngest import functions
+    from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation
+
+    captured: dict = {}
+
+    class _FakeService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def extract_from_text(self, **kwargs) -> ExtractionResponse:
+            captured.update(kwargs)
+            return ExtractionResponse(
+                request_id="req-1",
+                schema_name="invoice_draft",
+                model_profile="test-profile",
+                document_hash="deadbeef",
+                result={},
+                validation=ExtractionValidation(valid=True, errors=[], warnings=[]),
+                latency_ms=1,
+            )
+
+    monkeypatch.setattr(functions, "ExtractionService", _FakeService)
+    monkeypatch.setattr("docie_bench.storage.audit.save_extraction_audit", lambda *a, **k: None)
+
+    result = asyncio.run(
+        functions._run_extraction(
+            {
+                "text": "some text",
+                "tenant_id": "t1",
+                "dynamic_schema": _payload("invoice_draft"),
+            }
+        )
+    )
+
+    assert result["schema_name"] == "invoice_draft"
+    assert captured["schema_mode"] == "dynamic"
+    assert captured["dynamic_schema"]["document_type"] == "invoice_draft"
+    assert captured["schema_name"] == "invoice_draft"
+
+
+def test_inline_dynamic_schema_wins_over_a_schema_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller testing an edited-but-unsaved schema must see the EDITED
+    version, not whatever happens to already be saved under the same name."""
+    from docie_bench.inngest import functions
+    from docie_bench.schemas.common import ExtractionResponse, ExtractionValidation
+
+    captured: dict = {}
+
+    class _FakeService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def extract_from_text(self, **kwargs) -> ExtractionResponse:
+            captured.update(kwargs)
+            return ExtractionResponse(
+                request_id="req-1",
+                schema_name="invoice_custom",
+                model_profile="test-profile",
+                document_hash="deadbeef",
+                result={},
+                validation=ExtractionValidation(valid=True, errors=[], warnings=[]),
+                latency_ms=1,
+            )
+
+    monkeypatch.setattr(functions, "ExtractionService", _FakeService)
+    monkeypatch.setattr("docie_bench.storage.audit.save_extraction_audit", lambda *a, **k: None)
+
+    edited_spec = _payload("invoice_custom")
+    edited_spec["fields"].append({"name": "notes", "type": "string"})
+
+    asyncio.run(
+        functions._run_extraction(
+            {
+                "text": "some text",
+                "tenant_id": "t1",
+                "dynamic_schema_name": "invoice_custom",
+                "dynamic_schema": edited_spec,
+            }
+        )
+    )
+
+    field_names = {f["name"] for f in captured["dynamic_schema"]["fields"]}
+    assert "notes" in field_names
+
+
+def test_trigger_extract_rejects_an_invalid_inline_dynamic_schema(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/studio/extract",
+        json={
+            "text": "some text",
+            "dynamic_schema": {"document_type": "Not Snake Case", "fields": []},
+        },
+    )
+
+    assert resp.status_code == 422
+
+
 def test_edits_saved_schema_and_compiles_variable_nested_lists(client: TestClient) -> None:
     from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 

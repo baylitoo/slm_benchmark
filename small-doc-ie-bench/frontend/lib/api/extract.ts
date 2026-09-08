@@ -23,6 +23,10 @@ export interface ExtractRequest {
    * schema_name when present -- the backend resolves the spec by name and
    * runs the extraction in schema_mode="dynamic". */
   dynamic_schema_name?: string;
+  /** A schema the caller hasn't saved yet -- a full DynamicSchemaSpec object,
+   * run through the exact same extraction path with nothing written to the
+   * dynamic_schemas registry. Wins over dynamic_schema_name. */
+  dynamic_schema?: Record<string, unknown>;
   /** Free-text models.yaml/CLI profile name. Retained for back-compat. */
   model_profile?: string;
   /**

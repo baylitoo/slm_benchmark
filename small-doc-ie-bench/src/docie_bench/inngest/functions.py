@@ -435,8 +435,18 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     schema_name = data.get("schema_name", "invoice")
     schema_mode = "static"
     dynamic_schema: dict[str, Any] | None = None
+    inline_dynamic_schema = data.get("dynamic_schema")
     dynamic_schema_name = data.get("dynamic_schema_name")
-    if dynamic_schema_name:
+    if inline_dynamic_schema:
+        # #462: a schema the caller hasn't (or won't) save yet -- the Studio's
+        # "test this schema" action posts the candidate spec straight through
+        # here instead of round-tripping it via POST /schemas/dynamic first.
+        # Nothing is written to the dynamic_schemas registry; this spec lives
+        # for exactly this one job.
+        schema_mode = "dynamic"
+        dynamic_schema = inline_dynamic_schema
+        schema_name = str(inline_dynamic_schema.get("document_type") or schema_name)
+    elif dynamic_schema_name:
         # ExtractionService already accepts schema_mode="dynamic" + an inline
         # spec (extract/service.py) -- resolve the saved spec by name here so
         # the caller doesn't have to supply the full field list every request.

@@ -27,6 +27,11 @@ class ExtractRequest(BaseModel):
     # dynamic_schema inline (extract/service.py), this just resolves the spec
     # by name server-side instead of requiring the full field list every call.
     dynamic_schema_name: str | None = None
+    # #462: a schema the caller hasn't saved yet -- a full DynamicSchemaSpec
+    # dict, run through the exact same extraction path with NOTHING written
+    # to the dynamic_schemas registry. Wins over dynamic_schema_name (the
+    # Studio's "test this schema" action always sends this, never a name).
+    dynamic_schema: dict[str, Any] | None = None
     # Explicit live-deployment selector (a DeploymentRecord ``spec.name``). Wins
     # over ``model_profile``; forwarded verbatim into the event data (auto-included
     # by ``model_dump(exclude_none=True)`` below) for the worker's resolver.
@@ -49,6 +54,19 @@ async def trigger_extract(
 ) -> _shared.TriggerResponse:
     if not payload.text and not payload.content_b64:
         raise HTTPException(status_code=422, detail="Provide either 'text' or 'content_b64'")
+    if payload.dynamic_schema is not None:
+        # Fail fast at the API edge: an invalid candidate schema should be a
+        # 422 NOW, not a failed Inngest run discovered by polling -- the whole
+        # point of a "test this schema" action is a fast, clear signal on a
+        # schema the caller is actively iterating on and hasn't saved yet.
+        from pydantic import ValidationError
+
+        from docie_bench.schemas.dynamic import DynamicSchemaSpec
+
+        try:
+            DynamicSchemaSpec.model_validate(payload.dynamic_schema)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     if payload.routing_policy:
         # Fail fast at the API edge: a bad selector should be a 4xx NOW, not a
         # failed Inngest run the caller only discovers by polling. The worker
