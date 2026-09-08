@@ -1266,6 +1266,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     batch_size = int(raw_batch_size) if raw_batch_size is not None else None
     raw_ubatch_size = data.get("ubatch_size")
     ubatch_size = int(raw_ubatch_size) if raw_ubatch_size is not None else None
+    raw_numa = data.get("numa")
+    numa = str(raw_numa) if raw_numa else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1280,6 +1282,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             chat_template_file=chat_template_file,
             batch_size=batch_size,
             ubatch_size=ubatch_size,
+            numa=numa,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1307,6 +1310,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             chat_template_file=chat_template_file,
             batch_size=batch_size,
             ubatch_size=ubatch_size,
+            numa=numa,
         )
     return record
 

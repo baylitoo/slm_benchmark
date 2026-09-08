@@ -30,6 +30,7 @@ import {
   Card,
   EmptyState,
   Field,
+  Select,
   Skeleton,
   TextInput,
   ComingSoon,
@@ -74,6 +75,7 @@ export function DeployForm({
   const [nParallel, setNParallel] = useState("1");
   const [batchSize, setBatchSize] = useState("");
   const [ubatchSize, setUbatchSize] = useState("");
+  const [numa, setNuma] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -150,6 +152,7 @@ export function DeployForm({
         ...(showNParallel && Number(nParallel) > 1 ? { n_parallel: Number(nParallel) } : {}),
         ...(showNParallel && batchSize.trim() ? { batch_size: Number(batchSize) } : {}),
         ...(showNParallel && ubatchSize.trim() ? { ubatch_size: Number(ubatchSize) } : {}),
+        ...(showNParallel && numa ? { numa } : {}),
       };
       const res = await deployModel(payload);
       setTrigger(res);
@@ -357,6 +360,16 @@ export function DeployForm({
                       placeholder="512"
                       aria-label="Micro-batch size"
                     />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="NUMA strategy" hint="--numa. Multi-socket CPU boxes only.">
+                    <Select value={numa} onChange={(e) => setNuma(e.target.value)} aria-label="NUMA strategy">
+                      <option value="">default</option>
+                      <option value="distribute">distribute</option>
+                      <option value="isolate">isolate</option>
+                      <option value="numactl">numactl</option>
+                    </Select>
                   </Field>
                 )}
               </div>

@@ -858,6 +858,7 @@ class ScaleRequest(BaseModel):
     chat_template_file: str | None = None
     batch_size: int | None = Field(default=None, ge=1)
     ubatch_size: int | None = Field(default=None, ge=1)
+    numa: str | None = None
 
 
 @router.post("/store/{name}/scale")
@@ -922,6 +923,8 @@ async def scale_store_model(
                 data["batch_size"] = request.batch_size
             if request.ubatch_size is not None:
                 data["ubatch_size"] = request.ubatch_size
+            if request.numa is not None:
+                data["numa"] = request.numa
             ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
             event_ids.extend(ids)
         return {
