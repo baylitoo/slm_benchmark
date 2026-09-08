@@ -93,6 +93,8 @@ class RuntimeLaunchSpec:
     cpu_threads: int | None = None
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float | None = None
+    batch_size: int | None = None
+    ubatch_size: int | None = None
     api_key_env: str | None = None
     extra_args: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
@@ -156,6 +158,10 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("tensor_parallel_size must be positive")
         if self.gpu_memory_utilization is not None and not (0 < self.gpu_memory_utilization <= 1):
             raise RuntimeConfigurationError("gpu_memory_utilization must be in (0, 1]")
+        if self.batch_size is not None and self.batch_size < 1:
+            raise RuntimeConfigurationError("batch_size must be positive")
+        if self.ubatch_size is not None and self.ubatch_size < 1:
+            raise RuntimeConfigurationError("ubatch_size must be positive")
         if any("\x00" in value for value in self.extra_args):
             raise RuntimeConfigurationError("extra_args must not contain NUL bytes")
         if any("\x00" in key or "\x00" in value for key, value in self.env.items()):
@@ -800,6 +806,10 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--threads", str(spec.cpu_threads)])
         if spec.cache_reuse is not None:
             command.extend(["--cache-reuse", str(spec.cache_reuse)])
+        if spec.batch_size is not None:
+            command.extend(["--batch-size", str(spec.batch_size)])
+        if spec.ubatch_size is not None:
+            command.extend(["--ubatch-size", str(spec.ubatch_size)])
         command.extend(spec.extra_args)
         return tuple(command)
 

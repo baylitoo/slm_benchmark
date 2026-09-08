@@ -856,6 +856,8 @@ class ScaleRequest(BaseModel):
     n_parallel: int = Field(default=1, ge=1, le=32)
     cache_reuse: int | None = Field(default=None, ge=1)
     chat_template_file: str | None = None
+    batch_size: int | None = Field(default=None, ge=1)
+    ubatch_size: int | None = Field(default=None, ge=1)
 
 
 @router.post("/store/{name}/scale")
@@ -916,6 +918,10 @@ async def scale_store_model(
                 data["cache_reuse"] = request.cache_reuse
             if request.chat_template_file is not None:
                 data["chat_template_file"] = request.chat_template_file
+            if request.batch_size is not None:
+                data["batch_size"] = request.batch_size
+            if request.ubatch_size is not None:
+                data["ubatch_size"] = request.ubatch_size
             ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
             event_ids.extend(ids)
         return {
