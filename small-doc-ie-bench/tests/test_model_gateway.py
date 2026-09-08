@@ -415,6 +415,36 @@ async def test_last_queue_wait_ms_reflects_actual_semaphore_wait() -> None:
     assert second.last_queue_wait_ms >= 40
 
 
+def test_state_for_warns_once_when_max_concurrency_exceeds_observed_slots(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from docie_bench.llm.model_gateway import _state_for
+
+    profile = _profile(max_concurrency=4, deployment_slot_count=1)
+
+    with caplog.at_level("WARNING"):
+        _state_for(profile)
+        _state_for(profile)  # second call reuses the cached state -- no re-warn
+
+    warnings = [r for r in caplog.records if "real slot" in r.message]
+    assert len(warnings) == 1
+    assert profile.name in warnings[0].message
+
+
+def test_state_for_does_not_warn_when_slots_are_unobserved_or_sufficient(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from docie_bench.llm.model_gateway import _state_for
+
+    with caplog.at_level("WARNING"):
+        _state_for(_profile(name="unobserved", max_concurrency=4, deployment_slot_count=None))
+        _state_for(
+            _profile(name="sufficient", model="sufficient", max_concurrency=4, deployment_slot_count=4)
+        )
+
+    assert not [r for r in caplog.records if "real slot" in r.message]
+
+
 def test_model_profile_loads_gateway_controls(tmp_path: Path) -> None:
     config = tmp_path / "models.yaml"
     config.write_text(

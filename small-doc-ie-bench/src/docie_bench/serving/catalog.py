@@ -140,6 +140,13 @@ class ModelPlacement(Base):
         DateTime(timezone=True), nullable=True
     )
     throughput_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The real number of llama-server processing slots observed via GET
+    # /slots (HealthResult.slot_count) -- NOT the --parallel launch value,
+    # which can drift from what a manually-restarted process actually runs
+    # with. NULL means "not live" or "undetermined" (a non-llamacpp engine,
+    # an unhealthy deployment, --no-slots, an older build). Feeds the
+    # concurrency-mismatch warning in model_gateway._state_for.
+    slot_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -322,6 +329,7 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     ("ttft_ms", Float()),
     ("throughput_measured_at", DateTime(timezone=True)),
     ("throughput_source", String(32)),
+    ("slot_count", Integer()),
 )
 
 
@@ -508,6 +516,7 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
             row.throughput_measured_at.isoformat() if row.throughput_measured_at else None
         ),
         "throughput_source": row.throughput_source,
+        "slot_count": row.slot_count,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
@@ -764,6 +773,7 @@ class ModelCatalog:
         ttft_ms: float | None = None,
         throughput_measured_at: dt.datetime | None = None,
         throughput_source: str | None = None,
+        slot_count: int | None = None,
     ) -> dict[str, Any]:
         """Publish one reconciler observation (the reconciler is the sole caller).
 
@@ -818,6 +828,7 @@ class ModelCatalog:
             row.ttft_ms = ttft_ms
             row.throughput_measured_at = throughput_measured_at
             row.throughput_source = throughput_source
+            row.slot_count = slot_count
             session.flush()
             return _placement_view(row)
 
