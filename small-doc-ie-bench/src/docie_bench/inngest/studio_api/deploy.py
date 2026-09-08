@@ -48,6 +48,8 @@ class DeployRequest(BaseModel):
     # reachable inside the serving container). Existence is the caller's
     # responsibility, same as `model` itself.
     chat_template_file: str | None = None
+    batch_size: int | None = Field(default=None, ge=1)
+    ubatch_size: int | None = Field(default=None, ge=1)
 
 
 async def _trigger_replicated_deploy(
@@ -109,6 +111,10 @@ async def _trigger_replicated_deploy(
             data["cache_reuse"] = payload.cache_reuse
         if payload.chat_template_file is not None:
             data["chat_template_file"] = payload.chat_template_file
+        if payload.batch_size is not None:
+            data["batch_size"] = payload.batch_size
+        if payload.ubatch_size is not None:
+            data["ubatch_size"] = payload.ubatch_size
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )

@@ -72,6 +72,8 @@ export function DeployForm({
   // shown for Auto (which resolves to llama.cpp for GGUF store models) and
   // for an explicit "llamacpp" runtime pick, never for vllm/ollama/remote.
   const [nParallel, setNParallel] = useState("1");
+  const [batchSize, setBatchSize] = useState("");
+  const [ubatchSize, setUbatchSize] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -146,6 +148,8 @@ export function DeployForm({
         ...(maxTokens.trim() ? { max_tokens: Number(maxTokens) } : {}),
         ...(replicaCount > 1 ? { replicas: replicaCount } : {}),
         ...(showNParallel && Number(nParallel) > 1 ? { n_parallel: Number(nParallel) } : {}),
+        ...(showNParallel && batchSize.trim() ? { batch_size: Number(batchSize) } : {}),
+        ...(showNParallel && ubatchSize.trim() ? { ubatch_size: Number(ubatchSize) } : {}),
       };
       const res = await deployModel(payload);
       setTrigger(res);
@@ -328,6 +332,30 @@ export function DeployForm({
                       onChange={(e) => setNParallel(e.target.value)}
                       placeholder="1"
                       aria-label="Parallel slots"
+                    />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Batch size" hint="--batch-size (logical prefill batch).">
+                    <TextInput
+                      type="number"
+                      min={1}
+                      value={batchSize}
+                      onChange={(e) => setBatchSize(e.target.value)}
+                      placeholder="2048"
+                      aria-label="Batch size"
+                    />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Micro-batch size" hint="--ubatch-size (physical batch).">
+                    <TextInput
+                      type="number"
+                      min={1}
+                      value={ubatchSize}
+                      onChange={(e) => setUbatchSize(e.target.value)}
+                      placeholder="512"
+                      aria-label="Micro-batch size"
                     />
                   </Field>
                 )}
