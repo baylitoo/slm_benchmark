@@ -265,6 +265,7 @@ def _synthesize_profile(
             base_url=base_url,
             kind="passthrough",
             max_tokens=launch.max_tokens or match.max_tokens,
+            deployment_slot_count=launch.n_parallel,
         )
 
     traits = _family_traits(record.spec.name)
@@ -286,6 +287,7 @@ def _synthesize_profile(
         temperature=traits.temperature,
         max_tokens=launch.max_tokens or traits.max_tokens,
         timeout_seconds=traits.timeout_seconds,
+        deployment_slot_count=launch.n_parallel,
     )
 
 

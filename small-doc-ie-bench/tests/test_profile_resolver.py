@@ -634,3 +634,22 @@ def test_activity_recording_hiccup_never_breaks_resolution(
         deployment="resilient", models_config_path=models_config, deployments=[record]
     )
     assert profile.model == "resilient"
+
+
+def test_bare_deployment_name_carries_declared_slot_count(models_config: Path) -> None:
+    from dataclasses import replace
+
+    record = _record(
+        name="lfm2.5-2.6b",
+        runtime=RuntimeKind.LLAMACPP,
+        model="/app/.serving/models/lfm2.5-2.6b/model.gguf",
+        alias="lfm2.5-2.6b",
+    )
+    launch = replace(record.spec.launch, n_parallel=3)
+    record = replace(record, spec=replace(record.spec, launch=launch))
+
+    profile = resolve_extraction_profile(
+        model_profile="lfm2.5-2.6b", models_config_path=models_config, deployments=[record]
+    )
+
+    assert profile.deployment_slot_count == 3

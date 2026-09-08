@@ -467,6 +467,11 @@ class ModelGateway:
     def _classify_exception(self, exc: Exception) -> ModelGatewayError:
         if isinstance(exc, ModelGatewayError):
             return exc
+        if isinstance(exc, httpx.ReadTimeout):
+            return ModelGatewayError(
+                f"Model did not finish within timeout_seconds; not retried (a retry would "
+                f"queue a duplicate prompt behind the still-running one): {exc}"
+            )
         if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
             return TransientModelError(f"Model endpoint transport failure: {exc}")
         return ModelGatewayError(f"Model gateway operation failed: {exc}")
