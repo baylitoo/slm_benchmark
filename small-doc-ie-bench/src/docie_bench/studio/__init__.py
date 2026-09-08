@@ -19,7 +19,9 @@ from __future__ import annotations
 from docie_bench.studio.models import StudioRun, StudioRunArtifact
 from docie_bench.studio.store import (
     ArtifactBlobStore,
+    BlobStoreBackend,
     RunStore,
+    S3ArtifactBlobStore,
     StoredBlob,
     default_blob_store,
     default_run_store,
@@ -27,7 +29,9 @@ from docie_bench.studio.store import (
 
 __all__ = [
     "ArtifactBlobStore",
+    "BlobStoreBackend",
     "RunStore",
+    "S3ArtifactBlobStore",
     "StoredBlob",
     "StudioRun",
     "StudioRunArtifact",

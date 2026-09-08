@@ -113,10 +113,18 @@ A benchmark job runs on the **worker**, whose local filesystem the `api`/`web`
 replicas cannot read. So a run's results are made *addressable* rather than
 returned as worker-local paths:
 
-- **Blob store** (`ArtifactBlobStore`) — a content-addressed directory on the
-  shared `artifact-store` volume (`ARTIFACT_STORE_DIR`, default `/app/artifacts`;
-  swap for an S3/MinIO mount). The worker writes `report.html`,
-  `predictions.jsonl` and `metrics.json` here; the api reads them back by id.
+- **Blob store** (`BlobStoreBackend`, selected by `ARTIFACT_STORE_BACKEND`) —
+  content-addressed; the worker writes `report.html`, `predictions.jsonl` and
+  `metrics.json` here, the api reads them back by id.
+  - `filesystem` (default, `ArtifactBlobStore`): a directory on the shared
+    `artifact-store` volume (`ARTIFACT_STORE_DIR`, default `/app/artifacts`),
+    which must resolve to the same location on every replica.
+  - `s3` (`S3ArtifactBlobStore`): objects in an S3-compatible bucket (AWS S3 or
+    MinIO via `ARTIFACT_STORE_S3_ENDPOINT_URL`; optional
+    `ARTIFACT_STORE_S3_PREFIX`, bucket via `ARTIFACT_STORE_S3_BUCKET`) — no
+    shared volume needed for multi-replica deployments. Credentials come from
+    the standard AWS env chain; requires the optional extra
+    `pip install 'small-doc-ie-bench[s3]'`.
 - **Run index** (`studio_runs` / `studio_run_artifacts` in Postgres) — one row
   per run keyed by the Inngest `event_id`, holding `{status, metrics summary,
   artifact URIs, tenant_id}`. The **large `predictions.jsonl` never lands in
