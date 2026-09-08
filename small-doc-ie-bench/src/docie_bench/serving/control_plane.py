@@ -235,6 +235,7 @@ class Supervisor(Protocol):
         cache_type_v: str | None = None,
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -256,6 +257,7 @@ class Supervisor(Protocol):
         cache_type_v: str | None = None,
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -408,6 +410,7 @@ class ControlPlane:
         cache_type_v: str | None = None,
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -447,6 +450,8 @@ class ControlPlane:
             kwargs["reasoning_budget"] = reasoning_budget
         if reasoning_budget_message is not None:
             kwargs["reasoning_budget_message"] = reasoning_budget_message
+        if flash_attn is not None:
+            kwargs["flash_attn"] = flash_attn
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -474,6 +479,7 @@ class ControlPlane:
         cache_type_v: str | None = None,
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -513,6 +519,8 @@ class ControlPlane:
             kwargs["reasoning_budget"] = reasoning_budget
         if reasoning_budget_message is not None:
             kwargs["reasoning_budget_message"] = reasoning_budget_message
+        if flash_attn is not None:
+            kwargs["flash_attn"] = flash_attn
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -953,6 +961,7 @@ class _DefaultSupervisor:
         cache_type_v: str | None = None,
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -989,6 +998,7 @@ class _DefaultSupervisor:
                     cache_type_v=cache_type_v,
                     reasoning_budget=reasoning_budget,
                     reasoning_budget_message=reasoning_budget_message,
+                    flash_attn=flash_attn,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -1020,6 +1030,7 @@ class _DefaultSupervisor:
                     cache_type_v=cache_type_v,
                     reasoning_budget=reasoning_budget,
                     reasoning_budget_message=reasoning_budget_message,
+                    flash_attn=flash_attn,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -1061,6 +1072,7 @@ class _DefaultSupervisor:
         cache_type_v: str | None = None,
         reasoning_budget: int | None = None,
         reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -1148,6 +1160,7 @@ class _DefaultSupervisor:
                     cache_type_v=cache_type_v,
                     reasoning_budget=reasoning_budget,
                     reasoning_budget_message=reasoning_budget_message,
+                    flash_attn=flash_attn,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,

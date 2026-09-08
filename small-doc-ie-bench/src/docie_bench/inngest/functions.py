@@ -1282,6 +1282,8 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     reasoning_budget_message = (
         str(raw_reasoning_budget_message) if raw_reasoning_budget_message else None
     )
+    raw_flash_attn = data.get("flash_attn")
+    flash_attn = str(raw_flash_attn) if raw_flash_attn else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1303,6 +1305,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             cache_type_v=cache_type_v,
             reasoning_budget=reasoning_budget,
             reasoning_budget_message=reasoning_budget_message,
+            flash_attn=flash_attn,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1337,6 +1340,7 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             cache_type_v=cache_type_v,
             reasoning_budget=reasoning_budget,
             reasoning_budget_message=reasoning_budget_message,
+            flash_attn=flash_attn,
         )
     return record
 

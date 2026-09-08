@@ -72,6 +72,7 @@ _LLAMACPP_CACHE_TYPES = frozenset(
     {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 )
 _LLAMACPP_NUMA_MODES = frozenset({"distribute", "isolate", "numactl"})
+_LLAMACPP_FLASH_ATTN_MODES = frozenset({"on", "off", "auto"})
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,7 @@ class RuntimeLaunchSpec:
     # reasoning_budget; validated together below.
     reasoning_budget_message: str | None = None
     numa: str | None = None
+    flash_attn: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -201,6 +203,17 @@ class RuntimeLaunchSpec:
         if self.numa is not None and self.numa not in _LLAMACPP_NUMA_MODES:
             raise RuntimeConfigurationError(
                 f"numa must be one of {sorted(_LLAMACPP_NUMA_MODES)}"
+            )
+        if self.flash_attn is not None and self.flash_attn not in _LLAMACPP_FLASH_ATTN_MODES:
+            raise RuntimeConfigurationError(
+                f"flash_attn must be one of {sorted(_LLAMACPP_FLASH_ATTN_MODES)}"
+            )
+        kv_quantized = (
+            self.cache_type_k not in (None, "f16") or self.cache_type_v not in (None, "f16")
+        )
+        if self.flash_attn == "off" and kv_quantized:
+            raise RuntimeConfigurationError(
+                "flash_attn='off' disables quantized KV cache; use f16 or flash_attn on/auto"
             )
 
 
@@ -794,7 +807,12 @@ class LlamaCppRuntime(RuntimeAdapter):
         # Forced on automatically rather than left to the operator to
         # separately remember (or to llama-server's own "auto" default,
         # which isn't guaranteed to enable it on every backend).
-        if spec.cache_type_k not in (None, "f16") or spec.cache_type_v not in (None, "f16"):
+        kv_quantized = (
+            spec.cache_type_k not in (None, "f16") or spec.cache_type_v not in (None, "f16")
+        )
+        if spec.flash_attn is not None:
+            command.extend(["--flash-attn", spec.flash_attn])
+        elif kv_quantized:
             command.extend(["--flash-attn", "on"])
         if spec.reasoning_budget is not None:
             command.extend(["--reasoning-budget", str(spec.reasoning_budget)])

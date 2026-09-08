@@ -84,6 +84,7 @@ export function DeployForm({
   const [cacheTypeV, setCacheTypeV] = useState("");
   const [reasoningBudget, setReasoningBudget] = useState("");
   const [reasoningBudgetMessage, setReasoningBudgetMessage] = useState("");
+  const [flashAttn, setFlashAttn] = useState("");
   const [cpuThreads, setCpuThreads] = useState("");
   const [cpuThreadsBatch, setCpuThreadsBatch] = useState("");
 
@@ -171,6 +172,7 @@ export function DeployForm({
         ...(showNParallel && reasoningBudget.trim() && reasoningBudgetMessage.trim()
           ? { reasoning_budget_message: reasoningBudgetMessage.trim() }
           : {}),
+        ...(showNParallel && flashAttn ? { flash_attn: flashAttn } : {}),
         ...(showNParallel && cpuThreads.trim() ? { cpu_threads: Number(cpuThreads) } : {}),
         ...(showNParallel && cpuThreadsBatch.trim() ? { cpu_threads_batch: Number(cpuThreadsBatch) } : {}),
       };
@@ -426,6 +428,16 @@ export function DeployForm({
                 {showNParallel && reasoningBudget.trim() && (
                   <Field label="Reasoning budget message" hint="Injected before the end-of-thinking tag on cutoff.">
                     <TextInput value={reasoningBudgetMessage} onChange={(e) => setReasoningBudgetMessage(e.target.value)} placeholder="(none)" aria-label="Reasoning budget message" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Flash attention" hint="--flash-attn. Fused attention kernel; lower memory traffic.">
+                    <Select value={flashAttn} onChange={(e) => setFlashAttn(e.target.value)} aria-label="Flash attention">
+                      <option value="">default</option>
+                      <option value="on">on</option>
+                      <option value="off">off</option>
+                      <option value="auto">auto</option>
+                    </Select>
                   </Field>
                 )}
                 {showNParallel && (

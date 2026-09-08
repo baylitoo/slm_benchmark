@@ -68,6 +68,7 @@ class DeployRequest(BaseModel):
     # forces a cutoff. Requires reasoning_budget to be set (runtime.py enforces
     # this at validation, not here — the API layer doesn't duplicate it).
     reasoning_budget_message: str | None = None
+    flash_attn: str | None = None
 
 
 async def _trigger_replicated_deploy(
@@ -147,6 +148,8 @@ async def _trigger_replicated_deploy(
             data["reasoning_budget"] = payload.reasoning_budget
         if payload.reasoning_budget_message is not None:
             data["reasoning_budget_message"] = payload.reasoning_budget_message
+        if payload.flash_attn is not None:
+            data["flash_attn"] = payload.flash_attn
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )
