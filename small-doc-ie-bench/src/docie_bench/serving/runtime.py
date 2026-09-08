@@ -92,6 +92,7 @@ class RuntimeLaunchSpec:
     # override it per request.
     max_tokens: int | None = None
     cpu_threads: int | None = None
+    cpu_threads_batch: int | None = None
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float | None = None
     batch_size: int | None = None
@@ -156,6 +157,8 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("max_tokens must be positive")
         if self.cpu_threads is not None and self.cpu_threads < 1:
             raise RuntimeConfigurationError("cpu_threads must be positive")
+        if self.cpu_threads_batch is not None and self.cpu_threads_batch < 1:
+            raise RuntimeConfigurationError("cpu_threads_batch must be positive")
         if self.tensor_parallel_size < 1:
             raise RuntimeConfigurationError("tensor_parallel_size must be positive")
         if self.gpu_memory_utilization is not None and not (0 < self.gpu_memory_utilization <= 1):
@@ -810,6 +813,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--parallel", str(spec.n_parallel)])
         if spec.cpu_threads is not None:
             command.extend(["--threads", str(spec.cpu_threads)])
+        if spec.cpu_threads_batch is not None:
+            command.extend(["--threads-batch", str(spec.cpu_threads_batch)])
         if spec.cache_reuse is not None:
             command.extend(["--cache-reuse", str(spec.cache_reuse)])
         if spec.batch_size is not None:

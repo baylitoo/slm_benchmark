@@ -229,6 +229,8 @@ class Supervisor(Protocol):
         batch_size: int | None = None,
         ubatch_size: int | None = None,
         numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -244,6 +246,8 @@ class Supervisor(Protocol):
         batch_size: int | None = None,
         ubatch_size: int | None = None,
         numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -390,6 +394,8 @@ class ControlPlane:
         batch_size: int | None = None,
         ubatch_size: int | None = None,
         numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -417,6 +423,10 @@ class ControlPlane:
             kwargs["ubatch_size"] = ubatch_size
         if numa is not None:
             kwargs["numa"] = numa
+        if cpu_threads is not None:
+            kwargs["cpu_threads"] = cpu_threads
+        if cpu_threads_batch is not None:
+            kwargs["cpu_threads_batch"] = cpu_threads_batch
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -438,6 +448,8 @@ class ControlPlane:
         batch_size: int | None = None,
         ubatch_size: int | None = None,
         numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -465,6 +477,10 @@ class ControlPlane:
             kwargs["ubatch_size"] = ubatch_size
         if numa is not None:
             kwargs["numa"] = numa
+        if cpu_threads is not None:
+            kwargs["cpu_threads"] = cpu_threads
+        if cpu_threads_batch is not None:
+            kwargs["cpu_threads_batch"] = cpu_threads_batch
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -899,6 +915,8 @@ class _DefaultSupervisor:
         batch_size: int | None = None,
         ubatch_size: int | None = None,
         numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -929,6 +947,8 @@ class _DefaultSupervisor:
                     batch_size=batch_size,
                     ubatch_size=ubatch_size,
                     numa=numa,
+                    cpu_threads=cpu_threads,
+                    cpu_threads_batch=cpu_threads_batch,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -954,6 +974,8 @@ class _DefaultSupervisor:
                     batch_size=batch_size,
                     ubatch_size=ubatch_size,
                     numa=numa,
+                    cpu_threads=cpu_threads,
+                    cpu_threads_batch=cpu_threads_batch,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -989,6 +1011,8 @@ class _DefaultSupervisor:
         batch_size: int | None = None,
         ubatch_size: int | None = None,
         numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -1070,6 +1094,8 @@ class _DefaultSupervisor:
                     batch_size=batch_size,
                     ubatch_size=ubatch_size,
                     numa=numa,
+                    cpu_threads=cpu_threads,
+                    cpu_threads_batch=cpu_threads_batch,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,

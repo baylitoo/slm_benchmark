@@ -51,6 +51,8 @@ class DeployRequest(BaseModel):
     batch_size: int | None = Field(default=None, ge=1)
     ubatch_size: int | None = Field(default=None, ge=1)
     numa: str | None = None
+    cpu_threads: int | None = Field(default=None, ge=1)
+    cpu_threads_batch: int | None = Field(default=None, ge=1)
 
 
 async def _trigger_replicated_deploy(
@@ -118,6 +120,10 @@ async def _trigger_replicated_deploy(
             data["ubatch_size"] = payload.ubatch_size
         if payload.numa is not None:
             data["numa"] = payload.numa
+        if payload.cpu_threads is not None:
+            data["cpu_threads"] = payload.cpu_threads
+        if payload.cpu_threads_batch is not None:
+            data["cpu_threads_batch"] = payload.cpu_threads_batch
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )

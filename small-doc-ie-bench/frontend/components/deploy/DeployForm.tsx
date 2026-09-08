@@ -76,6 +76,8 @@ export function DeployForm({
   const [batchSize, setBatchSize] = useState("");
   const [ubatchSize, setUbatchSize] = useState("");
   const [numa, setNuma] = useState("");
+  const [cpuThreads, setCpuThreads] = useState("");
+  const [cpuThreadsBatch, setCpuThreadsBatch] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -153,6 +155,8 @@ export function DeployForm({
         ...(showNParallel && batchSize.trim() ? { batch_size: Number(batchSize) } : {}),
         ...(showNParallel && ubatchSize.trim() ? { ubatch_size: Number(ubatchSize) } : {}),
         ...(showNParallel && numa ? { numa } : {}),
+        ...(showNParallel && cpuThreads.trim() ? { cpu_threads: Number(cpuThreads) } : {}),
+        ...(showNParallel && cpuThreadsBatch.trim() ? { cpu_threads_batch: Number(cpuThreadsBatch) } : {}),
       };
       const res = await deployModel(payload);
       setTrigger(res);
@@ -370,6 +374,16 @@ export function DeployForm({
                       <option value="isolate">isolate</option>
                       <option value="numactl">numactl</option>
                     </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Threads" hint="--threads for generation. Blank = llama-server default.">
+                    <TextInput type="number" min={1} value={cpuThreads} onChange={(e) => setCpuThreads(e.target.value)} placeholder="auto" aria-label="Threads" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Batch threads" hint="--threads-batch for prefill. Blank = same as threads.">
+                    <TextInput type="number" min={1} value={cpuThreadsBatch} onChange={(e) => setCpuThreadsBatch(e.target.value)} placeholder="auto" aria-label="Batch threads" />
                   </Field>
                 )}
               </div>
