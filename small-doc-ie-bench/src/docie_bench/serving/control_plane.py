@@ -231,6 +231,10 @@ class Supervisor(Protocol):
         numa: str | None = None,
         cpu_threads: int | None = None,
         cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -248,6 +252,10 @@ class Supervisor(Protocol):
         numa: str | None = None,
         cpu_threads: int | None = None,
         cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -396,6 +404,10 @@ class ControlPlane:
         numa: str | None = None,
         cpu_threads: int | None = None,
         cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -427,6 +439,14 @@ class ControlPlane:
             kwargs["cpu_threads"] = cpu_threads
         if cpu_threads_batch is not None:
             kwargs["cpu_threads_batch"] = cpu_threads_batch
+        if cache_type_k is not None:
+            kwargs["cache_type_k"] = cache_type_k
+        if cache_type_v is not None:
+            kwargs["cache_type_v"] = cache_type_v
+        if reasoning_budget is not None:
+            kwargs["reasoning_budget"] = reasoning_budget
+        if reasoning_budget_message is not None:
+            kwargs["reasoning_budget_message"] = reasoning_budget_message
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -450,6 +470,10 @@ class ControlPlane:
         numa: str | None = None,
         cpu_threads: int | None = None,
         cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -481,6 +505,14 @@ class ControlPlane:
             kwargs["cpu_threads"] = cpu_threads
         if cpu_threads_batch is not None:
             kwargs["cpu_threads_batch"] = cpu_threads_batch
+        if cache_type_k is not None:
+            kwargs["cache_type_k"] = cache_type_k
+        if cache_type_v is not None:
+            kwargs["cache_type_v"] = cache_type_v
+        if reasoning_budget is not None:
+            kwargs["reasoning_budget"] = reasoning_budget
+        if reasoning_budget_message is not None:
+            kwargs["reasoning_budget_message"] = reasoning_budget_message
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -917,6 +949,10 @@ class _DefaultSupervisor:
         numa: str | None = None,
         cpu_threads: int | None = None,
         cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -949,6 +985,10 @@ class _DefaultSupervisor:
                     numa=numa,
                     cpu_threads=cpu_threads,
                     cpu_threads_batch=cpu_threads_batch,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                    reasoning_budget=reasoning_budget,
+                    reasoning_budget_message=reasoning_budget_message,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -976,6 +1016,10 @@ class _DefaultSupervisor:
                     numa=numa,
                     cpu_threads=cpu_threads,
                     cpu_threads_batch=cpu_threads_batch,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                    reasoning_budget=reasoning_budget,
+                    reasoning_budget_message=reasoning_budget_message,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -1013,6 +1057,10 @@ class _DefaultSupervisor:
         numa: str | None = None,
         cpu_threads: int | None = None,
         cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -1096,6 +1144,10 @@ class _DefaultSupervisor:
                     numa=numa,
                     cpu_threads=cpu_threads,
                     cpu_threads_batch=cpu_threads_batch,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                    reasoning_budget=reasoning_budget,
+                    reasoning_budget_message=reasoning_budget_message,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,

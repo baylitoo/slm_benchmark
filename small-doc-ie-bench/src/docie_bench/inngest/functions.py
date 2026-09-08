@@ -1272,6 +1272,16 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     cpu_threads = int(raw_cpu_threads) if raw_cpu_threads is not None else None
     raw_cpu_threads_batch = data.get("cpu_threads_batch")
     cpu_threads_batch = int(raw_cpu_threads_batch) if raw_cpu_threads_batch is not None else None
+    raw_cache_type_k = data.get("cache_type_k")
+    cache_type_k = str(raw_cache_type_k) if raw_cache_type_k else None
+    raw_cache_type_v = data.get("cache_type_v")
+    cache_type_v = str(raw_cache_type_v) if raw_cache_type_v else None
+    raw_reasoning_budget = data.get("reasoning_budget")
+    reasoning_budget = int(raw_reasoning_budget) if raw_reasoning_budget is not None else None
+    raw_reasoning_budget_message = data.get("reasoning_budget_message")
+    reasoning_budget_message = (
+        str(raw_reasoning_budget_message) if raw_reasoning_budget_message else None
+    )
     if runtime:
         record = await cp.serve(
             model,
@@ -1289,6 +1299,10 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             numa=numa,
             cpu_threads=cpu_threads,
             cpu_threads_batch=cpu_threads_batch,
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
+            reasoning_budget=reasoning_budget,
+            reasoning_budget_message=reasoning_budget_message,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1319,6 +1333,10 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             numa=numa,
             cpu_threads=cpu_threads,
             cpu_threads_batch=cpu_threads_batch,
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
+            reasoning_budget=reasoning_budget,
+            reasoning_budget_message=reasoning_budget_message,
         )
     return record
 

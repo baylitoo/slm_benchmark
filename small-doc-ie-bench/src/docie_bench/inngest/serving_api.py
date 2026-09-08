@@ -861,6 +861,10 @@ class ScaleRequest(BaseModel):
     numa: str | None = None
     cpu_threads: int | None = Field(default=None, ge=1)
     cpu_threads_batch: int | None = Field(default=None, ge=1)
+    cache_type_k: str | None = None
+    cache_type_v: str | None = None
+    reasoning_budget: int | None = Field(default=None, ge=-1)
+    reasoning_budget_message: str | None = None
 
 
 @router.post("/store/{name}/scale")
@@ -931,6 +935,14 @@ async def scale_store_model(
                 data["cpu_threads"] = request.cpu_threads
             if request.cpu_threads_batch is not None:
                 data["cpu_threads_batch"] = request.cpu_threads_batch
+            if request.cache_type_k is not None:
+                data["cache_type_k"] = request.cache_type_k
+            if request.cache_type_v is not None:
+                data["cache_type_v"] = request.cache_type_v
+            if request.reasoning_budget is not None:
+                data["reasoning_budget"] = request.reasoning_budget
+            if request.reasoning_budget_message is not None:
+                data["reasoning_budget_message"] = request.reasoning_budget_message
             ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
             event_ids.extend(ids)
         return {
