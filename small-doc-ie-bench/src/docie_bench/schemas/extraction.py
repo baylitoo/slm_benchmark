@@ -87,10 +87,10 @@ def schema_json(schema_name: str) -> dict:
 # constraints llama.cpp's schema->GBNF can't express (notably `pattern`, which
 # carries a negative lookahead on the money/number fields — non-context-free, so
 # the grammar fails to compile). Validated downstream, never by the sampler.
+# `description` stays: it is the only per-field guidance the model gets.
 _FLATTEN_DROP = frozenset(
     {
         "title",
-        "description",
         "default",
         "pattern",
         "minimum",
