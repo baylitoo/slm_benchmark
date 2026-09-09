@@ -387,7 +387,8 @@ class OpenAICompatibleClient:
         self._gateway.client = self._client
         await self._gateway.validate_request(needs_vision=bool(image_urls))
         ladder = self._negotiated_ladder()
-        native_reasoning = uses_native_reasoning(self.profile)
+        thinking_disabled = (chat_template_kwargs or {}).get("enable_thinking") is False
+        native_reasoning = uses_native_reasoning(self.profile) and not thinking_disabled
         if native_reasoning:
             # A JSON prefill bypasses this checkpoint's trained thinking prompt.
             assistant_prefill = None
