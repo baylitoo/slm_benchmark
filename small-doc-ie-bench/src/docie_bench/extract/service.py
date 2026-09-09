@@ -848,6 +848,19 @@ class ExtractionService:
             if not parallel_extraction or self.on_delta is not None or self.on_reset is not None
             else _split_schema_into_groups(generation_schema)
         )
+        if groups is not None and get_settings().llm_trace:
+            logger.info(
+                "llm_trace_split",
+                extra={
+                    "docie_step": "llm_trace_split",
+                    "docie_schema_name": schema_name,
+                    "docie_groups": groups,
+                    "docie_fanout": max(
+                        1,
+                        min(self.profile.deployment_slot_count or 1, self.profile.max_concurrency),
+                    ),
+                },
+            )
         if groups is None:
             raw, usage_dict, effective_style, queue_wait_ms, field_confidences = (
                 await self._extract_group(

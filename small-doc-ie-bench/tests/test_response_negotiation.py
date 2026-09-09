@@ -8,6 +8,7 @@ a live model.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -490,3 +491,24 @@ async def test_lfm26_explicit_disable_thinking_wins_over_native_default() -> Non
     assert requests[0]["messages"][-1]["role"] == "assistant"
     assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False, "other": "kept"}
     assert requests[0]["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_llm_trace_logs_exact_messages_and_response(monkeypatch, caplog) -> None:
+    from docie_bench.settings import Settings
+
+    monkeypatch.setattr(
+        "docie_bench.llm.openai_client.get_settings", lambda: Settings(llm_trace=True)
+    )
+    client = await _client(_profile(), lambda request: _completion('{"ok": true}'))
+    with caplog.at_level(logging.INFO, logger="docie_bench.llm.openai_client"):
+        await _chat(client)
+    request = next(r for r in caplog.records if r.getMessage() == "llm_trace_request")
+    response = next(r for r in caplog.records if r.getMessage() == "llm_trace_response")
+    assert [m["role"] for m in request.docie_messages] == ["system", "user"]
+    assert request.docie_messages[1]["content"] == "user"
+    assert request.docie_prompt_chars == len("system") + len("user")
+    assert request.docie_response_format_type == "json_schema"
+    assert request.docie_attempt == "1/3"
+    assert response.docie_content == '{"ok": true}'
+    assert response.docie_usage["prompt_tokens"] == 1
