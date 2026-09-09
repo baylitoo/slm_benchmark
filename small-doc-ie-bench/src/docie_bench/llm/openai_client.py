@@ -456,6 +456,20 @@ class OpenAICompatibleClient:
             if resp.status_code >= 400:
                 await resp.aread()
                 return resp, {}
+            if "text/event-stream" not in resp.headers.get("content-type", ""):
+                # Runtime ignored stream=true and answered with one JSON body.
+                await resp.aread()
+                try:
+                    plain = resp.json()
+                except ValueError:
+                    plain = None
+                if isinstance(plain, dict):
+                    content = ((plain.get("choices") or [{}])[0].get("message") or {}).get(
+                        "content"
+                    )
+                    if isinstance(content, str) and content:
+                        on_delta(content)
+                    return resp, plain
 
             role = "assistant"
             content_parts: list[str] = []
