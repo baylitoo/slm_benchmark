@@ -240,12 +240,10 @@ def _data_urls(images: list[DocumentImage]) -> list[str]:
 
 
 def _is_array_field(field_schema: dict[str, Any]) -> bool:
-    """True for a top-level field whose flattened JSON-schema type is
-    ``array`` -- a static schema's list field is a bare
-    ``{"type": "array", ...}``; a dynamic schema's is Optional by
-    construction (every field defaults to None) and wraps that same shape in
-    ``anyOf`` alongside a ``null`` branch. Both are checked."""
-    if field_schema.get("type") == "array":
+    """True when a flattened field is an array: bare ``{"type": "array"}``,
+    nullable ``{"type": ["array", "null"]}``, or an ``anyOf`` array branch."""
+    declared = field_schema.get("type")
+    if declared == "array" or (isinstance(declared, list) and "array" in declared):
         return True
     for branch in field_schema.get("anyOf", ()):
         if isinstance(branch, dict) and branch.get("type") == "array":
