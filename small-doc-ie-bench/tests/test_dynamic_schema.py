@@ -284,6 +284,29 @@ async def test_native_reasoning_checkpoint_gets_json_prefill_without_opt_in(
 
 
 @pytest.mark.asyncio
+async def test_null_strings_become_none_and_single_call_reports_no_groups(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        async def chat_json(self, **kwargs: Any) -> tuple[dict[str, Any], None, dict[str, Any]]:
+            raw = {"invoice_number": "null", "vendor_name": "None", "customer_name": "ACME"}
+            return raw, None, {}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("docie_bench.extract.service.OpenAICompatibleClient", FakeClient)
+    response = await ExtractionService(_profile()).extract_from_text(
+        text="INVOICE ACME", ocr_blocks=None, schema_name="invoice"
+    )
+    assert response.result["invoice_number"] is None
+    assert response.result["vendor_name"] is None
+    assert response.result["customer_name"]["value"] == "ACME"
+    assert response.parallel_groups is None
+
+
+@pytest.mark.asyncio
 async def test_parallel_extraction_bounds_fanout_to_deployment_slots(monkeypatch) -> None:
     in_flight = 0
     peak = 0

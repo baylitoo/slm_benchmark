@@ -88,6 +88,10 @@ class ExtractionResponse(BaseModel):
     # for non-LLM adapters (e.g. the router's audit stages don't set it),
     # separating queueing from actual generation time in `latency_ms`.
     queue_wait_ms: int | None = None
+    # Number of concurrent schema groups when the request opted into
+    # parallel_extraction and the schema had list fields to split; None for
+    # a single model call.
+    parallel_groups: int | None = None
     # The OCR blocks this extraction was grounded against (empty for
     # vision-only or manual-text extractions with no OCR step). Internal-only
     # plumbing into the review queue (storage/audit.py), NOT part of the

@@ -340,6 +340,14 @@ async def _complete_structured_document(
         "mode": mode,
         "validation": response.validation.model_dump(),
         "response_format_style": response.response_format_style,
+        "latency_ms": response.latency_ms,
+        "queue_wait_ms": response.queue_wait_ms,
+        "generation_ms": (
+            max(response.latency_ms - response.queue_wait_ms, 0)
+            if response.queue_wait_ms is not None
+            else response.latency_ms
+        ),
+        "parallel_groups": response.parallel_groups,
     }
     if routing_audit is not None:
         docie_agent["routing"] = routing_audit
