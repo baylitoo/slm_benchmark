@@ -132,6 +132,17 @@ def _derive_invoice_subtotal(result: dict[str, Any]) -> bool:
     return True
 
 
+def _null_strings_to_none(value: Any) -> Any:
+    """Small models asked to 'use null' sometimes emit the string "null"."""
+    if isinstance(value, dict):
+        return {key: _null_strings_to_none(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_null_strings_to_none(item) for item in value]
+    if isinstance(value, str) and value.strip().lower() in {"null", "none"}:
+        return None
+    return value
+
+
 def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dict[str, Any], bool]:
     """Post-process NuExtract3 output: enforce document_type, strip IBAN spaces,
     null-out empty MoneyFields, and apply fallback normalization for any values the
@@ -917,7 +928,7 @@ class ExtractionService:
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
-        raw = rehydrate_extraction_result(raw, schema)
+        raw = rehydrate_extraction_result(_null_strings_to_none(raw), schema)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
         if field_confidences:
@@ -984,6 +995,7 @@ class ExtractionService:
             ),
             response_format_style=effective_style,
             queue_wait_ms=queue_wait_ms,
+            parallel_groups=len(groups) if groups else None,
             ocr_blocks=blocks or None,
         )
 
