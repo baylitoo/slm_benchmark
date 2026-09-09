@@ -35,6 +35,7 @@ from docie_bench.llm.prompts import (
     build_user_prompt,
     build_vision_user_prompt,
 )
+from docie_bench.llm.reasoning import uses_native_reasoning
 from docie_bench.ocr.base import text_to_blocks
 from docie_bench.ocr.service import processor_from_settings
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
@@ -740,14 +741,13 @@ class ExtractionService:
                 image_urls=image_urls,
                 chat_template_kwargs=extra_template_kwargs or None,
                 max_tokens=self.max_tokens,
-                # LFM2.5's bundled template opens <think> unconditionally and
-                # ignores enable_thinking/reasoning_effort. Continuing an
-                # assistant JSON turn bypasses that generation prompt while
-                # retaining the kwargs for templates that do honor them.
+                # LFM2.5-2.6B's template opens <think> unconditionally and
+                # ignores enable_thinking; continuing an assistant JSON turn is
+                # the only thing that skips it. Extraction never wants thinking.
                 assistant_prefill=(
                     "{"
-                    if self.disable_thinking
-                    and self.profile.prompt_profile == "strict_extraction_v1"
+                    if self.profile.prompt_profile == "strict_extraction_v1"
+                    and (self.disable_thinking or uses_native_reasoning(self.profile))
                     else None
                 ),
                 request_logprobs=want_logprobs,

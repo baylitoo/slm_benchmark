@@ -12,10 +12,12 @@ from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 
 
-def _profile(prompt_profile: str = "strict_extraction_v1") -> ModelProfile:
+def _profile(
+    prompt_profile: str = "strict_extraction_v1", name: str = "test"
+) -> ModelProfile:
     return ModelProfile(
-        name="test",
-        model="test-model",
+        name=name,
+        model=name if name != "test" else "test-model",
         base_url="http://test",
         api_key="test",
         prompt_profile=prompt_profile,
@@ -250,6 +252,35 @@ async def test_nuextract_dynamic_inference_requires_proposer_or_reused_schema() 
             schema_name="unknown",
             schema_mode="dynamic",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "expected_prefill"),
+    [("lfm2.5-2.6b", "{"), ("lfm2.5-350m", None)],
+)
+async def test_native_reasoning_checkpoint_gets_json_prefill_without_opt_in(
+    monkeypatch, name: str, expected_prefill: str | None
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        async def chat_json(self, **kwargs: Any) -> tuple[dict[str, Any], None, dict[str, Any]]:
+            calls.append(kwargs)
+            return {"document_type": "invoice"}, None, {}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("docie_bench.extract.service.OpenAICompatibleClient", FakeClient)
+    await ExtractionService(_profile(name=name)).extract_from_text(
+        text="INVOICE INV-1 Total EUR 10.00", ocr_blocks=None, schema_name="invoice"
+    )
+    assert calls[0]["assistant_prefill"] == expected_prefill
+    assert calls[0]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 @pytest.mark.asyncio
