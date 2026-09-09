@@ -263,34 +263,59 @@ def _is_array_field(field_schema: dict[str, Any]) -> bool:
     return False
 
 
-def _split_schema_into_groups(generation_schema: dict[str, Any]) -> list[list[str]] | None:
-    """Split a flattened generation schema's top-level fields into
-    independently-extractable groups (design #444): every list-typed field
-    becomes its own group; every remaining field (scalars, nested objects)
-    forms one shared base group. ``document_type``/``extraction_notes``
-    never appear here -- flatten_schema_json already strips them, they're
-    reattached during post-processing (_normalize_nuextract_raw /
-    rehydrate_extraction_result), so no group needs to "own" them.
+def _field_weight(node: dict[str, Any]) -> int:
+    """Leaf count under a flattened schema node: a proxy for output size."""
+    for key in ("properties", "items"):
+        child = node.get(key)
+        if isinstance(child, dict):
+            if key == "properties":
+                return max(1, sum(_field_weight(v) for v in child.values() if isinstance(v, dict)))
+            return _field_weight(child)
+    return 1
 
-    Returns None when the result would be a single group -- nothing to
-    parallelize, the caller keeps the existing one-call path unchanged.
+
+def _split_schema_into_groups(
+    generation_schema: dict[str, Any], max_groups: int | None = None
+) -> list[list[str]] | None:
+    """Split a flattened generation schema's top-level fields into
+    independently-extractable groups (design #444): list-typed fields are
+    the units of work, scalars and nested objects form one base group.
+
+    With ``max_groups`` (the deployment's usable slot count) the units are
+    bin-packed into that many groups, heaviest first, so a run costs one
+    prompt evaluation per slot instead of one per list field. Each group
+    keeps the schema's field order. ``document_type``/``extraction_notes``
+    never appear here (flatten_schema_json strips them). Returns None when
+    the result would be a single group.
     """
     properties = generation_schema.get("properties")
     if not isinstance(properties, dict) or len(properties) < 2:
         return None
+    order = {name: index for index, name in enumerate(properties)}
     list_fields = [
         name
         for name, spec in properties.items()
         if isinstance(spec, dict) and _is_array_field(spec)
     ]
     other_fields = [name for name in properties if name not in list_fields]
-    groups: list[list[str]] = []
-    if other_fields:
-        groups.append(other_fields)
-    groups.extend([name] for name in list_fields)
-    if len(groups) < 2:
+    if not list_fields:
         return None
-    return groups
+    natural = (1 if other_fields else 0) + len(list_fields)
+    if max_groups is None or max_groups >= natural:
+        groups: list[list[str]] = [other_fields] if other_fields else []
+        groups.extend([name] for name in list_fields)
+        return groups if len(groups) >= 2 else None
+    if max_groups < 2:
+        return None
+    bins: list[list[str]] = [[] for _ in range(max_groups)]
+    loads = [0] * max_groups
+    for name in sorted(list_fields, key=lambda n: -_field_weight(properties[n])):
+        target = loads.index(min(loads))
+        bins[target].append(name)
+        loads[target] += _field_weight(properties[name])
+    if other_fields:
+        bins[loads.index(min(loads))].extend(other_fields)
+    return [sorted(group, key=order.__getitem__) for group in bins if group]
 
 
 def _subset_schema(generation_schema: dict[str, Any], field_names: list[str]) -> dict[str, Any]:
@@ -843,10 +868,14 @@ class ExtractionService:
         # benchmark timing) for nearly every extraction. Streaming also
         # forces the unsplit path -- N concurrent groups would interleave
         # into one garbled live preview.
+        slot_count = self.profile.deployment_slot_count
+        fanout_bound = max(1, min(slot_count or 1, self.profile.max_concurrency))
         groups = (
             None
             if not parallel_extraction or self.on_delta is not None or self.on_reset is not None
-            else _split_schema_into_groups(generation_schema)
+            else _split_schema_into_groups(
+                generation_schema, max_groups=fanout_bound if slot_count else None
+            )
         )
         if groups is not None and get_settings().llm_trace:
             logger.info(
@@ -855,10 +884,7 @@ class ExtractionService:
                     "docie_step": "llm_trace_split",
                     "docie_schema_name": schema_name,
                     "docie_groups": groups,
-                    "docie_fanout": max(
-                        1,
-                        min(self.profile.deployment_slot_count or 1, self.profile.max_concurrency),
-                    ),
+                    "docie_fanout": fanout_bound,
                 },
             )
         if groups is None:
@@ -901,8 +927,7 @@ class ExtractionService:
                     want_logprobs=want_logprobs,
                 )
 
-            slots = self.profile.deployment_slot_count or 1
-            fanout = asyncio.Semaphore(max(1, min(slots, self.profile.max_concurrency)))
+            fanout = asyncio.Semaphore(fanout_bound)
 
             async def _bounded(field_names: list[str]) -> Any:
                 async with fanout:
