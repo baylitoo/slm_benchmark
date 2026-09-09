@@ -507,6 +507,9 @@ class ExtractStreamRequest(BaseModel):
     parallel_extraction: bool = False
 
 
+_SSE_KEEPALIVE_SECONDS = 10.0
+
+
 @app.post("/v1/extract/stream")
 async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency) -> Response:
     """SSE counterpart to ``/v1/extract/text`` + ``/v1/extract/file`` for the
@@ -650,7 +653,13 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
         task = asyncio.create_task(drive())
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_SSE_KEEPALIVE_SECONDS)
+                except TimeoutError:
+                    # A split run streams no deltas; proxies drop a silent
+                    # connection long before a 3-page CV finishes.
+                    yield b": keepalive\n\n"
+                    continue
                 if item is None:
                     break
                 yield _sse_event(item)

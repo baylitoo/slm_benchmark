@@ -10,6 +10,7 @@ event carrying the post-processed response, `reset` clears the buffer,
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -45,6 +46,7 @@ class _FakeStreamingService:
 
     deltas_to_emit: list[str] = []
     emit_reset = False
+    delay_seconds = 0.0
 
     def __init__(self, profile: ModelProfile, **kwargs: Any) -> None:
         self.profile = profile
@@ -52,6 +54,8 @@ class _FakeStreamingService:
         self.on_reset = kwargs.get("on_reset")
 
     async def _run(self, **_: Any) -> ExtractionResponse:
+        if _FakeStreamingService.delay_seconds:
+            await asyncio.sleep(_FakeStreamingService.delay_seconds)
         for piece in _FakeStreamingService.deltas_to_emit:
             if self.on_delta:
                 self.on_delta(piece)
@@ -74,6 +78,7 @@ def _profile(name: str = "fake-model") -> ModelProfile:
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     _FakeStreamingService.deltas_to_emit = ['{"invoice', '_number": "INV-1"}']
     _FakeStreamingService.emit_reset = False
+    _FakeStreamingService.delay_seconds = 0.0
 
     async def fake_resolve_or_error(model: str, *, session_id: str | None = None):
         return _profile(model or "studio_default")
@@ -156,3 +161,20 @@ def test_extract_text_endpoint_is_unaffected(monkeypatch: pytest.MonkeyPatch) ->
     assert response.status_code == 200
     assert "on_delta" not in captured["kwargs"]
     assert "on_reset" not in captured["kwargs"]
+
+
+def test_keepalive_comments_flow_while_a_silent_split_run_is_in_progress(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(api, "_SSE_KEEPALIVE_SECONDS", 0.05)
+    _FakeStreamingService.deltas_to_emit = []
+    _FakeStreamingService.delay_seconds = 0.3
+    response = client.post(
+        "/v1/extract/stream",
+        json={"text": "Invoice INV-1", "deployment": "fake-model", "parallel_extraction": True},
+    )
+    lines = list(response.iter_lines())
+    assert sum(line.startswith(": keepalive") for line in lines) >= 2
+    assert [e["type"] for e in _events(response)] == ["phase", "result"] or any(
+        '"result"' in line for line in lines
+    )
