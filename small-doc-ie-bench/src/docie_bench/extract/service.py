@@ -21,7 +21,7 @@ from docie_bench.extract.logprob_confidence import (
 )
 from docie_bench.extract.postprocess import (
     dedupe_lists,
-    normalize_dates,
+    normalize_by_schema,
     normalize_placeholders,
 )
 from docie_bench.extract.validators import validate_extraction
@@ -987,7 +987,7 @@ class ExtractionService:
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
         raw = rehydrate_extraction_result(dedupe_lists(normalize_placeholders(raw)), schema)
-        raw = normalize_dates(raw, schema)
+        raw = normalize_by_schema(raw, schema)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
         if field_confidences:

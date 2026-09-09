@@ -10,6 +10,7 @@ from rapidfuzz import fuzz
 from docie_bench.schemas.common import OCRBlock
 
 DEFAULT_MATCH_THRESHOLD = 0.7
+MAX_WINDOW_BLOCKS = 5
 
 
 def ground_evidence(
@@ -82,10 +83,17 @@ def _best_match(candidate: str, blocks: list[OCRBlock]) -> tuple[list[str], floa
     best_ids: list[str] = []
     best_score = 0.0
     for index, block in enumerate(blocks):
-        spans = [([block.id], block.text)]
-        if index + 1 < len(blocks) and blocks[index + 1].page == block.page:
-            next_block = blocks[index + 1]
-            spans.append(([block.id, next_block.id], f"{block.text} {next_block.text}"))
+        # A value copied from several consecutive lines (a paragraph, a
+        # wrapped title) only matches a window of blocks, never one block.
+        spans: list[tuple[list[str], str]] = []
+        ids: list[str] = []
+        texts: list[str] = []
+        for window in blocks[index : index + MAX_WINDOW_BLOCKS]:
+            if window.page != block.page:
+                break
+            ids.append(window.id)
+            texts.append(window.text)
+            spans.append((list(ids), " ".join(texts)))
         for evidence_ids, text in spans:
             block_text = _normalize(text)
             if not block_text:

@@ -2,9 +2,15 @@ from typing import Any
 
 import pytest
 
-from docie_bench.extract.postprocess import dedupe_lists, normalize_date, normalize_placeholders
+from docie_bench.extract.postprocess import (
+    dedupe_lists,
+    normalize_by_schema,
+    normalize_date,
+    normalize_placeholders,
+)
 from docie_bench.extract.service import ExtractionService
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
 
 
 @pytest.mark.parametrize(
@@ -47,6 +53,25 @@ def test_placeholders_and_duplicates() -> None:
     assert cleaned["phone"] is None
     assert cleaned["name"] == "Amine"
     assert cleaned["experience"] == [{"company": "A", "title": "x"}, {"company": "B"}]
+
+
+def test_null_lists_become_empty_lists_but_null_scalars_stay() -> None:
+    spec = DynamicSchemaSpec.model_validate(
+        {
+            "document_type": "doc",
+            "fields": [
+                {"name": "title", "type": "string"},
+                {
+                    "name": "interests",
+                    "type": "list",
+                    "fields": [{"name": "interest", "type": "string"}],
+                },
+            ],
+        }
+    )
+    root = DynamicTemplateBuilder.build_model(spec).model_json_schema()
+    out = normalize_by_schema({"title": None, "interests": None}, root)
+    assert out == {"title": None, "interests": []}
 
 
 @pytest.mark.asyncio

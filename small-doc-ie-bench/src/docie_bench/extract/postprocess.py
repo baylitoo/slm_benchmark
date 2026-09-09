@@ -140,9 +140,9 @@ def dedupe_lists(value: Any) -> Any:
     return value
 
 
-def normalize_dates(payload: Any, root: dict[str, Any]) -> Any:
-    """Walk a rehydrated extraction with its rich Pydantic schema and
-    normalise every DateField's ``value``."""
+def normalize_by_schema(payload: Any, root: dict[str, Any]) -> Any:
+    """Walk a rehydrated extraction with its rich Pydantic schema: every
+    DateField ``value`` is normalised, every null list becomes ``[]``."""
     defs = root.get("$defs", {})
 
     def is_date_ref(node: Any) -> bool:
@@ -180,6 +180,8 @@ def normalize_dates(payload: Any, root: dict[str, Any]) -> Any:
         if not isinstance(node, dict):
             return value
         node = resolve(pick(node, value))
+        if value is None and node.get("type") == "array":
+            return []
         if isinstance(value, list) and isinstance(node.get("items"), dict | list):
             items = node["items"]
             return [walk(v, items, name) for v in value]
