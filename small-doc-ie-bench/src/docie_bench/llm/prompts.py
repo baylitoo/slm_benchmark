@@ -128,18 +128,20 @@ _NUEXTRACT_TEMPLATES: dict[str, dict] = {
 
 
 def render_ocr_blocks(blocks: list[OCRBlock], max_blocks: int = 800) -> str:
-    compact = []
-    for block in blocks[:max_blocks]:
-        compact.append(
-            {
-                "id": block.id,
-                "page": block.page,
-                "text": block.text,
-                "bbox": block.bbox.model_dump() if block.bbox else None,
-                "ocr_confidence": block.confidence,
-            }
-        )
-    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    """Document text in reading order, one block per line, page markers only
+    when the document spans several pages. Block ids, boxes and OCR confidence
+    stay out of the prompt: grounding re-links values to blocks after
+    generation, and the model has no use for them."""
+    kept = [block for block in blocks[:max_blocks] if block.text.strip()]
+    multi_page = len({block.page for block in kept}) > 1
+    lines: list[str] = []
+    current_page: int | None = None
+    for block in kept:
+        if multi_page and block.page != current_page:
+            current_page = block.page
+            lines.append(f"[page {block.page}]")
+        lines.append(block.text.strip())
+    return "\n".join(lines)
 
 
 def build_user_prompt(
