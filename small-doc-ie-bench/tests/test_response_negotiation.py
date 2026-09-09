@@ -8,6 +8,7 @@ a live model.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -491,6 +492,46 @@ async def test_lfm26_explicit_disable_thinking_wins_over_native_default() -> Non
     assert requests[0]["messages"][-1]["role"] == "assistant"
     assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False, "other": "kept"}
     assert requests[0]["reasoning_effort"] == "none"
+
+
+def test_repeating_unit_detects_a_cycling_list_but_not_normal_json() -> None:
+    from docie_bench.llm.openai_client import _repeating_unit
+
+    cycle = '{"item": "MCP (Deep"}, {"item": "Research"}, {"item": "OSINT"}, '
+    assert _repeating_unit('{"skills": [' + cycle * 4) == cycle
+    normal = (
+        '{"skills": [{"item": "Python"}, {"item": "Django"}, '
+        '{"item": "React"}, {"item": "Docker"}]}'
+    )
+    assert _repeating_unit(normal) is None
+
+
+@pytest.mark.asyncio
+async def test_stream_aborts_with_repetition_loop_error(monkeypatch) -> None:
+    from docie_bench.llm.model_gateway import RepetitionLoopError
+
+    cycle = '{"item": "MCP (Deep"}, {"item": "Research"}, {"item": "OSINT"}, '
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = ['data: {"choices": [{"delta": {"content": "{\\"skills\\": ["}}]}\n\n']
+        frames += [
+            'data: {"choices": [{"delta": {"content": ' + json.dumps(cycle) + "}}]}\n\n"
+            for _ in range(40)
+        ]
+        frames.append("data: [DONE]\n\n")
+        return httpx.Response(
+            200, text="".join(frames), headers={"content-type": "text/event-stream"}
+        )
+
+    client = await _client(_profile(), handler)
+    with pytest.raises(RepetitionLoopError):
+        await client.chat_json(
+            system_prompt="system",
+            user_prompt="user",
+            schema_name="test",
+            schema={"type": "object"},
+            on_delta=lambda _t: None,
+        )
 
 
 @pytest.mark.asyncio

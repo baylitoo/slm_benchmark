@@ -15,6 +15,7 @@ from docie_bench.llm.model_gateway import (
     ModelGateway,
     ModelGatewayError,
     OutputTruncatedError,
+    RepetitionLoopError,
     classify_response_error,
 )
 from docie_bench.llm.model_profiles import ModelProfile
@@ -233,6 +234,27 @@ def _trace_response(
     )
 
 
+_LOOP_CHECK_EVERY_CHARS = 256
+_LOOP_TAIL_CHARS = 2000
+_LOOP_MIN_UNIT_CHARS = 8
+_LOOP_MAX_UNIT_CHARS = 500
+_LOOP_REPEATS = 4
+
+
+def _repeating_unit(text: str) -> str | None:
+    """The shortest unit of >= 8 chars that closes ``text`` repeated 4 times
+    back to back, or None. A constrained JSON list that has started cycling
+    through the same items looks exactly like this; legitimate output does
+    not repeat a whole unit four times in a row."""
+    tail = text[-_LOOP_TAIL_CHARS:]
+    limit = min(_LOOP_MAX_UNIT_CHARS, len(tail) // _LOOP_REPEATS)
+    for size in range(_LOOP_MIN_UNIT_CHARS, limit + 1):
+        unit = tail[-size:]
+        if tail.endswith(unit * _LOOP_REPEATS):
+            return unit
+    return None
+
+
 class OpenAICompatibleClient:
     def __init__(self, profile: ModelProfile) -> None:
         self.profile = profile
@@ -373,6 +395,8 @@ class OpenAICompatibleClient:
             finish_reason: str | None = None
             usage: dict[str, Any] | None = None
             timings: dict[str, Any] | None = None
+            streamed_chars = 0
+            next_loop_check = _LOOP_CHECK_EVERY_CHARS
             completion_id = ""
             model_name = str(payload.get("model") or "")
 
@@ -430,6 +454,19 @@ class OpenAICompatibleClient:
                 if isinstance(content_piece, str) and content_piece:
                     content_parts.append(content_piece)
                     on_delta(content_piece)
+                    streamed_chars += len(content_piece)
+                    if streamed_chars >= next_loop_check:
+                        next_loop_check = streamed_chars + _LOOP_CHECK_EVERY_CHARS
+                        unit = _repeating_unit("".join(content_parts))
+                        if unit is not None:
+                            await resp.aclose()
+                            raise RepetitionLoopError(
+                                "Model output entered a repetition loop after "
+                                f"{streamed_chars} chars (unit: {unit[:80]!r}); aborted "
+                                "instead of spending the remaining output budget. The "
+                                "document text is probably garbled (multi-column layout "
+                                "or OCR noise)."
+                            )
                 reasoning_piece = delta.get("reasoning_content")
                 if isinstance(reasoning_piece, str) and reasoning_piece:
                     reasoning_parts.append(reasoning_piece)

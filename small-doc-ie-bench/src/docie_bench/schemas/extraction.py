@@ -135,7 +135,10 @@ def flat_schema_json(schema_name: str) -> dict:
     return flatten_schema_json(schema_json(schema_name))
 
 
-def flatten_schema_json(root: dict) -> dict:
+MAX_LIST_ITEMS = 100
+
+
+def flatten_schema_json(root: dict, *, max_list_items: int = MAX_LIST_ITEMS) -> dict:
     """Flatten an extraction model's JSON schema for a grammar target.
 
     Unlike :func:`flat_schema_json`, this accepts an already-built schema. It is
@@ -175,6 +178,7 @@ def flatten_schema_json(root: dict) -> dict:
                 out[key] = {k: transform(v) for k, v in value.items()}
             elif key == "items":
                 out[key] = transform(value)
+                out.setdefault("maxItems", max_list_items)
             elif key in ("anyOf", "oneOf", "allOf") and isinstance(value, list):
                 out[key] = _collapse_union([transform(item) for item in value])
             else:

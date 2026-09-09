@@ -132,6 +132,10 @@ def _derive_invoice_subtotal(result: dict[str, Any]) -> bool:
     return True
 
 
+def _discard_delta(_text: str) -> None:
+    return None
+
+
 def _null_strings_to_none(value: Any) -> Any:
     """Small models asked to 'use null' sometimes emit the string "null"."""
     if isinstance(value, dict):
@@ -793,7 +797,10 @@ class ExtractionService:
                 # _extract_blocks itself also refuses to split when a
                 # streaming callback is present, so this is a second,
                 # independent guard, not the only one.
-                on_delta=self.on_delta if field_names is None else None,
+                # Streaming is always on so the client can abort a repetition
+                # loop mid-generation; the live preview itself only exists on
+                # the unsplit path.
+                on_delta=(self.on_delta if field_names is None else None) or _discard_delta,
                 on_reset=self.on_reset if field_names is None else None,
             )
             effective_style = getattr(client, "last_response_format_style", None)

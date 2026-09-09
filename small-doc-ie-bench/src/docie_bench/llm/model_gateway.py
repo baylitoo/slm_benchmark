@@ -72,6 +72,10 @@ class OutputTruncatedError(InvalidModelResponseError):
     retryable = False
 
 
+class RepetitionLoopError(InvalidModelResponseError):
+    retryable = False
+
+
 class ModelCapabilityError(ModelGatewayError):
     classification = ErrorClassification.CAPABILITY
 
