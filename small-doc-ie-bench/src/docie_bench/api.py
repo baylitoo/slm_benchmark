@@ -504,6 +504,7 @@ class ExtractStreamRequest(BaseModel):
     routing_policy: str | None = None
     ocr_backend: str | None = None
     language: str | None = None
+    parallel_extraction: bool = False
 
 
 @app.post("/v1/extract/stream")
@@ -589,7 +590,11 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
         resolved = await _resolve_or_error(payload.deployment or payload.model_profile or "")
         if isinstance(resolved, JSONResponse):
             return resolved
-        executor = ExtractionService(resolved, on_delta=on_delta, on_reset=on_reset)
+        executor = ExtractionService(
+            resolved,
+            on_delta=None if payload.parallel_extraction else on_delta,
+            on_reset=None if payload.parallel_extraction else on_reset,
+        )
 
     async def drive() -> None:
         error: dict[str, Any] | None = None
@@ -605,6 +610,7 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
                     language=payload.language,
                     document_hash=hash_bytes(payload.text.encode("utf-8")),
                     metadata={"source": "playground_stream"},
+                    parallel_extraction=payload.parallel_extraction,
                 )
             else:
                 assert content is not None
@@ -623,6 +629,7 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
                             "source": "playground_stream",
                             "filename": payload.filename or "document",
                         },
+                        parallel_extraction=payload.parallel_extraction,
                     )
                 finally:
                     tmp_path.unlink(missing_ok=True)

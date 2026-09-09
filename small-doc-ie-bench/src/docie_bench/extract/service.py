@@ -728,9 +728,7 @@ class ExtractionService:
         # build_response_format's own extra_body (see build_payload), so
         # overriding "template" here for this one case is enough -- the
         # static-schema path (nuextract_template is None) is untouched.
-        extra_template_kwargs: dict[str, Any] = {}
-        if self.disable_thinking:
-            extra_template_kwargs["enable_thinking"] = False
+        extra_template_kwargs: dict[str, Any] = {"enable_thinking": False}
         if self.profile.prompt_profile == "nuextract3" and nuextract_template is not None:
             extra_template_kwargs["template"] = json.dumps(
                 nuextract_template, ensure_ascii=False

@@ -45,6 +45,9 @@ export interface ExtractRequest {
   routing_policy?: string;
   ocr_backend?: string;
   language?: string;
+  /** Split list-typed fields into concurrent sub-extractions. Disables the live
+   * delta preview for that call (N streams would interleave). */
+  parallel_extraction?: boolean;
 }
 
 export function triggerExtract(payload: ExtractRequest): Promise<TriggerResponse> {
