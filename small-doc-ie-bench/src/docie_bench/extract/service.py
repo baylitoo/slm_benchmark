@@ -19,6 +19,11 @@ from docie_bench.extract.logprob_confidence import (
     attach_model_confidence,
     compute_field_confidences,
 )
+from docie_bench.extract.postprocess import (
+    dedupe_lists,
+    normalize_dates,
+    normalize_placeholders,
+)
 from docie_bench.extract.validators import validate_extraction
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
@@ -145,17 +150,6 @@ def _cap_confidence(node: Any, cap: float) -> None:
 
 def _discard_delta(_text: str) -> None:
     return None
-
-
-def _null_strings_to_none(value: Any) -> Any:
-    """Small models asked to 'use null' sometimes emit the string "null"."""
-    if isinstance(value, dict):
-        return {key: _null_strings_to_none(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_null_strings_to_none(item) for item in value]
-    if isinstance(value, str) and value.strip().lower() in {"null", "none"}:
-        return None
-    return value
 
 
 def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dict[str, Any], bool]:
@@ -992,7 +986,8 @@ class ExtractionService:
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
-        raw = rehydrate_extraction_result(_null_strings_to_none(raw), schema)
+        raw = rehydrate_extraction_result(dedupe_lists(normalize_placeholders(raw)), schema)
+        raw = normalize_dates(raw, schema)
         raw = ground_evidence(raw, blocks)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
         if field_confidences:
