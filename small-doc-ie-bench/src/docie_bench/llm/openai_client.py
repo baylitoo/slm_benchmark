@@ -137,6 +137,102 @@ class LLMClientError(ModelGatewayError):
     pass
 
 
+_TRACE_KNOWN_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "response_format",
+        "chat_template_kwargs",
+        "reasoning_effort",
+        "stream",
+        "stream_options",
+        "logprobs",
+        "top_logprobs",
+        "stop",
+    }
+)
+
+
+def _trace_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            content = [
+                part
+                if part.get("type") != "image_url"
+                else {"type": "image_url", "image_url": "<omitted>"}
+                for part in content
+                if isinstance(part, dict)
+            ]
+        out.append({**message, "content": content})
+    return out
+
+
+def _trace_request(
+    profile: ModelProfile, schema_name: str, payload: dict[str, Any], position: int, total: int
+) -> None:
+    messages = payload.get("messages") or []
+    response_format = payload.get("response_format") or {}
+    schema = (response_format.get("json_schema") or {}).get("schema")
+    logger.info(
+        "llm_trace_request",
+        extra={
+            "docie_step": "llm_trace_request",
+            "docie_model": profile.model,
+            "docie_base_url": profile.base_url,
+            "docie_schema_name": schema_name,
+            "docie_attempt": f"{position + 1}/{total}",
+            "docie_messages": _trace_messages(messages),
+            "docie_prompt_chars": sum(
+                len(m["content"]) for m in messages if isinstance(m.get("content"), str)
+            ),
+            "docie_chat_template_kwargs": payload.get("chat_template_kwargs"),
+            "docie_reasoning_effort": payload.get("reasoning_effort"),
+            "docie_response_format_type": response_format.get("type"),
+            "docie_response_format_schema_chars": (
+                len(json.dumps(schema)) if schema is not None else 0
+            ),
+            "docie_max_tokens": payload.get("max_tokens"),
+            "docie_temperature": payload.get("temperature"),
+            "docie_logprobs": bool(payload.get("logprobs")),
+            "docie_other_keys": sorted(k for k in payload if k not in _TRACE_KNOWN_KEYS),
+        },
+    )
+
+
+def _trace_response(
+    profile: ModelProfile,
+    schema_name: str,
+    style: str,
+    data: dict[str, Any],
+    content: str,
+    llm_latency_ms: int,
+) -> None:
+    message = data.get("choices", [{}])[0].get("message") or {}
+    reasoning = message.get("reasoning_content")
+    logger.info(
+        "llm_trace_response",
+        extra={
+            "docie_step": "llm_trace_response",
+            "docie_model": profile.model,
+            "docie_schema_name": schema_name,
+            "docie_response_format_style": style,
+            "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+            "docie_usage": data.get("usage"),
+            "docie_timings": data.get("timings"),
+            "docie_llm_latency_ms": llm_latency_ms,
+            "docie_content_chars": len(content),
+            "docie_content": content,
+            "docie_reasoning_chars": len(reasoning) if isinstance(reasoning, str) else 0,
+            "docie_reasoning": reasoning if isinstance(reasoning, str) else None,
+        },
+    )
+
+
 class OpenAICompatibleClient:
     def __init__(self, profile: ModelProfile) -> None:
         self.profile = profile
@@ -276,6 +372,7 @@ class OpenAICompatibleClient:
             logprobs_parts: list[dict[str, Any]] = []
             finish_reason: str | None = None
             usage: dict[str, Any] | None = None
+            timings: dict[str, Any] | None = None
             completion_id = ""
             model_name = str(payload.get("model") or "")
 
@@ -298,6 +395,9 @@ class OpenAICompatibleClient:
                 frame_model = frame.get("model")
                 if isinstance(frame_model, str) and frame_model:
                     model_name = frame_model
+                frame_timings = frame.get("timings")
+                if isinstance(frame_timings, dict):
+                    timings = frame_timings
                 frame_usage = frame.get("usage")
                 if isinstance(frame_usage, dict):
                     # Sent on the TRAILING frame (stream_options.include_usage,
@@ -352,6 +452,8 @@ class OpenAICompatibleClient:
             }
             if usage is not None:
                 data["usage"] = usage
+            if timings is not None:
+                data["timings"] = timings
             return resp, data
 
     async def chat_json(
@@ -506,6 +608,10 @@ class OpenAICompatibleClient:
                     force_disable_reasoning=force_disable_reasoning,
                     use_prefill=use_prefill,
                 )
+                if get_settings().llm_trace:
+                    _trace_request(
+                        self.profile, schema_name, request_payload, position, len(attempts)
+                    )
                 streamed_data: dict[str, Any] | None = None
                 if on_delta is None:
                     resp = await self._client.post("/chat/completions", json=request_payload)
@@ -644,6 +750,10 @@ class OpenAICompatibleClient:
                         "docie_llm_latency_ms": llm_latency_ms,
                     },
                 )
+                if get_settings().llm_trace:
+                    _trace_response(
+                        self.profile, schema_name, style, data, content, llm_latency_ms
+                    )
                 cleaned = _clean_content(content)
                 try:
                     parsed = json.loads(cleaned)

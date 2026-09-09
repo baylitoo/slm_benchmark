@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     redacted_response_fields: str = ""
     redacted_audit_fields: str = ""
     log_document_content: bool = False
+    # INFO-level trace of every model call: the exact messages sent, template
+    # kwargs, budget, then content / reasoning / usage / timings back. Carries
+    # document text; debugging only.
+    llm_trace: bool = False
 
     database_url: str | None = None
     review_claim_lease_seconds: int = Field(default=900, ge=30, le=86400)
