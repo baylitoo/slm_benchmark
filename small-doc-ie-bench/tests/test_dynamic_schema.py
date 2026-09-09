@@ -334,7 +334,7 @@ async def test_parallel_extraction_bounds_fanout_to_deployment_slots(monkeypatch
     monkeypatch.setattr("docie_bench.extract.service.OpenAICompatibleClient", FakeClient)
     profile = ModelProfile(
         name="t", model="m", base_url="http://t", api_key="k",
-        max_concurrency=4, deployment_slot_count=1,
+        max_concurrency=4, deployment_slot_count=2,
     )
     service = ExtractionService(profile)
     fields = [{"name": "name", "type": "string"}] + [
@@ -346,7 +346,41 @@ async def test_parallel_extraction_bounds_fanout_to_deployment_slots(monkeypatch
         dynamic_schema={"document_type": "doc", "fields": fields}, parallel_extraction=True,
     )
     assert response.validation.valid
-    assert peak == 1
+    assert peak == 2
+    assert response.parallel_groups == 2
+
+
+def test_groups_pack_to_slot_count_heaviest_first_keeping_schema_order() -> None:
+    from docie_bench.extract.service import _split_schema_into_groups
+
+    def lst(*names: str) -> dict[str, Any]:
+        return {
+            "type": ["array", "null"],
+            "items": {"type": "object", "properties": {n: {"type": "string"} for n in names}},
+        }
+
+    schema = {
+        "properties": {
+            "name": {"type": "string"},
+            "contact": {"type": "object", "properties": {"email": {"type": "string"}}},
+            "experience": lst("company", "title", "start", "end", "location", "desc", "env"),
+            "education": lst("degree", "institution", "year"),
+            "skills": lst("category", "items"),
+            "languages": lst("language", "level"),
+            "certifications": lst("name", "issuer", "year"),
+            "interests": lst("interest"),
+        }
+    }
+    assert _split_schema_into_groups(schema) == [
+        ["name", "contact"], ["experience"], ["education"], ["skills"],
+        ["languages"], ["certifications"], ["interests"],
+    ]
+    assert _split_schema_into_groups(schema, max_groups=3) == [
+        ["experience"],
+        ["education", "skills", "interests"],
+        ["name", "contact", "languages", "certifications"],
+    ]
+    assert _split_schema_into_groups(schema, max_groups=1) is None
 
 
 @pytest.mark.asyncio
