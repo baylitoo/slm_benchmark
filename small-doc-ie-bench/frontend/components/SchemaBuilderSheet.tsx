@@ -25,7 +25,7 @@ export const RESUME_SCHEMA: DynamicSchemaSpec = {
   fields: [
     { name: "name", type: "string", description: "Candidate's full name as printed." },
     { name: "title", type: "string", description: "Current job title or headline shown under the name." },
-    { name: "years_experience", type: "string", description: "Total years of experience only when the CV states it explicitly (e.g. '5 ans d'experience'). null otherwise; never compute it or copy dates." },
+    { name: "years_experience", type: "string", description: "A total number of years of experience only when the CV literally states one. null otherwise; never compute it, never copy dates or job lines." },
     { name: "contact", type: "object", fields: [
       { name: "email", type: "string" }, { name: "phone", type: "string" },
       { name: "linkedin", type: "string" }, { name: "github", type: "string" },
@@ -45,12 +45,12 @@ export const RESUME_SCHEMA: DynamicSchemaSpec = {
       { name: "year", type: "string", description: "Graduation year, YYYY." },
     ] },
     { name: "skills", type: "list", description: "Technical skill groups only (programming languages, frameworks, tools, methods). Exclude spoken languages and hobbies.", fields: [
-      { name: "category", type: "string", description: "Skill group heading as written (e.g. Langages, Frameworks, Outils)." },
+      { name: "category", type: "string", description: "Skill group heading exactly as written in the document." },
       { name: "items", type: "list", fields: [{ name: "item", type: "string" }] },
     ] },
-    { name: "languages", type: "list", description: "Spoken / natural languages only (section LANGUES: Francais, Anglais...). Never programming languages.", fields: [
+    { name: "languages", type: "list", description: "Spoken / natural languages only, from the languages section. Never programming languages.", fields: [
       { name: "language", type: "string" },
-      { name: "level", type: "string", description: "Proficiency as written (natif, courant, B2...). null if absent." },
+      { name: "level", type: "string", description: "Proficiency level exactly as written. null if absent." },
     ] },
     { name: "certifications", type: "list", description: "Certifications explicitly listed. [] when the CV has none.", fields: [
       { name: "name", type: "string" }, { name: "issuer", type: "string" },
