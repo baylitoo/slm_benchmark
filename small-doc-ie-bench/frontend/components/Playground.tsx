@@ -593,6 +593,7 @@ export function ChatPanel({
   const [selectedPolicy, setSelectedPolicy] = useState<string>("");
   const [ocrBackend, setOcrBackend] = useState("");
   const [language, setLanguage] = useState("");
+  const [parallelExtraction, setParallelExtraction] = useState(false);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -636,6 +637,7 @@ export function ChatPanel({
       }
       if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
       if (language.trim()) payload.language = language.trim();
+      if (parallelExtraction) payload.parallel_extraction = true;
       return payload;
     }
 
@@ -1394,6 +1396,20 @@ export function ChatPanel({
                 placeholder="(auto)"
               />
             </Field>
+            <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground/90">
+              <input
+                type="checkbox"
+                checked={parallelExtraction}
+                onChange={(e) => setParallelExtraction(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5"
+              />
+              <span>
+                <T>Parallel extraction</T>
+                <span className="block text-muted-foreground">
+                  <T>Splits list fields into concurrent sub-extractions, each with its own output budget. No live preview for that run. Needs a deployment with 2+ slots.</T>
+                </span>
+              </span>
+            </label>
           </div>
         )}
 
