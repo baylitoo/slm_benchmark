@@ -68,6 +68,10 @@ class InvalidModelResponseError(ModelGatewayError):
     retryable = True
 
 
+class OutputTruncatedError(InvalidModelResponseError):
+    retryable = False
+
+
 class ModelCapabilityError(ModelGatewayError):
     classification = ErrorClassification.CAPABILITY
 

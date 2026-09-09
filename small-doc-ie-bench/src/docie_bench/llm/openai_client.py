@@ -14,6 +14,7 @@ from docie_bench.llm.model_gateway import (
     ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
+    OutputTruncatedError,
     classify_response_error,
 )
 from docie_bench.llm.model_profiles import ModelProfile
@@ -715,6 +716,12 @@ class OpenAICompatibleClient:
                         raise InvalidModelResponseError(
                             f"Generation exhausted max_tokens ({output_budget}) "
                             "with no usable answer even after reasoning was disabled"
+                        ) from exc
+                    if finish_reason == "length" and cleaned.strip():
+                        raise OutputTruncatedError(
+                            f"Output truncated at max_tokens ({output_budget}) mid-JSON; a retry "
+                            f"or weaker schema style would truncate identically. Raise max_tokens "
+                            f"or split the schema (parallel_extraction). Partial: {cleaned[:300]}"
                         ) from exc
                     invalid_reason = (
                         "empty_content" if not cleaned.strip() else "unparseable_content"
