@@ -23,37 +23,40 @@ const isContainer = (field: DynamicFieldSpec) => field.type === "object" || fiel
 export const RESUME_SCHEMA: DynamicSchemaSpec = {
   document_type: "adbi_resume",
   fields: [
-    { name: "name", type: "string" },
-    { name: "title", type: "string" },
-    { name: "years_experience", type: "number" },
+    { name: "name", type: "string", description: "Candidate's full name as printed." },
+    { name: "title", type: "string", description: "Current job title or headline shown under the name." },
+    { name: "years_experience", type: "string", description: "Total years of experience only when the CV states it explicitly (e.g. '5 ans d'experience'). null otherwise; never compute it or copy dates." },
     { name: "contact", type: "object", fields: [
       { name: "email", type: "string" }, { name: "phone", type: "string" },
       { name: "linkedin", type: "string" }, { name: "github", type: "string" },
-      { name: "location", type: "string" },
+      { name: "location", type: "string", description: "Candidate's city / country from the header." },
     ] },
-    { name: "experience", type: "list", description: "All work experiences in the document.", fields: [
-      { name: "company", type: "string" }, { name: "title", type: "string" },
-      { name: "start_date", type: "date" }, { name: "end_date", type: "date" },
-      { name: "location", type: "string" },
+    { name: "experience", type: "list", description: "Professional positions only (jobs, internships, freelance). Never degrees or education entries.", fields: [
+      { name: "company", type: "string", description: "Employer name as written." },
+      { name: "title", type: "string", description: "Job title held in this position." },
+      { name: "start_date", type: "date", description: "Start of this position, YYYY-MM or YYYY. A single date, never a range." },
+      { name: "end_date", type: "date", description: "End of this position, YYYY-MM or YYYY. null when current (Aujourd'hui, present)." },
+      { name: "location", type: "string", description: "City written next to this position. null if not stated." },
       { name: "description", type: "string", description: "Complete responsibilities and achievements for this experience, including text spanning multiple lines." },
-      { name: "env_technique", type: "string", description: "Stack technique / environnement technologique de la mission" },
+      { name: "env_technique", type: "string", description: "Stack technique / environnement technologique listed under this position only. null when this position lists none." },
     ] },
-    { name: "education", type: "list", description: "All education entries in the document.", fields: [
+    { name: "education", type: "list", description: "Degrees and diplomas only. Never work positions.", fields: [
       { name: "degree", type: "string" }, { name: "institution", type: "string" },
-      { name: "year", type: "string" },
+      { name: "year", type: "string", description: "Graduation year, YYYY." },
     ] },
-    { name: "skills", type: "list", fields: [
-      { name: "category", type: "string" },
+    { name: "skills", type: "list", description: "Technical skill groups only (programming languages, frameworks, tools, methods). Exclude spoken languages and hobbies.", fields: [
+      { name: "category", type: "string", description: "Skill group heading as written (e.g. Langages, Frameworks, Outils)." },
       { name: "items", type: "list", fields: [{ name: "item", type: "string" }] },
     ] },
-    { name: "languages", type: "list", fields: [
-      { name: "language", type: "string" }, { name: "level", type: "string" },
+    { name: "languages", type: "list", description: "Spoken / natural languages only (section LANGUES: Francais, Anglais...). Never programming languages.", fields: [
+      { name: "language", type: "string" },
+      { name: "level", type: "string", description: "Proficiency as written (natif, courant, B2...). null if absent." },
     ] },
-    { name: "certifications", type: "list", fields: [
+    { name: "certifications", type: "list", description: "Certifications explicitly listed. [] when the CV has none.", fields: [
       { name: "name", type: "string" }, { name: "issuer", type: "string" },
       { name: "year", type: "string" },
     ] },
-    { name: "interests", type: "list", fields: [{ name: "interest", type: "string" }] },
+    { name: "interests", type: "list", description: "Hobbies from a Centres d'interet / Loisirs section only. [] when the CV has none. Never skills, tools or languages.", fields: [{ name: "interest", type: "string" }] },
   ],
 };
 

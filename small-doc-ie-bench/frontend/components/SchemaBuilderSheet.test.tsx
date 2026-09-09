@@ -82,7 +82,7 @@ it("creates the complete ADBI resume starter with variable-length nested lists",
   expect(structure(spec.fields)).toEqual([
     { name: "name", type: "string" },
     { name: "title", type: "string" },
-    { name: "years_experience", type: "number" },
+    { name: "years_experience", type: "string" },
     { name: "contact", type: "object", fields: [
       { name: "email", type: "string" }, { name: "phone", type: "string" },
       { name: "linkedin", type: "string" }, { name: "github", type: "string" },
