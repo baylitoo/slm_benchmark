@@ -233,6 +233,97 @@ def _trace_response(
     )
 
 
+_LOOP_CHECK_EVERY_CHARS = 256
+_LOOP_TAIL_CHARS = 2000
+_LOOP_MIN_UNIT_CHARS = 8
+_LOOP_MAX_UNIT_CHARS = 500
+_LOOP_REPEATS = 4
+
+
+def _repeating_unit(text: str) -> str | None:
+    """The shortest unit of >= 8 chars that closes ``text`` repeated 4 times
+    back to back, or None. A constrained JSON list that has started cycling
+    through the same items looks exactly like this; legitimate output does
+    not repeat a whole unit four times in a row."""
+    tail = text[-_LOOP_TAIL_CHARS:]
+    limit = min(_LOOP_MAX_UNIT_CHARS, len(tail) // _LOOP_REPEATS)
+    for size in range(_LOOP_MIN_UNIT_CHARS, limit + 1):
+        unit = tail[-size:]
+        if tail.endswith(unit * _LOOP_REPEATS):
+            return unit
+    return None
+
+
+def _close_json_prefix(prefix: str) -> tuple[str, list[str]]:
+    """Turn a grammar-valid JSON prefix into a complete document by dropping
+    the unfinished element of the innermost open array and closing every open
+    bracket. Returns the document and the key path of that array."""
+    stack: list[dict[str, Any]] = []
+    in_string = False
+    escape = False
+    string_start = 0
+    i = 0
+    n = len(prefix)
+    while i < n:
+        c = prefix[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+                if stack and stack[-1]["kind"] == "obj" and stack[-1]["expect_key"]:
+                    stack[-1]["key"] = prefix[string_start:i]
+                    stack[-1]["expect_key"] = False
+                elif stack:
+                    stack[-1]["complete_at"] = i + 1
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            string_start = i + 1
+        elif c == "{":
+            stack.append({"kind": "obj", "key": None, "complete_at": i + 1, "expect_key": True})
+        elif c == "[":
+            stack.append({"kind": "arr", "key": None, "complete_at": i + 1, "expect_key": False})
+        elif c in "}]":
+            if stack:
+                stack.pop()
+            if stack:
+                stack[-1]["complete_at"] = i + 1
+        elif c == ",":
+            if stack and stack[-1]["kind"] == "obj":
+                stack[-1]["expect_key"] = True
+        elif c not in " \t\r\n:":
+            j = i
+            while j < n and prefix[j] not in ",}] \t\r\n":
+                j += 1
+            if stack and j < n:
+                stack[-1]["complete_at"] = j
+            i = j
+            continue
+        i += 1
+    depth = next((d for d in range(len(stack) - 1, -1, -1) if stack[d]["kind"] == "arr"), None)
+    if depth is None:
+        return prefix, []
+    body = prefix[: stack[depth]["complete_at"]]
+    closers = "".join("]" if f["kind"] == "arr" else "}" for f in reversed(stack[: depth + 1]))
+    path = [f["key"] for f in stack[:depth] if f["kind"] == "obj" and f["key"]]
+    return body + closers, path
+
+
+def _salvage_loop(text: str, unit: str) -> tuple[str, list[str], int]:
+    """Keep everything up to and including the first occurrence of the
+    repeating unit, then close the JSON."""
+    pos = len(text)
+    while pos - len(unit) >= 0 and text[pos - len(unit) : pos] == unit:
+        pos -= len(unit)
+    cut = min(len(text), pos + len(unit))
+    repaired, path = _close_json_prefix(text[:cut])
+    return repaired, path, cut
+
+
 class OpenAICompatibleClient:
     def __init__(self, profile: ModelProfile) -> None:
         self.profile = profile
@@ -365,6 +456,20 @@ class OpenAICompatibleClient:
             if resp.status_code >= 400:
                 await resp.aread()
                 return resp, {}
+            if "text/event-stream" not in resp.headers.get("content-type", ""):
+                # Runtime ignored stream=true and answered with one JSON body.
+                await resp.aread()
+                try:
+                    plain = resp.json()
+                except ValueError:
+                    plain = None
+                if isinstance(plain, dict):
+                    content = ((plain.get("choices") or [{}])[0].get("message") or {}).get(
+                        "content"
+                    )
+                    if isinstance(content, str) and content:
+                        on_delta(content)
+                    return resp, plain
 
             role = "assistant"
             content_parts: list[str] = []
@@ -373,6 +478,9 @@ class OpenAICompatibleClient:
             finish_reason: str | None = None
             usage: dict[str, Any] | None = None
             timings: dict[str, Any] | None = None
+            streamed_chars = 0
+            next_loop_check = _LOOP_CHECK_EVERY_CHARS
+            loop_truncated: dict[str, Any] | None = None
             completion_id = ""
             model_name = str(payload.get("model") or "")
 
@@ -430,6 +538,24 @@ class OpenAICompatibleClient:
                 if isinstance(content_piece, str) and content_piece:
                     content_parts.append(content_piece)
                     on_delta(content_piece)
+                    streamed_chars += len(content_piece)
+                    if streamed_chars >= next_loop_check:
+                        next_loop_check = streamed_chars + _LOOP_CHECK_EVERY_CHARS
+                        unit = _repeating_unit("".join(content_parts))
+                        if unit is not None:
+                            # Stop the slot, keep what was generated before the
+                            # cycle, close the JSON; the service flags the field.
+                            await resp.aclose()
+                            repaired, path, kept = _salvage_loop("".join(content_parts), unit)
+                            content_parts = [repaired]
+                            finish_reason = "stop"
+                            loop_truncated = {
+                                "unit": unit[:120],
+                                "kept_chars": kept,
+                                "streamed_chars": streamed_chars,
+                                "field_path": path,
+                            }
+                            break
                 reasoning_piece = delta.get("reasoning_content")
                 if isinstance(reasoning_piece, str) and reasoning_piece:
                     reasoning_parts.append(reasoning_piece)
@@ -454,6 +580,8 @@ class OpenAICompatibleClient:
                 data["usage"] = usage
             if timings is not None:
                 data["timings"] = timings
+            if loop_truncated is not None:
+                data["docie_loop_truncated"] = loop_truncated
             return resp, data
 
     async def chat_json(

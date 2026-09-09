@@ -132,6 +132,21 @@ def _derive_invoice_subtotal(result: dict[str, Any]) -> bool:
     return True
 
 
+def _cap_confidence(node: Any, cap: float) -> None:
+    if isinstance(node, dict):
+        if isinstance(node.get("confidence"), int | float):
+            node["confidence"] = min(float(node["confidence"]), cap)
+        for value in node.values():
+            _cap_confidence(value, cap)
+    elif isinstance(node, list):
+        for item in node:
+            _cap_confidence(item, cap)
+
+
+def _discard_delta(_text: str) -> None:
+    return None
+
+
 def _null_strings_to_none(value: Any) -> Any:
     """Small models asked to 'use null' sometimes emit the string "null"."""
     if isinstance(value, dict):
@@ -793,7 +808,10 @@ class ExtractionService:
                 # _extract_blocks itself also refuses to split when a
                 # streaming callback is present, so this is a second,
                 # independent guard, not the only one.
-                on_delta=self.on_delta if field_names is None else None,
+                # Streaming is always on so the client can abort a repetition
+                # loop mid-generation; the live preview itself only exists on
+                # the unsplit path.
+                on_delta=(self.on_delta if field_names is None else None) or _discard_delta,
                 on_reset=self.on_reset if field_names is None else None,
             )
             effective_style = getattr(client, "last_response_format_style", None)
@@ -806,7 +824,8 @@ class ExtractionService:
         field_confidences: dict[str, float | None] = (
             compute_field_confidences(raw, raw_response) if want_logprobs else {}
         )
-        return raw, usage_dict, effective_style, queue_wait_ms, field_confidences
+        loop_truncated = raw_response.get("docie_loop_truncated")
+        return raw, usage_dict, effective_style, queue_wait_ms, field_confidences, loop_truncated
 
     async def _extract_blocks(
         self,
@@ -888,7 +907,7 @@ class ExtractionService:
                 },
             )
         if groups is None:
-            raw, usage_dict, effective_style, queue_wait_ms, field_confidences = (
+            raw, usage_dict, effective_style, queue_wait_ms, field_confidences, loop_flag = (
                 await self._extract_group(
                     field_names=None,
                     generation_schema=generation_schema,
@@ -908,7 +927,7 @@ class ExtractionService:
                 field_names: list[str],
             ) -> tuple[
                 dict[str, Any], dict[str, Any] | None, str | None, int | None,
-                dict[str, float | None],
+                dict[str, float | None], dict[str, Any] | None,
             ]:
                 return await self._extract_group(
                     field_names=field_names,
@@ -943,11 +962,16 @@ class ExtractionService:
             raw = {}
             field_confidences = {}
             effective_style = None
+            loop_truncations = []
             usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             usage_seen = False
             queue_waits: list[int] = []
-            for group_raw, group_usage, group_style, group_wait, group_conf in group_results:
+            for group_raw, group_usage, group_style, group_wait, group_conf, group_loop in (
+                group_results
+            ):
                 raw.update(group_raw)
+                if group_loop:
+                    loop_truncations.append(group_loop)
                 field_confidences.update(group_conf)
                 if effective_style is None:
                     effective_style = group_style
@@ -963,6 +987,8 @@ class ExtractionService:
             # waited, not the sum (summing would double-count overlapping time).
             queue_wait_ms = max(queue_waits) if queue_waits else None
 
+        if groups is None:
+            loop_truncations = [loop_flag] if loop_flag else []
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
@@ -986,6 +1012,19 @@ class ExtractionService:
                 "subtotal.amount was derived from total_ttc - vat_amount "
                 "(the model did not extract it directly)"
             )
+        for loop in loop_truncations:
+            field = (loop.get("field_path") or ["output"])[0]
+            note = (
+                f"{field}: model output repeated itself ({loop.get('unit', '')[:40]!r}); "
+                "list truncated at the loop start, remaining items dropped; confidence "
+                "capped to 0.5 as a review flag"
+            )
+            validation.warnings.append(note)
+            notes = normalized.get("extraction_notes")
+            if isinstance(notes, list):
+                notes.append(note)
+            if field in normalized:
+                _cap_confidence(normalized[field], 0.5)
         latency_ms = int((time.perf_counter() - started) * 1000)
         usage = Usage.model_validate(usage_dict) if isinstance(usage_dict, dict) else None
 

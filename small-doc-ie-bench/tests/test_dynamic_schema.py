@@ -307,6 +307,36 @@ async def test_null_strings_become_none_and_single_call_reports_no_groups(monkey
 
 
 @pytest.mark.asyncio
+async def test_loop_truncated_group_is_flagged_and_confidence_capped(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        async def chat_json(self, **kwargs: Any) -> tuple[dict[str, Any], None, dict[str, Any]]:
+            raw = {"title": "Doc", "items": [{"name": "Alpha"}, {"name": "Beta"}]}
+            flag = {"unit": '{"name": "Beta"}, ', "kept_chars": 40, "field_path": ["items"]}
+            return raw, None, {"docie_loop_truncated": flag}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("docie_bench.extract.service.OpenAICompatibleClient", FakeClient)
+    response = await ExtractionService(_profile()).extract_from_text(
+        text="Doc Alpha Beta", ocr_blocks=None, schema_name="doc", schema_mode="dynamic",
+        dynamic_schema={"document_type": "doc", "fields": [
+            {"name": "title", "type": "string"},
+            {"name": "items", "type": "list", "fields": [{"name": "name", "type": "string"}]},
+        ]},
+    )
+    assert response.validation.valid
+    warnings = response.validation.warnings
+    assert any(w.startswith("items: model output repeated itself") for w in warnings)
+    assert response.result["extraction_notes"] == response.validation.warnings[-1:]
+    assert all(item["name"]["confidence"] <= 0.5 for item in response.result["items"])
+    assert response.result["title"]["confidence"] == 1
+
+
+@pytest.mark.asyncio
 async def test_parallel_extraction_bounds_fanout_to_deployment_slots(monkeypatch) -> None:
     in_flight = 0
     peak = 0
