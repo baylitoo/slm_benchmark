@@ -506,10 +506,19 @@ def test_repeating_unit_detects_a_cycling_list_but_not_normal_json() -> None:
     assert _repeating_unit(normal) is None
 
 
-@pytest.mark.asyncio
-async def test_stream_aborts_with_repetition_loop_error(monkeypatch) -> None:
-    from docie_bench.llm.model_gateway import RepetitionLoopError
+def test_close_json_prefix_drops_the_unfinished_element_and_reports_the_path() -> None:
+    from docie_bench.llm.openai_client import _close_json_prefix
 
+    prefix = '{"skills": [{"category": "A", "items": [{"item": "x"}, {"item": "y"}, {"it'
+    repaired, path = _close_json_prefix(prefix)
+    assert json.loads(repaired) == {
+        "skills": [{"category": "A", "items": [{"item": "x"}, {"item": "y"}]}]
+    }
+    assert path == ["skills", "items"]
+
+
+@pytest.mark.asyncio
+async def test_stream_salvages_a_repetition_loop(monkeypatch) -> None:
     cycle = '{"item": "MCP (Deep"}, {"item": "Research"}, {"item": "OSINT"}, '
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -524,14 +533,16 @@ async def test_stream_aborts_with_repetition_loop_error(monkeypatch) -> None:
         )
 
     client = await _client(_profile(), handler)
-    with pytest.raises(RepetitionLoopError):
-        await client.chat_json(
-            system_prompt="system",
-            user_prompt="user",
-            schema_name="test",
-            schema={"type": "object"},
-            on_delta=lambda _t: None,
-        )
+    parsed, _usage, raw = await client.chat_json(
+        system_prompt="system",
+        user_prompt="user",
+        schema_name="test",
+        schema={"type": "object"},
+        on_delta=lambda _t: None,
+    )
+    assert [item["item"] for item in parsed["skills"]] == ["MCP (Deep", "Research", "OSINT"]
+    assert raw["docie_loop_truncated"]["field_path"] == ["skills"]
+    assert raw["docie_loop_truncated"]["unit"] == cycle
 
 
 @pytest.mark.asyncio
