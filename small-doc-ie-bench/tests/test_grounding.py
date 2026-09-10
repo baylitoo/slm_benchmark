@@ -74,3 +74,20 @@ def test_ground_evidence_links_each_line_item_cell_to_its_row():
     assert grounded["line_items"][0]["description"]["evidence_ids"] == ["row-2"]
     assert grounded["line_items"][0]["quantity"]["evidence_ids"] == ["row-2"]
     assert grounded["line_items"][0]["line_total"]["evidence_ids"] == ["row-2"]
+
+
+def test_value_spanning_several_lines_grounds_to_the_block_window() -> None:
+    from docie_bench.extract.grounding import ground_evidence
+    from docie_bench.schemas.common import OCRBlock
+
+    lines = [
+        "Conception et développement d'une plateforme SaaS de gestion de stocks pour PME.",
+        "Mise en place de l'API REST et du frontend React.",
+        "Déploiement Docker sur AWS et supervision Prometheus.",
+        "Environnement technique : Python, Django, PostgreSQL",
+    ]
+    blocks = [OCRBlock(id=f"b{i}", text=t, page=1, source="manual") for i, t in enumerate(lines)]
+    value = " ".join(lines[:3])
+    grounded = ground_evidence({"description": {"value": value}}, blocks)
+    assert grounded["description"]["evidence_ids"] == ["b0", "b1", "b2"]
+    assert grounded["description"]["confidence"] >= 0.9
