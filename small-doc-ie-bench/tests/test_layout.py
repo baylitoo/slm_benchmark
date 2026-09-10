@@ -43,3 +43,15 @@ def test_words_of_a_justified_line_merge_but_columns_do_not() -> None:
     assert [b.text for b in merged] == ["Contributions diverses allant", "R1"]
     assert merged[0].bbox is not None
     assert merged[0].bbox.x1 == 160
+
+
+def test_label_and_value_on_a_tab_stop_stay_separate_blocks() -> None:
+    blocks: list[OCRBlock] = []
+    for row in range(4):
+        y = 20 + 14 * row
+        blocks.append(_block(f"Label {row}", 30, y, 150, y + 8))
+        blocks.append(_block(f"value {row} a", 162, y, 300, y + 8))
+    merged = merge_lines(blocks)
+    assert [b.text for b in merged] == [
+        t for row in range(4) for t in (f"Label {row}", f"value {row} a")
+    ]

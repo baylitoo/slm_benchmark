@@ -21,6 +21,7 @@ MIN_COLUMN_SHARE = 0.25
 MIN_COLUMN_BLOCKS = 6
 MAX_COLUMN_WIDTH_RATIO = 2.5
 MERGE_GAP_FACTOR = 3.0
+COLUMN_START_MIN_ITEMS = 3
 
 
 @dataclass(frozen=True)
@@ -45,11 +46,17 @@ def reading_order(blocks: list[OCRBlock], *, min_gap: float = MIN_GAP_POINTS) ->
 
 def merge_lines(blocks: list[OCRBlock]) -> list[OCRBlock]:
     """Join consecutive blocks that sit on the same line with a word-sized gap
-    (justified text split into words by the extractor) into one block."""
+    (justified text split into words by the extractor) into one block. A block
+    that starts on one of the page's column starts (an x where several items
+    begin: the value column of a label/value table) is never merged into the
+    block on its left unless the two are practically touching."""
+    starts_by_page = _column_starts(blocks)
     merged: list[OCRBlock] = []
     for block in blocks:
         previous = merged[-1] if merged else None
-        if previous is not None and _same_line_neighbours(previous, block):
+        if previous is not None and _same_line_neighbours(
+            previous, block, starts_by_page.get(block.page, set())
+        ):
             assert previous.bbox is not None
             assert block.bbox is not None
             merged[-1] = previous.model_copy(
@@ -68,13 +75,28 @@ def merge_lines(blocks: list[OCRBlock]) -> list[OCRBlock]:
     return merged
 
 
-def _same_line_neighbours(left: OCRBlock, right: OCRBlock) -> bool:
+def _column_starts(blocks: list[OCRBlock]) -> dict[int, set[int]]:
+    counts: dict[int, dict[int, int]] = {}
+    for block in blocks:
+        if block.bbox is None:
+            continue
+        page_counts = counts.setdefault(block.page, {})
+        x = round(block.bbox.x0)
+        page_counts[x] = page_counts.get(x, 0) + 1
+    return {
+        page: {x for x, n in page_counts.items() if n >= COLUMN_START_MIN_ITEMS}
+        for page, page_counts in counts.items()
+    }
+
+
+def _same_line_neighbours(left: OCRBlock, right: OCRBlock, column_starts: set[int]) -> bool:
     if left.page != right.page or left.bbox is None or right.bbox is None:
         return False
     height = max(left.bbox.y1 - left.bbox.y0, right.bbox.y1 - right.bbox.y0, 1.0)
     same_line = abs(left.bbox.y0 - right.bbox.y0) <= 0.5 * height
     gap = right.bbox.x0 - left.bbox.x1
-    return same_line and -2.0 <= gap <= MERGE_GAP_FACTOR * height
+    limit = height if round(right.bbox.x0) in column_starts else MERGE_GAP_FACTOR * height
+    return same_line and -2.0 <= gap <= limit
 
 
 def _xy_cut(items: list[OCRBlock], min_gap: float) -> list[OCRBlock]:
