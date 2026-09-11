@@ -336,6 +336,17 @@ FAMILIES: dict[str, FamilyContract] = {
         encoder_backend="gliner",
         ollama_faithful=False,
     ),
+    # GLiFormer: the analyzer surface of encoder_gliner plus a `structure` head
+    # (see encoders/server.py). Served by the same encoder runtime.
+    "encoder_gliformer": FamilyContract(
+        name="encoder_gliformer",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        analyzer=True,
+        encoder_backend="gliformer",
+        ollama_faithful=False,
+    ),
     "encoder_gliner2": FamilyContract(
         name="encoder_gliner2",
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,

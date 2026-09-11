@@ -50,6 +50,10 @@ paddle = [
 encoders = [
   "gliner>=0.2.13",
   "gliner2[local]",
+  # GLiFormer (knowledgator/gliformer-*-v1): NER plus schema-driven structured
+  # extraction on one DeBERTa encoder. Depends on gliner>=0.2.0 and pins
+  # nothing above transformers>=4.40, so it co-resolves with the two above.
+  "gliformer>=0.1.0",
   # Multi-vector (ColBERT / PyLate) reranking: MultiVectorEncoder landed in
   # 6.0. Co-resolves with gliner (transformers>=5.0,<5.14) — verified.
   "sentence-transformers>=6.0"
