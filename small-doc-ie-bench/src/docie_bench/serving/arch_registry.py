@@ -195,6 +195,15 @@ class RepoSignals:
     base_model: str | None = None
     library_name: str | None = None
 
+def _is_gliformer(signals: RepoSignals) -> bool:
+    """A GLiFormer repo, by how it describes itself rather than by its backbone."""
+    if (signals.library_name or "").strip().lower() == "gliformer":
+        return True
+    if any(str(tag).strip().lower() == "gliformer" for tag in signals.tags or ()):
+        return True
+    return "gliformer" in (signals.repo_id or "").lower()
+
+
 
 def _multi_vector_confidence(signals: RepoSignals) -> Confidence | None:
     """Multi-vector / late-interaction retrievers (ColBERT, PyLate) — one
@@ -318,6 +327,17 @@ def resolve_family(
     if "gliner" in arch:
         family = "encoder_gliner2" if "2" in arch else "encoder_gliner"
         return SupportVerdict("supported", family, f"analyzer architecture {architecture!r}")
+
+    # GLiFormer ships no config.json at all (its weights are described by
+    # gliner_config.json), so `arch` is empty and the "no architecture" gate
+    # below would claim it. It is identified the way the repo advertises
+    # itself: library_name, the gliformer tag, or the repo id. Note the repo
+    # also carries a "gliner" TAG — matched on `arch` above, never on tags, so
+    # the two families do not collide.
+    if _is_gliformer(signals):
+        return SupportVerdict(
+            "supported", "encoder_gliformer", "GLiFormer analyzer (library_name=gliformer)"
+        )
 
     if not architecture:
         if has_gguf:

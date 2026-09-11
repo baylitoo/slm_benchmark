@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse
 from docie_bench.openai_protocol import openai_error
 
 DEFAULT_ENCODER_MODEL = "urchade/gliner_multi_pii-v1"
+DEFAULT_GLIFORMER_MODEL = "knowledgator/gliformer-base-v1"
 
 # A practical default label set for the PII/confidentiality use case; callers
 # override per request via `labels`.
@@ -89,6 +90,53 @@ class GlinerBackend:
             }
             for entity in raw
         ]
+
+
+class GliformerBackend:
+    """GLiFormer backend: zero-shot NER plus schema-driven structuring.
+
+    ``knowledgator/gliformer-base-v1`` and ``-large-v1`` are one DeBERTa encoder
+    under several task heads. ``predict_entities`` carries the same signature and
+    result keys as GLiNER's, so the analyzer surface is unchanged; ``structure``
+    is the extra head this family brings (see :meth:`structure`).
+    """
+
+    def __init__(self, model_id: str = DEFAULT_GLIFORMER_MODEL) -> None:
+        try:
+            from gliformer import GLiFormer
+        except ImportError as exc:  # pragma: no cover - environment-dependent
+            raise RuntimeError(
+                "the GLiFormer encoder backend requires the 'encoders' extra: "
+                "pip install 'small-doc-ie-bench[encoders]'"
+            ) from exc
+        self.model_id = model_id
+        self._model = GLiFormer.from_pretrained(model_id, load_tokenizer=True)
+
+    def predict(
+        self, text: str, labels: list[str], threshold: float
+    ) -> list[dict[str, Any]]:
+        raw = self._model.predict_entities(text, labels, threshold=threshold)
+        return [
+            {
+                "type": str(entity["label"]),
+                "value": str(entity["text"]),
+                "start": int(entity["start"]),
+                "end": int(entity["end"]),
+                "score": float(entity.get("score", 0.0)),
+            }
+            for entity in raw
+        ]
+
+    def structure(self, text: str, schema: Any, *, validate_output: bool = True) -> Any:
+        """Extract records for ``schema``.
+
+        ``schema`` is whatever GLiFormer accepts: ``{"employee": ["name",
+        "company"]}`` for the plain field-list form, or ``{"company": Company}``
+        with a Pydantic model for nested records.
+        :class:`~docie_bench.schemas.dynamic.DynamicTemplateBuilder` builds
+        either one from a saved schema.
+        """
+        return self._model.structure(text, schema, validate_output=validate_output)
 
 
 # ---------------------------------------------------------------------------
@@ -203,17 +251,30 @@ class Gliner2Backend:
 def build_backend(model_id: str, kind: str = "auto") -> Any:
     """Instantiate the right backend for ``model_id``.
 
-    ``auto`` keys on the model id ("gliner2" anywhere, case-insensitive) so a
-    deploy needs no extra plumbing — ``fastino/GLiNER2-…`` just works.
+    ``auto`` keys on the model id, case-insensitive, so a deploy needs no extra
+    plumbing — ``fastino/GLiNER2-…`` and ``knowledgator/gliformer-…`` just work.
+    ``gliformer`` is tested first: it is its own library, and neither substring
+    is a prefix of the other, but ordering makes that independent of how the
+    names read.
     """
     normalized = kind.strip().lower()
     if normalized == "auto":
-        normalized = "gliner2" if "gliner2" in model_id.lower() else "gliner"
+        lowered = model_id.lower()
+        if "gliformer" in lowered:
+            normalized = "gliformer"
+        elif "gliner2" in lowered:
+            normalized = "gliner2"
+        else:
+            normalized = "gliner"
+    if normalized == "gliformer":
+        return GliformerBackend(model_id)
     if normalized == "gliner2":
         return Gliner2Backend(model_id)
     if normalized == "gliner":
         return GlinerBackend(model_id)
-    raise ValueError(f"unknown encoder backend {kind!r} (expected auto, gliner, or gliner2)")
+    raise ValueError(
+        f"unknown encoder backend {kind!r} (expected auto, gliner, gliner2, or gliformer)"
+    )
 
 
 def _last_user_text(messages: list[Any]) -> str | None:

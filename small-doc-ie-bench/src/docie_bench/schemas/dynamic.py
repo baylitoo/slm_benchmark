@@ -90,6 +90,68 @@ class DynamicTemplateBuilder:
         return {field.name: cls._nuextract_field(field) for field in spec.fields}
 
     @classmethod
+    def build_gliformer_schema(cls, spec: DynamicSchemaSpec) -> dict[str, Any]:
+        """The Pydantic form GLiFormer's ``structure()`` takes: ``{name: Model}``.
+
+        Every leaf is ``str | None``, including dates and amounts: GLiFormer
+        copies spans off the page, and turning ``"1 234,56 €"`` into a number is
+        the job of the schema-typed pass the extraction pipeline already runs
+        (``normalize_by_schema`` then ``coerce_scalars``). Declaring a Decimal
+        here would make ``validate_output=True`` reject the span instead.
+        """
+        model = create_model(  # type: ignore[call-overload]
+            "".join(part.title() for part in spec.document_type.split("_")) + "Gliformer",
+            __config__=ConfigDict(extra="forbid"),
+            **{field.name: cls._gliformer_field(field) for field in spec.fields},
+        )
+        return {spec.document_type: model}
+
+    @classmethod
+    def build_gliformer_fields(cls, spec: DynamicSchemaSpec) -> dict[str, list[str]]:
+        """The plain form: ``{record: [field, ...]}``.
+
+        Lighter than the Pydantic schema and all GLiFormer needs for a flat
+        record. A nested field contributes its own record, keyed by field name,
+        because this form cannot express nesting.
+        """
+        records: dict[str, list[str]] = {}
+
+        def collect(name: str, fields: list[DynamicFieldSpec]) -> None:
+            leaves: list[str] = []
+            for field in fields:
+                if field.type in {"object", "list"}:
+                    collect(field.name, list(field.fields))
+                else:
+                    leaves.append(field.name)
+            if leaves:
+                records[name] = leaves
+
+        collect(spec.document_type, list(spec.fields))
+        return records
+
+    @classmethod
+    def _gliformer_field(cls, spec: DynamicFieldSpec) -> tuple[Any, Any]:
+        field_info = Field(default=None, description=spec.description)
+        if spec.type == "money":
+            money = create_model(  # type: ignore[call-overload]
+                "".join(part.title() for part in spec.name.split("_")) + "GliformerMoney",
+                __config__=ConfigDict(extra="forbid"),
+                amount=(str | None, Field(default=None)),
+                currency=(str | None, Field(default=None)),
+            )
+            return money | None, field_info
+        if spec.type not in {"object", "list"}:
+            return str | None, field_info
+        nested = create_model(  # type: ignore[call-overload]
+            "".join(part.title() for part in spec.name.split("_")) + "Gliformer",
+            __config__=ConfigDict(extra="forbid"),
+            **{child.name: cls._gliformer_field(child) for child in spec.fields},
+        )
+        if spec.type == "list":
+            return list[nested] | None, field_info  # type: ignore[valid-type]
+        return nested | None, field_info
+
+    @classmethod
     def _model_field(cls, spec: DynamicFieldSpec, *, parent_name: str) -> tuple[Any, Any]:
         field_info = Field(default=None, description=spec.description)
         if spec.type not in {"object", "list"}:
