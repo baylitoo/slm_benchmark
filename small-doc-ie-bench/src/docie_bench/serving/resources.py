@@ -60,6 +60,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from docie_bench.serving.paths import serving_home
+
 logger = logging.getLogger(__name__)
 
 # Default cgroup-v2 controller mount inside a container.
@@ -157,17 +159,6 @@ DEFAULT_CONTEXT_LENGTH = 4096
 DEFAULT_DEPLOY_CONTEXT_LENGTH = 8192
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-
-
-def _serving_home() -> Path:
-    # Must match recency.py / control_plane.from_defaults so every process on
-    # the shared serving-state volume reads and writes the SAME sidecars.
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
 
 
 # --------------------------------------------------------------- node memory
@@ -452,7 +443,7 @@ class FootprintStore:
     """
 
     def __init__(self, home: Path | None = None) -> None:
-        self._directory = (home if home is not None else _serving_home()) / "footprints"
+        self._directory = (home if home is not None else serving_home()) / "footprints"
         # One migration sweep per directory per process (see _PURGED_FOOTPRINT_DIRS):
         # per-request constructions must not re-scan the directory every poll.
         if self._directory not in _PURGED_FOOTPRINT_DIRS:

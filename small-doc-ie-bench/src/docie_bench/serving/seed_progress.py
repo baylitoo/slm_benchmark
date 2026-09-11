@@ -20,20 +20,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from docie_bench.serving.paths import serving_home
+
 _SAFE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
-def _home() -> Path:
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
-
-
 def _progress_dir() -> Path:
-    return _home() / "seed-progress"
+    return serving_home() / "seed-progress"
 
 
 def _progress_path(channel: str) -> Path | None:

@@ -42,6 +42,7 @@ from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.serving.gateway import GatewayRoutingError
 from docie_bench.serving.gateway import resolve_profile as gateway_resolve_profile
 from docie_bench.serving.model_store import FAMILIES
+from docie_bench.serving.paths import serving_home
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
     resolve_store_profile,
@@ -82,17 +83,6 @@ class _Traits:
     timeout_seconds: float = 180.0
 
 
-def _serving_home() -> Path:
-    # Must match ``control_plane.from_defaults`` so the resolver reads the SAME
-    # deployments.json the worker writes (the shared ``serving-state`` volume).
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
-
-
 def _default_live_deployments() -> list[DeploymentRecord]:
     """Read deployments FRESH from disk (uncached), returning typed records.
 
@@ -104,7 +94,7 @@ def _default_live_deployments() -> list[DeploymentRecord]:
     ``ControlPlane`` facade (whose ``list_deployments`` returns JSON dicts, not the
     typed ``DeploymentRecord`` this module needs) and the planner/psutil setup.
     """
-    supervisor = PersistentSupervisor(_serving_home() / "deployments.json")
+    supervisor = PersistentSupervisor(serving_home() / "deployments.json")
     return list(supervisor.list())
 
 
@@ -173,7 +163,7 @@ def _store_family(name: str) -> str | None:
     missing/corrupt index or an absent entry yields ``None`` (fall back to the
     catalog).
     """
-    index_path = _serving_home() / "models" / "index.json"
+    index_path = serving_home() / "models" / "index.json"
     try:
         if not index_path.is_file():
             return None
