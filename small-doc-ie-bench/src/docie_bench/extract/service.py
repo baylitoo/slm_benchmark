@@ -23,7 +23,10 @@ from docie_bench.extract.postprocess import (
     coerce_scalars,
     dedupe_lists,
     normalize_by_schema,
+    normalize_currency,
     normalize_placeholders,
+    parse_number,
+    split_currency,
 )
 from docie_bench.extract.validators import validate_extraction
 from docie_bench.llm.model_profiles import ModelProfile
@@ -59,9 +62,6 @@ from docie_bench.vision import DocumentImage, load_document_images
 logger = logging.getLogger(__name__)
 
 
-_CURRENCY_MAP = {"€": "EUR", "£": "GBP", "$": "USD", "¥": "JPY", "₣": "CHF"}
-_DATE_FIELD_NAMES = {"issue_date", "due_date", "birth_date", "expiry_date"}
-_DECIMAL_FIELD_NAMES = {"vat_rate", "quantity", "tax_rate"}
 
 
 _COUNTRY_ISO: dict[str, str] = {
@@ -74,35 +74,19 @@ _COUNTRY_ISO: dict[str, str] = {
 }
 
 
-def _norm_amount(raw: str) -> str:
-    """Normalize a locale-formatted amount when a model ignores the type hint."""
-    s = re.sub(r"[€£$¥₣a-zA-Z]", "", raw).strip()
-    if "," in s and "." in s:
-        # Ambiguous: detect thousands vs decimal by position
-        comma_pos = s.rfind(",")
-        dot_pos = s.rfind(".")
-        s = s.replace(",", "") if dot_pos > comma_pos else s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(" ", "").replace(",", ".")
-    else:
-        s = s.replace(" ", "")
-    return s
+def _norm_money(sub: dict[str, Any], amount: str) -> None:
+    """Parse a MoneyField NuExtract returned as written, in place.
 
-
-def _norm_date(raw: str) -> str:
-    """Fallback date normalisation for formats the model ignores the 'date' type hint on."""
-    s = raw.strip()
-    # DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY (European numeric)
-    m = re.match(r"^(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})$", s)
-    if m:
-        return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
-    # "28 Feb 2026" / "28 February 2026" (written English month)
-    try:
-        from dateutil import parser as _dp
-        dt = _dp.parse(s, dayfirst=True)
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return s
+    Unparseable text is left exactly as the model wrote it: ``coerce_scalars``
+    runs later over every schema-typed leaf and drops it with a warning naming
+    the field. Guessing here instead is how ``"12 rue de la Paix"`` became 12.
+    """
+    text, currency = split_currency(amount)
+    number = parse_number(text)
+    if number is not None:
+        sub["amount"] = str(number)
+    if currency and not sub.get("currency"):
+        sub["currency"] = currency
 
 
 def _derive_invoice_subtotal(result: dict[str, Any]) -> bool:
@@ -180,18 +164,9 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dic
                 result[key] = None
                 continue
             if isinstance(amt, str):
-                sub["amount"] = _norm_amount(amt)
-            if "currency" in sub and isinstance(sub.get("currency"), str):
-                currency = sub["currency"].strip()
-                sub["currency"] = _CURRENCY_MAP.get(currency, currency) or None
-
-        # Date fallback
-        if key in _DATE_FIELD_NAMES and isinstance(sub.get("value"), str) and sub["value"]:
-            sub["value"] = _norm_date(sub["value"])
-
-        # NumberField fallback (strip "%" etc.)
-        if key in _DECIMAL_FIELD_NAMES and isinstance(sub.get("value"), str):
-            sub["value"] = re.sub(r"[%\s]", "", sub["value"]).replace(",", ".")
+                _norm_money(sub, amt)
+            if isinstance(sub.get("currency"), str):
+                sub["currency"] = normalize_currency(sub["currency"])
 
         # IBAN spaces
         if key == "iban" and isinstance(sub.get("value"), str):
@@ -219,24 +194,17 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dic
     return result, derived_subtotal
 
 
-def _normalize_nested_nuextract(obj: Any, field_name: str | None = None) -> Any:
+def _normalize_nested_nuextract(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_normalize_nested_nuextract(item) for item in obj]
     if not isinstance(obj, dict):
         return obj
-    normalized = {
-        key: _normalize_nested_nuextract(value, key)
-        for key, value in obj.items()
-    }
-    if isinstance(normalized.get("amount"), str):
-        normalized["amount"] = _norm_amount(normalized["amount"])
+    normalized = {key: _normalize_nested_nuextract(value) for key, value in obj.items()}
+    amount = normalized.get("amount")
+    if isinstance(amount, str):
+        _norm_money(normalized, amount)
     if isinstance(normalized.get("currency"), str):
-        currency = normalized["currency"].strip()
-        normalized["currency"] = _CURRENCY_MAP.get(currency, currency) or None
-    if field_name in _DECIMAL_FIELD_NAMES and isinstance(normalized.get("value"), str):
-        normalized["value"] = re.sub(r"[%\s]", "", normalized["value"]).replace(",", ".")
-    if field_name in _DATE_FIELD_NAMES and isinstance(normalized.get("value"), str):
-        normalized["value"] = _norm_date(normalized["value"])
+        normalized["currency"] = normalize_currency(normalized["currency"])
     if normalized.get("value") == "":
         return None
     return normalized

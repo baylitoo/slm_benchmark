@@ -175,7 +175,13 @@ def dedupe_lists(value: Any) -> Any:
 
 _KEEP = object()
 
-_CURRENCY_BY_SYMBOL = {"€": "EUR", "$": "USD", "£": "GBP", "¥": "JPY"}
+_CURRENCY_BY_SYMBOL = {
+    "€": "EUR",
+    "$": "USD",
+    "£": "GBP",
+    "¥": "JPY",
+    "₣": "CHF",
+}
 _CURRENCY_CODES = {"EUR", "USD", "GBP", "CHF", "CAD", "JPY", "AUD", "SEK", "NOK", "DKK"}
 _NUMBER_CHARS = re.compile(r"^[+-]?[\d .,'  ]+$")
 _GROUPED = re.compile(r"^\d{1,3}(?:[ .,'  ]\d{3})+$")
@@ -276,12 +282,15 @@ def split_currency(text: str) -> tuple[str, str | None]:
 def parse_number(text: str) -> Decimal | None:
     """Parse a human-written amount, or ``None`` when the text is not one.
 
-    Deliberately strict: only digits, a sign and separators are accepted, and
-    every thousands group must hold exactly three digits. Stripping the other
+    Deliberately strict: only digits, a sign, separators and a trailing percent
+    sign are accepted, and every thousands group must hold exactly three digits. Stripping the other
     characters instead would read ``"12 rue de la Paix"`` as ``12`` and a phone
     number as a nine-digit amount.
     """
     text = text.strip().replace(" ", " ").replace(" ", " ")
+    # A rate copied off the page keeps the number as written ("5,5 %" is 5.5,
+    # not 0.055): the schema says what the field means, this only parses it.
+    text = text.removesuffix("%").strip()
     if not text or not _NUMBER_CHARS.match(text) or not any(c.isdigit() for c in text):
         return None
     sign = "-" if text.startswith("-") else ""
