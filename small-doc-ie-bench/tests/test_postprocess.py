@@ -3,6 +3,7 @@ from typing import Any
 import pytest
 
 from docie_bench.extract.postprocess import (
+    coerce_scalars,
     dedupe_lists,
     normalize_by_schema,
     normalize_date,
@@ -104,10 +105,14 @@ async def test_service_normalizes_dates_by_schema_type(monkeypatch) -> None:
             "document_type": "doc",
             "fields": [
                 {"name": "title", "type": "string"},
-                {"name": "experience", "type": "list", "fields": [
-                    {"name": "start_date", "type": "date"},
-                    {"name": "end_date", "type": "date"},
-                ]},
+                {
+                    "name": "experience",
+                    "type": "list",
+                    "fields": [
+                        {"name": "start_date", "type": "date"},
+                        {"name": "end_date", "type": "date"},
+                    ],
+                },
             ],
         },
     )
@@ -118,3 +123,58 @@ async def test_service_normalizes_dates_by_schema_type(monkeypatch) -> None:
     assert first["end_date"]["value"] is None
     assert second["start_date"]["value"] == "2019"
     assert second["end_date"]["value"] == "2022"
+
+
+def _money_spec() -> dict:
+    return {
+        "document_type": "invoice",
+        "fields": [
+            {"name": "total", "type": "money"},
+            {"name": "years_experience", "type": "number"},
+        ],
+    }
+
+
+def _money_root() -> dict:
+    spec = DynamicSchemaSpec.model_validate(_money_spec())
+    return DynamicTemplateBuilder.build_model(spec).model_json_schema()
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        ("3,5", "3.5"),
+        ("1.234,56", "1234.56"),
+        ("1,234.56", "1234.56"),
+        ("1 234,56", "1234.56"),
+        ("1234", "1234"),
+    ],
+)
+def test_a_number_written_as_text_is_coerced(written: str, expected: str) -> None:
+    payload = {"years_experience": {"value": written, "evidence_ids": [], "confidence": 0.9}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["years_experience"]["value"] == expected
+    assert warnings == []
+
+
+def test_an_amount_carries_its_currency_when_the_currency_leaf_is_empty() -> None:
+    payload = {"total": {"amount": "1 234,56 \u20ac", "currency": None}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["total"] == {"amount": "1234.56", "currency": "EUR"}
+    assert warnings == []
+
+
+def test_a_currency_symbol_becomes_an_iso_code() -> None:
+    payload = {"total": {"amount": "10", "currency": "\u20ac"}}
+    out, _ = coerce_scalars(payload, _money_root())
+    assert out["total"]["currency"] == "EUR"
+
+
+@pytest.mark.parametrize("written", ["12 rue de la Paix", "06 12 34 56 78", "5 ans"])
+def test_text_that_is_not_a_number_is_dropped_with_a_warning(written: str) -> None:
+    payload = {"years_experience": {"value": written, "evidence_ids": ["b1"], "confidence": 0.4}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["years_experience"]["value"] is None
+    assert out["years_experience"]["evidence_ids"] == ["b1"]
+    assert len(warnings) == 1
+    assert written in warnings[0]
