@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import re
 import shutil
 import socket
@@ -27,6 +26,7 @@ from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 if TYPE_CHECKING:
     from docie_bench.serving.runtime import RuntimeLaunchSpec
 
+from docie_bench.serving.paths import serving_home
 from docie_bench.serving.placement import (
     clear_placement,
     mark_placement_ready,
@@ -304,17 +304,12 @@ class ControlPlane:
         import psutil
 
         from docie_bench.serving.planner import HostResources, ResourcePlanner, RuntimeName
-        from docie_bench.serving.resources import read_node_memory
         from docie_bench.serving.registry import ModelRegistry
+        from docie_bench.serving.resources import read_node_memory
         from docie_bench.serving.runtime import default_runtime_adapters
         from docie_bench.serving.supervisor import PersistentSupervisor
 
-        home = Path(
-            os.environ.get(
-                "DOCIE_SERVING_HOME",
-                Path.home() / ".local" / "share" / "docie-bench" / "serving",
-            )
-        )
+        home = serving_home()
         registry = _DefaultRegistry(ModelRegistry(home / "registry"))
         runtimes = _DefaultRuntimes(default_runtime_adapters())
         planner = _DefaultPlanner(

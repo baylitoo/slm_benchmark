@@ -34,6 +34,7 @@ from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
 from docie_bench.serving.failure import classify_failure
+from docie_bench.serving.paths import serving_home
 from docie_bench.settings import get_settings
 
 logger = logging.getLogger("docie_bench.inngest.serving_api")
@@ -575,21 +576,10 @@ async def deployment_slots(name: str) -> dict[str, Any]:
     return {"name": name, "slots": list(slots)}
 
 
-def _serving_home() -> Path:
-    """The shared serving home (``DOCIE_SERVING_HOME``) on the serving-state
-    volume that api, serving and worker all mount."""
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
-
-
 def _serving_logs_dir() -> Path:
     """``<serving_home>/logs`` — the runtime stdout files the supervisor writes,
     readable by the api (it never spawned the process)."""
-    return _serving_home() / "logs"
+    return serving_home() / "logs"
 
 
 @router.get("/deployments/{name}/logs")
@@ -1079,7 +1069,7 @@ def _ondisk_store_view() -> list[dict[str, Any]]:
     from docie_bench.serving.catalog import available_backends
     from docie_bench.serving.model_store import FAMILIES, ModelStore
 
-    store = ModelStore(_serving_home() / "models")
+    store = ModelStore(serving_home() / "models")
     view: list[dict[str, Any]] = []
     for entry in store.list():
         contract = FAMILIES.get(entry.family)

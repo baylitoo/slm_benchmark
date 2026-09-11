@@ -40,6 +40,7 @@ from docie_bench.inngest.realtime import (
     publish,
 )
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.serving.paths import serving_home
 from docie_bench.serving.placement_resolver import STORE_PROFILE_PREFIX
 from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
@@ -124,7 +125,7 @@ def _read_deployment(name: str) -> dict[str, Any] | None:
 
     try:
         payload = json.loads(
-            (_serving_home() / "deployments.json").read_text(encoding="utf-8")
+            (serving_home() / "deployments.json").read_text(encoding="utf-8")
         )
         record = (payload.get("deployments") or {}).get(name)
         return record if isinstance(record, dict) else None
@@ -167,7 +168,7 @@ def _read_all_deployments() -> dict[str, dict[str, Any]]:
     see ``control_plane.replica_deployment_name``), not one record.
     """
     try:
-        payload = json.loads((_serving_home() / "deployments.json").read_text(encoding="utf-8"))
+        payload = json.loads((serving_home() / "deployments.json").read_text(encoding="utf-8"))
         deployments = payload.get("deployments")
         return deployments if isinstance(deployments, dict) else {}
     except (OSError, ValueError):
@@ -1630,14 +1631,6 @@ async def pin_deployment_job(ctx: inngest.Context) -> Any:
     return result
 
 
-def _serving_home() -> Path:
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME", Path.home() / ".local" / "share" / "docie-bench" / "serving"
-        )
-    )
-
-
 async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     """Seed a GGUF from the host's Ollama into the store + record it in the catalog."""
     from docie_bench.serving.model_store import ModelStore
@@ -1651,7 +1644,7 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     if not reference or not name:
         raise ValueError("seed event must include 'reference' and 'name'")
 
-    store = ModelStore(_serving_home() / "models")
+    store = ModelStore(serving_home() / "models")
     # Blocking file I/O (hard-link or copy of multi-GB blobs, plus a one-time
     # full-file rehash to verify integrity) -> off the loop. The rehash adds one
     # multi-GB read per seed; acceptable as a one-time, threaded cost.
@@ -1861,7 +1854,7 @@ async def _run_seed_hf(
     name = str(data.get("name") or "") or default_store_name(repo)
     contract = get_family(family)  # fail fast on an unknown family
 
-    store = ModelStore(_serving_home() / "models")
+    store = ModelStore(serving_home() / "models")
     tmp_dir = store.root / ".hf-downloads" / name
 
     throttle = {"at": 0.0, "percent": -100.0}
@@ -2096,7 +2089,7 @@ def _gc_seed_leftovers_sync() -> dict[str, int]:
     from docie_bench.serving.seed_progress import prune_stale
 
     removed_staging = 0
-    staging_root = _serving_home() / "models" / ".hf-downloads"
+    staging_root = serving_home() / "models" / ".hf-downloads"
     now = time.time()
     try:
         children = list(staging_root.iterdir())
