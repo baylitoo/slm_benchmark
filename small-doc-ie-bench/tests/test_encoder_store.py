@@ -12,7 +12,9 @@ from docie_bench.serving.catalog import available_backends
 from docie_bench.serving.hf_hub import (
     HfHubError,
     _is_snapshot_file,
+    is_weights_file,
     list_snapshot_files,
+    snapshot_files_for,
 )
 from docie_bench.serving.model_store import FAMILIES, ModelStore, ModelStoreError, get_family
 
@@ -200,3 +202,41 @@ async def test_list_snapshot_files_keeps_pytorch_weights_when_there_are_no_safet
     assert "pytorch_model.bin" in names
     assert "gliner_config.json" in names
     assert "tokenizer.json" in names
+
+
+# ── the deploy form and the download agree on the file list ──────────────────
+
+GLIFORMER_LARGE_SIBLINGS = [
+    {"rfilename": ".gitattributes", "size": 1_500},
+    {"rfilename": "README.md", "size": 10_800},
+    {"rfilename": "gliformer-tasks.gif", "size": 8_500_000},
+    {"rfilename": "gliner_config.json", "size": 13_100},
+    {"rfilename": "pytorch_model.bin", "size": 2_300_000_000},
+    {"rfilename": "tokenizer.json", "size": 7_900_000},
+    {"rfilename": "tokenizer_config.json", "size": 724},
+    {"rfilename": "trainer_state.json", "size": 33_500},
+]
+
+
+def test_a_pytorch_only_checkpoint_keeps_its_weights_in_the_file_list() -> None:
+    # What the deploy form showed before: seven files, every one labelled
+    # "support", 16.5 MB — the gif and the tokenizer, with the 2.3 GB of
+    # weights silently absent.
+    files = snapshot_files_for(GLIFORMER_LARGE_SIBLINGS)
+    names = {f.filename for f in files}
+    assert "pytorch_model.bin" in names
+    assert sum(f.size_bytes or 0 for f in files) > 2_000_000_000
+
+
+def test_the_weights_file_reads_as_weights_whatever_its_format() -> None:
+    assert is_weights_file("pytorch_model.bin")
+    assert is_weights_file("model.safetensors")
+    assert not is_weights_file("tokenizer.json")
+    assert not is_weights_file("gliformer-tasks.gif")
+
+
+def test_safetensors_still_win_when_a_repo_ships_both() -> None:
+    files = snapshot_files_for(SNAPSHOT_SIBLINGS)
+    names = {f.filename for f in files}
+    assert "model.safetensors" in names
+    assert "pytorch_model.bin" not in names
