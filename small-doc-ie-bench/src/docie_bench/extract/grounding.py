@@ -20,25 +20,59 @@ def ground_evidence(
     match_threshold: float = DEFAULT_MATCH_THRESHOLD,
 ) -> dict[str, Any]:
     """Link typed extraction fields to the best matching OCR block."""
-    grounded = _copy_and_ground(payload, blocks, match_threshold)
+    grounded = _copy_and_ground(payload, _Evidence.of(blocks), match_threshold)
     return grounded if isinstance(grounded, dict) else payload
 
 
-def _copy_and_ground(obj: Any, blocks: list[OCRBlock], match_threshold: float) -> Any:
+class _Evidence:
+    """The candidate spans of a block list, normalised once.
+
+    Every field is matched against the same windows of up to
+    ``MAX_WINDOW_BLOCKS`` consecutive same-page blocks. The windows depend only
+    on the blocks, so building and normalising them per field was repeating the
+    same NFKD decomposition and regex for every field on the page.
+    """
+
+    __slots__ = ("blocks", "spans")
+
+    def __init__(self, blocks: list[OCRBlock], spans: list[tuple[list[str], str]]) -> None:
+        self.blocks = blocks
+        self.spans = spans
+
+    @classmethod
+    def of(cls, blocks: list[OCRBlock]) -> _Evidence:
+        spans: list[tuple[list[str], str]] = []
+        for index, block in enumerate(blocks):
+            ids: list[str] = []
+            texts: list[str] = []
+            for window in blocks[index : index + MAX_WINDOW_BLOCKS]:
+                if window.page != block.page:
+                    break
+                ids.append(window.id)
+                texts.append(window.text)
+                normalized = _normalize(" ".join(texts))
+                if normalized:
+                    spans.append((list(ids), normalized))
+        return cls(blocks, spans)
+
+    def restrict(self, evidence_ids: list[str]) -> _Evidence:
+        """The same view over only the blocks a row already matched."""
+        keep = set(evidence_ids)
+        return _Evidence.of([block for block in self.blocks if block.id in keep])
+
+
+def _copy_and_ground(obj: Any, evidence: _Evidence, match_threshold: float) -> Any:
     if isinstance(obj, list):
-        return [_copy_and_ground_row(item, blocks, match_threshold) for item in obj]
+        return [_copy_and_ground_row(item, evidence, match_threshold) for item in obj]
     if not isinstance(obj, dict):
         return obj
 
-    result = {
-        key: _copy_and_ground(value, blocks, match_threshold)
-        for key, value in obj.items()
-    }
+    result = {key: _copy_and_ground(value, evidence, match_threshold) for key, value in obj.items()}
     candidate = _field_candidate(result)
     if candidate is None:
         return result
 
-    evidence_ids, score = _best_match(candidate, blocks)
+    evidence_ids, score = _best_match(candidate, evidence)
     if evidence_ids and score >= match_threshold:
         result["evidence_ids"] = evidence_ids
         result["confidence"] = round(score, 4)
@@ -48,15 +82,14 @@ def _copy_and_ground(obj: Any, blocks: list[OCRBlock], match_threshold: float) -
     return result
 
 
-def _copy_and_ground_row(obj: Any, blocks: list[OCRBlock], match_threshold: float) -> Any:
+def _copy_and_ground_row(obj: Any, evidence: _Evidence, match_threshold: float) -> Any:
     if not isinstance(obj, dict):
-        return _copy_and_ground(obj, blocks, match_threshold)
+        return _copy_and_ground(obj, evidence, match_threshold)
     candidate = " ".join(_row_candidates(obj))
-    evidence_ids, score = _best_match(candidate, blocks) if candidate else ([], 0.0)
+    evidence_ids, score = _best_match(candidate, evidence) if candidate else ([], 0.0)
     if score < match_threshold:
-        return _copy_and_ground(obj, blocks, match_threshold)
-    preferred_blocks = [block for block in blocks if block.id in evidence_ids]
-    return _copy_and_ground(obj, preferred_blocks, match_threshold)
+        return _copy_and_ground(obj, evidence, match_threshold)
+    return _copy_and_ground(obj, evidence.restrict(evidence_ids), match_threshold)
 
 
 def _row_candidates(obj: Any) -> list[str]:
@@ -78,32 +111,17 @@ def _field_candidate(field: dict[str, Any]) -> str | None:
     return text or None
 
 
-def _best_match(candidate: str, blocks: list[OCRBlock]) -> tuple[list[str], float]:
+def _best_match(candidate: str, evidence: _Evidence) -> tuple[list[str], float]:
     variants = _candidate_variants(candidate)
     best_ids: list[str] = []
     best_score = 0.0
-    for index, block in enumerate(blocks):
-        # A value copied from several consecutive lines (a paragraph, a
-        # wrapped title) only matches a window of blocks, never one block.
-        spans: list[tuple[list[str], str]] = []
-        ids: list[str] = []
-        texts: list[str] = []
-        for window in blocks[index : index + MAX_WINDOW_BLOCKS]:
-            if window.page != block.page:
-                break
-            ids.append(window.id)
-            texts.append(window.text)
-            spans.append((list(ids), " ".join(texts)))
-        for evidence_ids, text in spans:
-            block_text = _normalize(text)
-            if not block_text:
-                continue
-            score = max(_match_score(variant, block_text) for variant in variants)
-            if score > best_score or (
-                score == best_score and (not best_ids or len(evidence_ids) < len(best_ids))
-            ):
-                best_ids = evidence_ids
-                best_score = score
+    for evidence_ids, block_text in evidence.spans:
+        score = max(_match_score(variant, block_text) for variant in variants)
+        if score > best_score or (
+            score == best_score and (not best_ids or len(evidence_ids) < len(best_ids))
+        ):
+            best_ids = evidence_ids
+            best_score = score
     return best_ids, best_score
 
 
