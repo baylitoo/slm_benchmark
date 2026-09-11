@@ -152,6 +152,21 @@ def _resolve_extraction_schema(schema_name: str) -> tuple[str, dict[str, Any] | 
         return "dynamic", saved["spec"]
 
 
+# Every key a field wrapper may carry beside its value. A wrapper is unwrapped
+# for the Agent's flat contract whatever subset of these it holds: gaining one
+# (``model_confidence``, when logprob confidence is on) must not change the
+# shape of the value a consumer reads.
+_WRAPPER_METADATA = frozenset({"evidence_ids", "confidence", "model_confidence"})
+
+
+def _is_wrapper(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and "value" in value
+        and set(value) - {"value"} <= (_WRAPPER_METADATA)
+    )
+
+
 def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
     """Restore the Agent endpoint's flat value contract after shared validation.
 
@@ -163,9 +178,9 @@ def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
         return [_flatten_agent_result(item, root=False) for item in value]
     if not isinstance(value, dict):
         return value
-    if "value" in value and set(value) <= {"value", "evidence_ids", "confidence"}:
+    if _is_wrapper(value):
         return _flatten_agent_result(value.get("value"), root=False)
-    omitted = {"evidence_ids", "confidence"}
+    omitted = set(_WRAPPER_METADATA)
     if root:
         omitted.update({"document_type", "extraction_notes"})
     return {
@@ -173,6 +188,48 @@ def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
         for key, item in value.items()
         if key not in omitted
     }
+
+
+def _field_confidence(result: Any) -> dict[str, dict[str, Any]]:
+    """Per-field review signal for a flat Agent consumer.
+
+    Flattening drops the wrappers, so a consumer reading the completion's
+    content can tell that a record needs review (the aggregate validation
+    block) but not *which* field. This walks the rich result before it is
+    flattened and reports one entry per wrapped leaf, keyed by the same dotted
+    path the value sits at in the content: ``experience[0].title``.
+
+    Entries carry the grounding ``confidence`` (0..1, where a repetition-loop
+    truncation caps the field to 0.5) and, when logprob confidence is enabled,
+    ``model_confidence``. A field with no evidence is reported too, at its real
+    confidence of 0, which is the point.
+    """
+    out: dict[str, dict[str, Any]] = {}
+
+    def walk(node: Any, path: str) -> None:
+        if _is_wrapper(node):
+            entry: dict[str, Any] = {"confidence": node.get("confidence", 0.0)}
+            if node.get("model_confidence") is not None:
+                entry["model_confidence"] = node["model_confidence"]
+            if node.get("evidence_ids"):
+                entry["evidence_ids"] = list(node["evidence_ids"])
+            if path:
+                out[path] = entry
+            return
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in _WRAPPER_METADATA or (not path and key in _ROOT_OMITTED):
+                    continue
+                walk(item, f"{path}.{key}" if path else key)
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{path}[{index}]")
+
+    walk(result, "")
+    return out
+
+
+_ROOT_OMITTED = frozenset({"document_type", "extraction_notes"})
 
 
 def _money_amount(value: Any) -> float | None:
@@ -209,8 +266,7 @@ def _invoice_sum_check(result: dict[str, Any]) -> dict[str, Any] | None:
     amounts = [
         amount
         for item in line_items
-        if isinstance(item, dict)
-        and (amount := _money_amount(item.get("line_total"))) is not None
+        if isinstance(item, dict) and (amount := _money_amount(item.get("line_total"))) is not None
     ]
     if not amounts:
         return None
@@ -303,9 +359,7 @@ async def _complete_structured_document(
             error_type="upstream_error",
         ) from exc
     except ValueError as exc:
-        raise AgentError(
-            str(exc), status_code=400, error_type="invalid_request_error"
-        ) from exc
+        raise AgentError(str(exc), status_code=400, error_type="invalid_request_error") from exc
     finally:
         path.unlink(missing_ok=True)
 
@@ -348,6 +402,7 @@ async def _complete_structured_document(
             else response.latency_ms
         ),
         "parallel_groups": response.parallel_groups,
+        "field_confidence": _field_confidence(response.result),
     }
     if routing_audit is not None:
         docie_agent["routing"] = routing_audit
@@ -498,7 +553,7 @@ async def _complete_ocr(
         # model. Runs through the shared structured path with a prebuilt
         # router as the executor.
         if extractor_selector.startswith(_POLICY_PREFIX):
-            policy_name = extractor_selector[len(_POLICY_PREFIX):]
+            policy_name = extractor_selector[len(_POLICY_PREFIX) :]
             schema_name = options.get("schema")
             if not schema_name:
                 raise AgentError(
@@ -636,8 +691,7 @@ async def _complete_proxy(
     unsafe = moderation_flags(guard_state.get("moderation") or {})
     if mode == "block" and unsafe:
         raise AgentError(
-            f"request blocked by agent {spec.name!r}: flagged by moderation "
-            f"({', '.join(unsafe)})",
+            f"request blocked by agent {spec.name!r}: flagged by moderation ({', '.join(unsafe)})",
             status_code=400,
             error_type="unsafe_blocked",
         )
@@ -662,9 +716,7 @@ async def _complete_proxy(
         "analyzer": analyzer_label,
         "detected": sum(detected_types.values()),
         # Types + placeholders only — raw values never leave the process.
-        "entities": [
-            {"type": t, "count": n} for t, n in sorted(detected_types.items())
-        ],
+        "entities": [{"type": t, "count": n} for t, n in sorted(detected_types.items())],
         "placeholders": sorted(placeholders) if mode == "placeholder" else [],
     }
     if guard_state.get("degraded"):
@@ -733,11 +785,7 @@ def _build_analyzer(
             status_code=500,
             error_type="invalid_agent_config",
         )
-    labels = (
-        [str(label) for label in labels_raw]
-        if labels_raw
-        else labels_from_entities(entities)
-    )
+    labels = [str(label) for label in labels_raw] if labels_raw else labels_from_entities(entities)
     threshold_raw = options.get("guard_threshold")
     try:
         threshold = float(threshold_raw) if threshold_raw is not None else None
@@ -771,9 +819,7 @@ def _build_analyzer(
             if fallback_to_regex:
                 guard_state["degraded"] = True
                 return pii.analyze(text, entities)
-            raise AgentError(
-                exc.message, status_code=502, error_type="guard_unavailable"
-            ) from exc
+            raise AgentError(exc.message, status_code=502, error_type="guard_unavailable") from exc
         if result.moderation:
             _merge_moderation(guard_state, result.moderation)
         return result.entities
@@ -974,9 +1020,7 @@ async def _complete_with_tools(
                     # branch (returned to the caller, never executed) rather
                     # than being honored.
                     tools = [t for t in tools if t["function"]["name"] in allowed]
-                    mapping = {
-                        name: target for name, target in mapping.items() if name in allowed
-                    }
+                    mapping = {name: target for name, target in mapping.items() if name in allowed}
                 completion = await mcp_mod.run_tool_loop(
                     post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
                 )
@@ -1137,9 +1181,7 @@ async def _stream_with_tools(
                         if allowed is not None:
                             tools = [t for t in tools if t["function"]["name"] in allowed]
                             mapping = {
-                                name: target
-                                for name, target in mapping.items()
-                                if name in allowed
+                                name: target for name, target in mapping.items() if name in allowed
                             }
                         completion = await mcp_mod.run_tool_loop(
                             post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
@@ -1378,8 +1420,7 @@ def _resolve_step_agent(spec: AgentSpec, step_name: str, agent_name: str) -> Age
         return AgentRegistry().get(agent_name)
     except AgentNotFoundError as exc:
         raise AgentError(
-            f"agent {spec.name!r}: step {step_name!r} references unknown agent "
-            f"{agent_name!r}",
+            f"agent {spec.name!r}: step {step_name!r} references unknown agent {agent_name!r}",
             status_code=500,
             error_type="invalid_agent_config",
         ) from exc
@@ -1713,9 +1754,7 @@ async def stream_workflow(
                     step_name=step_name,
                 ):
                     if event["type"] == "tool_call":
-                        tool_call_trace.append(
-                            {k: v for k, v in event.items() if k != "type"}
-                        )
+                        tool_call_trace.append({k: v for k, v in event.items() if k != "type"})
                         yield event
                     elif event["type"] == "error":
                         yield event
