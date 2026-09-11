@@ -139,6 +139,9 @@ class FamilyContract:
 
 
 # Known families. Adding a new model is "drop the GGUF + pick (or add) a family".
+_SNAPSHOT_WEIGHT_SUFFIXES = frozenset({".safetensors", ".bin", ".pt", ".pth"})
+
+
 FAMILIES: dict[str, FamilyContract] = {
     "nuextract3": FamilyContract(
         name="nuextract3",
@@ -341,7 +344,10 @@ FAMILIES: dict[str, FamilyContract] = {
     "encoder_gliformer": FamilyContract(
         name="encoder_gliformer",
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
-        response_format_style="none",
+        # Not "none": the schema on the request IS how this family extracts.
+        # Without it the server has nothing to structure into and falls back to
+        # entity recognition.
+        response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",
         analyzer=True,
         encoder_backend="gliformer",
@@ -700,9 +706,13 @@ class ModelStore:
         src = Path(snapshot_dir)
         if not src.is_dir():
             raise ModelStoreError(f"snapshot directory not found: {src}")
-        if not any(p.suffix == ".safetensors" for p in src.rglob("*") if p.is_file()):
+        # Safetensors OR PyTorch weights: an encoder checkpoint that ships only
+        # pytorch_model.bin loads the same way through ``from_pretrained``.
+        if not any(
+            p.suffix in _SNAPSHOT_WEIGHT_SUFFIXES for p in src.rglob("*") if p.is_file()
+        ):
             raise ModelStoreError(
-                f"snapshot {src} has no .safetensors weights — not a servable checkpoint"
+                f"snapshot {src} has no weights — not a servable checkpoint"
             )
         _assert_within(self.root / name, self.root, label=f"store name {name!r}")
 

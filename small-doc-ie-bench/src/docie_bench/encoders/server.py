@@ -36,6 +36,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from docie_bench.openai_protocol import openai_error
+from docie_bench.schemas.dynamic import gliformer_model_from_json_schema
 
 DEFAULT_ENCODER_MODEL = "urchade/gliner_multi_pii-v1"
 DEFAULT_GLIFORMER_MODEL = "knowledgator/gliformer-base-v1"
@@ -248,6 +249,40 @@ class Gliner2Backend:
         return dict(self._model.classify_text(text, tasks, threshold=0.5))
 
 
+def _one_record(records: Any, record_name: str) -> dict[str, Any]:
+    """GLiFormer returns a LIST of records per schema key; an extraction of one
+    document wants one object. The first record is the document."""
+    if isinstance(records, dict):
+        rows = records.get(record_name)
+        if isinstance(rows, list):
+            first = rows[0] if rows else {}
+            return first if isinstance(first, dict) else {}
+        if isinstance(rows, dict):
+            return rows
+        return dict(records)
+    return {}
+
+
+def _completion(model_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-encoder",
+        "object": "chat.completion",
+        "created": 0,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 def build_backend(model_id: str, kind: str = "auto") -> Any:
     """Instantiate the right backend for ``model_id``.
 
@@ -363,6 +398,39 @@ def create_encoder_app(
                 "an encoder request needs at least one user message with text content",
                 status_code=400,
                 error_type="invalid_request_error",
+            )
+
+        # A schema on the request turns this into a structured extraction: the
+        # rest of the platform already sends one as
+        # response_format.json_schema, so a served GLiFormer is reached through
+        # the ordinary extraction path with no channel of its own.
+        schema_spec = (body.get("response_format") or {}) if isinstance(
+            body.get("response_format"), dict
+        ) else {}
+        json_schema = schema_spec.get("json_schema") or {}
+        schema_root = json_schema.get("schema") if isinstance(json_schema, dict) else None
+        if isinstance(schema_root, dict) and schema_root:
+            structure = getattr(app.state.backend, "structure", None)
+            if structure is None:
+                return openai_error(
+                    "this encoder backend has no structuring head — serve a "
+                    "GLiFormer checkpoint (e.g. knowledgator/gliformer-base-v1) "
+                    "to extract records from a schema",
+                    status_code=400,
+                    error_type="invalid_request_error",
+                )
+            record_name = str(json_schema.get("name") or "record")
+            try:
+                model = gliformer_model_from_json_schema(schema_root, name=record_name)
+            except ValueError as exc:
+                return openai_error(
+                    f"schema cannot be structured: {exc}",
+                    status_code=400,
+                    error_type="invalid_request_error",
+                )
+            records = await asyncio.to_thread(structure, text, {record_name: model})
+            return JSONResponse(
+                _completion(app.state.model_id, _one_record(records, record_name))
             )
 
         labels_raw = body.get("labels")
