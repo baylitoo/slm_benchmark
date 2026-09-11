@@ -38,6 +38,8 @@ from typing import Any, Protocol
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from docie_bench.openai_protocol import openai_error
+
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TEMPERATURE = 0.0
 
@@ -235,10 +237,7 @@ class HfTransformersBackend:
 
         from PIL import Image  # transformers pulls Pillow for VLMs
 
-        return [
-            Image.open(io.BytesIO(_decode_data_uri(url))).convert("RGB")
-            for url in image_urls
-        ]
+        return [Image.open(io.BytesIO(_decode_data_uri(url))).convert("RGB") for url in image_urls]
 
     def generate(
         self, messages: list[dict[str, Any]], *, max_tokens: int, temperature: float
@@ -274,19 +273,10 @@ class HfTransformersBackend:
         new_tokens = output[0][input_len:]
         decoder = getattr(self._processor, "batch_decode", None)
         if decoder is not None:
-            text = self._processor.batch_decode(
-                [new_tokens], skip_special_tokens=True
-            )[0]
+            text = self._processor.batch_decode([new_tokens], skip_special_tokens=True)[0]
         else:  # pragma: no cover - all processors/tokenizers expose decode
             text = self._processor.decode(new_tokens, skip_special_tokens=True)
         return text.strip()
-
-
-def _openai_error(message: str, *, status_code: int, error_type: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"message": message, "type": error_type, "code": error_type}},
-    )
 
 
 def create_transformers_app(
@@ -305,9 +295,7 @@ def create_transformers_app(
         # deploy immediately instead of 500ing the first caller. The multi-GB
         # download happens here — the deploy's readiness window is sized for it.
         if app.state.backend is None:
-            app.state.backend = HfTransformersBackend(
-                model_id, trust_remote_code=trust_remote_code
-            )
+            app.state.backend = HfTransformersBackend(model_id, trust_remote_code=trust_remote_code)
         yield
 
     app = FastAPI(
@@ -343,20 +331,20 @@ def create_transformers_app(
         try:
             body = await request.json()
         except ValueError:
-            return _openai_error(
+            return openai_error(
                 "request body must be valid JSON",
                 status_code=400,
                 error_type="invalid_request_error",
             )
         if not isinstance(body, dict):
-            return _openai_error(
+            return openai_error(
                 "request body must be a JSON object",
                 status_code=400,
                 error_type="invalid_request_error",
             )
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
-            return _openai_error(
+            return openai_error(
                 "a chat request needs a non-empty 'messages' array",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -364,9 +352,7 @@ def create_transformers_app(
         try:
             split_prompt(messages)  # eager image validation -> 400 not 500
         except ValueError as exc:
-            return _openai_error(
-                str(exc), status_code=400, error_type="invalid_request_error"
-            )
+            return openai_error(str(exc), status_code=400, error_type="invalid_request_error")
 
         # OpenAI names the cap max_tokens (legacy) or max_completion_tokens.
         max_tokens_raw = body.get("max_completion_tokens", body.get("max_tokens"))
@@ -374,13 +360,13 @@ def create_transformers_app(
             max_tokens = int(max_tokens_raw) if max_tokens_raw is not None else default_max_tokens
             temperature = float(body.get("temperature", default_temperature))
         except (TypeError, ValueError):
-            return _openai_error(
+            return openai_error(
                 "'max_tokens' must be an integer and 'temperature' a number",
                 status_code=400,
                 error_type="invalid_request_error",
             )
         if max_tokens < 1:
-            return _openai_error(
+            return openai_error(
                 "'max_tokens' must be positive",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -395,9 +381,7 @@ def create_transformers_app(
                 temperature=temperature,
             )
         except ValueError as exc:
-            return _openai_error(
-                str(exc), status_code=400, error_type="invalid_request_error"
-            )
+            return openai_error(str(exc), status_code=400, error_type="invalid_request_error")
         except Exception as exc:  # noqa: BLE001 - see docstring: any backend failure
             # must reach the caller as an OpenAI-shaped error, never an
             # unhandled 500. A custom-code checkpoint (trust_remote_code)
@@ -406,7 +390,7 @@ def create_transformers_app(
             # generically (a real risk for last-resort onboarding) fails
             # HERE, not at import time — this is the honest failure mode,
             # not a crash with no actionable message.
-            return _openai_error(
+            return openai_error(
                 f"the transformers backend failed to generate a response: {exc}",
                 status_code=500,
                 error_type="backend_error",

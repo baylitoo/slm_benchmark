@@ -46,6 +46,8 @@ from typing import Any, Protocol
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from docie_bench.openai_protocol import openai_error
+
 MULTI_VECTOR_MIN_VERSION = 6
 
 
@@ -172,13 +174,6 @@ class SentenceTransformersMultiVectorBackend:
 # ---------------------------------------------------------------------------
 
 
-def _openai_error(message: str, *, status_code: int, error_type: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"message": message, "type": error_type, "code": error_type}},
-    )
-
-
 def create_multi_vector_app(
     *,
     model_id: str,
@@ -226,7 +221,7 @@ def create_multi_vector_app(
         try:
             body = await request.json()
         except ValueError:
-            return _openai_error(
+            return openai_error(
                 "request body must be valid JSON",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -234,16 +229,12 @@ def create_multi_vector_app(
         try:
             query, documents, top_n = parse_rerank_request(body)
         except ValueError as exc:
-            return _openai_error(
-                str(exc), status_code=400, error_type="invalid_request_error"
-            )
+            return openai_error(str(exc), status_code=400, error_type="invalid_request_error")
         backend_impl: MultiVectorBackend = app.state.backend
         try:
             scores = await asyncio.to_thread(backend_impl.rerank, query, documents)
         except ValueError as exc:
-            return _openai_error(
-                str(exc), status_code=400, error_type="invalid_request_error"
-            )
+            return openai_error(str(exc), status_code=400, error_type="invalid_request_error")
         return JSONResponse(
             {
                 "model": app.state.model_id,

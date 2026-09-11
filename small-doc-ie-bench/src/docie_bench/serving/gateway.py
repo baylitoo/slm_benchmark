@@ -22,7 +22,6 @@ circuit-breaker. Those layer on top later.
 from __future__ import annotations
 
 import contextlib
-import json
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
+from docie_bench.openai_protocol import openai_error, single_chunk_stream
 from docie_bench.serving.solutions import SolutionError, build_solution
 
 DEFAULT_MODELS_CONFIG = Path("configs/models.yaml")
@@ -71,13 +71,6 @@ def resolve_profile(model: str, profiles: dict[str, ModelProfile]) -> ModelProfi
             error_type="ambiguous_model",
         )
     return matches[0]
-
-
-def _openai_error(message: str, *, status_code: int, error_type: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"message": message, "type": error_type, "code": error_type}},
-    )
 
 
 def create_gateway_app(
@@ -132,13 +125,13 @@ def create_gateway_app(
         try:
             body = await request.json()
         except ValueError:
-            return _openai_error(
+            return openai_error(
                 "request body must be valid JSON",
                 status_code=400,
                 error_type="invalid_request_error",
             )
         if not isinstance(body, dict):
-            return _openai_error(
+            return openai_error(
                 "request body must be a JSON object",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -147,9 +140,7 @@ def create_gateway_app(
         try:
             profile = resolve_profile(body.get("model", ""), app.state.profiles)
         except GatewayRoutingError as exc:
-            return _openai_error(
-                exc.message, status_code=exc.status_code, error_type=exc.error_type
-            )
+            return openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
 
         # Non-passthrough profiles are served by a local solution adapter
         # (OCR engine, pipeline, …) rather than proxied to an upstream.
@@ -173,7 +164,7 @@ def create_gateway_app(
         try:
             upstream = await client.post(url, json=body, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
-            return _openai_error(
+            return openai_error(
                 f"upstream {profile.base_url} is unreachable: {exc}",
                 status_code=502,
                 error_type="upstream_unavailable",
@@ -204,7 +195,7 @@ async def _forward_stream(
     try:
         upstream = await stream.__aenter__()
     except httpx.RequestError as exc:
-        return _openai_error(
+        return openai_error(
             f"upstream is unreachable: {exc}",
             status_code=502,
             error_type="upstream_unavailable",
@@ -240,7 +231,7 @@ async def _dispatch_solution(
         solution = build_solution(profile, profiles=profiles, http_client=http_client)
         completion = await solution.complete(body)
     except SolutionError as exc:
-        return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
+        return openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
     if body.get("stream"):
         return _solution_sse(completion)
     return JSONResponse(completion)
@@ -264,8 +255,4 @@ def _solution_sse(completion: dict[str, object]) -> StreamingResponse:
         ],
     }
 
-    async def body_iterator() -> AsyncIterator[bytes]:
-        yield f"data: {json.dumps(chunk)}\n\n".encode()
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(body_iterator(), media_type="text/event-stream")
+    return single_chunk_stream(chunk)

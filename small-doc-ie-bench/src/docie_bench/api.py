@@ -11,12 +11,12 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from docie_bench.agents.api import router as agents_router
 from docie_bench.benchmark.routing_config import build_extraction_router
-from docie_bench.chat_api import _resolve_or_error, _sse_event
+from docie_bench.chat_api import _resolve_or_error
 from docie_bench.chat_api import router as chat_router
 from docie_bench.extract.routing import (
     ExtractionRouter,
@@ -31,6 +31,7 @@ from docie_bench.inngest.studio_api import router as studio_router
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.logging_config import configure_logging
 from docie_bench.mcp_api import router as mcp_router
+from docie_bench.openai_protocol import error_payload, queue_stream
 from docie_bench.orchestrator.api import configure_orchestrator
 from docie_bench.orchestrator.api import router as orchestrator_router
 from docie_bench.orchestrator.service import OrchestratorService
@@ -294,9 +295,7 @@ async def resolve_extraction_executor(
             "POST /v1/studio/routing-policies (or pick it in the Studio)",
         )
     policy = RoutingPolicy.model_validate(record["policy"])
-    profiles = {
-        stage.name: await resolve_profile(stage.name) for stage in policy.stages
-    }
+    profiles = {stage.name: await resolve_profile(stage.name) for stage in policy.stages}
     return build_extraction_router(policy, profiles)
 
 
@@ -313,9 +312,7 @@ def _finalize_outcome(
     return _finalize_routed(outcome, routing_policy=routing_policy)
 
 
-def _finalize_routed(
-    result: RoutingResult, *, routing_policy: str
-) -> ExtractionResponse:
+def _finalize_routed(result: RoutingResult, *, routing_policy: str) -> ExtractionResponse:
     """Unwrap a router's result into the ExtractionResponse the live routes
     return, carrying the audit in the response's ``routing`` field.
 
@@ -641,36 +638,15 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
             queue.put_nowait({"type": "result", "result": response.model_dump(mode="json")})
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            error = {"message": detail, "type": "extraction_error", "code": str(exc.status_code)}
+            error = error_payload(detail, "extraction_error", code=str(exc.status_code))
         except Exception as exc:  # noqa: BLE001 - must reach the client as an error frame
-            error = {"message": str(exc), "type": "internal_error", "code": "internal_error"}
+            error = error_payload(str(exc), "internal_error")
         finally:
             if error is not None:
                 queue.put_nowait({"type": "error", "error": error})
             queue.put_nowait(None)
 
-    async def body_iterator() -> AsyncIterator[bytes]:
-        task = asyncio.create_task(drive())
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=_SSE_KEEPALIVE_SECONDS)
-                except TimeoutError:
-                    # A split run streams no deltas; proxies drop a silent
-                    # connection long before a 3-page CV finishes.
-                    yield b": keepalive\n\n"
-                    continue
-                if item is None:
-                    break
-                yield _sse_event(item)
-        finally:
-            if not task.done():
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(body_iterator(), media_type="text/event-stream")
+    return queue_stream(queue, drive, keepalive_seconds=_SSE_KEEPALIVE_SECONDS)
 
 
 @app.post("/v1/benchmarks/run")
