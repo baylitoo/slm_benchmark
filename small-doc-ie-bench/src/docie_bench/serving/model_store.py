@@ -344,7 +344,10 @@ FAMILIES: dict[str, FamilyContract] = {
     "encoder_gliformer": FamilyContract(
         name="encoder_gliformer",
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
-        response_format_style="none",
+        # Not "none": the schema on the request IS how this family extracts.
+        # Without it the server has nothing to structure into and falls back to
+        # entity recognition.
+        response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",
         analyzer=True,
         encoder_backend="gliformer",

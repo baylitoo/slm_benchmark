@@ -55,6 +55,67 @@ class DynamicSchemaSpec(BaseModel):
         return self
 
 
+def gliformer_model_from_json_schema(
+    schema: dict[str, Any], *, name: str = "Record"
+) -> type[BaseModel]:
+    """Build the Pydantic model GLiFormer's ``structure()`` takes from a JSON Schema.
+
+    The extraction path already sends a schema on every request, as
+    ``response_format.json_schema.schema``. This turns that into the one form
+    GLiFormer accepts, so a served GLiFormer needs no schema channel of its own.
+
+    Every leaf is ``str | None``, dates and amounts included: GLiFormer copies
+    spans off the page, and typing them is the job of the pass that already runs
+    after extraction (``normalize_by_schema`` then ``coerce_scalars``).
+    Declaring a Decimal here would make ``validate_output=True`` reject
+    ``"1 234,56 EUR"`` rather than accept it.
+    """
+    defs = schema.get("$defs") or schema.get("definitions") or {}
+
+    def resolve(node: Any, seen: int = 0) -> Any:
+        while isinstance(node, dict) and "$ref" in node and seen < 50:
+            node = defs.get(str(node["$ref"]).rsplit("/", 1)[-1], {})
+            seen += 1
+        return node
+
+    def pick(node: Any) -> Any:
+        node = resolve(node)
+        if not isinstance(node, dict):
+            return {}
+        for key in ("anyOf", "oneOf"):
+            choices = node.get(key)
+            if isinstance(choices, list):
+                for choice in choices:
+                    chosen = resolve(choice)
+                    if isinstance(chosen, dict) and chosen.get("type") != "null":
+                        return chosen
+        return node
+
+    def build(node: Any, label: str) -> Any:
+        node = pick(node)
+        properties = node.get("properties")
+        if isinstance(properties, dict) and properties:
+            fields = {
+                key: (build(value, f"{label}{key.title().replace('_', '')}"), Field(default=None))
+                for key, value in properties.items()
+                if key not in _RESERVED_FIELDS
+            }
+            if not fields:
+                return str | None
+            return create_model(  # type: ignore[call-overload]
+                label or "Record", __config__=ConfigDict(extra="forbid"), **fields
+            )
+        if node.get("type") == "array" or "items" in node:
+            inner = build(node.get("items") or {}, label + "Item")
+            return list[inner] | None  # type: ignore[valid-type]
+        return str | None
+
+    built = build(schema, "".join(part.title() for part in name.split("_")) or "Record")
+    if isinstance(built, type) and issubclass(built, BaseModel):
+        return built
+    raise ValueError("schema has no object properties to structure into")
+
+
 class DynamicTemplateBuilder:
     _PYDANTIC_TYPES: dict[ScalarDynamicFieldType, type[BaseModel]] = {
         "string": TextField,
