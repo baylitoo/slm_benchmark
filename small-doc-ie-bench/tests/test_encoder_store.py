@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import httpx
 import pytest
 
@@ -15,6 +17,17 @@ from docie_bench.serving.hf_hub import (
 from docie_bench.serving.model_store import FAMILIES, ModelStore, ModelStoreError, get_family
 
 REPO = "fastino/GLiNER2-Guardrails-PII-Multi"
+GLIFORMER_REPO = "knowledgator/gliformer-base-v1"
+
+# The real repo: weights described by gliner_config.json, no config.json and
+# no safetensors anywhere.
+GLIFORMER_SIBLINGS = [
+    {"rfilename": "gliner_config.json", "size": 1000},
+    {"rfilename": "pytorch_model.bin", "size": 1_000_000},
+    {"rfilename": "tokenizer.json", "size": 400},
+    {"rfilename": "tokenizer_config.json", "size": 200},
+    {"rfilename": "README.md", "size": 50},
+]
 
 SNAPSHOT_SIBLINGS = [
     {"rfilename": "config.json", "size": 1200},
@@ -34,6 +47,8 @@ def _transport() -> httpx.MockTransport:
             return httpx.Response(200, json={"siblings": SNAPSHOT_SIBLINGS})
         if path == "/api/models/gguf/only":
             return httpx.Response(200, json={"siblings": [{"rfilename": "m.gguf"}]})
+        if path == f"/api/models/{GLIFORMER_REPO}":
+            return httpx.Response(200, json={"siblings": GLIFORMER_SIBLINGS})
         if path.startswith(f"/{REPO}/resolve/main/"):
             fname = path.rsplit("/", 1)[-1]
             return httpx.Response(
@@ -67,9 +82,14 @@ def test_snapshot_file_filter_skips_alt_formats() -> None:
     assert _is_snapshot_file("model.safetensors")
     assert _is_snapshot_file("tokenizer.json")
     assert _is_snapshot_file("spm.model")
+    # Alternate weight formats are skipped beside safetensors, kept when the
+    # repo has nothing else; hardware exports and GGUF are always skipped.
     assert not _is_snapshot_file("pytorch_model.bin")
+    assert _is_snapshot_file("pytorch_model.bin", keep_alt_weights=True)
     assert not _is_snapshot_file("onnx/model.onnx")
+    assert not _is_snapshot_file("onnx/model.onnx", keep_alt_weights=True)
     assert not _is_snapshot_file("model.gguf")
+    assert not _is_snapshot_file("model.gguf", keep_alt_weights=True)
 
 
 async def test_list_snapshot_files_keeps_safetensors_tree() -> None:
@@ -83,7 +103,7 @@ async def test_list_snapshot_files_keeps_safetensors_tree() -> None:
 
 async def test_list_snapshot_files_refuses_gguf_only_repo() -> None:
     async with httpx.AsyncClient(transport=_transport()) as client:
-        with pytest.raises(HfHubError, match="no safetensors"):
+        with pytest.raises(HfHubError, match="no safetensors or PyTorch weights"):
             await list_snapshot_files("gguf/only", client=client)
 
 
@@ -118,13 +138,27 @@ def test_add_snapshot_rejects_non_analyzer_family(tmp_path) -> None:
         store.add_snapshot(name="x", family="lfm2", snapshot_dir=src)
 
 
-def test_add_snapshot_requires_safetensors(tmp_path) -> None:
+def test_add_snapshot_requires_weights(tmp_path) -> None:
     src = tmp_path / "dl"
     src.mkdir()
     (src / "config.json").write_text("{}")
     store = ModelStore(tmp_path / "store")
-    with pytest.raises(ModelStoreError, match="safetensors"):
+    with pytest.raises(ModelStoreError, match="no weights"):
         store.add_snapshot(name="x", family="encoder_gliner", snapshot_dir=src)
+
+
+def test_add_snapshot_accepts_a_pytorch_only_checkpoint(tmp_path) -> None:
+    # GLiFormer describes its weights with gliner_config.json and ships
+    # pytorch_model.bin; from_pretrained loads it the same way.
+    src = tmp_path / "dl"
+    src.mkdir()
+    (src / "gliner_config.json").write_text("{}")
+    (src / "pytorch_model.bin").write_bytes(b"\x00" * 16)
+    store = ModelStore(tmp_path / "store")
+    entry = store.add_snapshot(
+        name="gliformer-base-v1", family="encoder_gliformer", snapshot_dir=src
+    )
+    assert (pathlib.Path(entry.model_path) / "pytorch_model.bin").exists()
 
 
 # ── seed-hf job for an analyzer family (store on disk, hub mocked) ───────────
@@ -157,3 +191,12 @@ async def test_seed_hf_analyzer_downloads_snapshot(tmp_path, monkeypatch) -> Non
     # download dir cleaned up
     assert not (store.root / ".hf-downloads" / "guardrails-pii").exists()
     assert "download-snapshot" in {d.get("stage") for _, d in published if _ == "progress"}
+
+
+async def test_list_snapshot_files_keeps_pytorch_weights_when_there_are_no_safetensors() -> None:
+    async with httpx.AsyncClient(transport=_transport()) as client:
+        files = await list_snapshot_files(GLIFORMER_REPO, client=client)
+    names = {f.filename for f in files}
+    assert "pytorch_model.bin" in names
+    assert "gliner_config.json" in names
+    assert "tokenizer.json" in names
