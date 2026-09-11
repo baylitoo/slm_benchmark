@@ -190,6 +190,24 @@ def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
     }
 
 
+def _prompt_profile(
+    name: str, profile: ModelProfile | None, profiles: dict[str, ModelProfile] | None
+) -> str | None:
+    """The prompt profile of whichever model profile actually served.
+
+    Post-processing differs by prompt profile -- the nuextract profiles run
+    their own normalisation pass -- so a consumer deciding how far to trust a
+    field needs to know which one ran, and a router may not have used the
+    profile the request named.
+    """
+    if profile is not None and profile.name == name:
+        return profile.prompt_profile
+    resolved = (profiles or {}).get(name)
+    if resolved is not None:
+        return resolved.prompt_profile
+    return profile.prompt_profile if profile is not None else None
+
+
 def _field_confidence(result: Any) -> dict[str, dict[str, Any]]:
     """Per-field review signal for a flat Agent consumer.
 
@@ -403,6 +421,8 @@ async def _complete_structured_document(
         ),
         "parallel_groups": response.parallel_groups,
         "field_confidence": _field_confidence(response.result),
+        "model_profile": response.model_profile,
+        "prompt_profile": _prompt_profile(response.model_profile, profile, profiles),
     }
     if routing_audit is not None:
         docie_agent["routing"] = routing_audit

@@ -88,3 +88,30 @@ def test_the_map_keys_address_the_flat_content() -> None:
         for segment in path.replace("[", ".[").split("."):
             node = node[int(segment[1:-1])] if segment.startswith("[") else node[segment]
         assert node is not None
+
+
+def _profile(name: str, prompt_profile: str) -> Any:
+    from docie_bench.llm.model_profiles import ModelProfile
+
+    return ModelProfile(
+        name=name,
+        model=name,
+        base_url="http://x",
+        api_key=None,
+        prompt_profile=prompt_profile,
+    )
+
+
+def test_the_prompt_profile_of_the_profile_that_served_is_reported() -> None:
+    from docie_bench.agents.runtime import _prompt_profile
+
+    single = _profile("lfm2.5-2.6b", "strict_extraction_v1")
+    assert _prompt_profile("lfm2.5-2.6b", single, None) == "strict_extraction_v1"
+
+
+def test_a_router_reports_the_profile_that_actually_ran_not_the_one_requested() -> None:
+    from docie_bench.agents.runtime import _prompt_profile
+
+    requested = _profile("lfm2.5-2.6b", "strict_extraction_v1")
+    served = _profile("nuextract3", "nuextract3")
+    assert _prompt_profile("nuextract3", requested, {"nuextract3": served}) == "nuextract3"
