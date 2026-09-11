@@ -35,6 +35,8 @@ from typing import Any, Protocol
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from docie_bench.openai_protocol import openai_error
+
 DEFAULT_ENCODER_MODEL = "urchade/gliner_multi_pii-v1"
 
 # A practical default label set for the PII/confidentiality use case; callers
@@ -58,9 +60,7 @@ DEFAULT_THRESHOLD = 0.5
 class EncoderBackend(Protocol):
     """One synchronous prediction over one text (runs in a worker thread)."""
 
-    def predict(
-        self, text: str, labels: list[str], threshold: float
-    ) -> list[dict[str, Any]]: ...
+    def predict(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]: ...
 
 
 class GlinerBackend:
@@ -77,9 +77,7 @@ class GlinerBackend:
         self.model_id = model_id
         self._model = GLiNER.from_pretrained(model_id)
 
-    def predict(
-        self, text: str, labels: list[str], threshold: float
-    ) -> list[dict[str, Any]]:
+    def predict(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]:
         raw = self._model.predict_entities(text, labels, threshold=threshold)
         return [
             {
@@ -102,17 +100,35 @@ class GlinerBackend:
 _SAFETY_LABELS = ["safe", "unsafe"]
 _REFUSAL_LABELS = ["refusal", "compliance"]
 _TOXICITY_LABELS = [
-    "violence_and_weapons", "non_violent_crime", "sexual_content",
-    "hate_and_discrimination", "self_harm_and_suicide", "pii_exposure",
-    "misinformation", "copyright_violation", "child_safety",
-    "political_manipulation", "unethical_conduct", "regulated_advice",
-    "privacy_violation", "other", "benign",
+    "violence_and_weapons",
+    "non_violent_crime",
+    "sexual_content",
+    "hate_and_discrimination",
+    "self_harm_and_suicide",
+    "pii_exposure",
+    "misinformation",
+    "copyright_violation",
+    "child_safety",
+    "political_manipulation",
+    "unethical_conduct",
+    "regulated_advice",
+    "privacy_violation",
+    "other",
+    "benign",
 ]
 _JAILBREAK_LABELS = [
-    "prompt_injection", "jailbreak_attempt", "policy_evasion",
-    "instruction_override", "system_prompt_exfiltration", "data_exfiltration",
-    "roleplay_bypass", "hypothetical_bypass", "obfuscated_attack",
-    "multi_step_attack", "social_engineering", "benign",
+    "prompt_injection",
+    "jailbreak_attempt",
+    "policy_evasion",
+    "instruction_override",
+    "system_prompt_exfiltration",
+    "data_exfiltration",
+    "roleplay_bypass",
+    "hypothetical_bypass",
+    "obfuscated_attack",
+    "multi_step_attack",
+    "social_engineering",
+    "benign",
 ]
 
 MODERATION_TASKS: dict[str, Any] = {
@@ -146,9 +162,7 @@ class Gliner2Backend:
         self.model_id = model_id
         self._model = GLiNER2.from_pretrained(model_id)
 
-    def predict(
-        self, text: str, labels: list[str], threshold: float
-    ) -> list[dict[str, Any]]:
+    def predict(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]:
         raw = self._model.extract_entities(
             text, labels, threshold=threshold, include_spans=True, include_confidence=True
         )
@@ -200,13 +214,6 @@ def build_backend(model_id: str, kind: str = "auto") -> Any:
     if normalized == "gliner":
         return GlinerBackend(model_id)
     raise ValueError(f"unknown encoder backend {kind!r} (expected auto, gliner, or gliner2)")
-
-
-def _openai_error(message: str, *, status_code: int, error_type: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"message": message, "type": error_type, "code": error_type}},
-    )
 
 
 def _last_user_text(messages: list[Any]) -> str | None:
@@ -278,20 +285,20 @@ def create_encoder_app(
         try:
             body = await request.json()
         except ValueError:
-            return _openai_error(
+            return openai_error(
                 "request body must be valid JSON",
                 status_code=400,
                 error_type="invalid_request_error",
             )
         if not isinstance(body, dict):
-            return _openai_error(
+            return openai_error(
                 "request body must be a JSON object",
                 status_code=400,
                 error_type="invalid_request_error",
             )
         text = _last_user_text(body.get("messages") or [])
         if text is None:
-            return _openai_error(
+            return openai_error(
                 "an encoder request needs at least one user message with text content",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -306,7 +313,7 @@ def create_encoder_app(
         try:
             threshold = float(body.get("threshold", default_threshold))
         except (TypeError, ValueError):
-            return _openai_error(
+            return openai_error(
                 "'threshold' must be a number",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -324,7 +331,7 @@ def create_encoder_app(
             if isinstance(tasks_raw, list):
                 unknown = [t for t in tasks_raw if t not in MODERATION_TASKS]
                 if unknown:
-                    return _openai_error(
+                    return openai_error(
                         f"unknown moderation task(s): {', '.join(map(str, unknown))} "
                         f"(available: {', '.join(sorted(MODERATION_TASKS))})",
                         status_code=400,
@@ -334,14 +341,14 @@ def create_encoder_app(
             elif isinstance(tasks_raw, dict):
                 schema = tasks_raw
             else:
-                return _openai_error(
+                return openai_error(
                     "'tasks' must be a list of preset names or a schema object",
                     status_code=400,
                     error_type="invalid_request_error",
                 )
             classify = getattr(backend_impl, "classify", None)
             if classify is None:
-                return _openai_error(
+                return openai_error(
                     "this encoder backend has no moderation head — serve a "
                     "GLiNER2 guardrails checkpoint (e.g. "
                     "fastino/GLiNER2-Guardrails-PII-Multi) for 'tasks'",

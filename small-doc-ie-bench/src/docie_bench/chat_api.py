@@ -35,12 +35,12 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from docie_bench.agents.api import (
     _client,
-    _openai_error,
     agents_tenant_guard,
 )
 from docie_bench.inngest.serving_api import trigger_deployment_load
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_completion_content
+from docie_bench.openai_protocol import error_payload, openai_error, queue_stream
 from docie_bench.security import TenantContext
 from docie_bench.serving import recency
 from docie_bench.serving.placement_resolver import (
@@ -99,7 +99,7 @@ class ChatCompletionRequest(BaseModel):
 
 def _validation_error_to_openai(exc: RequestValidationError) -> JSONResponse:
     """Reformat FastAPI's ``{"detail": [...]}`` 422 shape into this
-    endpoint's existing ``_openai_error(...)`` 400 shape, which clients of
+    endpoint's existing ``openai_error(...)`` 400 shape, which clients of
     ``/v1/chat/completions`` already depend on."""
     errors = exc.errors()
     first = errors[0] if errors else None
@@ -109,7 +109,7 @@ def _validation_error_to_openai(exc: RequestValidationError) -> JSONResponse:
         field = ".".join(str(part) for part in first["loc"] if part != "body")
         msg = first.get("msg", "invalid request")
         message = f"{field!r}: {msg}" if field else msg
-    return _openai_error(message, status_code=400, error_type="invalid_request_error")
+    return openai_error(message, status_code=400, error_type="invalid_request_error")
 
 
 class _ChatCompletionsValidationRoute(APIRoute):
@@ -238,23 +238,20 @@ async def _resolve_or_error(
         not_found = isinstance(exc, PlacementNotFoundError)
         error_type = "model_not_found" if not_found else "model_not_ready"
         status_code = 404 if not_found else 409
-        return _openai_error(str(exc), status_code=status_code, error_type=error_type)
+        return openai_error(str(exc), status_code=status_code, error_type=error_type)
     except ProfileResolutionError as exc:
         triggered = await trigger_deployment_load(model)
         if triggered is not None:
             return _loading_response(triggered)
-        return _openai_error(str(exc), status_code=404, error_type="model_not_found")
-    if (
-        model.startswith(STORE_PROFILE_PREFIX)
-        and endpoint_is_loopback(profile.base_url)
-    ):
+        return openai_error(str(exc), status_code=404, error_type="model_not_found")
+    if model.startswith(STORE_PROFILE_PREFIX) and endpoint_is_loopback(profile.base_url):
         # See api.py's resolve_profile: the deploy runtime records a
         # placement's endpoint from the WORKER's point of view, so a
         # loopback endpoint is unreachable from this (api) process. Without
         # this guard the request "resolves" fine and then burns
         # timeout_seconds x retries on a doomed connect before a confusing
         # upstream_unavailable 502.
-        return _openai_error(
+        return openai_error(
             f"{model} resolved to {profile.base_url}, which is loopback on "
             "the worker that deployed it and not reachable from the API. "
             "Record a non-loopback advertised endpoint at deploy time, or "
@@ -279,11 +276,7 @@ async def list_models() -> dict[str, Any]:
 
     path = DEFAULT_MODELS_CONFIG
     yaml_profiles = load_model_profiles(path) if path.exists() else {}
-    live = {
-        record.spec.name: record
-        for record in _default_live_deployments()
-        if _is_live(record)
-    }
+    live = {record.spec.name: record for record in _default_live_deployments() if _is_live(record)}
     table = build_profile_table(yaml_profiles, live)
     return {
         "object": "list",
@@ -302,7 +295,7 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
         return resolved
     profile = resolved
     if profile.kind != "passthrough":
-        return _openai_error(
+        return openai_error(
             f"model {model!r} is a {profile.kind!r} solution profile — use the "
             "gateway or an agent for solution kinds",
             status_code=400,
@@ -419,13 +412,13 @@ async def _post_upstream(
             url, json=body, headers=headers, timeout=profile.timeout_seconds
         )
     except httpx.RequestError as exc:
-        return _openai_error(
+        return openai_error(
             f"upstream {profile.base_url} is unreachable: {exc}",
             status_code=502,
             error_type="upstream_unavailable",
         )
     if upstream.status_code >= 400:
-        return _openai_error(
+        return openai_error(
             f"upstream returned {upstream.status_code}: {upstream.text[:300]}{error_hint}",
             status_code=upstream.status_code,
             error_type="upstream_error",
@@ -433,13 +426,13 @@ async def _post_upstream(
     try:
         completion = upstream.json()
     except ValueError:
-        return _openai_error(
+        return openai_error(
             "upstream returned a non-JSON response",
             status_code=502,
             error_type="upstream_error",
         )
     if not isinstance(completion, dict):
-        return _openai_error(
+        return openai_error(
             "upstream returned a non-object completion",
             status_code=502,
             error_type="upstream_error",
@@ -474,10 +467,10 @@ async def _resolve_mcp_specs(
     try:
         registry = mcp_mod.load_mcp_registry()
     except mcp_mod.MCPConfigError as exc:
-        return _openai_error(str(exc), status_code=500, error_type="mcp_config_error")
+        return openai_error(str(exc), status_code=500, error_type="mcp_config_error")
     unknown = [name for name in server_names if name not in registry]
     if unknown:
-        return _openai_error(
+        return openai_error(
             f"unregistered MCP server(s): {', '.join(unknown)} — register them in "
             f"{get_settings().mcp_servers_config} (see GET /v1/mcp/servers)",
             status_code=400,
@@ -486,7 +479,7 @@ async def _resolve_mcp_specs(
     try:
         mcp_mod._require_mcp()
     except mcp_mod.MCPUnavailableError as exc:
-        return _openai_error(str(exc), status_code=501, error_type="mcp_unavailable")
+        return openai_error(str(exc), status_code=501, error_type="mcp_unavailable")
     specs = [registry[name] for name in server_names]
 
     if session_id is not None and "docs-search" in server_names:
@@ -496,7 +489,7 @@ async def _resolve_mcp_specs(
         try:
             session_dir = session_documents_dir(session_id)
         except SessionDocumentError as exc:
-            return _openai_error(str(exc), status_code=400, error_type="invalid_request_error")
+            return openai_error(str(exc), status_code=400, error_type="invalid_request_error")
         specs = [
             replace(spec, env={**spec.env, DOCS_DIR_ENV: str(session_dir)})
             if spec.name == "docs-search"
@@ -536,7 +529,7 @@ async def _chat_with_mcp_tools(
                 sessions = await mcp_mod.open_mcp_sessions(stack, specs)
                 tools, mapping = await mcp_mod.collect_openai_tools(sessions)
             except Exception as exc:  # noqa: BLE001 - connect/handshake failure is a gateway error
-                return _openai_error(
+                return openai_error(
                     f"could not connect to MCP server(s): {exc}",
                     status_code=502,
                     error_type="mcp_server_unreachable",
@@ -545,13 +538,13 @@ async def _chat_with_mcp_tools(
                 post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
             )
     except Exception as exc:  # noqa: BLE001 - transport teardown (ExitStack unwind) failure
-        return _openai_error(
+        return openai_error(
             f"MCP session error: {exc}",
             status_code=502,
             error_type="mcp_server_unreachable",
         )
     if completion is None:
-        return _openai_error(
+        return openai_error(
             f"model kept calling tools for {get_settings().mcp_max_tool_iterations} "
             "rounds without a final answer — raise mcp_max_tool_iterations or "
             "simplify the request",
@@ -614,14 +607,6 @@ def _tool_calls_supported_for_profile(profile: ModelProfile) -> bool | None:
         if record.spec.name == profile.name:
             return record.tool_calls_supported
     return None
-
-
-def _sse_event(payload: dict[str, Any]) -> bytes:
-    return f"data: {json.dumps(payload)}\n\n".encode()
-
-
-def _error_payload(message: str, error_type: str) -> dict[str, Any]:
-    return {"message": message, "type": error_type, "code": error_type}
 
 
 async def _post_upstream_streamed(
@@ -688,7 +673,7 @@ async def _post_upstream_streamed(
     try:
         upstream = await stream_ctx.__aenter__()
     except httpx.RequestError as exc:
-        return _openai_error(
+        return openai_error(
             f"upstream {profile.base_url} is unreachable: {exc}",
             status_code=502,
             error_type="upstream_unavailable",
@@ -696,7 +681,7 @@ async def _post_upstream_streamed(
     try:
         if upstream.status_code >= 400:
             error_bytes = await upstream.aread()
-            return _openai_error(
+            return openai_error(
                 f"upstream returned {upstream.status_code}: "
                 f"{error_bytes[:300].decode('utf-8', 'replace')}",
                 status_code=upstream.status_code,
@@ -801,7 +786,7 @@ async def _post_upstream_streamed(
                         if isinstance(arguments_piece, str):
                             entry["function"]["arguments"] += arguments_piece
     except httpx.RequestError as exc:
-        return _openai_error(
+        return openai_error(
             f"upstream {profile.base_url} is unreachable: {exc}",
             status_code=502,
             error_type="upstream_unavailable",
@@ -968,7 +953,6 @@ async def _stream_chat_with_mcp_tools(
     Always terminated by a literal ``data: [DONE]\\n\\n`` frame, the same
     convention ``_stream_chat_completions`` uses.
     """
-    import contextlib
     import uuid
     from contextlib import AsyncExitStack
 
@@ -1029,10 +1013,10 @@ async def _stream_chat_with_mcp_tools(
                         tools, mapping = await mcp_mod.collect_openai_tools(sessions)
                     except Exception as exc:  # noqa: BLE001 - connect/handshake failure
                         message = f"could not connect to MCP server(s): {exc}"
-                        outcome = _openai_error(
+                        outcome = openai_error(
                             message, status_code=502, error_type="mcp_server_unreachable"
                         )
-                        error = _error_payload(message, "mcp_server_unreachable")
+                        error = error_payload(message, "mcp_server_unreachable")
                         queue.put_nowait({"type": "error", "error": error})
                         return
                     completion = await mcp_mod.run_tool_loop(
@@ -1055,9 +1039,7 @@ async def _stream_chat_with_mcp_tools(
                         ),
                         exchange_id=exchange_id,
                         on_awaiting_input=(
-                            lambda payload: queue.put_nowait(
-                                {"type": "awaiting_input", **payload}
-                            )
+                            lambda payload: queue.put_nowait({"type": "awaiting_input", **payload})
                         )
                         if exchange_id is not None
                         else None,
@@ -1069,18 +1051,18 @@ async def _stream_chat_with_mcp_tools(
                 # A paused exchange (ask_user, or a user-initiated pause) got
                 # no answer in time -- fail cleanly, never hang the request.
                 message = str(exc)
-                outcome = _openai_error(message, status_code=504, error_type="ask_user_timeout")
+                outcome = openai_error(message, status_code=504, error_type="ask_user_timeout")
                 queue.put_nowait(
-                    {"type": "error", "error": _error_payload(message, "ask_user_timeout")}
+                    {"type": "error", "error": error_payload(message, "ask_user_timeout")}
                 )
                 return
             except Exception as exc:  # noqa: BLE001 - transport teardown failure
                 message = f"MCP session error: {exc}"
-                outcome = _openai_error(
+                outcome = openai_error(
                     message, status_code=502, error_type="mcp_server_unreachable"
                 )
                 queue.put_nowait(
-                    {"type": "error", "error": _error_payload(message, "mcp_server_unreachable")}
+                    {"type": "error", "error": error_payload(message, "mcp_server_unreachable")}
                 )
                 return
             if completion is None:
@@ -1089,11 +1071,11 @@ async def _stream_chat_with_mcp_tools(
                     "rounds without a final answer — raise mcp_max_tool_iterations or "
                     "simplify the request"
                 )
-                outcome = _openai_error(
+                outcome = openai_error(
                     message, status_code=502, error_type="mcp_tool_loop_exhausted"
                 )
                 queue.put_nowait(
-                    {"type": "error", "error": _error_payload(message, "mcp_tool_loop_exhausted")}
+                    {"type": "error", "error": error_payload(message, "mcp_tool_loop_exhausted")}
                 )
                 return
             if isinstance(completion, JSONResponse):
@@ -1116,12 +1098,12 @@ async def _stream_chat_with_mcp_tools(
             # still reach the client as an error frame, never a silent early
             # [DONE] with no explanation (that's strictly worse than a loud
             # 500 -- it looks like the model just... stopped).
-            outcome = _openai_error(
+            outcome = openai_error(
                 f"unexpected error in the MCP tool loop: {exc}",
                 status_code=500,
                 error_type="internal_error",
             )
-            queue.put_nowait({"type": "error", "error": _error_payload(str(exc), "internal_error")})
+            queue.put_nowait({"type": "error", "error": error_payload(str(exc), "internal_error")})
         finally:
             # Always reaped, on every exit path (answered, timed out, a
             # different error, or the client disconnecting mid-CancelledError
@@ -1132,26 +1114,7 @@ async def _stream_chat_with_mcp_tools(
             _record_usage_outcome(profile.name, "chat", tenant_id, started, outcome)
             queue.put_nowait(None)
 
-    async def body_iterator() -> AsyncIterator[bytes]:
-        task = asyncio.create_task(drive())
-        try:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                yield _sse_event(item)
-        finally:
-            if not task.done():
-                task.cancel()
-            # Only a cancellation WE just triggered (client disconnect) is
-            # expected here -- drive() itself already turned every other
-            # failure into an error frame before its sentinel, so nothing
-            # else should reach this await.
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(body_iterator(), media_type="text/event-stream")
+    return queue_stream(queue, drive)
 
 
 class _ExchangePauseRequest(BaseModel):
@@ -1168,7 +1131,7 @@ class _ExchangeRespondRequest(BaseModel):
 
 
 def _unknown_exchange_error(exchange_id: str) -> JSONResponse:
-    return _openai_error(
+    return openai_error(
         f"no exchange {exchange_id!r} is awaiting input — it may have already "
         "finished, timed out, or human-in-the-loop was never enabled for it",
         status_code=404,
@@ -1234,7 +1197,7 @@ async def list_mcp_servers() -> Any:
     try:
         registry = mcp_mod.load_mcp_registry()
     except mcp_mod.MCPConfigError as exc:
-        return _openai_error(str(exc), status_code=500, error_type="mcp_config_error")
+        return openai_error(str(exc), status_code=500, error_type="mcp_config_error")
     return {
         "servers": [
             {
@@ -1290,7 +1253,7 @@ async def _stream_chat_completions(
     try:
         upstream = await stream_ctx.__aenter__()
     except httpx.RequestError as exc:
-        error = _openai_error(
+        error = openai_error(
             f"upstream {url} is unreachable: {exc}",
             status_code=502,
             error_type="upstream_unavailable",
@@ -1302,7 +1265,7 @@ async def _stream_chat_completions(
         body_bytes = await upstream.aread()
         await stream_ctx.__aexit__(None, None, None)
         detail = body_bytes[:300].decode("utf-8", "replace")
-        error = _openai_error(
+        error = openai_error(
             f"upstream returned {upstream.status_code}: {detail}",
             status_code=upstream.status_code,
             error_type="upstream_error",
@@ -1370,26 +1333,26 @@ async def embeddings(request: Request, tenant: TenantParam) -> Any:
     try:
         body = await request.json()
     except ValueError:
-        return _openai_error(
+        return openai_error(
             "request body must be valid JSON",
             status_code=400,
             error_type="invalid_request_error",
         )
     if not isinstance(body, dict):
-        return _openai_error(
+        return openai_error(
             "request body must be a JSON object",
             status_code=400,
             error_type="invalid_request_error",
         )
     model = str(body.get("model") or "")
     if not model:
-        return _openai_error(
+        return openai_error(
             "missing required 'model' field (an embedding deployment)",
             status_code=400,
             error_type="invalid_request_error",
         )
     if body.get("input") in (None, "", []):
-        return _openai_error(
+        return openai_error(
             "missing required 'input' field",
             status_code=400,
             error_type="invalid_request_error",
@@ -1442,33 +1405,33 @@ async def rerank(request: Request, tenant: TenantParam) -> Any:
     try:
         body = await request.json()
     except ValueError:
-        return _openai_error(
+        return openai_error(
             "request body must be valid JSON",
             status_code=400,
             error_type="invalid_request_error",
         )
     if not isinstance(body, dict):
-        return _openai_error(
+        return openai_error(
             "request body must be a JSON object",
             status_code=400,
             error_type="invalid_request_error",
         )
     model = str(body.get("model") or "")
     if not model:
-        return _openai_error(
+        return openai_error(
             "missing required 'model' field (a reranker deployment)",
             status_code=400,
             error_type="invalid_request_error",
         )
     if not body.get("query"):
-        return _openai_error(
+        return openai_error(
             "missing required 'query' field",
             status_code=400,
             error_type="invalid_request_error",
         )
     documents = body.get("documents")
     if not isinstance(documents, list) or not documents:
-        return _openai_error(
+        return openai_error(
             "missing required 'documents' field (a non-empty list of strings)",
             status_code=400,
             error_type="invalid_request_error",
