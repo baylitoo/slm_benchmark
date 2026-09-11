@@ -219,8 +219,8 @@ def _field_confidence(result: Any) -> dict[str, dict[str, Any]]:
 
     Entries carry the grounding ``confidence`` (0..1, where a repetition-loop
     truncation caps the field to 0.5) and, when logprob confidence is enabled,
-    ``model_confidence``. A field with no evidence is reported too, at its real
-    confidence of 0, which is the point.
+    ``model_logprob`` on its own scale. A field with no evidence is reported
+    too, at its real confidence of 0, which is the point.
     """
     out: dict[str, dict[str, Any]] = {}
 
@@ -228,7 +228,13 @@ def _field_confidence(result: Any) -> dict[str, dict[str, Any]]:
         if _is_wrapper(node):
             entry: dict[str, Any] = {"confidence": node.get("confidence", 0.0)}
             if node.get("model_confidence") is not None:
-                entry["model_confidence"] = node["model_confidence"]
+                # Reported under a name that cannot be mistaken for a 0..1
+                # score: model_confidence is a natural-log probability (<= 0,
+                # closer to 0 = more confident), deliberately not renormalised
+                # (see extract/logprob_confidence.py). Side by side under
+                # similar names, a single "needs review below x" rule applied
+                # to both would flag every field that has one.
+                entry["model_logprob"] = node["model_confidence"]
             if node.get("evidence_ids"):
                 entry["evidence_ids"] = list(node["evidence_ids"])
             if path:

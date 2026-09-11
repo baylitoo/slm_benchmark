@@ -62,17 +62,19 @@ def test_an_ungrounded_field_is_reported_rather_than_omitted() -> None:
     assert confidence["experience[0].start"] == {"confidence": 0.0}
 
 
-def test_logprob_confidence_is_reported_beside_the_grounding_confidence() -> None:
+def test_the_logprob_is_reported_under_a_name_that_cannot_be_read_as_a_score() -> None:
     result = {
         "full_name": {
             "value": "Ada Lovelace",
             "evidence_ids": ["b1"],
             "confidence": 0.93,
-            "model_confidence": 0.82,
+            "model_confidence": -7.5,
         }
     }
+    # A natural-log probability, never a 0..1 score: -7.5 under a key called
+    # "model_confidence" would fail any "below 0.5 needs review" rule.
     assert _field_confidence(result) == {
-        "full_name": {"confidence": 0.93, "model_confidence": 0.82, "evidence_ids": ["b1"]}
+        "full_name": {"confidence": 0.93, "model_logprob": -7.5, "evidence_ids": ["b1"]}
     }
 
 

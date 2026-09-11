@@ -244,6 +244,10 @@ async def test_chat_json_omits_logprobs_by_default() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Every assertion below reads the RICH wrapper shape. The Agent endpoint
+# flattens it away, so the flat contract is asserted in
+# tests/test_agent_field_confidence.py -- a change here that breaks it
+# will not show up in this file.
 # End-to-end: ExtractionService attaches `model_confidence`
 # ---------------------------------------------------------------------------
 
