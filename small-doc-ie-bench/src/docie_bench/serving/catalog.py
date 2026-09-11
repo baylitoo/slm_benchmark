@@ -38,7 +38,13 @@ from sqlalchemy.sql.dml import Insert
 from sqlalchemy.types import TypeEngine
 
 from docie_bench.serving.model_store import FAMILIES, StoreEntry
-from docie_bench.storage.db import Base, get_session_factory, init_engine, session_scope
+from docie_bench.storage.db import (
+    Base,
+    get_session_factory,
+    init_engine,
+    isoformat,
+    session_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -508,17 +514,15 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "pid_create_time": row.pid_create_time,
         "rss_bytes": row.rss_bytes,
         "health_ok": row.health_ok,
-        "last_probe_at": row.last_probe_at.isoformat() if row.last_probe_at else None,
+        "last_probe_at": isoformat(row.last_probe_at),
         "last_error": row.last_error,
         "tokens_per_second": row.tokens_per_second,
         "ttft_ms": row.ttft_ms,
-        "throughput_measured_at": (
-            row.throughput_measured_at.isoformat() if row.throughput_measured_at else None
-        ),
+        "throughput_measured_at": isoformat(row.throughput_measured_at),
         "throughput_source": row.throughput_source,
         "slot_count": row.slot_count,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "created_at": isoformat(row.created_at),
+        "updated_at": isoformat(row.updated_at),
     }
 
 
@@ -529,7 +533,7 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         "source": row.source,
         "sum_rss_bytes": row.sum_rss_bytes,
         "reclaimable_bytes": row.reclaimable_bytes,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "updated_at": isoformat(row.updated_at),
     }
 
 
@@ -537,9 +541,9 @@ def _activity_view(row: ModelActivity) -> dict[str, Any]:
     return {
         "model_name": row.model_name,
         "window_count": row.window_count,
-        "window_started_at": row.window_started_at.isoformat() if row.window_started_at else None,
-        "last_request_at": row.last_request_at.isoformat() if row.last_request_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "window_started_at": isoformat(row.window_started_at),
+        "last_request_at": isoformat(row.last_request_at),
+        "updated_at": isoformat(row.updated_at),
     }
 
 
@@ -637,8 +641,8 @@ def _to_view(row: ModelStoreEntry, placement: ModelPlacement | None = None) -> d
         "source": row.source,
         "size_bytes": row.size_bytes,
         "placement": _placement_view(placement) if placement is not None else None,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "created_at": isoformat(row.created_at),
+        "updated_at": isoformat(row.updated_at),
     }
 
 
@@ -878,7 +882,7 @@ class ModelCatalog:
                 for name, value in values.items():
                     setattr(row, name, value)
                 session.flush()
-            return {**values, "updated_at": stamped.isoformat()}
+            return {**values, "updated_at": isoformat(stamped)}
 
     def get_node_snapshot(self) -> dict[str, Any] | None:
         """The published node snapshot, or None when never published."""
