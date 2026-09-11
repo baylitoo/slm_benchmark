@@ -316,10 +316,10 @@ def _artifact_options(
     if snapshot_files:
         option = _artifact_option(
             kind="snapshot",
-            label="safetensors snapshot",
+            label="checkpoint snapshot",
             quant=None,
             files=[
-                (file, "weights" if file.filename.endswith(".safetensors") else "support")
+                (file, "weights" if is_weights_file(file.filename) else "support")
                 for file in snapshot_files
             ],
             context_length=context_length,
@@ -499,6 +499,26 @@ def _snapshot_files_from_siblings(
     return files
 
 
+def is_weights_file(filename: str) -> bool:
+    """Does this file carry the model's weights, in any supported format?"""
+    return filename.lower().endswith((".safetensors", *_ALT_WEIGHT_SUFFIXES))
+
+
+def snapshot_files_for(siblings: list[dict[str, Any]]) -> list[HfGgufFile]:
+    """The checkpoint files to fetch, safetensors preferred.
+
+    The single answer to "which files is this snapshot?", used by both the
+    deploy form and the download. They disagreed before: the download learned to
+    keep PyTorch weights and the form did not, so a PyTorch-only checkpoint was
+    offered with its weights missing from the list and its size short by the
+    weight file.
+    """
+    files = _snapshot_files_from_siblings(siblings)
+    if any(file.filename.lower().endswith(".safetensors") for file in files):
+        return files
+    return _snapshot_files_from_siblings(siblings, keep_alt_weights=True)
+
+
 async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[HfGgufFile]:
     """The repo's checkpoint files (weights + config + tokenizer).
 
@@ -525,9 +545,7 @@ async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[H
         raise HfHubError(f"Hub returned HTTP {response.status_code} for {repo!r}")
     payload = response.json()
     siblings = [s for s in payload.get("siblings", []) if isinstance(s, dict)]
-    files = _snapshot_files_from_siblings(siblings)
-    if not any(file.filename.lower().endswith(".safetensors") for file in files):
-        files = _snapshot_files_from_siblings(siblings, keep_alt_weights=True)
+    files = snapshot_files_for(siblings)
     if not has_weights(files):
         raise HfHubError(
             f"repo {repo!r} ships no safetensors or PyTorch weights — "
@@ -840,7 +858,7 @@ async def inspect_repo(
         base_model=_extract_base_model(card_data),
         library_name=str(payload["library_name"]) if payload.get("library_name") else None,
     )
-    snapshot_files = _snapshot_files_from_siblings(siblings) if not has_gguf else []
+    snapshot_files = snapshot_files_for(siblings) if not has_gguf else []
     from docie_bench.serving.model_store import FAMILIES
 
     contract = FAMILIES.get(result.family or "")
