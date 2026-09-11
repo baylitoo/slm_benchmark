@@ -31,7 +31,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from docie_bench.storage.db import session_scope
-from docie_bench.studio.models import UsageRecord, utcnow
+from docie_bench.studio.models import UsageRecord, isoformat, utcnow
 
 logger = logging.getLogger("docie_bench.studio.usage_store")
 
@@ -221,7 +221,7 @@ def aggregate_usage(rows: list[UsageRow]) -> list[dict[str, Any]]:
         grouped[deployment]["avg_latency_ms"] = round(sum(values) / len(values), 1)
         grouped[deployment]["p95_latency_ms"] = percentile(values, 0.95)
     for deployment, stamp in last_used.items():
-        grouped[deployment]["last_used_at"] = stamp.isoformat()
+        grouped[deployment]["last_used_at"] = isoformat(stamp)
     for deployment, per_tool in tool_stats.items():
         grouped[deployment]["tool_calls"] = [
             {

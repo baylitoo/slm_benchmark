@@ -11,7 +11,6 @@ ephemeral realtime topic and a pollable-but-cleared-on-settle sidecar file.
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 from typing import Any
 
@@ -22,7 +21,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from docie_bench.storage.db import session_scope
-from docie_bench.studio.models import SeedRun
+from docie_bench.studio.models import SeedRun, isoformat
 
 logger = logging.getLogger("docie_bench.studio.seed_store")
 
@@ -69,17 +68,9 @@ def _to_dict(row: SeedRun) -> dict[str, Any]:
         "status": row.status,
         "error": row.error_text,
         "result": row.result_json,
-        "created_at": _isoformat(row.created_at),
-        "updated_at": _isoformat(row.updated_at),
+        "created_at": isoformat(row.created_at),
+        "updated_at": isoformat(row.updated_at),
     }
-
-
-def _isoformat(value: dt.datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=dt.UTC)
-    return value.isoformat()
 
 
 def claim_seed_run(

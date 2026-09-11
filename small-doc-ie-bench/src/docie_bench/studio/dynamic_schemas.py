@@ -26,7 +26,7 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 
 from docie_bench.schemas.dynamic import DynamicSchemaSpec
 from docie_bench.storage.db import session_scope
-from docie_bench.studio.models import DynamicSchema
+from docie_bench.studio.models import DynamicSchema, isoformat
 
 # Arbitrary-but-stable advisory-lock key ("docie dynamic schemas v1"), distinct
 # from every other migration's key so they never serialize against each other
@@ -92,8 +92,8 @@ def _to_dict(row: DynamicSchema) -> dict[str, Any]:
     return {
         "name": row.name,
         "spec": row.spec_json,
-        "created_at": row.created_at.isoformat(),
-        "updated_at": row.updated_at.isoformat(),
+        "created_at": isoformat(row.created_at),
+        "updated_at": isoformat(row.updated_at),
     }
 
 
