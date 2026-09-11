@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from docie_bench.settings import get_settings
 from docie_bench.storage.db import get_session_factory
-from docie_bench.studio.models import StudioEventOwner, StudioRun, StudioRunArtifact
+from docie_bench.studio.models import StudioEventOwner, StudioRun, StudioRunArtifact, isoformat
 
 logger = logging.getLogger("docie_bench.studio.store")
 
@@ -579,14 +579,6 @@ class RunStore:
         }
 
 
-def _isoformat(value: dt.datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=dt.UTC)
-    return value.isoformat()
-
-
 def _artifact_to_dict(artifact: StudioRunArtifact) -> dict[str, Any]:
     return {
         "id": artifact.id,
@@ -610,8 +602,8 @@ def _run_to_dict(run: StudioRun) -> dict[str, Any]:
         "schema_name": run.schema_name,
         "metrics": run.metrics_json,
         "error": run.error_text,
-        "created_at": _isoformat(run.created_at),
-        "updated_at": _isoformat(run.updated_at),
+        "created_at": isoformat(run.created_at),
+        "updated_at": isoformat(run.updated_at),
         "artifacts": [_artifact_to_dict(a) for a in run.artifacts],
     }
 

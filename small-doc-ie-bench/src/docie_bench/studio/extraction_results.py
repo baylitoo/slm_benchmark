@@ -8,7 +8,6 @@ does not reliably carry it on this project's self-hosted Inngest server.
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 from typing import Any
 
@@ -20,7 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from docie_bench.storage.db import session_scope
-from docie_bench.studio.models import ExtractionRunResult
+from docie_bench.studio.models import ExtractionRunResult, isoformat
 
 logger = logging.getLogger("docie_bench.studio.extraction_results")
 
@@ -60,16 +59,8 @@ def _to_dict(row: ExtractionRunResult) -> dict[str, Any]:
         "status": row.status,
         "output": row.output_json,
         "error": row.error_text,
-        "created_at": _isoformat(row.created_at),
+        "created_at": isoformat(row.created_at),
     }
-
-
-def _isoformat(value: dt.datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=dt.UTC)
-    return value.isoformat()
 
 
 def record_extraction_result(

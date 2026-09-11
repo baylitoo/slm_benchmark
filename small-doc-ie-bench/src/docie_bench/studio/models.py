@@ -32,6 +32,22 @@ def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
+def isoformat(value: dt.datetime | None) -> str | None:
+    """Serialise a stored timestamp, always with its UTC offset.
+
+    Every timestamp column here is ``DateTime(timezone=True)`` written by
+    :func:`utcnow`, but SQLite does not store an offset and reads the value back
+    naive. Calling ``.isoformat()`` on it emits a bare local-looking string, and
+    ``new Date("2026-09-11T15:45:30")`` in a browser reads that as local time
+    while the same instant from a sibling endpoint reads as UTC.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.UTC)
+    return value.isoformat()
+
+
 class StudioRun(Base):
     __tablename__ = "studio_runs"
 
