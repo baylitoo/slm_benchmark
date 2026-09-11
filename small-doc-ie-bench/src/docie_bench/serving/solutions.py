@@ -15,8 +15,6 @@ reserved for the next adapter.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 from collections.abc import Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -34,7 +32,7 @@ from docie_bench.llm.prompts import (
 from docie_bench.llm.reasoning import apply_native_reasoning, uses_native_reasoning
 from docie_bench.ocr.factory import get_ocr_backend
 from docie_bench.settings import get_settings
-from docie_bench.vision import DocumentImage, load_document_images
+from docie_bench.vision import DocumentImage, decode_data_uri, load_document_images
 
 # Document extraction (OCR text -> JSON, or image -> text) on a CPU box is slow:
 # a multi-page invoice easily generates 1k+ grammar-constrained tokens at single
@@ -465,17 +463,12 @@ def _extract_document(request: dict[str, Any]) -> tuple[bytes, str]:
 
 
 def _decode_data_uri(url: str) -> tuple[bytes, str]:
-    if not url.startswith("data:"):
-        raise SolutionError("the OCR adapter only accepts inline 'data:' image_url payloads")
-    header, _, encoded = url.partition(",")
-    if ";base64" not in header:
-        raise SolutionError("image_url data URI must be base64-encoded")
+    """The document's bytes and the file suffix to write it under."""
     try:
-        raw = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise SolutionError(f"invalid base64 image data: {exc}") from exc
-    mime = header[len("data:") :].split(";", 1)[0].strip().lower()
-    return raw, _DATA_URI_SUFFIX.get(mime, ".png")
+        raw, media_type = decode_data_uri(url)
+    except ValueError as exc:
+        raise SolutionError(f"image_url: {exc}") from exc
+    return raw, _DATA_URI_SUFFIX.get(media_type, ".png")
 
 
 def _chat_completion(model: str, content: str) -> dict[str, Any]:

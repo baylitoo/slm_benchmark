@@ -28,8 +28,6 @@ startup with an actionable message, never 500s the first caller.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import contextlib
 import time
 from collections.abc import AsyncIterator
@@ -39,6 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from docie_bench.openai_protocol import openai_error
+from docie_bench.vision import decode_data_uri
 
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TEMPERATURE = 0.0
@@ -64,18 +63,7 @@ class TransformersBackend(Protocol):
 
 def _decode_data_uri(url: str) -> bytes:
     """Bytes from a ``data:...;base64,<payload>`` URI. Raises ValueError otherwise."""
-    if not url.startswith("data:"):
-        raise ValueError(
-            "transformers serving accepts only inline base64 data: image URLs "
-            "(the serving node does not fetch remote image URLs)"
-        )
-    _, _, payload = url.partition(",")
-    if not payload:
-        raise ValueError("data: image URL has no base64 payload")
-    try:
-        return base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError(f"data: image URL is not valid base64: {exc}") from exc
+    return decode_data_uri(url)[0]
 
 
 def split_prompt(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
