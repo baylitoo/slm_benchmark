@@ -291,10 +291,12 @@ def parse_number(text: str) -> Decimal | None:
     last = max(",.", key=text.rfind)
     if last in text:
         head, _, tail = text.rpartition(last)
-        # Three digits behind the only separator is a thousands group
-        # ("1,234"); anything else is the decimal part ("3,5", "1.234,56").
-        ambiguous = len(tail) == 3 and not _THOUSANDS.search(head)
-        if tail.isdigit() and not ambiguous:
+        if last in head:
+            # "1,234,567": the separator repeats, so all of them group thousands.
+            pass
+        elif tail.isdigit() and (len(tail) != 3 or _THOUSANDS.search(head)):
+            # Three digits behind the only separator is a thousands group
+            # ("1,234"); anything else is the decimal part ("3,5", "1.234,56").
             text, decimals = head, tail
 
     integer = text.strip() or "0"
@@ -310,13 +312,18 @@ def parse_number(text: str) -> Decimal | None:
 
 
 def normalize_currency(value: Any) -> str | None:
-    """Map a currency symbol or code to its ISO 4217 code."""
+    """Map a currency symbol to its ISO 4217 code, keeping any other code.
+
+    Unlike :func:`split_currency`, which needs a whitelist to tell a currency
+    from a word, this reads an already typed currency leaf: every three-letter
+    code is kept, so a client billing in MAD or XOF is not silently nulled.
+    """
     if not isinstance(value, str):
         return None
     text = value.strip()
     if text in _CURRENCY_BY_SYMBOL:
         return _CURRENCY_BY_SYMBOL[text]
-    return text.upper() if text.upper() in _CURRENCY_CODES else None
+    return text.upper() if len(text) == 3 and text.isalpha() else None
 
 
 def coerce_scalars(payload: Any, root: dict[str, Any]) -> tuple[Any, list[str]]:
@@ -350,8 +357,14 @@ def coerce_scalars(payload: Any, root: dict[str, Any]) -> tuple[Any, list[str]]:
             return coerce(value, name, "value")
         if "MoneyField" in refs:
             money = coerce(value, name, "amount")
-            if isinstance(money.get("currency"), str):
-                money = {**money, "currency": normalize_currency(money["currency"])}
+            written = money.get("currency")
+            if isinstance(written, str):
+                code = normalize_currency(written)
+                if code is None:
+                    warnings.append(
+                        f"{name or 'currency'}: {written!r} is not a currency; value dropped"
+                    )
+                money = {**money, "currency": code}
             return money
         return _KEEP
 
