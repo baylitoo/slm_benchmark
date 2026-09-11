@@ -26,6 +26,7 @@ from docie_bench.extract.postprocess import (
     normalize_currency,
     normalize_placeholders,
     parse_number,
+    report_lost_text,
     split_currency,
 )
 from docie_bench.extract.validators import validate_extraction
@@ -963,7 +964,13 @@ class ExtractionService:
         # "1 234,56 EUR".
         raw, coercion_warnings = coerce_scalars(raw, schema)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
+        # Validation builds each declared shape and drops whatever does not fit
+        # it, without raising: a money field answered with `value` instead of
+        # `amount` arrives null and nothing says the model had written
+        # something. Compare what went in against what came out.
+        lost_text = report_lost_text(raw, normalized)
         validation.warnings.extend(coercion_warnings)
+        validation.warnings.extend(lost_text)
         if field_confidences:
             # Attached to the plain validated dict, not a Pydantic field on
             # TextField/MoneyField/etc: `model_confidence` is ad-hoc metadata
