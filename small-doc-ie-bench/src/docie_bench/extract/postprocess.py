@@ -335,6 +335,85 @@ def normalize_currency(value: Any) -> str | None:
     return text.upper() if len(text) == 3 and text.isalpha() else None
 
 
+_WRAPPER_KEYS = frozenset({"evidence_ids", "confidence", "model_confidence"})
+_VALUE_KEYS = ("value", "amount")
+
+
+# A wrapper is recognised by its WHOLE key set, not by holding one of these
+# names: a schema is free to have a field called "amount", and a presence test
+# would read the containing object as a leaf and stop there.
+_LEAF_KEYS = frozenset({*_VALUE_KEYS, "currency", *_WRAPPER_KEYS})
+
+
+def _is_typed_leaf(node: Any) -> bool:
+    return (
+        isinstance(node, dict)
+        and any(key in node for key in _VALUE_KEYS)
+        and set(node) <= _LEAF_KEYS
+    )
+
+
+def _leaf_kept_something(node: dict[str, Any]) -> bool:
+    return any(node.get(key) is not None for key in _VALUE_KEYS)
+
+
+def _texts_in(node: Any) -> list[str]:
+    if isinstance(node, str):
+        return [node] if node.strip() else []
+    if isinstance(node, dict):
+        return [
+            text
+            for key, value in node.items()
+            if key not in _WRAPPER_KEYS
+            for text in _texts_in(value)
+        ]
+    if isinstance(node, list):
+        return [text for item in node for text in _texts_in(item)]
+    return []
+
+
+def report_lost_text(before: Any, after: Any, *, path: str = "") -> list[str]:
+    """Text the model wrote that no typed leaf kept.
+
+    A model that answers a money field with ``{"value": "5 ans"}`` instead of
+    ``{"amount": ...}`` has written something. Rehydration builds the declared
+    shape, the stray key has nowhere to go, and the field arrives null with no
+    warning anywhere: a consumer cannot tell "the document did not say" from
+    "the model said something we could not place".
+
+    Compares the payload before rehydration with the payload after, so it
+    reports what was actually dropped rather than inferring it from the schema.
+    """
+    lost: list[str] = []
+
+    def describe(text: str, at: str) -> str:
+        return (
+            f"{at or 'field'}: the model wrote {text[:60]!r} in a shape this field "
+            "cannot hold; nothing was kept"
+        )
+
+    if _is_typed_leaf(after):
+        if not _leaf_kept_something(after):
+            texts = _texts_in(before)
+            if texts:
+                lost.append(describe(texts[0], path))
+        return lost
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key, value in before.items():
+            if key in _WRAPPER_KEYS:
+                continue
+            child = f"{path}.{key}" if path else key
+            lost.extend(report_lost_text(value, after.get(key), path=child))
+        return lost
+    if isinstance(before, list) and isinstance(after, list):
+        for index, (was, now) in enumerate(zip(before, after, strict=False)):
+            lost.extend(report_lost_text(was, now, path=f"{path}[{index}]"))
+        return lost
+    if isinstance(before, str) and before.strip() and after is None:
+        lost.append(describe(before, path))
+    return lost
+
+
 def coerce_scalars(payload: Any, root: dict[str, Any]) -> tuple[Any, list[str]]:
     """Coerce number and money leaves the model wrote as text.
 
