@@ -9,6 +9,11 @@ from pydantic import BaseModel, ValidationError
 from docie_bench.schemas.common import ExtractionValidation, OCRBlock
 from docie_bench.schemas.extraction import get_schema_model
 
+# How far an invoice's stated total may sit from the sum of its parts before it
+# is reported. One constant: the agent surface's sum_check answers the same
+# question on the same document, and two thresholds made the two disagree.
+INVOICE_TOLERANCE = Decimal("0.05")
+
 
 def _collect_evidence_ids(obj: Any) -> list[str]:
     ids: list[str] = []
@@ -119,10 +124,10 @@ def validate_extraction(
 
 def _validate_invoice_arithmetic(invoice: dict[str, Any]) -> list[str]:
     warnings: list[str] = []
-    tolerance = Decimal("0.05")
-    subtotal = _money_amount(invoice.get("subtotal"))
-    vat = _money_amount(invoice.get("vat_amount"))
-    total = _money_amount(invoice.get("total_ttc"))
+    tolerance = INVOICE_TOLERANCE
+    subtotal = money_amount(invoice.get("subtotal"))
+    vat = money_amount(invoice.get("vat_amount"))
+    total = money_amount(invoice.get("total_ttc"))
     if (
         subtotal is not None
         and vat is not None
@@ -138,9 +143,9 @@ def _validate_invoice_arithmetic(invoice: dict[str, Any]) -> list[str]:
     for index, item in enumerate(invoice.get("line_items", [])):
         if not isinstance(item, dict):
             continue
-        quantity = _number_value(item.get("quantity"))
-        unit_price = _money_amount(item.get("unit_price"))
-        line_total = _money_amount(item.get("line_total"))
+        quantity = number_value(item.get("quantity"))
+        unit_price = money_amount(item.get("unit_price"))
+        line_total = money_amount(item.get("line_total"))
         if line_total is not None:
             line_totals.append(line_total)
         if (
@@ -169,7 +174,12 @@ def _validate_invoice_arithmetic(invoice: dict[str, Any]) -> list[str]:
     return warnings
 
 
-def _money_amount(value: Any) -> Decimal | None:
+def money_amount(value: Any) -> Decimal | None:
+    """A MoneyField's amount as a Decimal, or None when it is absent or unreadable.
+
+    Decimal, not float: these values are compared against a tolerance of a few
+    cents, and a float sum of amounts drifts below that.
+    """
     if not isinstance(value, dict) or value.get("amount") is None:
         return None
     try:
@@ -178,7 +188,7 @@ def _money_amount(value: Any) -> Decimal | None:
         return None
 
 
-def _number_value(value: Any) -> Decimal | None:
+def number_value(value: Any) -> Decimal | None:
     if not isinstance(value, dict) or value.get("value") is None:
         return None
     try:

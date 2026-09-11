@@ -35,6 +35,7 @@ from docie_bench.extract.routing import (
     live_routing_audit,
 )
 from docie_bench.extract.service import ExtractionService
+from docie_bench.extract.validators import INVOICE_TOLERANCE, money_amount
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.mcp_servers.calculator import check_sum
@@ -256,18 +257,6 @@ def _field_confidence(result: Any) -> dict[str, dict[str, Any]]:
 _ROOT_OMITTED = frozenset({"document_type", "extraction_notes"})
 
 
-def _money_amount(value: Any) -> float | None:
-    """A MoneyField's numeric amount from the rich (pre-flatten) validated
-    result — ``{"amount": "12.50", "currency": "EUR", ...}`` — or ``None``
-    when the field is absent, null, or unparseable."""
-    if not isinstance(value, dict) or value.get("amount") is None:
-        return None
-    try:
-        return float(value["amount"])
-    except (TypeError, ValueError):
-        return None
-
-
 def _invoice_sum_check(result: dict[str, Any]) -> dict[str, Any] | None:
     """Best-effort, server-side verification of an invoice-shaped extraction's
     arithmetic: ``line_items[].line_total`` summed and compared against a
@@ -290,15 +279,22 @@ def _invoice_sum_check(result: dict[str, Any]) -> dict[str, Any] | None:
     amounts = [
         amount
         for item in line_items
-        if isinstance(item, dict) and (amount := _money_amount(item.get("line_total"))) is not None
+        if isinstance(item, dict) and (amount := money_amount(item.get("line_total"))) is not None
     ]
     if not amounts:
         return None
-    total_field = "subtotal" if _money_amount(result.get("subtotal")) is not None else "total_ttc"
-    claimed_total = _money_amount(result.get(total_field))
+    total_field = "subtotal" if money_amount(result.get("subtotal")) is not None else "total_ttc"
+    claimed_total = money_amount(result.get(total_field))
     if claimed_total is None:
         return None
-    outcome = check_sum(amounts, claimed_total)
+    # check_sum is a float API; the amounts are read as Decimals and the
+    # threshold is the one the validator applies, so this answer and
+    # validation.warnings cannot disagree about the same invoice.
+    outcome = check_sum(
+        [float(amount) for amount in amounts],
+        float(claimed_total),
+        tolerance=float(INVOICE_TOLERANCE),
+    )
     return {**outcome, "total_field": total_field, "line_item_count": len(amounts)}
 
 
