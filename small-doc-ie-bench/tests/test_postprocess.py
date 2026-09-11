@@ -3,6 +3,7 @@ from typing import Any
 import pytest
 
 from docie_bench.extract.postprocess import (
+    coerce_scalars,
     dedupe_lists,
     normalize_by_schema,
     normalize_date,
@@ -104,10 +105,14 @@ async def test_service_normalizes_dates_by_schema_type(monkeypatch) -> None:
             "document_type": "doc",
             "fields": [
                 {"name": "title", "type": "string"},
-                {"name": "experience", "type": "list", "fields": [
-                    {"name": "start_date", "type": "date"},
-                    {"name": "end_date", "type": "date"},
-                ]},
+                {
+                    "name": "experience",
+                    "type": "list",
+                    "fields": [
+                        {"name": "start_date", "type": "date"},
+                        {"name": "end_date", "type": "date"},
+                    ],
+                },
             ],
         },
     )
@@ -118,3 +123,117 @@ async def test_service_normalizes_dates_by_schema_type(monkeypatch) -> None:
     assert first["end_date"]["value"] is None
     assert second["start_date"]["value"] == "2019"
     assert second["end_date"]["value"] == "2022"
+
+
+def _money_spec() -> dict:
+    return {
+        "document_type": "invoice",
+        "fields": [
+            {"name": "total", "type": "money"},
+            {"name": "years_experience", "type": "number"},
+        ],
+    }
+
+
+def _money_root() -> dict:
+    spec = DynamicSchemaSpec.model_validate(_money_spec())
+    return DynamicTemplateBuilder.build_model(spec).model_json_schema()
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        ("1234", "1234"),
+        ("3,5", "3.5"),
+        ("3.5", "3.5"),
+        ("0,5", "0.5"),
+        (",5", "0.5"),
+        ("-12,5", "-12.5"),
+        ("+12,5", "12.5"),
+        # A lone separator with three digits behind it groups thousands.
+        ("1,234", "1234"),
+        ("1.234", "1234"),
+        # Two different separators: the last one is the decimal point.
+        ("1.234,56", "1234.56"),
+        ("1,234.56", "1234.56"),
+        ("1 234,56", "1234.56"),
+        # The same separator repeated only ever groups thousands.
+        ("1,234,567", "1234567"),
+        ("1.234.567", "1234567"),
+        ("1.234.567,89", "1234567.89"),
+        ("1 234 567,89", "1234567.89"),
+        ("1\u00a0234,56", "1234.56"),
+    ],
+)
+def test_a_number_written_as_text_is_coerced(written: str, expected: str) -> None:
+    payload = {"years_experience": {"value": written, "evidence_ids": [], "confidence": 0.9}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["years_experience"]["value"] == expected
+    assert warnings == []
+
+
+def test_an_amount_carries_its_currency_when_the_currency_leaf_is_empty() -> None:
+    payload = {"total": {"amount": "1 234,56 \u20ac", "currency": None}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["total"] == {"amount": "1234.56", "currency": "EUR"}
+    assert warnings == []
+
+
+def test_a_currency_symbol_becomes_an_iso_code() -> None:
+    payload = {"total": {"amount": "10", "currency": "\u20ac"}}
+    out, _ = coerce_scalars(payload, _money_root())
+    assert out["total"]["currency"] == "EUR"
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "12 rue de la Paix",
+        "06 12 34 56 78",
+        "5 ans",
+        "Septembre 2019 - Fevrier 2022",
+        "N/A",
+        # A thousands group must hold exactly three digits.
+        "1,234,5",
+        "12 34 56",
+    ],
+)
+def test_text_that_is_not_a_number_is_dropped_with_a_warning(written: str) -> None:
+    payload = {"years_experience": {"value": written, "evidence_ids": ["b1"], "confidence": 0.4}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["years_experience"]["value"] is None
+    assert out["years_experience"]["evidence_ids"] == ["b1"]
+    assert len(warnings) == 1
+    assert written in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("written", "expected_amount", "expected_currency"),
+    [
+        ("1 234,56 \u20ac", "1234.56", "EUR"),
+        ("\u20ac1.234", "1234", "EUR"),
+        ("1234.56 EUR", "1234.56", "EUR"),
+        ("CHF 1 000", "1000", "CHF"),
+    ],
+)
+def test_a_currency_marker_is_split_off_the_amount(
+    written: str, expected_amount: str, expected_currency: str
+) -> None:
+    payload = {"total": {"amount": written, "currency": None}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["total"] == {"amount": expected_amount, "currency": expected_currency}
+    assert warnings == []
+
+
+def test_a_currency_the_symbol_table_does_not_know_is_kept() -> None:
+    payload = {"total": {"amount": "1000", "currency": "mad"}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["total"]["currency"] == "MAD"
+    assert warnings == []
+
+
+def test_a_currency_that_is_not_a_code_is_dropped_with_a_warning() -> None:
+    payload = {"total": {"amount": "1000", "currency": "euros"}}
+    out, warnings = coerce_scalars(payload, _money_root())
+    assert out["total"]["currency"] is None
+    assert len(warnings) == 1

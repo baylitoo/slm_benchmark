@@ -20,6 +20,7 @@ from docie_bench.extract.logprob_confidence import (
     compute_field_confidences,
 )
 from docie_bench.extract.postprocess import (
+    coerce_scalars,
     dedupe_lists,
     normalize_by_schema,
     normalize_placeholders,
@@ -989,7 +990,12 @@ class ExtractionService:
         raw = rehydrate_extraction_result(dedupe_lists(normalize_placeholders(raw)), schema)
         raw = normalize_by_schema(raw, schema)
         raw = ground_evidence(raw, blocks)
+        # After grounding: the evidence search matches the value as the
+        # model wrote it, and "1234.56" no longer matches a line reading
+        # "1 234,56 EUR".
+        raw, coercion_warnings = coerce_scalars(raw, schema)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
+        validation.warnings.extend(coercion_warnings)
         if field_confidences:
             # Attached to the plain validated dict, not a Pydantic field on
             # TextField/MoneyField/etc: `model_confidence` is ad-hoc metadata

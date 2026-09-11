@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +24,77 @@ def _collect_evidence_ids(obj: Any) -> list[str]:
     return ids
 
 
+MAX_SALVAGE_PASSES = 20
+
+
+def _describe(loc: tuple[Any, ...]) -> str:
+    parts: list[str] = []
+    for segment in loc:
+        if isinstance(segment, int):
+            parts.append(f"[{segment}]")
+        elif isinstance(segment, str) and not segment.endswith("]"):
+            parts.append(f".{segment}" if parts else segment)
+    return "".join(parts) or "<root>"
+
+
+def _prune(payload: Any, loc: tuple[Any, ...]) -> bool:
+    """Drop the deepest reachable value on an error path.
+
+    A list index means the element itself is the wrong shape, so it is removed;
+    nulling it would fail validation again on the very same location.
+    """
+    parent: Any = None
+    key: Any = None
+    node: Any = payload
+    for segment in loc:
+        if isinstance(node, dict):
+            reachable = segment in node
+        elif isinstance(node, list):
+            reachable = isinstance(segment, int) and -len(node) <= segment < len(node)
+        else:
+            reachable = False
+        if not reachable:
+            break
+        parent, key, node = node, segment, node[segment]
+    if parent is None:
+        return False
+    if isinstance(parent, list):
+        del parent[key]
+        return True
+    if parent[key] is None:
+        return False
+    parent[key] = None
+    return True
+
+
+def _salvage(
+    model_cls: type[BaseModel], payload: dict[str, Any]
+) -> tuple[BaseModel | None, dict[str, Any], list[str], list[str]]:
+    """Validate, dropping one offending leaf per pass until the rest parses.
+
+    A single unparsable scalar used to invalidate the whole document and return
+    the raw payload, so a correct 40-field extraction was lost to one bad year.
+    Every dropped value is reported as a warning.
+    """
+    payload = copy.deepcopy(payload)
+    warnings: list[str] = []
+    for _ in range(MAX_SALVAGE_PASSES):
+        try:
+            return model_cls.model_validate(payload), payload, warnings, []
+        except ValidationError as exc:
+            error = exc.errors()[0]
+            if not _prune(payload, tuple(error.get("loc", ()))):
+                return None, payload, warnings, [str(exc)]
+            warnings.append(
+                f"{_describe(tuple(error.get('loc', ())))}: "
+                f"{error.get('msg', 'invalid value')}; dropped"
+            )
+    try:
+        return model_cls.model_validate(payload), payload, warnings, []
+    except ValidationError as exc:
+        return None, payload, warnings, [str(exc)]
+
+
 def validate_extraction(
     schema_name: str,
     payload: dict[str, Any],
@@ -30,12 +102,9 @@ def validate_extraction(
     model_cls: type[BaseModel] | None = None,
 ) -> tuple[dict[str, Any], ExtractionValidation]:
     model_cls = model_cls or get_schema_model(schema_name)
-    errors: list[str] = []
-    warnings: list[str] = []
-    try:
-        parsed = model_cls.model_validate(payload)
-    except ValidationError as exc:
-        return payload, ExtractionValidation(valid=False, errors=[str(exc)], warnings=[])
+    parsed, payload, warnings, errors = _salvage(model_cls, payload)
+    if parsed is None:
+        return payload, ExtractionValidation(valid=False, errors=errors, warnings=warnings)
 
     block_ids = {block.id for block in blocks}
     for evidence_id in _collect_evidence_ids(parsed.model_dump(mode="json")):
