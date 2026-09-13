@@ -38,6 +38,7 @@ from docie_bench.llm.prompts import (
     SCHEMA_PROPOSER_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
+    build_document_only_prompts,
     build_nuextract3_prompts,
     build_nuextract_prompts,
     build_schema_proposer_prompt,
@@ -696,7 +697,11 @@ class ExtractionService:
         field_confidences) -- everything _extract_blocks needs to merge
         across groups without this method knowing whether it's one of many.
         """
-        if self.profile.prompt_profile == "nuextract3":
+        if self.profile.prompt_profile == "document_only" and not images:
+            # The schema reaches this family out-of-band (response_format), so
+            # the prompt is the document alone.
+            system_prompt, user_prompt = build_document_only_prompts(blocks)
+        elif self.profile.prompt_profile == "nuextract3":
             # NuExtract3 gets the template out-of-band via chat_template_kwargs
             # (the `nuextract3` response style), so the prompt carries only the
             # document — as the page image (vision) or OCR text. This must win

@@ -281,6 +281,23 @@ def nuextract_template_for(schema_name: str) -> dict:
     return _NUEXTRACT_TEMPLATES.get(schema_name, {})
 
 
+def build_document_only_prompts(blocks: list[OCRBlock]) -> tuple[str, str]:
+    """Return (system_prompt, user_prompt) carrying the document and nothing else.
+
+    For a family that receives its schema out-of-band rather than as prompt
+    text: NuExtract3 through ``chat_template_kwargs``, GLiFormer through
+    ``response_format``. Such a model does not read instructions, so the generic
+    prompt's role, security preamble, output contract, evidence markers,
+    metadata line and rendered field list are all text it can only mistake for
+    the document.
+
+    That is not hypothetical: a GLiFormer run returned ``issue_date`` as the
+    literal ``"YYYY-MM-DD"``, a string that appears nowhere in the invoice and
+    only in the field list's own type hint.
+    """
+    return "", "\n".join(block.text for block in blocks)
+
+
 def build_nuextract3_prompts(
     *,
     blocks: list[OCRBlock],
@@ -295,7 +312,7 @@ def build_nuextract3_prompts(
     """
     if has_images:
         return "", ""
-    return "", "\n".join(block.text for block in blocks)
+    return build_document_only_prompts(blocks)
 
 
 def build_schema_proposer_prompt(*, blocks: list[OCRBlock], language: str | None = None) -> str:
