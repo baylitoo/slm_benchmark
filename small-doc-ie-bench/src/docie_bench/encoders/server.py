@@ -29,14 +29,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator
-from typing import Any, Protocol
+import logging
+from collections.abc import AsyncIterator, Callable
+from typing import Any, Protocol, cast
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from docie_bench.extract.postprocess import dedupe_lists
 from docie_bench.openai_protocol import openai_error
 from docie_bench.schemas.dynamic import gliformer_model_from_json_schema
+
+logger = logging.getLogger("docie_bench.encoders.server")
 
 DEFAULT_ENCODER_MODEL = "urchade/gliner_multi_pii-v1"
 DEFAULT_GLIFORMER_MODEL = "knowledgator/gliformer-base-v1"
@@ -93,6 +97,119 @@ class GlinerBackend:
         ]
 
 
+# A document longer than the encoder's input window has to be structured in
+# pieces. The window is read off the model rather than guessed; this is only the
+# fallback for a checkpoint that declares none.
+DEFAULT_STRUCTURE_WINDOW_TOKENS = 512
+# Lines repeated at the seam, so a record split across a boundary is seen whole
+# by at least one chunk.
+STRUCTURE_OVERLAP_LINES = 2
+
+
+def model_input_window(model: Any) -> int | None:
+    """The model's own input limit, when it declares one.
+
+    Guessing a DeBERTa window would be wrong in both directions: too low splits
+    documents that fit and loses records across seams, too high silently
+    truncates. The checkpoint knows, so ask it.
+    """
+    candidates = (
+        (getattr(model, "config", None), "max_position_embeddings"),
+        (getattr(model, "tokenizer", None), "model_max_length"),
+    )
+    for owner, attribute in candidates:
+        value = getattr(owner, attribute, None)
+        # transformers writes a sentinel in the billions when a tokenizer
+        # declares no limit; that is "unknown", not "unbounded".
+        if isinstance(value, int) and 0 < value < 1_000_000:
+            return value
+    return None
+
+
+def split_for_window(
+    text: str,
+    count_tokens: Callable[[str], int],
+    budget: int,
+    *,
+    overlap_lines: int = STRUCTURE_OVERLAP_LINES,
+) -> list[str]:
+    """Split ``text`` on line boundaries so no piece exceeds ``budget`` tokens.
+
+    Lines are the unit because OCR emits them and a record rarely straddles one.
+    A few lines are repeated at each seam so a record written across a boundary
+    is seen whole by one side, and the overlap is shortened when carrying it
+    would push the next piece over budget: the ceiling is the invariant, the
+    overlap is best effort. A single line over budget is split on whitespace
+    rather than dropped.
+    """
+    if budget <= 0 or count_tokens(text) <= budget:
+        return [text]
+
+    def fits(lines: list[str]) -> bool:
+        return count_tokens("\n".join(lines)) <= budget
+
+    pieces: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if count_tokens(line) > budget:
+            if current:
+                pieces.append("\n".join(current))
+                current = []
+            pieces.extend(_split_long_line(line, count_tokens, budget))
+            continue
+        if not current or fits([*current, line]):
+            current.append(line)
+            continue
+        pieces.append("\n".join(current))
+        carried = current[-overlap_lines:] if overlap_lines else []
+        while carried and not fits([*carried, line]):
+            carried = carried[1:]
+        current = [*carried, line]
+    if current:
+        pieces.append("\n".join(current))
+    return [piece for piece in pieces if piece.strip()] or [text]
+
+
+def _split_long_line(line: str, count_tokens: Callable[[str], int], budget: int) -> list[str]:
+    pieces: list[str] = []
+    current: list[str] = []
+    for word in line.split():
+        candidate = [*current, word]
+        if current and count_tokens(" ".join(candidate)) > budget:
+            pieces.append(" ".join(current))
+            current = [word]
+            continue
+        current = candidate
+    if current:
+        pieces.append(" ".join(current))
+    return pieces
+
+
+def merge_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold the records read from each chunk into the one the document describes.
+
+    A list field concatenates, because chunk two holds experiences chunk one
+    never saw. A scalar takes the first chunk that answered, because the same
+    name repeated on every page is one name, not four.
+
+    Exact duplicates are dropped afterwards by ``dedupe_lists``, which the
+    extraction pipeline already uses for this.
+    """
+    merged: dict[str, Any] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key, value in record.items():
+            if value is None or value == "" or value == []:
+                continue
+            existing = merged.get(key)
+            if isinstance(value, list):
+                merged[key] = [*(existing if isinstance(existing, list) else []), *value]
+            elif key not in merged:
+                merged[key] = value
+    return cast(dict[str, Any], dedupe_lists(merged))
+
+
 class GliformerBackend:
     """GLiFormer backend: zero-shot NER plus schema-driven structuring.
 
@@ -101,6 +218,10 @@ class GliformerBackend:
     result keys as GLiNER's, so the analyzer surface is unchanged; ``structure``
     is the extra head this family brings (see :meth:`structure`).
     """
+
+    # A class attribute so an instance built without ``__init__`` still has a
+    # window: ``structure`` must never fail on a missing attribute.
+    input_window: int = DEFAULT_STRUCTURE_WINDOW_TOKENS
 
     def __init__(self, model_id: str = DEFAULT_GLIFORMER_MODEL) -> None:
         try:
@@ -112,10 +233,9 @@ class GliformerBackend:
             ) from exc
         self.model_id = model_id
         self._model = GLiFormer.from_pretrained(model_id, load_tokenizer=True)
+        self.input_window = model_input_window(self._model) or DEFAULT_STRUCTURE_WINDOW_TOKENS
 
-    def predict(
-        self, text: str, labels: list[str], threshold: float
-    ) -> list[dict[str, Any]]:
+    def predict(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]:
         raw = self._model.predict_entities(text, labels, threshold=threshold)
         return [
             {
@@ -136,8 +256,34 @@ class GliformerBackend:
         with a Pydantic model for nested records.
         :class:`~docie_bench.schemas.dynamic.DynamicTemplateBuilder` builds
         either one from a saved schema.
+
+        A document past the encoder's input window is structured in pieces and
+        the pieces folded back into one record: without this a three-page CV
+        returns only what fits in the first window, with no error to say the
+        rest was never read.
         """
-        return self._model.structure(text, schema, validate_output=validate_output)
+        chunks = split_for_window(text, self.count_tokens, self.input_window)
+        if len(chunks) == 1:
+            return self._model.structure(text, schema, validate_output=validate_output)
+        record_name = next(iter(schema))
+        found: list[dict[str, Any]] = []
+        for chunk in chunks:
+            answer = self._model.structure(chunk, schema, validate_output=validate_output)
+            if isinstance(answer, dict):
+                rows = answer.get(record_name)
+                found.extend(row for row in (rows or []) if isinstance(row, dict))
+        return {record_name: [merge_records(found)]}
+
+    def count_tokens(self, text: str) -> int:
+        """Length in the model's own tokens, or a character estimate without one."""
+        tokenizer = getattr(self._model, "tokenizer", None)
+        encode = getattr(tokenizer, "encode", None)
+        if encode is not None:
+            try:
+                return len(encode(text))
+            except Exception as exc:  # noqa: BLE001 - never fail a request on this
+                logger.debug("tokenizer_count_failed", extra={"docie_error": str(exc)})
+        return max(1, len(text) // 4)
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +550,11 @@ def create_encoder_app(
         # rest of the platform already sends one as
         # response_format.json_schema, so a served GLiFormer is reached through
         # the ordinary extraction path with no channel of its own.
-        schema_spec = (body.get("response_format") or {}) if isinstance(
-            body.get("response_format"), dict
-        ) else {}
+        schema_spec = (
+            (body.get("response_format") or {})
+            if isinstance(body.get("response_format"), dict)
+            else {}
+        )
         json_schema = schema_spec.get("json_schema") or {}
         schema_root = json_schema.get("schema") if isinstance(json_schema, dict) else None
         if isinstance(schema_root, dict) and schema_root:
@@ -429,9 +577,7 @@ def create_encoder_app(
                     error_type="invalid_request_error",
                 )
             records = await asyncio.to_thread(structure, text, {record_name: model})
-            return JSONResponse(
-                _completion(app.state.model_id, _one_record(records, record_name))
-            )
+            return JSONResponse(_completion(app.state.model_id, _one_record(records, record_name)))
 
         labels_raw = body.get("labels")
         labels = (
