@@ -55,6 +55,12 @@ class DynamicSchemaSpec(BaseModel):
         return self
 
 
+# How deep a request-supplied schema may nest. Real ones reach three or four
+# levels; the ceiling exists so a hostile or generated one cannot exhaust the
+# stack on the way in, which would reach the client as a 500 rather than a 400.
+_MAX_SCHEMA_DEPTH = 24
+
+
 def gliformer_model_from_json_schema(
     schema: dict[str, Any], *, name: str = "Record"
 ) -> type[BaseModel]:
@@ -69,34 +75,56 @@ def gliformer_model_from_json_schema(
     after extraction (``normalize_by_schema`` then ``coerce_scalars``).
     Declaring a Decimal here would make ``validate_output=True`` reject
     ``"1 234,56 EUR"`` rather than accept it.
+
+    The schema comes off a request, so two shapes are refused with ``ValueError``
+    rather than followed: one nesting past :data:`_MAX_SCHEMA_DEPTH`, and a
+    definition that refers back to itself. Both describe an infinitely deep
+    record and both would otherwise raise ``RecursionError``, which the caller
+    cannot turn into a 400.
     """
     defs = schema.get("$defs") or schema.get("definitions") or {}
 
-    def resolve(node: Any, seen: int = 0) -> Any:
-        while isinstance(node, dict) and "$ref" in node and seen < 50:
-            node = defs.get(str(node["$ref"]).rsplit("/", 1)[-1], {})
-            seen += 1
-        return node
+    def deref(node: Any, followed: frozenset[str]) -> tuple[Any, frozenset[str]]:
+        """Follow ``$ref`` links, refusing one already followed on this path."""
+        while isinstance(node, dict) and "$ref" in node:
+            ref = str(node["$ref"]).rsplit("/", 1)[-1]
+            if ref in followed:
+                raise ValueError(f"schema definition {ref!r} refers to itself")
+            followed = followed | {ref}
+            node = defs.get(ref, {})
+        return node, followed
 
-    def pick(node: Any) -> Any:
-        node = resolve(node)
+    def pick(node: Any, followed: frozenset[str]) -> tuple[Any, frozenset[str]]:
+        """The non-null branch of a union, dereferenced."""
+        node, followed = deref(node, followed)
         if not isinstance(node, dict):
-            return {}
+            return {}, followed
         for key in ("anyOf", "oneOf"):
             choices = node.get(key)
-            if isinstance(choices, list):
-                for choice in choices:
-                    chosen = resolve(choice)
-                    if isinstance(chosen, dict) and chosen.get("type") != "null":
-                        return chosen
-        return node
+            if not isinstance(choices, list):
+                continue
+            for choice in choices:
+                chosen, chosen_followed = deref(choice, followed)
+                if isinstance(chosen, dict) and chosen.get("type") != "null":
+                    return chosen, chosen_followed
+        return node, followed
 
-    def build(node: Any, label: str) -> Any:
-        node = pick(node)
-        properties = node.get("properties")
+    def build(node: Any, label: str, depth: int, followed: frozenset[str]) -> Any:
+        if depth > _MAX_SCHEMA_DEPTH:
+            raise ValueError(f"schema nests deeper than {_MAX_SCHEMA_DEPTH} levels")
+        node, followed = pick(node, followed)
+        properties = node.get("properties") if isinstance(node, dict) else None
         if isinstance(properties, dict) and properties:
             fields = {
-                key: (build(value, f"{label}{key.title().replace('_', '')}"), Field(default=None))
+                key: (
+                    build(
+                        value,
+                        f"{label}{key.title().replace('_', '')}",
+                        depth + 1,
+                        followed,
+                    ),
+                    Field(default=None),
+                )
                 for key, value in properties.items()
                 if key not in _RESERVED_FIELDS
             }
@@ -105,12 +133,13 @@ def gliformer_model_from_json_schema(
             return create_model(  # type: ignore[call-overload]
                 label or "Record", __config__=ConfigDict(extra="forbid"), **fields
             )
-        if node.get("type") == "array" or "items" in node:
-            inner = build(node.get("items") or {}, label + "Item")
+        if isinstance(node, dict) and (node.get("type") == "array" or "items" in node):
+            inner = build(node.get("items") or {}, label + "Item", depth + 1, followed)
             return list[inner] | None  # type: ignore[valid-type]
         return str | None
 
-    built = build(schema, "".join(part.title() for part in name.split("_")) or "Record")
+    label = "".join(part.title() for part in name.split("_")) or "Record"
+    built = build(schema, label, 0, frozenset())
     if isinstance(built, type) and issubclass(built, BaseModel):
         return built
     raise ValueError("schema has no object properties to structure into")
@@ -220,8 +249,7 @@ class DynamicTemplateBuilder:
 
         nested_name = parent_name + "".join(part.title() for part in spec.name.split("_"))
         nested_fields = {
-            child.name: cls._model_field(child, parent_name=nested_name)
-            for child in spec.fields
+            child.name: cls._model_field(child, parent_name=nested_name) for child in spec.fields
         }
         nested_model = create_model(
             nested_name,
