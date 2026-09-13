@@ -58,8 +58,12 @@ class _Structuring:
         return {"probe": [{}]}
 
 
-@pytest.mark.parametrize("schema", [SELF_REFERENTIAL, _deeply_nested(2000)])
+@pytest.mark.parametrize("schema", [SELF_REFERENTIAL, _deeply_nested(40)])
 def test_the_endpoint_answers_400_not_500(schema: dict[str, Any]) -> None:
+    # 40 levels, not thousands: the client serialises this schema to JSON, and
+    # json.encoder recurses per level, so a very deep dict blows the
+    # interpreter's stack on the way IN on some Pythons — failing the test
+    # without ever reaching the guard it exists to check.
     app = create_encoder_app(model_id="knowledgator/gliformer-base-v1", backend=_Structuring())
     with TestClient(app) as client:
         response = client.post(
