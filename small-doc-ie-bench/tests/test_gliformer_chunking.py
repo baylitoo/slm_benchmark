@@ -32,9 +32,49 @@ class _Tokenizer:
         return text.split()
 
 
-def test_the_model_config_declares_the_window() -> None:
+def test_the_tokenizer_is_preferred_over_the_backbone_position_table() -> None:
+    # _Config declares only max_position_embeddings (1024) and _Tokenizer
+    # declares model_max_length (4096). The backbone's table is the last
+    # resort, so the tokenizer wins.
     model = type("M", (), {"config": _Config(), "tokenizer": _Tokenizer()})()
-    assert model_input_window(model) == 1024
+    assert model_input_window(model) == 4096
+
+
+# The two published checkpoints, verbatim from their gliner_config.json. Both
+# report max_position_embeddings 512, which belongs to the DeBERTa backbone's
+# absolute position table and is NOT what the encoder accepts.
+@pytest.mark.parametrize(
+    ("checkpoint", "max_len", "expected"),
+    [("gliformer-base-v1", 16384, 16384), ("gliformer-large-v1", 8192, 8192)],
+)
+def test_the_published_checkpoints_report_their_real_window(
+    checkpoint: str, max_len: int, expected: int
+) -> None:
+    config = type("C", (), {"max_len": max_len, "max_position_embeddings": 512})()
+    model = type("M", (), {"config": config})()
+    assert model_input_window(model) == expected
+
+
+def test_the_backbone_position_table_never_wins_over_max_len() -> None:
+    # Reading it first chunked a document into sixteen to thirty-two times more
+    # pieces than needed, each seam another call and another place to cut a
+    # record in half.
+    config = type("C", (), {"max_len": 8192, "max_position_embeddings": 512})()
+    assert model_input_window(type("M", (), {"config": config})()) == 8192
+
+
+def test_the_backbone_table_is_still_used_when_nothing_else_is_declared() -> None:
+    config = type("C", (), {"max_position_embeddings": 512})()
+    assert model_input_window(type("M", (), {"config": config})()) == 512
+
+
+def test_max_len_on_the_model_itself_is_accepted() -> None:
+    assert model_input_window(type("M", (), {"max_len": 2048})()) == 2048
+
+
+def test_a_boolean_is_not_a_window() -> None:
+    config = type("C", (), {"max_len": True, "max_position_embeddings": 512})()
+    assert model_input_window(type("M", (), {"config": config})()) == 512
 
 
 def test_the_tokenizer_answers_when_the_config_does_not() -> None:

@@ -100,6 +100,9 @@ class GlinerBackend:
 # A document longer than the encoder's input window has to be structured in
 # pieces. The window is read off the model rather than guessed; this is only the
 # fallback for a checkpoint that declares none.
+# Only for a checkpoint that declares nothing. Conservative on purpose: chunking
+# a document that would have fitted costs time, reading past the real window
+# truncates it silently.
 DEFAULT_STRUCTURE_WINDOW_TOKENS = 512
 # Lines repeated at the seam, so a record split across a boundary is seen whole
 # by at least one chunk.
@@ -109,19 +112,30 @@ STRUCTURE_OVERLAP_LINES = 2
 def model_input_window(model: Any) -> int | None:
     """The model's own input limit, when it declares one.
 
-    Guessing a DeBERTa window would be wrong in both directions: too low splits
-    documents that fit and loses records across seams, too high silently
-    truncates. The checkpoint knows, so ask it.
+    Order matters, and the obvious field is the wrong one.
+    ``max_position_embeddings`` describes the BACKBONE's absolute position
+    table; GLiFormer's DeBERTa reports 512 there while the checkpoint declares
+    ``max_len`` of 8192 (large) and 16384 (base), because DeBERTa's positions
+    are relative and the encoder is not bound by that table.
+
+    Reading it first chunked a document into sixteen to thirty-two times more
+    pieces than needed: every extra seam is another inference call and another
+    place a record can be cut in half. So ``max_len`` is asked first, the
+    tokenizer's own limit second, and the backbone's table only as a last
+    resort for a checkpoint that says nothing else.
     """
+    config = getattr(model, "config", None)
     candidates = (
-        (getattr(model, "config", None), "max_position_embeddings"),
+        (config, "max_len"),
+        (model, "max_len"),
         (getattr(model, "tokenizer", None), "model_max_length"),
+        (config, "max_position_embeddings"),
     )
     for owner, attribute in candidates:
         value = getattr(owner, attribute, None)
         # transformers writes a sentinel in the billions when a tokenizer
         # declares no limit; that is "unknown", not "unbounded".
-        if isinstance(value, int) and 0 < value < 1_000_000:
+        if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 1_000_000:
             return value
     return None
 
