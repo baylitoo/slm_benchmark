@@ -353,7 +353,11 @@ FAMILIES: dict[str, FamilyContract] = {
         # Without it the server has nothing to structure into and falls back to
         # entity recognition.
         response_format_style="openai_json_schema",
-        prompt_profile="strict_extraction_v1",
+        # The schema travels in response_format, so the prompt carries the
+        # document and nothing else — the same shape NuExtract3 uses. The
+        # generic extraction prompt is instructions this model cannot follow and
+        # spans it can mistake for the document.
+        prompt_profile="document_only",
         analyzer=True,
         encoder_backend="gliformer",
         structured_extraction=True,
