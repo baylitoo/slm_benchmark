@@ -113,6 +113,13 @@ def _field_candidate(field: dict[str, Any]) -> str | None:
 
 def _best_match(candidate: str, evidence: _Evidence) -> tuple[list[str], float]:
     variants = _candidate_variants(candidate)
+    if not variants:
+        # Nothing left to match on: normalisation keeps letters and digits only,
+        # so a value made entirely of punctuation or symbols -- a bare "€" in a
+        # currency field, which small models emit routinely -- reduces to the
+        # empty string. That is ungrounded, not an error, and max() over no
+        # variants used to raise and fail the whole extraction.
+        return [], 0.0
     best_ids: list[str] = []
     best_score = 0.0
     for evidence_ids, block_text in evidence.spans:
