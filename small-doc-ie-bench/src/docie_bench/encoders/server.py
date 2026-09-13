@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Callable
 from typing import Any, Protocol, cast
 
@@ -100,6 +101,9 @@ class GlinerBackend:
 # A document longer than the encoder's input window has to be structured in
 # pieces. The window is read off the model rather than guessed; this is only the
 # fallback for a checkpoint that declares none.
+# Only for a checkpoint that declares nothing. Conservative on purpose: chunking
+# a document that would have fitted costs time, reading past the real window
+# truncates it silently.
 DEFAULT_STRUCTURE_WINDOW_TOKENS = 512
 # Lines repeated at the seam, so a record split across a boundary is seen whole
 # by at least one chunk.
@@ -109,21 +113,113 @@ STRUCTURE_OVERLAP_LINES = 2
 def model_input_window(model: Any) -> int | None:
     """The model's own input limit, when it declares one.
 
-    Guessing a DeBERTa window would be wrong in both directions: too low splits
-    documents that fit and loses records across seams, too high silently
-    truncates. The checkpoint knows, so ask it.
+    Order matters, and the obvious field is the wrong one.
+    ``max_position_embeddings`` describes the BACKBONE's absolute position
+    table; GLiFormer's DeBERTa reports 512 there while the checkpoint declares
+    ``max_len`` of 8192 (large) and 16384 (base), because DeBERTa's positions
+    are relative and the encoder is not bound by that table.
+
+    Reading it first chunked a document into sixteen to thirty-two times more
+    pieces than needed: every extra seam is another inference call and another
+    place a record can be cut in half. So ``max_len`` is asked first, the
+    tokenizer's own limit second, and the backbone's table only as a last
+    resort for a checkpoint that says nothing else.
     """
+    config = getattr(model, "config", None)
     candidates = (
-        (getattr(model, "config", None), "max_position_embeddings"),
+        (config, "max_len"),
+        (model, "max_len"),
         (getattr(model, "tokenizer", None), "model_max_length"),
+        (config, "max_position_embeddings"),
     )
     for owner, attribute in candidates:
         value = getattr(owner, attribute, None)
         # transformers writes a sentinel in the billions when a tokenizer
         # declares no limit; that is "unknown", not "unbounded".
-        if isinstance(value, int) and 0 < value < 1_000_000:
+        if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 1_000_000:
             return value
     return None
+
+
+# The prompt marks page boundaries as "[page N]" when a document spans several
+# pages (see llm/prompts.render_ocr_blocks), so the structure the OCR found
+# survives into the text this server receives.
+_PAGE_MARKER = re.compile(r"^\[page \d+\]$")
+
+
+def split_into_pages(text: str) -> list[str]:
+    """The document's pages, marker included, or one piece when unmarked."""
+    pages: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if _PAGE_MARKER.match(line.strip()) and current:
+            pages.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        pages.append("\n".join(current))
+    return pages
+
+
+def _split_oversized_page(
+    page: str, count_tokens: Callable[[str], int], budget: int
+) -> list[str]:
+    """Cut one page that cannot be kept whole, repeating its marker.
+
+    Every fragment carries the "[page N]" line, so a piece taken from the
+    middle of a page still tells the model where it came from instead of
+    arriving as unplaced text.
+    """
+    lines = page.splitlines()
+    marker = lines[0] if lines and _PAGE_MARKER.match(lines[0].strip()) else None
+    if marker is None:
+        return _split_lines_for_window(page, count_tokens, budget)
+    # The marker is prepended to every fragment, so its own cost comes out
+    # of the budget first: the ceiling is the invariant, and a fragment that
+    # fitted only before the marker was added would break it.
+    body = "\n".join(lines[1:])
+    room = budget - count_tokens(marker)
+    if room <= 0:
+        return _split_lines_for_window(page, count_tokens, budget)
+    fragments = _split_lines_for_window(body, count_tokens, room)
+    return [marker + "\n" + fragment for fragment in fragments]
+
+
+def pack_pages(
+    pages: list[str],
+    count_tokens: Callable[[str], int],
+    budget: int,
+) -> list[str]:
+    """Group whole pages into pieces under ``budget``.
+
+    A page is the unit because it is the one the document itself declares: a
+    record rarely straddles a page break, while an arbitrary line cut lands
+    mid-record by construction. Grouping greedily is also what handles a sparse
+    page — a cover sheet, a page holding one table — since it simply joins the
+    pages after it until the budget is reached, rather than spending a whole
+    inference call on four lines.
+
+    A single page over budget is the one case a page cannot be kept whole; it
+    falls through to the line splitter, and only that page does.
+    """
+    pieces: list[str] = []
+    current: list[str] = []
+    for page in pages:
+        if count_tokens(page) > budget:
+            if current:
+                pieces.append("\n".join(current))
+                current = []
+            pieces.extend(_split_oversized_page(page, count_tokens, budget))
+            continue
+        candidate = [*current, page]
+        if current and count_tokens("\n".join(candidate)) > budget:
+            pieces.append("\n".join(current))
+            current = [page]
+            continue
+        current = candidate
+    if current:
+        pieces.append("\n".join(current))
+    return pieces
 
 
 def split_for_window(
@@ -133,9 +229,38 @@ def split_for_window(
     *,
     overlap_lines: int = STRUCTURE_OVERLAP_LINES,
 ) -> list[str]:
-    """Split ``text`` on line boundaries so no piece exceeds ``budget`` tokens.
+    """Divide a document into pieces the model can read, page by page.
 
-    Lines are the unit because OCR emits them and a record rarely straddles one.
+    A document that fits goes through whole. Past the window it is divided on
+    the boundaries the document itself declares — its pages — and whole pages
+    are grouped up to the budget, so a sparse page rides along with the next one
+    instead of costing its own inference call. Only a page that is itself too
+    large is cut on line boundaries, and only that page.
+
+    Before this, every document past the window was cut on an arbitrary line,
+    which lands mid-record by construction: the text either side of a seam is
+    what the overlap exists to repair, and not cutting there at all is better
+    than repairing it.
+    """
+    if budget <= 0 or count_tokens(text) <= budget:
+        return [text]
+    pages = split_into_pages(text)
+    if len(pages) > 1:
+        return [piece for piece in pack_pages(pages, count_tokens, budget) if piece.strip()]
+    return _split_lines_for_window(text, count_tokens, budget, overlap_lines=overlap_lines)
+
+
+def _split_lines_for_window(
+    text: str,
+    count_tokens: Callable[[str], int],
+    budget: int,
+    *,
+    overlap_lines: int = STRUCTURE_OVERLAP_LINES,
+) -> list[str]:
+    """Split one page on line boundaries so no piece exceeds ``budget`` tokens.
+
+    The last resort, for a page too large to keep whole. Lines are the unit
+    because OCR emits them.
     A few lines are repeated at each seam so a record written across a boundary
     is seen whole by one side, and the overlap is shortened when carrying it
     would push the next piece over budget: the ceiling is the invariant, the
