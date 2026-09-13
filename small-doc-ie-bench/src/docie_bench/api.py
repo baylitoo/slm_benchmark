@@ -31,6 +31,7 @@ from docie_bench.inngest.studio_api import router as studio_router
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.logging_config import configure_logging
 from docie_bench.mcp_api import router as mcp_router
+from docie_bench.ocr.factory import available_ocr_backends
 from docie_bench.openai_protocol import error_payload, queue_stream
 from docie_bench.orchestrator.api import configure_orchestrator
 from docie_bench.orchestrator.api import router as orchestrator_router
@@ -399,6 +400,32 @@ def readyz() -> dict[str, str]:
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_metrics(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/v1/capabilities")
+def capabilities(_tenant: TenantDependency) -> dict[str, Any]:
+    """What this deployment accepts, as it is actually configured.
+
+    A consumer otherwise has to hard-code the upload allowlist and the limits,
+    and a copy is wrong the moment an operator changes one: every value here
+    comes from settings, which are per-deployment. Read-only, and deliberately
+    nothing about models, keys or paths.
+    """
+    settings = get_settings()
+    return {
+        "upload": {
+            "max_bytes": settings.max_upload_bytes,
+            "max_request_body_bytes": settings.max_request_body_mb * 1024 * 1024,
+            "allowed_mime_types": sorted(settings.allowed_mime_types),
+        },
+        "text": {
+            "max_chars": settings.max_text_chars,
+            "max_ocr_blocks": settings.max_ocr_blocks,
+            "max_ocr_block_chars": settings.max_ocr_block_chars,
+        },
+        "metadata": {"max_entries": settings.max_metadata_entries},
+        "ocr_backends": available_ocr_backends(),
+    }
 
 
 @app.get("/v1/schemas")
