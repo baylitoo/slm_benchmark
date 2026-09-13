@@ -95,6 +95,11 @@ class FamilyContract:
     # the store-driven replacement for the server's name-based auto-detection.
     analyzer: bool = False
     encoder_backend: str | None = None
+    # An analyzer that ALSO answers a schema: GLiFormer's structure() head reads
+    # text and returns records, so the model belongs in the extraction picker
+    # even though it is served by the encoder runtime. Being an analyzer says
+    # how it is launched; this says what it can be asked for.
+    structured_extraction: bool = False
     # A transformers/AutoModel family: a safetensors snapshot served by the
     # TRANSFORMERS runtime (docie transformers), NOT llama.cpp. The LAST-RESORT
     # path for a model with no GGUF / an arch llama.cpp cannot serve — stored as
@@ -351,6 +356,7 @@ FAMILIES: dict[str, FamilyContract] = {
         prompt_profile="strict_extraction_v1",
         analyzer=True,
         encoder_backend="gliformer",
+        structured_extraction=True,
         ollama_faithful=False,
     ),
     "encoder_gliner2": FamilyContract(

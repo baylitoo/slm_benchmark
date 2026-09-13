@@ -200,6 +200,10 @@ export interface ModelFamily {
   /** True for reranker families — served with --reranking --embedding --pooling
    * rank, used via /v1/rerank. */
   reranker?: boolean;
+  /** True when the family answers a schema with records (GLiFormer's
+   * structure() head), so it belongs in the extraction picker even when it
+   * is served by the encoder runtime. */
+  structured_extraction?: boolean;
   /** True for multi-vector (ColBERT / PyLate late-interaction) families — a
    * safetensors snapshot served by the multi-vector runtime (sentence-
    * transformers MultiVectorEncoder), also used via /v1/rerank. */

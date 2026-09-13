@@ -36,6 +36,7 @@ import {
   rerank,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
+  structuringDeploymentNames,
   visionDeploymentNames,
   getDeployments,
   getStore,
@@ -121,18 +122,27 @@ export function Playground({
     () => rerankerDeploymentNames(store.data, families.data),
     [store.data, families.data],
   );
-  // Encoders (analyzers) AND embedding models are excluded from chat/arena:
-  // they don't answer chat prompts. Embedding/reranker models live in the
-  // Embed/Rerank mode instead. Vision and extraction ride the SAME deployment
-  // list — Chat now handles both inline, so there's no separate narrowing.
+  const structuringNames = useMemo(
+    () => structuringDeploymentNames(store.data, families.data),
+    [store.data, families.data],
+  );
+  // Encoders AND embedding models are excluded from chat/arena: they don't
+  // answer chat prompts. Embedding/reranker models live in the Embed/Rerank
+  // mode instead. Vision and extraction ride the SAME deployment list — Chat
+  // now handles both inline, so there's no separate narrowing.
+  //
+  // An encoder with a structuring head is the exception: it answers a schema
+  // with records, so it belongs here even though the encoder runtime launches
+  // it. Filtering on the runtime alone hid GLiFormer from extraction entirely.
   const selectable = useMemo(
     () =>
       selectableDeployments(deployments.data ?? []).filter(
         (d) =>
-          d.spec?.launch?.runtime !== "encoder" &&
+          (d.spec?.launch?.runtime !== "encoder" ||
+            Boolean(d.spec?.name && structuringNames.has(d.spec.name))) &&
           !(d.spec?.name && embeddingNames.has(d.spec.name)),
       ),
-    [deployments.data, embeddingNames],
+    [deployments.data, embeddingNames, structuringNames],
   );
 
   return (
