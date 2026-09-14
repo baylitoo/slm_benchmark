@@ -48,6 +48,9 @@ export interface ExtractRequest {
   /** Split list-typed fields into concurrent sub-extractions. Disables the live
    * delta preview for that call (N streams would interleave). */
   parallel_extraction?: boolean;
+  /** Replaces the deployment's response_format_style for this call only.
+   * Single deployment only; rejected alongside routing_policy. */
+  response_format_style?: string;
 }
 
 export function triggerExtract(payload: ExtractRequest): Promise<TriggerResponse> {

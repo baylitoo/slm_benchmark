@@ -604,6 +604,7 @@ export function ChatPanel({
   const [ocrBackend, setOcrBackend] = useState("");
   const [language, setLanguage] = useState("");
   const [parallelExtraction, setParallelExtraction] = useState(false);
+  const [responseFormatStyle, setResponseFormatStyle] = useState("");
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -648,6 +649,9 @@ export function ChatPanel({
       if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
       if (language.trim()) payload.language = language.trim();
       if (parallelExtraction) payload.parallel_extraction = true;
+      if (modelSource === "single" && responseFormatStyle.trim()) {
+        payload.response_format_style = responseFormatStyle.trim();
+      }
       return payload;
     }
 
@@ -1406,6 +1410,18 @@ export function ChatPanel({
                 placeholder="(auto)"
               />
             </Field>
+            {modelSource === "single" && (
+              <Field
+                label="Response format"
+                hint="Optional — replaces the deployment's style for this run, e.g. json_object or gliformer_records."
+              >
+                <TextInput
+                  value={responseFormatStyle}
+                  onChange={(e) => setResponseFormatStyle(e.target.value)}
+                  placeholder="(deployment default)"
+                />
+              </Field>
+            )}
             <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground/90">
               <input
                 type="checkbox"
