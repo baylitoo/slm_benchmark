@@ -196,10 +196,17 @@ class _FakeGliformer:
 
     def __init__(self) -> None:
         self.seen: Any = None
+        self.validate_output: bool | None = None
         self.reply: Any = {}
 
     def structure(self, text: str, schema: Any, *, validate_output: bool = True) -> Any:
+        # The real library raises TypeError when validate_output is set and no
+        # schema is a Pydantic model; mirror that so the records form is held
+        # to the same contract.
+        if validate_output and all(isinstance(spec, list) for spec in schema.values()):
+            raise TypeError("validate_output=True requires at least one Pydantic BaseModel schema")
         self.seen = schema
+        self.validate_output = validate_output
         return self.reply
 
     def predict(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]:
@@ -250,6 +257,7 @@ def test_the_server_switches_form_on_structure_mode() -> None:
         )
     assert response.status_code == 200
     assert backend.seen == {"adbi_resume": ["full_name"], "skills": ["category", "skill"]}
+    assert backend.validate_output is False
     import json
 
     content = json.loads(response.json()["choices"][0]["message"]["content"])
@@ -276,8 +284,9 @@ def test_without_the_mode_the_nested_form_is_still_used() -> None:
             },
         )
     assert response.status_code == 200
-    # A Pydantic model per record, not a field list.
+    # A Pydantic model per record, not a field list, and still validated.
     assert not isinstance(backend.seen["invoice"], list)
+    assert backend.validate_output is True
 
 
 class _ChunkedModel:

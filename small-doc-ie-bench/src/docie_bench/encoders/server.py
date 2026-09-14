@@ -728,7 +728,12 @@ def create_encoder_app(
                     status_code=400,
                     error_type="invalid_request_error",
                 )
-            records = await asyncio.to_thread(structure, text, schema_for_model)
+            # GLiFormer validates only against Pydantic models and raises when
+            # asked to validate a schema that has none, which the field lists
+            # of the records form never do.
+            records = await asyncio.to_thread(
+                structure, text, schema_for_model, validate_output=plan is None
+            )
             document = (
                 document_from_gliformer_records(records, plan, name=record_name)
                 if plan is not None
