@@ -6,6 +6,7 @@ import logging
 import os
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -529,6 +530,9 @@ class ExtractStreamRequest(BaseModel):
     ocr_backend: str | None = None
     language: str | None = None
     parallel_extraction: bool = False
+    # Replaces the deployment's response_format_style for this run only, so two
+    # styles can be compared on one document without redeploying.
+    response_format_style: str | None = None
 
 
 _SSE_KEEPALIVE_SECONDS = 10.0
@@ -571,6 +575,13 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
             status_code=400,
             detail="'routing_policy' is mutually exclusive with 'model_profile'/"
             "'deployment': a policy names its model profiles per stage",
+        )
+    style_override = (payload.response_format_style or "").strip() or None
+    if payload.routing_policy and style_override:
+        raise HTTPException(
+            status_code=400,
+            detail="'response_format_style' overrides one deployment's style; "
+            "a routing policy runs each stage with its own",
         )
 
     schema_name = payload.schema_name
@@ -617,6 +628,8 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
         resolved = await _resolve_or_error(payload.deployment or payload.model_profile or "")
         if isinstance(resolved, JSONResponse):
             return resolved
+        if style_override:
+            resolved = replace(resolved, response_format_style=style_override)
         executor = ExtractionService(
             resolved,
             on_delta=None if payload.parallel_extraction else on_delta,

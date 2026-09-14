@@ -178,3 +178,60 @@ def test_keepalive_comments_flow_while_a_silent_split_run_is_in_progress(
     assert [e["type"] for e in _events(response)] == ["phase", "result"] or any(
         '"result"' in line for line in lines
     )
+
+
+def _capture_styles(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    seen: list[str] = []
+
+    class _Capturing(_FakeStreamingService):
+        def __init__(self, profile: ModelProfile, **kwargs: Any) -> None:
+            super().__init__(profile, **kwargs)
+            seen.append(profile.response_format_style)
+
+    monkeypatch.setattr(api, "ExtractionService", _Capturing)
+    return seen
+
+
+def test_a_style_override_replaces_the_deployment_style_for_that_run(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _capture_styles(monkeypatch)
+    response = client.post(
+        "/v1/extract/stream",
+        json={
+            "text": "Invoice INV-1",
+            "deployment": "fake-model",
+            "response_format_style": "json_object",
+        },
+    )
+    assert _events(response)[-1]["type"] == "result"
+    assert seen == ["json_object"]
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_without_an_override_the_deployment_style_is_kept(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, blank: str | None
+) -> None:
+    seen = _capture_styles(monkeypatch)
+    client.post(
+        "/v1/extract/stream",
+        json={
+            "text": "Invoice INV-1",
+            "deployment": "fake-model",
+            "response_format_style": blank,
+        },
+    )
+    assert seen == [_profile().response_format_style]
+
+
+def test_a_style_override_with_a_routing_policy_is_a_400(client: TestClient) -> None:
+    response = client.post(
+        "/v1/extract/stream",
+        json={
+            "text": "Invoice INV-1",
+            "routing_policy": "p",
+            "response_format_style": "json_object",
+        },
+    )
+    assert response.status_code == 400
+    assert "response_format_style" in response.json()["detail"]
