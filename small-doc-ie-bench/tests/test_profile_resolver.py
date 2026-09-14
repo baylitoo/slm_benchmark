@@ -329,7 +329,7 @@ def test_family_synth_carries_generation_params(
     models_config: Path, store_home, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Finding 1: the family-synth path must carry the nuextract3 generation params
-    # (4096 / 0.2 / 600), NOT the ModelProfile defaults (900 / 0.0 / 180). The
+    # (16384 / 0.2 / 600), NOT the ModelProfile defaults (900 / 0.0 / 180). The
     # deployment's served id (alias) matches no yaml profile -> family path.
     store_home("nux-store", "nuextract3")
     _no_catalog(monkeypatch)
@@ -339,7 +339,7 @@ def test_family_synth_carries_generation_params(
     profile = resolve_extraction_profile(
         deployment="nux-store", models_config_path=models_config, deployments=[record]
     )
-    assert profile.max_tokens == 4096
+    assert profile.max_tokens == 16384
     assert profile.temperature == pytest.approx(0.2)
     assert profile.timeout_seconds == pytest.approx(600.0)
 
