@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
@@ -59,6 +60,217 @@ class DynamicSchemaSpec(BaseModel):
 # levels; the ceiling exists so a hostile or generated one cannot exhaust the
 # stack on the way in, which would reach the client as a 500 rather than a 400.
 _MAX_SCHEMA_DEPTH = 24
+
+
+_Step = tuple[str, bool]
+"""One path segment: the key, and whether it holds a list."""
+
+
+@dataclass(frozen=True)
+class GliformerRecord:
+    """One record type in the flat form, and where its values belong."""
+
+    path: tuple[_Step, ...]
+    fields: dict[str, tuple[_Step, ...]]
+    leaves: list[tuple[_Step, ...]]
+
+
+@dataclass(frozen=True)
+class GliformerRecordPlan:
+    """The flat record form sent to GLiFormer, and how to read the answer back.
+
+    ``fields`` is what the model receives (``{"skills": ["category", "skill"]}``);
+    ``records`` is the inverse, so reassembly looks up a path rather than
+    guessing which record belongs where.
+    """
+
+    fields: dict[str, list[str]]
+    records: dict[str, GliformerRecord]
+
+
+def _name_paths(paths: list[tuple[_Step, ...]]) -> dict[str, tuple[_Step, ...]]:
+    """Name each path by its last key, or by the whole path when that repeats.
+
+    Two passes rather than first-come, so ``vendor.name`` never takes the name a
+    top-level ``name`` also wants: a repeated leaf qualifies both.
+    """
+    repeated = {
+        path[-1][0]
+        for index, path in enumerate(paths)
+        if any(other[-1][0] == path[-1][0] for other in paths[index + 1 :])
+    }
+    named: dict[str, tuple[_Step, ...]] = {}
+    for path in paths:
+        base = "_".join(key for key, _ in path) if path[-1][0] in repeated else path[-1][0]
+        name, suffix = base, 2
+        while name in named:
+            name, suffix = f"{base}_{suffix}", suffix + 1
+        named[name] = path
+    return named
+
+
+def gliformer_records_plan(
+    schema: dict[str, Any], *, name: str = "record"
+) -> GliformerRecordPlan:
+    """Build GLiFormer's plain record form from a JSON Schema.
+
+    ``{"employee": ["name", "company"]}`` is the form the model card documents
+    first; :func:`gliformer_model_from_json_schema` builds the nested one.
+
+    Every list becomes a record and every leaf below it becomes one of that
+    record's fields, however deep — so a list inside a list contributes fields
+    to its outermost list rather than a record of its own. That is what makes
+    the answer reassemble: the model pairs the fields within a record, and no
+    step has to guess which child row belongs to which parent.
+
+    The depth and cycle guards of the nested builder apply here too: the schema
+    arrives on a request.
+    """
+    defs = schema.get("$defs") or schema.get("definitions") or {}
+    fields: dict[str, list[str]] = {}
+    records: dict[str, GliformerRecord] = {}
+
+    def deref(node: Any, followed: frozenset[str]) -> tuple[Any, frozenset[str]]:
+        while isinstance(node, dict) and "$ref" in node:
+            ref = str(node["$ref"]).rsplit("/", 1)[-1]
+            if ref in followed:
+                raise ValueError(f"schema definition {ref!r} refers to itself")
+            followed = followed | {ref}
+            node = defs.get(ref, {})
+        return node, followed
+
+    def pick(node: Any, followed: frozenset[str]) -> tuple[Any, frozenset[str]]:
+        node, followed = deref(node, followed)
+        if not isinstance(node, dict):
+            return {}, followed
+        for key in ("anyOf", "oneOf"):
+            choices = node.get(key)
+            if not isinstance(choices, list):
+                continue
+            for choice in choices:
+                chosen, chosen_followed = deref(choice, followed)
+                if isinstance(chosen, dict) and chosen.get("type") != "null":
+                    return chosen, chosen_followed
+        return node, followed
+
+    def collect(
+        node: Any,
+        record: GliformerRecord,
+        below: tuple[_Step, ...],
+        depth: int,
+        followed: frozenset[str],
+    ) -> None:
+        """Add ``node``'s leaves to ``record``, opening a record for each list."""
+        if depth > _MAX_SCHEMA_DEPTH:
+            raise ValueError(f"schema nests deeper than {_MAX_SCHEMA_DEPTH} levels")
+        node, followed = pick(node, followed)
+        properties = node.get("properties") if isinstance(node, dict) else None
+        if not isinstance(properties, dict):
+            return
+        for key, value in properties.items():
+            if key in _RESERVED_FIELDS:
+                continue
+            child, child_followed = pick(value, followed)
+            is_list = isinstance(child, dict) and (
+                child.get("type") == "array" or "items" in child
+            )
+            inner, inner_followed = (
+                pick(child.get("items") or {}, child_followed)
+                if is_list
+                else (child, child_followed)
+            )
+            path = (*below, (key, is_list))
+            has_properties = isinstance(inner, dict) and isinstance(
+                inner.get("properties"), dict
+            )
+            if is_list and not record.path and has_properties:
+                # A list with no list above it opens its own record.
+                opened = GliformerRecord(path=path, fields={}, leaves=[])
+                opened_records.append(opened)
+                collect(inner, opened, (), depth + 1, inner_followed)
+            elif has_properties:
+                collect(inner, record, path, depth + 1, inner_followed)
+            else:
+                record.leaves.append(path)
+
+    root = GliformerRecord(path=(), fields={}, leaves=[])
+    opened_records: list[GliformerRecord] = []
+    collect(schema, root, (), 0, frozenset())
+
+    records[name] = root
+    for named, opened in _name_paths([one.path for one in opened_records]).items():
+        records[named if named != name else f"{named}_record"] = next(
+            one for one in opened_records if one.path == opened
+        )
+    for record_name, record in records.items():
+        record.fields.update(_name_paths(record.leaves))
+        if record.fields:
+            fields[record_name] = list(record.fields)
+    if not fields:
+        raise ValueError("schema has no fields to structure into")
+    return GliformerRecordPlan(fields=fields, records=records)
+
+
+def _place(container: dict[str, Any], path: tuple[_Step, ...], value: Any) -> None:
+    """Write ``value`` at ``path``, opening one-element lists on the way down."""
+    for index, (key, is_list) in enumerate(path):
+        if index == len(path) - 1:
+            container[key] = [value] if is_list else value
+            return
+        nested = container.get(key)
+        if is_list:
+            if not (isinstance(nested, list) and nested and isinstance(nested[0], dict)):
+                nested = [{}]
+                container[key] = nested
+            container = nested[0]
+        else:
+            if not isinstance(nested, dict):
+                nested = {}
+                container[key] = nested
+            container = nested
+
+
+def document_from_gliformer_records(
+    answer: Any, plan: GliformerRecordPlan, *, name: str = "record"
+) -> dict[str, Any]:
+    """Read the flat records back into the shape the schema describes.
+
+    The exact inverse of :func:`gliformer_records_plan`: each field goes back to
+    the path it was taken from. A list that held another list gets one parent
+    row per item, because that is how the model returned them.
+    """
+    if not isinstance(answer, dict):
+        return {}
+    document: dict[str, Any] = {}
+    for record_name, record in plan.records.items():
+        raw = answer.get(record_name)
+        rows = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+        rows = [row for row in rows if isinstance(row, dict)]
+        if not record.path:
+            # The root record carries the document's own fields, so a field
+            # answered on more than one chunk keeps the first answer.
+            answered: set[tuple[_Step, ...]] = set()
+            for row in rows:
+                for field, path in record.fields.items():
+                    value = row.get(field)
+                    if value in (None, "") or path in answered:
+                        continue
+                    _place(document, path, value)
+                    answered.add(path)
+            continue
+        built: list[dict[str, Any]] = []
+        for row in rows:
+            out: dict[str, Any] = {}
+            for field, path in record.fields.items():
+                value = row.get(field)
+                if value not in (None, ""):
+                    _place(out, path, value)
+            if out:
+                built.append(out)
+        if built:
+            # The last step is the list itself, so it takes the rows as they are.
+            _place(document, (*record.path[:-1], (record.path[-1][0], False)), built)
+    return document
 
 
 def gliformer_model_from_json_schema(

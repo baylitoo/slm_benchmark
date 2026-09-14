@@ -39,7 +39,11 @@ from fastapi.responses import JSONResponse
 
 from docie_bench.extract.postprocess import dedupe_lists
 from docie_bench.openai_protocol import openai_error
-from docie_bench.schemas.dynamic import gliformer_model_from_json_schema
+from docie_bench.schemas.dynamic import (
+    document_from_gliformer_records,
+    gliformer_model_from_json_schema,
+    gliformer_records_plan,
+)
 
 logger = logging.getLogger("docie_bench.encoders.server")
 
@@ -390,14 +394,24 @@ class GliformerBackend:
         chunks = split_for_window(text, self.count_tokens, self.input_window)
         if len(chunks) == 1:
             return self._model.structure(text, schema, validate_output=validate_output)
-        record_name = next(iter(schema))
-        found: list[dict[str, Any]] = []
+        found: dict[str, list[dict[str, Any]]] = {key: [] for key in schema}
         for chunk in chunks:
             answer = self._model.structure(chunk, schema, validate_output=validate_output)
-            if isinstance(answer, dict):
-                rows = answer.get(record_name)
-                found.extend(row for row in (rows or []) if isinstance(row, dict))
-        return {record_name: [merge_records(found)]}
+            if not isinstance(answer, dict):
+                continue
+            for key, rows in found.items():
+                chunk_rows = answer.get(key)
+                if isinstance(chunk_rows, dict):
+                    chunk_rows = [chunk_rows]
+                rows.extend(row for row in (chunk_rows or []) if isinstance(row, dict))
+        if not all(isinstance(value, list) for value in schema.values()):
+            # The nested form: one model per key, and the document is one
+            # record of it, so the chunks fold into that record.
+            key = next(iter(found))
+            return {key: [merge_records(found[key])]}
+        # The plain record form: every key is a record type the caller folds by
+        # what the schema says it is, so each keeps its own rows.
+        return found
 
     def count_tokens(self, text: str) -> int:
         """Length in the model's own tokens, or a character estimate without one."""
@@ -693,16 +707,34 @@ def create_encoder_app(
                     error_type="invalid_request_error",
                 )
             record_name = str(json_schema.get("name") or "record")
+            # "records" asks for the plain {record: [field, ...]} form the model
+            # card documents first; the default builds the nested Pydantic one.
+            # Sent as an extra body field by the gliformer_records style.
+            wants_records = str(body.get("structure_mode") or "").strip().lower() == "records"
+            plan = None
             try:
-                model = gliformer_model_from_json_schema(schema_root, name=record_name)
+                if wants_records:
+                    plan = gliformer_records_plan(schema_root, name=record_name)
+                    schema_for_model: Any = plan.fields
+                else:
+                    schema_for_model = {
+                        record_name: gliformer_model_from_json_schema(
+                            schema_root, name=record_name
+                        )
+                    }
             except ValueError as exc:
                 return openai_error(
                     f"schema cannot be structured: {exc}",
                     status_code=400,
                     error_type="invalid_request_error",
                 )
-            records = await asyncio.to_thread(structure, text, {record_name: model})
-            return JSONResponse(_completion(app.state.model_id, _one_record(records, record_name)))
+            records = await asyncio.to_thread(structure, text, schema_for_model)
+            document = (
+                document_from_gliformer_records(records, plan, name=record_name)
+                if plan is not None
+                else _one_record(records, record_name)
+            )
+            return JSONResponse(_completion(app.state.model_id, document))
 
         labels_raw = body.get("labels")
         labels = (

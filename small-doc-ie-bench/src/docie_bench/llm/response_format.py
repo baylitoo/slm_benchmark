@@ -55,6 +55,20 @@ def build_response_format(
                 "schema": schema,
             },
         }, {}
+    if normalized == "gliformer_records":
+        # Same schema on the wire, plus the field this runtime reads to pick the
+        # plain record form over the nested one (see encoders/server.py). The
+        # nested decoder emits one record per matched SPAN rather than per
+        # entity on some documents; this is the lever to compare the two without
+        # a code change.
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": f"{schema_name}_extraction",
+                "strict": True,
+                "schema": schema,
+            },
+        }, {"structure_mode": "records"}
     if normalized == "llamacpp_schema":
         # llama.cpp server variants commonly accept schema under response_format.
         return {"type": "json_object", "schema": schema}, {}
