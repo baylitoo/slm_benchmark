@@ -364,10 +364,12 @@ class DynamicTemplateBuilder:
         "number": NumberField,
         "money": MoneyField,
     }
-    _NUEXTRACT_TYPES: dict[ScalarDynamicFieldType, dict[str, str]] = {
-        "string": {"value": "verbatim-string"},
-        "date": {"value": "date"},
-        "number": {"value": "number"},
+    # Bare type strings, NuExtract's own template shape; money is a real
+    # two-field object. See llm.prompts._NUEXTRACT_TEMPLATES.
+    _NUEXTRACT_TYPES: dict[ScalarDynamicFieldType, str | dict[str, str]] = {
+        "string": "verbatim-string",
+        "date": "date",
+        "number": "number",
         "money": {"amount": "number", "currency": "currency"},
     }
 
@@ -475,6 +477,7 @@ class DynamicTemplateBuilder:
     @classmethod
     def _nuextract_field(cls, spec: DynamicFieldSpec) -> Any:
         if spec.type not in {"object", "list"}:
-            return dict(cls._NUEXTRACT_TYPES[spec.type])
+            leaf = cls._NUEXTRACT_TYPES[spec.type]
+            return dict(leaf) if isinstance(leaf, dict) else leaf
         nested = {child.name: cls._nuextract_field(child) for child in spec.fields}
         return [nested] if spec.type == "list" else nested

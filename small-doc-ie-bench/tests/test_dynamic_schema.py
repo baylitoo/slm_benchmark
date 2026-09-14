@@ -49,9 +49,7 @@ def test_dynamic_schema_is_serializable_and_builds_runtime_artifacts() -> None:
 
     assert parsed.document_type == "purchase_order"
     assert model.model_json_schema()["additionalProperties"] is False
-    assert DynamicTemplateBuilder.build_nuextract_template(restored)["order_date"] == {
-        "value": "date"
-    }
+    assert DynamicTemplateBuilder.build_nuextract_template(restored)["order_date"] == "date"
 
 
 def test_dynamic_schema_rejects_duplicate_or_unsafe_fields() -> None:
@@ -103,9 +101,9 @@ def test_dynamic_schema_builds_reusable_nested_list_schema() -> None:
     assert parsed.items[0].dimensions.weight.value == 10.5
     assert template["items"] == [
         {
-            "description": {"value": "verbatim-string"},
-            "quantity": {"value": "number"},
-            "dimensions": {"weight": {"value": "number"}},
+            "description": "verbatim-string",
+            "quantity": "number",
+            "dimensions": {"weight": "number"},
         }
     ]
 
@@ -239,7 +237,7 @@ async def test_nuextract3_dynamic_schema_sends_its_real_template_not_an_empty_on
     )
 
     sent_template = json.loads(calls[0]["chat_template_kwargs"]["template"])
-    assert sent_template == {"name": {"value": "verbatim-string"}}
+    assert sent_template == {"name": "verbatim-string"}
 
 
 @pytest.mark.asyncio
