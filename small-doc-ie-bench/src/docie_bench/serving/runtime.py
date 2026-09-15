@@ -752,6 +752,13 @@ class VLLMRuntime(RuntimeAdapter):
             command.extend(["--quantization", spec.quantization])
         if spec.gpu_memory_utilization is not None:
             command.extend(["--gpu-memory-utilization", str(spec.gpu_memory_utilization)])
+        # #447: api_key_env was only ever read for the control plane's own
+        # OUTBOUND probe calls (health/props/slots below) -- the launched
+        # process itself never required a key, so anything with network
+        # reach to the port got full inference access regardless of this
+        # setting. vLLM's own --api-key enforces it on the server side.
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            command.extend(["--api-key", api_key])
         command.extend(spec.extra_args)
         return tuple(command)
 
@@ -856,6 +863,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--ubatch-size", str(spec.ubatch_size)])
         if spec.numa is not None:
             command.extend(["--numa", spec.numa])
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            command.extend(["--api-key", api_key])
         command.extend(spec.extra_args)
         return tuple(command)
 
