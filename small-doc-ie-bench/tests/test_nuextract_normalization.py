@@ -214,3 +214,12 @@ async def test_extraction_response_has_no_warning_when_subtotal_is_extracted(mon
     )
 
     assert not any("derived" in w for w in response.validation.warnings)
+
+
+def test_a_bare_value_goes_through_the_pipeline_like_a_wrapped_one() -> None:
+    # The template sends bare type strings, so the model answers with bare
+    # values; rehydration restores the wrapper before the typed stages run.
+    assert _through_pipeline({"issue_date": "28/02/2026"}) == _through_pipeline(
+        {"issue_date": {"value": "28/02/2026"}}
+    )
+    assert _through_pipeline({"vat_rate": "5,5%"})["vat_rate"]["value"] == "5.5"

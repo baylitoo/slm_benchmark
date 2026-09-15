@@ -139,6 +139,18 @@ def _discard_delta(_text: str) -> None:
     return None
 
 
+def _normalize_nuextract_text(key: str, text: str) -> str:
+    """Field-specific clean-up of one top-level value, bare or ``{"value": ...}``."""
+    if key == "iban":
+        return text.replace(" ", "")
+    if key == "country":
+        # Full country name -> ISO-3166-1 alpha-3.
+        return _COUNTRY_ISO.get(text.lower().strip(), text)
+    if key == "document_number":
+        return re.sub(r"^N[°o][\s\.]*", "", text).strip()
+    return text
+
+
 def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dict[str, Any], bool]:
     """Post-process NuExtract3 output: enforce document_type, strip IBAN spaces,
     null-out empty MoneyFields, and apply fallback normalization for any values the
@@ -153,6 +165,9 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dic
             continue  # already set above
         if isinstance(val, list):
             result[key] = [_normalize_nested_nuextract(item) for item in val]
+            continue
+        if isinstance(val, str):
+            result[key] = _normalize_nuextract_text(key, val)
             continue
         if not isinstance(val, dict):
             result[key] = val
@@ -170,19 +185,8 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dic
             if isinstance(sub.get("currency"), str):
                 sub["currency"] = normalize_currency(sub["currency"])
 
-        # IBAN spaces
-        if key == "iban" and isinstance(sub.get("value"), str):
-            sub["value"] = sub["value"].replace(" ", "")
-
-        # country: normalize full country name → ISO-3166-1 alpha-3
-        if key == "country" and isinstance(sub.get("value"), str):
-            iso = _COUNTRY_ISO.get(sub["value"].lower().strip())
-            if iso:
-                sub["value"] = iso
-
-        # document_number: strip leading "N° " prefix if present
-        if key == "document_number" and isinstance(sub.get("value"), str):
-            sub["value"] = re.sub(r"^N[°o][\s\.]*", "", sub["value"]).strip()
+        if isinstance(sub.get("value"), str):
+            sub["value"] = _normalize_nuextract_text(key, sub["value"])
 
         # Empty-string value → null
         if sub.get("value") == "":

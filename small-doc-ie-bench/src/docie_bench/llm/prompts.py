@@ -80,49 +80,53 @@ VISION_SYSTEM_PROMPT = VISION_EXTRACTION_SYSTEM_PROMPT
 #   "number"          → output clean decimal (no symbols, no locale separators)
 #   "currency"        → output ISO-4217 code (EUR, GBP, USD …)
 #   ["A", "B", ...]   → enum, model picks one value
+# A leaf is the bare type string, NuExtract's own template shape. Wrapping it as
+# {"value": "verbatim-string"} doubles the brace depth of every field, costs
+# output tokens on every value, and is where the model starts dropping closing
+# braces in lists of one-field objects. rehydrate_extraction_result restores the
+# {value, evidence_ids, confidence} wrapper after generation.
 # document_type and extraction_notes are omitted — Pydantic fills them from defaults.
-# evidence_ids and confidence are omitted — Pydantic defaults them to [] and 0.0.
 _NUEXTRACT_TEMPLATES: dict[str, dict] = {
     "invoice": {
-        "invoice_number": {"value": "verbatim-string"},
-        "vendor_name": {"value": "verbatim-string"},
-        "vendor_tax_id": {"value": "verbatim-string"},
-        "customer_name": {"value": "verbatim-string"},
-        "customer_tax_id": {"value": "verbatim-string"},
-        "issue_date": {"value": "date"},
-        "due_date": {"value": "date"},
-        "purchase_order_number": {"value": "verbatim-string"},
+        "invoice_number": "verbatim-string",
+        "vendor_name": "verbatim-string",
+        "vendor_tax_id": "verbatim-string",
+        "customer_name": "verbatim-string",
+        "customer_tax_id": "verbatim-string",
+        "issue_date": "date",
+        "due_date": "date",
+        "purchase_order_number": "verbatim-string",
         "subtotal": {"amount": "number", "currency": "currency"},
         "vat_amount": {"amount": "number", "currency": "currency"},
-        "vat_rate": {"value": "number"},
+        "vat_rate": "number",
         "total_ttc": {"amount": "number", "currency": "currency"},
-        "iban": {"value": "verbatim-string"},
-        "payment_terms": {"value": "string"},
+        "iban": "verbatim-string",
+        "payment_terms": "string",
         "line_items": [
             {
-                "description": {"value": "verbatim-string"},
-                "sku": {"value": "verbatim-string"},
-                "quantity": {"value": "number"},
+                "description": "verbatim-string",
+                "sku": "verbatim-string",
+                "quantity": "number",
                 "unit_price": {"amount": "number", "currency": "currency"},
                 "line_total": {"amount": "number", "currency": "currency"},
-                "tax_rate": {"value": "number"},
+                "tax_rate": "number",
             }
         ],
     },
     "identity_card": {
-        "country": {"value": "country"},
-        "document_number": {"value": "verbatim-string"},
-        "surname": {"value": "verbatim-string"},
-        "given_names": {"value": "verbatim-string"},
-        "birth_date": {"value": "date"},
-        "birth_place": {"value": "verbatim-string"},
-        "nationality": {"value": "verbatim-string"},
-        "sex": {"value": "verbatim-string"},
-        "issue_date": {"value": "date"},
-        "expiry_date": {"value": "date"},
-        "issuing_authority": {"value": "verbatim-string"},
-        "mrz_line_1": {"value": "verbatim-string"},
-        "mrz_line_2": {"value": "verbatim-string"},
+        "country": "country",
+        "document_number": "verbatim-string",
+        "surname": "verbatim-string",
+        "given_names": "verbatim-string",
+        "birth_date": "date",
+        "birth_place": "verbatim-string",
+        "nationality": "verbatim-string",
+        "sex": "verbatim-string",
+        "issue_date": "date",
+        "expiry_date": "date",
+        "issuing_authority": "verbatim-string",
+        "mrz_line_1": "verbatim-string",
+        "mrz_line_2": "verbatim-string",
     },
 }
 
