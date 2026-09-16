@@ -252,7 +252,7 @@ profiles:
     response_format_style: nuextract3
     temperature: 0.2
     top_p: 1.0
-    max_tokens: 4096
+    max_tokens: 16384
     timeout_seconds: 600
     prompt_profile: nuextract3
     vision: true
