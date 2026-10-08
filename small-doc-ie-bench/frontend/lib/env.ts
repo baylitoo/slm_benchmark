@@ -23,6 +23,13 @@ export const INNGEST_URL =
 export const INNGEST_REALTIME_BASE_URL =
   process.env.NEXT_PUBLIC_INNGEST_BASE_URL?.replace(/\/$/, "") || "http://localhost:8288";
 
+// Company auth server (app.cynov.com) serving /rest/v2/auth/*. Unset => the
+// Studio renders without a sign-in gate, which is what a local `next dev` or a
+// single-operator deployment wants. The access token gates THIS UI only; the
+// DocIE backend keeps its own X-API-Key check and never sees it.
+export const AUTH_BASE =
+  process.env.NEXT_PUBLIC_AUTH_BASE_URL?.replace(/\/$/, "") || "";
+
 export const METRICS_URL = `${API_BASE}/metrics`;
 
 // The docie dashboard's uid is pinned in infra/grafana/dashboards/docie.json
