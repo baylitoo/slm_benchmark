@@ -7,6 +7,7 @@ import { Badge, StatusDot } from "../ui";
 import { ThemeToggle } from "../ThemeToggle";
 import { LanguageToggle } from "../LanguageToggle";
 import { ApiKeyButton } from "./ApiKeyDialog";
+import { SessionMenu } from "./SessionMenu";
 import { useI18n } from "@/lib/i18n";
 
 const GITHUB_URL = "https://github.com/baylitoo/slm_benchmark";
@@ -95,6 +96,7 @@ export function TopBar({
           <StatusDot tone={meta.tone} pulse={health !== "offline"} />
           <span className="hidden sm:inline">{t(meta.label)}</span>
         </span>
+        <SessionMenu />
         <ApiKeyButton />
         <LanguageToggle />
         <ThemeToggle />

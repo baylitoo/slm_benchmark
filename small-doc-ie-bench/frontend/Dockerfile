@@ -30,7 +30,12 @@ ARG NEXT_PUBLIC_INNGEST_URL=http://localhost:8288
 # host-published Inngest API port (INNGEST_HOST_PORT, default 8288) — never the
 # internal docker name (ws://inngest:8289), which the browser cannot resolve.
 ARG NEXT_PUBLIC_INNGEST_BASE_URL=http://localhost:8288
-ENV NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE \
+# Company auth server (/rest/v2/auth/*). Unset => the Studio renders with no
+# sign-in gate, which is what a local build wants; set it and the UI asks for
+# company credentials before showing anything.
+ARG NEXT_PUBLIC_AUTH_BASE_URL=
+ENV NEXT_PUBLIC_AUTH_BASE_URL=$NEXT_PUBLIC_AUTH_BASE_URL \
+    NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE \
     NEXT_PUBLIC_GRAFANA_URL=$NEXT_PUBLIC_GRAFANA_URL \
     NEXT_PUBLIC_INNGEST_URL=$NEXT_PUBLIC_INNGEST_URL \
     NEXT_PUBLIC_INNGEST_BASE_URL=$NEXT_PUBLIC_INNGEST_BASE_URL \
