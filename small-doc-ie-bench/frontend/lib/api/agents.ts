@@ -16,6 +16,16 @@ import {
 
 export type AgentKind = "proxy_security" | "ocr" | "custom" | "workflow";
 
+/** Optional sampling overrides (#384) -- an unset field is omitted from the
+ * request body entirely rather than the frontend inventing its own default,
+ * so a bare send stays byte-identical to llama-server's own defaults. */
+export interface SamplingParams {
+  temperature?: number;
+  top_p?: number;
+  min_p?: number;
+  repeat_penalty?: number;
+}
+
 /** A catalog template (GET /v1/agents/templates). */
 export interface AgentTemplate {
   id: string;
@@ -278,6 +288,7 @@ export async function chatCompletionStream(
   messages: { role: string; content: unknown }[],
   onToken: (text: string) => void,
   signal?: AbortSignal,
+  samplingParams?: SamplingParams,
 ): Promise<void> {
   let res: Response;
   try {
@@ -288,7 +299,7 @@ export async function chatCompletionStream(
         Accept: "text/event-stream",
         ...authHeader(),
       },
-      body: JSON.stringify({ model, messages, stream: true }),
+      body: JSON.stringify({ model, messages, stream: true, ...samplingParams }),
       signal,
     });
   } catch (e) {
@@ -477,6 +488,7 @@ export async function chatCompletionMcpStream(
   onContentDelta?: (text: string) => void,
   onReasoningDelta?: (text: string) => void,
   signal?: AbortSignal,
+  samplingParams?: SamplingParams,
 ): Promise<AgentChatResponse> {
   let res: Response;
   try {
@@ -494,6 +506,7 @@ export async function chatCompletionMcpStream(
         mcp_servers: mcpServers,
         enable_ask_user: true,
         ...(sessionId ? { session_id: sessionId } : {}),
+        ...samplingParams,
       }),
       signal,
     });

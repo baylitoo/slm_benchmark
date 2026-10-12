@@ -127,14 +127,15 @@ def _build_reconciler(instance_id: str) -> Any:
     home so a second (misconfigured, ``--scale serving=2``) replica refuses
     to start its reconciler instead of silently double-writing.
     """
-    from docie_bench.inngest.functions import _serving_control_plane, _serving_home
+    from docie_bench.inngest.functions import _serving_control_plane
+    from docie_bench.serving.paths import serving_home
     from docie_bench.serving.reconciler import ReconcilerLease, ServingReconciler
 
     control_plane = _serving_control_plane()
     supervisor = control_plane.supervisor.backend  # the shared PersistentSupervisor
     interval = float(os.getenv("DOCIE_SERVING_RECONCILE_INTERVAL", "10"))
     lease = ReconcilerLease(
-        path=_serving_home() / "reconciler-lease.json",
+        path=serving_home() / "reconciler-lease.json",
         instance_id=instance_id,
         # Generous multiple of the cycle so one slow cycle (long health
         # timeouts) never lets a second replica steal a live lease.

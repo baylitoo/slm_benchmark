@@ -316,10 +316,10 @@ def _artifact_options(
     if snapshot_files:
         option = _artifact_option(
             kind="snapshot",
-            label="safetensors snapshot",
+            label="checkpoint snapshot",
             quant=None,
             files=[
-                (file, "weights" if file.filename.endswith(".safetensors") else "support")
+                (file, "weights" if is_weights_file(file.filename) else "support")
                 for file in snapshot_files
             ],
             context_length=context_length,
@@ -445,30 +445,46 @@ def _content_total(response: httpx.Response, *, offset: int) -> int | None:
     return None
 
 
-# Snapshot download (analyzer/encoder checkpoints — safetensors + configs).
-# Alternate weight formats and hardware-specific exports are skipped: the
-# encoder runtime loads safetensors, so pulling .bin/.onnx/.h5 doubles the
-# download for nothing.
+# Snapshot download (analyzer/encoder checkpoints — weights + configs).
+# Hardware-specific exports are always skipped. Alternate WEIGHT formats are
+# skipped too when the repo ships safetensors, since pulling .bin as well
+# doubles the download for nothing — but a repo that ships only PyTorch weights
+# (GLiFormer describes its own with gliner_config.json and ships
+# pytorch_model.bin) is still a servable checkpoint, so they are kept then.
+_ALT_WEIGHT_SUFFIXES = frozenset({".bin", ".pt", ".pth"})
 _SNAPSHOT_SKIP_SUFFIXES = frozenset(
-    {".gguf", ".bin", ".pt", ".pth", ".h5", ".onnx", ".msgpack", ".tflite", ".ot"}
+    {".gguf", ".h5", ".msgpack", ".tflite", ".ot", ".onnx"} | _ALT_WEIGHT_SUFFIXES
 )
 _SNAPSHOT_SKIP_DIRS = ("onnx/", "openvino/", "coreml/", "tflite/")
 
 
-def _is_snapshot_file(filename: str) -> bool:
+def _is_snapshot_file(filename: str, *, keep_alt_weights: bool = False) -> bool:
     lower = filename.lower()
     if any(lower.startswith(prefix) or f"/{prefix}" in lower for prefix in _SNAPSHOT_SKIP_DIRS):
         return False
     suffix = filename[filename.rfind(".") :].lower() if "." in filename else ""
-    return suffix not in _SNAPSHOT_SKIP_SUFFIXES
+    skip = _SNAPSHOT_SKIP_SUFFIXES
+    if keep_alt_weights:
+        skip = skip - _ALT_WEIGHT_SUFFIXES
+    return suffix not in skip
 
 
-def _snapshot_files_from_siblings(siblings: list[dict[str, Any]]) -> list[HfGgufFile]:
+def has_weights(files: list[HfGgufFile]) -> bool:
+    """Does this file list carry loadable weights in any supported format?"""
+    return any(
+        file.filename.lower().endswith((".safetensors", *_ALT_WEIGHT_SUFFIXES))
+        for file in files
+    )
+
+
+def _snapshot_files_from_siblings(
+    siblings: list[dict[str, Any]], *, keep_alt_weights: bool = False
+) -> list[HfGgufFile]:
     """Snapshot files from an already-fetched model-info response."""
     files: list[HfGgufFile] = []
     for sibling in siblings:
         filename = str(sibling.get("rfilename") or "")
-        if not filename or not _is_snapshot_file(filename):
+        if not filename or not _is_snapshot_file(filename, keep_alt_weights=keep_alt_weights):
             continue
         size = sibling.get("size")
         files.append(
@@ -483,13 +499,34 @@ def _snapshot_files_from_siblings(siblings: list[dict[str, Any]]) -> list[HfGguf
     return files
 
 
+def is_weights_file(filename: str) -> bool:
+    """Does this file carry the model's weights, in any supported format?"""
+    return filename.lower().endswith((".safetensors", *_ALT_WEIGHT_SUFFIXES))
+
+
+def snapshot_files_for(siblings: list[dict[str, Any]]) -> list[HfGgufFile]:
+    """The checkpoint files to fetch, safetensors preferred.
+
+    The single answer to "which files is this snapshot?", used by both the
+    deploy form and the download. They disagreed before: the download learned to
+    keep PyTorch weights and the form did not, so a PyTorch-only checkpoint was
+    offered with its weights missing from the list and its size short by the
+    weight file.
+    """
+    files = _snapshot_files_from_siblings(siblings)
+    if any(file.filename.lower().endswith(".safetensors") for file in files):
+        return files
+    return _snapshot_files_from_siblings(siblings, keep_alt_weights=True)
+
+
 async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[HfGgufFile]:
-    """The repo's safetensors-checkpoint files (weights + config + tokenizer).
+    """The repo's checkpoint files (weights + config + tokenizer).
 
     Reuses the same ``?blobs=true`` metadata as :func:`list_repo_ggufs` but keeps
     the transformers snapshot instead of the GGUFs — for analyzer/encoder
-    families served by the encoder runtime. Refuses a repo with no safetensors
-    (that is a GGUF-only or an incompatible repo).
+    families served by the encoder runtime. Safetensors are preferred; a repo
+    that ships only PyTorch weights keeps those instead. Refuses a repo with no
+    loadable weights at all (a GGUF-only or an incompatible repo).
     """
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
         raise HfHubError(f"invalid Hugging Face repo id {repo!r} (expected owner/name)")
@@ -508,13 +545,11 @@ async def list_snapshot_files(repo: str, *, client: httpx.AsyncClient) -> list[H
         raise HfHubError(f"Hub returned HTTP {response.status_code} for {repo!r}")
     payload = response.json()
     siblings = [s for s in payload.get("siblings", []) if isinstance(s, dict)]
-    files = _snapshot_files_from_siblings(siblings)
-    has_safetensors = any(
-        file.filename.lower().endswith(".safetensors") for file in files
-    )
-    if not has_safetensors:
+    files = snapshot_files_for(siblings)
+    if not has_weights(files):
         raise HfHubError(
-            f"repo {repo!r} ships no safetensors weights — not an encoder checkpoint"
+            f"repo {repo!r} ships no safetensors or PyTorch weights — "
+            "not an encoder checkpoint"
         )
     return files
 
@@ -823,7 +858,7 @@ async def inspect_repo(
         base_model=_extract_base_model(card_data),
         library_name=str(payload["library_name"]) if payload.get("library_name") else None,
     )
-    snapshot_files = _snapshot_files_from_siblings(siblings) if not has_gguf else []
+    snapshot_files = snapshot_files_for(siblings) if not has_gguf else []
     from docie_bench.serving.model_store import FAMILIES
 
     contract = FAMILIES.get(result.family or "")

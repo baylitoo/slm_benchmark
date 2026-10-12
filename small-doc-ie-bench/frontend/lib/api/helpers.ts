@@ -64,6 +64,23 @@ export function embeddingDeploymentNames(
  * for" (the Playground Rerank tab, the Deployments type filter) they are the
  * same thing. Mirrors embeddingDeploymentNames exactly.
  */
+/**
+ * Deployment names that can answer an extraction schema even though they are
+ * served by the encoder runtime: an encoder with a structuring head is still an
+ * extractor, and excluding every encoder from the picker hid it.
+ */
+export function structuringDeploymentNames(
+  store: StoreEntry[] | null | undefined,
+  families: ModelFamily[] | null | undefined,
+): Set<string> {
+  const structuring = new Set(
+    (families ?? []).filter((f) => f.structured_extraction).map((f) => f.name),
+  );
+  return new Set(
+    (store ?? []).filter((e) => e.family && structuring.has(e.family)).map((e) => e.name),
+  );
+}
+
 export function rerankerDeploymentNames(
   store: StoreEntry[] | null | undefined,
   families: ModelFamily[] | null | undefined,

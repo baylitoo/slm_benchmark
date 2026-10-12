@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
 import re
 import time
@@ -17,6 +19,16 @@ from docie_bench.extract.logprob_confidence import (
     attach_model_confidence,
     compute_field_confidences,
 )
+from docie_bench.extract.postprocess import (
+    coerce_scalars,
+    dedupe_lists,
+    normalize_by_schema,
+    normalize_currency,
+    normalize_placeholders,
+    parse_number,
+    report_lost_text,
+    split_currency,
+)
 from docie_bench.extract.validators import validate_extraction
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
@@ -27,12 +39,14 @@ from docie_bench.llm.prompts import (
     SCHEMA_PROPOSER_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
+    build_document_only_prompts,
     build_nuextract3_prompts,
     build_nuextract_prompts,
     build_schema_proposer_prompt,
     build_user_prompt,
     build_vision_user_prompt,
 )
+from docie_bench.llm.reasoning import uses_native_reasoning
 from docie_bench.ocr.base import text_to_blocks
 from docie_bench.ocr.service import processor_from_settings
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
@@ -50,9 +64,6 @@ from docie_bench.vision import DocumentImage, load_document_images
 logger = logging.getLogger(__name__)
 
 
-_CURRENCY_MAP = {"€": "EUR", "£": "GBP", "$": "USD", "¥": "JPY", "₣": "CHF"}
-_DATE_FIELD_NAMES = {"issue_date", "due_date", "birth_date", "expiry_date"}
-_DECIMAL_FIELD_NAMES = {"vat_rate", "quantity", "tax_rate"}
 
 
 _COUNTRY_ISO: dict[str, str] = {
@@ -65,35 +76,19 @@ _COUNTRY_ISO: dict[str, str] = {
 }
 
 
-def _norm_amount(raw: str) -> str:
-    """Normalize a locale-formatted amount when a model ignores the type hint."""
-    s = re.sub(r"[€£$¥₣a-zA-Z]", "", raw).strip()
-    if "," in s and "." in s:
-        # Ambiguous: detect thousands vs decimal by position
-        comma_pos = s.rfind(",")
-        dot_pos = s.rfind(".")
-        s = s.replace(",", "") if dot_pos > comma_pos else s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(" ", "").replace(",", ".")
-    else:
-        s = s.replace(" ", "")
-    return s
+def _norm_money(sub: dict[str, Any], amount: str) -> None:
+    """Parse a MoneyField NuExtract returned as written, in place.
 
-
-def _norm_date(raw: str) -> str:
-    """Fallback date normalisation for formats the model ignores the 'date' type hint on."""
-    s = raw.strip()
-    # DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY (European numeric)
-    m = re.match(r"^(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})$", s)
-    if m:
-        return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
-    # "28 Feb 2026" / "28 February 2026" (written English month)
-    try:
-        from dateutil import parser as _dp
-        dt = _dp.parse(s, dayfirst=True)
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return s
+    Unparseable text is left exactly as the model wrote it: ``coerce_scalars``
+    runs later over every schema-typed leaf and drops it with a warning naming
+    the field. Guessing here instead is how ``"12 rue de la Paix"`` became 12.
+    """
+    text, currency = split_currency(amount)
+    number = parse_number(text)
+    if number is not None:
+        sub["amount"] = str(number)
+    if currency and not sub.get("currency"):
+        sub["currency"] = currency
 
 
 def _derive_invoice_subtotal(result: dict[str, Any]) -> bool:
@@ -129,6 +124,33 @@ def _derive_invoice_subtotal(result: dict[str, Any]) -> bool:
     return True
 
 
+def _cap_confidence(node: Any, cap: float) -> None:
+    if isinstance(node, dict):
+        if isinstance(node.get("confidence"), int | float):
+            node["confidence"] = min(float(node["confidence"]), cap)
+        for value in node.values():
+            _cap_confidence(value, cap)
+    elif isinstance(node, list):
+        for item in node:
+            _cap_confidence(item, cap)
+
+
+def _discard_delta(_text: str) -> None:
+    return None
+
+
+def _normalize_nuextract_text(key: str, text: str) -> str:
+    """Field-specific clean-up of one top-level value, bare or ``{"value": ...}``."""
+    if key == "iban":
+        return text.replace(" ", "")
+    if key == "country":
+        # Full country name -> ISO-3166-1 alpha-3.
+        return _COUNTRY_ISO.get(text.lower().strip(), text)
+    if key == "document_number":
+        return re.sub(r"^N[°o][\s\.]*", "", text).strip()
+    return text
+
+
 def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dict[str, Any], bool]:
     """Post-process NuExtract3 output: enforce document_type, strip IBAN spaces,
     null-out empty MoneyFields, and apply fallback normalization for any values the
@@ -144,6 +166,9 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dic
         if isinstance(val, list):
             result[key] = [_normalize_nested_nuextract(item) for item in val]
             continue
+        if isinstance(val, str):
+            result[key] = _normalize_nuextract_text(key, val)
+            continue
         if not isinstance(val, dict):
             result[key] = val
             continue
@@ -156,32 +181,12 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dic
                 result[key] = None
                 continue
             if isinstance(amt, str):
-                sub["amount"] = _norm_amount(amt)
-            if "currency" in sub and isinstance(sub.get("currency"), str):
-                currency = sub["currency"].strip()
-                sub["currency"] = _CURRENCY_MAP.get(currency, currency) or None
+                _norm_money(sub, amt)
+            if isinstance(sub.get("currency"), str):
+                sub["currency"] = normalize_currency(sub["currency"])
 
-        # Date fallback
-        if key in _DATE_FIELD_NAMES and isinstance(sub.get("value"), str) and sub["value"]:
-            sub["value"] = _norm_date(sub["value"])
-
-        # NumberField fallback (strip "%" etc.)
-        if key in _DECIMAL_FIELD_NAMES and isinstance(sub.get("value"), str):
-            sub["value"] = re.sub(r"[%\s]", "", sub["value"]).replace(",", ".")
-
-        # IBAN spaces
-        if key == "iban" and isinstance(sub.get("value"), str):
-            sub["value"] = sub["value"].replace(" ", "")
-
-        # country: normalize full country name → ISO-3166-1 alpha-3
-        if key == "country" and isinstance(sub.get("value"), str):
-            iso = _COUNTRY_ISO.get(sub["value"].lower().strip())
-            if iso:
-                sub["value"] = iso
-
-        # document_number: strip leading "N° " prefix if present
-        if key == "document_number" and isinstance(sub.get("value"), str):
-            sub["value"] = re.sub(r"^N[°o][\s\.]*", "", sub["value"]).strip()
+        if isinstance(sub.get("value"), str):
+            sub["value"] = _normalize_nuextract_text(key, sub["value"])
 
         # Empty-string value → null
         if sub.get("value") == "":
@@ -195,24 +200,17 @@ def _normalize_nuextract_raw(raw: dict[str, Any], schema_name: str) -> tuple[dic
     return result, derived_subtotal
 
 
-def _normalize_nested_nuextract(obj: Any, field_name: str | None = None) -> Any:
+def _normalize_nested_nuextract(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_normalize_nested_nuextract(item) for item in obj]
     if not isinstance(obj, dict):
         return obj
-    normalized = {
-        key: _normalize_nested_nuextract(value, key)
-        for key, value in obj.items()
-    }
-    if isinstance(normalized.get("amount"), str):
-        normalized["amount"] = _norm_amount(normalized["amount"])
+    normalized = {key: _normalize_nested_nuextract(value) for key, value in obj.items()}
+    amount = normalized.get("amount")
+    if isinstance(amount, str):
+        _norm_money(normalized, amount)
     if isinstance(normalized.get("currency"), str):
-        currency = normalized["currency"].strip()
-        normalized["currency"] = _CURRENCY_MAP.get(currency, currency) or None
-    if field_name in _DECIMAL_FIELD_NAMES and isinstance(normalized.get("value"), str):
-        normalized["value"] = re.sub(r"[%\s]", "", normalized["value"]).replace(",", ".")
-    if field_name in _DATE_FIELD_NAMES and isinstance(normalized.get("value"), str):
-        normalized["value"] = _norm_date(normalized["value"])
+        normalized["currency"] = normalize_currency(normalized["currency"])
     if normalized.get("value") == "":
         return None
     return normalized
@@ -228,6 +226,94 @@ def hash_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             h.update(chunk)
     return "sha256:" + h.hexdigest()
+
+
+def _data_urls(images: list[DocumentImage]) -> list[str]:
+    """Base64-encode every page image -- synchronous, CPU-bound for a
+    many-page document, so callers run this through asyncio.to_thread rather
+    than call DocumentImage.data_url() directly in a loop on the event loop."""
+    return [image.data_url() for image in images]
+
+
+def _is_array_field(field_schema: dict[str, Any]) -> bool:
+    """True when a flattened field is an array: bare ``{"type": "array"}``,
+    nullable ``{"type": ["array", "null"]}``, or an ``anyOf`` array branch."""
+    declared = field_schema.get("type")
+    if declared == "array" or (isinstance(declared, list) and "array" in declared):
+        return True
+    for branch in field_schema.get("anyOf", ()):
+        if isinstance(branch, dict) and branch.get("type") == "array":
+            return True
+    return False
+
+
+def _field_weight(node: dict[str, Any]) -> int:
+    """Leaf count under a flattened schema node: a proxy for output size."""
+    for key in ("properties", "items"):
+        child = node.get(key)
+        if isinstance(child, dict):
+            if key == "properties":
+                return max(1, sum(_field_weight(v) for v in child.values() if isinstance(v, dict)))
+            return _field_weight(child)
+    return 1
+
+
+def _split_schema_into_groups(
+    generation_schema: dict[str, Any], max_groups: int | None = None
+) -> list[list[str]] | None:
+    """Split a flattened generation schema's top-level fields into
+    independently-extractable groups (design #444): list-typed fields are
+    the units of work, scalars and nested objects form one base group.
+
+    With ``max_groups`` (the deployment's usable slot count) the units are
+    bin-packed into that many groups, heaviest first, so a run costs one
+    prompt evaluation per slot instead of one per list field. Each group
+    keeps the schema's field order. ``document_type``/``extraction_notes``
+    never appear here (flatten_schema_json strips them). Returns None when
+    the result would be a single group.
+    """
+    properties = generation_schema.get("properties")
+    if not isinstance(properties, dict) or len(properties) < 2:
+        return None
+    order = {name: index for index, name in enumerate(properties)}
+    list_fields = [
+        name
+        for name, spec in properties.items()
+        if isinstance(spec, dict) and _is_array_field(spec)
+    ]
+    other_fields = [name for name in properties if name not in list_fields]
+    if not list_fields:
+        return None
+    natural = (1 if other_fields else 0) + len(list_fields)
+    if max_groups is None or max_groups >= natural:
+        groups: list[list[str]] = [other_fields] if other_fields else []
+        groups.extend([name] for name in list_fields)
+        return groups if len(groups) >= 2 else None
+    if max_groups < 2:
+        return None
+    bins: list[list[str]] = [[] for _ in range(max_groups)]
+    loads = [0] * max_groups
+    for name in sorted(list_fields, key=lambda n: -_field_weight(properties[n])):
+        target = loads.index(min(loads))
+        bins[target].append(name)
+        loads[target] += _field_weight(properties[name])
+    if other_fields:
+        bins[loads.index(min(loads))].extend(other_fields)
+    return [sorted(group, key=order.__getitem__) for group in bins if group]
+
+
+def _subset_schema(generation_schema: dict[str, Any], field_names: list[str]) -> dict[str, Any]:
+    """Narrow a flattened generation schema down to just ``field_names`` --
+    the per-group schema a split extraction's chat_json call is compiled
+    against. Keeps every other top-level schema key (additionalProperties,
+    type, ...) unchanged; only properties/required are subset."""
+    subset = {**generation_schema, "properties": {
+        name: generation_schema["properties"][name] for name in field_names
+    }}
+    required = generation_schema.get("required")
+    if isinstance(required, list):
+        subset["required"] = [name for name in required if name in field_names]
+    return subset
 
 
 class ExtractionService:
@@ -270,6 +356,7 @@ class ExtractionService:
         language: str | None = None,
         document_hash: str | None = None,
         metadata: dict[str, str] | None = None,
+        parallel_extraction: bool = False,
     ) -> ExtractionResponse:
         blocks = (
             ocr_blocks
@@ -297,6 +384,7 @@ class ExtractionService:
             language=language,
             document_hash=document_hash,
             metadata=metadata or {},
+            parallel_extraction=parallel_extraction,
         )
 
     async def extract_from_file(
@@ -309,6 +397,7 @@ class ExtractionService:
         dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None = None,
         language: str | None = None,
         metadata: dict[str, str] | None = None,
+        parallel_extraction: bool = False,
     ) -> ExtractionResponse:
         # kind="ocr" (no extractor -- just OCR text as the "completion", per
         # serving.solutions.OcrSolution) is NOT handled here: it falls through
@@ -326,10 +415,12 @@ class ExtractionService:
                 dynamic_schema=dynamic_schema,
                 language=language,
                 metadata=metadata or {},
+                parallel_extraction=parallel_extraction,
             )
         if self.profile.vision:
             t0 = time.perf_counter()
-            images = load_document_images(
+            images = await asyncio.to_thread(
+                load_document_images,
                 path,
                 max_pages=self.profile.vision_max_pages,
                 pdf_dpi=self.profile.vision_pdf_dpi,
@@ -350,13 +441,15 @@ class ExtractionService:
                 schema_mode=schema_mode,
                 dynamic_schema=dynamic_schema,
                 language=language,
-                document_hash=hash_file(path),
+                document_hash=await asyncio.to_thread(hash_file, path),
                 metadata=metadata or {},
+                parallel_extraction=parallel_extraction,
             )
         if ocr_backend_name.lower().strip() == "vision":
             raise ValueError("ocr_backend='vision' requires a model profile with vision: true")
         t0 = time.perf_counter()
-        ocr_result = processor_from_settings(get_settings()).process(
+        ocr_result = await asyncio.to_thread(
+            processor_from_settings(get_settings()).process,
             path,
             backend_name=ocr_backend_name,
             language=language,
@@ -387,6 +480,7 @@ class ExtractionService:
             language=language,
             document_hash=ocr_result.artifact.document_hash,
             metadata=metadata or {},
+            parallel_extraction=parallel_extraction,
         )
 
     async def _extract_pipeline(
@@ -398,6 +492,7 @@ class ExtractionService:
         dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
         language: str | None,
         metadata: dict[str, str],
+        parallel_extraction: bool = False,
     ) -> ExtractionResponse:
         """kind="pipeline": OCR the document, then extract with the configured
         `options.extractor` profile -- the benchmark-side counterpart to
@@ -454,11 +549,12 @@ class ExtractionService:
             # didn't come through a registered OCR backend (see its own
             # text_to_blocks(..., source="manual") call).
             blocks = text_to_blocks(text, source="manual")
-            document_hash = hash_file(path)
+            document_hash = await asyncio.to_thread(hash_file, path)
         else:
             backend_name = str(options.get("ocr_backend", "tesseract"))
             ocr_language = options.get("language") or language
-            ocr_result = processor_from_settings(get_settings()).process(
+            ocr_result = await asyncio.to_thread(
+                processor_from_settings(get_settings()).process,
                 path,
                 backend_name=backend_name,
                 language=ocr_language,
@@ -498,6 +594,7 @@ class ExtractionService:
             language=language,
             document_hash=document_hash,
             metadata=metadata,
+            parallel_extraction=parallel_extraction,
         )
         # Report as the pipeline profile the caller asked to benchmark, not
         # the inner extractor -- matches what predictions.jsonl/metrics key
@@ -520,14 +617,18 @@ class ExtractionService:
         request data URI because its input is already an HTTP request, not
         a file on disk.
         """
-        images = load_document_images(
-            path, max_pages=vision.vision_max_pages, pdf_dpi=vision.vision_pdf_dpi
+        images = await asyncio.to_thread(
+            load_document_images,
+            path,
+            max_pages=vision.vision_max_pages,
+            pdf_dpi=vision.vision_pdf_dpi,
         )
         content: list[dict[str, Any]] = [
             {"type": "text", "text": OCR_TRANSCRIPTION_USER_PROMPT}
         ]
         content += [
-            {"type": "image_url", "image_url": {"url": image.data_url()}} for image in images
+            {"type": "image_url", "image_url": {"url": url}}
+            for url in await asyncio.to_thread(_data_urls, images)
         ]
         request = {
             "model": vision.model,
@@ -573,51 +674,39 @@ class ExtractionService:
             text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
         return fix_mojibake(str(text or "")) or ""
 
-    async def _extract_blocks(
+    async def _extract_group(
         self,
         *,
+        field_names: list[str] | None,
+        generation_schema: dict[str, Any],
+        nuextract_template: dict[str, Any] | None,
         blocks: list[OCRBlock],
-        images: list[DocumentImage] | None = None,
+        images: list[DocumentImage] | None,
+        image_urls: list[str] | None,
         schema_name: str,
-        schema_mode: str,
-        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
         language: str | None,
-        document_hash: str | None,
         metadata: dict[str, str],
-    ) -> ExtractionResponse:
-        request_id = str(uuid.uuid4())
-        started = time.perf_counter()
-        dynamic_spec: DynamicSchemaSpec | None = None
-        model_cls = None
-        nuextract_template = None
-        if schema_mode == "dynamic":
-            if isinstance(dynamic_schema, DynamicSchemaSpec):
-                dynamic_spec = dynamic_schema
-            elif dynamic_schema is not None:
-                dynamic_spec = DynamicSchemaSpec.model_validate(dynamic_schema)
-            else:
-                if not blocks:
-                    raise ValueError(
-                        "Dynamic schema inference requires OCR text; supply a reusable "
-                        "dynamic_schema for vision-only extraction"
-                    )
-                dynamic_spec = await self._propose_schema(blocks=blocks, language=language)
-            schema_name = dynamic_spec.document_type
-            model_cls = DynamicTemplateBuilder.build_model(dynamic_spec)
-            schema = model_cls.model_json_schema()
-            nuextract_template = DynamicTemplateBuilder.build_nuextract_template(dynamic_spec)
-        elif schema_mode == "static":
-            if dynamic_schema is not None:
-                raise ValueError("dynamic_schema can only be supplied when schema_mode='dynamic'")
-            schema = schema_json(schema_name)
-        else:
-            raise ValueError("schema_mode must be 'static' or 'dynamic'")
-        # Keep two explicit contracts. The rich Pydantic schema is the internal
-        # validation/audit shape. The compact value schema is what the model
-        # sees and what structured decoders compile; the rich schema contains
-        # regexes and wrapper defaults that llama.cpp cannot turn into GBNF.
-        generation_schema = flatten_schema_json(schema)
-        if self.profile.prompt_profile == "nuextract3":
+        want_logprobs: bool,
+    ) -> tuple[
+        dict[str, Any], dict[str, Any] | None, str | None, int | None, dict[str, float | None]
+    ]:
+        """Run one chat_json call over ``generation_schema`` -- the unit of
+        work fanned out across a split extraction's groups (design #444), or
+        called once directly for an unsplit one. ``field_names=None`` marks
+        the unsplit path (every field, streaming allowed); a split call's
+        caller has already narrowed ``generation_schema``/``nuextract_template``
+        to just its group's fields (see _split_schema_into_groups /
+        _subset_schema) -- nothing here re-derives the split.
+
+        Returns (raw, usage_dict, effective_style, queue_wait_ms,
+        field_confidences) -- everything _extract_blocks needs to merge
+        across groups without this method knowing whether it's one of many.
+        """
+        if self.profile.prompt_profile == "document_only" and not images:
+            # The schema reaches this family out-of-band (response_format), so
+            # the prompt is the document alone.
+            system_prompt, user_prompt = build_document_only_prompts(blocks)
+        elif self.profile.prompt_profile == "nuextract3":
             # NuExtract3 gets the template out-of-band via chat_template_kwargs
             # (the `nuextract3` response style), so the prompt carries only the
             # document — as the page image (vision) or OCR text. This must win
@@ -651,55 +740,246 @@ class ExtractionService:
                 language=language,
                 metadata=metadata,
             )
-        # Opt-in (#335): llama.cpp-only per-token logprob confidence. Both the
-        # request flag AND the declared runtime must agree -- an unlabeled or
-        # non-llama.cpp profile never gets `logprobs` on the wire, regardless
-        # of the flag (see ModelProfile.runtime/.logprob_confidence).
-        want_logprobs = self.profile.logprob_confidence and self.profile.runtime == "llamacpp"
         client = OpenAICompatibleClient(self.profile)
+        # build_response_format's own "nuextract3" branch resolves a template
+        # PURELY from schema_name, via a static lookup (llm.prompts._NUEXTRACT_TEMPLATES)
+        # that only ever knew about the built-in schemas -- a dynamic schema's
+        # freshly-built nuextract_template never reached it, so every
+        # dynamic-schema extraction through nuextract3 silently sent an EMPTY
+        # template (nothing to extract -> every field comes back null).
+        # chat_json's chat_template_kwargs is MERGED on top of
+        # build_response_format's own extra_body (see build_payload), so
+        # overriding "template" here for this one case is enough -- the
+        # static-schema path (nuextract_template is None) is untouched.
+        extra_template_kwargs: dict[str, Any] = {"enable_thinking": False}
+        if self.profile.prompt_profile == "nuextract3" and nuextract_template is not None:
+            extra_template_kwargs["template"] = json.dumps(
+                nuextract_template, ensure_ascii=False
+            )
         try:
             raw, usage_dict, raw_response = await client.chat_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 schema_name=schema_name,
                 schema=generation_schema,
-                image_urls=[image.data_url() for image in images] if images else None,
-                chat_template_kwargs=(
-                    {"enable_thinking": False} if self.disable_thinking else None
-                ),
+                image_urls=image_urls,
+                chat_template_kwargs=extra_template_kwargs or None,
                 max_tokens=self.max_tokens,
-                # LFM2.5's bundled template opens <think> unconditionally and
-                # ignores enable_thinking/reasoning_effort. Continuing an
-                # assistant JSON turn bypasses that generation prompt while
-                # retaining the kwargs for templates that do honor them.
+                # LFM2.5-2.6B's template opens <think> unconditionally and
+                # ignores enable_thinking; continuing an assistant JSON turn is
+                # the only thing that skips it. Extraction never wants thinking.
                 assistant_prefill=(
                     "{"
-                    if self.disable_thinking
-                    and self.profile.prompt_profile == "strict_extraction_v1"
+                    if self.profile.prompt_profile == "strict_extraction_v1"
+                    and (self.disable_thinking or uses_native_reasoning(self.profile))
                     else None
                 ),
                 request_logprobs=want_logprobs,
-                on_delta=self.on_delta,
-                on_reset=self.on_reset,
+                # A split extraction's groups run concurrently -- N interleaved
+                # streams would garble one live preview, so streaming only
+                # ever wires up on the unsplit path (field_names is None);
+                # _extract_blocks itself also refuses to split when a
+                # streaming callback is present, so this is a second,
+                # independent guard, not the only one.
+                # Streaming is always on so the client can abort a repetition
+                # loop mid-generation; the live preview itself only exists on
+                # the unsplit path.
+                on_delta=(self.on_delta if field_names is None else None) or _discard_delta,
+                on_reset=self.on_reset if field_names is None else None,
             )
             effective_style = getattr(client, "last_response_format_style", None)
+            queue_wait_ms = getattr(client, "last_queue_wait_ms", None)
         finally:
             await client.aclose()
         # Snapshot BEFORE any reshaping: `raw` here is exactly the FLAT dict
         # the model generated (matches `generation_schema`'s unwrapped shape),
-        # which is what field-value substrings must be located against. Both
-        # NuExtract normalization and schema rehydration below rebuild new
-        # dicts rather than mutating `raw` in place, so this reference stays
-        # untouched by them.
+        # which is what field-value substrings must be located against.
         field_confidences: dict[str, float | None] = (
             compute_field_confidences(raw, raw_response) if want_logprobs else {}
         )
+        loop_truncated = raw_response.get("docie_loop_truncated")
+        return raw, usage_dict, effective_style, queue_wait_ms, field_confidences, loop_truncated
+
+    async def _extract_blocks(
+        self,
+        *,
+        blocks: list[OCRBlock],
+        images: list[DocumentImage] | None = None,
+        schema_name: str,
+        schema_mode: str,
+        dynamic_schema: dict[str, Any] | DynamicSchemaSpec | None,
+        language: str | None,
+        document_hash: str | None,
+        metadata: dict[str, str],
+        parallel_extraction: bool = False,
+    ) -> ExtractionResponse:
+        request_id = str(uuid.uuid4())
+        started = time.perf_counter()
+        dynamic_spec: DynamicSchemaSpec | None = None
+        model_cls = None
+        nuextract_template = None
+        if schema_mode == "dynamic":
+            if isinstance(dynamic_schema, DynamicSchemaSpec):
+                dynamic_spec = dynamic_schema
+            elif dynamic_schema is not None:
+                dynamic_spec = DynamicSchemaSpec.model_validate(dynamic_schema)
+            else:
+                if not blocks:
+                    raise ValueError(
+                        "Dynamic schema inference requires OCR text; supply a reusable "
+                        "dynamic_schema for vision-only extraction"
+                    )
+                dynamic_spec = await self._propose_schema(blocks=blocks, language=language)
+            schema_name = dynamic_spec.document_type
+            model_cls = DynamicTemplateBuilder.build_model(dynamic_spec)
+            schema = model_cls.model_json_schema()
+            nuextract_template = DynamicTemplateBuilder.build_nuextract_template(dynamic_spec)
+        elif schema_mode == "static":
+            if dynamic_schema is not None:
+                raise ValueError("dynamic_schema can only be supplied when schema_mode='dynamic'")
+            schema = schema_json(schema_name)
+        else:
+            raise ValueError("schema_mode must be 'static' or 'dynamic'")
+        # Keep two explicit contracts. The rich Pydantic schema is the internal
+        # validation/audit shape. The compact value schema is what the model
+        # sees and what structured decoders compile; the rich schema contains
+        # regexes and wrapper defaults that llama.cpp cannot turn into GBNF.
+        generation_schema = flatten_schema_json(schema)
+        # Opt-in (#335): llama.cpp-only per-token logprob confidence. Both the
+        # request flag AND the declared runtime must agree -- an unlabeled or
+        # non-llama.cpp profile never gets `logprobs` on the wire, regardless
+        # of the flag (see ModelProfile.runtime/.logprob_confidence).
+        want_logprobs = self.profile.logprob_confidence and self.profile.runtime == "llamacpp"
+        image_urls = await asyncio.to_thread(_data_urls, images) if images else None
+
+        # Design #444: split a schema's list-typed top-level fields into
+        # independent groups and fan them out concurrently, each through the
+        # SAME gateway semaphore (no new limiter). Opt-in per request
+        # (parallel_extraction) -- most real schemas have a list field, so an
+        # always-on split would silently change the call pattern (and
+        # benchmark timing) for nearly every extraction. Streaming also
+        # forces the unsplit path -- N concurrent groups would interleave
+        # into one garbled live preview.
+        slot_count = self.profile.deployment_slot_count
+        fanout_bound = max(1, min(slot_count or 1, self.profile.max_concurrency))
+        groups = (
+            None
+            if not parallel_extraction or self.on_delta is not None or self.on_reset is not None
+            else _split_schema_into_groups(
+                generation_schema, max_groups=fanout_bound if slot_count else None
+            )
+        )
+        if groups is not None and get_settings().llm_trace:
+            logger.info(
+                "llm_trace_split",
+                extra={
+                    "docie_step": "llm_trace_split",
+                    "docie_schema_name": schema_name,
+                    "docie_groups": groups,
+                    "docie_fanout": fanout_bound,
+                },
+            )
+        if groups is None:
+            raw, usage_dict, effective_style, queue_wait_ms, field_confidences, loop_flag = (
+                await self._extract_group(
+                    field_names=None,
+                    generation_schema=generation_schema,
+                    nuextract_template=nuextract_template,
+                    blocks=blocks,
+                    images=images,
+                    image_urls=image_urls,
+                    schema_name=schema_name,
+                    language=language,
+                    metadata=metadata,
+                    want_logprobs=want_logprobs,
+                )
+            )
+        else:
+
+            async def _run_group(
+                field_names: list[str],
+            ) -> tuple[
+                dict[str, Any], dict[str, Any] | None, str | None, int | None,
+                dict[str, float | None], dict[str, Any] | None,
+            ]:
+                return await self._extract_group(
+                    field_names=field_names,
+                    generation_schema=_subset_schema(generation_schema, field_names),
+                    nuextract_template=(
+                        {k: v for k, v in nuextract_template.items() if k in field_names}
+                        if nuextract_template is not None
+                        else None
+                    ),
+                    blocks=blocks,
+                    images=images,
+                    image_urls=image_urls,
+                    schema_name=schema_name,
+                    language=language,
+                    metadata=metadata,
+                    want_logprobs=want_logprobs,
+                )
+
+            fanout = asyncio.Semaphore(fanout_bound)
+
+            async def _bounded(field_names: list[str]) -> Any:
+                async with fanout:
+                    return await _run_group(field_names)
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    tasks = [tg.create_task(_bounded(group)) for group in groups]
+            except* Exception as eg:
+                raise eg.exceptions[0] from None
+            group_results = [task.result() for task in tasks]
+
+            raw = {}
+            field_confidences = {}
+            effective_style = None
+            loop_truncations = []
+            usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            usage_seen = False
+            queue_waits: list[int] = []
+            for group_raw, group_usage, group_style, group_wait, group_conf, group_loop in (
+                group_results
+            ):
+                raw.update(group_raw)
+                if group_loop:
+                    loop_truncations.append(group_loop)
+                field_confidences.update(group_conf)
+                if effective_style is None:
+                    effective_style = group_style
+                if group_wait is not None:
+                    queue_waits.append(group_wait)
+                if isinstance(group_usage, dict):
+                    usage_seen = True
+                    for key in usage_totals:
+                        usage_totals[key] += group_usage.get(key) or 0
+            usage_dict = usage_totals if usage_seen else None
+            # Groups run concurrently -- their waits overlap, so the total
+            # queued time a caller actually experienced is the LONGEST one
+            # waited, not the sum (summing would double-count overlapping time).
+            queue_wait_ms = max(queue_waits) if queue_waits else None
+
+        if groups is None:
+            loop_truncations = [loop_flag] if loop_flag else []
         derived_subtotal = False
         if self.profile.prompt_profile in {"nuextract_v1", "nuextract3"}:
             raw, derived_subtotal = _normalize_nuextract_raw(raw, schema_name)
-        raw = rehydrate_extraction_result(raw, schema)
+        raw = rehydrate_extraction_result(dedupe_lists(normalize_placeholders(raw)), schema)
+        raw = normalize_by_schema(raw, schema)
         raw = ground_evidence(raw, blocks)
+        # After grounding: the evidence search matches the value as the
+        # model wrote it, and "1234.56" no longer matches a line reading
+        # "1 234,56 EUR".
+        raw, coercion_warnings = coerce_scalars(raw, schema)
         normalized, validation = validate_extraction(schema_name, raw, blocks, model_cls=model_cls)
+        # Validation builds each declared shape and drops whatever does not fit
+        # it, without raising: a money field answered with `value` instead of
+        # `amount` arrives null and nothing says the model had written
+        # something. Compare what went in against what came out.
+        lost_text = report_lost_text(raw, normalized)
+        validation.warnings.extend(coercion_warnings)
+        validation.warnings.extend(lost_text)
         if field_confidences:
             # Attached to the plain validated dict, not a Pydantic field on
             # TextField/MoneyField/etc: `model_confidence` is ad-hoc metadata
@@ -717,6 +997,19 @@ class ExtractionService:
                 "subtotal.amount was derived from total_ttc - vat_amount "
                 "(the model did not extract it directly)"
             )
+        for loop in loop_truncations:
+            field = (loop.get("field_path") or ["output"])[0]
+            note = (
+                f"{field}: model output repeated itself ({loop.get('unit', '')[:40]!r}); "
+                "list truncated at the loop start, remaining items dropped; confidence "
+                "capped to 0.5 as a review flag"
+            )
+            validation.warnings.append(note)
+            notes = normalized.get("extraction_notes")
+            if isinstance(notes, list):
+                notes.append(note)
+            if field in normalized:
+                _cap_confidence(normalized[field], 0.5)
         latency_ms = int((time.perf_counter() - started) * 1000)
         usage = Usage.model_validate(usage_dict) if isinstance(usage_dict, dict) else None
 
@@ -728,6 +1021,17 @@ class ExtractionService:
                 "docie_model_profile": self.profile.name,
                 "docie_doc_id": metadata.get("doc_id"),
                 "docie_latency_ms": latency_ms,
+                # Time spent waiting for the ModelGateway's per-(base_url,
+                # model) semaphore before the HTTP call to the model even
+                # started -- separates queueing from generation. Everything
+                # else in docie_latency_ms not accounted for here is prompt
+                # construction, the model call itself, and post-processing
+                # (rehydration/grounding/validation), which stay lumped
+                # together as "generation" -- not worth a further split.
+                "docie_queue_wait_ms": queue_wait_ms,
+                "docie_generation_ms": (
+                    max(latency_ms - queue_wait_ms, 0) if queue_wait_ms is not None else None
+                ),
                 "docie_valid": validation.valid,
                 "docie_errors": validation.errors,
                 "docie_warnings": validation.warnings,
@@ -752,6 +1056,8 @@ class ExtractionService:
                 else None
             ),
             response_format_style=effective_style,
+            queue_wait_ms=queue_wait_ms,
+            parallel_groups=len(groups) if groups else None,
             ocr_blocks=blocks or None,
         )
 

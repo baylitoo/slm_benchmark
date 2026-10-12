@@ -7,6 +7,7 @@ from typing import Any
 from liteparse import LiteParse
 
 from docie_bench.ocr.base import OCRBackend, stable_block_id, text_to_blocks
+from docie_bench.ocr.layout import merge_lines, reading_order
 from docie_bench.schemas.common import BoundingBox, OCRBlock
 from docie_bench.settings import get_settings
 
@@ -49,6 +50,7 @@ class PdfTextBackend(OCRBackend):
         # invalidate cached artifacts.
         return {
             "engine": "liteparse",
+            "layout": "xy-cut-v1",
             "dpi": self._dpi,
             "ocr_server_url": self._ocr_server_url or "",
             "language": self._language or "",
@@ -72,7 +74,7 @@ class PdfTextBackend(OCRBackend):
         )
         result = parser.parse(path)
 
-        blocks: list[OCRBlock] = []
+        raw: list[OCRBlock] = []
         for page in result.pages:
             for idx, item in enumerate(page.text_items):
                 text = (item.text or "").strip()
@@ -85,9 +87,9 @@ class PdfTextBackend(OCRBackend):
                     y1=float(item.y) + float(item.height),
                 )
                 confidence = getattr(item, "confidence", None)
-                blocks.append(
+                raw.append(
                     OCRBlock(
-                        id=stable_block_id(page.page_num, idx, text),
+                        id=f"raw-{page.page_num}-{idx}",
                         text=text,
                         page=page.page_num,
                         bbox=bbox,
@@ -95,4 +97,10 @@ class PdfTextBackend(OCRBackend):
                         confidence=float(confidence) if confidence is not None else None,
                     )
                 )
-        return blocks
+        ordered = merge_lines(reading_order(raw))
+        # Ids follow reading order so evidence ids stay stable for a given
+        # document + layout algorithm.
+        return [
+            block.model_copy(update={"id": stable_block_id(block.page, idx, block.text)})
+            for idx, block in enumerate(ordered)
+        ]

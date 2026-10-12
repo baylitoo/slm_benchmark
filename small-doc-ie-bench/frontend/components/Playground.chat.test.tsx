@@ -100,6 +100,43 @@ describe("ChatPanel", () => {
     expect(messages.at(-1)).toEqual({ role: "user", content: "hello" });
   });
 
+  it("omits sampling params entirely when nothing is set (#384)", async () => {
+    renderChat();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/Type a message/), "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(api.chatCompletionStream).toHaveBeenCalledTimes(1));
+    const call = vi.mocked(api.chatCompletionStream).mock.calls[0];
+    expect(call[4]).toEqual({});
+  });
+
+  it("sends only the sampling params the user actually set (#384)", async () => {
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Sampling"));
+    await user.type(screen.getByLabelText("Temperature"), "0.2");
+    await user.type(screen.getByLabelText("Top P"), "0.9");
+    await user.type(screen.getByPlaceholderText(/Type a message/), "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(api.chatCompletionStream).toHaveBeenCalledTimes(1));
+    const call = vi.mocked(api.chatCompletionStream).mock.calls[0];
+    expect(call[4]).toEqual({ temperature: 0.2, top_p: 0.9 });
+  });
+
+  it("disables the sampling inputs while Extraction is on", async () => {
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Sampling"));
+    await user.click(screen.getByRole("checkbox", { name: /Extraction/ }));
+
+    expect(screen.getByLabelText("Temperature")).toBeDisabled();
+    expect(screen.getByLabelText("Top P")).toBeDisabled();
+    expect(screen.getByLabelText("Min P")).toBeDisabled();
+    expect(screen.getByLabelText("Repeat penalty")).toBeDisabled();
+  });
+
   it("attaches an image and sends it as multimodal content (vision folded into chat)", async () => {
     renderChat(RECORDS, [{ name: "lfm2.5-350m", vision: true }]);
     const user = userEvent.setup();
@@ -489,6 +526,7 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(AbortSignal),
+      {},
     );
 
     // A second turn with no new attachment still carries the SAME session id
@@ -512,6 +550,7 @@ describe("ChatPanel", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(AbortSignal),
+      {},
     );
   });
 

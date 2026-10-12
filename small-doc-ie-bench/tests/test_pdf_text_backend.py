@@ -55,6 +55,7 @@ def test_pdf_text_maps_liteparse_items_to_blocks(monkeypatch: pytest.MonkeyPatch
     cfg = backend.configuration()
     assert cfg == {
         "engine": "liteparse",
+        "layout": "xy-cut-v1",
         "dpi": 200,
         "ocr_server_url": "http://vlm/ocr",
         "language": "fr",

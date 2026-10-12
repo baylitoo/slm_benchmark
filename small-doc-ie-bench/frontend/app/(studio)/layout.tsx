@@ -1,5 +1,6 @@
 import { Suspense } from "react";
 import { AppShell } from "@/components/AppShell";
+import { AuthGate } from "@/components/AuthGate";
 
 /**
  * The Studio shell lives in this LAYOUT, not in the pages: layouts persist
@@ -28,9 +29,11 @@ import { AppShell } from "@/components/AppShell";
  */
 export default function StudioLayout({ children }: { children: React.ReactNode }) {
   return (
-    <Suspense>
-      <AppShell />
-      {children}
-    </Suspense>
+    <AuthGate>
+      <Suspense>
+        <AppShell />
+        {children}
+      </Suspense>
+    </AuthGate>
   );
 }

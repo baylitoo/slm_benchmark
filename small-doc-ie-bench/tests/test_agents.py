@@ -539,6 +539,39 @@ def test_ocr_extract_agent_omits_sum_check_for_unrecognized_schema_shape(
     assert "sum_check" not in payload["docie_agent"]
 
 
+def test_ocr_extract_agent_missing_image_url_is_a_clean_400_not_a_500(api) -> None:
+    """Found via a real integration test: a schema-having OCR agent's request
+    path called _extract_document(body) BEFORE the try/except that every
+    other malformed-input case in this function is wrapped in, so a request
+    with no image_url content part (e.g. the OpenAI file/file_data
+    convention, which this OCR path doesn't support) raised SolutionError
+    straight through FastAPI as an unhandled 500 instead of a normal 4xx."""
+    client, _captured = api
+
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "doc-ocr-needs-image",
+            "kind": "ocr",
+            "options": {
+                "mode": "ocr_extract",
+                "extractor": "lfm2.5",
+                "backend": "liteparse",
+                "schema": "invoice",
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/v1/agents/doc-ocr-needs-image/chat/completions",
+        json={"messages": [{"role": "user", "content": "extract structured data"}]},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "image_url" in resp.json()["error"]["message"]
+
+
 def test_shared_extraction_result_keeps_agent_flat_contract() -> None:
     from docie_bench.agents.runtime import _flatten_agent_result
 

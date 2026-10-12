@@ -59,6 +59,16 @@ class ModelProfile:
     # payload-size cost at scale -- and only takes effect when `runtime` is
     # also declared "llamacpp"; the call site checks both.
     logprob_confidence: bool = False
+    # The real slot count the reconciler last observed for this deployment
+    # via GET /slots (serving.catalog.ModelPlacement.slot_count) -- NOT the
+    # --parallel value it was launched with, which can drift from what a
+    # manually-restarted process actually runs with. Only set for a `store:`
+    # profile resolved through placement_resolver.resolve_store_profile;
+    # every models.yaml-configured profile leaves this None (nothing to
+    # observe -- it isn't a managed deployment). None also means "not yet
+    # observed" or "not llama.cpp". Read-only signal for model_gateway's
+    # concurrency-mismatch warning; never fed back into deploy/launch logic.
+    deployment_slot_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in VALID_PROFILE_KINDS:

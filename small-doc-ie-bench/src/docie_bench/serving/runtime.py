@@ -65,6 +65,16 @@ class RuntimeLaunchError(RuntimeError):
     pass
 
 
+# llama-server's own --cache-type-k/-v allowed values (#382), verified against
+# the live upstream tools/server/README.md -- shared by the draft-model
+# variants too, but those aren't wired here.
+_LLAMACPP_CACHE_TYPES = frozenset(
+    {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
+)
+_LLAMACPP_NUMA_MODES = frozenset({"distribute", "isolate", "numactl"})
+_LLAMACPP_FLASH_ATTN_MODES = frozenset({"on", "off", "auto"})
+
+
 @dataclass(frozen=True)
 class RuntimeLaunchSpec:
     runtime: RuntimeKind
@@ -82,9 +92,13 @@ class RuntimeLaunchSpec:
     # generation metadata, not a llama-server process flag; callers may still
     # override it per request.
     max_tokens: int | None = None
+    timeout_seconds: float | None = None
     cpu_threads: int | None = None
+    cpu_threads_batch: int | None = None
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float | None = None
+    batch_size: int | None = None
+    ubatch_size: int | None = None
     api_key_env: str | None = None
     extra_args: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
@@ -92,6 +106,44 @@ class RuntimeLaunchSpec:
     # build_command never reads these.
     n_parallel: int = 1
     cache_reuse: int | None = None
+    # llama.cpp only (#387): overrides the GGUF's own embedded chat_template
+    # with an operator-supplied Jinja file -- e.g. patching tool-call
+    # rendering onto a checkpoint whose baked-in template lacks it. Existence
+    # is the caller's responsibility (same as `model` itself); the #290
+    # health check re-verifies whatever template ends up live via GET /props
+    # automatically, since that check queries the running server, not the
+    # GGUF's static bytes -- an override gets exactly the same scrutiny a
+    # baked-in template does, with no extra code.
+    chat_template_file: str | None = None
+    # llama.cpp only (#382): quantizing the KV cache is a direct, mechanical
+    # RAM win on the RAM/VRAM-constrained boxes this framework targets --
+    # q8_0 roughly halves KV cache size vs. f16 with near-zero accuracy
+    # loss, q4_0 roughly quarters it with a small, model-dependent cost.
+    # None (the default) omits both flags entirely, matching llama-server's
+    # own f16 default byte-for-byte. --flash-attn is a *prerequisite* for
+    # KV quant below f16 to actually take effect (otherwise it's silently a
+    # no-op) -- build_command forces it on automatically whenever either
+    # cache type is quantized, rather than requiring the operator to
+    # separately remember to enable it.
+    cache_type_k: str | None = None
+    cache_type_v: str | None = None
+    # llama.cpp only (#402): caps how many tokens a thinking/reasoning model
+    # can spend before it's forced to stop and answer -- -1 (the default)
+    # is unrestricted, 0 ends thinking immediately, N>0 is a hard token cap.
+    # Directly relevant to latency/cost: an unbounded reasoning model can
+    # spend an arbitrary number of tokens "thinking" before ever producing a
+    # usable answer, and interacts with the tool-budget-forced-answer
+    # guarantee (#391) -- a forced round still has to wait through however
+    # long the model wants to think before it answers. None omits the flag
+    # entirely, matching llama-server's own -1/unrestricted default.
+    reasoning_budget: int | None = None
+    # Text injected before the end-of-thinking tag when reasoning_budget runs
+    # out, so a budget-exhausted response reads as an intentional wrap-up
+    # rather than an abrupt cut-off thought. Only meaningful alongside
+    # reasoning_budget; validated together below.
+    reasoning_budget_message: str | None = None
+    numa: str | None = None
+    flash_attn: str | None = None
     # llama.cpp only (#366): unlocks llama-server's own Prometheus-compatible
     # GET /metrics -- a DIFFERENT consumer than this app's in-app
     # Observability tab (usage ledger, slots card): an operator's EXTERNAL
@@ -118,12 +170,20 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("context_length must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
             raise RuntimeConfigurationError("max_tokens must be positive")
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise RuntimeConfigurationError("timeout_seconds must be positive")
         if self.cpu_threads is not None and self.cpu_threads < 1:
             raise RuntimeConfigurationError("cpu_threads must be positive")
+        if self.cpu_threads_batch is not None and self.cpu_threads_batch < 1:
+            raise RuntimeConfigurationError("cpu_threads_batch must be positive")
         if self.tensor_parallel_size < 1:
             raise RuntimeConfigurationError("tensor_parallel_size must be positive")
         if self.gpu_memory_utilization is not None and not (0 < self.gpu_memory_utilization <= 1):
             raise RuntimeConfigurationError("gpu_memory_utilization must be in (0, 1]")
+        if self.batch_size is not None and self.batch_size < 1:
+            raise RuntimeConfigurationError("batch_size must be positive")
+        if self.ubatch_size is not None and self.ubatch_size < 1:
+            raise RuntimeConfigurationError("ubatch_size must be positive")
         if any("\x00" in value for value in self.extra_args):
             raise RuntimeConfigurationError("extra_args must not contain NUL bytes")
         if any("\x00" in key or "\x00" in value for key, value in self.env.items()):
@@ -132,6 +192,44 @@ class RuntimeLaunchSpec:
             raise RuntimeConfigurationError("n_parallel must be positive")
         if self.cache_reuse is not None and self.cache_reuse < 1:
             raise RuntimeConfigurationError("cache_reuse must be positive")
+        if self.chat_template_file is not None and not self.chat_template_file.strip():
+            raise RuntimeConfigurationError("chat_template_file must not be empty")
+        if self.chat_template_file is not None and "\x00" in self.chat_template_file:
+            raise RuntimeConfigurationError("chat_template_file must not contain NUL bytes")
+        if self.cache_type_k is not None and self.cache_type_k not in _LLAMACPP_CACHE_TYPES:
+            raise RuntimeConfigurationError(
+                f"cache_type_k must be one of {sorted(_LLAMACPP_CACHE_TYPES)}"
+            )
+        if self.cache_type_v is not None and self.cache_type_v not in _LLAMACPP_CACHE_TYPES:
+            raise RuntimeConfigurationError(
+                f"cache_type_v must be one of {sorted(_LLAMACPP_CACHE_TYPES)}"
+            )
+        if self.reasoning_budget is not None and self.reasoning_budget < -1:
+            raise RuntimeConfigurationError("reasoning_budget must be -1, 0, or positive")
+        if self.reasoning_budget_message is not None:
+            if self.reasoning_budget is None:
+                raise RuntimeConfigurationError(
+                    "reasoning_budget_message requires reasoning_budget to be set"
+                )
+            if "\x00" in self.reasoning_budget_message:
+                raise RuntimeConfigurationError(
+                    "reasoning_budget_message must not contain NUL bytes"
+                )
+        if self.numa is not None and self.numa not in _LLAMACPP_NUMA_MODES:
+            raise RuntimeConfigurationError(
+                f"numa must be one of {sorted(_LLAMACPP_NUMA_MODES)}"
+            )
+        if self.flash_attn is not None and self.flash_attn not in _LLAMACPP_FLASH_ATTN_MODES:
+            raise RuntimeConfigurationError(
+                f"flash_attn must be one of {sorted(_LLAMACPP_FLASH_ATTN_MODES)}"
+            )
+        kv_quantized = (
+            self.cache_type_k not in (None, "f16") or self.cache_type_v not in (None, "f16")
+        )
+        if self.flash_attn == "off" and kv_quantized:
+            raise RuntimeConfigurationError(
+                "flash_attn='off' disables quantized KV cache; use f16 or flash_attn on/auto"
+            )
 
 
 @dataclass(frozen=True)
@@ -166,6 +264,18 @@ class HealthResult:
     # unreachable /props, or a runtime (vLLM, Ollama, ...) that never probes
     # this at all. Every non-llamacpp adapter leaves this at the default None.
     tool_calls_supported: bool | None = None
+    # llama.cpp only: the real number of processing slots this deployment is
+    # actually running with (GET /slots array length -- one entry per real
+    # slot), NOT the --parallel value it was launched with. Distinct on
+    # purpose: a manually-restarted or externally-managed process could be
+    # running with a different slot count than its launch spec claims, and
+    # this is meant to be ground truth for the concurrency-mismatch warning
+    # (see model_gateway._state_for). None whenever unreachable/undetermined
+    # (an unhealthy deployment, --no-slots, an older build, a non-llamacpp
+    # runtime) -- a slot count of 0 is never a valid state, so an empty
+    # /slots response is indistinguishable from "couldn't observe" and both
+    # collapse to None here.
+    slot_count: int | None = None
 
 
 class Process(Protocol):
@@ -654,6 +764,13 @@ class VLLMRuntime(RuntimeAdapter):
             command.extend(["--quantization", spec.quantization])
         if spec.gpu_memory_utilization is not None:
             command.extend(["--gpu-memory-utilization", str(spec.gpu_memory_utilization)])
+        # #447: api_key_env was only ever read for the control plane's own
+        # OUTBOUND probe calls (health/props/slots below) -- the launched
+        # process itself never required a key, so anything with network
+        # reach to the port got full inference access regardless of this
+        # setting. vLLM's own --api-key enforces it on the server side.
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            command.extend(["--api-key", api_key])
         command.extend(spec.extra_args)
         return tuple(command)
 
@@ -702,10 +819,41 @@ class LlamaCppRuntime(RuntimeAdapter):
             spec.host,
             "--port",
             str(spec.port),
-            "--jinja",
         ]
         if spec.metrics_enabled:
             command.append("--metrics")
+        # Default on for a bare RuntimeLaunchSpec (e.g. `docie serve`'s direct
+        # construction, README-documented advanced usage, see control_plane.py's
+        # serve()) -- but every family-routed store deploy (serve_store_model)
+        # already carries its own "--jinja" via family_launch_args/extra_args
+        # when its FamilyContract wants it, so appending it here UNCONDITIONALLY
+        # duplicated the flag on every one of those launches (llama-server logs
+        # "argument '--jinja' specified multiple times" and silently keeps only
+        # the last value -- harmless today only because both values agree).
+        if "--jinja" not in spec.extra_args:
+            command.append("--jinja")
+        if spec.chat_template_file is not None:
+            command.extend(["--chat-template-file", spec.chat_template_file])
+        if spec.cache_type_k is not None:
+            command.extend(["--cache-type-k", spec.cache_type_k])
+        if spec.cache_type_v is not None:
+            command.extend(["--cache-type-v", spec.cache_type_v])
+        # --flash-attn is a prerequisite for KV quant below f16 to actually
+        # apply -- otherwise the type flags above are silently a no-op.
+        # Forced on automatically rather than left to the operator to
+        # separately remember (or to llama-server's own "auto" default,
+        # which isn't guaranteed to enable it on every backend).
+        kv_quantized = (
+            spec.cache_type_k not in (None, "f16") or spec.cache_type_v not in (None, "f16")
+        )
+        if spec.flash_attn is not None:
+            command.extend(["--flash-attn", spec.flash_attn])
+        elif kv_quantized:
+            command.extend(["--flash-attn", "on"])
+        if spec.reasoning_budget is not None:
+            command.extend(["--reasoning-budget", str(spec.reasoning_budget)])
+        if spec.reasoning_budget_message is not None:
+            command.extend(["--reasoning-budget-message", spec.reasoning_budget_message])
         if spec.context_length is not None:
             ctx_size = spec.context_length
             if spec.n_parallel > 1:
@@ -719,8 +867,18 @@ class LlamaCppRuntime(RuntimeAdapter):
             command.extend(["--parallel", str(spec.n_parallel)])
         if spec.cpu_threads is not None:
             command.extend(["--threads", str(spec.cpu_threads)])
+        if spec.cpu_threads_batch is not None:
+            command.extend(["--threads-batch", str(spec.cpu_threads_batch)])
         if spec.cache_reuse is not None:
             command.extend(["--cache-reuse", str(spec.cache_reuse)])
+        if spec.batch_size is not None:
+            command.extend(["--batch-size", str(spec.batch_size)])
+        if spec.ubatch_size is not None:
+            command.extend(["--ubatch-size", str(spec.ubatch_size)])
+        if spec.numa is not None:
+            command.extend(["--numa", spec.numa])
+        if spec.api_key_env and (api_key := os.environ.get(spec.api_key_env)):
+            command.extend(["--api-key", api_key])
         command.extend(spec.extra_args)
         return tuple(command)
 
@@ -757,7 +915,11 @@ class LlamaCppRuntime(RuntimeAdapter):
             mismatch = llamacpp_tool_calls_mismatch(props)
             if mismatch is not None:
                 logger.warning("%s (alias=%r, endpoint=%r)", mismatch, spec.alias, base)
-        return replace(result, tool_calls_supported=tool_calls_supported)
+        observed_slots = self.slots(spec, timeout=timeout)
+        slot_count = len(observed_slots) or None
+        return replace(
+            result, tool_calls_supported=tool_calls_supported, slot_count=slot_count
+        )
 
     def slots(self, spec: RuntimeLaunchSpec, *, timeout: float = 2) -> tuple[dict[str, Any], ...]:
         """llama-server's own ``GET /slots`` introspection (#315): per-slot

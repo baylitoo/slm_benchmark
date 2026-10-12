@@ -94,8 +94,26 @@ from docie_bench.serving.throughput import (
     probe_applicability,
     probe_deployment,
 )
+from docie_bench.telemetry import DEPLOYMENT_HEALTHY, DEPLOYMENT_PHASE
 
 logger = logging.getLogger(__name__)
+
+# Every phase ObservedDeployment.phase can carry (see its docstring). Exporting
+# the full fixed set each cycle -- not just the observed one -- keeps a
+# deployment's OTHER phase series at 0 instead of stuck at its last nonzero
+# value forever after a transition (a Gauge never clears a label combo nobody
+# re-sets), which would otherwise let a stale "loading=1" outlive an actual
+# recovery to "hot".
+_DEPLOYMENT_PHASES = ("hot", "loading", "cold", "evicted", "failed")
+
+
+def _export_deployment_metrics(observations: list[ObservedDeployment]) -> None:
+    for observation in observations:
+        DEPLOYMENT_HEALTHY.labels(observation.name).set(1.0 if observation.health_ok else 0.0)
+        for phase in _DEPLOYMENT_PHASES:
+            DEPLOYMENT_PHASE.labels(observation.name, phase).set(
+                1.0 if phase == observation.phase else 0.0
+            )
 
 # create_time is stable for the lifetime of a process; allow a small slack for
 # float rounding across psutil reads.
@@ -258,6 +276,11 @@ class ObservedDeployment:
     ttft_ms: float | None = None
     throughput_measured_at: dt.datetime | None = None
     throughput_source: str | None = None
+    # The real slot count observed via GET /slots (see HealthResult.slot_count)
+    # -- None whenever not live or undetermined. Never carried forward from a
+    # stale cycle: a deployment that stops being live publishes None here,
+    # same policy as the throughput fields.
+    slot_count: int | None = None
 
 
 def default_fit_check(
@@ -336,6 +359,7 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
                 ttft_ms=observed.ttft_ms,
                 throughput_measured_at=observed.throughput_measured_at,
                 throughput_source=observed.throughput_source,
+                slot_count=observed.slot_count,
             )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: observed state not published (repair-only cycle)")
@@ -503,6 +527,7 @@ class ServingReconciler:
         # Publish OUTSIDE the lock: observations are immutable snapshots and a
         # slow database must not block the lifecycle handlers.
         self._publisher(observations)
+        _export_deployment_metrics(observations)
         # Resource snapshot (PR-2), also outside the lock: pure measurement
         # (cgroup/psutil reads + footprint sidecar writes). Best-effort — a
         # measurement hiccup must never mark the repair cycle failed.
@@ -606,7 +631,9 @@ class ServingReconciler:
             self._was_ready.add(name)
             self._misses[name] = 0
             record = self._credit_healthy_cycle(name, record)
-            return self._observation(name, record, phase="hot", health_ok=True)
+            return self._observation(
+                name, record, phase="hot", health_ok=True, slot_count=health.slot_count
+            )
 
         self._healthy_streak.pop(name, None)  # any miss restarts the streak
         detail = health.detail or f"health check returned status {health.status_code}"
@@ -931,6 +958,7 @@ class ServingReconciler:
         phase: str,
         health_ok: bool,
         last_error: str | None = None,
+        slot_count: int | None = None,
     ) -> ObservedDeployment:
         live = phase == "hot"
         rss = 0
@@ -965,6 +993,7 @@ class ServingReconciler:
             ttft_ms=ttft_ms,
             throughput_measured_at=throughput_at,
             throughput_source=throughput_source,
+            slot_count=slot_count,
         )
 
 

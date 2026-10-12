@@ -40,12 +40,14 @@ from docie_bench.inngest.realtime import (
     publish,
 )
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.serving.paths import serving_home
 from docie_bench.serving.placement_resolver import STORE_PROFILE_PREFIX
 from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 from docie_bench.serving.seed_progress import clear_progress, write_progress
 from docie_bench.settings import get_settings
 from docie_bench.storage.audit import record_extraction
+from docie_bench.studio.extraction_results import record_extraction_result
 
 logger = logging.getLogger("docie_bench.inngest.functions")
 
@@ -123,7 +125,7 @@ def _read_deployment(name: str) -> dict[str, Any] | None:
 
     try:
         payload = json.loads(
-            (_serving_home() / "deployments.json").read_text(encoding="utf-8")
+            (serving_home() / "deployments.json").read_text(encoding="utf-8")
         )
         record = (payload.get("deployments") or {}).get(name)
         return record if isinstance(record, dict) else None
@@ -166,7 +168,7 @@ def _read_all_deployments() -> dict[str, dict[str, Any]]:
     see ``control_plane.replica_deployment_name``), not one record.
     """
     try:
-        payload = json.loads((_serving_home() / "deployments.json").read_text(encoding="utf-8"))
+        payload = json.loads((serving_home() / "deployments.json").read_text(encoding="utf-8"))
         deployments = payload.get("deployments")
         return deployments if isinstance(deployments, dict) else {}
     except (OSError, ValueError):
@@ -434,8 +436,18 @@ async def _run_extraction(data: dict[str, Any]) -> dict[str, Any]:
     schema_name = data.get("schema_name", "invoice")
     schema_mode = "static"
     dynamic_schema: dict[str, Any] | None = None
+    inline_dynamic_schema = data.get("dynamic_schema")
     dynamic_schema_name = data.get("dynamic_schema_name")
-    if dynamic_schema_name:
+    if inline_dynamic_schema:
+        # #462: a schema the caller hasn't (or won't) save yet -- the Studio's
+        # "test this schema" action posts the candidate spec straight through
+        # here instead of round-tripping it via POST /schemas/dynamic first.
+        # Nothing is written to the dynamic_schemas registry; this spec lives
+        # for exactly this one job.
+        schema_mode = "dynamic"
+        dynamic_schema = inline_dynamic_schema
+        schema_name = str(inline_dynamic_schema.get("document_type") or schema_name)
+    elif dynamic_schema_name:
         # ExtractionService already accepts schema_mode="dynamic" + an inline
         # spec (extract/service.py) -- resolve the saved spec by name here so
         # the caller doesn't have to supply the full field list every request.
@@ -560,6 +572,7 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
     """
     data = dict(ctx.event.data or {})
     channel = str(data.get("channel") or f"run:{ctx.event.id}")
+    tenant_id = str(data.get("tenant_id") or "anonymous")
 
     await publish(channel, TOPIC_STATUS, {"state": "started", "schema": data.get("schema_name")})
     try:
@@ -567,8 +580,17 @@ async def extract_document(ctx: inngest.Context) -> dict[str, Any]:
         result = await ctx.step.run("extract", lambda: _run_extraction(data))
     except Exception as exc:  # noqa: BLE001 - surface error to the channel then re-raise
         await publish(channel, TOPIC_ERROR, {"message": str(exc)})
+        # Durable counterpart to the realtime error topic above -- see
+        # ExtractionRunResult's docstring for why GET /v1/studio/runs/{id}
+        # needs this rather than relying on Inngest's own proxy.
+        record_extraction_result(
+            event_id=ctx.event.id, tenant_id=tenant_id, status="failed", error=str(exc)
+        )
         raise
     await publish(channel, TOPIC_RESULT, result)
+    record_extraction_result(
+        event_id=ctx.event.id, tenant_id=tenant_id, status="completed", output=result
+    )
     return result
 
 
@@ -1239,6 +1261,32 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
     n_parallel = int(raw_n_parallel) if raw_n_parallel is not None else 1
     raw_cache_reuse = data.get("cache_reuse")
     cache_reuse = int(raw_cache_reuse) if raw_cache_reuse is not None else None
+    raw_chat_template_file = data.get("chat_template_file")
+    chat_template_file = str(raw_chat_template_file) if raw_chat_template_file else None
+    raw_batch_size = data.get("batch_size")
+    batch_size = int(raw_batch_size) if raw_batch_size is not None else None
+    raw_ubatch_size = data.get("ubatch_size")
+    ubatch_size = int(raw_ubatch_size) if raw_ubatch_size is not None else None
+    raw_numa = data.get("numa")
+    numa = str(raw_numa) if raw_numa else None
+    raw_cpu_threads = data.get("cpu_threads")
+    cpu_threads = int(raw_cpu_threads) if raw_cpu_threads is not None else None
+    raw_cpu_threads_batch = data.get("cpu_threads_batch")
+    cpu_threads_batch = int(raw_cpu_threads_batch) if raw_cpu_threads_batch is not None else None
+    raw_cache_type_k = data.get("cache_type_k")
+    cache_type_k = str(raw_cache_type_k) if raw_cache_type_k else None
+    raw_cache_type_v = data.get("cache_type_v")
+    cache_type_v = str(raw_cache_type_v) if raw_cache_type_v else None
+    raw_reasoning_budget = data.get("reasoning_budget")
+    reasoning_budget = int(raw_reasoning_budget) if raw_reasoning_budget is not None else None
+    raw_reasoning_budget_message = data.get("reasoning_budget_message")
+    reasoning_budget_message = (
+        str(raw_reasoning_budget_message) if raw_reasoning_budget_message else None
+    )
+    raw_flash_attn = data.get("flash_attn")
+    flash_attn = str(raw_flash_attn) if raw_flash_attn else None
+    raw_timeout = data.get("timeout_seconds")
+    timeout_seconds = float(raw_timeout) if raw_timeout is not None else None
     if runtime:
         record = await cp.serve(
             model,
@@ -1250,6 +1298,18 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             ),
             n_parallel=n_parallel,
             cache_reuse=cache_reuse,
+            chat_template_file=chat_template_file,
+            batch_size=batch_size,
+            ubatch_size=ubatch_size,
+            numa=numa,
+            cpu_threads=cpu_threads,
+            cpu_threads_batch=cpu_threads_batch,
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
+            reasoning_budget=reasoning_budget,
+            reasoning_budget_message=reasoning_budget_message,
+            flash_attn=flash_attn,
+            timeout_seconds=timeout_seconds,
         )
         # Runtime-specified deploys bypass serve_store_model, so record here;
         # the `up` path records inside the control-plane seam it shares with
@@ -1274,6 +1334,18 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
             deployment_name=str(raw_dep_name) if raw_dep_name else None,
             n_parallel=n_parallel,
             cache_reuse=cache_reuse,
+            chat_template_file=chat_template_file,
+            batch_size=batch_size,
+            ubatch_size=ubatch_size,
+            numa=numa,
+            cpu_threads=cpu_threads,
+            cpu_threads_batch=cpu_threads_batch,
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
+            reasoning_budget=reasoning_budget,
+            reasoning_budget_message=reasoning_budget_message,
+            flash_attn=flash_attn,
+            timeout_seconds=timeout_seconds,
         )
     return record
 
@@ -1559,14 +1631,6 @@ async def pin_deployment_job(ctx: inngest.Context) -> Any:
     return result
 
 
-def _serving_home() -> Path:
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME", Path.home() / ".local" / "share" / "docie-bench" / "serving"
-        )
-    )
-
-
 async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     """Seed a GGUF from the host's Ollama into the store + record it in the catalog."""
     from docie_bench.serving.model_store import ModelStore
@@ -1580,7 +1644,7 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     if not reference or not name:
         raise ValueError("seed event must include 'reference' and 'name'")
 
-    store = ModelStore(_serving_home() / "models")
+    store = ModelStore(serving_home() / "models")
     # Blocking file I/O (hard-link or copy of multi-GB blobs, plus a one-time
     # full-file rehash to verify integrity) -> off the loop. The rehash adds one
     # multi-GB read per seed; acceptable as a one-time, threaded cost.
@@ -1790,7 +1854,7 @@ async def _run_seed_hf(
     name = str(data.get("name") or "") or default_store_name(repo)
     contract = get_family(family)  # fail fast on an unknown family
 
-    store = ModelStore(_serving_home() / "models")
+    store = ModelStore(serving_home() / "models")
     tmp_dir = store.root / ".hf-downloads" / name
 
     throttle = {"at": 0.0, "percent": -100.0}
@@ -2025,7 +2089,7 @@ def _gc_seed_leftovers_sync() -> dict[str, int]:
     from docie_bench.serving.seed_progress import prune_stale
 
     removed_staging = 0
-    staging_root = _serving_home() / "models" / ".hf-downloads"
+    staging_root = serving_home() / "models" / ".hf-downloads"
     now = time.time()
     try:
         children = list(staging_root.iterdir())

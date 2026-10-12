@@ -87,10 +87,10 @@ def schema_json(schema_name: str) -> dict:
 # constraints llama.cpp's schema->GBNF can't express (notably `pattern`, which
 # carries a negative lookahead on the money/number fields — non-context-free, so
 # the grammar fails to compile). Validated downstream, never by the sampler.
+# `description` stays: it is the only per-field guidance the model gets.
 _FLATTEN_DROP = frozenset(
     {
         "title",
-        "description",
         "default",
         "pattern",
         "minimum",
@@ -135,7 +135,10 @@ def flat_schema_json(schema_name: str) -> dict:
     return flatten_schema_json(schema_json(schema_name))
 
 
-def flatten_schema_json(root: dict) -> dict:
+MAX_LIST_ITEMS = 100
+
+
+def flatten_schema_json(root: dict, *, max_list_items: int = MAX_LIST_ITEMS) -> dict:
     """Flatten an extraction model's JSON schema for a grammar target.
 
     Unlike :func:`flat_schema_json`, this accepts an already-built schema. It is
@@ -175,11 +178,12 @@ def flatten_schema_json(root: dict) -> dict:
                 out[key] = {k: transform(v) for k, v in value.items()}
             elif key == "items":
                 out[key] = transform(value)
+                out.setdefault("maxItems", max_list_items)
             elif key in ("anyOf", "oneOf", "allOf") and isinstance(value, list):
                 out[key] = _collapse_union([transform(item) for item in value])
             else:
                 out[key] = value
-        return out
+        return _compact_union(out)
 
     result = transform(root)
     if isinstance(result, dict):
@@ -280,6 +284,40 @@ def rehydrate_extraction_result(payload: dict[str, Any], root: dict[str, Any]) -
 
     result = transform(payload, root)
     return result if isinstance(result, dict) else payload
+
+
+def _branch_types(branch: dict) -> list[str] | None:
+    declared = branch.get("type")
+    if isinstance(declared, str):
+        return [declared]
+    if isinstance(declared, list) and declared and all(isinstance(t, str) for t in declared):
+        return list(declared)
+    return None
+
+
+def _compact_union(node: dict) -> dict:
+    """``{"anyOf": [{"type": "string"}, {"type": "null"}]}`` becomes
+    ``{"type": ["string", "null"]}``; one structured branch (object/array)
+    keeps its keys. Anything else is returned unchanged."""
+    branches = node.get("anyOf")
+    if not isinstance(branches, list) or not branches:
+        return node
+    if not all(isinstance(b, dict) and _branch_types(b) for b in branches):
+        return node
+    structured = [b for b in branches if set(b) - {"type"}]
+    if len(structured) > 1:
+        return node
+    merged: dict = dict(structured[0]) if structured else {}
+    types: list[str] = []
+    for branch in branches:
+        for t in _branch_types(branch) or ():
+            if t not in types:
+                types.append(t)
+    merged["type"] = types if len(types) > 1 else types[0]
+    for key, value in node.items():
+        if key != "anyOf":
+            merged[key] = value
+    return merged
 
 
 def _collapse_union(items: list) -> list:

@@ -81,6 +81,21 @@ def test_nuextract3_contract_is_chat_template_kwargs_vision_and_not_ollama_faith
     assert contract.ollama_faithful is False
 
 
+def test_spark2_5_contract_is_a_standard_chat_family_own_kv_sizing() -> None:
+    # Same wire contract as "lfm2" (response_format, --jinja, tool_calls) --
+    # its own family purely so the sizing engine can price its hybrid
+    # sliding-window/full-attention KV-cache cost separately (see
+    # serving.resources.SPARK2_5_KV_CACHE_BYTES_PER_TOKEN).
+    contract = FAMILIES["spark2_5"]
+    assert contract.template_delivery is TemplateDelivery.OPENAI_JSON_SCHEMA
+    assert contract.response_format_style == "openai_json_schema"
+    assert "--jinja" in contract.llama_server_args
+    assert contract.tools is True
+    assert contract.needs_mmproj is False
+    assert contract.vision is False
+    assert contract.ollama_faithful is True
+
+
 def test_seed_from_ollama_hardlinks_model_and_projector(tmp_path: Path) -> None:
     home = _fake_ollama_home(tmp_path, ("hf.co", "numind", "NuExtract3-GGUF"), "Q4_K_M")
     store = ModelStore(tmp_path / "models")

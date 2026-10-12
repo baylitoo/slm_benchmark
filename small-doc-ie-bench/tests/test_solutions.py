@@ -431,3 +431,38 @@ async def test_pipeline_retries_grammar_without_prefill_on_sampler_400(fake_ocr:
     assert seen[1]["response_format"]["type"] == "json_schema"  # grammar kept
     assert result["choices"][0]["message"]["content"] == '{"total_ttc": 5}'
     assert len(seen) == 2
+
+
+@pytest.mark.parametrize("no_think", [False, True])
+async def test_lfm26_pipeline_keeps_native_thinking(fake_ocr, no_think: bool) -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": '{"vendor":"x"}', "reasoning_content": "reasoning"
+        }}]})
+
+    extractor = ModelProfile(
+        name="extractor", model="LiquidAI/LFM2.5-2.6B-GGUF", base_url="http://llm/v1", api_key="k"
+    )
+    pipeline = ModelProfile(
+        name="pipe", model="", base_url="", api_key="", kind="pipeline",
+        options={"extractor": "extractor", "no_think": no_think},
+    )
+    request = _image_request("pipe")
+    request["response_format"] = {
+        "type": "json_schema", "json_schema": {"schema": {"type": "object"}}
+    }
+    request["reasoning_effort"] = "none"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        solution = build_solution(
+            pipeline, profiles={"extractor": extractor}, http_client=http
+        )
+        result = await solution.complete(request)
+    assert len(seen) == 1
+    assert seen[0]["messages"][-1]["role"] == "user"
+    assert seen[0]["chat_template_kwargs"]["enable_thinking"] is True
+    assert "reasoning_effort" not in seen[0]
+    assert seen[0]["response_format"] == request["response_format"]
+    assert result["choices"][0]["message"]["content"] == '{"vendor":"x"}'
