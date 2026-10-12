@@ -49,11 +49,20 @@ class Settings(BaseSettings):
     # turn off request bounding. 0 disables the respective check.
     anonymous_rate_limit_requests: int = Field(default=600, ge=0)
     anonymous_max_concurrent_requests: int = Field(default=16, ge=0)
+    # #448: a WRONG/missing API key used to short-circuit straight to a 401,
+    # before the tenant rate limiter (below it) was ever reached -- unlimited
+    # concurrent guesses at full network throughput. Bucketed per client IP,
+    # over the same rate_limit_window_seconds. 0 disables the check.
+    auth_failure_rate_limit_requests: int = Field(default=20, ge=0)
     enable_benchmark_api: bool = False
 
     redacted_response_fields: str = ""
     redacted_audit_fields: str = ""
     log_document_content: bool = False
+    # INFO-level trace of every model call: the exact messages sent, template
+    # kwargs, budget, then content / reasoning / usage / timings back. Carries
+    # document text; debugging only.
+    llm_trace: bool = False
 
     database_url: str | None = None
     review_claim_lease_seconds: int = Field(default=900, ge=30, le=86400)
@@ -142,6 +151,23 @@ class Settings(BaseSettings):
     mcp_session_documents_root: Path = Path("data/session-docs")
     mcp_session_documents_max_files: int = Field(default=20, ge=1, le=500)
     mcp_session_documents_max_age_hours: int = Field(default=24, ge=1, le=720)
+
+    # Upload-time rolling summarization (#430): fires when a session document
+    # is saved, so docs-search's list_files can pair a filename with a quick
+    # description instead of the model (or the Playground's attachment
+    # thumbnail) needing to open the file cold. Defaults to the 350M profile
+    # (cheap enough to fire on every upload; doc_summarization's own
+    # load-on-demand seam brings it up on the first request if it isn't
+    # already live) -- set to "" to disable, or to a different store:/
+    # models.yaml profile (e.g. a bigger deployed model) to use that instead.
+    # Sized in pages, not characters, so the loop reads with the same
+    # page-anchored unit the rest of docs-search already uses.
+    doc_summary_model: str | None = "store:lfm2.5-350m"
+    doc_summary_chunk_pages: int = Field(default=4, ge=1, le=20)
+    # A more extensive running summary (~2000 chars, ~500 tokens) than a
+    # one-line description -- enough room to actually cover an invoice's line
+    # items or a contract's clauses across chunks, not just name the document.
+    doc_summary_max_chars: int = Field(default=2000, ge=100, le=4000)
 
     # Durable, addressable artifact store for Studio benchmark runs. Must resolve
     # to the SAME location on every replica that reads it (a shared volume or an

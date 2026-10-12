@@ -6,17 +6,18 @@ import logging
 import os
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from docie_bench.agents.api import router as agents_router
 from docie_bench.benchmark.routing_config import build_extraction_router
-from docie_bench.chat_api import _resolve_or_error, _sse_event
+from docie_bench.chat_api import _resolve_or_error
 from docie_bench.chat_api import router as chat_router
 from docie_bench.extract.routing import (
     ExtractionRouter,
@@ -31,6 +32,8 @@ from docie_bench.inngest.studio_api import router as studio_router
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.logging_config import configure_logging
 from docie_bench.mcp_api import router as mcp_router
+from docie_bench.ocr.factory import available_ocr_backends
+from docie_bench.openai_protocol import error_payload, queue_stream
 from docie_bench.orchestrator.api import configure_orchestrator
 from docie_bench.orchestrator.api import router as orchestrator_router
 from docie_bench.orchestrator.service import OrchestratorService
@@ -294,9 +297,7 @@ async def resolve_extraction_executor(
             "POST /v1/studio/routing-policies (or pick it in the Studio)",
         )
     policy = RoutingPolicy.model_validate(record["policy"])
-    profiles = {
-        stage.name: await resolve_profile(stage.name) for stage in policy.stages
-    }
+    profiles = {stage.name: await resolve_profile(stage.name) for stage in policy.stages}
     return build_extraction_router(policy, profiles)
 
 
@@ -313,9 +314,7 @@ def _finalize_outcome(
     return _finalize_routed(outcome, routing_policy=routing_policy)
 
 
-def _finalize_routed(
-    result: RoutingResult, *, routing_policy: str
-) -> ExtractionResponse:
+def _finalize_routed(result: RoutingResult, *, routing_policy: str) -> ExtractionResponse:
     """Unwrap a router's result into the ExtractionResponse the live routes
     return, carrying the audit in the response's ``routing`` field.
 
@@ -402,6 +401,32 @@ def readyz() -> dict[str, str]:
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_metrics(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/v1/capabilities")
+def capabilities(_tenant: TenantDependency) -> dict[str, Any]:
+    """What this deployment accepts, as it is actually configured.
+
+    A consumer otherwise has to hard-code the upload allowlist and the limits,
+    and a copy is wrong the moment an operator changes one: every value here
+    comes from settings, which are per-deployment. Read-only, and deliberately
+    nothing about models, keys or paths.
+    """
+    settings = get_settings()
+    return {
+        "upload": {
+            "max_bytes": settings.max_upload_bytes,
+            "max_request_body_bytes": settings.max_request_body_mb * 1024 * 1024,
+            "allowed_mime_types": sorted(settings.allowed_mime_types),
+        },
+        "text": {
+            "max_chars": settings.max_text_chars,
+            "max_ocr_blocks": settings.max_ocr_blocks,
+            "max_ocr_block_chars": settings.max_ocr_block_chars,
+        },
+        "metadata": {"max_entries": settings.max_metadata_entries},
+        "ocr_backends": available_ocr_backends(),
+    }
 
 
 @app.get("/v1/schemas")
@@ -504,6 +529,13 @@ class ExtractStreamRequest(BaseModel):
     routing_policy: str | None = None
     ocr_backend: str | None = None
     language: str | None = None
+    parallel_extraction: bool = False
+    # Replaces the deployment's response_format_style for this run only, so two
+    # styles can be compared on one document without redeploying.
+    response_format_style: str | None = None
+
+
+_SSE_KEEPALIVE_SECONDS = 10.0
 
 
 @app.post("/v1/extract/stream")
@@ -543,6 +575,13 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
             status_code=400,
             detail="'routing_policy' is mutually exclusive with 'model_profile'/"
             "'deployment': a policy names its model profiles per stage",
+        )
+    style_override = (payload.response_format_style or "").strip() or None
+    if payload.routing_policy and style_override:
+        raise HTTPException(
+            status_code=400,
+            detail="'response_format_style' overrides one deployment's style; "
+            "a routing policy runs each stage with its own",
         )
 
     schema_name = payload.schema_name
@@ -589,7 +628,13 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
         resolved = await _resolve_or_error(payload.deployment or payload.model_profile or "")
         if isinstance(resolved, JSONResponse):
             return resolved
-        executor = ExtractionService(resolved, on_delta=on_delta, on_reset=on_reset)
+        if style_override:
+            resolved = replace(resolved, response_format_style=style_override)
+        executor = ExtractionService(
+            resolved,
+            on_delta=None if payload.parallel_extraction else on_delta,
+            on_reset=None if payload.parallel_extraction else on_reset,
+        )
 
     async def drive() -> None:
         error: dict[str, Any] | None = None
@@ -605,6 +650,7 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
                     language=payload.language,
                     document_hash=hash_bytes(payload.text.encode("utf-8")),
                     metadata={"source": "playground_stream"},
+                    parallel_extraction=payload.parallel_extraction,
                 )
             else:
                 assert content is not None
@@ -623,6 +669,7 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
                             "source": "playground_stream",
                             "filename": payload.filename or "document",
                         },
+                        parallel_extraction=payload.parallel_extraction,
                     )
                 finally:
                     tmp_path.unlink(missing_ok=True)
@@ -631,30 +678,15 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
             queue.put_nowait({"type": "result", "result": response.model_dump(mode="json")})
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            error = {"message": detail, "type": "extraction_error", "code": str(exc.status_code)}
+            error = error_payload(detail, "extraction_error", code=str(exc.status_code))
         except Exception as exc:  # noqa: BLE001 - must reach the client as an error frame
-            error = {"message": str(exc), "type": "internal_error", "code": "internal_error"}
+            error = error_payload(str(exc), "internal_error")
         finally:
             if error is not None:
                 queue.put_nowait({"type": "error", "error": error})
             queue.put_nowait(None)
 
-    async def body_iterator() -> AsyncIterator[bytes]:
-        task = asyncio.create_task(drive())
-        try:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                yield _sse_event(item)
-        finally:
-            if not task.done():
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(body_iterator(), media_type="text/event-stream")
+    return queue_stream(queue, drive, keepalive_seconds=_SSE_KEEPALIVE_SECONDS)
 
 
 @app.post("/v1/benchmarks/run")

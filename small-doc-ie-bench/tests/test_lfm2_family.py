@@ -46,6 +46,7 @@ def test_lfm2_text_contract() -> None:
     assert not contract.vision
     assert contract.ollama_faithful
     assert contract.default_temperature == pytest.approx(0.0)
+    assert contract.default_max_tokens == 4096
 
 
 def test_lfm2_vl_contract() -> None:
@@ -71,6 +72,8 @@ def test_profile_load_vision_flag() -> None:
     # All four LFM2.5 store profiles are present.
     for name in ("lfm25_230m", "lfm25_350m", "lfm25_1_2b", "lfm25_vl_1_6b"):
         assert name in profiles, f"missing LFM2.5 profile {name!r}"
+    for name in ("ollama_lfm25_350m", "lfm25_230m", "lfm25_350m", "lfm25_1_2b"):
+        assert profiles[name].max_tokens == 4096
     # Only the VL profile carries vision; the text ones do not.
     assert profiles["lfm25_vl_1_6b"].vision is True
     assert profiles["lfm25_350m"].vision is False
@@ -233,5 +236,6 @@ def test_resolver_yields_vision_false_for_text_lfm2_via_family(
         models_config_path=tmp_path / "absent-models.yaml",
         deployments=[_record("text-store", "text-store")],
     )
+    assert profile.max_tokens == 4096
     assert profile.vision is False
     assert profile.response_format_style == "openai_json_schema"

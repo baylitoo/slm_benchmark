@@ -30,6 +30,7 @@ import {
   Card,
   EmptyState,
   Field,
+  Select,
   Skeleton,
   TextInput,
   ComingSoon,
@@ -42,6 +43,8 @@ import { PortsAdmin } from "./PortsAdmin";
 // ---------------------------------------------------------------------------
 // Deploy form (model picker + scoped runtime + advanced + progress)
 // ---------------------------------------------------------------------------
+
+const LLAMACPP_CACHE_TYPES = ["f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"] as const;
 
 export function DeployForm({
   store,
@@ -72,6 +75,19 @@ export function DeployForm({
   // shown for Auto (which resolves to llama.cpp for GGUF store models) and
   // for an explicit "llamacpp" runtime pick, never for vllm/ollama/remote.
   const [nParallel, setNParallel] = useState("1");
+  const [batchSize, setBatchSize] = useState("");
+  const [ubatchSize, setUbatchSize] = useState("");
+  const [numa, setNuma] = useState("");
+  const [cacheReuse, setCacheReuse] = useState("");
+  const [chatTemplateFile, setChatTemplateFile] = useState("");
+  const [cacheTypeK, setCacheTypeK] = useState("");
+  const [cacheTypeV, setCacheTypeV] = useState("");
+  const [reasoningBudget, setReasoningBudget] = useState("");
+  const [reasoningBudgetMessage, setReasoningBudgetMessage] = useState("");
+  const [flashAttn, setFlashAttn] = useState("");
+  const [timeoutSeconds, setTimeoutSeconds] = useState("");
+  const [cpuThreads, setCpuThreads] = useState("");
+  const [cpuThreadsBatch, setCpuThreadsBatch] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -146,6 +162,21 @@ export function DeployForm({
         ...(maxTokens.trim() ? { max_tokens: Number(maxTokens) } : {}),
         ...(replicaCount > 1 ? { replicas: replicaCount } : {}),
         ...(showNParallel && Number(nParallel) > 1 ? { n_parallel: Number(nParallel) } : {}),
+        ...(showNParallel && batchSize.trim() ? { batch_size: Number(batchSize) } : {}),
+        ...(showNParallel && ubatchSize.trim() ? { ubatch_size: Number(ubatchSize) } : {}),
+        ...(showNParallel && numa ? { numa } : {}),
+        ...(showNParallel && cacheReuse.trim() ? { cache_reuse: Number(cacheReuse) } : {}),
+        ...(showNParallel && chatTemplateFile.trim() ? { chat_template_file: chatTemplateFile.trim() } : {}),
+        ...(showNParallel && cacheTypeK ? { cache_type_k: cacheTypeK } : {}),
+        ...(showNParallel && cacheTypeV ? { cache_type_v: cacheTypeV } : {}),
+        ...(showNParallel && reasoningBudget.trim() ? { reasoning_budget: Number(reasoningBudget) } : {}),
+        ...(showNParallel && reasoningBudget.trim() && reasoningBudgetMessage.trim()
+          ? { reasoning_budget_message: reasoningBudgetMessage.trim() }
+          : {}),
+        ...(showNParallel && flashAttn ? { flash_attn: flashAttn } : {}),
+        ...(timeoutSeconds.trim() ? { timeout_seconds: Number(timeoutSeconds) } : {}),
+        ...(showNParallel && cpuThreads.trim() ? { cpu_threads: Number(cpuThreads) } : {}),
+        ...(showNParallel && cpuThreadsBatch.trim() ? { cpu_threads_batch: Number(cpuThreadsBatch) } : {}),
       };
       const res = await deployModel(payload);
       setTrigger(res);
@@ -289,6 +320,12 @@ export function DeployForm({
                   />
                 </Field>
                 <Field
+                  label="Request timeout (s)"
+                  hint="Per-request generation timeout. Blank = family default (180s). Must stay below your client's own timeout."
+                >
+                  <TextInput type="number" min={1} value={timeoutSeconds} onChange={(e) => setTimeoutSeconds(e.target.value)} placeholder="180" aria-label="Request timeout (s)" />
+                </Field>
+                <Field
                   label="Default max output tokens"
                   hint="Optional. Agents inherit this unless they or a request override it."
                 >
@@ -329,6 +366,96 @@ export function DeployForm({
                       placeholder="1"
                       aria-label="Parallel slots"
                     />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Batch size" hint="--batch-size (logical prefill batch).">
+                    <TextInput
+                      type="number"
+                      min={1}
+                      value={batchSize}
+                      onChange={(e) => setBatchSize(e.target.value)}
+                      placeholder="2048"
+                      aria-label="Batch size"
+                    />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Micro-batch size" hint="--ubatch-size (physical batch).">
+                    <TextInput
+                      type="number"
+                      min={1}
+                      value={ubatchSize}
+                      onChange={(e) => setUbatchSize(e.target.value)}
+                      placeholder="512"
+                      aria-label="Micro-batch size"
+                    />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="NUMA strategy" hint="--numa. Multi-socket CPU boxes only.">
+                    <Select value={numa} onChange={(e) => setNuma(e.target.value)} aria-label="NUMA strategy">
+                      <option value="">default</option>
+                      <option value="distribute">distribute</option>
+                      <option value="isolate">isolate</option>
+                      <option value="numactl">numactl</option>
+                    </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Cache reuse" hint="--cache-reuse: min token span to reuse from the KV prefix.">
+                    <TextInput type="number" min={1} value={cacheReuse} onChange={(e) => setCacheReuse(e.target.value)} placeholder="off" aria-label="Cache reuse" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Chat template file" hint="Jinja file path inside the serving container; overrides the GGUF template.">
+                    <TextInput value={chatTemplateFile} onChange={(e) => setChatTemplateFile(e.target.value)} placeholder="(embedded template)" aria-label="Chat template file" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="KV cache type (K)" hint="Quantized KV cache; non-f16 auto-enables --flash-attn.">
+                    <Select value={cacheTypeK} onChange={(e) => setCacheTypeK(e.target.value)} aria-label="KV cache type (K)">
+                      <option value="">f16 (default)</option>
+                      {LLAMACPP_CACHE_TYPES.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="KV cache type (V)" hint="Same tradeoff as K.">
+                    <Select value={cacheTypeV} onChange={(e) => setCacheTypeV(e.target.value)} aria-label="KV cache type (V)">
+                      <option value="">f16 (default)</option>
+                      {LLAMACPP_CACHE_TYPES.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Reasoning budget" hint="--reasoning-budget: max thinking tokens. -1 unbounded, 0 disables thinking.">
+                    <TextInput type="number" min={-1} value={reasoningBudget} onChange={(e) => setReasoningBudget(e.target.value)} placeholder="unbounded" aria-label="Reasoning budget" />
+                  </Field>
+                )}
+                {showNParallel && reasoningBudget.trim() && (
+                  <Field label="Reasoning budget message" hint="Injected before the end-of-thinking tag on cutoff.">
+                    <TextInput value={reasoningBudgetMessage} onChange={(e) => setReasoningBudgetMessage(e.target.value)} placeholder="(none)" aria-label="Reasoning budget message" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Flash attention" hint="--flash-attn. Fused attention kernel; lower memory traffic.">
+                    <Select value={flashAttn} onChange={(e) => setFlashAttn(e.target.value)} aria-label="Flash attention">
+                      <option value="">default</option>
+                      <option value="on">on</option>
+                      <option value="off">off</option>
+                      <option value="auto">auto</option>
+                    </Select>
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Threads" hint="--threads for generation. Blank = llama-server default.">
+                    <TextInput type="number" min={1} value={cpuThreads} onChange={(e) => setCpuThreads(e.target.value)} placeholder="auto" aria-label="Threads" />
+                  </Field>
+                )}
+                {showNParallel && (
+                  <Field label="Batch threads" hint="--threads-batch for prefill. Blank = same as threads.">
+                    <TextInput type="number" min={1} value={cpuThreadsBatch} onChange={(e) => setCpuThreadsBatch(e.target.value)} placeholder="auto" aria-label="Batch threads" />
                   </Field>
                 )}
               </div>

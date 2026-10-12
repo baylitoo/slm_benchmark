@@ -307,6 +307,9 @@ def resolve_store_profile(
         # NuExtract3 silently ran capped at 900 tokens / timing out at 180s.
         max_tokens=contract.default_max_tokens if contract else 900,
         timeout_seconds=contract.default_timeout_seconds if contract else 180.0,
+        deployment_slot_count=(
+            placement["slot_count"] if isinstance(placement.get("slot_count"), int) else None
+        ),
     )
 
 

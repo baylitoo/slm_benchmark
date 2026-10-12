@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from docie_bench.agents.spec import AgentSpec, utcnow_iso
+from docie_bench.serving.paths import serving_home
 
 
 class AgentRegistryError(RuntimeError):
@@ -32,13 +33,7 @@ class AgentConflictError(AgentRegistryError):
 
 
 def default_agents_path() -> Path:
-    home = Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
-    return home / "agents.json"
+    return serving_home() / "agents.json"
 
 
 class AgentRegistry:

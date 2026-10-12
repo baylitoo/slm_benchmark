@@ -51,10 +51,9 @@ async def create_dynamic_schema_route(payload: DynamicSchemaSpec) -> dict[str, A
     ``DynamicSchemaSpec`` is already fully validated (schemas.dynamic) and
     already compiles into a working pydantic model + NuExtract template at
     extraction time -- this route is the missing "define once, reuse by name"
-    persistence layer, not new extraction logic. Create-only, matching the
-    pipeline/ocr profile routes above: 409 on an existing document_type, no
-    in-place update (delete + recreate is cheap here since this is a real
-    table, not a text file to splice).
+    persistence layer, not new extraction logic. Create-only: 409 on an existing
+    document_type. Use PUT on the named
+    resource to edit an existing schema without changing its identifier.
     """
     from docie_bench.studio.dynamic_schemas import (
         DynamicSchemaConflictError,
@@ -85,3 +84,26 @@ async def delete_dynamic_schema_route(name: str) -> dict[str, Any]:
     except DynamicSchemaUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"deleted": name}
+
+
+@router.put("/schemas/dynamic/{name}")
+async def update_dynamic_schema_route(
+    name: str, payload: DynamicSchemaSpec,
+) -> dict[str, Any]:
+    """Edit a saved schema in place; existing references keep the same name."""
+    from docie_bench.studio.dynamic_schemas import (
+        DynamicSchemaNotFoundError,
+        DynamicSchemaUnavailableError,
+        update_dynamic_schema,
+    )
+
+    if payload.document_type != name:
+        raise HTTPException(
+            status_code=422, detail="document_type must match the saved schema name"
+        )
+    try:
+        return update_dynamic_schema(name, payload)
+    except DynamicSchemaNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_shared._DOMAIN_404) from exc
+    except DynamicSchemaUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc

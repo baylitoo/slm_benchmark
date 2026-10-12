@@ -14,10 +14,12 @@ from docie_bench.llm.model_gateway import (
     ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
+    OutputTruncatedError,
     classify_response_error,
 )
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
+from docie_bench.llm.reasoning import apply_native_reasoning, uses_native_reasoning
 from docie_bench.llm.response_format import (
     build_response_format,
     is_generic_style,
@@ -135,6 +137,193 @@ class LLMClientError(ModelGatewayError):
     pass
 
 
+_TRACE_KNOWN_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "response_format",
+        "chat_template_kwargs",
+        "reasoning_effort",
+        "stream",
+        "stream_options",
+        "logprobs",
+        "top_logprobs",
+        "stop",
+    }
+)
+
+
+def _trace_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            content = [
+                part
+                if part.get("type") != "image_url"
+                else {"type": "image_url", "image_url": "<omitted>"}
+                for part in content
+                if isinstance(part, dict)
+            ]
+        out.append({**message, "content": content})
+    return out
+
+
+def _trace_request(
+    profile: ModelProfile, schema_name: str, payload: dict[str, Any], position: int, total: int
+) -> None:
+    messages = payload.get("messages") or []
+    response_format = payload.get("response_format") or {}
+    schema = (response_format.get("json_schema") or {}).get("schema")
+    logger.info(
+        "llm_trace_request",
+        extra={
+            "docie_step": "llm_trace_request",
+            "docie_model": profile.model,
+            "docie_base_url": profile.base_url,
+            "docie_schema_name": schema_name,
+            "docie_attempt": f"{position + 1}/{total}",
+            "docie_messages": _trace_messages(messages),
+            "docie_prompt_chars": sum(
+                len(m["content"]) for m in messages if isinstance(m.get("content"), str)
+            ),
+            "docie_chat_template_kwargs": payload.get("chat_template_kwargs"),
+            "docie_reasoning_effort": payload.get("reasoning_effort"),
+            "docie_response_format_type": response_format.get("type"),
+            "docie_response_format_schema_chars": (
+                len(json.dumps(schema)) if schema is not None else 0
+            ),
+            "docie_max_tokens": payload.get("max_tokens"),
+            "docie_temperature": payload.get("temperature"),
+            "docie_logprobs": bool(payload.get("logprobs")),
+            "docie_other_keys": sorted(k for k in payload if k not in _TRACE_KNOWN_KEYS),
+        },
+    )
+
+
+def _trace_response(
+    profile: ModelProfile,
+    schema_name: str,
+    style: str,
+    data: dict[str, Any],
+    content: str,
+    llm_latency_ms: int,
+) -> None:
+    message = data.get("choices", [{}])[0].get("message") or {}
+    reasoning = message.get("reasoning_content")
+    logger.info(
+        "llm_trace_response",
+        extra={
+            "docie_step": "llm_trace_response",
+            "docie_model": profile.model,
+            "docie_schema_name": schema_name,
+            "docie_response_format_style": style,
+            "docie_finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+            "docie_usage": data.get("usage"),
+            "docie_timings": data.get("timings"),
+            "docie_llm_latency_ms": llm_latency_ms,
+            "docie_content_chars": len(content),
+            "docie_content": content,
+            "docie_reasoning_chars": len(reasoning) if isinstance(reasoning, str) else 0,
+            "docie_reasoning": reasoning if isinstance(reasoning, str) else None,
+        },
+    )
+
+
+_LOOP_CHECK_EVERY_CHARS = 256
+_LOOP_TAIL_CHARS = 2000
+_LOOP_MIN_UNIT_CHARS = 8
+_LOOP_MAX_UNIT_CHARS = 500
+_LOOP_REPEATS = 4
+
+
+def _repeating_unit(text: str) -> str | None:
+    """The shortest unit of >= 8 chars that closes ``text`` repeated 4 times
+    back to back, or None. A constrained JSON list that has started cycling
+    through the same items looks exactly like this; legitimate output does
+    not repeat a whole unit four times in a row."""
+    tail = text[-_LOOP_TAIL_CHARS:]
+    limit = min(_LOOP_MAX_UNIT_CHARS, len(tail) // _LOOP_REPEATS)
+    for size in range(_LOOP_MIN_UNIT_CHARS, limit + 1):
+        unit = tail[-size:]
+        if tail.endswith(unit * _LOOP_REPEATS):
+            return unit
+    return None
+
+
+def _close_json_prefix(prefix: str) -> tuple[str, list[str]]:
+    """Turn a grammar-valid JSON prefix into a complete document by dropping
+    the unfinished element of the innermost open array and closing every open
+    bracket. Returns the document and the key path of that array."""
+    stack: list[dict[str, Any]] = []
+    in_string = False
+    escape = False
+    string_start = 0
+    i = 0
+    n = len(prefix)
+    while i < n:
+        c = prefix[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+                if stack and stack[-1]["kind"] == "obj" and stack[-1]["expect_key"]:
+                    stack[-1]["key"] = prefix[string_start:i]
+                    stack[-1]["expect_key"] = False
+                elif stack:
+                    stack[-1]["complete_at"] = i + 1
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            string_start = i + 1
+        elif c == "{":
+            stack.append({"kind": "obj", "key": None, "complete_at": i + 1, "expect_key": True})
+        elif c == "[":
+            stack.append({"kind": "arr", "key": None, "complete_at": i + 1, "expect_key": False})
+        elif c in "}]":
+            if stack:
+                stack.pop()
+            if stack:
+                stack[-1]["complete_at"] = i + 1
+        elif c == ",":
+            if stack and stack[-1]["kind"] == "obj":
+                stack[-1]["expect_key"] = True
+        elif c not in " \t\r\n:":
+            j = i
+            while j < n and prefix[j] not in ",}] \t\r\n":
+                j += 1
+            if stack and j < n:
+                stack[-1]["complete_at"] = j
+            i = j
+            continue
+        i += 1
+    depth = next((d for d in range(len(stack) - 1, -1, -1) if stack[d]["kind"] == "arr"), None)
+    if depth is None:
+        return prefix, []
+    body = prefix[: stack[depth]["complete_at"]]
+    closers = "".join("]" if f["kind"] == "arr" else "}" for f in reversed(stack[: depth + 1]))
+    path = [f["key"] for f in stack[:depth] if f["kind"] == "obj" and f["key"]]
+    return body + closers, path
+
+
+def _salvage_loop(text: str, unit: str) -> tuple[str, list[str], int]:
+    """Keep everything up to and including the first occurrence of the
+    repeating unit, then close the JSON."""
+    pos = len(text)
+    while pos - len(unit) >= 0 and text[pos - len(unit) : pos] == unit:
+        pos -= len(unit)
+    cut = min(len(text), pos + len(unit))
+    repaired, path = _close_json_prefix(text[:cut])
+    return repaired, path, cut
+
+
 class OpenAICompatibleClient:
     def __init__(self, profile: ModelProfile) -> None:
         self.profile = profile
@@ -151,6 +340,14 @@ class OpenAICompatibleClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    @property
+    def last_queue_wait_ms(self) -> int:
+        """Time the most recent chat_json call spent waiting for the
+        ModelGateway's per-(base_url, model) semaphore, before its HTTP call
+        even started -- separates queueing from actual generation time in a
+        latency breakdown (see extract/service.py's extraction_complete log)."""
+        return int(self._gateway.last_wait_seconds * 1000)
 
     async def discover_capabilities(self, *, force: bool = False) -> ModelCapabilities:
         self._gateway.client = self._client
@@ -259,6 +456,20 @@ class OpenAICompatibleClient:
             if resp.status_code >= 400:
                 await resp.aread()
                 return resp, {}
+            if "text/event-stream" not in resp.headers.get("content-type", ""):
+                # Runtime ignored stream=true and answered with one JSON body.
+                await resp.aread()
+                try:
+                    plain = resp.json()
+                except ValueError:
+                    plain = None
+                if isinstance(plain, dict):
+                    content = ((plain.get("choices") or [{}])[0].get("message") or {}).get(
+                        "content"
+                    )
+                    if isinstance(content, str) and content:
+                        on_delta(content)
+                    return resp, plain
 
             role = "assistant"
             content_parts: list[str] = []
@@ -266,6 +477,10 @@ class OpenAICompatibleClient:
             logprobs_parts: list[dict[str, Any]] = []
             finish_reason: str | None = None
             usage: dict[str, Any] | None = None
+            timings: dict[str, Any] | None = None
+            streamed_chars = 0
+            next_loop_check = _LOOP_CHECK_EVERY_CHARS
+            loop_truncated: dict[str, Any] | None = None
             completion_id = ""
             model_name = str(payload.get("model") or "")
 
@@ -288,6 +503,9 @@ class OpenAICompatibleClient:
                 frame_model = frame.get("model")
                 if isinstance(frame_model, str) and frame_model:
                     model_name = frame_model
+                frame_timings = frame.get("timings")
+                if isinstance(frame_timings, dict):
+                    timings = frame_timings
                 frame_usage = frame.get("usage")
                 if isinstance(frame_usage, dict):
                     # Sent on the TRAILING frame (stream_options.include_usage,
@@ -320,6 +538,24 @@ class OpenAICompatibleClient:
                 if isinstance(content_piece, str) and content_piece:
                     content_parts.append(content_piece)
                     on_delta(content_piece)
+                    streamed_chars += len(content_piece)
+                    if streamed_chars >= next_loop_check:
+                        next_loop_check = streamed_chars + _LOOP_CHECK_EVERY_CHARS
+                        unit = _repeating_unit("".join(content_parts))
+                        if unit is not None:
+                            # Stop the slot, keep what was generated before the
+                            # cycle, close the JSON; the service flags the field.
+                            await resp.aclose()
+                            repaired, path, kept = _salvage_loop("".join(content_parts), unit)
+                            content_parts = [repaired]
+                            finish_reason = "stop"
+                            loop_truncated = {
+                                "unit": unit[:120],
+                                "kept_chars": kept,
+                                "streamed_chars": streamed_chars,
+                                "field_path": path,
+                            }
+                            break
                 reasoning_piece = delta.get("reasoning_content")
                 if isinstance(reasoning_piece, str) and reasoning_piece:
                     reasoning_parts.append(reasoning_piece)
@@ -342,6 +578,10 @@ class OpenAICompatibleClient:
             }
             if usage is not None:
                 data["usage"] = usage
+            if timings is not None:
+                data["timings"] = timings
+            if loop_truncated is not None:
+                data["docie_loop_truncated"] = loop_truncated
             return resp, data
 
     async def chat_json(
@@ -378,6 +618,11 @@ class OpenAICompatibleClient:
         self._gateway.client = self._client
         await self._gateway.validate_request(needs_vision=bool(image_urls))
         ladder = self._negotiated_ladder()
+        thinking_disabled = (chat_template_kwargs or {}).get("enable_thinking") is False
+        native_reasoning = uses_native_reasoning(self.profile) and not thinking_disabled
+        if native_reasoning:
+            # A JSON prefill bypasses this checkpoint's trained thinking prompt.
+            assistant_prefill = None
         declared_style = self.profile.response_format_style
         user_content: str | list[dict[str, Any]] = user_prompt
         if image_urls:
@@ -426,7 +671,9 @@ class OpenAICompatibleClient:
                 merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
                 merged_template_kwargs.update(chat_template_kwargs)
                 payload["chat_template_kwargs"] = merged_template_kwargs
-            if force_disable_reasoning:
+            if native_reasoning:
+                apply_native_reasoning(payload)
+            elif force_disable_reasoning:
                 merged_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
                 merged_template_kwargs["enable_thinking"] = False
                 payload["chat_template_kwargs"] = merged_template_kwargs
@@ -489,6 +736,10 @@ class OpenAICompatibleClient:
                     force_disable_reasoning=force_disable_reasoning,
                     use_prefill=use_prefill,
                 )
+                if get_settings().llm_trace:
+                    _trace_request(
+                        self.profile, schema_name, request_payload, position, len(attempts)
+                    )
                 streamed_data: dict[str, Any] | None = None
                 if on_delta is None:
                     resp = await self._client.post("/chat/completions", json=request_payload)
@@ -627,6 +878,10 @@ class OpenAICompatibleClient:
                         "docie_llm_latency_ms": llm_latency_ms,
                     },
                 )
+                if get_settings().llm_trace:
+                    _trace_response(
+                        self.profile, schema_name, style, data, content, llm_latency_ms
+                    )
                 cleaned = _clean_content(content)
                 try:
                     parsed = json.loads(cleaned)
@@ -638,6 +893,12 @@ class OpenAICompatibleClient:
                         not cleaned.strip() or unclosed_think
                     )
                     if output_budget_exhausted:
+                        if native_reasoning:
+                            raise InvalidModelResponseError(
+                                f"Generation exhausted max_tokens ({output_budget}) "
+                                "before producing usable JSON with native reasoning enabled; "
+                                "increase the output budget or configure a reasoning token budget"
+                            ) from exc
                         reasoning_already_disabled = (
                             force_disable_reasoning
                             or request_payload.get("reasoning_effort") == "none"
@@ -693,6 +954,12 @@ class OpenAICompatibleClient:
                         raise InvalidModelResponseError(
                             f"Generation exhausted max_tokens ({output_budget}) "
                             "with no usable answer even after reasoning was disabled"
+                        ) from exc
+                    if finish_reason == "length" and cleaned.strip():
+                        raise OutputTruncatedError(
+                            f"Output truncated at max_tokens ({output_budget}) mid-JSON; a retry "
+                            f"or weaker schema style would truncate identically. Raise max_tokens "
+                            f"or split the schema (parallel_extraction). Partial: {cleaned[:300]}"
                         ) from exc
                     invalid_reason = (
                         "empty_content" if not cleaned.strip() else "unparseable_content"

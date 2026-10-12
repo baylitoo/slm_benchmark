@@ -8,6 +8,8 @@ a live model.
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 import httpx
@@ -434,3 +436,131 @@ async def test_truncated_think_without_length_finish_reason_still_downgrades() -
     # Downgraded through the full ladder (json_schema -> json_object -> none)
     # before raising, unlike the finish_reason == "length" fail-fast case.
     assert styles_seen == ["json_schema", "json_object", "none"]
+
+
+async def test_lfm26_native_reasoning_preserved_by_default() -> None:
+    import json
+
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {
+                "content": '{"invoice_number": "INV-1"}',
+                "reasoning_content": "consider the invoice",
+            }, "finish_reason": "stop"}],
+        })
+
+    client = await _client(_profile(model="lfm2.5-2.6b", max_tokens=4096), handler)
+    try:
+        result, _, _ = await client.chat_json(
+            system_prompt="system", user_prompt="user", schema_name="test",
+            schema={"type": "object"}, assistant_prefill="{",
+        )
+        assert result == {"invoice_number": "INV-1"}
+    finally:
+        await client.aclose()
+    assert len(requests) == 1
+    assert requests[0]["messages"][-1]["role"] == "user"
+    assert requests[0]["chat_template_kwargs"]["enable_thinking"] is True
+    assert "reasoning_effort" not in requests[0]
+
+
+async def test_lfm26_explicit_disable_thinking_wins_over_native_default() -> None:
+    import json
+
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '"invoice_number": "INV-1"}'}, "finish_reason": "stop"}],
+        })
+
+    client = await _client(_profile(model="lfm2.5-2.6b", max_tokens=4096), handler)
+    try:
+        result, _, _ = await client.chat_json(
+            system_prompt="system", user_prompt="user", schema_name="test",
+            schema={"type": "object"}, assistant_prefill="{",
+            chat_template_kwargs={"enable_thinking": False, "other": "kept"},
+        )
+        assert result == {"invoice_number": "INV-1"}
+    finally:
+        await client.aclose()
+    assert len(requests) == 1
+    assert requests[0]["messages"][-1]["role"] == "assistant"
+    assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False, "other": "kept"}
+    assert requests[0]["reasoning_effort"] == "none"
+
+
+def test_repeating_unit_detects_a_cycling_list_but_not_normal_json() -> None:
+    from docie_bench.llm.openai_client import _repeating_unit
+
+    cycle = '{"item": "MCP (Deep"}, {"item": "Research"}, {"item": "OSINT"}, '
+    assert _repeating_unit('{"skills": [' + cycle * 4) == cycle
+    normal = (
+        '{"skills": [{"item": "Python"}, {"item": "Django"}, '
+        '{"item": "React"}, {"item": "Docker"}]}'
+    )
+    assert _repeating_unit(normal) is None
+
+
+def test_close_json_prefix_drops_the_unfinished_element_and_reports_the_path() -> None:
+    from docie_bench.llm.openai_client import _close_json_prefix
+
+    prefix = '{"skills": [{"category": "A", "items": [{"item": "x"}, {"item": "y"}, {"it'
+    repaired, path = _close_json_prefix(prefix)
+    assert json.loads(repaired) == {
+        "skills": [{"category": "A", "items": [{"item": "x"}, {"item": "y"}]}]
+    }
+    assert path == ["skills", "items"]
+
+
+@pytest.mark.asyncio
+async def test_stream_salvages_a_repetition_loop(monkeypatch) -> None:
+    cycle = '{"item": "MCP (Deep"}, {"item": "Research"}, {"item": "OSINT"}, '
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        frames = ['data: {"choices": [{"delta": {"content": "{\\"skills\\": ["}}]}\n\n']
+        frames += [
+            'data: {"choices": [{"delta": {"content": ' + json.dumps(cycle) + "}}]}\n\n"
+            for _ in range(40)
+        ]
+        frames.append("data: [DONE]\n\n")
+        return httpx.Response(
+            200, text="".join(frames), headers={"content-type": "text/event-stream"}
+        )
+
+    client = await _client(_profile(), handler)
+    parsed, _usage, raw = await client.chat_json(
+        system_prompt="system",
+        user_prompt="user",
+        schema_name="test",
+        schema={"type": "object"},
+        on_delta=lambda _t: None,
+    )
+    assert [item["item"] for item in parsed["skills"]] == ["MCP (Deep", "Research", "OSINT"]
+    assert raw["docie_loop_truncated"]["field_path"] == ["skills"]
+    assert raw["docie_loop_truncated"]["unit"] == cycle
+
+
+@pytest.mark.asyncio
+async def test_llm_trace_logs_exact_messages_and_response(monkeypatch, caplog) -> None:
+    from docie_bench.settings import Settings
+
+    monkeypatch.setattr(
+        "docie_bench.llm.openai_client.get_settings", lambda: Settings(llm_trace=True)
+    )
+    client = await _client(_profile(), lambda request: _completion('{"ok": true}'))
+    with caplog.at_level(logging.INFO, logger="docie_bench.llm.openai_client"):
+        await _chat(client)
+    request = next(r for r in caplog.records if r.getMessage() == "llm_trace_request")
+    response = next(r for r in caplog.records if r.getMessage() == "llm_trace_response")
+    assert [m["role"] for m in request.docie_messages] == ["system", "user"]
+    assert request.docie_messages[1]["content"] == "user"
+    assert request.docie_prompt_chars == len("system") + len("user")
+    assert request.docie_response_format_type == "json_schema"
+    assert request.docie_attempt == "1/3"
+    assert response.docie_content == '{"ok": true}'
+    assert response.docie_usage["prompt_tokens"] == 1

@@ -29,7 +29,7 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 
 from docie_bench.extract.routing import RoutingPolicy
 from docie_bench.storage.db import session_scope
-from docie_bench.studio.models import RoutingPolicyRecord
+from docie_bench.studio.models import RoutingPolicyRecord, isoformat
 
 # Arbitrary-but-stable advisory-lock key ("docie routing policies v1"),
 # distinct from every other migration's key -- see dynamic_schemas.py's
@@ -83,8 +83,8 @@ def _to_dict(row: RoutingPolicyRecord) -> dict[str, Any]:
     return {
         "name": row.name,
         "policy": row.spec_json,
-        "created_at": row.created_at.isoformat(),
-        "updated_at": row.updated_at.isoformat(),
+        "created_at": isoformat(row.created_at),
+        "updated_at": isoformat(row.updated_at),
     }
 
 

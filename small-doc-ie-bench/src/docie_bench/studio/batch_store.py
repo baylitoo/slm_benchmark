@@ -13,7 +13,6 @@ transient blip mid-batch loses one item's persisted state, not the run.
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 from typing import Any
 
@@ -25,7 +24,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from docie_bench.storage.db import session_scope
-from docie_bench.studio.models import BatchItem, BatchRun
+from docie_bench.studio.models import BatchItem, BatchRun, isoformat
 
 logger = logging.getLogger("docie_bench.studio.batch_store")
 
@@ -93,14 +92,6 @@ def ensure_batch_tables(engine: Engine) -> bool:
     return not existed
 
 
-def _isoformat(value: dt.datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=dt.UTC)
-    return value.isoformat()
-
-
 def _item_to_dict(item: BatchItem) -> dict[str, Any]:
     return {
         "position": item.position,
@@ -110,7 +101,7 @@ def _item_to_dict(item: BatchItem) -> dict[str, Any]:
         "result": item.result_json,
         "error": item.error_text,
         "latency_ms": item.latency_ms,
-        "updated_at": _isoformat(item.updated_at),
+        "updated_at": isoformat(item.updated_at),
     }
 
 
@@ -130,8 +121,8 @@ def _run_to_dict(run: BatchRun, *, include_items: bool) -> dict[str, Any]:
         "artifacts": run.artifacts_json or [],
         "callback_url": run.callback_url,
         "selectors": run.selectors_json or {},
-        "created_at": _isoformat(run.created_at),
-        "updated_at": _isoformat(run.updated_at),
+        "created_at": isoformat(run.created_at),
+        "updated_at": isoformat(run.updated_at),
     }
     if include_items:
         out["items"] = [_item_to_dict(item) for item in run.items]

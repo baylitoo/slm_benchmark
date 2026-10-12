@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,37 @@ class DocumentImage:
     def data_url(self) -> str:
         encoded = base64.b64encode(self.data).decode("ascii")
         return f"data:{self.media_type};base64,{encoded}"
+
+
+def decode_data_uri(url: str) -> tuple[bytes, str]:
+    """The bytes and media type of a ``data:<type>;base64,<payload>`` URI.
+
+    The inverse of :meth:`DocumentImage.data_url`, which is how a document
+    reaches a serving node. Raises ``ValueError`` on anything else; callers on
+    an OpenAI surface translate that into their own error shape.
+
+    All three guards matter and each was previously missing from one of the two
+    copies of this: a remote URL must be refused rather than fetched from the
+    serving node, a non-base64 data URI must be refused rather than handed to
+    the decoder, and an EMPTY payload must be refused rather than decoded to
+    zero bytes and written out as a zero-byte document.
+    """
+    if not url.startswith("data:"):
+        raise ValueError(
+            "only inline base64 'data:' URLs are accepted "
+            "(a serving node never fetches a remote URL)"
+        )
+    header, _, payload = url.partition(",")
+    if ";base64" not in header:
+        raise ValueError("data: URL must be base64-encoded")
+    if not payload:
+        raise ValueError("data: URL has no base64 payload")
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"data: URL is not valid base64: {exc}") from exc
+    media_type = header[len("data:") :].split(";", 1)[0].strip().lower()
+    return raw, media_type or "application/octet-stream"
 
 
 def load_document_images(

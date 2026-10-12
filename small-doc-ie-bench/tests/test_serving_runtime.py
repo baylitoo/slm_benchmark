@@ -135,6 +135,33 @@ def test_llamacpp_requires_gguf_and_builds_cpu_flags() -> None:
     assert adapter.probe(_spec(RuntimeKind.LLAMACPP)).compatible is False
 
 
+def test_llamacpp_does_not_duplicate_jinja_when_extra_args_already_carries_it() -> None:
+    """serve_store_model's family-routed deploys carry their own "--jinja" via
+    family_launch_args/extra_args (model_store.FAMILIES) for every text/vision
+    family -- build_command's own default must not ALSO append it, which used
+    to produce a literal duplicate flag on the launched command line
+    (llama-server logs "argument '--jinja' specified multiple times" and
+    silently keeps only the last value)."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        extra_args=("--jinja",),
+    )
+    command = adapter.build_command(spec)
+    assert command.count("--jinja") == 1
+
+
+def test_llamacpp_still_defaults_jinja_on_for_a_bare_spec() -> None:
+    """A direct RuntimeLaunchSpec construction with no extra_args at all (e.g.
+    control_plane.serve()'s advanced/uncommon usage, README-documented) must
+    still get --jinja by default -- only a spec that ALREADY carries it should
+    skip the duplicate."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+    assert "--jinja" in adapter.build_command(spec)
+
+
 def test_llamacpp_n_parallel_default_is_byte_identical_to_before() -> None:
     """n_parallel=1 (the default) must never emit --parallel and must never
     scale --ctx-size -- this is the existing, already-tested default path."""
@@ -236,6 +263,161 @@ def test_launch_spec_rejects_empty_or_nul_slot_save_path() -> None:
         _spec(RuntimeKind.LLAMACPP, slot_save_path="/bad\x00path")
 
 
+def test_llamacpp_chat_template_file_emits_flag() -> None:
+    # #387: overrides the GGUF's own embedded chat_template -- e.g. patching
+    # tool-call rendering onto a checkpoint whose baked-in template lacks it
+    # (verified live against LFM2.5-350M's own /props this milestone).
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        chat_template_file="/templates/lfm2-with-tool-calls.jinja",
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--chat-template-file" in command
+    assert (
+        command[command.index("--chat-template-file") + 1]
+        == "/templates/lfm2-with-tool-calls.jinja"
+    )
+
+
+def test_llamacpp_omits_chat_template_file_flag_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--chat-template-file" not in command
+
+
+def test_launch_spec_rejects_empty_or_nul_chat_template_file() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="chat_template_file"):
+        _spec(RuntimeKind.LLAMACPP, chat_template_file="   ")
+    with pytest.raises(RuntimeConfigurationError, match="chat_template_file"):
+        _spec(RuntimeKind.LLAMACPP, chat_template_file="/bad\x00path.jinja")
+
+
+def test_llamacpp_kv_cache_quant_emits_both_type_flags_and_forces_flash_attn() -> None:
+    # #382: q8_0/q4_0 KV cache quant is a direct RAM win on the constrained
+    # boxes this framework targets. --flash-attn is a prerequisite for the
+    # quant to actually apply, forced on automatically rather than left to
+    # the operator to separately remember.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        cache_type_k="q8_0",
+        cache_type_v="q8_0",
+    )
+
+    command = adapter.build_command(spec)
+
+    assert command[command.index("--cache-type-k") + 1] == "q8_0"
+    assert command[command.index("--cache-type-v") + 1] == "q8_0"
+    assert command[command.index("--flash-attn") + 1] == "on"
+
+
+def test_llamacpp_kv_cache_quant_on_only_one_side_still_forces_flash_attn() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", cache_type_k="q4_0")
+
+    command = adapter.build_command(spec)
+
+    assert "--cache-type-v" not in command
+    assert command[command.index("--flash-attn") + 1] == "on"
+
+
+def test_llamacpp_omits_kv_cache_flags_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--cache-type-k" not in command
+    assert "--cache-type-v" not in command
+    assert "--flash-attn" not in command
+
+
+def test_llamacpp_explicit_f16_cache_type_does_not_force_flash_attn() -> None:
+    # f16 is llama-server's own default -- an operator explicitly spelling it
+    # out is a no-op request, not a quantization request.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", cache_type_k="f16")
+
+    command = adapter.build_command(spec)
+
+    assert command[command.index("--cache-type-k") + 1] == "f16"
+    assert "--flash-attn" not in command
+
+
+def test_launch_spec_rejects_unknown_kv_cache_type() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="cache_type_k"):
+        _spec(RuntimeKind.LLAMACPP, cache_type_k="q2_k")
+    with pytest.raises(RuntimeConfigurationError, match="cache_type_v"):
+        _spec(RuntimeKind.LLAMACPP, cache_type_v="not-a-real-type")
+
+
+def test_llamacpp_reasoning_budget_emits_flag() -> None:
+    # #402: caps how many tokens a thinking model spends before it's forced
+    # to answer -- timely given lfm2.5-1.2b-thinking is actively deployed
+    # this milestone.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", reasoning_budget=512)
+
+    command = adapter.build_command(spec)
+
+    assert command[command.index("--reasoning-budget") + 1] == "512"
+
+
+def test_llamacpp_reasoning_budget_zero_and_negative_one_are_valid() -> None:
+    # 0 = end thinking immediately, -1 = unrestricted -- both real,
+    # meaningful values per llama-server's own docs, not "unset".
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    for value in (0, -1):
+        spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", reasoning_budget=value)
+        command = adapter.build_command(spec)
+        assert command[command.index("--reasoning-budget") + 1] == str(value)
+
+
+def test_llamacpp_reasoning_budget_message_emits_alongside_budget() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        reasoning_budget=256,
+        reasoning_budget_message="Wrapping up my analysis now.",
+    )
+
+    command = adapter.build_command(spec)
+
+    assert (
+        command[command.index("--reasoning-budget-message") + 1]
+        == "Wrapping up my analysis now."
+    )
+
+
+def test_llamacpp_omits_reasoning_budget_flags_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--reasoning-budget" not in command
+    assert "--reasoning-budget-message" not in command
+
+
+def test_launch_spec_rejects_reasoning_budget_below_negative_one() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="reasoning_budget"):
+        _spec(RuntimeKind.LLAMACPP, reasoning_budget=-2)
+
+
+def test_launch_spec_rejects_reasoning_budget_message_without_a_budget() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="reasoning_budget_message"):
+        _spec(RuntimeKind.LLAMACPP, reasoning_budget_message="Wrapping up.")
+
+
 def test_llamacpp_tool_calls_mismatch_reads_the_real_chat_template_caps_schema() -> None:
     # Field name/shape confirmed against llama.cpp's own source (#290):
     # common/jinja/caps.h's caps struct, serialized via caps::to_map() in
@@ -328,6 +510,45 @@ def test_llamacpp_health_leaves_tool_calls_supported_none_when_undetermined(
     assert result.tool_calls_supported is None
 
 
+def test_llamacpp_health_records_slot_count_from_slots_endpoint() -> None:
+    # Ground truth for model_gateway's concurrency-mismatch warning: the REAL
+    # slot count observed via GET /slots, not the --parallel launch value
+    # (which can drift from what a manually-restarted process actually runs
+    # with).
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {},
+        slots_get=lambda url, timeout, headers: [
+            {"id": 0, "is_processing": False},
+            {"id": 1, "is_processing": True},
+            {"id": 2, "is_processing": False},
+            {"id": 3, "is_processing": False},
+        ],
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.slot_count == 4
+
+
+def test_llamacpp_health_leaves_slot_count_none_when_slots_endpoint_unreachable() -> None:
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {},
+        slots_get=lambda url, timeout, headers: None,
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.slot_count is None
+
+
 def test_llamacpp_slots_tolerates_a_missing_field_schema() -> None:
     # Schema varies by llama-server build (#315): one slot reports the full
     # shape (including build-dependent timing/cache fields), the other only
@@ -379,9 +600,12 @@ def test_llamacpp_slots_never_raises_on_query_failure_and_never_touches_health()
     spec = _spec(RuntimeKind.LLAMACPP)
 
     assert adapter.slots(spec) == ()
-    # health() doesn't even query /slots -- a slots-query failure must never
-    # be able to flip an otherwise-healthy deployment to unhealthy.
-    assert adapter.health(spec).healthy is True
+    # health() DOES query /slots too (to populate slot_count), but a
+    # slots-query failure must never be able to flip an otherwise-healthy
+    # deployment to unhealthy -- only ever degrades slot_count to None.
+    result = adapter.health(spec)
+    assert result.healthy is True
+    assert result.slot_count is None
 
 
 def test_fetch_llamacpp_slots_works_from_a_bare_endpoint_string() -> None:
@@ -463,6 +687,46 @@ def test_remote_runtime_is_processless_and_uses_api_key_env(
         "timeout": 4,
         "headers": {"Authorization": "Bearer secret"},
     }
+
+
+def test_llamacpp_build_command_requires_api_key_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #447: api_key_env was only ever read for the control plane's own
+    # outbound probe calls -- the launched process itself never required a
+    # key. --api-key must now appear in the actual command line.
+    monkeypatch.setenv("SERVING_KEY", "s3cr3t")
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", api_key_env="SERVING_KEY"
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" in command
+    assert command[command.index("--api-key") + 1] == "s3cr3t"
+
+
+def test_llamacpp_build_command_omits_api_key_when_unconfigured() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" not in command
+
+
+def test_vllm_build_command_requires_api_key_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SERVING_KEY", "s3cr3t")
+    adapter = VLLMRuntime(which=lambda name: "/opt/bin/vllm")
+    spec = _spec(RuntimeKind.VLLM, api_key_env="SERVING_KEY")
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" in command
+    assert command[command.index("--api-key") + 1] == "s3cr3t"
 
 
 def test_remote_runtime_rejects_embedded_credentials() -> None:

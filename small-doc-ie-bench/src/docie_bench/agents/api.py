@@ -24,7 +24,7 @@ from typing import Annotated, Any
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from docie_bench.agents import runtime
 from docie_bench.agents.registry import (
@@ -36,6 +36,7 @@ from docie_bench.agents.registry import (
 from docie_bench.agents.runtime import AgentError, complete_agent
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.agents.templates import AGENT_TEMPLATES, template_by_id
+from docie_bench.openai_protocol import openai_error, single_chunk_stream, sse_event
 from docie_bench.security import TenantContext, get_quota_manager
 from docie_bench.studio import usage_store
 from docie_bench.telemetry import AGENT_LATENCY, AGENT_PII_DETECTED, AGENT_REQUESTS
@@ -196,13 +197,6 @@ async def list_templates() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _openai_error(message: str, *, status_code: int, error_type: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"message": message, "type": error_type, "code": error_type}},
-    )
-
-
 def _openai_model(spec: AgentSpec) -> dict[str, Any]:
     return {"id": spec.name, "object": "model", "created": 0, "owned_by": "docie-agents"}
 
@@ -310,13 +304,13 @@ async def _serve_completion(spec: AgentSpec, request: Request, tenant: TenantCon
     try:
         body = await request.json()
     except ValueError:
-        return _openai_error(
+        return openai_error(
             "request body must be valid JSON",
             status_code=400,
             error_type="invalid_request_error",
         )
     if not isinstance(body, dict):
-        return _openai_error(
+        return openai_error(
             "request body must be a JSON object",
             status_code=400,
             error_type="invalid_request_error",
@@ -341,7 +335,7 @@ async def _serve_completion(spec: AgentSpec, request: Request, tenant: TenantCon
         AGENT_REQUESTS.labels(spec.name, spec.kind, exc.error_type).inc()
         AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
         _record_agent_usage(spec, tenant, started, exc)
-        return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
+        return openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
     AGENT_REQUESTS.labels(spec.name, spec.kind, "ok").inc()
     AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
     _record_pii_metrics(spec.name, completion)
@@ -349,10 +343,6 @@ async def _serve_completion(spec: AgentSpec, request: Request, tenant: TenantCon
     if wants_stream:
         return _single_chunk_sse(completion)
     return JSONResponse(completion)
-
-
-def _sse_event(payload: dict[str, Any]) -> bytes:
-    return f"data: {json.dumps(payload)}\n\n".encode()
 
 
 async def _serve_raw_stream(
@@ -373,7 +363,7 @@ async def _serve_raw_stream(
         AGENT_REQUESTS.labels(spec.name, spec.kind, exc.error_type).inc()
         AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
         _record_agent_usage(spec, tenant, started, exc)
-        return _openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
+        return openai_error(exc.message, status_code=exc.status_code, error_type=exc.error_type)
 
     async def relay() -> AsyncIterator[bytes]:
         # Bytes are relayed to the caller completely unchanged; a SECOND,
@@ -442,7 +432,7 @@ async def _serve_queue_stream(
                         status_code=500,
                         error_type=str(error.get("type") or "internal_error"),
                     )
-                yield _sse_event(event)
+                yield sse_event(event)
         finally:
             label = outcome.error_type if isinstance(outcome, AgentError) else "ok"
             AGENT_REQUESTS.labels(spec.name, spec.kind, label).inc()
@@ -484,7 +474,7 @@ async def agents_chat_completions(
         body = None
     model = body.get("model", "") if isinstance(body, dict) else ""
     if not model:
-        return _openai_error(
+        return openai_error(
             "missing required 'model' field (an agent name)",
             status_code=400,
             error_type="invalid_request_error",
@@ -492,7 +482,7 @@ async def agents_chat_completions(
     try:
         spec = _registry().get(str(model))
     except AgentNotFoundError:
-        return _openai_error(
+        return openai_error(
             f"model {model!r} is not a configured agent",
             status_code=404,
             error_type="model_not_found",
@@ -550,7 +540,7 @@ async def agent_chat_completions(
     try:
         spec = _registry().get(name)
     except AgentNotFoundError:
-        return _openai_error(
+        return openai_error(
             f"model {name!r} is not a configured agent",
             status_code=404,
             error_type="model_not_found",
@@ -580,8 +570,4 @@ def _single_chunk_sse(completion: dict[str, Any]) -> StreamingResponse:
         ],
     }
 
-    async def body_iterator() -> AsyncIterator[bytes]:
-        yield f"data: {json.dumps(chunk)}\n\n".encode()
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(body_iterator(), media_type="text/event-stream")
+    return single_chunk_stream(chunk)

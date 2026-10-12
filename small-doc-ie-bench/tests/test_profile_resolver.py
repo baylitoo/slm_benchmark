@@ -329,7 +329,7 @@ def test_family_synth_carries_generation_params(
     models_config: Path, store_home, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Finding 1: the family-synth path must carry the nuextract3 generation params
-    # (4096 / 0.2 / 600), NOT the ModelProfile defaults (900 / 0.0 / 180). The
+    # (16384 / 0.2 / 600), NOT the ModelProfile defaults (900 / 0.0 / 180). The
     # deployment's served id (alias) matches no yaml profile -> family path.
     store_home("nux-store", "nuextract3")
     _no_catalog(monkeypatch)
@@ -339,7 +339,7 @@ def test_family_synth_carries_generation_params(
     profile = resolve_extraction_profile(
         deployment="nux-store", models_config_path=models_config, deployments=[record]
     )
-    assert profile.max_tokens == 4096
+    assert profile.max_tokens == 16384
     assert profile.temperature == pytest.approx(0.2)
     assert profile.timeout_seconds == pytest.approx(600.0)
 
@@ -634,3 +634,41 @@ def test_activity_recording_hiccup_never_breaks_resolution(
         deployment="resilient", models_config_path=models_config, deployments=[record]
     )
     assert profile.model == "resilient"
+
+
+def test_bare_deployment_name_carries_declared_slot_count(models_config: Path) -> None:
+    from dataclasses import replace
+
+    record = _record(
+        name="lfm2.5-2.6b",
+        runtime=RuntimeKind.LLAMACPP,
+        model="/app/.serving/models/lfm2.5-2.6b/model.gguf",
+        alias="lfm2.5-2.6b",
+    )
+    launch = replace(record.spec.launch, n_parallel=3)
+    record = replace(record, spec=replace(record.spec, launch=launch))
+
+    profile = resolve_extraction_profile(
+        model_profile="lfm2.5-2.6b", models_config_path=models_config, deployments=[record]
+    )
+
+    assert profile.deployment_slot_count == 3
+
+
+def test_bare_deployment_name_carries_declared_timeout(models_config: Path) -> None:
+    from dataclasses import replace
+
+    record = _record(
+        name="lfm2.5-2.6b",
+        runtime=RuntimeKind.LLAMACPP,
+        model="/app/.serving/models/lfm2.5-2.6b/model.gguf",
+        alias="lfm2.5-2.6b",
+    )
+    launch = replace(record.spec.launch, timeout_seconds=600.0)
+    record = replace(record, spec=replace(record.spec, launch=launch))
+
+    profile = resolve_extraction_profile(
+        model_profile="lfm2.5-2.6b", models_config_path=models_config, deployments=[record]
+    )
+
+    assert profile.timeout_seconds == 600.0

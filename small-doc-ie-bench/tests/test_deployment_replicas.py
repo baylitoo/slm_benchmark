@@ -252,6 +252,45 @@ def test_deploy_replicas_omits_n_parallel_when_default(
     assert all("cache_reuse" not in e.data for e in captured_events)
 
 
+def test_deploy_single_instance_threads_chat_template_file(
+    serving_home: Path, captured_events: list[Any]
+) -> None:
+    """#387 follow-up: the non-replicated path model_dumps the whole
+    DeployRequest, so chat_template_file rides along automatically -- same
+    shape as n_parallel/cache_reuse."""
+    _deploy({"model": MODEL, "chat_template_file": "/templates/lfm2-tools.jinja"})
+
+    assert len(captured_events) == 1
+    assert captured_events[0].data["chat_template_file"] == "/templates/lfm2-tools.jinja"
+
+
+def test_deploy_replicas_thread_chat_template_file_into_each_event(
+    serving_home: Path, captured_events: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replicated path builds each event dict by hand -- chat_template_file
+    must be threaded in the same way n_parallel/cache_reuse already are."""
+    _no_sizing(monkeypatch)
+
+    _deploy(
+        {"model": MODEL, "replicas": 2, "chat_template_file": "/templates/lfm2-tools.jinja"}
+    )
+
+    assert len(captured_events) == 2
+    assert all(
+        e.data["chat_template_file"] == "/templates/lfm2-tools.jinja" for e in captured_events
+    )
+
+
+def test_deploy_replicas_omits_chat_template_file_when_unset(
+    serving_home: Path, captured_events: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_sizing(monkeypatch)
+
+    _deploy({"model": MODEL, "replicas": 2})
+
+    assert all("chat_template_file" not in e.data for e in captured_events)
+
+
 # ── RAM admission: N x footprint against the sizing budget ─────────────────
 
 

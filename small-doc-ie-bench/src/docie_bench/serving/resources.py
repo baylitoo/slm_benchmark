@@ -32,9 +32,18 @@ under-counts and later over-commits the node. The tracker therefore records a
 model's footprint only from STEADY-STATE samples (a run of consecutive
 ``hot`` observations whose RSS has stopped moving) and persists them per model
 in sidecar files on the serving-state volume, so sizing improves over time and
-survives restarts. The working number is always
-``footprint = max(observed_steady_rss, predicted)`` — trust the measurement
-once there is one, stay conservative about the ramp.
+survives restarts. A value only ever reaches the sidecar after passing that
+stabilization gate, so once one exists it IS the working footprint —
+``predicted`` is only ever used before a model has run long enough to
+calibrate. (Historically this was ``max(observed_steady_rss, predicted)``,
+reasoned as "never let a fresh RSS reading shrink the budget" — but that
+conflated an early, still-ramping READING (correctly excluded by the gate
+above and never written here) with an already-gated, stable OBSERVATION,
+which should simply replace a formula guess, not just raise its floor. A
+formula that overestimates a model's real footprint — e.g. the flat
+per-token KV-cache constant below, which has no per-architecture awareness
+— would otherwise pin the sizing engine to that overestimate forever, even
+once the real, stable footprint is known and is smaller.)
 """
 
 from __future__ import annotations
@@ -51,6 +60,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from docie_bench.serving.paths import serving_home
+
 logger = logging.getLogger(__name__)
 
 # Default cgroup-v2 controller mount inside a container.
@@ -63,8 +74,71 @@ _CGROUP_UNLIMITED_SENTINEL = "max"
 # KV-cache bytes per context token per parallel slot. This is exactly the
 # planner's formula constant (planner.py::_estimate_memory_gb prices 0.25 GiB
 # per 4096-token context per concurrent slot => 65536 bytes/token) — reuse the
-# FORMULA, not the plumbing (design doc §2/fix #6).
+# FORMULA, not the plumbing (design doc §2/fix #6). A generic, family-blind
+# ceiling: the right order of magnitude for a dense transformer with full
+# multi-head attention on every layer, but a real overestimate for a hybrid
+# architecture like LFM2 (see LFM2_KV_CACHE_BYTES_PER_TOKEN below) — kept as
+# the fallback for every family that doesn't have a verified constant of its
+# own, never removed.
 KV_CACHE_BYTES_PER_TOKEN = 65_536
+
+# LFM2/LFM2.5's real per-token KV-cache cost, derived from LiquidAI's own
+# published config.json (verified against LFM2.5-350M/1.2B/2.6B directly):
+# only a MINORITY of layers are "full_attention" (the rest are short gated
+# convolutions with a small fixed window, carrying no growing KV state at
+# all), and the attention layers use GQA (8 KV heads, not the full query-head
+# count). bytes_per_token = 2 (K+V) x num_full_attention_layers x
+# num_key_value_heads x head_dim x 2 (f16) -- computed per size:
+#   350M  (16 layers,  6 attn, kv_heads=8, head_dim=64):  2*6*8*64*2  = 12,288
+#   1.2B  (16 layers,  6 attn, kv_heads=8, head_dim=64):  2*6*8*64*2  = 12,288
+#   2.6B  (30 layers,  8 attn, kv_heads=8, head_dim=64):  2*8*8*64*2  = 16,384
+# 16,384 (the 2.6B figure, the largest/most conservative in the family) is
+# used for the whole family rather than a per-size table -- a ~4x reduction
+# from the generic constant, still never an underestimate for any size
+# actually shipped. Applies to both `lfm2` (text) and `lfm2_vl` (adds a
+# vision encoder/connector, priced separately via mmproj_bytes below, but the
+# LLM backbone's own KV cache shape is unchanged).
+LFM2_KV_CACHE_BYTES_PER_TOKEN = 16_384
+
+# XHToken Spark-X2.5 (1.7B, ggml-org/llama.cpp#27868, merged 2026-09-06):
+# a DIFFERENT hybrid shape than LFM2 -- sliding-window attention mixed with
+# full attention, not conv layers, so this is not "zero KV state" the way
+# LFM2's non-attention layers are. Derived from the model's own published
+# config.json: 28 layers, only 7 tagged "full_attention" (the rest
+# "sliding_attention", window=512), GQA with 2 KV heads, head_dim=256.
+# bytes_per_token = 2 (K+V) x num_full_attention_layers x num_key_value_heads
+# x head_dim x 2 (f16) = 2*7*2*256*2 = 14,336.
+# The 21 sliding-window layers are NOT truly zero-cost like LFM2's conv
+# layers -- each holds a real, bounded (window=512) KV state once past the
+# window, independent of context length beyond it. Folding them into the
+# ~0 approximation (same simplification LFM2 uses) is safe here because
+# that bounded contribution tops out at ~21 MiB total (21 layers x 512
+# tokens x 2 x 2 x 256 x 2 bytes) -- negligible next to RUNTIME_OVERHEAD_BYTES
+# (512 MiB) already budgeted per instance, not a meaningful underestimate at
+# any context length this framework actually deploys at.
+SPARK2_5_KV_CACHE_BYTES_PER_TOKEN = 14_336
+
+# Family -> its own verified per-token KV-cache constant. A family absent
+# here (including "openai_chat", shared by many non-hybrid dense-attention
+# archs) falls back to the generic KV_CACHE_BYTES_PER_TOKEN ceiling --
+# correct for those, since only a hybrid architecture with a family of its
+# own (added specifically to carry this distinction, see model_store.FAMILIES)
+# has a cheaper real cost worth tracking separately.
+_FAMILY_KV_CACHE_BYTES_PER_TOKEN: dict[str, int] = {
+    "lfm2": LFM2_KV_CACHE_BYTES_PER_TOKEN,
+    "lfm2_vl": LFM2_KV_CACHE_BYTES_PER_TOKEN,
+    "spark2_5": SPARK2_5_KV_CACHE_BYTES_PER_TOKEN,
+}
+
+
+def _kv_cache_bytes_per_token(family: str | None) -> int:
+    """The per-token KV-cache constant for ``family``, falling back to the
+    generic constant for every family without a verified constant of its
+    own (including ``None`` -- no family info available for this pricing)."""
+    if family is None:
+        return KV_CACHE_BYTES_PER_TOKEN
+    return _FAMILY_KV_CACHE_BYTES_PER_TOKEN.get(family, KV_CACHE_BYTES_PER_TOKEN)
+
 
 # Fixed llama-server runtime slab on top of weights + KV (arena, buffers;
 # design doc §2 brackets it 0.3-0.5 GB — take the conservative top end).
@@ -85,17 +159,6 @@ DEFAULT_CONTEXT_LENGTH = 4096
 DEFAULT_DEPLOY_CONTEXT_LENGTH = 8192
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-
-
-def _serving_home() -> Path:
-    # Must match recency.py / control_plane.from_defaults so every process on
-    # the shared serving-state volume reads and writes the SAME sidecars.
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
 
 
 # --------------------------------------------------------------- node memory
@@ -246,6 +309,7 @@ def predict_footprint_bytes(
     quant_factor: float = 1.0,
     mmproj_bytes: int = 0,
     overhead_bytes: int = RUNTIME_OVERHEAD_BYTES,
+    family: str | None = None,
 ) -> int:
     """The planner FORMULA priced from store/on-disk weights (design doc §2).
 
@@ -253,6 +317,10 @@ def predict_footprint_bytes(
     overhead (+ mmproj for vision families)``. ``quant_factor`` is ~1.0 for a
     GGUF already at its target quantization (the file IS the resident
     weights); it exists for callers pricing a hypothetical re-quantization.
+    ``family`` picks the per-token KV-cache constant (see
+    ``_kv_cache_bytes_per_token``) -- ``None`` (a caller with no family info,
+    e.g. the registry-manifest planner path) keeps the generic constant,
+    byte-for-byte the same as before this parameter existed.
     """
     if weights_bytes < 0:
         raise ValueError("weights_bytes must be non-negative")
@@ -264,7 +332,7 @@ def predict_footprint_bytes(
         else DEFAULT_CONTEXT_LENGTH
     )
     slots = max(1, n_parallel)
-    kv_cache = KV_CACHE_BYTES_PER_TOKEN * context * slots
+    kv_cache = _kv_cache_bytes_per_token(family) * context * slots
     return int(weights_bytes * quant_factor) + kv_cache + overhead_bytes + max(0, mmproj_bytes)
 
 
@@ -276,6 +344,7 @@ def predicted_footprint_for_model(
     n_parallel: int = 1,
     quant_factor: float = 1.0,
     mmproj_bytes: int = 0,
+    family: str | None = None,
 ) -> int | None:
     """Predicted footprint with the PR-2 weights contract: store size or stat.
 
@@ -299,17 +368,21 @@ def predicted_footprint_for_model(
         n_parallel=n_parallel,
         quant_factor=quant_factor,
         mmproj_bytes=mmproj_bytes,
+        family=family,
     )
 
 
 def footprint_bytes(predicted: int, observed_steady_rss: int | None) -> int:
-    """``max(observed_steady_rss, predicted)`` — the design's calibration rule.
+    """The calibrated working footprint.
 
-    Trust the measurement once there is one; fall back to the formula for
-    models never yet run. Never the minimum: a fresh mmap'd RSS below the
-    prediction must not shrink the budget (design doc §2).
+    ``observed_steady_rss`` only ever arrives here after
+    ``ResourceTracker._calibrate`` has already gated it through N consecutive
+    ``hot`` cycles with a stable (non-climbing) RSS delta -- it is ground
+    truth, not a still-ramping mmap read, so it REPLACES the formula's guess
+    rather than merely raising a floor under it. ``predicted`` is used as-is
+    only before a model has run long enough to produce a calibrated value.
     """
-    return max(predicted, observed_steady_rss or 0)
+    return predicted if observed_steady_rss is None else observed_steady_rss
 
 
 # Calibration-key scheme version. v1 keyed on the file BASENAME — but the
@@ -370,7 +443,7 @@ class FootprintStore:
     """
 
     def __init__(self, home: Path | None = None) -> None:
-        self._directory = (home if home is not None else _serving_home()) / "footprints"
+        self._directory = (home if home is not None else serving_home()) / "footprints"
         # One migration sweep per directory per process (see _PURGED_FOOTPRINT_DIRS):
         # per-request constructions must not re-scan the directory every poll.
         if self._directory not in _PURGED_FOOTPRINT_DIRS:
@@ -517,7 +590,7 @@ class ResourceTracker:
         )
 
     def footprint_for(self, model: str, predicted: int) -> int:
-        """Calibrated working footprint: ``max(observed_steady, predicted)``."""
+        """Calibrated working footprint -- see ``footprint_bytes``."""
         return footprint_bytes(predicted, self.footprints.get(model))
 
     def _calibrate(self, observations: Iterable[Observation]) -> None:
@@ -578,6 +651,8 @@ __all__ = [
     "DEFAULT_CONTEXT_LENGTH",
     "DEFAULT_DEPLOY_CONTEXT_LENGTH",
     "KV_CACHE_BYTES_PER_TOKEN",
+    "LFM2_KV_CACHE_BYTES_PER_TOKEN",
+    "SPARK2_5_KV_CACHE_BYTES_PER_TOKEN",
     "RUNTIME_OVERHEAD_BYTES",
     "FootprintStore",
     "NodeMemory",
