@@ -659,6 +659,46 @@ def test_remote_runtime_is_processless_and_uses_api_key_env(
     }
 
 
+def test_llamacpp_build_command_requires_api_key_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #447: api_key_env was only ever read for the control plane's own
+    # outbound probe calls -- the launched process itself never required a
+    # key. --api-key must now appear in the actual command line.
+    monkeypatch.setenv("SERVING_KEY", "s3cr3t")
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", api_key_env="SERVING_KEY"
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" in command
+    assert command[command.index("--api-key") + 1] == "s3cr3t"
+
+
+def test_llamacpp_build_command_omits_api_key_when_unconfigured() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" not in command
+
+
+def test_vllm_build_command_requires_api_key_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SERVING_KEY", "s3cr3t")
+    adapter = VLLMRuntime(which=lambda name: "/opt/bin/vllm")
+    spec = _spec(RuntimeKind.VLLM, api_key_env="SERVING_KEY")
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" in command
+    assert command[command.index("--api-key") + 1] == "s3cr3t"
+
+
 def test_remote_runtime_rejects_embedded_credentials() -> None:
     adapter = RemoteRuntime()
     spec = _spec(
