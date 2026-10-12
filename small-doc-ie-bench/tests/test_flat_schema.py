@@ -6,7 +6,9 @@ import json
 
 import pytest
 
-from docie_bench.schemas.extraction import flat_schema_json
+from docie_bench.llm.prompts import render_schema_sketch
+from docie_bench.schemas.dynamic import DynamicSchemaSpec, DynamicTemplateBuilder
+from docie_bench.schemas.extraction import flat_schema_json, flatten_schema_json
 
 
 @pytest.mark.parametrize("name", ["invoice", "identity_card"])
@@ -27,10 +29,10 @@ def test_invoice_wrappers_unwrapped_to_values() -> None:
     # Fields are preserved and flattened to plain nullable values.
     props = inv["properties"]
     assert "invoice_number" in props
-    assert props["invoice_number"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert props["invoice_number"] == {"type": ["string", "null"]}
     # A richer wrapper (MoneyField) keeps its data (amount/currency), drops meta.
-    money = props["total_ttc"]["anyOf"][0]
-    assert money["type"] == "object"
+    money = props["total_ttc"]
+    assert money["type"] == ["object", "null"]
     assert set(money["properties"]) == {"amount", "currency"}
 
 
@@ -47,6 +49,48 @@ def test_flat_schema_requires_every_typed_root_field(name: str) -> None:
     # typed key must be emitted; absent scalar values remain valid as null.
     schema = flat_schema_json(name)
     assert schema["required"] == list(schema["properties"])
+
+
+def test_schema_sketch_is_compact_and_keeps_descriptions() -> None:
+    spec = DynamicSchemaSpec.model_validate(
+        {
+            "document_type": "adbi_resume",
+            "fields": [
+                {"name": "name", "type": "string"},
+                {"name": "years_experience", "type": "number"},
+                {
+                    "name": "experience",
+                    "type": "list",
+                    "description": "Jobs only.",
+                    "fields": [
+                        {"name": "company", "type": "string"},
+                        {"name": "start_date", "type": "date", "description": "YYYY-MM."},
+                    ],
+                },
+                {
+                    "name": "contact",
+                    "type": "object",
+                    "fields": [{"name": "email", "type": "string"}],
+                },
+            ],
+        }
+    )
+    flat = flatten_schema_json(DynamicTemplateBuilder.build_model(spec).model_json_schema())
+    assert "anyOf" not in json.dumps(flat)
+    assert flat["properties"]["experience"]["type"] == ["array", "null"]
+    sketch = render_schema_sketch(flat)
+    assert sketch.splitlines() == [
+        "name: string",
+        "years_experience: number",
+        "experience: [{  # Jobs only.",
+        "  company: string",
+        "  start_date: string  # YYYY-MM.",
+        "}]",
+        "contact: {",
+        "  email: string",
+        "}",
+    ]
+    assert len(sketch) * 3 < len(json.dumps(flat))
 
 
 def test_unknown_schema_raises() -> None:

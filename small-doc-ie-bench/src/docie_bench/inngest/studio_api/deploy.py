@@ -48,6 +48,28 @@ class DeployRequest(BaseModel):
     # reachable inside the serving container). Existence is the caller's
     # responsibility, same as `model` itself.
     chat_template_file: str | None = None
+    batch_size: int | None = Field(default=None, ge=1)
+    ubatch_size: int | None = Field(default=None, ge=1)
+    numa: str | None = None
+    cpu_threads: int | None = Field(default=None, ge=1)
+    cpu_threads_batch: int | None = Field(default=None, ge=1)
+    # llama-server only (#382): quantized KV cache, trading a small accuracy
+    # cost for a large RAM saving on long-context deploys. Runtime.py already
+    # validates these against llama-server's own allowed --cache-type-k/-v
+    # values and auto-adds --flash-attn (required for a non-f16 cache type).
+    cache_type_k: str | None = None
+    cache_type_v: str | None = None
+    # llama-server only (#402): --reasoning-budget caps how many tokens a
+    # reasoning model spends thinking before being forced to answer.
+    # None/unset lets it think unbounded (or not at all, if the model has no
+    # reasoning channel). -1 means unbounded-but-tracked; 0 disables thinking.
+    reasoning_budget: int | None = Field(default=None, ge=-1)
+    # Text injected right before the end-of-thinking tag when reasoning_budget
+    # forces a cutoff. Requires reasoning_budget to be set (runtime.py enforces
+    # this at validation, not here — the API layer doesn't duplicate it).
+    reasoning_budget_message: str | None = None
+    flash_attn: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 async def _trigger_replicated_deploy(
@@ -109,6 +131,28 @@ async def _trigger_replicated_deploy(
             data["cache_reuse"] = payload.cache_reuse
         if payload.chat_template_file is not None:
             data["chat_template_file"] = payload.chat_template_file
+        if payload.batch_size is not None:
+            data["batch_size"] = payload.batch_size
+        if payload.ubatch_size is not None:
+            data["ubatch_size"] = payload.ubatch_size
+        if payload.numa is not None:
+            data["numa"] = payload.numa
+        if payload.cpu_threads is not None:
+            data["cpu_threads"] = payload.cpu_threads
+        if payload.cpu_threads_batch is not None:
+            data["cpu_threads_batch"] = payload.cpu_threads_batch
+        if payload.cache_type_k is not None:
+            data["cache_type_k"] = payload.cache_type_k
+        if payload.cache_type_v is not None:
+            data["cache_type_v"] = payload.cache_type_v
+        if payload.reasoning_budget is not None:
+            data["reasoning_budget"] = payload.reasoning_budget
+        if payload.reasoning_budget_message is not None:
+            data["reasoning_budget_message"] = payload.reasoning_budget_message
+        if payload.flash_attn is not None:
+            data["flash_attn"] = payload.flash_attn
+        if payload.timeout_seconds is not None:
+            data["timeout_seconds"] = payload.timeout_seconds
         ids = await send_or_503(
             inngest_client, inngest.Event(name=_shared.DEPLOY_EVENT, data=data)
         )

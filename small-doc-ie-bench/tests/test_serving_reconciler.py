@@ -61,6 +61,9 @@ class ScriptedAdapter:
         # alias -> the scripted HealthResult.tool_calls_supported (#353),
         # default None ("undetermined") like a non-llamacpp/older-build probe.
         self.tool_calls_supported: dict[str, bool | None] = {}
+        # alias -> the scripted HealthResult.slot_count, default None
+        # ("undetermined"/unreachable /slots, same default a real adapter uses).
+        self.slot_count: dict[str, int | None] = {}
 
     def start(self, spec: RuntimeLaunchSpec, *, log_path: Path | None = None) -> RuntimeProcess:
         del log_path
@@ -90,7 +93,10 @@ class ScriptedAdapter:
             self.probe_hook(spec.alias)
         if self.healthy.get(spec.alias, True):
             return HealthResult(
-                True, 200, tool_calls_supported=self.tool_calls_supported.get(spec.alias)
+                True,
+                200,
+                tool_calls_supported=self.tool_calls_supported.get(spec.alias),
+                slot_count=self.slot_count.get(spec.alias),
             )
         return HealthResult(False, detail="connection refused")
 
@@ -185,6 +191,50 @@ def test_tool_calls_supported_is_persisted_on_the_deployment_record(tmp_path: Pa
     adapter.tool_calls_supported["invoice"] = True
     reconciler.run_cycle()
     assert supervisor.get("invoice").tool_calls_supported is True
+
+
+def test_slot_count_is_published_only_while_hot(tmp_path: Path) -> None:
+    supervisor, adapter, reconciler, _ = _build(tmp_path)
+    adapter.slot_count["invoice"] = 4
+    supervisor.deploy(_spec())
+
+    observations = reconciler.run_cycle()
+
+    assert _only(observations, "invoice").slot_count == 4
+
+    # Once unhealthy, the observation is no longer "hot" -- slot_count must
+    # not linger from the last time it was, same policy as throughput.
+    adapter.healthy["invoice"] = False
+    observations = reconciler.run_cycle()
+    assert _only(observations, "invoice").slot_count is None
+
+
+def test_run_cycle_exports_deployment_metrics(tmp_path: Path) -> None:
+    """Each cycle must export the deployment's health/phase as Prometheus
+    gauges (docie_deployment_healthy / docie_deployment_phase) -- otherwise a
+    stuck extraction or a wedged deployment has no metric an alert can fire
+    on before a caller's request to it times out silently."""
+    from docie_bench.serving.reconciler import _DEPLOYMENT_PHASES
+    from docie_bench.telemetry import DEPLOYMENT_HEALTHY, DEPLOYMENT_PHASE
+
+    supervisor, adapter, reconciler, _ = _build(tmp_path, fit=(False, "would OOM"))
+    record = supervisor.deploy(_spec())
+    reconciler.run_cycle()  # observe hot
+
+    assert DEPLOYMENT_HEALTHY.labels("invoice")._value.get() == 1.0
+    assert DEPLOYMENT_PHASE.labels("invoice", "hot")._value.get() == 1.0
+    for phase in _DEPLOYMENT_PHASES:
+        if phase != "hot":
+            assert DEPLOYMENT_PHASE.labels("invoice", phase)._value.get() == 0.0
+
+    adapter.crash(record.pid)
+    reconciler.run_cycle()  # dead pid -> fast-fail, restart withheld (fit denies)
+
+    assert DEPLOYMENT_HEALTHY.labels("invoice")._value.get() == 0.0
+    assert DEPLOYMENT_PHASE.labels("invoice", "failed")._value.get() == 1.0
+    # The stale "hot=1" from the previous cycle must be cleared, not just left
+    # unset -- a Gauge never resets a label combo nobody re-sets.
+    assert DEPLOYMENT_PHASE.labels("invoice", "hot")._value.get() == 0.0
 
 
 def test_crashed_ready_deployment_fails_fast_without_respawn_when_fit_denies(
@@ -499,6 +549,42 @@ def test_publish_observed_updates_and_creates_rows() -> None:
     assert view["phase"] == "failed"
     assert view["endpoint"] == ""
     assert view["last_error"] == "runtime process exited"
+
+
+@pytest.mark.usefixtures("_sqlite_catalog")
+def test_publish_observed_round_trips_slot_count() -> None:
+    catalog = ModelCatalog()
+    view = catalog.publish_observed(
+        "invoice",
+        engine="llama-server",
+        state="ready",
+        endpoint="http://serving:8090/v1",
+        phase="hot",
+        pid=4242,
+        pid_create_time=111.0,
+        rss_bytes=2_000_000_000,
+        health_ok=True,
+        last_error=None,
+        slot_count=4,
+    )
+    assert view["slot_count"] == 4
+
+    # A deployment that stops being live publishes None -- never a stale
+    # slot count from the last time it was hot (same policy as throughput).
+    view = catalog.publish_observed(
+        "invoice",
+        engine="llama-server",
+        state="cold",
+        endpoint="",
+        phase="cold",
+        pid=None,
+        pid_create_time=None,
+        rss_bytes=0,
+        health_ok=False,
+        last_error=None,
+        slot_count=None,
+    )
+    assert view["slot_count"] is None
     assert len(catalog.list_placements()) == 1  # updated, not duplicated
 
 
@@ -556,6 +642,7 @@ def test_migration_adds_observed_columns_to_a_legacy_table(tmp_path: Path) -> No
         "ttft_ms",
         "throughput_measured_at",
         "throughput_source",
+        "slot_count",
     ]
     columns = {column["name"] for column in sa_inspect(engine).get_columns("model_placement")}
     assert {"phase", "pid", "rss_bytes", "health_ok", "last_probe_at", "last_error"} <= columns

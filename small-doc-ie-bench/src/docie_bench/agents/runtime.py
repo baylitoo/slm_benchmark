@@ -35,6 +35,7 @@ from docie_bench.extract.routing import (
     live_routing_audit,
 )
 from docie_bench.extract.service import ExtractionService
+from docie_bench.extract.validators import INVOICE_TOLERANCE, money_amount
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.mcp_servers.calculator import check_sum
@@ -129,6 +130,10 @@ def _generation_max_tokens(body: dict[str, Any], options: dict[str, Any]) -> int
     return raw
 
 
+def _parallel_extraction(body: dict[str, Any], options: dict[str, Any]) -> bool:
+    return bool(body.get("parallel_extraction", options.get("parallel_extraction")))
+
+
 def _resolve_extraction_schema(schema_name: str) -> tuple[str, dict[str, Any] | None]:
     """Return ExtractionService's schema mode and optional saved specification."""
     from docie_bench.schemas.extraction import schema_json
@@ -148,6 +153,21 @@ def _resolve_extraction_schema(schema_name: str) -> tuple[str, dict[str, Any] | 
         return "dynamic", saved["spec"]
 
 
+# Every key a field wrapper may carry beside its value. A wrapper is unwrapped
+# for the Agent's flat contract whatever subset of these it holds: gaining one
+# (``model_confidence``, when logprob confidence is on) must not change the
+# shape of the value a consumer reads.
+_WRAPPER_METADATA = frozenset({"evidence_ids", "confidence", "model_confidence"})
+
+
+def _is_wrapper(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and "value" in value
+        and set(value) - {"value"} <= (_WRAPPER_METADATA)
+    )
+
+
 def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
     """Restore the Agent endpoint's flat value contract after shared validation.
 
@@ -159,9 +179,9 @@ def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
         return [_flatten_agent_result(item, root=False) for item in value]
     if not isinstance(value, dict):
         return value
-    if "value" in value and set(value) <= {"value", "evidence_ids", "confidence"}:
+    if _is_wrapper(value):
         return _flatten_agent_result(value.get("value"), root=False)
-    omitted = {"evidence_ids", "confidence"}
+    omitted = set(_WRAPPER_METADATA)
     if root:
         omitted.update({"document_type", "extraction_notes"})
     return {
@@ -171,16 +191,70 @@ def _flatten_agent_result(value: Any, *, root: bool = True) -> Any:
     }
 
 
-def _money_amount(value: Any) -> float | None:
-    """A MoneyField's numeric amount from the rich (pre-flatten) validated
-    result — ``{"amount": "12.50", "currency": "EUR", ...}`` — or ``None``
-    when the field is absent, null, or unparseable."""
-    if not isinstance(value, dict) or value.get("amount") is None:
-        return None
-    try:
-        return float(value["amount"])
-    except (TypeError, ValueError):
-        return None
+def _prompt_profile(
+    name: str, profile: ModelProfile | None, profiles: dict[str, ModelProfile] | None
+) -> str | None:
+    """The prompt profile of whichever model profile actually served.
+
+    Post-processing differs by prompt profile -- the nuextract profiles run
+    their own normalisation pass -- so a consumer deciding how far to trust a
+    field needs to know which one ran, and a router may not have used the
+    profile the request named.
+    """
+    if profile is not None and profile.name == name:
+        return profile.prompt_profile
+    resolved = (profiles or {}).get(name)
+    if resolved is not None:
+        return resolved.prompt_profile
+    return profile.prompt_profile if profile is not None else None
+
+
+def _field_confidence(result: Any) -> dict[str, dict[str, Any]]:
+    """Per-field review signal for a flat Agent consumer.
+
+    Flattening drops the wrappers, so a consumer reading the completion's
+    content can tell that a record needs review (the aggregate validation
+    block) but not *which* field. This walks the rich result before it is
+    flattened and reports one entry per wrapped leaf, keyed by the same dotted
+    path the value sits at in the content: ``experience[0].title``.
+
+    Entries carry the grounding ``confidence`` (0..1, where a repetition-loop
+    truncation caps the field to 0.5) and, when logprob confidence is enabled,
+    ``model_logprob`` on its own scale. A field with no evidence is reported
+    too, at its real confidence of 0, which is the point.
+    """
+    out: dict[str, dict[str, Any]] = {}
+
+    def walk(node: Any, path: str) -> None:
+        if _is_wrapper(node):
+            entry: dict[str, Any] = {"confidence": node.get("confidence", 0.0)}
+            if node.get("model_confidence") is not None:
+                # Reported under a name that cannot be mistaken for a 0..1
+                # score: model_confidence is a natural-log probability (<= 0,
+                # closer to 0 = more confident), deliberately not renormalised
+                # (see extract/logprob_confidence.py). Side by side under
+                # similar names, a single "needs review below x" rule applied
+                # to both would flag every field that has one.
+                entry["model_logprob"] = node["model_confidence"]
+            if node.get("evidence_ids"):
+                entry["evidence_ids"] = list(node["evidence_ids"])
+            if path:
+                out[path] = entry
+            return
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in _WRAPPER_METADATA or (not path and key in _ROOT_OMITTED):
+                    continue
+                walk(item, f"{path}.{key}" if path else key)
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{path}[{index}]")
+
+    walk(result, "")
+    return out
+
+
+_ROOT_OMITTED = frozenset({"document_type", "extraction_notes"})
 
 
 def _invoice_sum_check(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -205,16 +279,22 @@ def _invoice_sum_check(result: dict[str, Any]) -> dict[str, Any] | None:
     amounts = [
         amount
         for item in line_items
-        if isinstance(item, dict)
-        and (amount := _money_amount(item.get("line_total"))) is not None
+        if isinstance(item, dict) and (amount := money_amount(item.get("line_total"))) is not None
     ]
     if not amounts:
         return None
-    total_field = "subtotal" if _money_amount(result.get("subtotal")) is not None else "total_ttc"
-    claimed_total = _money_amount(result.get(total_field))
+    total_field = "subtotal" if money_amount(result.get("subtotal")) is not None else "total_ttc"
+    claimed_total = money_amount(result.get(total_field))
     if claimed_total is None:
         return None
-    outcome = check_sum(amounts, claimed_total)
+    # check_sum is a float API; the amounts are read as Decimals and the
+    # threshold is the one the validator applies, so this answer and
+    # validation.warnings cannot disagree about the same invoice.
+    outcome = check_sum(
+        [float(amount) for amount in amounts],
+        float(claimed_total),
+        tolerance=float(INVOICE_TOLERANCE),
+    )
     return {**outcome, "total_field": total_field, "line_item_count": len(amounts)}
 
 
@@ -233,6 +313,7 @@ async def _complete_structured_document(
     max_tokens: int | None,
     executor: ExtractionService | ExtractionRouter | None = None,
     policy_name: str | None = None,
+    parallel_extraction: bool = False,
 ) -> dict[str, Any]:
     """Run an Agent document through the same extraction path as Playground.
 
@@ -255,7 +336,20 @@ async def _complete_structured_document(
     threading them (documented limitation, not hacked around here).
     """
     schema_mode, dynamic_schema = _resolve_extraction_schema(schema_name)
-    raw, suffix = _extract_document(body)
+    try:
+        raw, suffix = _extract_document(body)
+    except SolutionError as exc:
+        # Unlike extract_from_file below, this call sat OUTSIDE any try/except
+        # -- a request with no image_url part at all (e.g. the OpenAI
+        # file/file_data content-part convention, which this OCR path does
+        # not support) raised SolutionError straight through FastAPI as an
+        # unhandled 500, instead of the clean 400 every other malformed-input
+        # case here gets. Found via a real integration test hitting exactly
+        # this gap (schema-having agents only -- the schema-less branch below
+        # already wraps its own SolutionError-raising call correctly).
+        raise AgentError(
+            exc.message, status_code=exc.status_code, error_type=exc.error_type
+        ) from exc
     with NamedTemporaryFile(suffix=suffix, delete=False) as handle:
         handle.write(raw)
         path = Path(handle.name)
@@ -276,6 +370,7 @@ async def _complete_structured_document(
             dynamic_schema=dynamic_schema,
             language=language,
             metadata={"agent": spec.name},
+            parallel_extraction=parallel_extraction,
         )
     except ModelGatewayError as exc:
         raise AgentError(
@@ -284,9 +379,7 @@ async def _complete_structured_document(
             error_type="upstream_error",
         ) from exc
     except ValueError as exc:
-        raise AgentError(
-            str(exc), status_code=400, error_type="invalid_request_error"
-        ) from exc
+        raise AgentError(str(exc), status_code=400, error_type="invalid_request_error") from exc
     finally:
         path.unlink(missing_ok=True)
 
@@ -321,6 +414,17 @@ async def _complete_structured_document(
         "mode": mode,
         "validation": response.validation.model_dump(),
         "response_format_style": response.response_format_style,
+        "latency_ms": response.latency_ms,
+        "queue_wait_ms": response.queue_wait_ms,
+        "generation_ms": (
+            max(response.latency_ms - response.queue_wait_ms, 0)
+            if response.queue_wait_ms is not None
+            else response.latency_ms
+        ),
+        "parallel_groups": response.parallel_groups,
+        "field_confidence": _field_confidence(response.result),
+        "model_profile": response.model_profile,
+        "prompt_profile": _prompt_profile(response.model_profile, profile, profiles),
     }
     if routing_audit is not None:
         docie_agent["routing"] = routing_audit
@@ -448,6 +552,7 @@ async def _complete_ocr(
                 mode=mode,
                 output_model=upstream.model,
                 max_tokens=max_tokens,
+                parallel_extraction=_parallel_extraction(body, options),
             )
         upstream, base = _prepare_vision_forward(spec, body, options, max_tokens)
         completion = await _post_chat(upstream, base, http_client=http_client)
@@ -470,7 +575,7 @@ async def _complete_ocr(
         # model. Runs through the shared structured path with a prebuilt
         # router as the executor.
         if extractor_selector.startswith(_POLICY_PREFIX):
-            policy_name = extractor_selector[len(_POLICY_PREFIX):]
+            policy_name = extractor_selector[len(_POLICY_PREFIX) :]
             schema_name = options.get("schema")
             if not schema_name:
                 raise AgentError(
@@ -493,6 +598,7 @@ async def _complete_ocr(
                 max_tokens=max_tokens,
                 executor=router,
                 policy_name=policy_name,
+                parallel_extraction=_parallel_extraction(body, options),
             )
         extractor = _resolve_backing(extractor_selector)
         profiles[extractor.name] = extractor
@@ -535,6 +641,7 @@ async def _complete_ocr(
                 mode=mode,
                 output_model=extractor.model,
                 max_tokens=max_tokens,
+                parallel_extraction=_parallel_extraction(body, options),
             )
     else:
         kind = "ocr"
@@ -606,8 +713,7 @@ async def _complete_proxy(
     unsafe = moderation_flags(guard_state.get("moderation") or {})
     if mode == "block" and unsafe:
         raise AgentError(
-            f"request blocked by agent {spec.name!r}: flagged by moderation "
-            f"({', '.join(unsafe)})",
+            f"request blocked by agent {spec.name!r}: flagged by moderation ({', '.join(unsafe)})",
             status_code=400,
             error_type="unsafe_blocked",
         )
@@ -632,9 +738,7 @@ async def _complete_proxy(
         "analyzer": analyzer_label,
         "detected": sum(detected_types.values()),
         # Types + placeholders only — raw values never leave the process.
-        "entities": [
-            {"type": t, "count": n} for t, n in sorted(detected_types.items())
-        ],
+        "entities": [{"type": t, "count": n} for t, n in sorted(detected_types.items())],
         "placeholders": sorted(placeholders) if mode == "placeholder" else [],
     }
     if guard_state.get("degraded"):
@@ -703,11 +807,7 @@ def _build_analyzer(
             status_code=500,
             error_type="invalid_agent_config",
         )
-    labels = (
-        [str(label) for label in labels_raw]
-        if labels_raw
-        else labels_from_entities(entities)
-    )
+    labels = [str(label) for label in labels_raw] if labels_raw else labels_from_entities(entities)
     threshold_raw = options.get("guard_threshold")
     try:
         threshold = float(threshold_raw) if threshold_raw is not None else None
@@ -741,9 +841,7 @@ def _build_analyzer(
             if fallback_to_regex:
                 guard_state["degraded"] = True
                 return pii.analyze(text, entities)
-            raise AgentError(
-                exc.message, status_code=502, error_type="guard_unavailable"
-            ) from exc
+            raise AgentError(exc.message, status_code=502, error_type="guard_unavailable") from exc
         if result.moderation:
             _merge_moderation(guard_state, result.moderation)
         return result.entities
@@ -944,9 +1042,7 @@ async def _complete_with_tools(
                     # branch (returned to the caller, never executed) rather
                     # than being honored.
                     tools = [t for t in tools if t["function"]["name"] in allowed]
-                    mapping = {
-                        name: target for name, target in mapping.items() if name in allowed
-                    }
+                    mapping = {name: target for name, target in mapping.items() if name in allowed}
                 completion = await mcp_mod.run_tool_loop(
                     post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
                 )
@@ -1107,9 +1203,7 @@ async def _stream_with_tools(
                         if allowed is not None:
                             tools = [t for t in tools if t["function"]["name"] in allowed]
                             mapping = {
-                                name: target
-                                for name, target in mapping.items()
-                                if name in allowed
+                                name: target for name, target in mapping.items() if name in allowed
                             }
                         completion = await mcp_mod.run_tool_loop(
                             post, forward, sessions, mapping, tools, on_tool_call=record_tool_call
@@ -1348,8 +1442,7 @@ def _resolve_step_agent(spec: AgentSpec, step_name: str, agent_name: str) -> Age
         return AgentRegistry().get(agent_name)
     except AgentNotFoundError as exc:
         raise AgentError(
-            f"agent {spec.name!r}: step {step_name!r} references unknown agent "
-            f"{agent_name!r}",
+            f"agent {spec.name!r}: step {step_name!r} references unknown agent {agent_name!r}",
             status_code=500,
             error_type="invalid_agent_config",
         ) from exc
@@ -1683,9 +1776,7 @@ async def stream_workflow(
                     step_name=step_name,
                 ):
                     if event["type"] == "tool_call":
-                        tool_call_trace.append(
-                            {k: v for k, v in event.items() if k != "type"}
-                        )
+                        tool_call_trace.append({k: v for k, v in event.items() if k != "type"})
                         yield event
                     elif event["type"] == "error":
                         yield event

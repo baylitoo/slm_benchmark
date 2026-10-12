@@ -35,6 +35,7 @@ export type SectionId =
   | "deploy"
   | "agents"
   | "benchmark"
+  | "schemas"
   | "review"
   | "observability";
 
@@ -74,6 +75,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { id: "agents", label: "Templates", icon: LayoutGrid, view: "catalog" },
       { id: "agents", label: "My Agents", icon: Bot, view: "instances" },
       { id: "agents", label: "Create", icon: PlusCircle, view: "create" },
+      { id: "schemas", label: "Schemas", icon: FileStack },
     ],
   },
   {
@@ -100,12 +102,13 @@ export const NAV_GROUPS: NavGroup[] = [
   },
 ];
 
-/** The SIX unique sections — the single source of truth for the mount loop. */
+/** The unique sections — the single source of truth for the mount loop. */
 export const SECTIONS: SectionId[] = [
   "playground",
   "deploy",
   "agents",
   "benchmark",
+  "schemas",
   "review",
   "observability",
 ];
@@ -116,6 +119,7 @@ export const DEFAULT_VIEW: Record<SectionId, string> = {
   deploy: "deployments",
   agents: "catalog",
   benchmark: "run",
+  schemas: "",
   review: "",
   observability: "",
 };

@@ -38,6 +38,7 @@ EXPECTED_STUDIO_ROUTES = {
     ("GET", "/v1/studio/schemas/dynamic/{name}"),
     ("POST", "/v1/studio/schemas/dynamic"),
     ("DELETE", "/v1/studio/schemas/dynamic/{name}"),
+    ("PUT", "/v1/studio/schemas/dynamic/{name}"),
     ("GET", "/v1/studio/routing-policies"),
     ("GET", "/v1/studio/routing-policies/{name}"),
     ("POST", "/v1/studio/routing-policies"),
@@ -76,4 +77,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 37
+    assert len(EXPECTED_STUDIO_ROUTES) == 38

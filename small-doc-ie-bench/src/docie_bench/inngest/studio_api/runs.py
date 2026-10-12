@@ -65,8 +65,26 @@ async def event_runs(event_id: str, tenant: TenantDependency) -> Any:
             if record is not None:
                 # Durable benchmark run: answer from the index.
                 return record
-            # Owned extraction run: fall through to the proxy below (scoped by the
-            # ownership check we just passed).
+            # An owned extraction run (no StudioRun row -- those don't get
+            # one). Check the durable extraction-result row BEFORE ever
+            # touching the Inngest proxy below: it is authoritative once the
+            # run has finished and does not depend on the self-hosted Inngest
+            # server's REST API carrying `output` on its own run-status
+            # endpoint (confirmed via a real integration test that it does
+            # not reliably do so -- see ExtractionRunResult's docstring).
+            # Still-running extractions have no row yet and fall through.
+            from docie_bench.studio.extraction_results import get_extraction_result
+
+            extraction = get_extraction_result(event_id, tenant_id=tenant.tenant_id)
+            if extraction is not None:
+                return [
+                    {
+                        "run_id": event_id,
+                        "status": "Completed" if extraction["status"] == "completed" else "Failed",
+                        "output": extraction["output"],
+                        "error": extraction["error"],
+                    }
+                ]
         else:
             # Store is enabled but no ownership is recorded for this id: we cannot
             # prove the caller owns it, so refuse rather than leak another

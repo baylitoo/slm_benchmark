@@ -21,6 +21,7 @@ import docie_bench.storage.db as db
 from docie_bench.serving.resources import (
     DEFAULT_DEPLOY_CONTEXT_LENGTH,
     KV_CACHE_BYTES_PER_TOKEN,
+    LFM2_KV_CACHE_BYTES_PER_TOKEN,
     RUNTIME_OVERHEAD_BYTES,
     FootprintStore,
 )
@@ -279,6 +280,29 @@ def test_calibrated_steady_rss_lifts_the_footprint(tmp_path: Path) -> None:
     assert fit.calibrated_bytes == 5 * GIB
     assert fit.footprint_bytes == 5 * GIB  # measurement wins over the formula
     assert fit.fits_now == (6 * GIB) // (5 * GIB) == 1
+
+
+def test_lfm2_family_prices_with_its_own_smaller_kv_cache_constant(tmp_path: Path) -> None:
+    """A never-run LFM2 deployment at a long context must be priced with the
+    family's real, much smaller per-token KV cost -- not the generic
+    constant, which would overestimate a hybrid conv+attention model like
+    LFM2.5 badly enough to starve the rest of the node's RAM budget."""
+    context = 65_536
+    models = [_model("lfm2-2.6b", 3 * GIB, family="lfm2")]
+
+    report = compute_sizing(
+        models,
+        _snapshot(),
+        footprints=_footprints(tmp_path),
+        context_length=context,
+        margin_fraction=0.0,
+    )
+
+    fit = report.per_model[0]
+    assert fit.predicted_bytes == (
+        3 * GIB + LFM2_KV_CACHE_BYTES_PER_TOKEN * context + RUNTIME_OVERHEAD_BYTES
+    )
+    assert fit.predicted_bytes < _fp(3 * GIB, context=context)  # far below the generic formula
 
 
 def test_mmproj_is_priced_into_the_footprint(tmp_path: Path) -> None:

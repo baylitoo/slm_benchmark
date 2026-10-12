@@ -71,7 +71,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from docie_bench.serving.resources import _serving_home
+from docie_bench.serving.paths import serving_home
 from docie_bench.serving.resources import footprint_key as model_key
 from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
 
@@ -408,7 +408,7 @@ class ThroughputStore:
     """
 
     def __init__(self, home: Path | None = None) -> None:
-        self._directory = (home if home is not None else _serving_home()) / "throughput"
+        self._directory = (home if home is not None else serving_home()) / "throughput"
 
     @property
     def directory(self) -> Path:

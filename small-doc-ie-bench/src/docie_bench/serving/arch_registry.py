@@ -46,6 +46,13 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "phi3": "openai_chat",
     "stablelm": "openai_chat",
     "lfm2": "lfm2",
+    # XHToken Spark-X2.5 (1.7B): a hybrid sliding-window/full-attention
+    # backbone (ggml-org/llama.cpp#27868, merged 2026-09-06) -- own family
+    # (not lumped into "openai_chat") purely so the KV-cache sizing engine
+    # (serving.resources) can price its real, much cheaper per-token cost
+    # instead of the generic dense-attention ceiling, same reason "lfm2" is
+    # its own family and not just "openai_chat" underneath.
+    "spark2_5": "spark2_5",
     # vision (need an mmproj projector)
     "qwen2vl": "lfm2_vl",
     "qwen2_vl": "lfm2_vl",
@@ -111,6 +118,13 @@ DEFAULT_VISION_FAMILY = "lfm2_vl"
 # a "supported" verdict is honest ("rebuild the serving image if it won't
 # load"). Keyed by arch → the note shown to the operator.
 RUNTIME_NOTES: dict[str, str] = {
+    "spark2_5": (
+        "serving needs a llama-server built after ggml-org/llama.cpp#27868 "
+        "(merged 2026-09-06, Spark-X2.5 support) — rebuild the serving image "
+        "if the deploy fails to load. The published GGUF was converted with "
+        "the model author's own llama.cpp fork; verify it loads against "
+        "mainline before relying on it in production."
+    ),
     "unlimited-ocr": (
         "serving needs a llama-server built after ggml-org/llama.cpp#24969 "
         "(2026-06-24) — rebuild the serving image if the deploy fails to load"
@@ -180,6 +194,15 @@ class RepoSignals:
     pipeline_tag: str | None = None
     base_model: str | None = None
     library_name: str | None = None
+
+def _is_gliformer(signals: RepoSignals) -> bool:
+    """A GLiFormer repo, by how it describes itself rather than by its backbone."""
+    if (signals.library_name or "").strip().lower() == "gliformer":
+        return True
+    if any(str(tag).strip().lower() == "gliformer" for tag in signals.tags or ()):
+        return True
+    return "gliformer" in (signals.repo_id or "").lower()
+
 
 
 def _multi_vector_confidence(signals: RepoSignals) -> Confidence | None:
@@ -304,6 +327,17 @@ def resolve_family(
     if "gliner" in arch:
         family = "encoder_gliner2" if "2" in arch else "encoder_gliner"
         return SupportVerdict("supported", family, f"analyzer architecture {architecture!r}")
+
+    # GLiFormer ships no config.json at all (its weights are described by
+    # gliner_config.json), so `arch` is empty and the "no architecture" gate
+    # below would claim it. It is identified the way the repo advertises
+    # itself: library_name, the gliformer tag, or the repo id. Note the repo
+    # also carries a "gliner" TAG — matched on `arch` above, never on tags, so
+    # the two families do not collide.
+    if _is_gliformer(signals):
+        return SupportVerdict(
+            "supported", "encoder_gliformer", "GLiFormer analyzer (library_name=gliformer)"
+        )
 
     if not architecture:
         if has_gguf:

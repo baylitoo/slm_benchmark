@@ -36,6 +36,7 @@ import {
   rerank,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
+  structuringDeploymentNames,
   visionDeploymentNames,
   getDeployments,
   getStore,
@@ -121,18 +122,27 @@ export function Playground({
     () => rerankerDeploymentNames(store.data, families.data),
     [store.data, families.data],
   );
-  // Encoders (analyzers) AND embedding models are excluded from chat/arena:
-  // they don't answer chat prompts. Embedding/reranker models live in the
-  // Embed/Rerank mode instead. Vision and extraction ride the SAME deployment
-  // list — Chat now handles both inline, so there's no separate narrowing.
+  const structuringNames = useMemo(
+    () => structuringDeploymentNames(store.data, families.data),
+    [store.data, families.data],
+  );
+  // Encoders AND embedding models are excluded from chat/arena: they don't
+  // answer chat prompts. Embedding/reranker models live in the Embed/Rerank
+  // mode instead. Vision and extraction ride the SAME deployment list — Chat
+  // now handles both inline, so there's no separate narrowing.
+  //
+  // An encoder with a structuring head is the exception: it answers a schema
+  // with records, so it belongs here even though the encoder runtime launches
+  // it. Filtering on the runtime alone hid GLiFormer from extraction entirely.
   const selectable = useMemo(
     () =>
       selectableDeployments(deployments.data ?? []).filter(
         (d) =>
-          d.spec?.launch?.runtime !== "encoder" &&
+          (d.spec?.launch?.runtime !== "encoder" ||
+            Boolean(d.spec?.name && structuringNames.has(d.spec.name))) &&
           !(d.spec?.name && embeddingNames.has(d.spec.name)),
       ),
-    [deployments.data, embeddingNames],
+    [deployments.data, embeddingNames, structuringNames],
   );
 
   return (
@@ -593,6 +603,8 @@ export function ChatPanel({
   const [selectedPolicy, setSelectedPolicy] = useState<string>("");
   const [ocrBackend, setOcrBackend] = useState("");
   const [language, setLanguage] = useState("");
+  const [parallelExtraction, setParallelExtraction] = useState(false);
+  const [responseFormatStyle, setResponseFormatStyle] = useState("");
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -636,6 +648,10 @@ export function ChatPanel({
       }
       if (ocrBackend.trim()) payload.ocr_backend = ocrBackend.trim();
       if (language.trim()) payload.language = language.trim();
+      if (parallelExtraction) payload.parallel_extraction = true;
+      if (modelSource === "single" && responseFormatStyle.trim()) {
+        payload.response_format_style = responseFormatStyle.trim();
+      }
       return payload;
     }
 
@@ -1394,6 +1410,32 @@ export function ChatPanel({
                 placeholder="(auto)"
               />
             </Field>
+            {modelSource === "single" && (
+              <Field
+                label="Response format"
+                hint="Optional — replaces the deployment's style for this run, e.g. json_object or gliformer_records."
+              >
+                <TextInput
+                  value={responseFormatStyle}
+                  onChange={(e) => setResponseFormatStyle(e.target.value)}
+                  placeholder="(deployment default)"
+                />
+              </Field>
+            )}
+            <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground/90">
+              <input
+                type="checkbox"
+                checked={parallelExtraction}
+                onChange={(e) => setParallelExtraction(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5"
+              />
+              <span>
+                <T>Parallel extraction</T>
+                <span className="block text-muted-foreground">
+                  <T>Splits list fields into concurrent sub-extractions, each with its own output budget. No live preview for that run. Needs a deployment with 2+ slots.</T>
+                </span>
+              </span>
+            </label>
           </div>
         )}
 

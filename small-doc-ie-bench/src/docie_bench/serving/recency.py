@@ -24,24 +24,15 @@ import re
 import time
 from pathlib import Path
 
+from docie_bench.serving.paths import serving_home
+
 logger = logging.getLogger(__name__)
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-def _serving_home() -> Path:
-    # Must match control_plane.from_defaults / profile_resolver so every
-    # container reads and writes the SAME shared serving-state volume.
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
-
-
 def recency_dir(home: Path | None = None) -> Path:
-    return (home if home is not None else _serving_home()) / "recency"
+    return (home if home is not None else serving_home()) / "recency"
 
 
 def _filename(name: str) -> str:
@@ -83,7 +74,7 @@ def _deployment_record_names(home: Path | None = None) -> frozenset[str]:
     effects): any hiccup reads as "no deployments", so a recency stamp can
     never fail the extraction that produced it.
     """
-    path = (home if home is not None else _serving_home()) / "deployments.json"
+    path = (home if home is not None else serving_home()) / "deployments.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

@@ -107,7 +107,12 @@ def save_document(session_id: str | None, filename: str, content: bytes) -> tupl
         )
     sid = _new_session_id() if session_id is None else session_id
     directory = _session_dir(sid, create=session_id is None)
-    existing = sum(1 for _ in directory.glob("*"))
+    # Only real documents count -- a bare directory.glob("*") would also
+    # count doc_summarization's "<name>.summary.json" sidecars, silently
+    # halving the effective cap once summarization is enabled (#430).
+    existing = sum(
+        1 for p in directory.glob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES
+    )
     if existing >= settings.mcp_session_documents_max_files:
         raise SessionDocumentError(
             f"session already has {existing} documents "

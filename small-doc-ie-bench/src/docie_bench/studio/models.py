@@ -25,7 +25,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+# isoformat lives with Base so the serving catalog can use the same one; it
+# is re-exported here because every studio store already imports it from us.
 from docie_bench.storage.db import Base
+from docie_bench.storage.db import isoformat as isoformat
 
 
 def utcnow() -> dt.datetime:
@@ -86,10 +89,9 @@ class DynamicSchema(Base):
     Studio's schema builder.
 
     Shared operator config like ``models.yaml``/``data/datasets.yaml`` -- no
-    ``tenant_id``, unlike ``StudioRun``'s per-tenant scoping. Create-only for now
-    (409 on a duplicate ``name``): no version/lifecycle field, matching the "save
-    and reuse by name" scope of this first slice -- not the full draft/published
-    versioning the original roadmap brief described. ``name`` doubles as
+    ``tenant_id``, unlike ``StudioRun``'s per-tenant scoping. Creation rejects a
+    duplicate name; edits replace the definition in place without a version or
+    lifecycle field. ``name`` doubles as
     ``DynamicSchemaSpec.document_type`` (both already share the same snake_case
     pattern), so a saved schema's own name IS the identifier extraction requests
     reference.
@@ -232,6 +234,37 @@ class StudioEventOwner(Base):
 
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class ExtractionRunResult(Base):
+    """Durable outcome of one extraction run, keyed by its Inngest event id.
+
+    ``GET /v1/studio/runs/{event_id}`` is documented as pollable over plain
+    HTTP with only an API key, no Inngest client required -- but that
+    previously depended entirely on proxying Inngest's own
+    ``GET /v1/events/{id}/runs``, whose ``output`` field is NOT reliably
+    populated by this project's self-hosted Inngest server (confirmed by a
+    real external integration test, not speculation: Inngest's Cloud REST API
+    docs show `output` present on that endpoint, but self-hosted `inngest
+    start` does not guarantee the same parity). ``extract_document`` writes
+    its own outcome here on completion; the run-status route reads this
+    FIRST, before ever touching the Inngest proxy, making the "no Inngest
+    client needed" guarantee true regardless of the self-hosted server's REST
+    completeness. The realtime ``result``/``error`` topics remain the primary,
+    lower-latency channel for an Inngest-aware subscriber; this is the
+    durable counterpart for a plain polling caller.
+    """
+
+    __tablename__ = "extraction_run_results"
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    status: Mapped[str] = mapped_column(String(32))  # "completed" | "failed"
+    output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )

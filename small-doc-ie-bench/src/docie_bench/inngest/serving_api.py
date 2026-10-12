@@ -34,6 +34,7 @@ from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
 from docie_bench.serving.failure import classify_failure
+from docie_bench.serving.paths import serving_home
 from docie_bench.settings import get_settings
 
 logger = logging.getLogger("docie_bench.inngest.serving_api")
@@ -575,21 +576,10 @@ async def deployment_slots(name: str) -> dict[str, Any]:
     return {"name": name, "slots": list(slots)}
 
 
-def _serving_home() -> Path:
-    """The shared serving home (``DOCIE_SERVING_HOME``) on the serving-state
-    volume that api, serving and worker all mount."""
-    return Path(
-        os.environ.get(
-            "DOCIE_SERVING_HOME",
-            Path.home() / ".local" / "share" / "docie-bench" / "serving",
-        )
-    )
-
-
 def _serving_logs_dir() -> Path:
     """``<serving_home>/logs`` — the runtime stdout files the supervisor writes,
     readable by the api (it never spawned the process)."""
-    return _serving_home() / "logs"
+    return serving_home() / "logs"
 
 
 @router.get("/deployments/{name}/logs")
@@ -856,6 +846,17 @@ class ScaleRequest(BaseModel):
     n_parallel: int = Field(default=1, ge=1, le=32)
     cache_reuse: int | None = Field(default=None, ge=1)
     chat_template_file: str | None = None
+    batch_size: int | None = Field(default=None, ge=1)
+    ubatch_size: int | None = Field(default=None, ge=1)
+    numa: str | None = None
+    cpu_threads: int | None = Field(default=None, ge=1)
+    cpu_threads_batch: int | None = Field(default=None, ge=1)
+    cache_type_k: str | None = None
+    cache_type_v: str | None = None
+    reasoning_budget: int | None = Field(default=None, ge=-1)
+    reasoning_budget_message: str | None = None
+    flash_attn: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 @router.post("/store/{name}/scale")
@@ -916,6 +917,28 @@ async def scale_store_model(
                 data["cache_reuse"] = request.cache_reuse
             if request.chat_template_file is not None:
                 data["chat_template_file"] = request.chat_template_file
+            if request.batch_size is not None:
+                data["batch_size"] = request.batch_size
+            if request.ubatch_size is not None:
+                data["ubatch_size"] = request.ubatch_size
+            if request.numa is not None:
+                data["numa"] = request.numa
+            if request.cpu_threads is not None:
+                data["cpu_threads"] = request.cpu_threads
+            if request.cpu_threads_batch is not None:
+                data["cpu_threads_batch"] = request.cpu_threads_batch
+            if request.cache_type_k is not None:
+                data["cache_type_k"] = request.cache_type_k
+            if request.cache_type_v is not None:
+                data["cache_type_v"] = request.cache_type_v
+            if request.reasoning_budget is not None:
+                data["reasoning_budget"] = request.reasoning_budget
+            if request.reasoning_budget_message is not None:
+                data["reasoning_budget_message"] = request.reasoning_budget_message
+            if request.flash_attn is not None:
+                data["flash_attn"] = request.flash_attn
+            if request.timeout_seconds is not None:
+                data["timeout_seconds"] = request.timeout_seconds
             ids = await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
             event_ids.extend(ids)
         return {
@@ -1046,7 +1069,7 @@ def _ondisk_store_view() -> list[dict[str, Any]]:
     from docie_bench.serving.catalog import available_backends
     from docie_bench.serving.model_store import FAMILIES, ModelStore
 
-    store = ModelStore(_serving_home() / "models")
+    store = ModelStore(serving_home() / "models")
     view: list[dict[str, Any]] = []
     for entry in store.list():
         contract = FAMILIES.get(entry.family)
@@ -1066,6 +1089,7 @@ def _ondisk_store_view() -> list[dict[str, Any]]:
                 "embedding": bool(contract and contract.embedding),
                 "reranker": bool(contract and contract.reranker),
                 "analyzer": bool(contract and contract.analyzer),
+                "structured_extraction": bool(contract and contract.structured_extraction),
                 "available_backends": available_backends(entry.family),
                 "has_mmproj": entry.mmproj_path is not None,
                 "source": entry.source,
@@ -1126,6 +1150,7 @@ async def list_families() -> Any:
             "reranker": fam.reranker,
             "multi_vector": fam.multi_vector,
             "analyzer": fam.analyzer,
+            "structured_extraction": fam.structured_extraction,
             "encoder_backend": fam.encoder_backend,
             "transformers_runtime": fam.transformers_runtime,
             "trust_remote_code": fam.trust_remote_code,

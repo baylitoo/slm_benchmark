@@ -95,6 +95,11 @@ class FamilyContract:
     # the store-driven replacement for the server's name-based auto-detection.
     analyzer: bool = False
     encoder_backend: str | None = None
+    # An analyzer that ALSO answers a schema: GLiFormer's structure() head reads
+    # text and returns records, so the model belongs in the extraction picker
+    # even though it is served by the encoder runtime. Being an analyzer says
+    # how it is launched; this says what it can be asked for.
+    structured_extraction: bool = False
     # A transformers/AutoModel family: a safetensors snapshot served by the
     # TRANSFORMERS runtime (docie transformers), NOT llama.cpp. The LAST-RESORT
     # path for a model with no GGUF / an arch llama.cpp cannot serve — stored as
@@ -115,7 +120,7 @@ class FamilyContract:
     # whose served id matches no models.yaml profile). These are the single source
     # of truth for a family's tuning, so such a deployment runs with the family's
     # intended params — NOT the bare ModelProfile defaults (900 / 0.0 / 180), which
-    # would silently degrade a model like NuExtract3 that needs 4096 tokens.
+    # would silently degrade a model like NuExtract3 that needs long outputs.
     default_temperature: float = 0.0
     default_max_tokens: int = 900
     default_timeout_seconds: float = 180.0
@@ -139,6 +144,9 @@ class FamilyContract:
 
 
 # Known families. Adding a new model is "drop the GGUF + pick (or add) a family".
+_SNAPSHOT_WEIGHT_SUFFIXES = frozenset({".safetensors", ".bin", ".pt", ".pth"})
+
+
 FAMILIES: dict[str, FamilyContract] = {
     "nuextract3": FamilyContract(
         name="nuextract3",
@@ -149,7 +157,11 @@ FAMILIES: dict[str, FamilyContract] = {
         needs_mmproj=True,
         vision=True,
         default_temperature=0.2,
-        default_max_tokens=4096,
+        # NuMind sizes long answers well past 4096 (their largest benchmark
+        # ground truth is ~22k tokens); a CV's nested skill lists already come
+        # within 150 tokens of 4096. llama-server stops at the slot's context
+        # rather than rejecting a larger budget, so this only lifts the cap.
+        default_max_tokens=16384,
         default_timeout_seconds=600.0,
         ollama_faithful=False,
     ),
@@ -199,9 +211,34 @@ FAMILIES: dict[str, FamilyContract] = {
         needs_mmproj=False,
         vision=False,
         default_temperature=0.0,  # extraction-deterministic (Liquid's 0.1 is a chat rec)
-        default_max_tokens=900,
+        default_max_tokens=4096,
         default_timeout_seconds=180.0,
         ollama_faithful=True,  # standard template; Ollama auto-extracts the embedded one
+    ),
+    # XHToken Spark-X2.5 (1.7B, arch_registry.py). A standard instruct model
+    # from the extraction client's point of view -- response_format rides
+    # openai_json_schema like lfm2, needing no chat_template_kwargs -- but
+    # its GGUF chat template renders genuine tool-call XML (<tool_call>...),
+    # unlike LFM2.5-1.2B-Thinking's baked template (which needed a manual
+    # chat_template_file override, see #407), so tools=True should hold
+    # out-of-the-box PROVIDED the template renders faithfully under
+    # llama-server's --jinja (verify at deploy, not assumed here). Own family
+    # rather than folded into "openai_chat" for the same reason as "lfm2":
+    # its hybrid sliding-window/full-attention shape needs its own KV-cache
+    # sizing constant (serving.resources.SPARK2_5_KV_CACHE_BYTES_PER_TOKEN).
+    "spark2_5": FamilyContract(
+        name="spark2_5",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja",),
+        tools=True,
+        needs_mmproj=False,
+        vision=False,
+        default_temperature=0.0,
+        default_max_tokens=4096,  # matches lfm2's own default (#435)
+        default_timeout_seconds=180.0,
+        ollama_faithful=True,
     ),
     # LiquidAI LFM2.5-VL (1.6B). SigLIP2 encoder + connector on the LFM2 backbone;
     # ships a projector, so `needs_mmproj=True` (family_launch_args appends
@@ -309,6 +346,25 @@ FAMILIES: dict[str, FamilyContract] = {
         prompt_profile="strict_extraction_v1",
         analyzer=True,
         encoder_backend="gliner",
+        ollama_faithful=False,
+    ),
+    # GLiFormer: the analyzer surface of encoder_gliner plus a `structure` head
+    # (see encoders/server.py). Served by the same encoder runtime.
+    "encoder_gliformer": FamilyContract(
+        name="encoder_gliformer",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        # Not "none": the schema on the request IS how this family extracts.
+        # Without it the server has nothing to structure into and falls back to
+        # entity recognition.
+        response_format_style="openai_json_schema",
+        # The schema travels in response_format, so the prompt carries the
+        # document and nothing else — the same shape NuExtract3 uses. The
+        # generic extraction prompt is instructions this model cannot follow and
+        # spans it can mistake for the document.
+        prompt_profile="document_only",
+        analyzer=True,
+        encoder_backend="gliformer",
+        structured_extraction=True,
         ollama_faithful=False,
     ),
     "encoder_gliner2": FamilyContract(
@@ -664,9 +720,13 @@ class ModelStore:
         src = Path(snapshot_dir)
         if not src.is_dir():
             raise ModelStoreError(f"snapshot directory not found: {src}")
-        if not any(p.suffix == ".safetensors" for p in src.rglob("*") if p.is_file()):
+        # Safetensors OR PyTorch weights: an encoder checkpoint that ships only
+        # pytorch_model.bin loads the same way through ``from_pretrained``.
+        if not any(
+            p.suffix in _SNAPSHOT_WEIGHT_SUFFIXES for p in src.rglob("*") if p.is_file()
+        ):
             raise ModelStoreError(
-                f"snapshot {src} has no .safetensors weights — not a servable checkpoint"
+                f"snapshot {src} has no weights — not a servable checkpoint"
             )
         _assert_within(self.root / name, self.root, label=f"store name {name!r}")
 

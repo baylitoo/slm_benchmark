@@ -254,6 +254,51 @@ async def test_circuit_breaker_rejects_then_allows_recovery_probe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_circuit_breaker_recovers_after_probe_is_cancelled() -> None:
+    """A cancelled recovery probe (client disconnect / hard-stop while the
+    probe request is in flight) must not wedge the circuit open forever
+    either -- CancelledError is a BaseException, so it bypasses the
+    `except Exception` handler that normally releases half_open_in_flight
+    (see test_circuit_breaker_recovers_after_permanent_error_during_probe for
+    the classification-based version of this same failure shape, fixed by
+    #167). Without a dedicated CancelledError handler, cancellation reproduces
+    the identical permanently-wedged symptom through a different trigger."""
+    now = 0.0
+    status = 503  # trips the breaker (transient)
+    cancel = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if cancel:
+            raise asyncio.CancelledError
+        if status == 200:
+            return _completion('{"ok": true}')
+        return httpx.Response(status, text="failing")
+
+    client = await _client(
+        _profile(circuit_breaker_failure_threshold=1, circuit_breaker_reset_seconds=10),
+        handler,
+    )
+    client._gateway._monotonic = lambda: now
+    try:
+        with pytest.raises(ModelGatewayError, match="503"):
+            await _chat(client)  # trips the breaker (transient failure)
+
+        now = 11  # cooldown elapsed -- this call becomes the half-open probe
+        cancel = True  # the probe itself is cancelled mid-flight
+        with pytest.raises(asyncio.CancelledError):
+            await _chat(client)
+
+        # Without the fix: half_open_in_flight stays True, so every call
+        # from here on raises CircuitOpenError ("recovery probe is already
+        # running") forever, even though nothing is actually running.
+        cancel = False
+        status = 200
+        assert await _chat(client) == {"ok": True}
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_recovers_after_permanent_error_during_probe() -> None:
     """A non-transient (PERMANENT/CAPABILITY) error during the half-open
     recovery probe must not wedge the circuit open forever. _record_failure
@@ -332,6 +377,72 @@ async def test_shared_per_model_concurrency_and_queue_limit() -> None:
         await second.aclose()
         await third.aclose()
     assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_last_queue_wait_ms_reflects_actual_semaphore_wait() -> None:
+    """Regression: extraction's latency log/response lumped queue wait and
+    generation time into one docie_latency_ms, with no way to tell whether a
+    slow request was stuck behind other requests or genuinely slow to
+    generate. OpenAICompatibleClient.last_queue_wait_ms should be ~0 for a
+    call that acquires the semaphore immediately, and reflect the real wait
+    for a call stuck behind another one holding it."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await release.wait()
+        return _completion()
+
+    profile = _profile(max_concurrency=1, queue_limit=1)
+    first = await _client(profile, handler)
+    second = await _client(profile, handler)
+    first_task = asyncio.create_task(_chat(first))
+    try:
+        await entered.wait()
+        second_task = asyncio.create_task(_chat(second))
+        await asyncio.sleep(0.05)  # second is now parked waiting on the semaphore
+        release.set()
+        await first_task
+        await second_task
+    finally:
+        release.set()
+        await first.aclose()
+        await second.aclose()
+
+    assert first.last_queue_wait_ms < 20
+    assert second.last_queue_wait_ms >= 40
+
+
+def test_state_for_warns_once_when_max_concurrency_exceeds_observed_slots(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from docie_bench.llm.model_gateway import _state_for
+
+    profile = _profile(max_concurrency=4, deployment_slot_count=1)
+
+    with caplog.at_level("WARNING"):
+        _state_for(profile)
+        _state_for(profile)  # second call reuses the cached state -- no re-warn
+
+    warnings = [r for r in caplog.records if "real slot" in r.message]
+    assert len(warnings) == 1
+    assert profile.name in warnings[0].message
+
+
+def test_state_for_does_not_warn_when_slots_are_unobserved_or_sufficient(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from docie_bench.llm.model_gateway import _state_for
+
+    with caplog.at_level("WARNING"):
+        _state_for(_profile(name="unobserved", max_concurrency=4, deployment_slot_count=None))
+        _state_for(
+            _profile(name="sufficient", model="sufficient", max_concurrency=4, deployment_slot_count=4)
+        )
+
+    assert not [r for r in caplog.records if "real slot" in r.message]
 
 
 def test_model_profile_loads_gateway_controls(tmp_path: Path) -> None:

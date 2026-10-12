@@ -42,6 +42,22 @@ logger = logging.getLogger(__name__)
 metadata = MetaData()
 
 
+def isoformat(value: dt.datetime | None) -> str | None:
+    """Serialise a stored timestamp, always with its UTC offset.
+
+    Every timestamp column here is ``DateTime(timezone=True)`` written by
+    :func:`utcnow`, but SQLite does not store an offset and reads the value back
+    naive. Calling ``.isoformat()`` on it emits a bare local-looking string, and
+    ``new Date("2026-09-11T15:45:30")`` in a browser reads that as local time
+    while the same instant from a sibling endpoint reads as UTC.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.UTC)
+    return value.isoformat()
+
+
 class Base(DeclarativeBase):
     metadata = metadata
 
@@ -350,6 +366,12 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.usage_store import ensure_usage_record_table
 
     ensure_usage_record_table(_engine)
+    # Same race again: extraction_run_results is new (durable extraction
+    # outcome the plain-HTTP polling fallback reads before ever touching the
+    # Inngest proxy).
+    from docie_bench.studio.extraction_results import ensure_extraction_result_table
+
+    ensure_extraction_result_table(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:

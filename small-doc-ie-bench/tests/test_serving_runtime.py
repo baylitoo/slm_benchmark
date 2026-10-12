@@ -135,6 +135,33 @@ def test_llamacpp_requires_gguf_and_builds_cpu_flags() -> None:
     assert adapter.probe(_spec(RuntimeKind.LLAMACPP)).compatible is False
 
 
+def test_llamacpp_does_not_duplicate_jinja_when_extra_args_already_carries_it() -> None:
+    """serve_store_model's family-routed deploys carry their own "--jinja" via
+    family_launch_args/extra_args (model_store.FAMILIES) for every text/vision
+    family -- build_command's own default must not ALSO append it, which used
+    to produce a literal duplicate flag on the launched command line
+    (llama-server logs "argument '--jinja' specified multiple times" and
+    silently keeps only the last value)."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP,
+        model="C:/models/invoice.gguf",
+        extra_args=("--jinja",),
+    )
+    command = adapter.build_command(spec)
+    assert command.count("--jinja") == 1
+
+
+def test_llamacpp_still_defaults_jinja_on_for_a_bare_spec() -> None:
+    """A direct RuntimeLaunchSpec construction with no extra_args at all (e.g.
+    control_plane.serve()'s advanced/uncommon usage, README-documented) must
+    still get --jinja by default -- only a spec that ALREADY carries it should
+    skip the duplicate."""
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+    assert "--jinja" in adapter.build_command(spec)
+
+
 def test_llamacpp_n_parallel_default_is_byte_identical_to_before() -> None:
     """n_parallel=1 (the default) must never emit --parallel and must never
     scale --ctx-size -- this is the existing, already-tested default path."""
@@ -484,6 +511,45 @@ def test_llamacpp_health_leaves_tool_calls_supported_none_when_undetermined(
     assert result.tool_calls_supported is None
 
 
+def test_llamacpp_health_records_slot_count_from_slots_endpoint() -> None:
+    # Ground truth for model_gateway's concurrency-mismatch warning: the REAL
+    # slot count observed via GET /slots, not the --parallel launch value
+    # (which can drift from what a manually-restarted process actually runs
+    # with).
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {},
+        slots_get=lambda url, timeout, headers: [
+            {"id": 0, "is_processing": False},
+            {"id": 1, "is_processing": True},
+            {"id": 2, "is_processing": False},
+            {"id": 3, "is_processing": False},
+        ],
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.slot_count == 4
+
+
+def test_llamacpp_health_leaves_slot_count_none_when_slots_endpoint_unreachable() -> None:
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {},
+        slots_get=lambda url, timeout, headers: None,
+    )
+    spec = _spec(RuntimeKind.LLAMACPP)
+
+    result = adapter.health(spec)
+
+    assert result.healthy is True
+    assert result.slot_count is None
+
+
 def test_llamacpp_slots_tolerates_a_missing_field_schema() -> None:
     # Schema varies by llama-server build (#315): one slot reports the full
     # shape (including build-dependent timing/cache fields), the other only
@@ -535,9 +601,12 @@ def test_llamacpp_slots_never_raises_on_query_failure_and_never_touches_health()
     spec = _spec(RuntimeKind.LLAMACPP)
 
     assert adapter.slots(spec) == ()
-    # health() doesn't even query /slots -- a slots-query failure must never
-    # be able to flip an otherwise-healthy deployment to unhealthy.
-    assert adapter.health(spec).healthy is True
+    # health() DOES query /slots too (to populate slot_count), but a
+    # slots-query failure must never be able to flip an otherwise-healthy
+    # deployment to unhealthy -- only ever degrades slot_count to None.
+    result = adapter.health(spec)
+    assert result.healthy is True
+    assert result.slot_count is None
 
 
 def test_fetch_llamacpp_slots_works_from_a_bare_endpoint_string() -> None:
@@ -619,6 +688,46 @@ def test_remote_runtime_is_processless_and_uses_api_key_env(
         "timeout": 4,
         "headers": {"Authorization": "Bearer secret"},
     }
+
+
+def test_llamacpp_build_command_requires_api_key_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #447: api_key_env was only ever read for the control plane's own
+    # outbound probe calls -- the launched process itself never required a
+    # key. --api-key must now appear in the actual command line.
+    monkeypatch.setenv("SERVING_KEY", "s3cr3t")
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", api_key_env="SERVING_KEY"
+    )
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" in command
+    assert command[command.index("--api-key") + 1] == "s3cr3t"
+
+
+def test_llamacpp_build_command_omits_api_key_when_unconfigured() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" not in command
+
+
+def test_vllm_build_command_requires_api_key_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SERVING_KEY", "s3cr3t")
+    adapter = VLLMRuntime(which=lambda name: "/opt/bin/vllm")
+    spec = _spec(RuntimeKind.VLLM, api_key_env="SERVING_KEY")
+
+    command = adapter.build_command(spec)
+
+    assert "--api-key" in command
+    assert command[command.index("--api-key") + 1] == "s3cr3t"
 
 
 def test_remote_runtime_rejects_embedded_credentials() -> None:

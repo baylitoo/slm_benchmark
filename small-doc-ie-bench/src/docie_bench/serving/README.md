@@ -43,6 +43,7 @@ A `FamilyContract` records how to serve and prompt a family:
 | `openai_chat` | OpenAI `response_format` | – | yes |
 | `lfm2` | OpenAI `response_format` | `--jinja` | yes (embedded template) |
 | `lfm2_vl` | OpenAI `response_format` | `--jinja` (+`--mmproj`, vision) | no* (llama-server only) |
+| `spark2_5` | OpenAI `response_format` | `--jinja` | yes (embedded template) |
 
 \* LFM2.5's custom `<|startoftext|>`+ChatML template renders faithfully only via
 the GGUF's embedded jinja template, so both LFM2.5 families launch with `--jinja`
@@ -58,6 +59,16 @@ arch-support probe** — no family/profile ships for it yet.
 `LFM2.5-350M-GGUF` → `lfm25_350m`, `LFM2.5-1.2B-Instruct-GGUF` → `lfm25_1_2b`,
 and `LFM2.5-VL-1.6B-GGUF` + its `mmproj-LFM2.5-VL-1.6b-*.gguf` projector →
 `lfm25_vl_1_6b` (family `lfm2_vl`).
+
+**Spark-X2.5-1.7B** (`XHToken/Spark-X2.5-1.7B-GGUF`, family `spark2_5`): a
+hybrid sliding-window/full-attention arch that landed in llama.cpp very
+recently (`ggml-org/llama.cpp#27868`, merged 2026-09-06) — **rebuild the
+serving image** (`docker compose build --build-arg LLAMA_REF=<commit-after-
+the-merge> serving`, see `Dockerfile.api`) before deploying, and verify the
+published GGUF (converted with the model author's own llama.cpp fork) loads
+against mainline. Its own KV-cache constant
+(`serving.resources.SPARK2_5_KV_CACHE_BYTES_PER_TOKEN`) is why it isn't just
+`openai_chat`, same reasoning as `lfm2`.
 
 `ollama_modelfile()` **refuses** families that Ollama can't serve faithfully, so
 you can't accidentally deploy a NuExtract3 that ignores its template.

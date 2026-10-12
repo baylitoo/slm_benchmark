@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import re
 import shutil
 import socket
@@ -27,6 +26,7 @@ from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 if TYPE_CHECKING:
     from docie_bench.serving.runtime import RuntimeLaunchSpec
 
+from docie_bench.serving.paths import serving_home
 from docie_bench.serving.placement import (
     clear_placement,
     mark_placement_ready,
@@ -226,6 +226,17 @@ class Supervisor(Protocol):
         n_parallel: int = 1,
         cache_reuse: int | None = None,
         chat_template_file: str | None = None,
+        batch_size: int | None = None,
+        ubatch_size: int | None = None,
+        numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> Result: ...
 
     def serve_store_model(
@@ -238,6 +249,17 @@ class Supervisor(Protocol):
         n_parallel: int = 1,
         cache_reuse: int | None = None,
         chat_template_file: str | None = None,
+        batch_size: int | None = None,
+        ubatch_size: int | None = None,
+        numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> Result: ...
 
     def start(self, name: str) -> Result: ...
@@ -282,17 +304,12 @@ class ControlPlane:
         import psutil
 
         from docie_bench.serving.planner import HostResources, ResourcePlanner, RuntimeName
-        from docie_bench.serving.resources import read_node_memory
         from docie_bench.serving.registry import ModelRegistry
+        from docie_bench.serving.resources import read_node_memory
         from docie_bench.serving.runtime import default_runtime_adapters
         from docie_bench.serving.supervisor import PersistentSupervisor
 
-        home = Path(
-            os.environ.get(
-                "DOCIE_SERVING_HOME",
-                Path.home() / ".local" / "share" / "docie-bench" / "serving",
-            )
-        )
+        home = serving_home()
         registry = _DefaultRegistry(ModelRegistry(home / "registry"))
         runtimes = _DefaultRuntimes(default_runtime_adapters())
         planner = _DefaultPlanner(
@@ -381,6 +398,17 @@ class ControlPlane:
         n_parallel: int = 1,
         cache_reuse: int | None = None,
         chat_template_file: str | None = None,
+        batch_size: int | None = None,
+        ubatch_size: int | None = None,
+        numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         # Threaded like up(): the runtime-specified deploy path blocks in
         # deploy + await_ready (a bounded time.sleep poll while the model
@@ -402,6 +430,28 @@ class ControlPlane:
             kwargs["cache_reuse"] = cache_reuse
         if chat_template_file is not None:
             kwargs["chat_template_file"] = chat_template_file
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        if ubatch_size is not None:
+            kwargs["ubatch_size"] = ubatch_size
+        if numa is not None:
+            kwargs["numa"] = numa
+        if cpu_threads is not None:
+            kwargs["cpu_threads"] = cpu_threads
+        if cpu_threads_batch is not None:
+            kwargs["cpu_threads_batch"] = cpu_threads_batch
+        if cache_type_k is not None:
+            kwargs["cache_type_k"] = cache_type_k
+        if cache_type_v is not None:
+            kwargs["cache_type_v"] = cache_type_v
+        if reasoning_budget is not None:
+            kwargs["reasoning_budget"] = reasoning_budget
+        if reasoning_budget_message is not None:
+            kwargs["reasoning_budget_message"] = reasoning_budget_message
+        if flash_attn is not None:
+            kwargs["flash_attn"] = flash_attn
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
         result = await asyncio.to_thread(
             self.supervisor.serve,
             _required(model, "model"),
@@ -420,6 +470,17 @@ class ControlPlane:
         n_parallel: int = 1,
         cache_reuse: int | None = None,
         chat_template_file: str | None = None,
+        batch_size: int | None = None,
+        ubatch_size: int | None = None,
+        numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         # serve_store_model is synchronous and now blocks in await_ready() (a
         # bounded time.sleep poll until the model is serving). Run it in a thread
@@ -441,6 +502,28 @@ class ControlPlane:
             kwargs["cache_reuse"] = cache_reuse
         if chat_template_file is not None:
             kwargs["chat_template_file"] = chat_template_file
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        if ubatch_size is not None:
+            kwargs["ubatch_size"] = ubatch_size
+        if numa is not None:
+            kwargs["numa"] = numa
+        if cpu_threads is not None:
+            kwargs["cpu_threads"] = cpu_threads
+        if cpu_threads_batch is not None:
+            kwargs["cpu_threads_batch"] = cpu_threads_batch
+        if cache_type_k is not None:
+            kwargs["cache_type_k"] = cache_type_k
+        if cache_type_v is not None:
+            kwargs["cache_type_v"] = cache_type_v
+        if reasoning_budget is not None:
+            kwargs["reasoning_budget"] = reasoning_budget
+        if reasoning_budget_message is not None:
+            kwargs["reasoning_budget_message"] = reasoning_budget_message
+        if flash_attn is not None:
+            kwargs["flash_attn"] = flash_attn
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
         return to_data(
             await asyncio.to_thread(
                 self.supervisor.serve_store_model,
@@ -872,6 +955,17 @@ class _DefaultSupervisor:
         n_parallel: int = 1,
         cache_reuse: int | None = None,
         chat_template_file: str | None = None,
+        batch_size: int | None = None,
+        ubatch_size: int | None = None,
+        numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         from docie_bench.serving.runtime import RuntimeKind, RuntimeLaunchSpec
         from docie_bench.serving.supervisor import DeploymentSpec
@@ -899,6 +993,17 @@ class _DefaultSupervisor:
                     n_parallel=n_parallel,
                     cache_reuse=cache_reuse,
                     chat_template_file=chat_template_file,
+                    batch_size=batch_size,
+                    ubatch_size=ubatch_size,
+                    numa=numa,
+                    cpu_threads=cpu_threads,
+                    cpu_threads_batch=cpu_threads_batch,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                    reasoning_budget=reasoning_budget,
+                    reasoning_budget_message=reasoning_budget_message,
+                    flash_attn=flash_attn,
+                    timeout_seconds=timeout_seconds,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -921,6 +1026,17 @@ class _DefaultSupervisor:
                     n_parallel=n_parallel,
                     cache_reuse=cache_reuse,
                     chat_template_file=chat_template_file,
+                    batch_size=batch_size,
+                    ubatch_size=ubatch_size,
+                    numa=numa,
+                    cpu_threads=cpu_threads,
+                    cpu_threads_batch=cpu_threads_batch,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                    reasoning_budget=reasoning_budget,
+                    reasoning_budget_message=reasoning_budget_message,
+                    flash_attn=flash_attn,
+                    timeout_seconds=timeout_seconds,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
@@ -953,6 +1069,17 @@ class _DefaultSupervisor:
         n_parallel: int = 1,
         cache_reuse: int | None = None,
         chat_template_file: str | None = None,
+        batch_size: int | None = None,
+        ubatch_size: int | None = None,
+        numa: str | None = None,
+        cpu_threads: int | None = None,
+        cpu_threads_batch: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        reasoning_budget: int | None = None,
+        reasoning_budget_message: str | None = None,
+        flash_attn: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         """Deploy a store model. ``deployment_name`` overrides the record name so
         the SAME store model can run as several deployments (scale): the weights
@@ -1031,6 +1158,17 @@ class _DefaultSupervisor:
                     n_parallel=n_parallel,
                     cache_reuse=cache_reuse,
                     chat_template_file=chat_template_file,
+                    batch_size=batch_size,
+                    ubatch_size=ubatch_size,
+                    numa=numa,
+                    cpu_threads=cpu_threads,
+                    cpu_threads_batch=cpu_threads_batch,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                    reasoning_budget=reasoning_budget,
+                    reasoning_budget_message=reasoning_budget_message,
+                    flash_attn=flash_attn,
+                    timeout_seconds=timeout_seconds,
                 ),
                 bind_host=bind_host,
                 advertise_host=advertise_host,
