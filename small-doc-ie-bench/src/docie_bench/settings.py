@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # any networked deployment must populate API_KEYS and leave this on.
     auth_required: bool = True
     api_keys: SecretStr = Field(default=SecretStr(""))
+    # Encrypts the secret of every Studio-ISSUED key at rest (studio.
+    # key_crypto), so an operator can recover one after its one-time reveal.
+    # Unset means Studio-issued keys cannot be created or revealed at all --
+    # a deliberate hard failure rather than a silent downgrade to storing
+    # credentials in cleartext. API_KEYS above is unaffected and keeps working
+    # without this. Must live in the environment only: a database dump plus
+    # this value exposes live keys.
+    api_key_encryption_key: SecretStr = Field(default=SecretStr(""))
     # GET/HEAD traffic has its own budget because the authenticated Studio
     # continuously polls several control-plane views. Counting those reads
     # against inference/mutations makes the default 60/min quota self-deny

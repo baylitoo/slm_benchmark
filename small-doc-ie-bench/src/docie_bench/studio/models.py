@@ -211,6 +211,12 @@ class UsageRecord(Base):
     # ok | error -- whether the surface answered the caller successfully.
     status: Mapped[str] = mapped_column(String(16), default="ok")
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    # WHICH key made the call, when it was a Studio-issued one (ApiKeyRecord.id).
+    # Null for an env-configured API_KEYS key and for anonymous traffic: those
+    # have no key row to point at, so per-key views show them as unattributed
+    # rather than inventing an id. ``tenant_id`` stays authoritative for
+    # ownership either way.
+    api_key_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
     # Per-round MCP tool-call trace for an "agent" surface request that ran the
     # tool loop -- [{"tool": "calc__add", "status": "ok"|"error",
     # "latency_ms": int}, ...]. Null for every request that never touched a
@@ -218,6 +224,57 @@ class UsageRecord(Base):
     tool_calls_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class ApiKeyRecord(Base):
+    """One Studio-issued API key.
+
+    Three representations of the same secret, each for a different job:
+
+    * ``prefix`` -- plaintext and indexed, so authentication is ONE indexed
+      lookup instead of the ``compare_digest`` scan over every configured key
+      that ``security.parse_api_keys`` forces. Also what the UI shows once the
+      full value has been revealed and masked.
+    * ``digest`` -- SHA-256 of the secret, compared in constant time on the
+      authentication path. SHA-256 and not bcrypt/argon2 deliberately: an API
+      key is a high-entropy random secret, not a password, so a slow KDF buys
+      nothing against guessing while handing every request a CPU cost (and an
+      attacker a denial-of-service lever).
+    * ``secret_ciphertext`` -- the secret encrypted at rest (see
+      ``studio.key_crypto``), because an operator must be able to recover a
+      key server-side after the one-time reveal. This is the deliberate
+      trade-off recorded in the design issue: a database dump PLUS the
+      encryption key exposes live credentials, which a pure hash would not.
+      The encryption key therefore lives only in the environment.
+
+    ``revoked_at`` is a tombstone rather than a delete: usage rows reference
+    ``id``, and a revoked key's history must stay attributable.
+    """
+
+    __tablename__ = "studio_api_keys"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    prefix: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    digest: Mapped[str] = mapped_column(String(64))
+    secret_ciphertext: Mapped[str] = mapped_column(Text)
+    # Operator-supplied label and owning tenant. ``tenant_id`` is NOT derived
+    # from the Studio session: the backend never verifies the company JWT (it
+    # gates the UI only), so a tenant claimed by the browser would be an
+    # unverified assertion. The operator types it explicitly instead.
+    label: Mapped[str] = mapped_column(String(200))
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    # Stamped on each successful authentication, so a dormant key is visible.
+    # Best-effort and coarse (see api_key_store.touch_last_used): one UPDATE
+    # per request on the hot path is not worth a precise timestamp.
+    last_used_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

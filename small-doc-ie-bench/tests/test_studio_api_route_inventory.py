@@ -59,6 +59,14 @@ EXPECTED_STUDIO_ROUTES = {
     ("GET", "/v1/studio/seeds"),
     # Per-deployment usage aggregates (Observability tab's Usage section).
     ("GET", "/v1/studio/usage"),
+    # Studio-issued API keys (#540). Operator tier only: a key minted here
+    # cannot mint another. The reveal is a POST on purpose -- it returns a
+    # live credential, which must not land in browser history or a proxy log.
+    ("GET", "/v1/studio/api-keys"),
+    ("POST", "/v1/studio/api-keys"),
+    ("DELETE", "/v1/studio/api-keys/{key_id}"),
+    ("POST", "/v1/studio/api-keys/{key_id}/reveal"),
+    ("GET", "/v1/studio/api-keys/usage"),
     # Batch extraction (N documents, one durable job, per-document state).
     ("POST", "/v1/studio/extract/batch"),
     ("GET", "/v1/studio/batches"),
@@ -77,4 +85,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 38
+    assert len(EXPECTED_STUDIO_ROUTES) == 43

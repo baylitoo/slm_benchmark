@@ -357,7 +357,9 @@ def validate_text_request(payload: ExtractTextRequest) -> None:
         )
 
 
-def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> ExtractionResponse:
+def finalize_response(
+    response: ExtractionResponse, *, tenant_id: str, api_key_id: str | None = None
+) -> ExtractionResponse:
     record_extraction(response, tenant_id=tenant_id)
     # Usage ledger (GET /v1/studio/usage): the one seam both extract routes
     # funnel through with the full response in hand — model latency, token
@@ -372,6 +374,7 @@ def finalize_response(response: ExtractionResponse, *, tenant_id: str) -> Extrac
         prompt_tokens=response.usage.prompt_tokens if response.usage else None,
         completion_tokens=response.usage.completion_tokens if response.usage else None,
         status="ok",
+        api_key_id=api_key_id,
     )
     # PR-4 recency (review fix): the direct API extract endpoints serve
     # traffic too, so they must stamp last_served like the worker path — or a
@@ -470,7 +473,9 @@ async def extract_text(
         metadata=payload.metadata,
     )
     response = _finalize_outcome(outcome, routing_policy=payload.routing_policy)
-    return finalize_response(response, tenant_id=tenant.tenant_id)
+    return finalize_response(
+        response, tenant_id=tenant.tenant_id, api_key_id=tenant.api_key_id
+    )
 
 
 @app.post("/v1/extract/file", response_model=ExtractionResponse)
@@ -511,7 +516,9 @@ async def extract_file(
     finally:
         tmp_path.unlink(missing_ok=True)
     response = _finalize_outcome(outcome, routing_policy=routing_policy)
-    return finalize_response(response, tenant_id=tenant.tenant_id)
+    return finalize_response(
+        response, tenant_id=tenant.tenant_id, api_key_id=tenant.api_key_id
+    )
 
 
 class ExtractStreamRequest(BaseModel):
@@ -674,7 +681,9 @@ async def extract_stream(payload: ExtractStreamRequest, tenant: TenantDependency
                 finally:
                     tmp_path.unlink(missing_ok=True)
             response = _finalize_outcome(outcome, routing_policy=payload.routing_policy)
-            response = finalize_response(response, tenant_id=tenant.tenant_id)
+            response = finalize_response(
+                response, tenant_id=tenant.tenant_id, api_key_id=tenant.api_key_id
+            )
             queue.put_nowait({"type": "result", "result": response.model_dump(mode="json")})
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
