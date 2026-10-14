@@ -1,6 +1,6 @@
 "use client";
-// Studio sign-in against the company auth server (app.cynov.com,
-// `/rest/v2/auth/*`). This gates the STUDIO UI only: the DocIE backend keeps
+// Studio sign-in against the company auth server. This gates the STUDIO UI
+// only: the DocIE backend keeps
 // its own X-API-Key mechanism untouched (docie_bench.security
 // .TenantQuotaManager.authenticate), so the access token is never sent to it
 // and the backend needs no key material to verify anything.
@@ -15,6 +15,26 @@
 import { useEffect, useState } from "react";
 
 import { AUTH_BASE } from "./env";
+
+// The auth routes live under `<base>/rest/v2/auth/*`, and the base is NOT
+// necessarily the bare origin: on the company deployment the API is mounted
+// under an application prefix (`https://<host>/Facturation-api`), while the
+// bare origin serves the SPA instead -- a request to `https://<host>/rest/v2/
+// auth/login` reaches the single-page app, which answers the CORS preflight
+// with 405 and never gets as far as authenticating.
+//
+// So NEXT_PUBLIC_AUTH_BASE_URL is "origin + whatever prefix the API is mounted
+// under", and this strips a trailing `/rest/v2` when it is present: that is
+// the form an administrator naturally quotes ("the API is at
+// https://host/Facturation-api/rest/v2"), and pasting it verbatim would
+// otherwise build `/rest/v2/rest/v2/auth/login` -- a 404 that surfaces as the
+// same opaque "server unreachable" message as a CORS failure, with nothing to
+// distinguish it. Both forms now work.
+export function authRoot(base: string): string {
+  return base.replace(/\/+$/, "").replace(/\/rest\/v2$/, "");
+}
+
+const AUTH_ROOT = authRoot(AUTH_BASE);
 
 const STORAGE_KEY = "docie:session";
 // Same-tab writes don't fire the native `storage` event, so mounted components
@@ -91,7 +111,7 @@ async function readError(resp: Response, fallback: string): Promise<string> {
 async function post<T>(path: string, body: unknown, headers?: Record<string, string>): Promise<T> {
   let resp: Response;
   try {
-    resp = await fetch(`${AUTH_BASE}${path}`, {
+    resp = await fetch(`${AUTH_ROOT}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(headers ?? {}) },
       body: JSON.stringify(body),
@@ -104,7 +124,19 @@ async function post<T>(path: string, body: unknown, headers?: Record<string, str
       "Authentication server unreachable. Check the network, and that it allows this origin.",
     );
   }
-  if (!resp.ok) throw new Error(await readError(resp, `Authentication failed (HTTP ${resp.status})`));
+  if (!resp.ok) {
+    // 404/405 on an auth route almost always means the base URL is pointing at
+    // something that is not the auth API -- typically the bare origin, where
+    // the single-page app answers instead. Say that, rather than reporting a
+    // status code the operator then has to go and interpret.
+    const fallback =
+      resp.status === 404 || resp.status === 405
+        ? `No auth API at ${AUTH_ROOT}${path} (HTTP ${resp.status}). ` +
+          "NEXT_PUBLIC_AUTH_BASE_URL must include the application prefix the " +
+          "auth API is mounted under, not just the origin."
+        : `Authentication failed (HTTP ${resp.status})`;
+    throw new Error(await readError(resp, fallback));
+  }
   return (await resp.json()) as T;
 }
 

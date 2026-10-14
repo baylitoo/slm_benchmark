@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getSession, login, logout, refresh } from "./auth";
+import { authRoot, getSession, login, logout, refresh } from "./auth";
 
 function jsonResponse(body: unknown, ok = true, status = 200): Response {
   return {
@@ -16,6 +16,39 @@ const PAIR = {
   tokenType: "Bearer",
   expiresIn: 1800,
 };
+
+describe("authRoot", () => {
+  // The auth API is mounted under an application prefix on the company
+  // deployment; the bare origin serves the SPA, which answers the CORS
+  // preflight with 405 and never authenticates.
+  it("keeps an application prefix", () => {
+    expect(authRoot("https://newapp.cynov.com/Facturation-api")).toBe(
+      "https://newapp.cynov.com/Facturation-api",
+    );
+  });
+
+  it("strips a trailing /rest/v2 so the quoted API root can be pasted verbatim", () => {
+    // Without this, the request path becomes /rest/v2/rest/v2/auth/login -- a
+    // 404 that surfaces as the same opaque "unreachable" message as a CORS
+    // failure, with nothing to tell them apart.
+    expect(authRoot("https://newapp.cynov.com/Facturation-api/rest/v2")).toBe(
+      "https://newapp.cynov.com/Facturation-api",
+    );
+  });
+
+  it("tolerates trailing slashes in either form", () => {
+    expect(authRoot("https://host/api/")).toBe("https://host/api");
+    expect(authRoot("https://host/api/rest/v2/")).toBe("https://host/api");
+  });
+
+  it("leaves a bare origin alone", () => {
+    expect(authRoot("https://app.cynov.com")).toBe("https://app.cynov.com");
+  });
+
+  it("does not strip rest/v2 from the middle of a path", () => {
+    expect(authRoot("https://host/rest/v2/tenant-a")).toBe("https://host/rest/v2/tenant-a");
+  });
+});
 
 describe("auth session", () => {
   beforeEach(() => {
@@ -95,6 +128,26 @@ describe("auth session", () => {
     await logout();
 
     expect(getSession()).toBeNull();
+  });
+
+  it("names the misconfiguration on a 404, instead of a bare status code", async () => {
+    // Hitting the bare origin reaches the SPA, not the auth API. The operator
+    // needs to be told the base URL is wrong, not handed "HTTP 404".
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({}, false, 404)),
+    );
+
+    await expect(login("amine", "secret")).rejects.toThrow(/NEXT_PUBLIC_AUTH_BASE_URL/);
+  });
+
+  it("still prefers the server's own message when it sends one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ message: "Route introuvable" }, false, 404)),
+    );
+
+    await expect(login("amine", "secret")).rejects.toThrow("Route introuvable");
   });
 
   it("surfaces the server's own message on a failed sign-in", async () => {
