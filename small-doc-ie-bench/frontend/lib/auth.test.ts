@@ -17,6 +17,41 @@ const PAIR = {
   expiresIn: 1800,
 };
 
+describe("request URLs", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  // The four route names are the only paths this client hardcodes. Host, mount
+  // prefix and API version all come from NEXT_PUBLIC_AUTH_BASE_URL, so the
+  // request must be exactly base + "/auth/<route>" with nothing injected.
+  it("appends only the route name to the configured API root", async () => {
+    const fetchMock = vi.fn(async (_url: string) => jsonResponse(PAIR));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await login("amine", "secret");
+
+    // AUTH_BASE is unset in tests, so the path stands alone -- which is the
+    // point: no version segment is added by this module.
+    expect(fetchMock.mock.calls[0][0]).toBe("/auth/login");
+  });
+
+  it("uses the same root for refresh and logout", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(PAIR)));
+    await login("amine", "secret");
+
+    const fetchMock = vi.fn(async (_url: string) => jsonResponse(PAIR));
+    vi.stubGlobal("fetch", fetchMock);
+    await refresh();
+    expect(fetchMock.mock.calls[0][0]).toBe("/auth/refresh");
+
+    const logoutMock = vi.fn(async (_url: string) => jsonResponse({}));
+    vi.stubGlobal("fetch", logoutMock);
+    await logout();
+    expect(logoutMock.mock.calls[0][0]).toBe("/auth/logout");
+  });
+});
+
 describe("auth session", () => {
   beforeEach(() => {
     window.sessionStorage.clear();
@@ -95,6 +130,26 @@ describe("auth session", () => {
     await logout();
 
     expect(getSession()).toBeNull();
+  });
+
+  it("names the misconfiguration on a 404, instead of a bare status code", async () => {
+    // Hitting the bare origin reaches the SPA, not the auth API. The operator
+    // needs to be told the base URL is wrong, not handed "HTTP 404".
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({}, false, 404)),
+    );
+
+    await expect(login("amine", "secret")).rejects.toThrow(/NEXT_PUBLIC_AUTH_BASE_URL/);
+  });
+
+  it("still prefers the server's own message when it sends one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ message: "Route introuvable" }, false, 404)),
+    );
+
+    await expect(login("amine", "secret")).rejects.toThrow("Route introuvable");
   });
 
   it("surfaces the server's own message on a failed sign-in", async () => {
