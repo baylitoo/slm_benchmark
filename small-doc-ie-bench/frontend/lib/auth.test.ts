@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { authRoot, getSession, login, logout, refresh } from "./auth";
+import { getSession, login, logout, refresh } from "./auth";
 
 function jsonResponse(body: unknown, ok = true, status = 200): Response {
   return {
@@ -17,36 +17,38 @@ const PAIR = {
   expiresIn: 1800,
 };
 
-describe("authRoot", () => {
-  // The auth API is mounted under an application prefix on the company
-  // deployment; the bare origin serves the SPA, which answers the CORS
-  // preflight with 405 and never authenticates.
-  it("keeps an application prefix", () => {
-    expect(authRoot("https://newapp.cynov.com/Facturation-api")).toBe(
-      "https://newapp.cynov.com/Facturation-api",
-    );
+describe("request URLs", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
   });
 
-  it("strips a trailing /rest/v2 so the quoted API root can be pasted verbatim", () => {
-    // Without this, the request path becomes /rest/v2/rest/v2/auth/login -- a
-    // 404 that surfaces as the same opaque "unreachable" message as a CORS
-    // failure, with nothing to tell them apart.
-    expect(authRoot("https://newapp.cynov.com/Facturation-api/rest/v2")).toBe(
-      "https://newapp.cynov.com/Facturation-api",
-    );
+  // The four route names are the only paths this client hardcodes. Host, mount
+  // prefix and API version all come from NEXT_PUBLIC_AUTH_BASE_URL, so the
+  // request must be exactly base + "/auth/<route>" with nothing injected.
+  it("appends only the route name to the configured API root", async () => {
+    const fetchMock = vi.fn(async (_url: string) => jsonResponse(PAIR));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await login("amine", "secret");
+
+    // AUTH_BASE is unset in tests, so the path stands alone -- which is the
+    // point: no version segment is added by this module.
+    expect(fetchMock.mock.calls[0][0]).toBe("/auth/login");
   });
 
-  it("tolerates trailing slashes in either form", () => {
-    expect(authRoot("https://host/api/")).toBe("https://host/api");
-    expect(authRoot("https://host/api/rest/v2/")).toBe("https://host/api");
-  });
+  it("uses the same root for refresh and logout", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(PAIR)));
+    await login("amine", "secret");
 
-  it("leaves a bare origin alone", () => {
-    expect(authRoot("https://app.cynov.com")).toBe("https://app.cynov.com");
-  });
+    const fetchMock = vi.fn(async (_url: string) => jsonResponse(PAIR));
+    vi.stubGlobal("fetch", fetchMock);
+    await refresh();
+    expect(fetchMock.mock.calls[0][0]).toBe("/auth/refresh");
 
-  it("does not strip rest/v2 from the middle of a path", () => {
-    expect(authRoot("https://host/rest/v2/tenant-a")).toBe("https://host/rest/v2/tenant-a");
+    const logoutMock = vi.fn(async (_url: string) => jsonResponse({}));
+    vi.stubGlobal("fetch", logoutMock);
+    await logout();
+    expect(logoutMock.mock.calls[0][0]).toBe("/auth/logout");
   });
 });
 

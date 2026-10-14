@@ -1,7 +1,7 @@
 "use client";
 // Studio sign-in against the company auth server. This gates the STUDIO UI
-// only: the DocIE backend keeps
-// its own X-API-Key mechanism untouched (docie_bench.security
+// only: the DocIE backend keeps its own X-API-Key mechanism untouched
+// (docie_bench.security
 // .TenantQuotaManager.authenticate), so the access token is never sent to it
 // and the backend needs no key material to verify anything.
 //
@@ -16,26 +16,23 @@ import { useEffect, useState } from "react";
 
 import { AUTH_BASE } from "./env";
 
-// The auth routes live under `<base>/rest/v2/auth/*`, and the base is NOT
-// necessarily the bare origin: on the company deployment the API is mounted
-// under an application prefix (`https://<host>/Facturation-api`), while the
-// bare origin serves the SPA instead -- a request to `https://<host>/rest/v2/
-// auth/login` reaches the single-page app, which answers the CORS preflight
-// with 405 and never gets as far as authenticating.
+// NEXT_PUBLIC_AUTH_BASE_URL is the auth API's ROOT -- everything up to but not
+// including `/auth/...`. On the company deployment that is
+// `https://newapp.cynov.com/Facturation-api/rest/v2`: an application prefix
+// AND a version segment, neither of which this code may assume.
 //
-// So NEXT_PUBLIC_AUTH_BASE_URL is "origin + whatever prefix the API is mounted
-// under", and this strips a trailing `/rest/v2` when it is present: that is
-// the form an administrator naturally quotes ("the API is at
-// https://host/Facturation-api/rest/v2"), and pasting it verbatim would
-// otherwise build `/rest/v2/rest/v2/auth/login` -- a 404 that surfaces as the
-// same opaque "server unreachable" message as a CORS failure, with nothing to
-// distinguish it. Both forms now work.
-export function authRoot(base: string): string {
-  return base.replace(/\/+$/, "").replace(/\/rest\/v2$/, "");
-}
-
-const AUTH_ROOT = authRoot(AUTH_BASE);
-
+// Only the four route names below are hardcoded, because those are the
+// contract this client implements. The host, the mount prefix and the API
+// version are all deployment facts and all live in that one variable, so a
+// different mount point or a move to another version needs no code change
+// here -- and nothing has to be translated: the value is exactly the API root
+// an administrator quotes.
+//
+// Getting it wrong is easy to do and was previously impossible to diagnose:
+// the bare origin serves the single-page app, which answers the CORS preflight
+// with 405, and a failed preflight makes `fetch` reject with no readable
+// response -- indistinguishable from the auth server simply not allowing this
+// origin. Hence the explicit 404/405 message in `post` below.
 const STORAGE_KEY = "docie:session";
 // Same-tab writes don't fire the native `storage` event, so mounted components
 // (the gate, the top-bar menu) learn about sign-in/out through this instead.
@@ -111,7 +108,7 @@ async function readError(resp: Response, fallback: string): Promise<string> {
 async function post<T>(path: string, body: unknown, headers?: Record<string, string>): Promise<T> {
   let resp: Response;
   try {
-    resp = await fetch(`${AUTH_ROOT}${path}`, {
+    resp = await fetch(`${AUTH_BASE}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(headers ?? {}) },
       body: JSON.stringify(body),
@@ -131,9 +128,10 @@ async function post<T>(path: string, body: unknown, headers?: Record<string, str
     // status code the operator then has to go and interpret.
     const fallback =
       resp.status === 404 || resp.status === 405
-        ? `No auth API at ${AUTH_ROOT}${path} (HTTP ${resp.status}). ` +
-          "NEXT_PUBLIC_AUTH_BASE_URL must include the application prefix the " +
-          "auth API is mounted under, not just the origin."
+        ? `No auth API at ${AUTH_BASE}${path} (HTTP ${resp.status}). ` +
+          "NEXT_PUBLIC_AUTH_BASE_URL must be the auth API's root, including " +
+          "any application prefix and version segment (e.g. " +
+          "https://host/Facturation-api/rest/v2) — not just the origin."
         : `Authentication failed (HTTP ${resp.status})`;
     throw new Error(await readError(resp, fallback));
   }
@@ -154,7 +152,7 @@ function sessionFrom(pair: TokenPair, login: string): Session {
 
 /** Sign in with company credentials. Throws with the server's own message. */
 export async function login(loginName: string, password: string): Promise<Session> {
-  const pair = await post<TokenPair>("/rest/v2/auth/login", {
+  const pair = await post<TokenPair>("/auth/login", {
     login: loginName,
     password,
   });
@@ -171,7 +169,7 @@ export async function refresh(): Promise<Session | null> {
   const current = getSession();
   if (!current) return null;
   try {
-    const pair = await post<TokenPair>("/rest/v2/auth/refresh", {
+    const pair = await post<TokenPair>("/auth/refresh", {
       refreshToken: current.refreshToken,
     });
     const session = sessionFrom(pair, current.login);
@@ -192,7 +190,7 @@ export async function logout(): Promise<void> {
   if (!current) return;
   try {
     await post(
-      "/rest/v2/auth/logout",
+      "/auth/logout",
       { refreshToken: current.refreshToken },
       { Authorization: `Bearer ${current.accessToken}` },
     );
@@ -207,7 +205,7 @@ export async function changePassword(
   oldPassword: string,
   newPassword: string,
 ): Promise<void> {
-  await post("/rest/v2/auth/change-password", {
+  await post("/auth/change-password", {
     login: loginName,
     oldPassword,
     newPassword,
