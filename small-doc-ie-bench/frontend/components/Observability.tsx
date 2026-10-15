@@ -37,7 +37,6 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { Card, Badge } from "./ui";
 import { PageHeader } from "./patterns/PageHeader";
-import { ApiKeysCard } from "./ApiKeysCard";
 import { T } from "@/lib/i18n";
 
 const REVIEW_POLL_MS = 10000;
@@ -118,7 +117,6 @@ export function Observability({
           <SlotsCard active={active} />
         </div>
         <UsageCard active={active} />
-        <ApiKeysCard active={active} />
         <Card
           title="Small Document IE Benchmark"
           subtitle="Agent requests, PII detections, latency, and gate blocks — live from Prometheus."

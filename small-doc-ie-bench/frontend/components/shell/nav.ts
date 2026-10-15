@@ -27,6 +27,7 @@ import {
   Download,
   FileStack,
   Wrench,
+  KeyRound,
   type LucideIcon,
 } from "lucide-react";
 
@@ -37,7 +38,8 @@ export type SectionId =
   | "benchmark"
   | "schemas"
   | "review"
-  | "observability";
+  | "observability"
+  | "api-keys";
 
 export interface NavItem {
   id: SectionId;
@@ -94,6 +96,12 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [{ id: "review", label: "Queue", icon: ClipboardCheck }],
   },
   {
+    heading: "Settings",
+    // A management surface, not a dashboard widget -- it was a card inside
+    // Observability and did not belong there.
+    items: [{ id: "api-keys", label: "API keys", icon: KeyRound }],
+  },
+  {
     heading: "Observability",
     // A single view — no sub-tabs (mirrors Playground): the page combines the
     // quick-link tiles and the embedded dashboard together, so there is
@@ -111,6 +119,7 @@ export const SECTIONS: SectionId[] = [
   "schemas",
   "review",
   "observability",
+  "api-keys",
 ];
 
 /** Default sub-view applied when a section is entered via a view-less path. */
@@ -122,4 +131,5 @@ export const DEFAULT_VIEW: Record<SectionId, string> = {
   schemas: "",
   review: "",
   observability: "",
+  "api-keys": "",
 };
