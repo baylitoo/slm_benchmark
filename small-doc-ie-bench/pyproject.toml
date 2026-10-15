@@ -20,6 +20,9 @@ dependencies = [
   "typer>=0.12.0",
   "prometheus-client>=0.20.0",
   "sqlalchemy>=2.0.32",
+  # AES-GCM for Studio-issued API key secrets at rest (studio/key_crypto.py).
+  # Previously present only transitively via pdfminer.six.
+  "cryptography>=42.0.0",
   "psycopg[binary]>=3.2.1",
   "alembic>=1.13.2",
   "liteparse>=2.0.7",

@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -34,6 +34,15 @@ GENERIC_MIME_TYPES = {"", "application/octet-stream", "binary/octet-stream"}
 class TenantContext:
     tenant_id: str
     authenticated: bool
+    # Which Studio-issued key authenticated this request (ApiKeyRecord.id), so
+    # the usage ledger can attribute it. None for an env-configured API_KEYS
+    # key and for anonymous traffic -- neither has a key row to point at.
+    api_key_id: str | None = None
+    # True only for the env-configured API_KEYS tier, which may MANAGE keys.
+    # Studio-issued keys are the client tier: they call the serving surfaces
+    # and must not be able to mint more keys (otherwise revoking a leaked key
+    # is pointless -- it could have issued itself a successor).
+    operator: bool = False
 
 
 def parse_api_keys(raw: str) -> dict[str, str]:
@@ -73,8 +82,16 @@ class TenantQuotaManager:
         anonymous_requests_per_window: int = 0,
         anonymous_max_concurrent: int = 0,
         auth_failure_requests_per_window: int = 0,
+        issued_key_lookup: Callable[[str], tuple[str, str] | None] | None = None,
     ) -> None:
         self.api_keys = api_keys
+        # Resolves a Studio-issued key to ``(tenant_id, api_key_id)``, or None.
+        # An injection seam on purpose: it keeps the catalog lookup out of this
+        # module (no storage import, unit-testable without a database) and lets
+        # a deployment with no DATABASE_URL run on env keys alone by leaving it
+        # None. Deliberately NOT cached -- see api_key_store.lookup_by_secret:
+        # a revocation has to bite on the next request, on every replica.
+        self._issued_key_lookup = issued_key_lookup
         self.auth_required = auth_required
         self.requests_per_window = requests_per_window
         # ``None`` preserves the old one-budget behaviour for direct callers;
@@ -112,7 +129,21 @@ class TenantQuotaManager:
         if api_key:
             for configured_key, tenant_id in self.api_keys.items():
                 if hmac.compare_digest(api_key, configured_key):
-                    return TenantContext(tenant_id=tenant_id, authenticated=True)
+                    # The env tier is the OPERATOR tier: it may manage keys.
+                    return TenantContext(
+                        tenant_id=tenant_id, authenticated=True, operator=True
+                    )
+            # Then the Studio-issued keys (client tier). Checked second so an
+            # env key can never be shadowed by a database row, and injected
+            # rather than imported so this module stays free of storage
+            # imports (and unit-testable with no database).
+            if self._issued_key_lookup is not None:
+                found = self._issued_key_lookup(api_key)
+                if found is not None:
+                    tenant_id, key_id = found
+                    return TenantContext(
+                        tenant_id=tenant_id, authenticated=True, api_key_id=key_id
+                    )
         if self.auth_required:
             # #449: this is the only trace a rejected auth attempt leaves
             # anywhere -- there was previously no way to detect or
@@ -349,7 +380,23 @@ def get_quota_manager() -> TenantQuotaManager:
         anonymous_requests_per_window=settings.anonymous_rate_limit_requests,
         anonymous_max_concurrent=settings.anonymous_max_concurrent_requests,
         auth_failure_requests_per_window=settings.auth_failure_rate_limit_requests,
+        issued_key_lookup=_issued_key_lookup,
     )
+
+
+def _issued_key_lookup(api_key: str) -> tuple[str, str] | None:
+    """Resolve a Studio-issued key, or None when the catalog is unavailable.
+
+    Imported lazily so ``security`` keeps no module-level storage dependency:
+    the CLI, the tests and any deployment without ``DATABASE_URL`` must be able
+    to import this module (and run on env keys alone) without SQLAlchemy or a
+    database being reachable.
+    """
+    try:
+        from docie_bench.studio.api_key_store import lookup_by_secret
+    except Exception:  # noqa: BLE001 - storage extra absent; env keys still work
+        return None
+    return lookup_by_secret(api_key)
 
 
 async def tenant_guard(

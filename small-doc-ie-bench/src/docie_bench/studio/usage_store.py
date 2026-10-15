@@ -95,6 +95,7 @@ def record_usage(
     completion_tokens: int | None = None,
     status: str = "ok",
     tool_calls: list[dict[str, Any]] | None = None,
+    api_key_id: str | None = None,
 ) -> bool:
     """Insert one usage row. Best-effort by contract: NEVER raises.
 
@@ -118,6 +119,7 @@ def record_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     status=status if status in ("ok", "error") else "error",
+                    api_key_id=api_key_id,
                     tool_calls_json=tool_calls or None,
                 )
             )

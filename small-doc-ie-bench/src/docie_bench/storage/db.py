@@ -372,6 +372,17 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.extraction_results import ensure_extraction_result_table
 
     ensure_extraction_result_table(_engine)
+    # Same race again: studio_api_keys is new (Studio-issued API keys), and
+    # usage_records gains api_key_id. The column add runs AFTER
+    # ensure_usage_record_table above so a fresh database has already created
+    # the table complete and this is a no-op, while an existing one is altered.
+    from docie_bench.studio.api_key_store import (
+        ensure_api_key_table,
+        ensure_usage_api_key_column,
+    )
+
+    ensure_api_key_table(_engine)
+    ensure_usage_api_key_column(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:

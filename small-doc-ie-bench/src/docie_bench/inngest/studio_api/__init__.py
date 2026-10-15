@@ -27,6 +27,7 @@ tests/test_studio_api_route_inventory.py). One submodule per route domain:
                                  artifact download
   - ``seeds.py``              -- durable seed-download listing (Downloads tab)
   - ``usage.py``              -- per-deployment usage aggregates (Observability)
+  - ``api_keys.py``           -- Studio-issued API keys + per-key usage (operator only)
 
 ``_shared.py`` holds the constants/models/helpers every submodule needs
 (``default_run_store``, ``MODELS_CONFIG_PATH``, ``_record_event_owners``,
@@ -58,6 +59,7 @@ from ._shared import (
     _annotate_fits,
     _record_event_owners,
 )
+from .api_keys import router as _api_keys_router
 from .batch import BATCH_EVENT, BatchExtractRequest
 from .batch import router as _batch_router
 from .benchmark import BenchmarkRequest, trigger_benchmark
@@ -156,6 +158,7 @@ for _sub_router in (
     _seeds_router,
     _batch_router,
     _usage_router,
+    _api_keys_router,
 ):
     router.include_router(_sub_router)
 del _sub_router
