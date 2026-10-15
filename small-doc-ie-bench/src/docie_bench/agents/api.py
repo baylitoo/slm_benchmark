@@ -263,6 +263,7 @@ def _record_agent_usage(
         completion_tokens=completion_tokens,
         status=status,
         tool_calls=tool_calls,
+        api_key_id=tenant.api_key_id,
     )
 
 

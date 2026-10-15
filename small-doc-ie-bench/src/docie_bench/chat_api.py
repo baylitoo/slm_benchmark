@@ -138,6 +138,7 @@ def _record_usage_outcome(
     tenant_id: str,
     started: float,
     outcome: Any,
+    api_key_id: str | None = None,
 ) -> None:
     """One usage-ledger row for a request that RESOLVED to a deployment.
 
@@ -166,6 +167,7 @@ def _record_usage_outcome(
         deployment=profile_name,
         surface=surface,
         tenant_id=tenant_id,
+        api_key_id=api_key_id,
         latency_ms=int((time.perf_counter() - started) * 1000),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -335,6 +337,7 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
                 names,
                 session_id,
                 tenant_id=tenant.tenant_id,
+                api_key_id=tenant.api_key_id,
                 started=started,
                 enable_ask_user=payload.enable_ask_user,
             )
@@ -344,7 +347,9 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
         # run_tool_loop already summed usage across every tool round into the
         # final completion's usage block, so this one row carries the whole
         # exchange's token cost.
-        _record_usage_outcome(profile.name, "chat", tenant.tenant_id, started, outcome)
+        _record_usage_outcome(
+            profile.name, "chat", tenant.tenant_id, started, outcome, tenant.api_key_id
+        )
         return outcome
 
     if wants_stream:
@@ -356,11 +361,14 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
             profile.timeout_seconds,
             profile.name,
             tenant_id=tenant.tenant_id,
+            api_key_id=tenant.api_key_id,
             started=started,
         )
 
     completion = await _post_upstream(client, url, headers, forward, profile)
-    _record_usage_outcome(profile.name, "chat", tenant.tenant_id, started, completion)
+    _record_usage_outcome(
+        profile.name, "chat", tenant.tenant_id, started, completion, tenant.api_key_id
+    )
     if isinstance(completion, JSONResponse):
         return completion
     # PR-4 recency: this surface serves traffic too — stamp last_served like
@@ -824,6 +832,7 @@ async def _stream_chat_with_mcp_tools(
     session_id: str | None,
     *,
     tenant_id: str,
+    api_key_id: str | None = None,
     started: float,
     enable_ask_user: bool = False,
 ) -> StreamingResponse:
@@ -1111,7 +1120,7 @@ async def _stream_chat_with_mcp_tools(
             # entry, regardless of how it ended.
             if exchange_id is not None:
                 mcp_mod.close_pending_input(exchange_id)
-            _record_usage_outcome(profile.name, "chat", tenant_id, started, outcome)
+            _record_usage_outcome(profile.name, "chat", tenant_id, started, outcome, api_key_id)
             queue.put_nowait(None)
 
     return queue_stream(queue, drive)
@@ -1222,6 +1231,7 @@ async def _stream_chat_completions(
     profile_name: str,
     *,
     tenant_id: str,
+    api_key_id: str | None = None,
     started: float,
 ) -> Any:
     """Real token-by-token proxy: forward raw SSE bytes as the upstream emits
@@ -1258,7 +1268,7 @@ async def _stream_chat_completions(
             status_code=502,
             error_type="upstream_unavailable",
         )
-        _record_usage_outcome(profile_name, "chat", tenant_id, started, error)
+        _record_usage_outcome(profile_name, "chat", tenant_id, started, error, api_key_id)
         return error
     media_type = upstream.headers.get("content-type", "text/event-stream")
     if upstream.status_code >= 400:
@@ -1270,7 +1280,7 @@ async def _stream_chat_completions(
             status_code=upstream.status_code,
             error_type="upstream_error",
         )
-        _record_usage_outcome(profile_name, "chat", tenant_id, started, error)
+        _record_usage_outcome(profile_name, "chat", tenant_id, started, error, api_key_id)
         return error
     # PR-4 recency, see the non-streaming path's comment above — a stream
     # that gets this far has an accepted upstream connection, which counts
@@ -1314,7 +1324,7 @@ async def _stream_chat_completions(
             # actually carried a usage block (stream_options.include_usage,
             # set above) -- otherwise this is None exactly as before the fix.
             outcome = {"usage": usage} if usage is not None else None
-            _record_usage_outcome(profile_name, "chat", tenant_id, started, outcome)
+            _record_usage_outcome(profile_name, "chat", tenant_id, started, outcome, api_key_id)
 
     return StreamingResponse(
         body_iterator(), status_code=upstream.status_code, media_type=media_type
@@ -1379,7 +1389,9 @@ async def embeddings(request: Request, tenant: TenantParam) -> Any:
         profile,
         error_hint=" (is this deployment an embedding model, served with --embedding?)",
     )
-    _record_usage_outcome(profile.name, "embed", tenant.tenant_id, started, result)
+    _record_usage_outcome(
+        profile.name, "embed", tenant.tenant_id, started, result, tenant.api_key_id
+    )
     if isinstance(result, JSONResponse):
         return result
     recency.stamp_served_profile(profile.name)  # PR-4 recency, see chat_completions
@@ -1460,7 +1472,9 @@ async def rerank(request: Request, tenant: TenantParam) -> Any:
         "--reranking --embedding --pooling rank; family 'multi_vector' = the "
         "sentence-transformers MultiVectorEncoder runtime)",
     )
-    _record_usage_outcome(profile.name, "rerank", tenant.tenant_id, started, result)
+    _record_usage_outcome(
+        profile.name, "rerank", tenant.tenant_id, started, result, tenant.api_key_id
+    )
     if isinstance(result, JSONResponse):
         return result
     recency.stamp_served_profile(profile.name)  # PR-4 recency, see chat_completions
