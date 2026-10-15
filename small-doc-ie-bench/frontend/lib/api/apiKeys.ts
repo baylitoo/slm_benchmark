@@ -35,17 +35,24 @@ export async function listApiKeys(): Promise<{
   keys: ApiKeyView[];
   /** False when API_KEY_ENCRYPTION_KEY is unset: creation will 503. */
   encryption_configured: boolean;
+  /** The tenant this listing is restricted to, or null for an unscoped
+   * operator. A company-signed-in user only ever sees their own keys, so the
+   * UI must not imply otherwise. */
+  scoped_to: string | null;
 }> {
   return request("/v1/studio/api-keys");
 }
 
+/** Issue a key. `tenantId` is honoured only for an unscoped operator: a
+ * company-signed-in caller always gets their own verified login as the owner,
+ * whatever is sent here. */
 export async function createApiKey(
   label: string,
-  tenantId: string,
+  tenantId?: string,
 ): Promise<ApiKeyWithSecret> {
   return request("/v1/studio/api-keys", {
     method: "POST",
-    body: JSON.stringify({ label, tenant_id: tenantId }),
+    body: JSON.stringify(tenantId ? { label, tenant_id: tenantId } : { label }),
   });
 }
 

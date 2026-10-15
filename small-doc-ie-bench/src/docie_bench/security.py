@@ -15,6 +15,8 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, Header, HTTPException, Request, UploadFile
 
 from docie_bench.settings import get_settings
+from docie_bench.studio_session import TOKEN_PREFIX as STUDIO_SESSION_PREFIX
+from docie_bench.studio_session import verify as verify_studio_session
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +40,16 @@ class TenantContext:
     # the usage ledger can attribute it. None for an env-configured API_KEYS
     # key and for anonymous traffic -- neither has a key row to point at.
     api_key_id: str | None = None
+    # True when the caller proved a company sign-in (studio_session.verify).
+    # May manage keys, but only its own -- the routes filter by tenant_id. Kept
+    # distinct from ``operator`` so "everyone can issue keys" never silently
+    # becomes "everyone can revoke everyone's keys".
+    studio_user: bool = False
     # True only for the env-configured API_KEYS tier, which may MANAGE keys.
-    # Studio-issued keys are the client tier: they call the serving surfaces
+    # Studio-ISSUED keys are the client tier: they call the serving surfaces
     # and must not be able to mint more keys (otherwise revoking a leaked key
-    # is pointless -- it could have issued itself a successor).
+    # is pointless -- it could have issued itself a successor). Unscoped, so
+    # distinct from ``studio_user`` above.
     operator: bool = False
 
 
@@ -127,23 +135,44 @@ class TenantQuotaManager:
         now: float | None = None,
     ) -> TenantContext:
         if api_key:
-            for configured_key, tenant_id in self.api_keys.items():
-                if hmac.compare_digest(api_key, configured_key):
-                    # The env tier is the OPERATOR tier: it may manage keys.
+            # Three credential kinds, in a deliberate order.
+            #
+            # 1. A Studio session token, identified by its own prefix. Checked
+            #    first because it is self-describing: there is no reason to walk
+            #    the operator keys with it, and no way for one to be confused
+            #    with a key.
+            if api_key.startswith(STUDIO_SESSION_PREFIX):
+                login = verify_studio_session(api_key)
+                if login is not None:
+                    # tenant = the company login, so usage and key ownership
+                    # are attributable to the person. ``studio_user`` rather
+                    # than ``operator``: they may manage THEIR OWN keys (the
+                    # Studio exists partly to issue them) but not everyone's,
+                    # and the routes scope every read and write by tenant_id.
                     return TenantContext(
-                        tenant_id=tenant_id, authenticated=True, operator=True
+                        tenant_id=login, authenticated=True, studio_user=True
                     )
-            # Then the Studio-issued keys (client tier). Checked second so an
-            # env key can never be shadowed by a database row, and injected
-            # rather than imported so this module stays free of storage
-            # imports (and unit-testable with no database).
-            if self._issued_key_lookup is not None:
-                found = self._issued_key_lookup(api_key)
-                if found is not None:
-                    tenant_id, key_id = found
-                    return TenantContext(
-                        tenant_id=tenant_id, authenticated=True, api_key_id=key_id
-                    )
+                # A prefixed-but-invalid token is a bad credential, not a key
+                # to try elsewhere -- fall through to the 401 below.
+            else:
+                # 2. Env-configured keys: the OPERATOR tier, unscoped. They
+                #    provision on behalf of others, so they see every key.
+                for configured_key, tenant_id in self.api_keys.items():
+                    if hmac.compare_digest(api_key, configured_key):
+                        return TenantContext(
+                            tenant_id=tenant_id, authenticated=True, operator=True
+                        )
+                # 3. Studio-issued keys (client tier). Checked last so an env
+                #    key can never be shadowed by a database row, and injected
+                #    rather than imported so this module stays free of storage
+                #    imports (and unit-testable with no database).
+                if self._issued_key_lookup is not None:
+                    found = self._issued_key_lookup(api_key)
+                    if found is not None:
+                        tenant_id, key_id = found
+                        return TenantContext(
+                            tenant_id=tenant_id, authenticated=True, api_key_id=key_id
+                        )
         if self.auth_required:
             # #449: this is the only trace a rejected auth attempt leaves
             # anywhere -- there was previously no way to detect or

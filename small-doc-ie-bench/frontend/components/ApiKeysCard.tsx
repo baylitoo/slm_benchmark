@@ -46,6 +46,9 @@ export function ApiKeysCard({ active = true }: { active?: boolean }) {
   // dropped as soon as the operator dismisses it.
   const [secret, setSecret] = useState<{ id: string; key: string } | null>(null);
   const [encryptionReady, setEncryptionReady] = useState(true);
+  // Non-null => this listing is restricted to that tenant (a company-signed-in
+  // user sees only their own keys). Null => unscoped operator.
+  const [scopedTo, setScopedTo] = useState<string | null>(null);
 
   const fetchUsage = useCallback(() => apiKeyUsage(usageWindow), [window]);
   const usage = usePolling<{ window: string; keys: ApiKeyUsageRow[] }>(
@@ -65,17 +68,25 @@ export function ApiKeysCard({ active = true }: { active?: boolean }) {
   useEffect(() => {
     if (!active) return;
     void listApiKeys()
-      .then((result) => setEncryptionReady(result.encryption_configured))
+      .then((result) => {
+        setEncryptionReady(result.encryption_configured);
+        setScopedTo(result.scoped_to);
+      })
       .catch(() => setEncryptionReady(true));
   }, [active]);
 
   async function create(event: React.FormEvent) {
     event.preventDefault();
-    if (busy || !label.trim() || !tenantId.trim()) return;
+    // A scoped caller does not supply an owner: the backend uses their
+    // verified login whatever is sent, so asking for it would be a lie.
+    if (busy || !label.trim() || (scopedTo === null && !tenantId.trim())) return;
     setBusy(true);
     setError(null);
     try {
-      const created = await createApiKey(label.trim(), tenantId.trim());
+      const created = await createApiKey(
+        label.trim(),
+        scopedTo === null ? tenantId.trim() : undefined,
+      );
       setSecret({ id: created.id, key: created.key });
       setLabel("");
       setTenantId("");
@@ -117,7 +128,11 @@ export function ApiKeysCard({ active = true }: { active?: boolean }) {
     <Card
       icon={<KeyRound className="h-5 w-5" />}
       title="API keys"
-      subtitle="Keys you issue for clients of /v1, with what each one has served over the selected window. Shown once on creation, then masked."
+      subtitle={
+        scopedTo === null
+          ? "Every key issued on this deployment, with what each one has served over the selected window. Shown once on creation, then masked."
+          : "Your keys for clients of /v1, with what each one has served over the selected window. Shown once on creation, then masked."
+      }
       actions={<Segmented
           value={usageWindow}
           onChange={setUsageWindow}
@@ -166,14 +181,20 @@ export function ApiKeysCard({ active = true }: { active?: boolean }) {
               aria-label="Key label"
             />
           </Field>
-          <Field label="Tenant" hint="Owns the usage and quota.">
-            <TextInput
-              value={tenantId}
-              onChange={(e) => setTenantId(e.target.value)}
-              placeholder="acme"
-              aria-label="Tenant id"
-            />
-          </Field>
+          {scopedTo === null ? (
+            <Field label="Tenant" hint="Owns the usage and quota.">
+              <TextInput
+                value={tenantId}
+                onChange={(e) => setTenantId(e.target.value)}
+                placeholder="acme"
+                aria-label="Tenant id"
+              />
+            </Field>
+          ) : (
+            <Field label="Owner" hint="Your account — keys are yours alone.">
+              <TextInput value={scopedTo} readOnly aria-label="Owner" />
+            </Field>
+          )}
           <Button type="submit" loading={busy} disabled={!encryptionReady}>
             <Plus className="h-4 w-4" /> Issue key
           </Button>

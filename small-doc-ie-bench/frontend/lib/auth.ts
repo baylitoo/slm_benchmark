@@ -14,7 +14,8 @@
 
 import { useEffect, useState } from "react";
 
-import { AUTH_BASE } from "./env";
+import { API_BASE, AUTH_BASE } from "./env";
+import { getStudioTokenExpiry, setStudioToken } from "./apiKey";
 
 // NEXT_PUBLIC_AUTH_BASE_URL is the auth API's ROOT -- everything up to but not
 // including `/auth/...`. On the company deployment that is
@@ -33,6 +34,19 @@ import { AUTH_BASE } from "./env";
 // with 405, and a failed preflight makes `fetch` reject with no readable
 // response -- indistinguishable from the auth server simply not allowing this
 // origin. Hence the explicit 404/405 message in `post` below.
+// Exchanging a company session for Studio backend access goes through DocIE's
+// POST /v1/auth/session, which verifies the session by calling the auth
+// server's own /auth/refresh once and returns BOTH the rotated company pair
+// and a Studio token.
+//
+// That is why renewal is routed through it INSTEAD of calling /auth/refresh
+// directly, not in addition to it: the auth server rotates refresh tokens, so
+// doing both would double the upstream calls AND invalidate one of the two
+// rotated tokens. Steady-state load on the auth server is therefore unchanged
+// from before this existed -- one renewal per tab per token lifetime -- plus a
+// single exchange at sign-in.
+const EXCHANGE_PATH = "/v1/auth/session";
+
 const STORAGE_KEY = "docie:session";
 // Same-tab writes don't fire the native `storage` event, so mounted components
 // (the gate, the top-bar menu) learn about sign-in/out through this instead.
@@ -158,7 +172,81 @@ export async function login(loginName: string, password: string): Promise<Sessio
   });
   const session = sessionFrom(pair, loginName);
   setSession(session);
+  // One exchange here so the Studio has backend access immediately. The
+  // password went straight to the company auth server above and never reaches
+  // DocIE; only the resulting refresh token is exchanged.
+  await exchangeForStudioToken(session);
   return session;
+}
+
+/**
+ * Trade the company refresh token for a Studio token, and adopt the rotated
+ * company pair the exchange returns.
+ *
+ * Returns the (possibly rotated) session, or null when the company session was
+ * rejected. A deployment with the exchange unconfigured answers 503: that is
+ * not a failure of the sign-in, so the company session is kept and the Studio
+ * falls back to asking for an operator key exactly as it did before.
+ */
+async function exchangeForStudioToken(current: Session): Promise<Session | null> {
+  let resp: Response;
+  try {
+    resp = await fetch(`${API_BASE}${EXCHANGE_PATH}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: current.refreshToken }),
+    });
+  } catch {
+    // DocIE itself unreachable. The company session stands; panels will show
+    // their own errors rather than this being reported as a sign-in failure.
+    return current;
+  }
+  if (resp.status === 503) {
+    setStudioToken(null);
+    return current;
+  }
+  if (!resp.ok) {
+    // The company session was refused upstream: sign out rather than leave a
+    // dead session in storage.
+    if (resp.status === 401) {
+      setStudioToken(null);
+      setSession(null);
+      return null;
+    }
+    return current;
+  }
+  try {
+    const body = (await resp.json()) as {
+      studioToken?: string;
+      expiresIn?: number;
+      accessToken?: string;
+      refreshToken?: string;
+      expiresInCompany?: number;
+      login?: string;
+    };
+    if (body.accessToken && body.refreshToken) {
+      // The upstream rotated these; keeping the superseded refresh token would
+      // sign the user out at the next renewal.
+      const rotated: Session = {
+        accessToken: body.accessToken,
+        refreshToken: body.refreshToken,
+        expiresAt:
+          Date.now() +
+          (Number.isFinite(body.expiresInCompany) && (body.expiresInCompany ?? 0) > 0
+            ? (body.expiresInCompany as number)
+            : 1800) *
+            1000,
+        login: body.login || current.login,
+      };
+      setSession(rotated);
+      setStudioToken(body.studioToken ?? null, body.expiresIn);
+      return rotated;
+    }
+    setStudioToken(body.studioToken ?? null, body.expiresIn);
+    return current;
+  } catch {
+    return current;
+  }
 }
 
 /**
@@ -168,6 +256,12 @@ export async function login(loginName: string, password: string): Promise<Sessio
 export async function refresh(): Promise<Session | null> {
   const current = getSession();
   if (!current) return null;
+  // One upstream renewal, not two: the exchange refreshes against the company
+  // auth server and hands back both credentials.
+  const exchanged = await exchangeForStudioToken(current);
+  if (exchanged === null) return null;
+  if (exchanged !== current) return exchanged;
+  // Exchange unconfigured or DocIE unreachable -- renew directly, as before.
   try {
     const pair = await post<TokenPair>("/auth/refresh", {
       refreshToken: current.refreshToken,
@@ -187,6 +281,7 @@ export async function refresh(): Promise<Session | null> {
 export async function logout(): Promise<void> {
   const current = getSession();
   setSession(null);
+  setStudioToken(null);
   if (!current) return;
   try {
     await post(
@@ -239,7 +334,14 @@ export function useSession(): { session: Session | null; ready: boolean } {
 
   useEffect(() => {
     if (!session) return;
-    const due = session.expiresAt - Date.now() - REFRESH_MARGIN_MS;
+    // The Studio token's TTL is capped at the company access-token lifetime,
+    // so a company session longer than that cap expires LATER than the Studio
+    // token. Scheduling on the company deadline alone would leave the Studio
+    // unauthenticated in between, so renew on whichever comes first.
+    const studioExpiry = getStudioTokenExpiry();
+    const deadline =
+      studioExpiry !== null ? Math.min(session.expiresAt, studioExpiry) : session.expiresAt;
+    const due = deadline - Date.now() - REFRESH_MARGIN_MS;
     if (due <= 0) {
       void refresh();
       return;
