@@ -363,8 +363,19 @@ def init_engine(database_url: str | None = None) -> None:
     ensure_batch_tables(_engine)
     # Same race again: usage_records is new (per-deployment usage ledger behind
     # GET /v1/studio/usage).
+    #
+    # ORDER MATTERS. ensure_usage_record_table loops CreateIndex over
+    # UsageRecord's metadata, which includes ix_usage_records_api_key_id. On a
+    # database that predates that column, CREATE TABLE IF NOT EXISTS is a
+    # no-op, so the index would be created against a column the table does not
+    # have yet -- UndefinedColumn, raised during lifespan startup, which takes
+    # the whole API down. The column add therefore has to run FIRST. It
+    # returns early when the table is absent, so a fresh database still gets
+    # the complete table (and its indexes) from the call below.
+    from docie_bench.studio.api_key_store import ensure_usage_api_key_column
     from docie_bench.studio.usage_store import ensure_usage_record_table
 
+    ensure_usage_api_key_column(_engine)
     ensure_usage_record_table(_engine)
     # Same race again: extraction_run_results is new (durable extraction
     # outcome the plain-HTTP polling fallback reads before ever touching the
@@ -372,17 +383,12 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.studio.extraction_results import ensure_extraction_result_table
 
     ensure_extraction_result_table(_engine)
-    # Same race again: studio_api_keys is new (Studio-issued API keys), and
-    # usage_records gains api_key_id. The column add runs AFTER
-    # ensure_usage_record_table above so a fresh database has already created
-    # the table complete and this is a no-op, while an existing one is altered.
-    from docie_bench.studio.api_key_store import (
-        ensure_api_key_table,
-        ensure_usage_api_key_column,
-    )
+    # Same race again: studio_api_keys is new (Studio-issued API keys). The
+    # usage_records.api_key_id column is added further up, before the index
+    # loop that depends on it.
+    from docie_bench.studio.api_key_store import ensure_api_key_table
 
     ensure_api_key_table(_engine)
-    ensure_usage_api_key_column(_engine)
 
 
 def get_session_factory() -> sessionmaker[Session] | None:
