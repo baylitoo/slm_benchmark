@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import os
 import tempfile
@@ -10,10 +12,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 
+import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from docie_bench.agents.api import router as agents_router
 from docie_bench.benchmark.routing_config import build_extraction_router
@@ -69,7 +72,9 @@ from docie_bench.schemas.review import (
     ReviewTaskView,
 )
 from docie_bench.security import (
+    TenantContext,
     TenantDependency,
+    get_quota_manager,
     read_validated_upload,
     redact_fields,
     tenant_guard,
@@ -93,6 +98,9 @@ from docie_bench.studio.routing_policies import (
     RoutingPolicyUnavailableError,
     get_routing_policy,
 )
+from docie_bench.studio_session import mint as mint_studio_session
+from docie_bench.studio_session import session_exchange_configured
+from docie_bench.studio_session import ttl_for as studio_session_ttl_for
 from docie_bench.telemetry import (
     CONTENT_TYPE_LATEST,
     REVIEW_ACTIONS,
@@ -881,3 +889,132 @@ def reject_review_task(
         return result
     except Exception as exc:
         raise _review_http_error(exc) from exc
+
+
+class StudioSessionRequest(BaseModel):
+    """Body of ``POST /v1/auth/session`` -- the company refresh token."""
+
+    refreshToken: str = Field(min_length=1, max_length=4096)  # noqa: N815 - auth server's name
+
+
+@app.post("/v1/auth/session")
+async def studio_session_exchange(
+    payload: StudioSessionRequest, request: Request
+) -> dict[str, Any]:
+    """Exchange a proven company session for Studio backend access.
+
+    DELIBERATELY UNAUTHENTICATED: this is the endpoint that establishes
+    authentication, so it cannot require it. What it requires instead is proof
+    that the caller holds a live company session, and the proof is that the
+    company auth server accepts their refresh token -- see
+    ``docie_bench.studio_session`` for why that is the oracle used rather than
+    verifying the access token (no JWKS, no introspection endpoint, and a
+    shared HS256 secret would let this service forge a token for any employee).
+
+    Mounted outside the ``tenant_guard`` routers on purpose, and NOT under
+    ``/v1/studio`` -- that prefix is the authenticated Studio router, and a
+    string-prefix match on it would both sweep this route into that router's
+    pinned inventory and invite a later refactor to apply its dependency here.
+
+    The rotated company pair is returned to the caller because the auth server
+    rotates refresh tokens: keeping the superseded one would sign the user out
+    on their next renewal. Neither token is stored here.
+    """
+    client_host = request.client.host if request.client else None
+    manager = get_quota_manager()
+    # Bound it with the anonymous budget. An unauthenticated endpoint that
+    # makes an outbound call is a free amplifier otherwise, and the
+    # auth-failure bucket does not apply because this is not a key check.
+    # One context, used for both acquire and release: the concurrency slot is
+    # keyed by tenant_id, so two separately-built contexts would work today but
+    # leak a slot the moment the key derivation drifts between them.
+    anonymous = TenantContext(
+        tenant_id=f"anon:{client_host}" if client_host else "anonymous",
+        authenticated=False,
+    )
+    manager.acquire(anonymous, quota="request")
+    try:
+        if not session_exchange_configured():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Studio session exchange is not configured; set "
+                    "STUDIO_SESSION_SECRET and COMPANY_AUTH_BASE_URL"
+                ),
+            )
+        base = settings.company_auth_base_url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                upstream = await client.post(
+                    f"{base}/auth/refresh",
+                    json={"refreshToken": payload.refreshToken},
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.HTTPError as exc:
+            # The company auth server is the authority here; if it cannot be
+            # reached we must not guess, and must not fall back to granting
+            # access.
+            raise HTTPException(
+                status_code=502, detail="Company auth server unreachable"
+            ) from exc
+        if upstream.status_code >= 400:
+            logger.warning(
+                "studio session exchange rejected",
+                extra={"docie_client_host": client_host or "unknown"},
+            )
+            raise HTTPException(status_code=401, detail="Company session is not valid")
+        try:
+            pair = upstream.json()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502, detail="Company auth server returned a non-JSON response"
+            ) from exc
+        access_token = pair.get("accessToken")
+        rotated_refresh = pair.get("refreshToken")
+        if not isinstance(access_token, str) or not isinstance(rotated_refresh, str):
+            raise HTTPException(
+                status_code=502, detail="Company auth server returned no token pair"
+            )
+        login = _login_from_access_token(access_token)
+        if login is None:
+            raise HTTPException(
+                status_code=502,
+                detail="Could not read a login from the company access token",
+            )
+        # Bounded by the company token's own remaining life: Studio access must
+        # not outlive the session that proved it.
+        ttl = studio_session_ttl_for(pair.get("expiresIn"))
+        return {
+            "studioToken": mint_studio_session(login, ttl_seconds=ttl),
+            "expiresIn": ttl,
+            "login": login,
+            # Rotated by the auth server -- the browser must replace its copy.
+            "accessToken": access_token,
+            "refreshToken": rotated_refresh,
+            "expiresInCompany": pair.get("expiresIn"),
+        }
+    finally:
+        manager.release(anonymous)
+
+
+def _login_from_access_token(token: str) -> str | None:
+    """The login/subject claim, read WITHOUT verifying the signature.
+
+    Safe only because the signature is not what authorizes anything here: the
+    caller was already proven to hold a live company session by the refresh
+    exchange above, and this token is the one the auth server just minted for
+    them. The claim is used as a tenant label, never as a permission.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (ValueError, TypeError):
+        return None
+    for field in ("login", "sub", "username", "preferred_username", "email"):
+        value = claims.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:128]
+    return None

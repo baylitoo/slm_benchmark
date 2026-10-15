@@ -36,19 +36,95 @@ describe("request URLs", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/auth/login");
   });
 
-  it("uses the same root for refresh and logout", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(PAIR)));
+  it("renews through the exchange, NOT by calling /auth/refresh as well", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string) => jsonResponse(PAIR)));
     await login("amine", "secret");
 
-    const fetchMock = vi.fn(async (_url: string) => jsonResponse(PAIR));
+    const fetchMock = vi.fn(async (_url: string) =>
+      jsonResponse({
+        studioToken: "docie_sess_x.y",
+        accessToken: "access-2",
+        refreshToken: "refresh-2",
+        expiresInCompany: 1800,
+        login: "amine",
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
+
     await refresh();
-    expect(fetchMock.mock.calls[0][0]).toBe("/auth/refresh");
+
+    // The whole point: ONE upstream renewal. The exchange refreshes against
+    // the company auth server itself and returns both credentials, so calling
+    // /auth/refresh here too would double the load on it and invalidate one of
+    // the two rotated refresh tokens.
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("/v1/auth/session");
+    expect(urls.some((u) => u.includes("/auth/refresh"))).toBe(false);
+  });
+
+  it("adopts the rotated company pair the exchange returns", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string) => jsonResponse(PAIR)));
+    await login("amine", "secret");
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string) =>
+        jsonResponse({
+          studioToken: "docie_sess_x.y",
+          accessToken: "access-2",
+          refreshToken: "refresh-2",
+          expiresInCompany: 1800,
+        }),
+      ),
+    );
+    await refresh();
+
+    // The auth server rotates refresh tokens; holding the superseded one would
+    // sign the user out at the next renewal.
+    expect(getSession()?.refreshToken).toBe("refresh-2");
+  });
+
+  it("falls back to a direct renewal when the exchange is unconfigured", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string) => jsonResponse(PAIR)));
+    await login("amine", "secret");
+
+    // 503 = STUDIO_SESSION_SECRET / COMPANY_AUTH_BASE_URL not set. That is not
+    // a sign-in failure: the company session stands and the Studio keeps
+    // asking for an operator key, exactly as before this existed.
+    const fetchMock = vi.fn(async (url: string) =>
+      url.includes("/v1/auth/session")
+        ? jsonResponse({}, false, 503)
+        : jsonResponse({ ...PAIR, accessToken: "access-3", refreshToken: "refresh-3" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const renewed = await refresh();
+
+    expect(renewed?.accessToken).toBe("access-3");
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls.some((u) => u.includes("/auth/refresh"))).toBe(true);
+  });
+
+  it("signs out when the exchange reports the company session is dead", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string) => jsonResponse(PAIR)));
+    await login("amine", "secret");
+
+    vi.stubGlobal("fetch", vi.fn(async (_url: string) => jsonResponse({}, false, 401)));
+
+    expect(await refresh()).toBeNull();
+    expect(getSession()).toBeNull();
+  });
+
+  it("still revokes at the company auth server on sign-out", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string) => jsonResponse(PAIR)));
+    await login("amine", "secret");
 
     const logoutMock = vi.fn(async (_url: string) => jsonResponse({}));
     vi.stubGlobal("fetch", logoutMock);
     await logout();
-    expect(logoutMock.mock.calls[0][0]).toBe("/auth/logout");
+
+    expect(String(logoutMock.mock.calls[0][0])).toBe("/auth/logout");
   });
 });
 

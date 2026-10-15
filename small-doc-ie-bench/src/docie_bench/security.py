@@ -15,6 +15,8 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, Header, HTTPException, Request, UploadFile
 
 from docie_bench.settings import get_settings
+from docie_bench.studio_session import TOKEN_PREFIX as STUDIO_SESSION_PREFIX
+from docie_bench.studio_session import verify as verify_studio_session
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +112,22 @@ class TenantQuotaManager:
         now: float | None = None,
     ) -> TenantContext:
         if api_key:
-            for configured_key, tenant_id in self.api_keys.items():
-                if hmac.compare_digest(api_key, configured_key):
-                    return TenantContext(tenant_id=tenant_id, authenticated=True)
+            # Studio session tokens first, identified by their own prefix: they
+            # are self-describing, so there is no reason to walk the operator
+            # keys with them, and no way for one to be confused with a key.
+            if api_key.startswith(STUDIO_SESSION_PREFIX):
+                login = verify_studio_session(api_key)
+                if login is not None:
+                    # tenant = the company login, which is what the user chose
+                    # as the tenant dimension. NOT an operator: a signed-in
+                    # Studio user manages models, not API keys.
+                    return TenantContext(tenant_id=login, authenticated=True)
+                # A prefixed-but-invalid token is a bad credential, not a key
+                # to try elsewhere -- fall through to the 401 below.
+            else:
+                for configured_key, tenant_id in self.api_keys.items():
+                    if hmac.compare_digest(api_key, configured_key):
+                        return TenantContext(tenant_id=tenant_id, authenticated=True)
         if self.auth_required:
             # #449: this is the only trace a rejected auth attempt leaves
             # anywhere -- there was previously no way to detect or

@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     # any networked deployment must populate API_KEYS and leave this on.
     auth_required: bool = True
     api_keys: SecretStr = Field(default=SecretStr(""))
+    # Signs the short-lived Studio session tokens handed out when a user has
+    # proved a company sign-in (studio_session.py). Unset => the exchange is
+    # off and the Studio keeps asking for an operator API key, which is the
+    # pre-existing behaviour. Any high-entropy string; rotating it invalidates
+    # live Studio sessions (users sign in again) and nothing else.
+    studio_session_secret: SecretStr = Field(default=SecretStr(""))
+    # Server-side base of the company auth API -- the same value the browser
+    # gets as NEXT_PUBLIC_AUTH_BASE_URL, e.g.
+    # https://newapp.cynov.com/Facturation-api/rest/v2. Needed because the
+    # exchange verifies a company session by calling that server's own
+    # /auth/refresh; the browser's copy is build-time and never reaches Python.
+    company_auth_base_url: str = ""
     # GET/HEAD traffic has its own budget because the authenticated Studio
     # continuously polls several control-plane views. Counting those reads
     # against inference/mutations makes the default 60/min quota self-deny
