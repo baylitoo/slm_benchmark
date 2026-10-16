@@ -1,0 +1,13 @@
+/* Small adjustments on top of Furo. */
+
+/* These docs are table-heavy (env vars, credential tiers, limits); the
+   theme defaults assume narrower tables than this project has. */
+article table.docutils { width: 100%; display: table; }
+article table.docutils td,
+article table.docutils th { padding: 0.5rem 0.7rem; line-height: 1.45; }
+
+/* Identifiers, ports and env vars appear constantly in prose and read
+   better when they do not shift the baseline. */
+article code.literal { font-size: 0.86em; padding: 0.1em 0.3em; border-radius: 4px; }
+
+div.mermaid { text-align: center; margin: 1.4rem 0; }

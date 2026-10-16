@@ -1,0 +1,67 @@
+name: documentation
+
+# The project lives in the small-doc-ie-bench/ subdirectory of this repository;
+# workflows are only discovered at the repository root, so this file lives here
+# and the build points at that subdirectory explicitly.
+#
+# Built on every pull request that touches the docs, published to GitHub Pages
+# on every push to the integration branch.
+
+on:
+  pull_request:
+    paths:
+      - "small-doc-ie-bench/docs/**"
+      - ".github/workflows/documentation.yml"
+  push:
+    branches: [master, dev-agents-milestone]
+    paths:
+      - "small-doc-ie-bench/docs/**"
+      - ".github/workflows/documentation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time. A pull-request build may be superseded by a newer
+# commit; a publish in progress is never cancelled.
+concurrency:
+  group: documentation-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: small-doc-ie-bench/docs/requirements.txt
+      - run: pip install -r small-doc-ie-bench/docs/requirements.txt
+      # -W turns warnings into errors: a dead cross-reference, a page missing
+      # from a toctree, or a duplicate label fails the build instead of
+      # shipping a site with broken navigation. --keep-going reports every
+      # problem in one run rather than stopping at the first.
+      - run: >
+          sphinx-build -W --keep-going -b html
+          small-doc-ie-bench/docs
+          small-doc-ie-bench/docs/_build/html
+      - if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: small-doc-ie-bench/docs/_build/html
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
