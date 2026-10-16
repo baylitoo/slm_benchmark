@@ -1,0 +1,419 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage[margin=2.4cm,top=2.6cm,bottom=2.4cm]{geometry}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{tcolorbox}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows,calc,fit,backgrounds}
+\usepackage[colorlinks=true,linkcolor=accent,urlcolor=accent,citecolor=accent]{hyperref}
+
+% ---------------------------------------------------------------- palette ----
+\definecolor{accent}{HTML}{4F46E5}
+\definecolor{ink}{HTML}{18181B}
+\definecolor{muted}{HTML}{71717A}
+\definecolor{hairline}{HTML}{E4E4E7}
+\definecolor{surface}{HTML}{FAFAFA}
+\definecolor{warnbg}{HTML}{FFFBEB}
+\definecolor{warnline}{HTML}{D97706}
+
+\color{ink}
+
+% ------------------------------------------------------------- structure ----
+\titleformat{\section}{\large\bfseries\color{accent}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries\color{ink}}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{1.4em}{0.5em}
+\titlespacing*{\subsection}{0pt}{1.0em}{0.35em}
+
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\color{hairline}\hrule height\headrulewidth}
+\fancyhead[L]{\footnotesize\color{muted}Transcription vocale temps réel — contrat d'intégration}
+\fancyhead[R]{\footnotesize\color{muted}\thepage}
+
+% ----------------------------------------------------------------- code ----
+\lstdefinestyle{docie}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{surface},
+  frame=single,
+  rulecolor=\color{hairline},
+  framesep=6pt,
+  xleftmargin=2pt,
+  xrightmargin=2pt,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  stringstyle=\color{accent},
+  commentstyle=\color{muted}\itshape,
+  aboveskip=0.9em,
+  belowskip=0.9em,
+}
+\lstset{style=docie}
+
+% ------------------------------------------------------------ tikz style ----
+\tikzset{
+  lane/.style={draw=hairline, fill=white, rounded corners=3pt, line width=0.7pt,
+               minimum width=3.3cm, minimum height=0.95cm, align=center,
+               font=\small\bfseries},
+  life/.style={draw=hairline, dashed, line width=0.7pt},
+  msg/.style={->, >=latex, line width=0.8pt, draw=accent, font=\scriptsize},
+  msgback/.style={->, >=latex, line width=0.8pt, draw=muted, font=\scriptsize, dashed},
+  audio/.style={->, >=latex, line width=1.6pt, draw=accent, font=\scriptsize},
+  stepnum/.style={circle, fill=accent, text=white, font=\scriptsize\bfseries,
+               inner sep=1.4pt, minimum size=3.6mm},
+  box/.style={draw=hairline, fill=white, rounded corners=3pt, line width=0.7pt,
+              minimum height=1.05cm, align=center, font=\small},
+  note/.style={font=\scriptsize\itshape, text=muted, align=center},
+}
+
+% --------------------------------------------------------------- boxes ----
+\newtcolorbox{statusbox}{
+  colback=warnbg, colframe=warnline, boxrule=0.8pt, arc=3pt,
+  left=10pt, right=10pt, top=8pt, bottom=8pt,
+}
+\newtcolorbox{dontbox}[1]{
+  colback=white, colframe=warnline, boxrule=1.2pt, arc=3pt,
+  left=10pt, right=10pt, top=8pt, bottom=8pt,
+  title={\bfseries #1}, coltitle=white, colbacktitle=warnline,
+  fonttitle=\normalsize,
+}
+\newtcolorbox{askbox}{
+  colback=white, colframe=accent, boxrule=1pt, arc=3pt,
+  left=10pt, right=10pt, top=8pt, bottom=8pt,
+}
+
+\setlist[itemize]{leftmargin=1.3em, itemsep=0.32em, topsep=0.35em}
+\setlist[enumerate]{leftmargin=1.5em, itemsep=0.45em, topsep=0.35em}
+
+\begin{document}
+\thispagestyle{empty}
+
+% ----------------------------------------------------------- title block ----
+\begin{flushleft}
+{\color{accent}\rule{\textwidth}{2.2pt}}\\[1.1em]
+{\Huge\bfseries Transcription vocale temps réel}\\[0.45em]
+{\Large\color{muted} Contrat d'intégration}\\[1.1em]
+{\color{hairline}\rule{\textwidth}{0.6pt}}\\[0.7em]
+{\small\color{muted}
+Plateforme d'inférence DocIE \quad$\longleftrightarrow$\quad ERP Cynov \hfill \today}
+\end{flushleft}
+
+\vspace{1.3em}
+
+\begin{statusbox}
+\textbf{Statut : proposition soumise à relecture. Non encore implémenté.}\par\smallskip
+Ce document existe pour que les deux équipes valident le contrat \emph{avant} que l'une
+ou l'autre ne développe. Les chemins d'accès, les noms de champs et les types de
+messages peuvent encore évoluer selon vos retours. Merci de ne pas démarrer les
+développements avant validation conjointe de la section~\ref{sec:erp}.
+\end{statusbox}
+
+\vspace{0.6em}
+
+\section{Ce que nous construisons}
+
+L'ERP capte le micro dans le navigateur et affiche une transcription en direct pendant
+que l'utilisateur parle. L'audio transite vers la plateforme d'inférence DocIE via une
+WebSocket ; les transcriptions partielles reviennent en une seconde environ, et une
+transcription finale stable est émise à chaque pause du locuteur.
+
+Le modèle gère le français (fr-FR et fr-CA) et diffuse nativement en continu : la
+transcription est donc incrémentale, et non du type \emph{envoyer un fichier puis
+attendre}. La transcription de fichiers est explicitement hors périmètre.
+
+\vspace{0.8em}
+\begin{center}
+\begin{tikzpicture}[node distance=0pt]
+
+  \node[lane] (be)  at (0,0)     {Backend ERP};
+  \node[lane] (br)  at (5.6,0)   {Navigateur ERP};
+  \node[lane] (dc)  at (11.2,0)  {Plateforme DocIE};
+
+  \draw[life] (be.south)  -- ++(0,-6.25);
+  \draw[life] (br.south)  -- ++(0,-6.25);
+  \draw[life] (dc.south)  -- ++(0,-6.25);
+
+  \draw[msg] ([yshift=-1.05cm]be.south) -- node[above,midway,align=center]
+       {\texttt{POST /v1/realtime/sessions}\\ en-tête \texttt{X-API-Key}}
+       ([yshift=-1.05cm]dc.south);
+  \node[stepnum] at ([xshift=-3mm,yshift=-1.05cm]be.south) {1};
+
+  \draw[msgback] ([yshift=-2.15cm]dc.south) -- node[above,midway]
+       {\texttt{\{ ticket, expires\_in: 60 \}}}
+       ([yshift=-2.15cm]be.south);
+  \node[stepnum] at ([xshift=3mm,yshift=-2.15cm]dc.south) {2};
+
+  \draw[msg] ([yshift=-3.15cm]be.south) -- node[above,midway]
+       {ticket transmis à sa propre page}
+       ([yshift=-3.15cm]br.south);
+  \node[stepnum] at ([xshift=-3mm,yshift=-3.15cm]be.south) {3};
+
+  \draw[msg] ([yshift=-4.15cm]br.south) -- node[above,midway,align=center]
+       {\texttt{WSS /v1/realtime}\\ ticket en sous-protocole}
+       ([yshift=-4.15cm]dc.south);
+  \node[stepnum] at ([xshift=-3mm,yshift=-4.15cm]br.south) {4};
+
+  \draw[audio] ([yshift=-5.35cm]br.south) -- node[above,midway]
+       {PCM16 16\,kHz mono, trames binaires}
+       ([yshift=-5.35cm]dc.south);
+  \node[stepnum] at ([xshift=-3mm,yshift=-5.35cm]br.south) {5};
+
+  \draw[msgback] ([yshift=-6.05cm]dc.south) -- node[below,midway]
+       {\texttt{partial} \ldots\ \texttt{partial} \ldots\ \texttt{final}}
+       ([yshift=-6.05cm]br.south);
+  \node[stepnum] at ([xshift=3mm,yshift=-6.05cm]dc.south) {6};
+
+\end{tikzpicture}
+
+\vspace{0.3em}
+{\scriptsize\color{muted} Les étapes 1 à 3 sont de serveur à serveur et n'ont lieu qu'une
+fois par session de dictée. Seule la flèche épaisse transporte de l'audio.}
+\end{center}
+
+\section{Le point à ne surtout pas manquer}
+
+\begin{dontbox}{Ne jamais transmettre une clé API DocIE au navigateur}
+Les clés API de notre plateforme ont une durée de vie longue et une portée totale : une
+seule clé donne accès à tous les modèles de l'API \texttt{/v1}, et toute la consommation
+lui est imputée et auditée. Une clé intégrée au JavaScript de l'ERP est lisible par
+chaque utilisateur de l'ERP et par tout ce qui s'exécute dans cette page.\par\smallskip
+Traitez-la exactement comme un mot de passe de base de données.
+\end{dontbox}
+
+Ce n'est pas une restriction que nous pouvons lever par configuration, et c'est la raison
+pour laquelle le flux comporte deux étapes au lieu d'une. Un navigateur n'est pas un
+endroit où peut résider une authentification durable : il reçoit donc un ticket éphémère.
+La clé API ne quitte jamais votre serveur.
+
+\section{Ce que l'équipe ERP implémente}
+\label{sec:erp}
+
+Deux développements, un de chaque côté de votre pile.
+
+\subsection{Backend : émettre un ticket (serveur à serveur)}
+
+Votre backend détient déjà la clé API DocIE. Lorsqu'un utilisateur ouvre l'interface de
+dictée, votre backend demande un ticket et le transmet à la page de cet utilisateur.
+
+\begin{lstlisting}
+curl -X POST https://api.inference.cynov.com/v1/realtime/sessions \
+  -H "X-API-Key: $DOCIE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"language": "fr"}'
+\end{lstlisting}
+
+\begin{lstlisting}
+{
+  "ticket":     "docie_rt_<opaque>",
+  "expires_in": 60,
+  "ws_url":     "wss://api.inference.cynov.com/v1/realtime"
+}
+\end{lstlisting}
+
+\noindent Propriétés du ticket, qui déterminent son usage :
+
+\begin{center}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}>{\bfseries}p{3.4cm}p{10.9cm}@{}}
+\toprule
+Éphémère      & Environ 60 secondes : de quoi ouvrir la socket, pas de quoi mériter
+                d'être stocké. À émettre au moment où l'utilisateur lance la dictée. \\
+Usage unique  & Consommé par la première socket qui le présente ; une seconde connexion
+                avec le même ticket est refusée. \\
+Portée réduite & Ouvre une socket de transcription et n'autorise rien d'autre. Ce n'est
+                pas un substitut à la clé API. \\
+Imputé        & Toute la consommation est enregistrée sur la clé API émettrice : votre
+                suivi reste donc par clé, quel que soit le nombre d'utilisateurs. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Ne mettez pas les tickets en cache et n'en partagez pas un entre plusieurs
+utilisateurs. L'émission est peu coûteuse.
+
+\subsection{Navigateur : ouvrir la socket et diffuser l'audio}
+
+\begin{lstlisting}
+const ws = new WebSocket(ws_url, [ticket]);   // ticket en sous-protocole
+ws.binaryType = "arraybuffer";
+\end{lstlisting}
+
+Le ticket voyage comme sous-protocole WebSocket (\texttt{Sec-WebSocket-Protocol}), le seul
+en-tête qu'un navigateur peut positionner lors d'une poignée de main WebSocket. Nous le
+gardons délibérément hors de la chaîne de requête, car les URL finissent dans les journaux
+des proxys, les journaux d'accès et l'historique du navigateur. Si votre pile ne peut pas
+définir de sous-protocole, dites-le-nous et nous activerons un repli par paramètre
+d'URL — mais le sous-protocole reste préférable.
+
+\vspace{0.9em}
+\begin{center}
+\begin{tikzpicture}[node distance=5.5mm]
+
+  \node[box, minimum width=2.15cm] (mic)  {Microphone\\[-1pt]{\scriptsize 48\,kHz}};
+  \node[box, minimum width=2.45cm, right=of mic] (work) {\texttt{AudioWorklet}\\[-1pt]{\scriptsize sous-échantillonnage}};
+  \node[box, minimum width=2.15cm, right=of work] (pcm)  {PCM16\\[-1pt]{\scriptsize 16\,kHz mono}};
+  \node[box, minimum width=2.15cm, right=of pcm, fill=surface] (ws)   {WebSocket\\[-1pt]{\scriptsize trames binaires}};
+  \node[box, minimum width=2.45cm, right=of ws] (asr)  {ASR en continu\\[-1pt]{\scriptsize blocs 320--560\,ms}};
+  \node[box, minimum width=2.15cm, right=of asr] (out)  {Transcription\\[-1pt]{\scriptsize partielle / finale}};
+
+  \foreach \a/\b in {mic/work, work/pcm, pcm/ws, ws/asr, asr/out}
+    \draw[->, >=latex, line width=0.8pt, draw=accent] (\a) -- (\b);
+
+  \node[note, below=3.5mm of pcm, xshift=-6mm] {dans la page ERP};
+  \node[note, below=3.5mm of asr, xshift=4mm] {sur la plateforme d'inférence};
+
+  \begin{scope}[on background layer]
+    \node[draw=hairline, dashed, rounded corners=4pt, inner sep=3.6mm,
+          fit=(mic)(pcm)] {};
+    \node[draw=hairline, dashed, rounded corners=4pt, inner sep=3.6mm,
+          fit=(asr)(out)] {};
+  \end{scope}
+
+\end{tikzpicture}
+\end{center}
+
+\subsubsection*{Format audio}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}>{\bfseries}ll@{}}
+\toprule
+Encodage          & PCM signé 16 bits, petit-boutiste \\
+Fréquence         & 16\,000 Hz \\
+Canaux            & 1 (mono) \\
+Taille de trame   & 20 à 100\,ms par message (320 à 1600 échantillons) \\
+Transport         & trames binaires WebSocket \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Les navigateurs captent en 44,1 ou 48\,kHz : la page doit donc sous-échantillonner à
+16\,kHz. Utilisez un \texttt{AudioWorklet} plutôt que le \texttt{ScriptProcessorNode}
+déprécié : il s'exécute hors du fil principal et ne produira pas de coupures lorsque
+l'interface ERP est chargée. Rééchantillonner côté navigateur décharge également nos
+serveurs d'inférence mutualisés, ce qui augmente directement le nombre de locuteurs
+simultanés que nous pouvons servir.
+
+Merci de ne pas envoyer de WebM, d'Opus ni de MP3. Le moteur consomme du PCM brut ; un
+format conteneur devrait être décodé côté serveur et ajouterait de la latence.
+
+\subsubsection*{Messages reçus}
+
+Des trames texte, un objet JSON chacune.
+
+\begin{lstlisting}
+{ "type": "partial", "text": "bonjour je voudrais commander" }
+\end{lstlisting}
+
+\begin{lstlisting}
+{ "type":  "final",
+  "text":  "Bonjour, je voudrais commander trois cartons.",
+  "start": 0.42,
+  "end":   3.87 }
+\end{lstlisting}
+
+\begin{lstlisting}
+{ "type": "error", "code": "ticket_expired", "message": "..." }
+\end{lstlisting}
+
+Affichez \texttt{partial} comme un texte provisoire — grisé ou en italique, à votre
+convenance — et remplacez-le à l'arrivée du \texttt{final} correspondant. Plusieurs
+partiels par seconde sont normaux, chacun remplaçant le précédent. Un \texttt{final} est
+stable et ne sera pas révisé : seuls les finaux doivent être enregistrés. La socket se
+ferme après un \texttt{error}.
+
+\subsubsection*{Clore une session}
+
+Envoyez une trame texte \texttt{\{"type": "close"\}} lorsque l'utilisateur arrête de
+dicter, puis fermez la socket. Nous vidons l'audio encore en transit et émettons un
+dernier \texttt{final} avant la fermeture. Couper la connexion fonctionne aussi, mais
+risque de perdre la dernière phrase.
+
+\section{Ce dont nous avons besoin de votre part}
+
+\begin{askbox}
+\begin{enumerate}
+  \item \textbf{La ou les origines exactes du navigateur} qui ouvriront des sockets, par
+        exemple \texttt{https://newapp.cynov.com}. Les WebSockets ne sont pas soumises à
+        la politique de même origine : nous validons donc l'en-tête \texttt{Origin}
+        contre une liste blanche lors de la poignée de main. Sans cela, un ticket dérobé
+        fonctionnerait depuis n'importe quel site.
+  \item \textbf{La concurrence attendue} : combien d'utilisateurs peuvent dicter
+        simultanément en pointe. C'est notre véritable contrainte de capacité : le coût
+        croît avec le nombre de locuteurs actifs, et les serveurs d'inférence sont
+        uniquement CPU et partagés avec d'autres charges. Nous plafonnerons le nombre de
+        sockets simultanées par clé API, et nous préférons fixer ce chiffre avec vous
+        plutôt que le découvrir.
+  \item \textbf{La destination de la transcription.} Si seul le navigateur en a besoin —
+        l'utilisateur la lit et enregistre un formulaire — le flux ci-dessus est complet.
+        Si votre \emph{backend} a besoin du texte, pour l'archiver dans une fiche,
+        dites-le-nous maintenant : le faire remonter depuis le navigateur vers votre
+        serveur est source de pertes et de conditions de course. Nous livrerions plutôt
+        les finaux à un webhook que vous exposez, ou votre backend tiendrait la socket.
+  \item \textbf{Un échantillon d'audio français représentatif}, si vous pouvez en
+        partager un. Les chiffres de précision publiés pour ces modèles sont mesurés sur
+        de la lecture. Le français spontané de terrain, avec interruptions, accents et
+        bruit de fond, se comporte très différemment, et nous préférons mesurer sur vos
+        données réelles plutôt que sur un banc d'essai.
+\end{enumerate}
+\end{askbox}
+
+\section{Points ouverts de notre côté}
+
+Listés par transparence. Aucun ne modifie ce que la section~\ref{sec:erp} vous demande.
+
+\begin{itemize}
+  \item \textbf{Latence.} Le modèle expose des tailles de bloc de 80, 160, 320, 560 et
+        1120\,ms. Nous prévoyons 320 ou 560\,ms, ce qui maintient la latence de bout en
+        bout sous la seconde. Des blocs plus courts paraissent plus immédiats et coûtent
+        un peu de précision.
+  \item \textbf{Débit sur CPU.} Notre parc est dépourvu de GPU. Nous mesurons le facteur
+        temps réel sur le matériel réel avant de nous engager, car les bancs d'essai
+        publiés du modèle sont uniquement sur GPU. C'est le principal risque sur le
+        planning, et il conditionne la réponse au point~2 ci-dessus.
+  \item \textbf{Comptage.} Le flux continu se facture en secondes d'audio et non en
+        requêtes. Notre suivi de consommation par clé est étendu en conséquence.
+\end{itemize}
+
+\section{Synthèse du contrat}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.45}
+\begin{tabular}{@{}p{7.1cm}p{7.1cm}@{}}
+\toprule
+{\color{accent}\bfseries Équipe ERP} & {\color{accent}\bfseries Plateforme d'inférence} \\
+\midrule
+Conserver la clé API uniquement côté serveur &
+Émettre des tickets éphémères, à usage unique, de portée réduite \\
+Émettre un ticket par session de dictée &
+Valider le ticket et l'\texttt{Origin} à la poignée de main \\
+Capter le micro, sous-échantillonner en PCM16 16\,kHz mono &
+Transcrire en continu, diffuser partiels et finaux \\
+Afficher les partiels, n'enregistrer que les finaux &
+Imputer toute la consommation à la clé API émettrice \\
+Fournir origines, concurrence attendue, échantillon audio &
+Plafonner les sockets par clé, publier le contrat définitif \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{1.1em}
+\noindent
+Si quoi que ce soit ici ne correspond pas à la façon dont l'ERP est construit, merci de
+nous le signaler maintenant plutôt qu'une fois développé. La forme du flux
+d'authentification est imposée par la contrainte de la section~2 ; presque tout le reste
+est négociable.
+
+\end{document}
