@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from docie_bench.ocr.base import OCRBackend
+from docie_bench.ocr.indra_backend import IndraOCRBackend
 from docie_bench.ocr.paddle_backend import PaddleOCRBackend
 from docie_bench.ocr.pdf_text import PdfTextBackend
 from docie_bench.ocr.tesseract_backend import TesseractBackend
@@ -12,6 +13,7 @@ OCR_BACKENDS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
     ("liteparse", ("pdf_text",), None),
     ("tesseract", (), "pytesseract"),
     ("paddleocr", (), "paddleocr"),
+    ("indra", (), "indra_ocr"),
 )
 
 
@@ -40,6 +42,8 @@ def get_ocr_backend(name: str, *, language: str | None = None) -> OCRBackend:
         return TesseractBackend()
     if normalized == "paddleocr":
         return PaddleOCRBackend(lang=language or "en")
+    if normalized == "indra":
+        return IndraOCRBackend()
     raise ValueError(
-        f"Unknown OCR backend {name!r}. Expected liteparse, tesseract, or paddleocr."
+        f"Unknown OCR backend {name!r}. Expected liteparse, tesseract, paddleocr, or indra."
     )

@@ -101,7 +101,7 @@ export interface OCRBlock {
   text: string;
   page: number;
   bbox: BoundingBox | null;
-  source: "pdf_text" | "tesseract" | "paddleocr" | "manual" | "unknown";
+  source: "pdf_text" | "tesseract" | "paddleocr" | "indra" | "manual" | "unknown";
   confidence: number | null;
 }
 

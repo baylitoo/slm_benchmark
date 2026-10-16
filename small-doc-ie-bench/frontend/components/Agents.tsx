@@ -1491,6 +1491,7 @@ export function CreateView({
                           </option>
                           <option value="tesseract">tesseract</option>
                           <option value="paddleocr">paddleocr — needs the paddle extra</option>
+                          <option value="indra">indra — CPU ONNX OCR, needs the indra extra</option>
                           {ocrBackend === "pdf_text" && !ocrModel && (
                             <option value="pdf_text">pdf_text — legacy alias of liteparse</option>
                           )}

@@ -872,7 +872,7 @@ function RootCauseList({ title, rows }: { title: string; rows: ComparisonRow[] }
 // harder text-splice problem than either create or delete.
 // ---------------------------------------------------------------------------
 
-const OCR_BACKENDS = ["liteparse", "tesseract", "paddleocr"] as const;
+const OCR_BACKENDS = ["liteparse", "tesseract", "paddleocr", "indra"] as const;
 
 function PipelineProfileSheet({
   open,
