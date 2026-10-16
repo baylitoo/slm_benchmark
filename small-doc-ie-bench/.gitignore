@@ -18,3 +18,6 @@ models/*.safetensors
 # it (the image installs from pyproject.toml). Tracking it meant the tree could
 # declare dependencies pyproject no longer has.
 *.egg-info/
+
+# Sphinx build output
+docs/_build/
