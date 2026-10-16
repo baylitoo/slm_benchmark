@@ -144,6 +144,18 @@ class RuntimeLaunchSpec:
     reasoning_budget_message: str | None = None
     numa: str | None = None
     flash_attn: str | None = None
+    # llama.cpp only (#366): unlocks llama-server's own Prometheus-compatible
+    # GET /metrics -- a DIFFERENT consumer than this app's in-app
+    # Observability tab (usage ledger, slots card): an operator's EXTERNAL
+    # monitoring stack (Grafana, alerting) scraping llama-server directly,
+    # working even when nobody has the Studio open. Purely an ops toggle --
+    # no per-request behavioral effect, and this framework doesn't consume
+    # /metrics itself (the existing /slots + usage-ledger machinery already
+    # covers in-app observability; reading /metrics too would just
+    # duplicate it). Same host:port as the rest of the API -- no new
+    # access-control surface beyond whatever already gates the deployment
+    # (api_key_env).
+    metrics_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -808,6 +820,8 @@ class LlamaCppRuntime(RuntimeAdapter):
             "--port",
             str(spec.port),
         ]
+        if spec.metrics_enabled:
+            command.append("--metrics")
         # Default on for a bare RuntimeLaunchSpec (e.g. `docie serve`'s direct
         # construction, README-documented advanced usage, see control_plane.py's
         # serve()) -- but every family-routed store deploy (serve_store_model)
