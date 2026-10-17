@@ -60,6 +60,7 @@ import {
   type StoreEntry,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
+import { ocrBackendLabel, useOcrBackends } from "@/lib/useOcrBackends";
 import { cn } from "@/lib/cn";
 import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
@@ -751,6 +752,7 @@ export function CreateView({
     }
   }
   const [ocrBackend, setOcrBackend] = useState("tesseract");
+  const ocrBackends = useOcrBackends();
   const [ocrLanguage, setOcrLanguage] = useState("");
   const [ocrExtractor, setOcrExtractor] = useState("");
   // OCR→extract step-1 may be a deployed VISION model (VLM as OCR) instead of a
@@ -1486,11 +1488,11 @@ export function CreateView({
                         }}
                       >
                         <optgroup label="Built-in">
-                          <option value="liteparse">
-                            liteparse — PDF text + OCR fallback (light)
-                          </option>
-                          <option value="tesseract">tesseract</option>
-                          <option value="paddleocr">paddleocr — needs the paddle extra</option>
+                          {ocrBackends.map((b) => (
+                            <option key={b.name} value={b.name} disabled={!b.available}>
+                              {ocrBackendLabel(b)}
+                            </option>
+                          ))}
                           {ocrBackend === "pdf_text" && !ocrModel && (
                             <option value="pdf_text">pdf_text — legacy alias of liteparse</option>
                           )}

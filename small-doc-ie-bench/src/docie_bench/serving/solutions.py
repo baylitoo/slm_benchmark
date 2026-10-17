@@ -167,7 +167,7 @@ def build_solution(
 class OcrSolution:
     """Run a document image through an OCR backend; return its text as a completion.
 
-    `options`: ``backend`` (tesseract | paddleocr | pdf_text, default tesseract)
+    `options`: ``backend`` (tesseract | paddleocr | indra | pdf_text, default tesseract)
     and ``language`` (backend-specific, e.g. 'en').
     """
 

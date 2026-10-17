@@ -42,6 +42,7 @@ import {
   type RoutingPolicySummary,
 } from "@/lib/api";
 import { useAsync } from "@/lib/useAsync";
+import { ocrBackendLabel, useOcrBackends } from "@/lib/useOcrBackends";
 import { toUserMessage } from "@/lib/errors";
 import { cn } from "@/lib/cn";
 import { T } from "@/lib/i18n";
@@ -872,7 +873,7 @@ function RootCauseList({ title, rows }: { title: string; rows: ComparisonRow[] }
 // harder text-splice problem than either create or delete.
 // ---------------------------------------------------------------------------
 
-const OCR_BACKENDS = ["liteparse", "tesseract", "paddleocr"] as const;
+const DEFAULT_OCR_BACKEND = "liteparse";
 
 function PipelineProfileSheet({
   open,
@@ -926,7 +927,8 @@ function PipelineProfileSheet({
   const [name, setName] = useState("");
   const [extractor, setExtractor] = useState("");
   const [ocrSource, setOcrSource] = useState<"backend" | "model">("backend");
-  const [ocrBackend, setOcrBackend] = useState<string>(OCR_BACKENDS[0]);
+  const [ocrBackend, setOcrBackend] = useState<string>(DEFAULT_OCR_BACKEND);
+  const ocrBackends = useOcrBackends();
   const [ocrModel, setOcrModel] = useState("");
   const [language, setLanguage] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -937,7 +939,7 @@ function PipelineProfileSheet({
       setName("");
       setExtractor("");
       setOcrSource("backend");
-      setOcrBackend(OCR_BACKENDS[0]);
+      setOcrBackend(DEFAULT_OCR_BACKEND);
       setOcrModel("");
       setLanguage("");
       setError(null);
@@ -1061,9 +1063,9 @@ function PipelineProfileSheet({
         {ocrSource === "backend" ? (
           <Field label="OCR backend">
             <Select value={ocrBackend} onChange={(e) => setOcrBackend(e.target.value)}>
-              {OCR_BACKENDS.map((b) => (
-                <option key={b} value={b}>
-                  {b}
+              {ocrBackends.map((b) => (
+                <option key={b.name} value={b.name} disabled={!b.available}>
+                  {ocrBackendLabel(b)}
                 </option>
               ))}
             </Select>
@@ -1128,7 +1130,8 @@ function OcrProfileSheet({
   const { toast } = useToast();
 
   const [name, setName] = useState("");
-  const [backend, setBackend] = useState<string>(OCR_BACKENDS[0]);
+  const [backend, setBackend] = useState<string>(DEFAULT_OCR_BACKEND);
+  const ocrBackends = useOcrBackends();
   const [language, setLanguage] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1136,7 +1139,7 @@ function OcrProfileSheet({
   useEffect(() => {
     if (open) {
       setName("");
-      setBackend(OCR_BACKENDS[0]);
+      setBackend(DEFAULT_OCR_BACKEND);
       setLanguage("");
       setError(null);
     }
@@ -1191,9 +1194,9 @@ function OcrProfileSheet({
 
         <Field label="OCR backend">
           <Select value={backend} onChange={(e) => setBackend(e.target.value)}>
-            {OCR_BACKENDS.map((b) => (
-              <option key={b} value={b}>
-                {b}
+            {ocrBackends.map((b) => (
+              <option key={b.name} value={b.name} disabled={!b.available}>
+                {ocrBackendLabel(b)}
               </option>
             ))}
           </Select>

@@ -181,7 +181,7 @@ services:
         # Encoder deployments (runtime: "encoder", e.g. the GLiNER PII guard)
         # spawn inside THIS container — it needs the analyzer library. Other
         # services keep the light "ocr" default.
-        PIP_EXTRAS: "ocr,encoders"
+        PIP_EXTRAS: "ocr,encoders,indra"
         # llama.cpp pin: the serving container holds the llama-server that
         # actually serves deployed models. Set LLAMA_REF in .env to a commit/
         # tag to rebuild llama.cpp at that pin (reproducible + picks up new
