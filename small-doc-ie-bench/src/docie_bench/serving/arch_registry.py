@@ -195,6 +195,20 @@ class RepoSignals:
     base_model: str | None = None
     library_name: str | None = None
 
+def _is_gliclass(signals: RepoSignals) -> bool:
+    """A GLiClass repo, by how it describes itself.
+
+    Its backbone is a plain DeBERTa, so the architecture string says
+    "sequence classification" and nothing about GLiClass -- identical to the
+    GLiFormer problem, and solved the same way.
+    """
+    if (signals.library_name or "").strip().lower() == "gliclass":
+        return True
+    if any(str(tag).strip().lower() == "gliclass" for tag in signals.tags or ()):
+        return True
+    return "gliclass" in (signals.repo_id or "").lower()
+
+
 def _is_gliformer(signals: RepoSignals) -> bool:
     """A GLiFormer repo, by how it describes itself rather than by its backbone."""
     if (signals.library_name or "").strip().lower() == "gliformer":
@@ -334,6 +348,15 @@ def resolve_family(
     # itself: library_name, the gliformer tag, or the repo id. Note the repo
     # also carries a "gliner" TAG — matched on `arch` above, never on tags, so
     # the two families do not collide.
+    # GLiClass before the architecture gates below for the same reason as
+    # GLiFormer: its backbone is an ordinary DeBERTa, so `arch` describes a
+    # generic sequence classifier and would route it to the transformers
+    # last-resort family instead of the encoder runtime.
+    if _is_gliclass(signals):
+        return SupportVerdict(
+            "supported", "encoder_gliclass", "GLiClass classifier (library_name=gliclass)"
+        )
+
     if _is_gliformer(signals):
         return SupportVerdict(
             "supported", "encoder_gliformer", "GLiFormer analyzer (library_name=gliformer)"
