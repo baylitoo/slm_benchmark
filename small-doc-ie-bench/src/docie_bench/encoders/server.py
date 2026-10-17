@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import re
@@ -534,6 +535,76 @@ class Gliner2Backend:
         return dict(self._model.classify_text(text, tasks, threshold=0.5))
 
 
+class GliClassBackend:
+    """GLiClass zero-shot CLASSIFIER: scores candidate labels for a document.
+
+    Unlike every other backend here, this one does not locate anything. GLiNER
+    and GLiFormer answer "where in this text is a PERSON"; GLiClass answers
+    "does this text belong to these categories, and how strongly". There are no
+    spans to return, so it deliberately does NOT implement ``predict`` -- the
+    shim branches on that absence rather than inventing offsets that would be
+    meaningless downstream.
+
+    Multi-label is the default: each label is scored independently, so a
+    document can be several things at once. Single-label mode softmaxes across
+    the labels instead, which is what you want when the categories are
+    mutually exclusive.
+    """
+
+    #: Scores labels rather than locating them. The shim reads this.
+    classification_only = True
+
+    def __init__(self, model_id: str, *, multi_label: bool = True) -> None:
+        try:
+            from gliclass import GLiClassModel, ZeroShotClassificationPipeline
+        except ImportError as exc:  # pragma: no cover - environment-dependent
+            raise RuntimeError(
+                "the GLiClass encoder backend requires the gliclass package "
+                "(shipped in the 'encoders' extra): pip install 'small-doc-ie-bench[encoders]'"
+            ) from exc
+        self.model_id = model_id
+        self.multi_label = multi_label
+        model = GLiClassModel.from_pretrained(model_id)
+        # device="cpu" explicitly: this family is an edge/CPU checkpoint and the
+        # serving hosts have no GPUs. Letting the pipeline auto-select would
+        # make behaviour depend on what else is installed in the image.
+        self._pipeline = ZeroShotClassificationPipeline(
+            model,
+            model_id,
+            classification_type="multi-label" if multi_label else "single-label",
+            device="cpu",
+        )
+
+    def classify_labels(
+        self,
+        text: str,
+        labels: list[str],
+        threshold: float,
+        *,
+        multi_label: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """``[{"label": ..., "score": ...}]``, highest score first.
+
+        ``multi_label`` per request overrides the deployment default. The
+        pipeline is constructed with one mode, so a request asking for the
+        other is honoured by filtering rather than by rebuilding the model --
+        rebuilding would reload 0.4B of weights per request.
+        """
+        raw = self._pipeline(text, labels, threshold=threshold)
+        first = raw[0] if raw else []
+        scored: list[dict[str, Any]] = [
+            {"label": str(item.get("label", "")), "score": float(item.get("score", 0.0))}
+            for item in first
+            if isinstance(item, dict) and item.get("label")
+        ]
+        scored.sort(key=lambda item: float(item["score"]), reverse=True)
+        wants_multi = self.multi_label if multi_label is None else multi_label
+        if not wants_multi:
+            # Mutually exclusive categories: the top label is the answer.
+            return scored[:1]
+        return scored
+
+
 def _one_record(records: Any, record_name: str) -> dict[str, Any]:
     """GLiFormer returns a LIST of records per schema key; an extraction of one
     document wants one object. The first record is the document."""
@@ -580,12 +651,16 @@ def build_backend(model_id: str, kind: str = "auto") -> Any:
     normalized = kind.strip().lower()
     if normalized == "auto":
         lowered = model_id.lower()
-        if "gliformer" in lowered:
+        if "gliclass" in lowered:
+            normalized = "gliclass"
+        elif "gliformer" in lowered:
             normalized = "gliformer"
         elif "gliner2" in lowered:
             normalized = "gliner2"
         else:
             normalized = "gliner"
+    if normalized == "gliclass":
+        return GliClassBackend(model_id)
     if normalized == "gliformer":
         return GliformerBackend(model_id)
     if normalized == "gliner2":
@@ -593,7 +668,8 @@ def build_backend(model_id: str, kind: str = "auto") -> Any:
     if normalized == "gliner":
         return GlinerBackend(model_id)
     raise ValueError(
-        f"unknown encoder backend {kind!r} (expected auto, gliner, gliner2, or gliformer)"
+        f"unknown encoder backend {kind!r} "
+        "(expected auto, gliner, gliner2, gliformer, or gliclass)"
     )
 
 
@@ -757,6 +833,24 @@ def create_encoder_app(
             )
 
         backend_impl: EncoderBackend = app.state.backend
+
+        # A classification-only backend (GLiClass) scores the labels instead of
+        # locating them. It is answered here and returns early: there are no
+        # entities, so the moderation/entity assembly below has nothing to do,
+        # and falling through would call a `predict` it deliberately lacks.
+        classify_labels = getattr(backend_impl, "classify_labels", None)
+        if classify_labels is not None:
+            multi_label_raw = body.get("multi_label")
+            multi_label = multi_label_raw if isinstance(multi_label_raw, bool) else None
+            scored = await asyncio.to_thread(
+                functools.partial(
+                    classify_labels, text, labels, threshold, multi_label=multi_label
+                )
+            )
+            return JSONResponse(
+                _completion(app.state.model_id, {"labels": scored, "text_length": len(text)})
+            )
+
         entities = await asyncio.to_thread(backend_impl.predict, text, labels, threshold)
 
         # Optional guardrail tasks (GLiNER2 checkpoints): `tasks` is a list of

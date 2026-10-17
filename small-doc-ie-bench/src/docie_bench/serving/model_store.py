@@ -91,7 +91,8 @@ class FamilyContract:
     # An analyzer (encoder) family: a transformers/safetensors checkpoint served
     # by the ENCODER runtime (docie encoder), NOT llama.cpp. Stored as a
     # directory snapshot rather than a single GGUF, and typed "encoder".
-    # ``encoder_backend`` selects the analyzer library (gliner | gliner2); it is
+    # ``encoder_backend`` selects the analyzer library (gliner | gliner2 |
+    # gliformer | gliclass); it is
     # the store-driven replacement for the server's name-based auto-detection.
     analyzer: bool = False
     encoder_backend: str | None = None
@@ -365,6 +366,20 @@ FAMILIES: dict[str, FamilyContract] = {
         analyzer=True,
         encoder_backend="gliformer",
         structured_extraction=True,
+        ollama_faithful=False,
+    ),
+    # GLiClass: zero-shot CLASSIFIER, not an extractor. It scores candidate
+    # labels for a document and locates nothing, so it has no structured
+    # extraction head and no span output -- the encoder shim answers it on its
+    # own branch. Pair it with an extractor family when a pipeline needs both
+    # "what kind of document is this" and "what is in it".
+    "encoder_gliclass": FamilyContract(
+        name="encoder_gliclass",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="none",
+        prompt_profile="document_only",
+        analyzer=True,
+        encoder_backend="gliclass",
         ollama_faithful=False,
     ),
     "encoder_gliner2": FamilyContract(
