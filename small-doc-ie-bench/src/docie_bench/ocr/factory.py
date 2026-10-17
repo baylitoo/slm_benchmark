@@ -6,14 +6,15 @@ from docie_bench.ocr.paddle_backend import PaddleOCRBackend
 from docie_bench.ocr.pdf_text import PdfTextBackend
 from docie_bench.ocr.tesseract_backend import TesseractBackend
 
-# The backends :func:`get_ocr_backend` accepts, with the import each needs. The
-# optional ones raise only when constructed, so availability is reported from
-# the module being importable rather than by building one on a GET.
-OCR_BACKENDS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
-    ("liteparse", ("pdf_text",), None),
-    ("tesseract", (), "pytesseract"),
-    ("paddleocr", (), "paddleocr"),
-    ("indra", (), "indra_ocr"),
+# The backends :func:`get_ocr_backend` accepts, with the import each needs and
+# the package extra that provides it. The optional ones raise only when
+# constructed, so availability is reported from the module being importable
+# rather than by building one on a GET.
+OCR_BACKENDS: tuple[tuple[str, tuple[str, ...], str | None, str | None], ...] = (
+    ("liteparse", ("pdf_text",), None, None),
+    ("tesseract", (), "pytesseract", "ocr"),
+    ("paddleocr", (), "paddleocr", "paddle"),
+    ("indra", (), "indra_ocr", "indra"),
 )
 
 
@@ -26,8 +27,9 @@ def available_ocr_backends() -> list[dict[str, object]]:
             "name": name,
             "aliases": list(aliases),
             "available": module is None or importlib.util.find_spec(module) is not None,
+            "extra": extra,
         }
-        for name, aliases, module in OCR_BACKENDS
+        for name, aliases, module, extra in OCR_BACKENDS
     ]
 
 

@@ -69,6 +69,7 @@ import {
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { useAsync } from "@/lib/useAsync";
+import { ocrBackendLabel, useOcrBackends } from "@/lib/useOcrBackends";
 import { cn } from "@/lib/cn";
 import { T, useI18n } from "@/lib/i18n";
 import { useToast } from "./Toast";
@@ -602,6 +603,7 @@ export function ChatPanel({
   const [modelSource, setModelSource] = useState<"single" | "policy">("single");
   const [selectedPolicy, setSelectedPolicy] = useState<string>("");
   const [ocrBackend, setOcrBackend] = useState("");
+  const ocrBackends = useOcrBackends();
   const [language, setLanguage] = useState("");
   const [parallelExtraction, setParallelExtraction] = useState(false);
   const [responseFormatStyle, setResponseFormatStyle] = useState("");
@@ -1397,11 +1399,14 @@ export function ChatPanel({
               />
             </Field>
             <Field label="OCR backend" hint="Optional — for file uploads.">
-              <TextInput
-                value={ocrBackend}
-                onChange={(e) => setOcrBackend(e.target.value)}
-                placeholder="(default)"
-              />
+              <Select value={ocrBackend} onChange={(e) => setOcrBackend(e.target.value)}>
+                <option value="">(default)</option>
+                {ocrBackends.map((b) => (
+                  <option key={b.name} value={b.name} disabled={!b.available}>
+                    {ocrBackendLabel(b)}
+                  </option>
+                ))}
+              </Select>
             </Field>
             <Field label="Language" hint="Optional ISO code.">
               <TextInput

@@ -77,6 +77,7 @@ def test_an_optional_backend_reports_whether_its_import_is_present() -> None:
     by_name = {entry["name"]: entry for entry in available_ocr_backends()}
     assert isinstance(by_name["tesseract"]["available"], bool)
     assert isinstance(by_name["paddleocr"]["available"], bool)
+    assert by_name["indra"]["extra"] == "indra"
 
 
 def test_nothing_about_models_keys_or_paths_is_exposed(client: TestClient) -> None:
