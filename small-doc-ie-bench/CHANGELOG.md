@@ -8,6 +8,19 @@ release for a project that grew incrementally without prior version tags, so
 this entry summarizes the full feature set as it stands today rather than a
 diff against a previous release.
 
+## [Unreleased]
+
+### Model serving
+
+- Add EmbeddingGemma 2 text embeddings from the native Google checkpoint and
+  GGUF conversions, with automatic embedding-family detection instead of chat
+  fallback.
+- Add an isolated SentenceTransformers runtime with explicit query/document
+  prompts, normalized Matryoshka dimensions, float/base64 output, and context
+  limit validation. Keep its dependencies separate from GLiNER analyzers.
+- Pin the serving image's llama.cpp to v0.7.0 / b11669 for EmbeddingGemma 2 GGUF
+  support.
+
 ## [1.0.0]
 
 ### Benchmark & evaluation core

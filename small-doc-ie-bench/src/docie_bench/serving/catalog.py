@@ -495,6 +495,8 @@ def available_backends(family: str) -> list[str]:
     # runtime (a safetensors snapshot, no GGUF), never llama.cpp/Ollama.
     if contract is not None and contract.multi_vector:
         return ["multi_vector"]
+    if contract is not None and contract.dense_embedding:
+        return ["dense_embedding"]
     backends = ["llama-server"]
     if contract is not None and contract.ollama_faithful:
         backends.append("ollama")

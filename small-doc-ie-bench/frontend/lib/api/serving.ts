@@ -208,6 +208,8 @@ export interface ModelFamily {
    * safetensors snapshot served by the multi-vector runtime (sentence-
    * transformers MultiVectorEncoder), also used via /v1/rerank. */
   multi_vector?: boolean;
+  /** Native text embeddings from a SentenceTransformer snapshot. */
+  dense_embedding?: boolean;
   /** True for analyzer (encoder) families — served by the encoder runtime. */
   analyzer?: boolean;
   /** The analyzer library for an analyzer family (e.g. "gliner" | "gliner2"). */

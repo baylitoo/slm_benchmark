@@ -227,6 +227,8 @@ def _runtime_for_family(family: str | None, *, has_gguf: bool) -> str | None:
         return "transformers"
     if contract.multi_vector:
         return "multi_vector"
+    if contract.dense_embedding:
+        return "dense_embedding"
     return "llama.cpp"
 
 

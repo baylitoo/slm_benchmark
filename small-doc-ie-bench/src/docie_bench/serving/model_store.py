@@ -78,10 +78,12 @@ class FamilyContract:
     # families API exposes, so a caller can tell "tools ignored by a
     # non-jinja launch" apart from "model chose not to call".
     tools: bool = False
-    # An embedding model: served with llama-server's --embedding pooling, and
-    # answered on /v1/embeddings — never chat/extraction. Deployments of an
+    # An embedding model: GGUF pooling or native dense embeddings, answered on
+    # /v1/embeddings — never chat/extraction. Deployments of an
     # embedding family are typed "embedding" and routed by the embeddings API.
     embedding: bool = False
+    # Native dense embeddings served from a snapshot by SentenceTransformer.
+    dense_embedding: bool = False
     # A reranker / late-interaction retriever (e.g. LFM2.5-ColBERT-350M): served
     # with llama-server's --reranking + --embedding --pooling rank (llama.cpp
     # requires both), and answered on /v1/rerank — never chat/extraction/plain
@@ -140,7 +142,12 @@ class FamilyContract:
         the third) means one flag here, not a widened disjunction at every
         call site.
         """
-        return self.analyzer or self.transformers_runtime or self.multi_vector
+        return (
+            self.analyzer
+            or self.transformers_runtime
+            or self.multi_vector
+            or self.dense_embedding
+        )
 
 
 # Known families. Adding a new model is "drop the GGUF + pick (or add) a family".
@@ -298,6 +305,15 @@ FAMILIES: dict[str, FamilyContract] = {
         llama_server_args=("--embedding", "--pooling", "mean"),
         embedding=True,
         ollama_faithful=True,
+    ),
+    "embeddinggemma2": FamilyContract(
+        name="embeddinggemma2",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,  # unused for embeddings
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        embedding=True,
+        dense_embedding=True,
+        ollama_faithful=False,
     ),
     # Rerankers / late-interaction retrievers (LFM2.5-ColBERT-350M, or any GGUF
     # reranker). llama-server exposes /rerank (aliases /v1/rerank,
@@ -715,7 +731,7 @@ class ModelStore:
         if not contract.snapshot:
             raise ModelStoreError(
                 f"add_snapshot is for snapshot families (analyzer / transformers / "
-                f"multi_vector); {family!r} is not one"
+                f"multi_vector / dense_embedding); {family!r} is not one"
             )
         src = Path(snapshot_dir)
         if not src.is_dir():

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from docie_bench.agents.api import configure_http_transport
 from docie_bench.chat_api import router as chat_router
 from docie_bench.llm.model_profiles import ModelProfile
-from docie_bench.serving.model_store import FAMILIES, get_family
+from docie_bench.serving.model_store import get_family
 from docie_bench.serving.profile_resolver import ProfileResolutionError
 
 
@@ -21,11 +21,6 @@ def test_embedding_family_contract() -> None:
     assert fam.embedding is True
     assert "--embedding" in fam.llama_server_args
     assert "--pooling" in fam.llama_server_args
-
-
-def test_only_embedding_family_is_flagged() -> None:
-    flagged = [name for name, f in FAMILIES.items() if f.embedding]
-    assert flagged == ["embedding"]
 
 
 EMB = ModelProfile(

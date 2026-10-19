@@ -314,7 +314,7 @@ def probe_applicability(launch: RuntimeLaunchSpec) -> tuple[bool, str]:
             "remote endpoint: a measurement would describe the provider's "
             "queueing, not this node"
         )
-    if "--embedding" in launch.extra_args:
+    if launch.runtime == RuntimeKind.DENSE_EMBEDDING or "--embedding" in launch.extra_args:
         return False, "embedding deployments answer /v1/embeddings; no tokens are generated"
     return True, ""
 

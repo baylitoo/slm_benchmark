@@ -71,6 +71,7 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "deepseek-ocr": "vision_ocr",
     "deepseek2-ocr": "vision_ocr",
     # embeddings
+    "gemma-embedding2": "embedding",
     "bert": "embedding",
     "nomic-bert": "embedding",
     "xlm-roberta": "embedding",
@@ -320,6 +321,33 @@ def resolve_family(
         base_model=base_model,
         library_name=library_name,
     )
+
+    # EmbeddingGemma 2 has optional media towers upstream, but our embeddings
+    # API serves text only. Resolve before missing-arch, vision and generic
+    # transformers fallbacks, including GGUF repos identified by Hub lineage.
+    if (
+        arch in {
+            "embedding_gemma2", "embedding_gemma2_text", "embeddinggemma2model",
+            "gemma-embedding2",
+        }
+        or (base_model or "").strip().lower() == "google/embeddinggemma-2"
+        or (repo_id or "").strip().lower()
+        in {"google/embeddinggemma-2", "ggml-org/embeddinggemma-2-gguf"}
+    ):
+        if has_gguf:
+            return SupportVerdict(
+                "supported", "embedding",
+                "EmbeddingGemma 2 GGUF → text embeddings (llama-server, mean pooling)",
+            )
+        if has_safetensors:
+            return SupportVerdict(
+                "supported", "embeddinggemma2",
+                "EmbeddingGemma 2 snapshot → text embeddings (SentenceTransformer)",
+            )
+        return SupportVerdict(
+            "unsupported", None,
+            "EmbeddingGemma 2 repo contains neither GGUF nor safetensors weights",
+        )
 
     # Encoder analyzers are detected by the gliner marker, not a base arch
     # (GLiNER2's base is mdeberta but that is NOT what we serve it as). These

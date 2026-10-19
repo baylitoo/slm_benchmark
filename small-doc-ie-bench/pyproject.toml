@@ -59,6 +59,14 @@ encoders = [
   # 6.0. Co-resolves with gliner (transformers>=5.0,<5.14) — verified.
   "sentence-transformers>=6.0"
 ]
+embeddings = [
+  # EmbeddingGemma 2's saved pipeline requires ST 6.1. Its transformers
+  # architecture first ships in 5.19 (not the checkpoint's 5.18.0.dev0).
+  # Keep isolated from GLiNER, which caps transformers below this version.
+  # The shared processor imports torchvision even with media encoders disabled.
+  "sentence-transformers[image]>=6.1",
+  "transformers>=5.19,<6"
+]
 mcp = [
   # MCP tool sources for served chat models (src/docie_bench/mcp_tools.py).
   # v2 layout required: mcp.client.session / mcp.client.streamable_http /
@@ -110,3 +118,8 @@ python_version = "3.12"
 strict = true
 warn_unused_configs = true
 ignore_missing_imports = true
+
+[tool.uv]
+conflicts = [
+  [{ extra = "encoders" }, { extra = "embeddings" }]
+]

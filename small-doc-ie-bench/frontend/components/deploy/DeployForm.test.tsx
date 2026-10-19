@@ -116,4 +116,23 @@ describe("DeployForm — parallel slots", () => {
 
     expect(screen.getByText("Parallel slots")).toBeInTheDocument();
   });
+
+  it("deploys native embeddings through Auto without chat launch controls", async () => {
+    const user = userEvent.setup();
+    renderForm([{
+      name: "embeddinggemma-2",
+      family: "embeddinggemma2",
+      available_backends: ["dense_embedding"],
+    }]);
+    await user.click(screen.getByText("embeddinggemma-2"));
+    const group = screen.getByRole("radiogroup", { name: "Runtime" });
+    expect(within(group).getAllByRole("radio")).toHaveLength(1);
+    await openAdvanced(user);
+    expect(screen.queryByText("Parallel slots")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Deploy/i }));
+    await waitFor(() => expect(api.deployModel).toHaveBeenCalled());
+    const payload = vi.mocked(api.deployModel).mock.calls[0][0];
+    expect(payload).not.toHaveProperty("runtime");
+    expect(payload).not.toHaveProperty("n_parallel");
+  });
 });
