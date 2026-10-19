@@ -183,7 +183,7 @@ export function HfSeedForm({
                 label="Family"
                 hint={
                   isEmbeddingFamily(families, family)
-                    ? "Embedding model — served with --embedding, used via /v1/embeddings (Playground → Embed)."
+                    ? "Text embedding model — used via /v1/embeddings (Playground → Embed)."
                     : "How the model is launched and prompted. Pick 'embedding' for a vector model."
                 }
               >

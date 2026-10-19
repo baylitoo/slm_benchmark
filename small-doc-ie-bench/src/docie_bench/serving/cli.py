@@ -311,6 +311,38 @@ def create_app(
         typer.echo(f"docie multi-vector [{model}] -> http://{host}:{port}/v1")
         uvicorn.run(create_multi_vector_app(model_id=model), host=host, port=port)
 
+    @app.command("dense-embedding")
+    def dense_embedding(
+        host: str = typer.Option("127.0.0.1", help="Bind address."),
+        port: int = typer.Option(
+            8093, min=1, max=65535, help="Port for the text embeddings endpoint."
+        ),
+        model: str = typer.Option(
+            ..., help="EmbeddingGemma 2 snapshot directory or Hugging Face model id."
+        ),
+        check_runtime: bool = typer.Option(False, "--check-runtime", hidden=True),
+    ) -> None:
+        """Serve text-only /v1/embeddings (requires the isolated embeddings extra)."""
+        import uvicorn
+
+        from docie_bench.embedding_server.server import create_embedding_app, dependency_error
+
+        if check_runtime:
+            import importlib.metadata
+
+            reason = dependency_error()
+            version = None
+            if reason is None:
+                version = (
+                    f"sentence-transformers {importlib.metadata.version('sentence-transformers')}; "
+                    f"transformers {importlib.metadata.version('transformers')}"
+                )
+            typer.echo(json.dumps({"reason": reason, "version": version}))
+            raise typer.Exit(code=1 if reason else 0)
+
+        typer.echo(f"docie dense-embedding [{model}] -> http://{host}:{port}/v1")
+        uvicorn.run(create_embedding_app(model_id=model), host=host, port=port)
+
     return app
 
 

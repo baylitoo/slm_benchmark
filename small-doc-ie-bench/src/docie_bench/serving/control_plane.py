@@ -1138,6 +1138,9 @@ class _DefaultSupervisor:
             # /v1/rerank. The snapshot dir is the model; no extra flags.
             runtime_kind = RuntimeKind.MULTI_VECTOR
             launch_extra_args = ()
+        elif contract.dense_embedding:
+            runtime_kind = RuntimeKind.DENSE_EMBEDDING
+            launch_extra_args = ()
         else:
             runtime_kind = RuntimeKind.LLAMACPP
             launch_extra_args = store.family_launch_args(name)

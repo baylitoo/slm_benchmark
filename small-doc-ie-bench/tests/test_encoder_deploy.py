@@ -106,3 +106,60 @@ def test_encoder_placement_engine_is_encoder(_sqlite_catalog: None, tmp_path: Pa
     placement = ModelCatalog().get_placement("guardrails-pii")
     assert placement is not None
     assert placement["engine"] == "encoder"
+
+
+def test_dense_embedding_snapshot_deploys_with_native_placement(
+    _sqlite_catalog: None, tmp_path: Path,
+) -> None:
+    from docie_bench.serving.catalog import ModelCatalog, available_backends
+    from docie_bench.serving.throughput import probe_applicability
+
+    root = tmp_path / "models"
+    snapshot = tmp_path / "embedding-snapshot"
+    snapshot.mkdir()
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    (snapshot / "config.json").write_text('{"model_type":"embedding_gemma2"}')
+    ModelStore(root).add_snapshot(
+        name="embeddinggemma-2", family="embeddinggemma2", snapshot_dir=snapshot,
+        source="hf:google/embeddinggemma-2",
+    )
+    adapter = _CapturingAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.DENSE_EMBEDDING: adapter},
+    )
+    wrapper = _DefaultSupervisor(supervisor, planner=None, model_store_root=root)
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+    record = asyncio.run(plane.up("embeddinggemma-2", port=8093))
+    assert record["state"] == "ready"
+    launch = adapter.specs[-1]
+    assert launch.runtime == RuntimeKind.DENSE_EMBEDDING
+    assert Path(launch.model).is_dir()
+    assert launch.model.endswith("embeddinggemma-2/snapshot")
+    assert launch.extra_args == ()
+    assert available_backends("embeddinggemma2") == ["dense_embedding"]
+    placement = ModelCatalog().get_placement("embeddinggemma-2")
+    assert placement is not None and placement["engine"] == "dense_embedding"
+    probeable, reason = probe_applicability(launch)
+    assert not probeable and "/v1/embeddings" in reason
+
+
+def test_embeddinggemma2_gguf_deploys_with_mean_pooling(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"GGUF")
+    ModelStore(root).add_gguf(
+        name="embeddinggemma-2-gguf", family="embedding", model_gguf=gguf,
+        source="hf:ggml-org/embeddinggemma-2-GGUF",
+    )
+    adapter = _CapturingAdapter()
+    supervisor = PersistentSupervisor(
+        tmp_path / "state.json", adapters={RuntimeKind.LLAMACPP: adapter},
+    )
+    wrapper = _DefaultSupervisor(supervisor, planner=None, model_store_root=root)
+    plane = ControlPlane(None, None, wrapper, None)  # type: ignore[arg-type]
+    record = asyncio.run(plane.up("embeddinggemma-2-gguf", port=8093))
+    assert record["state"] == "ready"
+    launch = adapter.specs[-1]
+    assert launch.runtime == RuntimeKind.LLAMACPP
+    assert Path(launch.model).is_file()
+    assert launch.extra_args == ("--embedding", "--pooling", "mean")

@@ -1333,7 +1333,7 @@ async def _stream_chat_completions(
 
 @router.post("/v1/embeddings")
 async def embeddings(request: Request, tenant: TenantParam) -> Any:
-    """OpenAI embeddings over an embedding deployment (llama-server --embedding).
+    """OpenAI embeddings over a GGUF or native dense embedding deployment.
 
     Body: ``model`` (deployment/profile) + ``input`` (string or list). Forwarded
     verbatim to the upstream's ``/embeddings`` with the served model id. The
@@ -1387,7 +1387,8 @@ async def embeddings(request: Request, tenant: TenantParam) -> Any:
         headers,
         forward,
         profile,
-        error_hint=" (is this deployment an embedding model, served with --embedding?)",
+        error_hint=" (is this an embedding deployment: llama-server --embedding "
+        "or the dense-embedding runtime?)",
     )
     _record_usage_outcome(
         profile.name, "embed", tenant.tenant_id, started, result, tenant.api_key_id

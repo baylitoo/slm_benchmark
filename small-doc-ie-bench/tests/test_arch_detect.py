@@ -336,6 +336,48 @@ def test_multi_vector_family_is_a_snapshot_family() -> None:
     assert FAMILIES["openai_chat"].snapshot is False
 
 
+@pytest.mark.parametrize("architecture", [
+    "embedding_gemma2", "embedding_gemma2_text", "EmbeddingGemma2Model",
+])
+def test_embeddinggemma2_native_never_uses_chat_or_vision(architecture: str) -> None:
+    verdict = resolve_family(
+        architecture, has_gguf=False, has_safetensors=True, has_mmproj=True,
+        repo_id="owner/renamed-checkpoint",
+    )
+    assert (verdict.verdict, verdict.family) == ("supported", "embeddinggemma2")
+    family = FAMILIES[verdict.family]
+    assert family.embedding and family.dense_embedding and family.snapshot
+    assert not family.vision and not family.needs_mmproj and not family.tools
+    assert not family.transformers_runtime and not family.ollama_faithful
+
+
+@pytest.mark.parametrize("architecture", ["gemma-embedding2", None, "gemma4"])
+def test_embeddinggemma2_gguf_lineage_beats_chat_and_projector(
+    architecture: str | None,
+) -> None:
+    verdict = resolve_family(
+        architecture, has_gguf=True, has_safetensors=False, has_mmproj=True,
+        repo_id="owner/renamed-quant", base_model="google/embeddinggemma-2",
+    )
+    assert (verdict.verdict, verdict.family) == ("supported", "embedding")
+    assert FAMILIES["embedding"].llama_server_args == ("--embedding", "--pooling", "mean")
+    assert not FAMILIES["embedding"].snapshot
+
+
+def test_embeddinggemma2_arch_alone_identifies_gguf() -> None:
+    verdict = resolve_family(
+        "gemma-embedding2", has_gguf=True, has_safetensors=False, has_mmproj=False,
+    )
+    assert (verdict.verdict, verdict.family) == ("supported", "embedding")
+
+
+def test_embeddinggemma2_without_weights_is_not_chat_fallback() -> None:
+    verdict = resolve_family(
+        "embedding_gemma2", has_gguf=False, has_safetensors=False, has_mmproj=True,
+    )
+    assert (verdict.verdict, verdict.family) == ("unsupported", None)
+
+
 def test_cross_encoder_confirmed_without_gguf_still_needs_a_gguf() -> None:
     # A confirmed CROSS-ENCODER (not ColBERT) with no GGUF: llama-server
     # --reranking needs one, and a safetensors cross-encoder runtime is not
@@ -453,6 +495,44 @@ async def test_inspect_threads_hub_metadata_into_multi_vector_verdict() -> None:
     assert result["verdict"] == "supported"
     assert result["family"] == "multi_vector"
     assert result["runtime"] == "multi_vector"
+
+
+async def test_inspect_embeddinggemma2_snapshot_has_native_runtime_and_support_files() -> None:
+    payload = {
+        "config": {"model_type": "embedding_gemma2"},
+        "siblings": [
+            {"rfilename": "model.safetensors", "size": 600_000_000},
+            {"rfilename": "config.json", "size": 1000},
+            {"rfilename": "modules.json", "size": 300},
+            {"rfilename": "config_sentence_transformers.json", "size": 400},
+        ],
+    }
+    async with httpx.AsyncClient(transport=_transport(payload)) as client:
+        result = await inspect_repo("google/embeddinggemma-2", client=client)
+    assert result["family"] == "embeddinggemma2"
+    assert result["runtime"] == "dense_embedding"
+    assert result["verdict"] == "supported"
+    assert result["needs_trust_remote_code"] is False
+    assert {file["filename"] for file in result["required_files"]} == {
+        "model.safetensors", "config.json", "modules.json",
+        "config_sentence_transformers.json",
+    }
+
+
+async def test_inspect_embeddinggemma2_gguf_lineage_ignores_media_projector() -> None:
+    payload = {
+        "cardData": {"base_model": ["google/embeddinggemma-2"]},
+        "siblings": [
+            {"rfilename": "embeddinggemma-2-Q8_0.gguf", "size": 400_000_000},
+            {"rfilename": "mmproj-F16.gguf", "size": 300_000_000},
+        ],
+    }
+    async with httpx.AsyncClient(transport=_transport(payload)) as client:
+        result = await inspect_repo("owner/renamed-quant", client=client)
+    assert result["family"] == "embedding"
+    assert result["runtime"] == "llama.cpp"
+    assert result["verdict"] == "supported"
+    assert [file["role"] for file in result["required_files"]] == ["model"]
 
 
 async def test_inspect_quant_options_have_exact_fit_estimates() -> None:

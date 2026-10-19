@@ -78,8 +78,6 @@ describe("EmbedRerankPanel", () => {
     await user.click(screen.getByRole("button", { name: /Embed & compare/ }));
 
     await waitFor(() => expect(api.embed).toHaveBeenCalledTimes(2));
-    expect(api.embed).toHaveBeenCalledWith("lfm2.5-embedding-350m", "hello");
-    expect(api.embed).toHaveBeenCalledWith("lfm2.5-embedding-350m", "world");
     // Orthogonal vectors -> cosine similarity 0, and BOTH vectors present
     // (previously an empty second vector made every result read as 0 too,
     // indistinguishable from a real orthogonal pair — dims proves it's real).

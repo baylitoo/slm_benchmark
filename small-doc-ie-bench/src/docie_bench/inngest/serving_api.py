@@ -1149,6 +1149,7 @@ async def list_families() -> Any:
             "embedding": fam.embedding,
             "reranker": fam.reranker,
             "multi_vector": fam.multi_vector,
+            "dense_embedding": fam.dense_embedding,
             "analyzer": fam.analyzer,
             "structured_extraction": fam.structured_extraction,
             "encoder_backend": fam.encoder_backend,

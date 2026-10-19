@@ -115,16 +115,16 @@ export function DeployForm({
     () => models.find((m) => m.name === selected) ?? null,
     [models, selected],
   );
-  // Runtime picker is scoped to the chosen model's faithful backends. "encoder"
-  // is NOT an operator-selectable runtime — it is implied by an analyzer
-  // family and served through the store (Auto) path, so it never appears as a
-  // chip that would wrongly trigger the explicit-runtime serve() route.
-  const backends = (selectedEntry?.available_backends ?? []).filter((b) => b !== "encoder");
-  const isEncoderEntry = (selectedEntry?.available_backends ?? []).includes("encoder");
+  // Snapshot backends are implied by the store family: an explicit runtime
+  // route would lose the snapshot path and family-specific launch contract.
+  const snapshotBackends = ["encoder", "transformers", "multi_vector", "dense_embedding"];
+  const entryBackends = selectedEntry?.available_backends ?? [];
+  const backends = entryBackends.filter((b) => !snapshotBackends.includes(b));
+  const isSnapshotEntry = entryBackends.some((b) => snapshotBackends.includes(b));
   // Parallel slots is a llama.cpp-only launch flag: Auto resolves to
   // llama.cpp for GGUF store models, and an explicit runtime pick must be
   // "llamacpp" — never vllm/ollama/remote, where the flag is meaningless.
-  const showNParallel = runtime === "" || runtime === "llamacpp";
+  const showNParallel = !isSnapshotEntry && (runtime === "" || runtime === "llamacpp");
 
   function pick(modelName: string) {
     setSelected(modelName);
@@ -250,8 +250,8 @@ export function DeployForm({
               ))}
             </div>
             <p className="mt-1.5 text-xs text-muted-foreground">
-              {isEncoderEntry
-                ? "Encoder checkpoint — served by the encoder runtime automatically (Auto)."
+              {isSnapshotEntry
+                ? "Snapshot checkpoint — served by its native runtime automatically (Auto)."
                 : backends.length > 0
                   ? "Backends compatible with this model, from its store entry."
                   : "This model lists no explicit backends — Auto lets the server choose."}

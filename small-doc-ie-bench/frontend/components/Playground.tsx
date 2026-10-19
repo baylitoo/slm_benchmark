@@ -140,6 +140,7 @@ export function Playground({
         (d) =>
           (d.spec?.launch?.runtime !== "encoder" ||
             Boolean(d.spec?.name && structuringNames.has(d.spec.name))) &&
+          d.spec?.launch?.runtime !== "dense_embedding" &&
           !(d.spec?.name && embeddingNames.has(d.spec.name)),
       ),
     [deployments.data, embeddingNames, structuringNames],
@@ -2371,9 +2372,12 @@ export function EmbedRerankPanel({
   const modeDeployments = useMemo(
     () =>
       selectableDeployments(deployments).filter(
-        (d) => d.spec?.name && activeNames.has(d.spec.name),
+        (d) => d.spec?.name && (
+          activeNames.has(d.spec.name) ||
+          (subMode === "embed" && d.spec.launch?.runtime === "dense_embedding")
+        ),
       ),
-    [deployments, activeNames],
+    [deployments, activeNames, subMode],
   );
   const names = useMemo(
     () => modeDeployments.map((d) => d.spec?.name ?? "").filter(Boolean),
@@ -2410,7 +2414,7 @@ export function EmbedRerankPanel({
 
   async function runEmbed() {
     if (!model) {
-      setError("No live embedding deployment — deploy an embedding model (family: embedding).");
+      setError("No live embedding deployment — deploy an embedding model (family: embedding or embeddinggemma2).");
       return;
     }
     setError(null);
@@ -2420,7 +2424,9 @@ export function EmbedRerankPanel({
       // batch input's response order isn't guaranteed to line up with the
       // request order on every backend, and pairing by array position alone
       // previously produced a silently-wrong (or empty) second vector.
-      const [resA, resB] = await Promise.all([embed(model, textA), embed(model, textB)]);
+      const [resA, resB] = await Promise.all([
+        embed(model, textA), embed(model, textB),
+      ]);
       const a = resA.data?.[0]?.embedding ?? [];
       const b = resB.data?.[0]?.embedding ?? [];
       setEmbedResult({ dims: a.length, sim: cosine(a, b), a });
@@ -2494,7 +2500,7 @@ export function EmbedRerankPanel({
           label={subMode === "embed" ? "Embedding deployment" : "Reranker deployment"}
           hint={
             subMode === "embed"
-              ? "Deploy an embedding GGUF (e.g. LiquidAI/LFM2.5-Embedding-350M-GGUF) with family 'embedding'."
+              ? "Deploy a text embedding model: google/embeddinggemma-2 (family 'embeddinggemma2') or ggml-org/embeddinggemma-2-GGUF (family 'embedding')."
               : "Deploy a reranker: a GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF, family 'reranker') or a safetensors ColBERT (e.g. mixedbread-ai/mxbai-edge-colbert-v0-32m, family 'multi_vector')."
           }
         >

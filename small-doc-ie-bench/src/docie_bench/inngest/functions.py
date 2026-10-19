@@ -1207,6 +1207,7 @@ _ENGINE_BY_RUNTIME: dict[str, str] = {
     "ollama": "ollama",
     "encoder": "encoder",
     "multi_vector": "multi_vector",
+    "dense_embedding": "dense_embedding",
 }
 
 

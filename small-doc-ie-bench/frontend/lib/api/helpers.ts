@@ -30,6 +30,7 @@ export function deploymentModelType(
   rerankerNames?: Set<string>,
 ): DeployedModelType {
   if (r.spec?.launch?.runtime === "encoder") return "encoder";
+  if (r.spec?.launch?.runtime === "dense_embedding") return "embedding";
   const name = r.spec?.name;
   if (name && embeddingNames?.has(name)) return "embedding";
   if (name && rerankerNames?.has(name)) return "reranker";

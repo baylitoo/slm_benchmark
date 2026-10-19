@@ -418,16 +418,20 @@ def test_store_reads_on_disk_without_a_catalog(serving_home: Path) -> None:
     (snap / "model.safetensors").write_bytes(b"w")
     (snap / "config.json").write_text("{}")
     store.add_snapshot(name="guardrails-pii", family="encoder_gliner2", snapshot_dir=snap)
+    store.add_snapshot(name="embeddinggemma-2", family="embeddinggemma2", snapshot_dir=snap)
 
     view = asyncio.run(list_store())
 
     by_name = {e["name"]: e for e in view}
-    assert set(by_name) == {"lfm2.5-350m", "guardrails-pii"}
+    assert set(by_name) == {"lfm2.5-350m", "guardrails-pii", "embeddinggemma-2"}
     assert by_name["guardrails-pii"]["analyzer"] is True
     assert by_name["guardrails-pii"]["available_backends"] == ["encoder"]
     assert by_name["guardrails-pii"]["size_bytes"] == len(b"w") + len("{}")
     assert "model_path" not in by_name["guardrails-pii"]
     assert by_name["lfm2.5-350m"]["family"] == "lfm2"
+    assert by_name["embeddinggemma-2"]["embedding"] is True
+    assert by_name["embeddinggemma-2"]["vision"] is False
+    assert by_name["embeddinggemma-2"]["available_backends"] == ["dense_embedding"]
 
 
 # ── deployment slots: llama-server's own GET /slots, surfaced on demand ────

@@ -154,7 +154,7 @@ export interface HfInspect {
   /** Deploy-time outcome after artifacts, RAM, and node capacity are considered. */
   readiness?: "ready" | "caution" | "blocked";
   family?: string | null;
-  runtime?: "llama.cpp" | "transformers" | "encoder" | null;
+  runtime?: "llama.cpp" | "transformers" | "encoder" | "multi_vector" | "dense_embedding" | null;
   reason?: string;
   /** A runtime-support caveat (e.g. "needs a recent llama-server"), if any. */
   runtime_note?: string | null;

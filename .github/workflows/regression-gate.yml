@@ -53,6 +53,22 @@ jobs:
           name: regression-comparison
           path: small-doc-ie-bench/comparison/
 
+  embedding-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: small-doc-ie-bench/pyproject.toml
+      # Never combine this extra with encoders: GLiNER has an incompatible
+      # transformers cap. Mirrors the isolated serving-image interpreter.
+      - run: python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - run: python -m pip install -e ".[dev,embeddings]"
+      - run: python -c "from sentence_transformers import SentenceTransformer; from transformers import EmbeddingGemma2Model"
+      - run: python -m pytest -q tests/test_embedding_server.py tests/test_arch_detect.py tests/test_encoder_deploy.py --timeout=600
+
   frontend-checks:
     runs-on: ubuntu-latest
     defaults:

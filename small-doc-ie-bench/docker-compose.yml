@@ -182,11 +182,11 @@ services:
         # spawn inside THIS container — it needs the analyzer library. Other
         # services keep the light "ocr" default.
         PIP_EXTRAS: "ocr,encoders"
-        # llama.cpp pin: the serving container holds the llama-server that
-        # actually serves deployed models. Set LLAMA_REF in .env to a commit/
-        # tag to rebuild llama.cpp at that pin (reproducible + picks up new
-        # arch support, e.g. Unlimited-OCR). Empty = latest HEAD (cached).
-        LLAMA_REF: ${LLAMA_REF:-}
+        # Isolated native embedding dependencies; GLiNER's transformers cap
+        # cannot coexist with EmbeddingGemma 2 in the encoder interpreter.
+        INSTALL_EMBEDDINGS: "true"
+        # Tested release with gemma-embedding2 support; an override must retain it.
+        LLAMA_REF: ${LLAMA_REF:-620d2225cc436ab0b001e3200e590e3b286ef9ab}
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
@@ -197,6 +197,7 @@ services:
       DOCIE_WORKER_ROLE: serving
       # Pinned for the same reason as on `api`: one shared serving home.
       DOCIE_SERVING_HOME: /app/.serving
+      DOCIE_DENSE_EMBEDDING_EXECUTABLE: /opt/docie-embeddings/bin/docie
       # Deliberately NOT `${DOCIE_SERVING_ADVERTISE_HOST:-serving}`: a .env
       # written before the PR-1 service split carries
       # DOCIE_SERVING_ADVERTISE_HOST=worker, and interpolating the legacy

@@ -171,7 +171,7 @@ export const FR_MESSAGES: Record<string, string> = {
   "Answer": "Réponse",
   "The vision model is reading the image… (CPU vision is slow)": "Le modèle de vision analyse l’image… (la vision sur CPU est lente)",
   "Pick a vision deployment, upload an image, and run to see the answer.": "Choisissez un déploiement de vision, chargez une image et lancez l’analyse pour voir la réponse.",
-  "No live embedding deployment — deploy an embedding model (family: embedding).": "Aucun déploiement de plongement actif — déployez un modèle de plongement (famille : embedding).",
+  "No live embedding deployment — deploy an embedding model (family: embedding or embeddinggemma2).": "Aucun déploiement de plongement actif — déployez un modèle de plongement (famille : embedding ou embeddinggemma2).",
   "Embedding request failed.": "Échec de la requête de plongement.",
   "Embeddings": "Plongements",
   "Two texts in, cosine similarity out — the retrieval primitive, computed on-node.": "Deux textes en entrée, une similarité cosinus en sortie — la primitive de recherche, calculée sur le nœud.",
@@ -723,7 +723,7 @@ export const FR_MESSAGES: Record<string, string> = {
   "OCR (vision) model": "Modèle OCR (vision)",
   "Repo": "Dépôt",
   "URL or owner/slug-hash, e.g. LiquidAI/lfm25-collection-hash": "URL ou owner/slug-hash, p. ex. LiquidAI/lfm25-collection-hash",
-  "Deploy an embedding GGUF (e.g. LiquidAI/LFM2.5-Embedding-350M-GGUF) with family 'embedding'.": "Déployez un GGUF de plongement (p. ex. LiquidAI/LFM2.5-Embedding-350M-GGUF) avec la famille « embedding ».",
+  "Deploy a text embedding model: google/embeddinggemma-2 (family 'embeddinggemma2') or ggml-org/embeddinggemma-2-GGUF (family 'embedding').": "Déployez un modèle de plongement textuel : google/embeddinggemma-2 (famille « embeddinggemma2 ») ou ggml-org/embeddinggemma-2-GGUF (famille « embedding »).",
   "Deploy a reranker: a GGUF (e.g. LiquidAI/LFM2.5-ColBERT-350M-GGUF, family 'reranker') or a safetensors ColBERT (e.g. mixedbread-ai/mxbai-edge-colbert-v0-32m, family 'multi_vector').": "Déployez un reranker : un GGUF (p. ex. LiquidAI/LFM2.5-ColBERT-350M-GGUF, famille « reranker ») ou un ColBERT safetensors (p. ex. mixedbread-ai/mxbai-edge-colbert-v0-32m, famille « multi_vector »).",
 };
 

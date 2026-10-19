@@ -174,7 +174,7 @@ export function BatchView({ active = true }: { active?: boolean }) {
   const deploymentNames = useMemo(
     () =>
       selectableDeployments(deployments.data ?? [])
-        .filter((d) => d.spec?.launch?.runtime !== "encoder")
+        .filter((d) => !["encoder", "dense_embedding"].includes(d.spec?.launch?.runtime ?? ""))
         .map((d) => d.spec?.name)
         .filter((n): n is string => Boolean(n)),
     [deployments.data],

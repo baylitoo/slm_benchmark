@@ -32,6 +32,7 @@ class RuntimeKind(StrEnum):
     ENCODER = "encoder"
     TRANSFORMERS = "transformers"
     MULTI_VECTOR = "multi_vector"
+    DENSE_EMBEDDING = "dense_embedding"
 
 
 class LifecycleState(StrEnum):
@@ -1229,6 +1230,80 @@ class MultiVectorRuntime(RuntimeAdapter):
         )
 
 
+class DenseEmbeddingRuntime(RuntimeAdapter):
+    """Serve text embeddings; an optional executable isolates encoder dependencies."""
+
+    kind = RuntimeKind.DENSE_EMBEDDING
+    executable_names = ("docie", "docie-serving")
+    health_path = "/healthz"
+    features = frozenset({RuntimeFeature.EMBEDDINGS, RuntimeFeature.BATCHING})
+
+    @staticmethod
+    def _configured_executable(spec: RuntimeLaunchSpec) -> str | None:
+        return spec.executable or spec.env.get(
+            "DOCIE_DENSE_EMBEDDING_EXECUTABLE"
+        ) or os.environ.get("DOCIE_DENSE_EMBEDDING_EXECUTABLE")
+
+    def resolve_executable(self, spec: RuntimeLaunchSpec) -> str | None:
+        if configured := self._configured_executable(spec):
+            return self._which(configured)
+        return sys.executable
+
+    def detect_version(self, executable: str) -> str | None:
+        # External console scripts are queried in probe(), in their own environment.
+        if executable != sys.executable:
+            return None
+        try:
+            return f"sentence-transformers {importlib.metadata.version('sentence-transformers')}"
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    def probe(self, spec: RuntimeLaunchSpec) -> RuntimeCapabilities:
+        from docie_bench.embedding_server.server import dependency_error
+
+        capabilities = super().probe(spec)
+        if self._configured_executable(spec):
+            if not capabilities.installed:
+                return capabilities
+            executable = self.resolve_executable(spec)
+            assert executable is not None
+            try:
+                result = self._run_command(
+                    [executable, "dense-embedding", "--model", spec.model, "--check-runtime"],
+                    check=False, capture_output=True, text=True, timeout=30, shell=False,
+                    env=self.build_environment(spec),
+                )
+                report = json.loads(result.stdout)
+                reason = report.get("reason")
+                if result.returncode != 0 and not reason:
+                    reason = "dense embedding environment probe failed"
+                capabilities = replace(capabilities, version=report.get("version"))
+            except (OSError, subprocess.SubprocessError, ValueError, AttributeError) as exc:
+                reason = f"cannot probe dense embedding environment: {exc}"
+        else:
+            reason = dependency_error()
+        if reason:
+            return replace(
+                capabilities, compatible=False, reasons=(*capabilities.reasons, reason)
+            )
+        return capabilities
+
+    def build_command(self, spec: RuntimeLaunchSpec) -> tuple[str, ...]:
+        self.validate(spec)
+        configured = self._configured_executable(spec)
+        if configured:
+            executable = self._which(configured)
+            if executable is None:
+                raise RuntimeUnavailableError(f"dense embedding executable not found: {configured}")
+            base = (executable,)
+        else:
+            base = (sys.executable, "-m", "docie_bench.serving.cli")
+        return (
+            *base, "dense-embedding", "--model", spec.model,
+            "--host", spec.host, "--port", str(spec.port), *spec.extra_args,
+        )
+
+
 def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
     return {
         RuntimeKind.VLLM: VLLMRuntime(),
@@ -1238,6 +1313,7 @@ def default_runtime_adapters() -> dict[RuntimeKind, RuntimeAdapter]:
         RuntimeKind.ENCODER: EncoderRuntime(),
         RuntimeKind.TRANSFORMERS: TransformersRuntime(),
         RuntimeKind.MULTI_VECTOR: MultiVectorRuntime(),
+        RuntimeKind.DENSE_EMBEDDING: DenseEmbeddingRuntime(),
     }
 
 

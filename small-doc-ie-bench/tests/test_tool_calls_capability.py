@@ -32,7 +32,7 @@ def test_chat_families_serve_tools_and_extraction_contracts_do_not() -> None:
     # for chat. Tool calling is meaningless on an extraction contract.
     assert FAMILIES["nuextract3"].tools is False
     # Non-chat surfaces never claim tools.
-    for name in ("embedding", "reranker", "multi_vector", "encoder_gliner", "transformers"):
+    for name in ("embedding", "embeddinggemma2", "reranker", "multi_vector", "encoder_gliner", "transformers"):
         assert FAMILIES[name].tools is False, name
 
 
@@ -45,3 +45,6 @@ def test_families_api_exposes_the_tools_flag() -> None:
     by_name = {fam["name"]: fam for fam in payload}
     assert by_name["openai_chat"]["tools"] is True
     assert by_name["nuextract3"]["tools"] is False
+    native = by_name["embeddinggemma2"]
+    assert native["embedding"] is True and native["dense_embedding"] is True
+    assert native["vision"] is False and native["tools"] is False

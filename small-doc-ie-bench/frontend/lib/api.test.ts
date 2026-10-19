@@ -3,6 +3,7 @@ import {
   chatCompletion,
   chatCompletionStream,
   downloadArtifact,
+  deploymentModelType,
   getModels,
   searchCatalog,
 } from "./api";
@@ -14,6 +15,17 @@ function jsonResponse(status: number, body: unknown): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+describe("native text embeddings", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("never classifies a native deployment alias as chat without store metadata", () => {
+    expect(deploymentModelType({
+      spec: { name: "replica-2", launch: { runtime: "dense_embedding", model: "/snapshot" } },
+    })).toBe("embedding");
+  });
+
+});
 
 describe("request() auth header", () => {
   beforeEach(() => {
