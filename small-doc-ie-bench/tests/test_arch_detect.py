@@ -371,6 +371,14 @@ def test_embeddinggemma2_arch_alone_identifies_gguf() -> None:
     assert (verdict.verdict, verdict.family) == ("supported", "embedding")
 
 
+def test_embeddinggemma1_gguf_resolves_to_embedding_family() -> None:
+    verdict = resolve_family(
+        "gemma-embedding", has_gguf=True, has_safetensors=False, has_mmproj=False,
+        repo_id="ggml-org/embeddinggemma-300M-GGUF",
+    )
+    assert (verdict.verdict, verdict.family) == ("supported", "embedding")
+
+
 def test_embeddinggemma2_without_weights_is_not_chat_fallback() -> None:
     verdict = resolve_family(
         "embedding_gemma2", has_gguf=False, has_safetensors=False, has_mmproj=True,

@@ -394,6 +394,7 @@ export function HfSearchSeed({
                           onChange={(e) => setFamily(e.target.value)}
                           aria-label="Model family"
                         >
+                          {!family && <option value="">Select a family…</option>}
                           <FamilyOptions families={families} />
                         </Select>
                       </Field>

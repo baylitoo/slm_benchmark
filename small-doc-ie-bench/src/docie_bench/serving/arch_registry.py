@@ -71,6 +71,7 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "deepseek-ocr": "vision_ocr",
     "deepseek2-ocr": "vision_ocr",
     # embeddings
+    "gemma-embedding": "embedding",  # EmbeddingGemma 1 (300M), mean pooling
     "gemma-embedding2": "embedding",
     "bert": "embedding",
     "nomic-bert": "embedding",
