@@ -622,6 +622,24 @@ class ResourceTracker:
 # ----------------------------------------------------------------- publish
 
 
+def _local_store_models() -> list[str]:
+    """Names in THIS node's blob store (#562).
+
+    Published with the snapshot so a reader can tell which nodes can actually
+    serve a model: `model_store_entry` is global, the blobs are not. An
+    unreadable store reports nothing rather than failing the publish -- the
+    cycle must not depend on it.
+    """
+    from docie_bench.serving.model_store import ModelStore
+    from docie_bench.serving.paths import serving_home
+
+    try:
+        return [entry.name for entry in ModelStore(serving_home() / "models").list()]
+    except Exception:  # noqa: BLE001 - never break the reconcile cycle
+        logger.debug("could not list the local model store", exc_info=True)
+        return []
+
+
 def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
     """Default snapshot publisher: per-node upsert, best-effort, DB-optional.
 
@@ -641,6 +659,7 @@ def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
     try:
         ModelCatalog().publish_node_snapshot(
             node_id=resolve_node_id(),
+            store_models=_local_store_models(),
             total_bytes=snapshot.total_bytes,
             free_bytes=snapshot.free_bytes,
             source=snapshot.source,

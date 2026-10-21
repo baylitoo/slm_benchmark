@@ -14,6 +14,7 @@ Never store GGUF blobs in the DB — only metadata. See
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from collections.abc import Sequence
 from typing import Any, cast
@@ -203,6 +204,13 @@ class ServingNode(Base):
     # (cgroup working-set accounting, see resources.read_cgroup_memory); 0
     # means no adjustment applied (vm source / nothing reclaimable).
     reclaimable_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    # The store models present in THIS node's blob store, as a JSON array of
+    # names (#562). The blob store is node-local -- `DOCIE_SERVING_HOME/models`
+    # on a volume #564 documents as unshareable -- while `model_store_entry` is
+    # global. So the catalog saying a model exists does not mean the node
+    # chosen to serve it has the file, and without this nothing shows which
+    # nodes do. NULL means a node that has not reported its store yet.
+    store_models: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -272,6 +280,8 @@ _SERVING_NODE_LOCK_KEY = 0x0D0C1E02
 # hazard). Module-level tuple so the migration and tests agree on one list.
 _SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     ("reclaimable_bytes", BigInteger()),
+    # Which store models this node actually holds on disk (#562). JSON array.
+    ("store_models", Text()),
 )
 
 
@@ -548,11 +558,28 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
     }
 
 
+def _decode_store_models(raw: str | None) -> list[str] | None:
+    """The node's reported store models, or None when it has not reported.
+
+    None and [] mean different things: "this node has not told us" versus
+    "this node holds nothing". A reader deciding whether a deploy can succeed
+    there must not confuse them.
+    """
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    return [str(item) for item in decoded] if isinstance(decoded, list) else None
+
+
 def _node_view(row: ServingNode) -> dict[str, Any]:
     return {
         # Which node these numbers describe. Published so a fleet reader can
         # never mistake one machine's capacity for the whole fleet's.
         "node_id": row.id,
+        "store_models": _decode_store_models(row.store_models),
         "total_bytes": row.total_bytes,
         "free_bytes": row.free_bytes,
         "source": row.source,
@@ -929,6 +956,7 @@ class ModelCatalog:
         source: str,
         sum_rss_bytes: int,
         reclaimable_bytes: int = 0,
+        store_models: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Upsert ``node_id``'s ``serving_node`` row (its reconciler is the sole caller).
 
@@ -950,6 +978,8 @@ class ModelCatalog:
             "reclaimable_bytes": reclaimable_bytes,
             "updated_at": stamped,
         }
+        if store_models is not None:
+            values["store_models"] = json.dumps(sorted(set(store_models)))
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")
