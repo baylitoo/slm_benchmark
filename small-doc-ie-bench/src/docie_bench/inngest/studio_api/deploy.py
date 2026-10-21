@@ -87,7 +87,7 @@ async def _trigger_replicated_deploy(
     """
     from docie_bench.inngest.serving_api import (
         admit_replica_ram,
-        existing_deployment_names,
+        existing_deployment_records,
     )
     from docie_bench.serving.control_plane import replica_names_to_add
 
@@ -109,7 +109,7 @@ async def _trigger_replicated_deploy(
                 "name/port to deploy replicas"
             ),
         )
-    existing = await existing_deployment_names()
+    existing = await existing_deployment_records()
     to_add = replica_names_to_add(payload.model, existing, payload.replicas)
     admit_replica_ram(
         payload.model, len(to_add), payload.context_length, n_parallel=payload.n_parallel
