@@ -2191,6 +2191,7 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
 # the single replica keeps the write topology trivial.
 worker_functions = [
     extract_document,
+    batch_extract_job,
     run_benchmark_job,
     gc_studio_runs_job,
 ]
@@ -2256,6 +2257,7 @@ __all__ = [
     "functions_for_role",
     "apps_for_role",
     "extract_document",
+    "batch_extract_job",
     "run_benchmark_job",
     "deploy_model_job",
     "seed_ollama_job",
