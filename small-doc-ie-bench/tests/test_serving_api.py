@@ -52,7 +52,14 @@ class _FakeAdapter:
         return HealthResult(True, 200)
 
 
-def _seed_deployments(home: Path, ports: dict[str, int]) -> None:
+def _seed_deployments(home: Path, ports: dict[str, int], *, alias: str | None = None) -> None:
+    """Seed deployment records.
+
+    ``alias`` is the shared launch alias replicas of one store model are
+    addressed by, and what makes them replicas of each other (#530). Pass it
+    to seed a replica SET; leave it unset and each record gets its own alias,
+    which is what a bare deploy produces.
+    """
     supervisor = PersistentSupervisor(
         home / "deployments.json", adapters={RuntimeKind.LLAMACPP: _FakeAdapter()}
     )
@@ -63,7 +70,7 @@ def _seed_deployments(home: Path, ports: dict[str, int]) -> None:
                 launch=RuntimeLaunchSpec(
                     runtime=RuntimeKind.LLAMACPP,
                     model=f"/models/{name}.gguf",
-                    alias=name,
+                    alias=alias or name,
                     port=port,
                 ),
             )
@@ -197,7 +204,8 @@ def test_scale_fans_out_one_deploy_event_per_new_replica(
 ) -> None:
     from docie_bench.inngest import serving_api
 
-    _seed_deployments(serving_home, {"qwen": 8088, "qwen-2": 8089})  # already 2 replicas
+    # A real replica set: both records share the "qwen" launch alias.
+    _seed_deployments(serving_home, {"qwen": 8088, "qwen-2": 8089}, alias="qwen")  # 2 replicas
     sent: list[object] = []
 
     async def fake_send(event: object) -> list[str]:
@@ -223,7 +231,7 @@ def test_scale_is_idempotent_no_events_when_already_at_target(
 ) -> None:
     from docie_bench.inngest import serving_api
 
-    _seed_deployments(serving_home, {"qwen": 8088, "qwen-2": 8089})
+    _seed_deployments(serving_home, {"qwen": 8088, "qwen-2": 8089}, alias="qwen")
     sent: list[object] = []
 
     async def fake_send(event: object) -> list[str]:
