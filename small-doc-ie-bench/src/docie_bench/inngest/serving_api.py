@@ -144,6 +144,69 @@ def _observed_placements() -> dict[str, dict[str, Any]] | None:
         return None
 
 
+def _nodes_that_stopped_reporting() -> frozenset[str]:
+    """Nodes whose capacity snapshot has gone stale (best-effort)."""
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    try:
+        return stale_node_ids(ModelCatalog().list_node_snapshots())
+    except Exception:  # noqa: BLE001 - attribution must not 500 the Board
+        return frozenset()
+
+
+def _records_for_other_nodes(
+    local: list[Any], observed: dict[str, dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """Catalog-derived records for deployments this process has no file for.
+
+    The api reads one node's ``deployments.json`` -- the shared `serving-state`
+    volume -- so every deployment on another machine is simply absent from its
+    listing, presented as though the fleet were that one node (#562). These
+    rows fill that gap from ``model_placement``, which carries the owner since
+    #530.
+
+    Deliberately partial and marked as such. A placement row has no desired
+    state, restart policy or pin -- those live in the owning node's file, and
+    publishing them is the phase-2 desired-state work (#534). What it does
+    carry is enough to show the deployment exists, where it is, what state it
+    is in and how it is behaving, which beats omitting it.
+    """
+    if not observed:
+        return []
+    known = {
+        str((record.get("spec") or {}).get("name") or "")
+        for record in local
+        if isinstance(record, dict)
+    }
+    remote: list[dict[str, Any]] = []
+    for name, row in sorted(observed.items()):
+        if name in known:
+            continue
+        remote.append(
+            {
+                "spec": {
+                    "name": name,
+                    # model_name is the launch alias for a store deploy, which
+                    # is what groups replicas (`_replica_base`).
+                    "launch": {
+                        "alias": row.get("model_name") or name,
+                        "model": row.get("model_name"),
+                    },
+                },
+                "state": row.get("state"),
+                "endpoint": row.get("endpoint"),
+                "last_error": row.get("last_error"),
+                "node_id": row.get("node_id"),
+                # The UI needs to know this record is a catalog projection and
+                # not the owning node's own record, so it does not offer
+                # actions that need the file it does not have.
+                "record_source": "catalog",
+            }
+        )
+    return remote
+
+
 def _replica_base(record: dict[str, Any]) -> str | None:
     """The routable base a record belongs to: the launch ``--alias`` (shared by
     every replica of a scaled store model), falling back to the record name."""
@@ -172,6 +235,11 @@ async def list_deployments() -> Any:
     observed = _observed_placements()
     if not isinstance(records, list):
         return records
+    # Deployments owned by OTHER nodes, which this process has no file for
+    # (#562). Without this the listing silently presents one node's disk as the
+    # whole fleet; a missing deployment is worse than a partial one.
+    records.extend(_records_for_other_nodes(records, observed))
+    stale_nodes = _nodes_that_stopped_reporting()
     group_sizes: dict[str, int] = {}
     for record in records:
         if isinstance(record, dict) and (base := _replica_base(record)):
@@ -184,6 +252,13 @@ async def list_deployments() -> Any:
         record["observed_available"] = observed is not None
         obs = observed.get(name) if observed and name else None
         record["observed"] = obs
+        # Which node runs this, and whether that node is still reporting. Both
+        # come from the catalog, so a locally-read record gets attributed too
+        # rather than being implicitly "here".
+        record.setdefault("node_id", (obs or {}).get("node_id"))
+        record.setdefault("record_source", "node")
+        node_id = record.get("node_id")
+        record["node_reporting"] = not (node_id and node_id in stale_nodes)
         base = _replica_base(record)
         record["replica_group"] = base
         record["replicas"] = group_sizes.get(base, 1) if base else 1
