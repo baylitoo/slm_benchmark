@@ -751,7 +751,16 @@ def test_role_partition_is_disjoint_and_complete() -> None:
         "serving-reconfigure",
         "serving-pin",
     }
-    assert worker_ids == {"doc-extract", "benchmark-run", "studio-runs-gc"}
+    # batch-extract was missing here AND from worker_functions, so this
+    # assertion passed by comparing the mistake against a mirror of itself --
+    # see tests/test_inngest_function_registration.py, which checks the lists
+    # against what is actually DECLARED rather than against a hardcoded copy.
+    assert worker_ids == {
+        "doc-extract",
+        "batch-extract",
+        "benchmark-run",
+        "studio-runs-gc",
+    }
     assert serving_ids.isdisjoint(worker_ids)
     assert ids(fn.functions) == serving_ids | worker_ids
 
