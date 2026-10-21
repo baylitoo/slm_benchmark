@@ -16,7 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import (
     BigInteger,
@@ -28,10 +28,11 @@ from sqlalchemy import (
     Table,
     Text,
     select,
+    update,
 )
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text as sa_text
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.orm import Mapped, Session, mapped_column
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.sql.dml import Insert
@@ -159,26 +160,33 @@ class ModelPlacement(Base):
     )
 
 
-# Fixed primary key of the ONE serving_node row (single-node topology, P1).
-SERVING_NODE_ROW_ID = "node"
+# Primary key of the single serving_node row written before rows were keyed by
+# node id (#529). Kept only so the first keyed publish can ADOPT that row and
+# preserve the deployment's capacity history; nothing writes it any more.
+LEGACY_SERVING_NODE_ROW_ID = "node"
+
+# Deprecated alias: the fixed key is no longer where a snapshot is written.
+SERVING_NODE_ROW_ID = LEGACY_SERVING_NODE_ROW_ID
 
 
 class ServingNode(Base):
-    """Single-row node resource snapshot (PR-2, design doc §1 "Resources").
+    """Per-node resource snapshot (PR-2, design doc §1 "Resources").
 
-    Written ONLY by the serving-service reconciler each cycle (measured inside
-    the serving container — the one whose cgroup actually bounds the
-    runtimes); read by the api's ``/v1/serving/resources`` and later the
-    sizing engine. Exactly one row (fixed PK ``SERVING_NODE_ROW_ID``): the
-    control plane is single-node by design, and the publish is an upsert of
-    that row, never an append. ``source`` says whether the numbers came from
-    an authoritative cgroup-v2 limit (``cgroup``) or the soft VM fallback
-    (``vm``) so the UI can badge soft measurements honestly.
+    Written ONLY by that node's serving-service reconciler each cycle (measured
+    inside the serving container — the one whose cgroup actually bounds the
+    runtimes); read by the api's ``/v1/serving/resources`` and the sizing
+    engine. One row per node, keyed by ``node_identity.resolve_node_id()``
+    (#529): a node's publish upserts ITS row, so N nodes reporting into one
+    database stay distinguishable instead of overwriting each other — the
+    capacity view would otherwise show whichever node reconciled last.
+    ``source`` says whether the numbers came from an authoritative cgroup-v2
+    limit (``cgroup``) or the soft VM fallback (``vm``) so the UI can badge
+    soft measurements honestly.
     """
 
     __tablename__ = "serving_node"
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=SERVING_NODE_ROW_ID)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
     total_bytes: Mapped[int] = mapped_column(BigInteger)
     free_bytes: Mapped[int] = mapped_column(BigInteger)
     source: Mapped[str] = mapped_column(String(16))  # "cgroup" | "vm"
@@ -530,6 +538,9 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
 
 def _node_view(row: ServingNode) -> dict[str, Any]:
     return {
+        # Which node these numbers describe. Published so a fleet reader can
+        # never mistake one machine's capacity for the whole fleet's.
+        "node_id": row.id,
         "total_bytes": row.total_bytes,
         "free_bytes": row.free_bytes,
         "source": row.source,
@@ -549,20 +560,59 @@ def _activity_view(row: ModelActivity) -> dict[str, Any]:
     }
 
 
-def _node_snapshot_upsert(dialect_name: str, values: dict[str, Any]) -> Insert | None:
+def _adopt_legacy_node_row(session: Session, node_id: str) -> bool:
+    """Re-key the pre-fleet single ``"node"`` row to ``node_id`` (#529 migration).
+
+    The deployment that ran before rows were keyed by node has one row under the
+    fixed ``"node"`` key holding its capacity history. The node now publishing
+    IS that machine, so adopting the row preserves the history instead of
+    orphaning it beside a fresh one.
+
+    One statement, decided by rowcount: two nodes sharing the central database
+    both see the legacy row on their first publish, and a get-then-UPDATE would
+    let both adopt it. The UPDATE is atomic, so the first wins and the second
+    gets ``rowcount == 0`` and falls through to inserting its own row.
+
+    Skipped when this node already has a row: during a rolling restart an
+    outgoing pre-fleet container keeps re-creating the ``"node"`` row, and
+    re-keying it onto an id that already exists would violate the primary key
+    and fail every publish. The stale legacy row is then just another node in
+    the fleet view until the staleness gate drops it, which is honest — the old
+    container really is still publishing.
+
+    Deliberately NOT in ``ensure_serving_node_table``: that runs at startup in
+    every role, and a migration ordering mistake there is how the api last went
+    down (#549). This runs on the serving reconciler's publish path only.
+    """
+    if node_id == LEGACY_SERVING_NODE_ROW_ID:
+        return False
+    already_mine = select(ServingNode.id).where(ServingNode.id == node_id).exists()
+    result = cast(
+        "CursorResult[Any]",
+        session.execute(
+            update(ServingNode)
+            .where(ServingNode.id == LEGACY_SERVING_NODE_ROW_ID, ~already_mine)
+            .values(id=node_id)
+        ),
+    )
+    return bool(result.rowcount)
+
+
+def _node_snapshot_upsert(
+    dialect_name: str, node_id: str, values: dict[str, Any]
+) -> Insert | None:
     """One-statement ``INSERT .. ON CONFLICT (id) DO UPDATE`` for serving_node.
 
-    The single-row publish must be a REAL upsert: get-then-INSERT lets two
-    racing first publishes both observe "no row" and the loser abort on the
-    duplicate key. Both production PostgreSQL and the sqlite used in tests
-    support ``ON CONFLICT DO UPDATE`` natively; any other dialect returns
-    ``None`` and the caller falls back to get-then-INSERT (single-writer
-    semantics only).
+    A node's publish must be a REAL upsert: get-then-INSERT lets two racing
+    first publishes both observe "no row" and the loser abort on the duplicate
+    key. Both production PostgreSQL and the sqlite used in tests support ``ON
+    CONFLICT DO UPDATE`` natively; any other dialect returns ``None`` and the
+    caller falls back to get-then-INSERT (single-writer semantics only).
     """
     if dialect_name == "postgresql":
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-        pg_statement = pg_insert(ServingNode).values(id=SERVING_NODE_ROW_ID, **values)
+        pg_statement = pg_insert(ServingNode).values(id=node_id, **values)
         return pg_statement.on_conflict_do_update(
             index_elements=[ServingNode.id],
             set_={name: pg_statement.excluded[name] for name in values},
@@ -570,7 +620,7 @@ def _node_snapshot_upsert(dialect_name: str, values: dict[str, Any]) -> Insert |
     if dialect_name == "sqlite":
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        sqlite_statement = sqlite_insert(ServingNode).values(id=SERVING_NODE_ROW_ID, **values)
+        sqlite_statement = sqlite_insert(ServingNode).values(id=node_id, **values)
         return sqlite_statement.on_conflict_do_update(
             index_elements=[ServingNode.id],
             set_={name: sqlite_statement.excluded[name] for name in values},
@@ -842,17 +892,18 @@ class ModelCatalog:
     def publish_node_snapshot(
         self,
         *,
+        node_id: str,
         total_bytes: int,
         free_bytes: int,
         source: str,
         sum_rss_bytes: int,
         reclaimable_bytes: int = 0,
     ) -> dict[str, Any]:
-        """Upsert THE ``serving_node`` row (the reconciler is the sole caller).
+        """Upsert ``node_id``'s ``serving_node`` row (its reconciler is the sole caller).
 
-        Single-row semantics: always the fixed ``SERVING_NODE_ROW_ID`` key, so
-        repeated publishes UPDATE in place and the table never grows. A REAL
-        upsert (``INSERT .. ON CONFLICT (id) DO UPDATE``) — never
+        Keyed by node (#529), so repeated publishes from one node UPDATE in
+        place while a second node adds its own row rather than overwriting this
+        one. A REAL upsert (``INSERT .. ON CONFLICT (id) DO UPDATE``) — never
         get-then-INSERT, whose two racing first publishes (e.g. a replaced
         serving container overlapping the old one within the lease staleness
         window) both see "no row" and the loser aborts on the duplicate key.
@@ -871,28 +922,55 @@ class ModelCatalog:
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")
-            statement = _node_snapshot_upsert(session.get_bind().dialect.name, values)
+            _adopt_legacy_node_row(session, node_id)
+            statement = _node_snapshot_upsert(
+                session.get_bind().dialect.name, node_id, values
+            )
             if statement is not None:
                 session.execute(statement)
             else:  # pragma: no cover - no third dialect is in use
                 # Fallback for dialects without ON CONFLICT support: the old
                 # get-then-INSERT (single-writer semantics only).
-                row = session.get(ServingNode, SERVING_NODE_ROW_ID)
+                row = session.get(ServingNode, node_id)
                 if row is None:
-                    row = ServingNode(id=SERVING_NODE_ROW_ID)
+                    row = ServingNode(id=node_id)
                     session.add(row)
                 for name, value in values.items():
                     setattr(row, name, value)
                 session.flush()
-            return {**values, "updated_at": isoformat(stamped)}
+            return {"node_id": node_id, **values, "updated_at": isoformat(stamped)}
 
-    def get_node_snapshot(self) -> dict[str, Any] | None:
-        """The published node snapshot, or None when never published."""
+    def get_node_snapshot(self, node_id: str | None = None) -> dict[str, Any] | None:
+        """One node's published snapshot, or None when there is no single answer.
+
+        With ``node_id``, that node's row. Without it, the row of the only node
+        that has published — and ``None`` once several have. That is deliberate
+        for the callers that PRICE with the result (RAM admission): picking one
+        of N nodes' free RAM is the "whichever reconciled last" guess #529
+        exists to remove, and it can refuse a deploy that fits on another node.
+        The admission gate is documented fail-open on an absent snapshot, so
+        ``None`` degrades to the serving container's own per-instance fit gate
+        instead of a wrong refusal. Display callers want
+        :meth:`list_node_snapshots` and must say which node they are showing.
+        """
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")
-            row = session.get(ServingNode, SERVING_NODE_ROW_ID)
-            return _node_view(row) if row is not None else None
+            if node_id is not None:
+                row = session.get(ServingNode, node_id)
+                return _node_view(row) if row is not None else None
+            rows = session.scalars(select(ServingNode).limit(2)).all()
+            return _node_view(rows[0]) if len(rows) == 1 else None
+
+    def list_node_snapshots(self) -> Sequence[dict[str, Any]]:
+        """Every node's published snapshot, newest measurement first."""
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            rows = session.scalars(
+                select(ServingNode).order_by(ServingNode.updated_at.desc())
+            ).all()
+            return [_node_view(row) for row in rows]
 
     def mark_placement_ready(self, name: str, *, endpoint: str) -> bool:
         """UPDATE an existing row to ready/hot after a load (PR-4, no create).
@@ -1097,6 +1175,7 @@ __all__ = [
     "ModelActivity",
     "ModelCatalog",
     "CatalogUnavailableError",
+    "LEGACY_SERVING_NODE_ROW_ID",
     "SERVING_NODE_ROW_ID",
     "ServingNode",
     "available_backends",

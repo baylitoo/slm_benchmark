@@ -449,9 +449,11 @@ def _sqlite_catalog(tmp_path: Path) -> Iterator[None]:
 def test_publish_node_snapshot_is_a_single_row_upsert() -> None:
     catalog = ModelCatalog()
     catalog.publish_node_snapshot(
+        node_id="testnode",
         total_bytes=8 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=GIB
     )
     catalog.publish_node_snapshot(
+        node_id="testnode",
         total_bytes=8 * GIB, free_bytes=5 * GIB, source="cgroup", sum_rss_bytes=2 * GIB
     )
 
@@ -464,7 +466,11 @@ def test_publish_node_snapshot_is_a_single_row_upsert() -> None:
 
     with db.session_scope() as session:
         assert session is not None
-        assert len(session.scalars(select(ServingNode)).all()) == 1  # one row, ever
+        # One row PER NODE (#529): repeated publishes from the same node update
+        # in place, so this node's table footprint never grows. A second node
+        # adding its own row is covered in test_serving_node_identity.py.
+        rows = session.scalars(select(ServingNode)).all()
+        assert [row.id for row in rows] == ["testnode"]
 
 
 def test_publish_skipped_without_database() -> None:
@@ -562,7 +568,7 @@ def test_publish_node_snapshot_is_a_native_on_conflict_upsert(dialect_name: str)
         "sum_rss_bytes": GIB,
         "reclaimable_bytes": 0,
     }
-    statement = _node_snapshot_upsert(dialect_name, dict(values))
+    statement = _node_snapshot_upsert(dialect_name, "testnode", dict(values))
     assert statement is not None
     dialect = postgresql.dialect() if dialect_name == "postgresql" else sqlite.dialect()
     sql = str(statement.compile(dialect=dialect))
@@ -662,6 +668,7 @@ def test_resources_endpoint_serves_snapshot_and_source_flag() -> None:
 
     catalog = ModelCatalog()
     catalog.publish_node_snapshot(
+        node_id="testnode",
         total_bytes=8 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=2 * GIB
     )
     catalog.publish_observed(
