@@ -21,6 +21,7 @@ No live processes anywhere: deployments are seeded through a fake adapter
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -502,12 +503,10 @@ def _fresh_round_robin() -> Iterator[None]:
     from docie_bench.serving import placement_resolver
 
     placement_resolver._ROUND_ROBIN_COUNTERS.clear()
-    placement_resolver._SESSION_AFFINITY.clear()
     try:
         yield
     finally:
         placement_resolver._ROUND_ROBIN_COUNTERS.clear()
-        placement_resolver._SESSION_AFFINITY.clear()
 
 
 def _seed_store(name: str) -> None:
@@ -610,8 +609,12 @@ def test_session_affinity_pins_same_replica_across_calls(sqlite_catalog: None) -
 def test_session_affinity_distributes_across_different_sessions(
     sqlite_catalog: None,
 ) -> None:
-    """Different session_ids (or no session_id at all) must still spread load
-    across the live replicas — affinity must not collapse load balancing."""
+    """Different session_ids must still spread across the live replicas —
+    affinity must not collapse load balancing.
+
+    Assignment is hash-uniform rather than round-robin-even, so this asserts
+    coverage over a realistic number of sessions, not an exact split of six.
+    """
     from docie_bench.serving.placement_resolver import resolve_store_profile
 
     _seed_store(MODEL)
@@ -619,54 +622,57 @@ def test_session_affinity_distributes_across_different_sessions(
     _place(f"{MODEL}-2", MODEL, port=8092)
     _place(f"{MODEL}-3", MODEL, port=8093)
 
-    urls = {
-        resolve_store_profile(MODEL, session_id=f"conv-{i}").base_url for i in range(6)
-    }
-    assert urls == {
+    all_replicas = {
         "http://worker:8091/v1",
         "http://worker:8092/v1",
         "http://worker:8093/v1",
     }
+    urls = {
+        resolve_store_profile(MODEL, session_id=f"conv-{i}").base_url
+        for i in range(60)
+    }
+    assert urls == all_replicas
 
     # No session_id given: unchanged round-robin behavior too.
     no_session_urls = [resolve_store_profile(MODEL).base_url for _ in range(3)]
-    assert set(no_session_urls) == urls
+    assert set(no_session_urls) == all_replicas
 
 
 def test_session_affinity_falls_back_and_repins_when_replica_dies(
     sqlite_catalog: None,
 ) -> None:
-    """A pinned replica that's no longer live must fall back to a normal pick
-    for that request AND update the pin, so the NEXT call for the same
-    session_id follows the replacement instead of reverting.
+    """A session whose replica is no longer live must move to a surviving one
+    and stay there, rather than flapping between the remaining replicas.
 
-    Three replicas are seeded (not two) so that after the pinned one dies,
-    two replicas remain live -- resolve_store_profile's single-live-replica
-    shortcut is deliberately NOT triggered, and the fallback/re-pin path
-    inside session_affinity_choice actually runs."""
+    Three replicas are seeded (not two) so that after the chosen one dies, two
+    remain live -- resolve_store_profile's single-live-replica shortcut is
+    deliberately NOT triggered, and the selection among several actually runs.
+    """
     from docie_bench.serving.placement_resolver import resolve_store_profile
 
     _seed_store(MODEL)
-    _place(MODEL, MODEL, port=8091)
-    _place(f"{MODEL}-2", MODEL, port=8092)
-    _place(f"{MODEL}-3", MODEL, port=8093)
+    ports = {MODEL: 8091, f"{MODEL}-2": 8092, f"{MODEL}-3": 8093}
+    for name, port in ports.items():
+        _place(name, MODEL, port=port)
 
     first = resolve_store_profile(MODEL, session_id="conv-xyz")
-    assert first.base_url == "http://worker:8091/v1"  # first pin: round-robin index 0
 
-    # Kill the replica the session got pinned to; two replicas remain live.
+    # Kill whichever replica this session was assigned -- which one that is
+    # depends on the hash, not on a rotation index.
+    chosen = next(
+        name for name, port in ports.items() if first.base_url.endswith(f":{port}/v1")
+    )
     ModelCatalog().record_placement(
-        MODEL,
+        chosen,
         model_name=MODEL,
         engine="llama-server",
-        endpoint="http://worker:8091/v1",
+        endpoint=f"http://worker:{ports[chosen]}/v1",
         state="failed",
     )
 
     second = resolve_store_profile(MODEL, session_id="conv-xyz")
     assert second.base_url != first.base_url
 
-    # The pin follows the replacement on the next call.
     third = resolve_store_profile(MODEL, session_id="conv-xyz")
     assert third.base_url == second.base_url
 
@@ -718,3 +724,62 @@ def test_list_deployments_annotates_replica_group_and_count(
     assert by_name[f"{MODEL}-2"]["replica_group"] == MODEL
     assert by_name["nuextract3"]["replicas"] == 1
     assert by_name["nuextract3"]["replica_group"] == "nuextract3"
+
+
+def test_session_assignment_survives_a_different_process_hash_seed() -> None:
+    """The reason this is hashlib and not the builtin ``hash``.
+
+    str hashing is salted per process, so ``hash`` would give two api/worker
+    processes different answers for one session -- and extraction resolves
+    placements on the ``worker`` service, which is built to scale. A session's
+    second turn would reach a different replica and lose the prefix-KV cache
+    it exists to keep warm. Run the selection under two different seeds and
+    require the same answer.
+    """
+    import subprocess
+    import sys
+
+    # A whole mapping, not one session: any single session agrees across seeds
+    # by chance roughly one time in three with a salted hash.
+    program = (
+        "from docie_bench.serving.placement_resolver import session_affinity_choice;"
+        "cands=[{'name':'m'},{'name':'m-2'},{'name':'m-3'}];"
+        "print(','.join(session_affinity_choice('conv-%d' % i,'m',cands)['name']"
+        " for i in range(12)))"
+    )
+    answers = set()
+    for seed in ("0", "1", "777", "12345", "31337"):
+        # noqa S603: this interpreter, a literal program, no shell.
+        completed = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": "src"},
+            check=True,
+        )
+        assert completed.stdout.strip(), "subprocess produced no assignment"
+        answers.add(completed.stdout.strip())
+
+    assert len(answers) == 1, f"assignment moved with PYTHONHASHSEED: {answers}"
+
+
+def test_losing_a_replica_only_moves_the_sessions_that_were_on_it() -> None:
+    """Rendezvous selection, not a modulo over the candidate count.
+
+    A modulo would re-map every session when the live set shrinks, dropping
+    warm caches fleet-wide for one replica's failure. Here the surviving
+    replicas keep their weights, so only the sessions assigned to the dead one
+    move.
+    """
+    from docie_bench.serving.placement_resolver import session_affinity_choice
+
+    full = [{"name": "m"}, {"name": "m-2"}, {"name": "m-3"}]
+    sessions = [f"conv-{i}" for i in range(200)]
+    before = {s: session_affinity_choice(s, "m", full)["name"] for s in sessions}
+
+    survivors = [c for c in full if c["name"] != "m-2"]
+    after = {s: session_affinity_choice(s, "m", survivors)["name"] for s in sessions}
+
+    moved = {s for s in sessions if before[s] != after[s]}
+    assert moved == {s for s in sessions if before[s] == "m-2"}
+    assert moved, "the sample should include sessions that were on the dead replica"
