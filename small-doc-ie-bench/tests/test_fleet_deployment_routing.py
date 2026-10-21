@@ -28,6 +28,21 @@ REMOTE = "nuextract3"
 MISSING_CONFIG = "configs/__no_such_models_file__.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _empty_resolution_cache() -> Iterator[None]:
+    """#532's last-known-good cache is process-global and would otherwise let
+    one test's successful resolution answer another test's outage."""
+    from docie_bench.serving import placement_resolver
+
+    placement_resolver._RESOLUTION_CACHE.clear()
+    placement_resolver._ROUND_ROBIN_COUNTERS.clear()
+    try:
+        yield
+    finally:
+        placement_resolver._RESOLUTION_CACHE.clear()
+        placement_resolver._ROUND_ROBIN_COUNTERS.clear()
+
+
 @pytest.fixture
 def sqlite_catalog(tmp_path: Path) -> Iterator[None]:
     db.dispose_engine()
@@ -119,9 +134,73 @@ def test_an_unknown_deployment_still_refuses(sqlite_catalog: None) -> None:
 
 
 def test_resolution_is_unchanged_without_a_catalog() -> None:
-    """No DATABASE_URL: no remote entries, and the refusal is the old one --
-    routing must not acquire a database dependency."""
+    """No DATABASE_URL and nothing cached: no remote entries, and the refusal
+    is the old one -- routing must not acquire a database dependency.
+
+    "Nothing cached" is load-bearing: #532 deliberately keeps resolving a model
+    it resolved before the catalog went away, so a previously-seen model would
+    resolve here and that would be correct.
+    """
     db.dispose_engine()
 
     with pytest.raises(ProfileResolutionError, match="not a live"):
+        _resolve(deployment=REMOTE)
+
+
+# --- the model name still routes after minting (#530) --------------------
+
+
+def test_the_model_name_resolves_to_a_live_replica(sqlite_catalog: None) -> None:
+    """Record names are minted since #530, so the model's own name is no longer
+    one of them. A caller naming the MODEL must still reach a live replica --
+    that is what keeps `deployment=<model>` working.
+    """
+    from docie_bench.serving.model_store import StoreEntry
+
+    ModelCatalog().upsert(
+        StoreEntry(
+            name=REMOTE,
+            family="openai_chat",
+            model_path=Path(f"/models/{REMOTE}/model.gguf"),
+        )
+    )
+    # A minted record name, with the model as its launch alias.
+    _place(f"{REMOTE}-a1b2c3", node_id="node-b", model_name=REMOTE)
+
+    profile = _resolve(deployment=REMOTE)
+
+    assert profile.base_url == "http://node-b:8088/v1"
+    assert profile.model == REMOTE
+
+
+def test_a_bare_model_name_resolves_too(sqlite_catalog: None) -> None:
+    from docie_bench.serving.model_store import StoreEntry
+
+    ModelCatalog().upsert(
+        StoreEntry(
+            name=REMOTE,
+            family="openai_chat",
+            model_path=Path(f"/models/{REMOTE}/model.gguf"),
+        )
+    )
+    _place(f"{REMOTE}-a1b2c3", node_id="node-b", model_name=REMOTE)
+
+    assert _resolve(model_profile=REMOTE).base_url == "http://node-b:8088/v1"
+
+
+def test_a_model_with_no_live_replica_still_refuses(sqlite_catalog: None) -> None:
+    """The fallback must not soften the refusal: a model in the catalog with
+    nothing serving is still an error, not a silent env fallback."""
+    from docie_bench.serving.model_store import StoreEntry
+
+    ModelCatalog().upsert(
+        StoreEntry(
+            name=REMOTE,
+            family="openai_chat",
+            model_path=Path(f"/models/{REMOTE}/model.gguf"),
+        )
+    )
+    _place(f"{REMOTE}-a1b2c3", node_id="node-b", model_name=REMOTE, state="loading")
+
+    with pytest.raises(ProfileResolutionError):
         _resolve(deployment=REMOTE)
