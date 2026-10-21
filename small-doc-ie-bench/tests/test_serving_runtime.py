@@ -233,6 +233,36 @@ def test_launch_spec_rejects_invalid_n_parallel_and_cache_reuse() -> None:
         _spec(RuntimeKind.LLAMACPP, cache_reuse=0)
 
 
+def test_llamacpp_slot_save_path_emits_flag() -> None:
+    # #373: enables llama-server's POST /slots/<id>?action=save|restore --
+    # this only turns the API on server-side, no automatic save/restore
+    # orchestration is wired here.
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(
+        RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf", slot_save_path="/var/slots"
+    )
+
+    command = adapter.build_command(spec)
+
+    assert command[command.index("--slot-save-path") + 1] == "/var/slots"
+
+
+def test_llamacpp_omits_slot_save_path_flag_when_unset() -> None:
+    adapter = LlamaCppRuntime(which=lambda name: "llama-server")
+    spec = _spec(RuntimeKind.LLAMACPP, model="C:/models/invoice.gguf")
+
+    command = adapter.build_command(spec)
+
+    assert "--slot-save-path" not in command
+
+
+def test_launch_spec_rejects_empty_or_nul_slot_save_path() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="slot_save_path"):
+        _spec(RuntimeKind.LLAMACPP, slot_save_path="   ")
+    with pytest.raises(RuntimeConfigurationError, match="slot_save_path"):
+        _spec(RuntimeKind.LLAMACPP, slot_save_path="/bad\x00path")
+
+
 def test_llamacpp_chat_template_file_emits_flag() -> None:
     # #387: overrides the GGUF's own embedded chat_template -- e.g. patching
     # tool-call rendering onto a checkpoint whose baked-in template lacks it
