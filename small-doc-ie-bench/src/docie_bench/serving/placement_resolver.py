@@ -22,6 +22,7 @@ Style precedence (the load-bearing rule):
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import logging
 import threading
@@ -135,8 +136,9 @@ def round_robin_choice(
     re-maps the counter and one endpoint may be skipped or repeated once —
     acceptable for load balancing, but this function alone has no session
     affinity (successive calls for the same conversation can land on
-    different replicas). See :func:`session_affinity_choice`, which layers
-    per-conversation pinning on top of this same rotation.
+    different replicas). Requests carrying a session id go through
+    :func:`session_affinity_choice` instead, which derives its pick by
+    hashing rather than rotating, so it needs none of this state.
     """
     ordered = sorted(candidates, key=lambda p: str(p.get("name") or ""))
     with _ROUND_ROBIN_LOCK:
@@ -145,19 +147,26 @@ def round_robin_choice(
     return ordered[index % len(ordered)]
 
 
-# Session-affinity state: (model_name, session_id) -> pinned replica record
-# name. Guarded by the same lock discipline as the round-robin counters
-# above (a separate lock, since the two are never taken together). See
-# session_affinity_choice for the consistency model.
-_SESSION_AFFINITY_LOCK = threading.Lock()
-_SESSION_AFFINITY: dict[str, str] = {}
+def _affinity_weight(session_id: str, model_name: str, replica_name: str) -> int:
+    """Rendezvous weight of one replica for one session.
+
+    ``hashlib`` rather than the builtin ``hash``: str hashing is salted per
+    process (``PYTHONHASHSEED``), so ``hash`` would hand two api processes
+    different answers for the same session — the exact failure this function
+    exists to remove.
+    """
+    digest = hashlib.blake2b(
+        f"{model_name}\x00{session_id}\x00{replica_name}".encode(),
+        digest_size=16,
+    ).digest()
+    return int.from_bytes(digest, "big")
 
 
 def session_affinity_choice(
     session_id: str, model_name: str, candidates: Sequence[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Pick a replica of ``model_name`` for ``session_id``, pinning later
-    turns of the same conversation to the same replica.
+    """Pick a replica of ``model_name`` for ``session_id``, so later turns of
+    the same conversation reach the same replica.
 
     Each top-level ``/v1/chat/completions`` call is independently
     round-robined by default, which can bounce a multi-turn conversation
@@ -165,40 +174,40 @@ def session_affinity_choice(
     Reusing the ``session_id`` already threaded through the Playground for
     docs-search continuity gives this a free, request-visible affinity key.
 
-    CONSISTENCY MODEL (stated as honestly as round_robin_choice's own): the
-    pin map is process-local and in-memory. Each api/worker process pins
-    independently, a restart drops every pin (those sessions just
-    round-robin again from a cold start, same as a brand-new session), and
-    nothing is coordinated across processes — acceptable because
-    round_robin_choice already makes the same trade-off for load balancing.
-    The map also only grows (one entry per distinct ``session_id`` seen,
-    never evicted) until a process restart. Note also that
-    ``resolve_store_profile``'s single-live-replica shortcut bypasses this
-    function entirely, so a pin recorded while two replicas were live is not
-    refreshed during a window where only one survives — if the pinned
-    replica later revives, the stale pin still points at it, which is
-    correct routing either way.
+    CHOSEN BY HASHING, NOT REMEMBERED. Highest-random-weight (rendezvous)
+    selection: weigh every live replica against the session key and take the
+    maximum. The assignment is therefore a pure function of the session id and
+    the live set, which is what makes it hold where a remembered pin could not
+    — extraction resolves placements on the ``worker`` service, which is built
+    to scale (``--scale worker=3``), so a process-local pin map gave a
+    session's second turn only a 1-in-N chance of reaching the process holding
+    its pin. Nothing is stored, so there is also nothing to coordinate between
+    processes, nothing to lose on restart, and no per-session entry to grow.
 
-    Behavior:
-    - No existing pin for ``session_id``: falls back to
-      :func:`round_robin_choice` and records the pick as the new pin.
-    - An existing pin whose replica is still in ``candidates`` (still live):
-      returns that replica — deterministic reuse across turns.
-    - An existing pin whose replica is no longer live: falls back to
-      :func:`round_robin_choice` for THIS request and re-pins to the new
-      pick, so subsequent turns in the same session follow the replacement.
+    Removing a replica only reassigns the sessions that were on it: the
+    surviving replicas keep their weights, so the maximum among them is
+    unchanged for every other session. That is the property a modulo over the
+    candidate count would not have.
+
+    Honest limits:
+    - Assignment is hash-uniform, not perfectly even. Over few sessions the
+      split can be lumpy (two sessions may weigh the same replica highest);
+      it evens out with volume. Requests WITHOUT a session id still go through
+      :func:`round_robin_choice`, so plain load balancing is unaffected.
+    - ``resolve_store_profile``'s single-live-replica shortcut bypasses this
+      function entirely, which is correct routing either way.
+    - A session follows its replica's identity, not its node, so a deployment
+      that moves node keeps its sessions.
     """
-    key = f"{model_name}:{session_id}"
-    with _SESSION_AFFINITY_LOCK:
-        pinned_name = _SESSION_AFFINITY.get(key)
-    if pinned_name is not None:
-        for candidate in candidates:
-            if str(candidate.get("name") or "") == pinned_name:
-                return candidate
-    choice = round_robin_choice(model_name, candidates)
-    with _SESSION_AFFINITY_LOCK:
-        _SESSION_AFFINITY[key] = str(choice.get("name") or "")
-    return choice
+    return max(
+        candidates,
+        key=lambda candidate: (
+            _affinity_weight(session_id, model_name, str(candidate.get("name") or "")),
+            # Total order even in the (astronomically unlikely) weight tie, so
+            # every process breaks it the same way.
+            str(candidate.get("name") or ""),
+        ),
+    )
 
 
 def _record_activity_best_effort(name: str, catalog: ModelCatalog) -> None:
