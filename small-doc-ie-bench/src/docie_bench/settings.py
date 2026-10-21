@@ -268,6 +268,27 @@ class Settings(BaseSettings):
         ),
     )
 
+    # How long a successfully resolved `store:` target stays usable after the
+    # catalog becomes unreachable (#532). The node side already keeps serving
+    # without Postgres -- the reconciler repairs and saves deployments.json and
+    # just skips the publish -- so without this the models are alive and only
+    # the central resolver is dead, which #527 forbids.
+    #
+    # Deliberately much longer than the node-staleness window (3x the reconcile
+    # interval): that window answers "has this node stopped reporting", a
+    # per-node question answered by fresh data. This one answers "is the
+    # central catalog down", during which there is no fresh data at all, and
+    # the cost of an over-long entry is a failed connection to a removed
+    # deployment -- loud and recoverable -- not a wrong answer. 0 disables the
+    # cache and restores the pre-#532 behaviour of refusing to resolve.
+    serving_placement_cache_ttl_seconds: float = Field(
+        default=900.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "DOCIE_SERVING_PLACEMENT_CACHE_TTL", "serving_placement_cache_ttl_seconds"
+        ),
+    )
+
     # Dynamic lifecycle knobs (PR-4, design doc §4). All DOCIE_-prefixed like
     # the other serving knobs.
     #
