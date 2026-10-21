@@ -10,6 +10,7 @@ import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -43,8 +44,12 @@ def create_app(
     )
     model_app = typer.Typer(help="Manage local model artifacts.", no_args_is_help=True)
     runtime_app = typer.Typer(help="Inspect available inference runtimes.", no_args_is_help=True)
+    store_app = typer.Typer(
+        help="Seed and inspect THIS node's blob store.", no_args_is_help=True
+    )
     app.add_typer(model_app, name="model")
     app.add_typer(runtime_app, name="runtime")
+    app.add_typer(store_app, name="store")
     state = _Context(
         plane_factory=(lambda: control_plane) if control_plane is not None else plane_factory
     )
@@ -60,6 +65,94 @@ def create_app(
     ) -> None:
         state.json_output = json_output
         ctx.obj = state
+
+    # ------------------------------------------------------- node-local store
+    # Seeding is otherwise reachable only through `serving/seed.requested`, an
+    # ordinary event on the shared `docie-serving` app -- so it lands on
+    # whichever serving node Inngest picks and a specific node cannot be
+    # targeted (#562). The blob store is node-local, so "deploy the same model
+    # on two nodes" needs the GGUF on both, which until node-addressed
+    # lifecycle lands (#535) means seeding each node directly. These commands
+    # are that path: they run against the store of whichever node executes
+    # them, and never emit an event.
+
+    def _store() -> Any:
+        from docie_bench.serving.model_store import ModelStore
+        from docie_bench.serving.paths import serving_home
+
+        return ModelStore(serving_home() / "models")
+
+    @store_app.command("list")
+    def store_list(ctx: typer.Context) -> None:
+        """What THIS node actually holds — the input a deploy here needs."""
+        store = _store()
+        _emit(
+            ctx,
+            [
+                {
+                    "name": entry.name,
+                    "family": entry.family,
+                    "source": entry.source,
+                    "model_path": entry.model_path.as_posix(),
+                }
+                for entry in store.list()
+            ],
+        )
+
+    @store_app.command("seed-ollama")
+    def store_seed_ollama(
+        ctx: typer.Context,
+        reference: str = typer.Argument(..., help="Ollama reference, e.g. lfm2.5:350m."),
+        name: str = typer.Option(..., "--name", help="Store name to register it under."),
+        family: str = typer.Option(..., "--family", help="Model family contract."),
+        mmproj: str | None = typer.Option(None, help="Explicit vision projector path."),
+        copy: bool = typer.Option(
+            False, "--copy", help="Copy instead of hard-linking the blob."
+        ),
+    ) -> None:
+        """Seed from a model Ollama already pulled on THIS machine.
+
+        Idempotent: a store that already holds a complete copy re-registers it
+        rather than re-reading the blob.
+        """
+        try:
+            entry = _store().seed_from_ollama(
+                reference,
+                name=name,
+                family=family,
+                link=not copy,
+                mmproj_source=mmproj,
+            )
+            _emit(ctx, {"name": entry.name, "model_path": entry.model_path.as_posix()})
+        except Exception as exc:
+            _emit_error(ctx, exc)
+            raise typer.Exit(code=1) from exc
+
+    @store_app.command("add-gguf")
+    def store_add_gguf(
+        ctx: typer.Context,
+        model_gguf: str = typer.Argument(..., help="Path to a GGUF already on disk."),
+        name: str = typer.Option(..., "--name", help="Store name to register it under."),
+        family: str = typer.Option(..., "--family", help="Model family contract."),
+        mmproj: str | None = typer.Option(None, help="Vision projector path."),
+        copy: bool = typer.Option(
+            False, "--copy", help="Copy instead of hard-linking the file."
+        ),
+    ) -> None:
+        """Register a GGUF already on THIS node's disk."""
+        try:
+            entry = _store().add_gguf(
+                name=name,
+                family=family,
+                model_gguf=model_gguf,
+                mmproj=mmproj,
+                source="cli",
+                link=not copy,
+            )
+            _emit(ctx, {"name": entry.name, "model_path": entry.model_path.as_posix()})
+        except Exception as exc:
+            _emit_error(ctx, exc)
+            raise typer.Exit(code=1) from exc
 
     @model_app.command("list")
     def model_list(ctx: typer.Context) -> None:
@@ -385,6 +478,24 @@ def _execute(
     _render(result, json_output=state.json_output)
     if hint is not None and not state.json_output:
         typer.echo(hint(result))
+
+
+def _emit(ctx: typer.Context, value: object) -> None:
+    """Render a NODE-LOCAL result (no control plane, no event loop).
+
+    Same rendering and the same error shape as :func:`_execute`, so `--json`
+    behaves identically for the store commands.
+    """
+    _render(value, json_output=_state(ctx).json_output)
+
+
+def _emit_error(ctx: typer.Context, exc: Exception) -> None:
+    if _state(ctx).json_output:
+        typer.echo(
+            _json({"error": {"message": str(exc), "type": type(exc).__name__}}), err=True
+        )
+    else:
+        typer.echo(f"Error: {exc}", err=True)
 
 
 def _state(ctx: typer.Context) -> _Context:
