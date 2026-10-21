@@ -116,6 +116,14 @@ class ModelPlacement(Base):
     # Probed known-good response-format style (PR "probe-at-deploy" fills it);
     # NULL means the resolver falls back to the engine default.
     negotiated_style: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Which node runs this deployment (#530). Set at creation by the
+    # supervisor seam that launched the runtime, and rewritten every cycle by
+    # that node's reconciler -- the process actually holding the handle -- so
+    # ownership is observed rather than declared. NULL therefore means exactly
+    # one thing: a row written before ownership was tracked, which on the
+    # existing single-node deployment is every row. Indexed: the fleet views
+    # filter by it.
+    node_id: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
     # ------------------------------------------------ observed state (PR-1)
     # Written ONLY by the serving-service reconciler each cycle. NULL means
     # "never observed" (e.g. the reconciler has not run since this row was
@@ -344,6 +352,9 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     ("throughput_measured_at", DateTime(timezone=True)),
     ("throughput_source", String(32)),
     ("slot_count", Integer()),
+    # Owning node (#530). Listed here, not just mapped above, or an existing
+    # database would throw UndefinedColumn on the reconciler's first publish.
+    ("node_id", String(32)),
 )
 
 
@@ -519,6 +530,7 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "endpoint": row.endpoint,
         "state": row.state,
         "negotiated_style": row.negotiated_style,
+        "node_id": row.node_id,
         "phase": row.phase,
         "pid": row.pid,
         "pid_create_time": row.pid_create_time,
@@ -780,8 +792,16 @@ class ModelCatalog:
         endpoint: str,
         state: str,
         negotiated_style: str | None = None,
+        node_id: str | None = None,
     ) -> dict[str, Any]:
-        """Upsert the live placement for deployment ``name`` (worker writes it)."""
+        """Upsert the live placement for deployment ``name`` (worker writes it).
+
+        ``node_id`` is optional here and required on
+        :meth:`publish_observed`: the deploy path may not be running on the
+        node that will own the runtime, while the reconciler always is. Passing
+        ``None`` leaves whatever the owning node last recorded instead of
+        erasing it.
+        """
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")
@@ -794,6 +814,8 @@ class ModelCatalog:
             row.endpoint = endpoint
             row.state = state
             row.negotiated_style = negotiated_style
+            if node_id is not None:
+                row.node_id = node_id
             session.flush()
             return _placement_view(row)
 
@@ -815,6 +837,7 @@ class ModelCatalog:
         self,
         name: str,
         *,
+        node_id: str,
         engine: str,
         state: str,
         endpoint: str,
@@ -846,6 +869,12 @@ class ModelCatalog:
         unconditionally alongside the rest of the observation so a measurement
         that stops being valid — model replaced, sample expired — clears
         instead of lingering as a number nothing stands behind.
+
+        ``node_id`` records which node runs this deployment (#530). It is
+        written with the rest of the observation, under the same monotonic
+        guard: the publisher is the node holding the runtime's handle, so the
+        freshest observation's node is the owner, and a stale publish cannot
+        claim a deployment away from the node that actually has it.
         """
         with session_scope() as session:
             if session is None:
@@ -858,6 +887,7 @@ class ModelCatalog:
                         name if session.get(ModelStoreEntry, name) is not None else None
                     ),
                     engine=engine,
+                    node_id=node_id,
                 )
                 session.add(row)
             elif probed_at is not None and row.updated_at is not None:
@@ -871,6 +901,7 @@ class ModelCatalog:
                     updated = updated.replace(tzinfo=dt.UTC)
                 if updated > probed_at:
                     return _placement_view(row)
+            row.node_id = node_id
             row.state = state
             row.endpoint = endpoint
             row.phase = phase

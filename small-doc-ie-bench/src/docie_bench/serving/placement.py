@@ -28,6 +28,7 @@ def record_placement(model_name: str, record: object) -> None:
     discoverable via ``store:<model_name>``.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.node_identity import resolve_node_id
 
     spec = getattr(record, "spec", None)
     state = getattr(record, "state", None)
@@ -49,6 +50,10 @@ def record_placement(model_name: str, record: object) -> None:
             engine=engine,
             endpoint=str(getattr(record, "endpoint", None) or ""),
             state=str(getattr(state, "value", state) or "unknown"),
+            # Recording happens at the supervisor seam, which runs on the node
+            # that launched the runtime -- so the owner is known at creation
+            # and a new row is never left without one (#530).
+            node_id=resolve_node_id(),
         )
     except CatalogUnavailableError:
         logger.warning(
