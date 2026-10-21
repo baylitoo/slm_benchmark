@@ -1214,15 +1214,100 @@ async def list_store() -> Any:
     except Exception:  # noqa: BLE001 - catalog hiccup must not blank the store list
         logger.warning("store catalog enrichment failed; serving on-disk view", exc_info=True)
         catalog = {}
+    # Models the catalog knows but THIS node has no blob for -- i.e. seeded on
+    # another node (#562). Without them the Studio shows one node's disk as the
+    # fleet's store, and a deploy of a model it cannot see simply fails.
+    known = {entry["name"] for entry in entries}
+    for name, row in sorted(catalog.items()):
+        if name in known:
+            continue
+        entries.append(_store_entry_from_catalog(name, row))
+    node_stores = _store_models_by_node()
     for entry in entries:
         extra = catalog.get(entry["name"])
         if extra:
             entry["placement"] = extra.get("placement")
             entry["created_at"] = extra.get("created_at")
             entry["updated_at"] = extra.get("updated_at")
+        entry["nodes"] = _presence_across_nodes(str(entry["name"]), node_stores)
         entry.pop("model_path", None)
         entry.pop("mmproj_path", None)
     return entries
+
+
+def _store_models_by_node() -> dict[str, list[str] | None]:
+    """What each node reports holding, ``None`` for a node that has not said.
+
+    Best-effort: an unreadable node table yields nothing, so the store listing
+    degrades to un-annotated rather than failing.
+    """
+    from docie_bench.serving.catalog import ModelCatalog
+
+    try:
+        snapshots = ModelCatalog().list_node_snapshots()
+    except Exception:  # noqa: BLE001 - annotation must not blank the store list
+        return {}
+    return {
+        str(row.get("node_id") or ""): row.get("store_models")
+        for row in snapshots
+        if row.get("node_id")
+    }
+
+
+def _presence_across_nodes(
+    name: str, node_stores: dict[str, list[str] | None]
+) -> dict[str, list[str]]:
+    """Which nodes hold ``name``, which do not, and which have not reported.
+
+    The distinction matters for what an operator does next: `missing` means
+    re-seed that node, `unreported` means wait for its next publish (or check
+    whether it is reporting at all). Collapsing them into one list would turn
+    "we do not know" into "it is not there".
+    """
+    present: list[str] = []
+    missing: list[str] = []
+    unreported: list[str] = []
+    for node_id, models in sorted(node_stores.items()):
+        if models is None:
+            unreported.append(node_id)
+        elif name in models:
+            present.append(node_id)
+        else:
+            missing.append(node_id)
+    return {"present": present, "missing": missing, "unreported": unreported}
+
+
+def _store_entry_from_catalog(name: str, row: dict[str, Any]) -> dict[str, Any]:
+    """A store row for a model seeded on another node (#562).
+
+    Deliberately thin: size and mmproj presence are properties of a blob this
+    process cannot see. What it can say is that the model exists, what family
+    it is, and -- via the `nodes` annotation added by the caller -- where its
+    blob actually is.
+    """
+    from docie_bench.serving.catalog import available_backends
+    from docie_bench.serving.model_store import FAMILIES
+
+    family = str(row.get("family") or "")
+    contract = FAMILIES.get(family)
+    return {
+        "name": name,
+        "family": family,
+        "vision": bool(contract and contract.vision),
+        "embedding": bool(contract and contract.embedding),
+        "reranker": bool(contract and contract.reranker),
+        "analyzer": bool(contract and contract.analyzer),
+        "structured_extraction": bool(contract and contract.structured_extraction),
+        "available_backends": available_backends(family),
+        "has_mmproj": None,
+        "source": row.get("source"),
+        "size_bytes": row.get("size_bytes"),
+        "placement": None,
+        "created_at": None,
+        "updated_at": None,
+        # This process has no blob for it, so nothing here was read from disk.
+        "store_view": "catalog",
+    }
 
 
 @router.get("/families")
