@@ -340,12 +340,16 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
     if not observations:
         return
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.node_identity import resolve_node_id
 
     try:
         catalog = ModelCatalog()
+        # This process holds these runtimes' handles, so it is their owner.
+        node_id = resolve_node_id()
         for observed in observations:
             catalog.publish_observed(
                 observed.name,
+                node_id=node_id,
                 engine=observed.engine,
                 state=observed.state,
                 endpoint=observed.endpoint,

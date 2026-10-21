@@ -86,6 +86,7 @@ def test_resolve_store_surfaces_the_observed_slot_count(_sqlite_catalog: None) -
 
     ModelCatalog().publish_observed(
         "qwen2.5-1.5b",
+        node_id="testnode",
         engine="llama-server",
         state="ready",
         endpoint=_ENDPOINT,
