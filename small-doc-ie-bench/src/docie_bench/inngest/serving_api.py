@@ -782,15 +782,19 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     return await _fire_lifecycle_event(name, event=UNLOAD_EVENT, prefix="unload")
 
 
-async def existing_deployment_names() -> list[str]:
-    """Every deployment record name in the shared on-disk state (replica math
-    input for the scale endpoint and the replicated-deploy trigger)."""
+async def existing_deployment_records() -> list[dict[str, Any]]:
+    """Every deployment record in the shared on-disk state (replica math input
+    for the scale endpoint and the replicated-deploy trigger).
+
+    The records, not just their names: replica membership is decided by the
+    launch alias (``control_plane.replica_group_of``), which a name alone does
+    not carry.
+    """
     records = await _control_plane().list_deployments()
     return [
-        str(spec_name)
+        record
         for record in (records if isinstance(records, list) else [])
-        if isinstance(record, dict)
-        and (spec_name := (record.get("spec") or {}).get("name"))
+        if isinstance(record, dict) and (record.get("spec") or {}).get("name")
     ]
 
 
@@ -922,7 +926,7 @@ async def scale_store_model(
     )
     from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
-    existing = await existing_deployment_names()
+    existing = await existing_deployment_records()
     to_add = replica_names_to_add(name, existing, request.replicas)
     to_remove = replica_names_to_remove(name, existing, request.replicas)
     current = count_replica_deployments(name, existing)

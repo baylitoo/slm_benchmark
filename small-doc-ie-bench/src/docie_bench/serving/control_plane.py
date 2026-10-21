@@ -1380,40 +1380,76 @@ def replica_deployment_name(base: str, index: int) -> str:
     return base if index <= 1 else f"{base}-{index}"
 
 
-def _replica_re(base: str) -> re.Pattern[str]:
+def _replica_suffix_re(base: str) -> re.Pattern[str]:
+    """Matches ``base`` / ``base-N``, for ORDERING scale-down victims only.
+
+    Membership is decided by :func:`replica_group_of`, not by this pattern: a
+    name is a weak signal and a deployment a user deliberately called
+    ``<model>-2`` is not a replica of ``<model>``. What the suffix is still
+    good for is picking which replica to peel off first, since it is the only
+    record of the order they were added.
+    """
     return re.compile(rf"^{re.escape(base)}(?:-(\d+))?$")
 
 
-def count_replica_deployments(base: str, existing_names: Iterable[str]) -> int:
-    """How many live deployments are replicas of ``base`` (``base`` or ``base-N``)."""
-    pattern = _replica_re(base)
-    return sum(1 for n in existing_names if pattern.match(n))
+def replica_group_of(record: object) -> str:
+    """The routable group a deployment record belongs to.
+
+    The launch ``alias`` is what every replica of a scaled store model shares
+    (it is the ``--alias`` / ``--served-model-name`` its requests arrive under),
+    so it — not the record name — is what makes two records replicas of each
+    other. Falls back to the record name for a bare deploy, where the two are
+    the same thing anyway.
+    """
+    if isinstance(record, dict):
+        spec = record.get("spec") or {}
+        launch = spec.get("launch") or {}
+        return str(launch.get("alias") or spec.get("name") or "")
+    spec_obj = getattr(record, "spec", None)
+    launch_obj = getattr(spec_obj, "launch", None)
+    return str(getattr(launch_obj, "alias", None) or getattr(spec_obj, "name", "") or "")
+
+
+def deployment_name_of(record: object) -> str:
+    if isinstance(record, dict):
+        return str((record.get("spec") or {}).get("name") or "")
+    return str(getattr(getattr(record, "spec", None), "name", "") or "")
+
+
+def count_replica_deployments(base: str, existing: Iterable[object]) -> int:
+    """How many live deployments serve ``base``, by launch alias (#530).
+
+    Previously keyed on the name matching ``base``/``base-N``, which counted an
+    unrelated deployment a user happened to name ``<base>-2`` as a replica.
+    """
+    return sum(1 for record in existing if replica_group_of(record) == base)
 
 
 def replica_names_to_add(
-    base: str, existing_names: Iterable[str], target_total: int
+    base: str, existing: Iterable[object], target_total: int
 ) -> list[str]:
     """The deployment names to CREATE to bring ``base`` up to ``target_total``
     replicas, skipping any name already taken (replica of ``base`` or not).
 
     Returns fewer than the delta only if the search is exhausted (bounded). An
     already-satisfied target returns ``[]`` — scaling is idempotent."""
-    existing = set(existing_names)
-    current = count_replica_deployments(base, existing)
+    records = list(existing)
+    taken = {deployment_name_of(record) for record in records} - {""}
+    current = count_replica_deployments(base, records)
     delta = max(0, target_total - current)
     names: list[str] = []
     index = 1
     while len(names) < delta and index <= 10_000:
         candidate = replica_deployment_name(base, index)
-        if candidate not in existing:
+        if candidate not in taken:
             names.append(candidate)
-            existing.add(candidate)
+            taken.add(candidate)
         index += 1
     return names
 
 
 def replica_names_to_remove(
-    base: str, existing_names: Iterable[str], target_total: int
+    base: str, existing: Iterable[object], target_total: int
 ) -> list[str]:
     """The replica record names to DELETE to bring ``base`` down to
     ``target_total`` deployments — the scale-down mirror of
@@ -1426,13 +1462,18 @@ def replica_names_to_remove(
     bare ``base``). Already at/below the target returns ``[]`` — scaling is
     idempotent in both directions.
     """
-    pattern = _replica_re(base)
+    pattern = _replica_suffix_re(base)
     matched: list[tuple[int, str]] = []
-    for candidate in set(existing_names):
+    for record in existing:
+        if replica_group_of(record) != base:
+            continue
+        candidate = deployment_name_of(record)
         found = pattern.match(candidate)
-        if found:
-            index = int(found.group(1)) if found.group(1) else 1
-            matched.append((index, candidate))
+        # Group membership comes from the alias; the suffix only orders the
+        # victims. A replica whose name does not fit the convention sorts as
+        # index 1, beside the canonical record.
+        index = int(found.group(1)) if found and found.group(1) else 1
+        matched.append((index, candidate))
     matched.sort(reverse=True)
     delta = max(0, len(matched) - max(target_total, 0))
     return [name for _index, name in matched[:delta]]
