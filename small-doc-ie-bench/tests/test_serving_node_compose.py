@@ -206,3 +206,46 @@ def test_the_example_env_does_not_ship_a_usable_advertise_host() -> None:
             assert line.split("=", 1)[1].strip() == ""
             return
     pytest.fail("DOCIE_SERVING_ADVERTISE_HOST is not in the example env")
+
+
+# --- the central side a node has to reach --------------------------------
+
+
+@pytest.mark.parametrize(
+    ("service", "variable"),
+    [("postgres", "POSTGRES_BIND_HOST"), ("inngest", "INNGEST_BIND_HOST")],
+)
+def test_the_central_services_a_node_needs_have_a_binding_knob(
+    service: str, variable: str
+) -> None:
+    """A node reaches Postgres and Inngest over the private network, so both
+    have to be bindable without editing the tracked compose file."""
+    published = _load(CENTRAL_COMPOSE)["services"][service]["ports"]
+
+    assert published, f"{service} publishes no host port"
+    assert all(str(entry).startswith(f"${{{variable}:-") for entry in published)
+
+
+@pytest.mark.parametrize(
+    ("service", "variable"),
+    [("postgres", "POSTGRES_BIND_HOST"), ("inngest", "INNGEST_BIND_HOST")],
+)
+def test_the_central_services_stay_on_loopback_by_default(
+    service: str, variable: str
+) -> None:
+    """Opening them is a fleet decision an operator makes explicitly: Postgres
+    answers to real credentials and the Inngest dashboard has no auth at all,
+    so a single-host stack must not expose either by default."""
+    published = _load(CENTRAL_COMPOSE)["services"][service]["ports"]
+
+    for entry in published:
+        assert str(entry).startswith(f"${{{variable}:-127.0.0.1}}")
+
+
+def test_the_node_example_says_the_central_side_must_be_opened_first() -> None:
+    """The node values are useless until the central host binds these, and
+    that is the step most likely to be missed."""
+    text = NODE_ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    assert "POSTGRES_BIND_HOST" in text
+    assert "INNGEST_BIND_HOST" in text
