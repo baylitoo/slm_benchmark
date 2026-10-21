@@ -1086,7 +1086,7 @@ class ModelCatalog:
             row = self._placement_row_for_model(session, model_name)
             return _placement_view(row) if row is not None else None
 
-    def list_placements_for_model(self, model_name: str) -> list[dict[str, Any]]:
+    def list_placements_for_model(self, model_name: str) -> Sequence[dict[str, Any]]:
         """ALL placements serving store model ``model_name`` (its scaled
         replicas), freshest first. The load-balancing resolver picks one live
         replica per request; a single-instance model returns one row exactly as
