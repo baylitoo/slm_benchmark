@@ -526,6 +526,7 @@ def test_sizing_endpoint_serves_fit_table_from_observed_surface() -> None:
 
     _seed_store("small", 2 * GIB)
     ModelCatalog().publish_node_snapshot(
+        node_id="testnode",
         total_bytes=16 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=0
     )
 
@@ -585,6 +586,7 @@ def test_whatif_endpoint_matches_the_fit_table_math() -> None:
 
     _seed_store("small", 2 * GIB)
     ModelCatalog().publish_node_snapshot(
+        node_id="testnode",
         total_bytes=16 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=0
     )
     margin = int(16 * GIB * 0.10)
@@ -617,6 +619,7 @@ def test_whatif_endpoint_accepts_and_threads_n_parallel() -> None:
 
     _seed_store("small", 2 * GIB)
     ModelCatalog().publish_node_snapshot(
+        node_id="testnode",
         total_bytes=16 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=0
     )
     margin = int(16 * GIB * 0.10)
@@ -666,11 +669,12 @@ def test_sizing_and_resources_flag_a_stale_snapshot_as_unavailable() -> None:
         serving_sizing,
         snapshot_stale_after_s,
     )
-    from docie_bench.serving.catalog import SERVING_NODE_ROW_ID, ModelCatalog, ServingNode
+    from docie_bench.serving.catalog import ModelCatalog, ServingNode
     from docie_bench.storage.db import session_scope
 
     _seed_store("small", 2 * GIB)
     ModelCatalog().publish_node_snapshot(
+        node_id="testnode",
         total_bytes=16 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=0
     )
     # Age the published stamp past the gate (the reconciler "died" 10x ago).
@@ -679,7 +683,7 @@ def test_sizing_and_resources_flag_a_stale_snapshot_as_unavailable() -> None:
     )
     with session_scope() as session:
         assert session is not None
-        row = session.get(ServingNode, SERVING_NODE_ROW_ID)
+        row = session.get(ServingNode, "testnode")
         assert row is not None
         row.updated_at = aged
 
@@ -708,6 +712,7 @@ def test_sizing_endpoint_reserves_loading_placements() -> None:
     _seed_store("small", 2 * GIB)
     catalog = ModelCatalog()
     catalog.publish_node_snapshot(
+        node_id="testnode",
         total_bytes=16 * GIB, free_bytes=6 * GIB, source="cgroup", sum_rss_bytes=GIB
     )
     catalog.publish_observed(

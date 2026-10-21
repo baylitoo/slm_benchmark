@@ -623,17 +623,24 @@ class ResourceTracker:
 
 
 def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
-    """Default snapshot publisher: single-row upsert, best-effort, DB-optional.
+    """Default snapshot publisher: per-node upsert, best-effort, DB-optional.
 
     With no ``DATABASE_URL`` (or a DB hiccup) the publish is SKIPPED and the
     cycle goes on — the repair loop must never depend on Postgres (design doc
     fix #8); the api then reports the observed surface as unavailable instead
     of serving a stale number.
+
+    This is the only path that resolves the node id, which is why it is also the
+    only path that may generate one: ``serving_home()`` is shared with the api
+    container, and an api-role process minting an id there would give one
+    machine two identities (#529).
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.node_identity import resolve_node_id
 
     try:
         ModelCatalog().publish_node_snapshot(
+            node_id=resolve_node_id(),
             total_bytes=snapshot.total_bytes,
             free_bytes=snapshot.free_bytes,
             source=snapshot.source,

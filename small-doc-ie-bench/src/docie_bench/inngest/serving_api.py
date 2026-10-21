@@ -234,16 +234,27 @@ async def serving_resources() -> dict[str, Any]:
     node: dict[str, Any] | None = None
     deployments: list[dict[str, Any]] = []
     detail: str | None = None
+    node_count = 0
     try:
         catalog = ModelCatalog()
-        node = catalog.get_node_snapshot()
-        if node is None:
+        # Every node that has published, newest measurement first. Reading the
+        # list rather than "the" snapshot is what keeps this view honest once a
+        # second node reports: it describes ONE machine, and says which.
+        snapshots = catalog.list_node_snapshots()
+        node_count = len(snapshots)
+        if not snapshots:
             detail = (
                 "no capacity measurement published yet — is the serving "
                 "service running?"
             )
         else:
-            node, detail = _gate_snapshot_staleness(node)
+            node, detail = _gate_snapshot_staleness(snapshots[0])
+            if node is not None and node_count > 1:
+                detail = (
+                    f"showing node {node['node_id']}; {node_count} nodes are "
+                    f"publishing capacity — these numbers describe that one "
+                    f"node, not the fleet total"
+                )
         deployments = [
             {
                 "name": placement["name"],
@@ -260,6 +271,9 @@ async def serving_resources() -> dict[str, Any]:
         "observed_available": node is not None,
         "source": node["source"] if node is not None else None,
         "node": node,
+        # How many nodes published a snapshot, so the UI can show that `node`
+        # is one of several instead of implying it is the whole capacity.
+        "node_count": node_count,
         "deployments": deployments,
         "detail": detail,
     }
@@ -292,18 +306,33 @@ def _sizing_inputs() -> tuple[
     (staleness gate above) keeps the store list (footprints still price) and
     lets the engine mark fits unknown — never a fit computed against a dead
     reconciler's last number.
+
+    With several nodes publishing, the snapshot is likewise withheld: a fit
+    priced against one arbitrary node's free RAM is the guess #529 removes, and
+    it would refuse a plan that fits elsewhere in the fleet. Pricing resumes
+    once a deploy names its target node (placement ownership, #527 §5.C).
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
     try:
         catalog = ModelCatalog()
         models = catalog.list()
-        snapshot = catalog.get_node_snapshot()
+        snapshots = catalog.list_node_snapshots()
         placements = list(catalog.list_placements())
     except CatalogUnavailableError:
         return [], None, [], "observed state unavailable: DATABASE_URL is not configured"
     except Exception:  # noqa: BLE001 - a DB hiccup must not 500 the Sizing tab
         return [], None, [], "observed state unavailable: database error"
+    if len(snapshots) > 1:
+        return (
+            models,
+            None,
+            placements,
+            f"{len(snapshots)} serving nodes are publishing capacity; a fit "
+            f"cannot be priced against one of them without knowing which node "
+            f"a deploy would land on",
+        )
+    snapshot = snapshots[0] if snapshots else None
     if snapshot is None:
         return (
             models,
