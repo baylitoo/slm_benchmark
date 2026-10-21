@@ -531,14 +531,20 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      # Bound to loopback only (127.0.0.1): still reachable from the host
-      # machine for `psql`/migrations/debugging, but not from the LAN or
-      # internet — containers reach it as `postgres:5432` over the compose
-      # network regardless of this binding. Override if you already run
-      # Postgres on 5432: set POSTGRES_PORT=5433. If you have a real need for
-      # Postgres to be reachable from other hosts, change the host binding
-      # below explicitly and make sure POSTGRES_PASSWORD is strong first.
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+      # Loopback by default (127.0.0.1): still reachable from the host machine
+      # for `psql`/migrations/debugging, but not from the LAN or internet —
+      # containers reach it as `postgres:5432` over the compose network
+      # regardless of this binding. Override if you already run Postgres on
+      # 5432: set POSTGRES_PORT=5433.
+      #
+      # A REMOTE serving node (docker-compose.serving-node.yml) connects to
+      # this database over the private network, so a fleet must set
+      # POSTGRES_BIND_HOST to the central host's private-network address. Same
+      # knob and same default as INNGEST_BIND_HOST above. Set it to that one
+      # address, never 0.0.0.0, and make sure POSTGRES_PASSWORD is strong
+      # first — these are real credentials on a port that answers to anyone
+      # who can reach it.
+      - "${POSTGRES_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       # `/docker-entrypoint-initdb.d` only runs while initializing an empty
       # data directory. A restored/pre-existing volume (or a deployment host
