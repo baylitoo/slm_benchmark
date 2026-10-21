@@ -22,7 +22,6 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +33,17 @@ from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
 from docie_bench.serving.failure import classify_failure
+from docie_bench.serving.node_liveness import (
+    SNAPSHOT_STALE_FLOOR_S as _SNAPSHOT_STALE_FLOOR_S,
+)
+from docie_bench.serving.node_liveness import (
+    SNAPSHOT_STALE_INTERVALS as _SNAPSHOT_STALE_INTERVALS,
+)
+from docie_bench.serving.node_liveness import (
+    reconcile_interval_s,
+    snapshot_age_s,
+    snapshot_stale_after_s,
+)
 from docie_bench.serving.paths import serving_home
 from docie_bench.settings import get_settings
 
@@ -57,44 +67,16 @@ PIN_EVENT = "serving/pin.requested"
 # endpoint just fans out one deploy event per new replica name.
 DEPLOY_EVENT = "serving/deploy.requested"
 
-# Snapshot-staleness gate: a published node snapshot is only trusted while it
-# is at most this many reconcile intervals old. If the serving reconciler dies,
-# its last snapshot must NOT keep backing "observed_available: true" sizing
-# forever — /resources promises "never a stale number", and that promise has to
-# cover the reconciler-died case, not just the never-published one.
-SNAPSHOT_STALE_INTERVALS = 3.0
-# Floor so a very short dev interval (e.g. 1s) does not flap the gate on one
-# slow DB round-trip.
-SNAPSHOT_STALE_FLOOR_S = 30.0
-
-
-def _reconcile_interval_s() -> float:
-    """The reconciler's cycle interval — same env knob worker.py reads."""
-    try:
-        interval = float(os.getenv("DOCIE_SERVING_RECONCILE_INTERVAL", "10"))
-    except ValueError:
-        return 10.0
-    return interval if interval > 0 else 10.0
-
-
-def snapshot_stale_after_s() -> float:
-    return max(SNAPSHOT_STALE_INTERVALS * _reconcile_interval_s(), SNAPSHOT_STALE_FLOOR_S)
-
-
-def _snapshot_age_s(snapshot: Mapping[str, Any], *, now: dt.datetime | None = None) -> float | None:
-    """Seconds since the snapshot's ``updated_at`` (None when unparseable)."""
-    raw = snapshot.get("updated_at")
-    if not raw:
-        return None
-    try:
-        stamp = dt.datetime.fromisoformat(str(raw))
-    except ValueError:
-        return None
-    if stamp.tzinfo is None:
-        # sqlite round-trips the reconciler's UTC stamp as a naive datetime.
-        stamp = stamp.replace(tzinfo=dt.UTC)
-    current = now if now is not None else dt.datetime.now(dt.UTC)
-    return (current - stamp).total_seconds()
+# The snapshot-staleness gate now lives in serving/node_liveness.py, so the
+# router can apply the SAME definition of "this node is still reporting" when
+# deciding whether its placements should keep receiving traffic (#531). Two
+# definitions of reporting would drift, and the capacity view and the router
+# disagreeing about whether a node is alive is the worst version of that.
+# Re-exported under the original names: these are this module's public surface.
+SNAPSHOT_STALE_FLOOR_S = _SNAPSHOT_STALE_FLOOR_S
+SNAPSHOT_STALE_INTERVALS = _SNAPSHOT_STALE_INTERVALS
+_reconcile_interval_s = reconcile_interval_s
+_snapshot_age_s = snapshot_age_s
 
 
 def _gate_snapshot_staleness(

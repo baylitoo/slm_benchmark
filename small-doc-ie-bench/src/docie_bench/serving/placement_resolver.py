@@ -34,6 +34,7 @@ from typing import Any
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 from docie_bench.serving.model_store import FAMILIES, FamilyContract, TemplateDelivery
+from docie_bench.serving.node_liveness import stale_node_ids
 from docie_bench.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -329,6 +330,62 @@ def _read_catalog(
     return entry, placements, False
 
 
+def _nodes_that_stopped_reporting(catalog: ModelCatalog) -> frozenset[str]:
+    """Node ids that published a capacity snapshot before and have stopped.
+
+    Best-effort: an unreadable node table returns the empty set, so routing is
+    never withheld because liveness could not be established.
+    """
+    try:
+        return stale_node_ids(catalog.list_node_snapshots())
+    except Exception:  # noqa: BLE001 - liveness is advisory, never a gate on routing
+        logger.debug("could not read node snapshots for liveness", exc_info=True)
+        return frozenset()
+
+
+def _prefer_live_nodes(
+    name: str, live: list[dict[str, Any]], catalog: ModelCatalog
+) -> list[dict[str, Any]]:
+    """Drop candidates whose owning node stopped reporting (#531).
+
+    A node that is switched off stops republishing, and nothing else expires
+    what it left behind: its rows stay ``ready`` with a live-looking endpoint,
+    so the rotation keeps handing it a share of traffic forever.
+
+    DEMOTION, NOT EXCLUSION. If every candidate is on a node that stopped
+    reporting, all of them are kept and the request is attempted anyway. A
+    stale snapshot proves the *reconciler* stopped publishing, which is not the
+    same as the runtime being gone -- a crashed reconciler leaves llama-server
+    serving, and #527 requires that an already-running model keep serving. So
+    staleness is only ever used to prefer a better replica, never to refuse the
+    only one. Where it bites is exactly the case #531 is about: a replica on a
+    live node exists, and traffic should stop going to the dead machine.
+
+    Rows with no ``node_id`` (written before ownership was tracked) are never
+    demoted -- their owner is unknown, not dead.
+    """
+    stale = _nodes_that_stopped_reporting(catalog)
+    if not stale:
+        return live
+    on_live_nodes = [
+        candidate for candidate in live if str(candidate.get("node_id") or "") not in stale
+    ]
+    if not on_live_nodes:
+        logger.warning(
+            "every live placement of %r is on a node that stopped reporting; "
+            "routing to it anyway rather than refusing",
+            name,
+        )
+        return live
+    if len(on_live_nodes) != len(live):
+        logger.info(
+            "dropped %d placement(s) of %r on nodes that stopped reporting",
+            len(live) - len(on_live_nodes),
+            name,
+        )
+    return on_live_nodes
+
+
 def resolve_store_profile(
     name: str,
     *,
@@ -384,6 +441,11 @@ def resolve_store_profile(
             f"store model {name!r} placement advertises no live endpoint — "
             f"wait for the deploy/reload to finish or redeploy."
         )
+    if not from_cache:
+        # Only on the fresh path: the cached path has no node table to read,
+        # and withholding routing during a catalog outage is the failure #532
+        # removed.
+        live = _prefer_live_nodes(name, live, catalog)
     if len(live) == 1:
         placement = live[0]
     elif chooser is not None:
