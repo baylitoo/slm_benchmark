@@ -151,7 +151,10 @@ def test_deploy_replicas_fans_out_one_event_per_instance(
     response = _deploy({"model": MODEL, "replicas": 3})
 
     names = [e.data["deployment_name"] for e in captured_events]
-    assert names == [MODEL, f"{MODEL}-2", f"{MODEL}-3"]
+    # Minted, so assert the shape rather than exact names (#530).
+    assert len(names) == 3
+    assert len(set(names)) == 3
+    assert all(n.startswith(f"{MODEL}-") for n in names)
     assert all(e.name == "serving/deploy.requested" for e in captured_events)
     assert all(e.data["model"] == MODEL for e in captured_events)
     # One shared progress channel; one event id per replica.
@@ -171,7 +174,9 @@ def test_deploy_replicas_tops_up_existing_instances(
 
     _deploy({"model": MODEL, "replicas": 3})
 
-    assert [e.data["deployment_name"] for e in captured_events] == [f"{MODEL}-3"]
+    added = [e.data["deployment_name"] for e in captured_events]
+    assert len(added) == 1
+    assert added[0].startswith(f"{MODEL}-")
 
 
 def test_deploy_replicas_rejects_explicit_runtime(
@@ -396,7 +401,8 @@ def test_scale_up_admits_when_budget_fits(
     )
 
     result = _scale(MODEL, 2)
-    assert result["adding"] == [MODEL, f"{MODEL}-2"]
+    assert len(result["adding"]) == 2
+    assert all(str(name).startswith(f"{MODEL}-") for name in result["adding"])
     assert len(captured_events) == 2
 
 
@@ -413,7 +419,7 @@ def test_scale_up_ram_gate_scales_with_n_parallel(
     )
 
     result = _scale(MODEL, 1, n_parallel=1)
-    assert result["adding"] == [MODEL]
+    assert len(result["adding"]) == 1
 
     with pytest.raises(HTTPException) as excinfo:
         _scale(MODEL, 1, n_parallel=2)
@@ -428,7 +434,8 @@ def test_scale_admission_fails_open_without_snapshot(
     _no_sizing(monkeypatch)
 
     result = _scale(MODEL, 2)
-    assert result["adding"] == [MODEL, f"{MODEL}-2"]
+    assert len(result["adding"]) == 2
+    assert all(str(name).startswith(f"{MODEL}-") for name in result["adding"])
     assert len(captured_events) == 2
 
 
@@ -491,7 +498,7 @@ def test_replica_names_to_remove_orders_and_bounds() -> None:
     assert replica_names_to_remove(MODEL, existing, 16) == []
     # Mirror sanity: add/remove agree on what a replica of MODEL is (three
     # exist — MODEL, -2, -5 — so target 4 fills the first free slot).
-    assert replica_names_to_add(MODEL, existing, 4) == [f"{MODEL}-3"]
+    assert len(replica_names_to_add(MODEL, existing, 4)) == 1
 
 
 # ── round-robin routing across live replicas ────────────────────────────────

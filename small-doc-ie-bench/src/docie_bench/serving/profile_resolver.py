@@ -46,6 +46,7 @@ from docie_bench.serving.model_store import FAMILIES
 from docie_bench.serving.paths import serving_home
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
+    PlacementError,
     resolve_store_profile,
 )
 from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
@@ -406,6 +407,30 @@ def _profile_from_placement(
     )
 
 
+def _profile_for_model_name(name: str, *, session_id: str | None) -> ModelProfile | None:
+    """Resolve ``name`` as a store MODEL rather than a deployment record.
+
+    Record names are minted since #530, so a model's own name is no longer the
+    name of its first deployment. A caller naming the model therefore means
+    "whichever replica is live", which is exactly what ``store:`` resolution
+    answers -- load-balanced, session-affine, node-liveness aware, and backed
+    by the last-known-good cache. This keeps ``deployment=<model>`` and a bare
+    ``<model>`` working after minting, without them meaning "this one exact
+    instance", which for a minted name is no longer something a caller could
+    have known.
+
+    Returns None when ``name`` is not a store model with a live placement, so
+    the caller's own refusal still applies.
+    """
+    try:
+        return resolve_store_profile(name, session_id=session_id)
+    except PlacementError:
+        return None
+    except Exception:  # noqa: BLE001 - a lookup must not mask the real refusal
+        logger.debug("store-model fallback failed for %r", name, exc_info=True)
+        return None
+
+
 def _profiles_on_other_nodes(
     known: Collection[str], yaml_profiles: dict[str, ModelProfile]
 ) -> dict[str, ModelProfile]:
@@ -489,12 +514,19 @@ def resolve_extraction_profile(
         if record is None:
             # Not on this node's disk -- it may be running on another (#562).
             remote = _profiles_on_other_nodes({}, yaml_profiles).get(deployment)
-            if remote is None:
-                raise ProfileResolutionError(
-                    f"deployment {deployment!r} is not a live (ready) deployment"
-                )
-            _record_activity_if_cataloged(deployment)
-            return remote
+            if remote is not None:
+                _record_activity_if_cataloged(deployment)
+                return remote
+            # Not a record name at all. Since #530 mints record names, the
+            # model's own name is no longer one of them -- so a caller naming
+            # the MODEL means "a live deployment of this", which is what
+            # store: resolution answers (load-balanced, session-affine).
+            by_model = _profile_for_model_name(deployment, session_id=session_id)
+            if by_model is not None:
+                return by_model
+            raise ProfileResolutionError(
+                f"deployment {deployment!r} is not a live (ready) deployment"
+            )
         _record_activity_if_cataloged(deployment)
         return _synthesize_profile(record, yaml_profiles)
 
@@ -517,6 +549,12 @@ def resolve_extraction_profile(
         try:
             resolved = gateway_resolve_profile(model_profile, table)
         except GatewayRoutingError as exc:
+            # Same fallback as the `deployment=` route: the name may be a store
+            # MODEL rather than a record, which since #530 is the normal way to
+            # address "whatever replica is live" (#562).
+            by_model = _profile_for_model_name(model_profile, session_id=session_id)
+            if by_model is not None:
+                return by_model
             raise ProfileResolutionError(exc.message) from exc
         if model_profile in live:
             _record_activity_if_cataloged(model_profile)
