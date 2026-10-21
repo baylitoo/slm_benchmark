@@ -26,13 +26,15 @@ import hashlib
 import ipaddress
 import logging
 import threading
+import time
 import urllib.parse
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from docie_bench.llm.model_profiles import ModelProfile
-from docie_bench.serving.catalog import ModelCatalog
+from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 from docie_bench.serving.model_store import FAMILIES, FamilyContract, TemplateDelivery
+from docie_bench.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +225,110 @@ def _record_activity_best_effort(name: str, catalog: ModelCatalog) -> None:
         logger.debug("model-activity bump failed for %r", name, exc_info=True)
 
 
+# Last-known-good catalog reads, so an unreachable catalog does not make a
+# running model unroutable (#532). Keyed by store model name; holds the store
+# entry and its placement rows, which are the two reads resolution needs.
+#
+# Process-local, like the round-robin counter. Unlike session affinity -- where
+# a process-local map defeated the feature outright -- that is sufficient here:
+# any process that has resolved this model once can keep resolving it, and
+# under steady traffic every replica warms within a few requests. A shared
+# cache would need Redis on the resolution path to protect against an outage of
+# the other datastore, which is a worse trade than a cold process failing
+# honestly.
+_RESOLUTION_CACHE_LOCK = threading.Lock()
+_RESOLUTION_CACHE: dict[str, tuple[float, dict[str, Any], list[dict[str, Any]]]] = {}
+
+
+def _cache_resolution(
+    name: str, entry: dict[str, Any], placements: list[dict[str, Any]]
+) -> None:
+    """Remember a SUCCESSFUL read, and prune expired entries while here.
+
+    Pruning on write rather than never: the session-affinity map grew one entry
+    per session forever, and this cache has the same shape. Bounded by the
+    number of distinct store models actually routed to, which is small, and the
+    prune keeps it to the ones routed to recently.
+    """
+    ttl = get_settings().serving_placement_cache_ttl_seconds
+    if ttl <= 0:
+        return
+    now = time.monotonic()
+    with _RESOLUTION_CACHE_LOCK:
+        _RESOLUTION_CACHE[name] = (now, entry, placements)
+        for cached_name, (stamped, _entry, _rows) in list(_RESOLUTION_CACHE.items()):
+            if now - stamped > ttl:
+                del _RESOLUTION_CACHE[cached_name]
+
+
+def _cached_resolution(
+    name: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """The last-known-good read for ``name``, or None when absent or expired."""
+    ttl = get_settings().serving_placement_cache_ttl_seconds
+    if ttl <= 0:
+        return None
+    with _RESOLUTION_CACHE_LOCK:
+        cached = _RESOLUTION_CACHE.get(name)
+        if cached is None:
+            return None
+        stamped, entry, placements = cached
+        if time.monotonic() - stamped > ttl:
+            del _RESOLUTION_CACHE[name]
+            return None
+    return entry, placements
+
+
+def _read_catalog(
+    name: str, catalog: ModelCatalog
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    """``(entry, placements, from_cache)`` for ``name``.
+
+    A successful read always wins and refreshes the cache; the cache is only
+    consulted when the catalog cannot answer. The ABSENCE of a model is never
+    cached -- a model that was unknown during an outage must not be remembered
+    as unknown once the catalog returns.
+    """
+    try:
+        entry = catalog.get(name)
+        placements = list(catalog.list_placements_for_model(name))
+    except CatalogUnavailableError:
+        cached = _cached_resolution(name)
+        if cached is None:
+            raise PlacementNotFoundError(
+                f"store model {name!r} cannot be resolved: the model catalog is "
+                f"unreachable (DATABASE_URL is not configured) and this model has "
+                f"not been resolved recently, so there is no last-known-good "
+                f"placement to fall back on."
+            ) from None
+        logger.warning(
+            "catalog unavailable: resolving %r from last-known-good placements", name
+        )
+        return cached[0], cached[1], True
+    except Exception:  # noqa: BLE001 - a DB hiccup must not unroute a live model
+        cached = _cached_resolution(name)
+        if cached is None:
+            raise PlacementNotFoundError(
+                f"store model {name!r} cannot be resolved: the model catalog read "
+                f"failed and this model has not been resolved recently, so there "
+                f"is no last-known-good placement to fall back on."
+            ) from None
+        logger.warning(
+            "catalog read failed: resolving %r from last-known-good placements",
+            name,
+            exc_info=True,
+        )
+        return cached[0], cached[1], True
+    if entry is None:
+        raise PlacementNotFoundError(
+            f"store model {name!r} is not in the catalog; seed it first"
+        )
+    if placements:
+        # Only a complete, positive read is worth remembering.
+        _cache_resolution(name, entry, placements)
+    return entry, placements, False
+
+
 def resolve_store_profile(
     name: str,
     *,
@@ -257,12 +363,7 @@ def resolve_store_profile(
     ``CatalogUnavailableError`` when DATABASE_URL is not configured.
     """
     catalog = catalog if catalog is not None else ModelCatalog()
-    entry = catalog.get(name)
-    if entry is None:
-        raise PlacementNotFoundError(
-            f"store model {name!r} is not in the catalog; seed it first"
-        )
-    placements = catalog.list_placements_for_model(name)
+    entry, placements, from_cache = _read_catalog(name, catalog)
     if not placements:
         raise PlacementNotFoundError(
             f"No live placement for store model {name!r}. Deploy it first "
@@ -291,7 +392,10 @@ def resolve_store_profile(
         placement = session_affinity_choice(session_id, name, live)
     else:
         placement = round_robin_choice(name, live)
-    _record_activity_best_effort(name, catalog)
+    if not from_cache:
+        # Activity tracking is a catalog WRITE; with the catalog unreachable it
+        # would only log another failure for a request that resolved fine.
+        _record_activity_best_effort(name, catalog)
     contract = FAMILIES.get(str(entry.get("family") or ""))
     engine = str(placement.get("engine") or "")
     return ModelProfile(
