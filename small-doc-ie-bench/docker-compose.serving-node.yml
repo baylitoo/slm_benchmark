@@ -1,0 +1,116 @@
+# A REMOTE serving node: one container, nothing else (milestone #4, #538).
+#
+# The central stack (docker-compose.yml) keeps Postgres, Inngest, Redis, the
+# api, the web UI and the scaled `worker`. A serving node adds capacity and
+# runs ONLY the serving role: deploy/seed/delete lifecycle, the reconciler, and
+# the llama-server / encoder runtimes those deploys launch.
+#
+#   docker compose -f docker-compose.serving-node.yml up -d
+#
+# The node reads one `.env`, same as the central stack. Copy the central `.env`
+# so every application setting matches, then append the node block from
+# `.env.serving-node.example` and correct the values it marks.
+#
+# Four of them have NO default and the stack refuses to start without them,
+# because every one silently misroutes or over-exposes if guessed:
+#
+#   DOCIE_DB_HOST                    central Postgres, reachable from here
+#   DOCIE_SERVING_ADVERTISE_HOST     THIS node's address as the central api sees it
+#   DOCIE_SERVING_PUBLISH_IP         the interface the runtime ports bind on
+#   POSTGRES_PASSWORD                same as the central stack
+#
+# Everything the serving role reads from Postgres (the model catalog, observed
+# placements) and from Inngest (lifecycle events) travels over the network, so
+# this file mounts no shared storage: `data`, `runs`, `annotations` and
+# `artifact-store` are benchmark/worker surfaces the serving role never writes.
+
+services:
+  serving:
+    # Prefer a published image: this build compiles llama.cpp and installs the
+    # encoder + embedding extras, which is a long build to repeat on every
+    # machine in the fleet. Point DOCIE_SERVING_IMAGE at a registry tag to skip
+    # it; the build stanza stays as the local fallback.
+    image: ${DOCIE_SERVING_IMAGE:-docie-serving:local}
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+      args:
+        # Must match the central `serving` service: encoder deployments spawn
+        # INSIDE this container and need the analyzer library.
+        PIP_EXTRAS: "ocr,encoders"
+        INSTALL_EMBEDDINGS: "true"
+        LLAMA_REF: ${LLAMA_REF:-}
+    env_file: .env
+    mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
+    environment:
+      # Central Postgres over the private network. Only the HOST differs from
+      # the central stack's own value -- user, port and database name are the
+      # same, and the password must be identical.
+      DATABASE_URL: postgresql+psycopg://docie:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in your node .env (the SAME value as the central stack)}@${DOCIE_DB_HOST:?set DOCIE_DB_HOST to the central Postgres address reachable from this node (not "postgres", which only resolves inside the central compose network)}:${DOCIE_DB_PORT:-5432}/docie
+
+      # Lifecycle + reconciler only. Extraction and benchmark functions stay on
+      # the central `worker`; this node registers the serving app alone.
+      DOCIE_WORKER_ROLE: serving
+
+      # Node-local state: desired state (deployments.json), the GGUF blob store
+      # and this node's id all live here. NEVER share this volume between
+      # machines -- two nodes would fight over one deployments.json and adopt
+      # each other's identity.
+      DOCIE_SERVING_HOME: /app/.serving
+
+      # Optional readable name for this node; generated and persisted in
+      # DOCIE_SERVING_HOME when unset. Must be unique across the fleet.
+      DOCIE_SERVING_NODE_ID: ${DOCIE_SERVING_NODE_ID:-}
+
+      # THE value to get right. Every deploy records its endpoint as
+      # http://{this}:{port}/v1, and the central api resolves that string in
+      # ITS network -- so a compose service name like `serving` resolves there
+      # to the central node's own container, and requests for this node's
+      # models land on the wrong machine (#538). No default: a wrong value here
+      # fails as a wrong answer, not as an error.
+      DOCIE_SERVING_ADVERTISE_HOST: ${DOCIE_SERVING_ADVERTISE_HOST:?set DOCIE_SERVING_ADVERTISE_HOST to THIS node's address as the central api reaches it (e.g. its WireGuard IP) -- never a compose service name}
+
+      # All interfaces INSIDE the container; what the host exposes is decided by
+      # the `ports` binding below, not here.
+      DOCIE_SERVING_BIND_HOST: 0.0.0.0
+
+      # The window deploys allocate from. Published below as the same range, so
+      # these two can never disagree -- a deploy landing on an unpublished port
+      # would record an endpoint nothing can reach. Narrower than the code
+      # default (8088-8188) because Docker runs one proxy per published port.
+      # Nodes do NOT need disjoint windows: the recorded endpoint carries the
+      # host, so each node may use the same ports on its own address.
+      DOCIE_SERVING_PORT_RANGE_START: ${DOCIE_SERVING_PORT_RANGE_START:-8088}
+      DOCIE_SERVING_PORT_RANGE_END: ${DOCIE_SERVING_PORT_RANGE_END:-8107}
+
+      DOCIE_SERVING_RECONCILE_INTERVAL: ${DOCIE_SERVING_RECONCILE_INTERVAL:-10}
+    ports:
+      # Bound to ONE explicit interface, not 0.0.0.0. A deployed runtime has no
+      # authentication of its own -- the api gateway in front of it is what
+      # carries the key -- so publishing these on a public interface would hand
+      # anyone who can reach the host a free, unmetered inference endpoint.
+      # Point DOCIE_SERVING_PUBLISH_IP at the private-network address the
+      # central api uses, which is normally the same address as
+      # DOCIE_SERVING_ADVERTISE_HOST.
+      - "${DOCIE_SERVING_PUBLISH_IP:?set DOCIE_SERVING_PUBLISH_IP to this node's private-network address -- deployed runtimes are unauthenticated and must not be published on a public interface}:${DOCIE_SERVING_PORT_RANGE_START:-8088}-${DOCIE_SERVING_PORT_RANGE_END:-8107}:${DOCIE_SERVING_PORT_RANGE_START:-8088}-${DOCIE_SERVING_PORT_RANGE_END:-8107}"
+    # No depends_on: Postgres and Inngest live on the central host. The
+    # reconciler already tolerates a missing database (it skips the publish and
+    # keeps repairing), and the Inngest Connect worker reconnects on its own, so
+    # this node may boot before the central stack is reachable.
+    restart: unless-stopped
+    volumes:
+      # Same model definitions as the central stack -- keep this copy in sync.
+      - ./configs:/app/configs:ro
+      # Node-local. Not shareable: see DOCIE_SERVING_HOME above.
+      - serving-state:/app/.serving
+      - ocr-cache:/app/.cache/ocr
+      - hf-cache:/root/.cache/huggingface
+      # Optional: host Ollama blobs, so seed-from-ollama can import an existing
+      # GGUF instead of re-downloading it on this machine.
+      - ${OLLAMA_MODELS_HOST:-/root/.ollama/models}:/root/.ollama/models:ro
+    command: ["docie-worker"]
+
+volumes:
+  serving-state:
+  ocr-cache:
+  hf-cache:

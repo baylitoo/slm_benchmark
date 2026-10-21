@@ -256,3 +256,39 @@ The control plane is single-node; the `store:` data plane is not. Extending to
 several serving nodes is tracked in the distributed-serving issue, which also
 records why a separate manager service was rejected — the placement table is
 already the registry such a service would have had to invent.
+
+### What a second node runs
+
+`docker-compose.serving-node.yml` deploys one container and nothing else: the
+serving role, its reconciler, and the runtimes its deploys launch. Postgres,
+Inngest, Redis, the api, the web UI and the scaled `worker` all stay central
+and are reached over the network, so a node mounts no shared storage — `data`,
+`runs`, `annotations` and `artifact-store` are worker surfaces the serving role
+never writes.
+
+Start from `.env.serving-node.example`, which is a delta to append to a copy of
+the central `.env`. Four values have no default and compose refuses to start
+without them, because each one fails silently rather than loudly:
+
+| Value | What goes wrong when it is guessed |
+|---|---|
+| `DOCIE_SERVING_ADVERTISE_HOST` | every deploy records `http://{this}:{port}/v1`, and the central api resolves that string in **its own** network. A compose service name resolves there to the central container, so a request for this node's model is answered by whatever holds the same port — HTTP 200, wrong model. |
+| `DOCIE_SERVING_PUBLISH_IP` | a deployed runtime carries no authentication of its own; the api gateway in front of it holds the key. Published on a public interface, the window is free inference for anyone who can reach the host. |
+| `DOCIE_DB_HOST` | `postgres` resolves only inside the central compose network. A node left at that default writes placements nowhere the api can read them. |
+| `POSTGRES_PASSWORD` | the node connects to the central database; it does not run one. |
+
+The port window (`DOCIE_SERVING_PORT_RANGE_START`/`_END`) is both what deploys
+allocate from and what the compose file publishes, driven by the same two
+variables so they cannot disagree — a runtime on an unpublished port would
+record an endpoint nothing can reach. Nodes do **not** need disjoint windows:
+the recorded endpoint carries the host, so each node may use the same ports on
+its own address.
+
+Inngest Connect is outbound, so a node needs no inbound reachability for job
+delivery — only the two Inngest endpoints and Postgres. The only inbound
+traffic is the central api calling the runtime ports.
+
+Each node's capacity row is keyed by its own node id, generated on first
+publish and persisted in `DOCIE_SERVING_HOME` beside `deployments.json`. That
+volume is node-local by construction: two machines sharing it would fight over
+one `deployments.json` and adopt each other's identity.
