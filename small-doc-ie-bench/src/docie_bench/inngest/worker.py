@@ -152,7 +152,37 @@ def _build_reconciler(instance_id: str) -> Any:
         # Port-collision self-healing: redeploy on a reallocated port when a
         # respawn keeps dying on EADDRINUSE (orphan process holding the port).
         repair=control_plane.supervisor.repair,
+        # Desired-state starts (#535): the control plane's own deploy path, so
+        # the repair loop does not reimplement store lookup, port allocation
+        # and readiness. Only ever reached for rows tagged with THIS node.
+        deployer=_desired_state_deployer(control_plane),
     )
+
+
+def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]], object]:
+    """Adapt the control plane's deploy path to the reconciler's start hook.
+
+    The desired row's ``spec`` carries the intent the central side recorded;
+    anything it omits falls back to the deploy path's own defaults rather than
+    being guessed here.
+    """
+
+    def deploy(name: str, spec: dict[str, Any]) -> object:
+        model = str(spec.get("model") or name)
+        port = spec.get("port")
+        context_length = spec.get("context_length")
+        return asyncio.run(
+            control_plane.up(
+                model,
+                port=int(port) if isinstance(port, int) else None,
+                context_length=(
+                    int(context_length) if isinstance(context_length, int) else None
+                ),
+                deployment_name=name,
+            )
+        )
+
+    return deploy
 
 
 # How often a replica that found the lease HELD retries claiming it. A held

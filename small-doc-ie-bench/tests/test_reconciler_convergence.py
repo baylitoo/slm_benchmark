@@ -71,6 +71,9 @@ def _converge(supervisor: _FakeSupervisor) -> object:
 
     reconciler = ServingReconciler.__new__(ServingReconciler)
     reconciler.supervisor = supervisor  # type: ignore[attr-defined]
+    # __new__ skips __init__, so set what convergence reads. No deployer: these
+    # cases are about stops, removals and the decisions, not starts.
+    reconciler._deployer = None  # type: ignore[attr-defined]
     return reconciler._converge_desired_state()
 
 
@@ -229,3 +232,101 @@ def test_one_failing_action_does_not_stall_the_rest(
     _converge(supervisor)
 
     assert supervisor.removed == ["good"]
+
+
+# --- starts (#535) -------------------------------------------------------
+
+
+def _converge_with_deployer(
+    supervisor: _FakeSupervisor, started: list[tuple[str, dict[str, object]]]
+) -> object:
+    from docie_bench.serving.reconciler import ServingReconciler
+
+    reconciler = ServingReconciler.__new__(ServingReconciler)
+    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
+    reconciler._deployer = lambda name, spec: started.append((name, spec))  # type: ignore[attr-defined]
+    return reconciler._converge_desired_state()
+
+
+def test_a_desired_deployment_is_started_with_its_recorded_spec(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spec is the intent the central side recorded; the node must pass it
+    through rather than guess a port or context length of its own."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    ModelCatalog().set_desired_deployment(
+        NODE,
+        "lfm2.5-350m-ovh-02",
+        desired_state="running",
+        spec={"model": "lfm2.5-350m", "context_length": 8192},
+    )
+    started: list[tuple[str, dict[str, object]]] = []
+
+    _converge_with_deployer(_FakeSupervisor([]), started)
+
+    assert started == [
+        ("lfm2.5-350m-ovh-02", {"model": "lfm2.5-350m", "context_length": 8192})
+    ]
+
+
+def test_a_start_is_not_attempted_without_the_opt_in(
+    node: None,
+) -> None:
+    _publish_capacity()
+    _desire("wanted")
+    started: list[tuple[str, dict[str, object]]] = []
+
+    _converge_with_deployer(_FakeSupervisor([]), started)
+
+    assert started == []
+
+
+def test_a_failing_start_does_not_stall_the_plan(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving.reconciler import ServingReconciler
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("first")
+    _desire("second")
+    supervisor = _FakeSupervisor([])
+    started: list[str] = []
+
+    def deployer(name: str, spec: dict[str, object]) -> None:
+        if name == "first":
+            raise RuntimeError("port exhausted")
+        started.append(name)
+
+    reconciler = ServingReconciler.__new__(ServingReconciler)
+    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
+    reconciler._deployer = deployer  # type: ignore[attr-defined]
+    reconciler._converge_desired_state()
+
+    assert started == ["second"]
+
+
+def test_starts_happen_before_stops_and_removals(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Converging towards MORE capacity first means a generation that replaces
+    one deployment with another never leaves the model unserved in between."""
+    from docie_bench.serving.reconciler import ServingReconciler
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("replacement")
+    supervisor = _FakeSupervisor(["retired"])
+    write_applied_state(AppliedState(generation=0, names=frozenset({"retired"})))
+    order: list[str] = []
+
+    reconciler = ServingReconciler.__new__(ServingReconciler)
+    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
+    reconciler._deployer = lambda name, spec: order.append(f"start:{name}")  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        supervisor, "remove", lambda name: order.append(f"remove:{name}")
+    )
+    reconciler._converge_desired_state()
+
+    assert order == ["start:replacement", "remove:retired"]

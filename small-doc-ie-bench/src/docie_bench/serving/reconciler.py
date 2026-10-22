@@ -66,6 +66,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from docie_bench.serving import recency
 from docie_bench.serving.lifecycle import assess_fit
@@ -409,6 +410,7 @@ class ServingReconciler:
         min_hot_s: float = 0.0,
         clock: Callable[[], float] = time.time,
         repair: Callable[[str], object] | None = None,
+        deployer: Callable[[str, dict[str, Any]], object] | None = None,
         throughput: ThroughputStore | None = None,
         probe: Callable[[ProbeRequest], ThroughputSample | None] = probe_deployment,
         probe_hot_cycles: int = _PROBE_HOT_CYCLES,
@@ -477,6 +479,12 @@ class ServingReconciler:
         # clicking Repair recovers. Repairs run OUTSIDE the observation lock
         # (they block on await_ready) and are throttled per deployment.
         self._repair = repair
+        # Desired-state starts (#535). Injected like `repair` rather than built
+        # here: launching a runtime is the deploy path (resolve a store entry,
+        # allocate a port, block on readiness) and belongs to the control
+        # plane, not the repair loop. Unset, the loop logs the starts it cannot
+        # perform instead of silently dropping them.
+        self._deployer = deployer
         self._repairs_due: list[str] = []
         self._repair_last: dict[str, float] = {}
         # Measured throughput: one fixed generation probe per model path, run
@@ -660,11 +668,15 @@ class ServingReconciler:
             return decision
 
         rows = snapshot.get("deployments") if snapshot else []
-        desired = {
-            str(row["name"]): str(row.get("desired_state") or "running")
-            for row in (rows if isinstance(rows, list) else [])
-            if isinstance(row, dict) and row.get("name")
-        }
+        desired: dict[str, str] = {}
+        specs: dict[str, dict[str, Any]] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not row.get("name"):
+                continue
+            name = str(row["name"])
+            desired[name] = str(row.get("desired_state") or "running")
+            spec = row.get("spec")
+            specs[name] = spec if isinstance(spec, dict) else {}
         plan = plan_convergence(
             desired=desired,
             local_names=local_names,
@@ -695,31 +707,41 @@ class ServingReconciler:
             plan.to_stop,
             plan.to_remove,
         )
-        self._apply_plan(plan)
+        self._apply_plan(plan, specs)
         write_applied_state(
             AppliedState(generation=int(generation or 0), names=frozenset(desired))
         )
         return decision
 
-    def _apply_plan(self, plan: object) -> None:
+    def _apply_plan(self, plan: object, specs: dict[str, dict[str, Any]]) -> None:
         """Carry out a convergence plan, one deployment at a time.
 
         Each action is contained: one deployment that refuses to stop must not
         prevent the rest of the plan, and the next cycle re-plans from what
         actually happened rather than from what was intended.
 
-        Starts are deliberately NOT performed here. Launching a runtime means
-        resolving a store entry, allocating a port and blocking on readiness --
-        the deploy path, which belongs to the lifecycle handlers rather than
-        the repair loop. The plan's starts are logged so the gap is visible;
-        wiring them is the remaining step of #535.
+        Starts go through the injected deployer, which is the control plane's
+        own deploy path -- resolving a store entry, allocating a port and
+        blocking on readiness is not work the repair loop should reimplement.
+        With no deployer injected the starts are logged rather than dropped, so
+        a misconfigured loop is visible instead of quietly doing half its job.
+
+        Stops and removals are ordered after starts on purpose: converging
+        towards MORE capacity before less means a generation that replaces one
+        deployment with another never leaves the model unserved in between.
         """
         for name in getattr(plan, "to_start", ()):
-            logger.warning(
-                "desired state wants %s started; the reconciler does not launch "
-                "runtimes (see #535) -- deploy it on this node",
-                name,
-            )
+            if self._deployer is None:
+                logger.warning(
+                    "desired state wants %s started but no deployer is wired; "
+                    "deploy it on this node",
+                    name,
+                )
+                continue
+            try:
+                self._deployer(name, specs.get(name, {}))
+            except Exception:  # noqa: BLE001 - one failure must not stall the plan
+                logger.warning("desired-state start of %s failed", name, exc_info=True)
         for name in getattr(plan, "to_stop", ()):
             try:
                 self.supervisor.stop(name)
