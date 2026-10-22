@@ -211,7 +211,52 @@ class ServingNode(Base):
     # chosen to serve it has the file, and without this nothing shows which
     # nodes do. NULL means a node that has not reported its store yet.
     store_models: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Bumped by every desired-state write touching this node (#534). A node
+    # compares it against the last generation it applied, which is what lets a
+    # READER decide in one read whether the catalog is provably current for it
+    # -- see serving/convergence.py for why readability is not enough. NULL
+    # means no desired state has ever been written for this node.
+    desired_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ServingDesiredDeployment(Base):
+    """What a node SHOULD be running, owned by that node (#534, phase 2).
+
+    Postgres becomes the authoritative global desired state while each node
+    keeps ``deployments.json`` as its local snapshot -- the mechanism that makes
+    the #527 non-negotiable work, since the reconciler repairs and saves without
+    a database.
+
+    Keyed ``(node_id, name)``: a desired row belongs to exactly one node, and
+    moving a deployment between nodes is a delete here and an insert there
+    rather than a mutation. ``generation`` is per-row and exists for WRITER
+    concurrency -- every write carries the generation it read, and a mismatch
+    loses, so two central API calls racing on one deployment cannot interleave.
+    That is a different job from ``ServingNode.desired_generation``, which is
+    per-node and exists for the READER.
+
+    Nothing reads this yet; the reconciler side is a separate change.
+    """
+
+    __tablename__ = "serving_desired_deployment"
+
+    node_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), primary_key=True)
+    # Per-row optimistic concurrency (see the class docstring).
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    # "running" | "stopped" -- a removal is a DELETE, not a state, so a node
+    # cannot mistake "should not run" for "no longer desired at all".
+    desired_state: Mapped[str] = mapped_column(String(32))
+    # The launch spec as JSON, opaque here: the catalog stores intent and the
+    # node owns how to realise it.
+    spec: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
 
 class ModelActivity(Base):
@@ -282,6 +327,8 @@ _SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     ("reclaimable_bytes", BigInteger()),
     # Which store models this node actually holds on disk (#562). JSON array.
     ("store_models", Text()),
+    # Monotonic counter bumped by any desired-state write for this node (#534).
+    ("desired_generation", Integer()),
 )
 
 
@@ -340,6 +387,33 @@ def ensure_serving_node_table(engine: Engine) -> bool:
         connection.execute(CreateTable(node_table, if_not_exists=True))
         if existed:
             _ensure_serving_node_columns(connection, engine)
+    return not existed
+
+
+_DESIRED_LOCK_KEY = 0x0D0C1E03
+
+
+class DesiredStateConflictError(RuntimeError):
+    """A desired-state write lost its optimistic-concurrency check (#534)."""
+
+
+def ensure_serving_desired_table(engine: Engine) -> bool:
+    """Race-safe forward migration: create ``serving_desired_deployment``.
+
+    Same pattern and the same reasoning as :func:`ensure_serving_node_table` --
+    ``CREATE TABLE IF NOT EXISTS`` under an advisory lock, with the inspection
+    inside the lock so a pre-lock snapshot cannot misreport who created it.
+    """
+    table = ServingDesiredDeployment.__table__
+    assert isinstance(table, Table)  # narrow FromClause for the compiler
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _DESIRED_LOCK_KEY},
+            )
+        existed = sa_inspect(connection).has_table("serving_desired_deployment")
+        connection.execute(CreateTable(table, if_not_exists=True))
     return not existed
 
 
@@ -574,12 +648,54 @@ def _decode_store_models(raw: str | None) -> list[str] | None:
     return [str(item) for item in decoded] if isinstance(decoded, list) else None
 
 
+def _desired_view(row: ServingDesiredDeployment) -> dict[str, Any]:
+    try:
+        spec = json.loads(row.spec)
+    except ValueError:
+        spec = None
+    return {
+        "node_id": row.node_id,
+        "name": row.name,
+        "generation": row.generation,
+        "desired_state": row.desired_state,
+        "spec": spec if isinstance(spec, dict) else None,
+        "updated_at": isoformat(row.updated_at),
+    }
+
+
+def _bump_desired_generation(session: Session, node_id: str) -> int:
+    """Advance ``node_id``'s desired generation, creating no capacity numbers.
+
+    The node row may not exist yet -- desired state can be written for a node
+    before it has ever reported -- so this inserts a MINIMAL row rather than
+    failing. The capacity fields stay at zero with ``source="unreported"`` and
+    are overwritten by the node's first real publish; what matters here is that
+    the counter exists and only ever moves forward.
+    """
+    row = session.get(ServingNode, node_id)
+    if row is None:
+        row = ServingNode(
+            id=node_id,
+            total_bytes=0,
+            free_bytes=0,
+            source="unreported",
+            sum_rss_bytes=0,
+            reclaimable_bytes=0,
+            desired_generation=0,
+        )
+        session.add(row)
+    row.desired_generation = (row.desired_generation or 0) + 1
+    session.flush()
+    return row.desired_generation
+
+
 def _node_view(row: ServingNode) -> dict[str, Any]:
     return {
         # Which node these numbers describe. Published so a fleet reader can
         # never mistake one machine's capacity for the whole fleet's.
         "node_id": row.id,
         "store_models": _decode_store_models(row.store_models),
+        "desired_generation": row.desired_generation,
         "total_bytes": row.total_bytes,
         "free_bytes": row.free_bytes,
         "source": row.source,
@@ -1023,6 +1139,106 @@ class ModelCatalog:
             rows = session.scalars(select(ServingNode).limit(2)).all()
             return _node_view(rows[0]) if len(rows) == 1 else None
 
+    # ------------------------------------------------------- desired state
+    def set_desired_deployment(
+        self,
+        node_id: str,
+        name: str,
+        *,
+        desired_state: str,
+        spec: dict[str, Any],
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Write what ``node_id`` should be running for ``name`` (#534).
+
+        ``expected_generation`` is the per-row generation the caller read;
+        ``None`` means "this row should not exist yet". A mismatch raises
+        :class:`DesiredStateConflictError` rather than overwriting, so two central
+        API calls racing on one deployment cannot interleave -- the loser
+        re-reads and decides again.
+
+        The node's ``desired_generation`` is bumped in the SAME transaction, so
+        the per-row and per-node counters cannot disagree: a reader that sees a
+        newer node generation is guaranteed to see the row that caused it.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ServingDesiredDeployment, (node_id, name))
+            current = row.generation if row is not None else None
+            if current != expected_generation:
+                raise DesiredStateConflictError(
+                    f"desired state for {name!r} on node {node_id!r} is at "
+                    f"generation {current!r}, not {expected_generation!r}; "
+                    f"re-read and retry"
+                )
+            if row is None:
+                row = ServingDesiredDeployment(node_id=node_id, name=name, generation=1)
+                session.add(row)
+            else:
+                row.generation = row.generation + 1
+            row.desired_state = desired_state
+            row.spec = json.dumps(spec, sort_keys=True)
+            node_generation = _bump_desired_generation(session, node_id)
+            session.flush()
+            return {
+                "node_id": node_id,
+                "name": name,
+                "generation": row.generation,
+                "desired_state": desired_state,
+                "node_desired_generation": node_generation,
+            }
+
+    def delete_desired_deployment(
+        self, node_id: str, name: str, *, expected_generation: int
+    ) -> int:
+        """Remove the desired row, returning the node's new generation.
+
+        A removal is a DELETE rather than a state, so a node cannot confuse
+        "should not be running" with "no longer desired at all" -- the two call
+        for different actions.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ServingDesiredDeployment, (node_id, name))
+            found = row.generation if row is not None else None
+            if found != expected_generation:
+                raise DesiredStateConflictError(
+                    f"desired state for {name!r} on node {node_id!r} is at "
+                    f"generation {found!r}, not {expected_generation!r}; "
+                    f"re-read and retry"
+                )
+            session.delete(row)
+            return _bump_desired_generation(session, node_id)
+
+    def desired_snapshot(self, node_id: str) -> dict[str, Any]:
+        """Everything ``node_id`` should be running, read in ONE transaction.
+
+        The generation and the rows come from the same snapshot deliberately.
+        A node derives DELETIONS from this, and a partial or interrupted read
+        would otherwise look like "these deployments are gone" -- so the two
+        must never be fetched separately.
+
+        ``generation`` is None when no desired state has ever been written for
+        this node, which ``convergence.decide_convergence`` treats differently
+        from a node that had rows and lost them.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            node = session.get(ServingNode, node_id)
+            rows = session.scalars(
+                select(ServingDesiredDeployment)
+                .where(ServingDesiredDeployment.node_id == node_id)
+                .order_by(ServingDesiredDeployment.name)
+            ).all()
+            return {
+                "node_id": node_id,
+                "generation": node.desired_generation if node is not None else None,
+                "deployments": [_desired_view(row) for row in rows],
+            }
+
     def list_node_snapshots(self) -> Sequence[dict[str, Any]]:
         """Every node's published snapshot, newest measurement first."""
         with session_scope() as session:
@@ -1236,11 +1452,14 @@ __all__ = [
     "ModelActivity",
     "ModelCatalog",
     "CatalogUnavailableError",
+    "DesiredStateConflictError",
     "LEGACY_SERVING_NODE_ROW_ID",
     "SERVING_NODE_ROW_ID",
+    "ServingDesiredDeployment",
     "ServingNode",
     "available_backends",
     "ensure_placement_observed_columns",
+    "ensure_serving_desired_table",
     "ensure_serving_node_table",
     "ensure_model_activity_table",
     "ensure_size_bytes_bigint",
