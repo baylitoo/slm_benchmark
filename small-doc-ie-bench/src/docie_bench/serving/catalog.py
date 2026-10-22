@@ -1235,6 +1235,13 @@ class ModelCatalog:
             ).all()
             return {
                 "node_id": node_id,
+                # Whether the catalog knows this node AT ALL, reported apart
+                # from the generation because they mean different things and a
+                # reader must not conflate them: a known node with no desired
+                # state yet is ordinary, while an unknown node that is running
+                # deployments suggests the wrong database. Both show
+                # generation=None. See convergence.decide_convergence.
+                "node_known": node is not None,
                 "generation": node.desired_generation if node is not None else None,
                 "deployments": [_desired_view(row) for row in rows],
             }

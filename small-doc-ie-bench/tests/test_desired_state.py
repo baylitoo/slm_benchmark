@@ -214,3 +214,29 @@ def test_stopped_is_a_state_but_removed_is_a_deletion(catalog: ModelCatalog) -> 
 
     catalog.delete_desired_deployment(NODE, MODEL, expected_generation=1)
     assert catalog.desired_snapshot(NODE)["deployments"] == []
+
+
+def test_an_unknown_node_is_reported_apart_from_the_generation(
+    catalog: ModelCatalog,
+) -> None:
+    """Both states show `generation=None`, and they mean opposite things.
+
+    A node the catalog knows, with no desired state written yet, is ordinary.
+    A node it has never heard of, which is running deployments, suggests the
+    wrong database. `decide_convergence` needs them separated, so the snapshot
+    must not conflate them.
+    """
+    unknown = catalog.desired_snapshot("never-seen")
+    assert unknown["node_known"] is False
+    assert unknown["generation"] is None
+
+    catalog.publish_node_snapshot(
+        node_id=NODE,
+        total_bytes=1,
+        free_bytes=1,
+        source="cgroup",
+        sum_rss_bytes=0,
+    )
+    known = catalog.desired_snapshot(NODE)
+    assert known["node_known"] is True
+    assert known["generation"] is None  # capacity published, nothing desired yet
