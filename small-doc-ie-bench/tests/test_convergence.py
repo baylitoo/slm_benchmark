@@ -82,10 +82,28 @@ def test_a_missing_node_row_on_a_fresh_node_is_not_suspicious() -> None:
     assert decision.should_alarm is False
 
 
-def test_an_unreadable_generation_holds() -> None:
-    decision = _decide(catalog_generation=None)
+def test_no_desired_state_yet_is_the_ordinary_state_not_an_alarm() -> None:
+    """What every node of an existing deployment looks like the moment this
+    ships: its capacity row exists, and no desired state has been written.
+
+    #534's migration plan is deliberately ship-table, backfill, then read --
+    so this state is the norm for a while. Holding and alarming here would cry
+    wolf on every cycle of a perfectly healthy single-node stack.
+    """
+    decision = _decide(catalog_generation=None, applied_generation=0)
+
+    assert decision.action is ConvergeAction.NOTHING
+    assert decision.should_alarm is False
+
+
+def test_losing_a_generation_this_node_applied_holds() -> None:
+    """The same observation, with history. This node converged on generation 4
+    and the catalog now reports none: a restore, a wipe, or the wrong database.
+    """
+    decision = _decide(catalog_generation=None, applied_generation=4)
 
     assert decision.action is ConvergeAction.HOLD
+    assert decision.should_alarm is True
 
 
 @pytest.mark.parametrize(
@@ -113,7 +131,7 @@ def test_teardown_is_never_reachable_from_a_hold() -> None:
         _decide(catalog_reachable=False),
         _decide(catalog_generation=3, applied_generation=5),
         _decide(node_row_present=False, local_deployment_count=3),
-        _decide(catalog_generation=None),
+        _decide(catalog_generation=None, applied_generation=4),
     ]
 
     assert all(decision.action is ConvergeAction.HOLD for decision in holds)

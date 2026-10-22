@@ -110,8 +110,22 @@ def decide_convergence(
         )
 
     if catalog_generation is None:
+        if applied_generation == 0:
+            # The ordinary state before any desired state is written for this
+            # node -- including every node of an existing deployment the
+            # moment this ships. Holding here would alarm on every cycle of a
+            # perfectly healthy single-node stack.
+            return ConvergeDecision(
+                ConvergeAction.NOTHING, "no desired state written for this node yet"
+            )
+        # This node HAS applied a generation, and the catalog now reports none.
+        # Something removed what we converged on: a restore, a wipe, or the
+        # wrong database. Never a reason to undo work.
         return ConvergeDecision(
-            ConvergeAction.HOLD, "desired generation is unreadable for this node"
+            ConvergeAction.HOLD,
+            f"catalog reports no desired generation but this node applied "
+            f"{applied_generation}; refusing to converge on a catalog that may "
+            f"not be ours",
         )
 
     if catalog_generation > applied_generation:
