@@ -746,6 +746,15 @@ class ServingReconciler:
         Stops and removals are ordered after starts on purpose: converging
         towards MORE capacity before less means a generation that replaces one
         deployment with another never leaves the model unserved in between.
+
+        The singleton lease is heartbeated between actions. A start blocks in
+        ``await_ready`` until the model is serving, which for a multi-GB GGUF
+        is longer than the lease's staleness window -- so a plan with several
+        starts would otherwise leave the heartbeat unrefreshed long enough for
+        a *newly booting* serving container to judge the lease abandoned and
+        claim it. This bounds that gap to one model load instead of the whole
+        plan; see the note on #582 for why a single load is still a gap and
+        what fixing it properly needs.
         """
         ok = True
         for name in getattr(plan, "to_start", ()):
@@ -762,19 +771,35 @@ class ServingReconciler:
             except Exception:  # noqa: BLE001 - one failure must not stall the plan
                 logger.warning("desired-state start of %s failed", name, exc_info=True)
                 ok = False
+            self._heartbeat()
         for name in getattr(plan, "to_stop", ()):
             try:
                 self.supervisor.stop(name)
             except Exception:  # noqa: BLE001 - one failure must not stall the plan
                 logger.warning("desired-state stop of %s failed", name, exc_info=True)
                 ok = False
+            self._heartbeat()
         for name in getattr(plan, "to_remove", ()):
             try:
                 self.supervisor.remove(name)
             except Exception:  # noqa: BLE001 - same containment
                 logger.warning("desired-state removal of %s failed", name, exc_info=True)
                 ok = False
+            self._heartbeat()
         return ok
+
+    def _heartbeat(self) -> None:
+        """Refresh the singleton lease mid-plan (best-effort).
+
+        Contained: a lease write that fails must not abort a convergence that
+        is otherwise succeeding -- the next cycle's own refresh is the backstop.
+        """
+        if self._lease is None:
+            return
+        try:
+            self._lease.refresh()
+        except Exception:  # noqa: BLE001 - heartbeat hiccup != failed plan
+            logger.debug("lease heartbeat during convergence failed", exc_info=True)
 
     def _observe_locked(self) -> list[ObservedDeployment]:
         records = self.supervisor.records()
