@@ -695,18 +695,34 @@ class ServingReconciler:
             plan.to_stop,
             plan.to_remove,
         )
-        self._apply_plan(plan)
-        write_applied_state(
-            AppliedState(generation=int(generation or 0), names=frozenset(desired))
-        )
+        if self._apply_plan(plan):
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+        else:
+            # Leave the applied generation where it is, so the NEXT cycle
+            # re-plans and retries. Recording it here would mean a single
+            # transient failure -- a port briefly held, a GGUF on a slow disk
+            # -- wedges the deployment until somebody writes desired state
+            # again, because the generations would match and the decision
+            # would be NOTHING forever. A reconciler that gives up after one
+            # attempt is not reconciling.
+            logger.warning(
+                "desired generation %s only partly applied; retrying next cycle",
+                generation,
+            )
         return decision
 
-    def _apply_plan(self, plan: object) -> None:
-        """Carry out a convergence plan, one deployment at a time.
+    def _apply_plan(self, plan: object) -> bool:
+        """Carry out a convergence plan, returning whether ALL of it succeeded.
 
         Each action is contained: one deployment that refuses to stop must not
         prevent the rest of the plan, and the next cycle re-plans from what
         actually happened rather than from what was intended.
+
+        The return value is what keeps that promise. The caller records the
+        applied generation only on full success, so anything that failed is
+        attempted again next cycle instead of being treated as done.
 
         Starts are deliberately NOT performed here. Launching a runtime means
         resolving a store entry, allocating a port and blocking on readiness --
@@ -714,22 +730,29 @@ class ServingReconciler:
         the repair loop. The plan's starts are logged so the gap is visible;
         wiring them is the remaining step of #535.
         """
+        # No deployer on this branch: a start cannot be performed, so the plan
+        # is NOT fully applied and the generation must not be recorded.
+        unstarted = bool(getattr(plan, "to_start", ()))
         for name in getattr(plan, "to_start", ()):
             logger.warning(
                 "desired state wants %s started; the reconciler does not launch "
                 "runtimes (see #535) -- deploy it on this node",
                 name,
             )
+        ok = not unstarted
         for name in getattr(plan, "to_stop", ()):
             try:
                 self.supervisor.stop(name)
             except Exception:  # noqa: BLE001 - one failure must not stall the plan
                 logger.warning("desired-state stop of %s failed", name, exc_info=True)
+                ok = False
         for name in getattr(plan, "to_remove", ()):
             try:
                 self.supervisor.remove(name)
             except Exception:  # noqa: BLE001 - same containment
                 logger.warning("desired-state removal of %s failed", name, exc_info=True)
+                ok = False
+        return ok
 
     def _observe_locked(self) -> list[ObservedDeployment]:
         records = self.supervisor.records()
