@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
+from docie_bench.serving.control_plane import mint_deployment_name
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
 from . import _shared
@@ -38,6 +39,13 @@ class DeployRequest(BaseModel):
     # endpoint's semantics): >1 fans out one deploy per missing replica, each
     # on its own auto-allocated port, load-balanced behind the model id.
     replicas: int = Field(default=1, ge=1, le=16)
+    # Deploy to THIS node instead of wherever the lifecycle event happens to
+    # land (#535). Omitted, the behaviour is exactly as before: an event on the
+    # shared `docie-serving` app, delivered to whichever serving node Inngest
+    # picks -- which is fine for one node and is why this is opt-in rather than
+    # required. Given, the deploy is recorded as desired state owned by that
+    # node and its own reconciler converges on it.
+    node_id: str | None = None
     # llama-server request slots (#248/#321). 32 is an operator sanity ceiling,
     # not a llama.cpp hard limit. Meaningless for non-llamacpp runtimes; the
     # build_command for those simply never reads it.
@@ -164,10 +172,122 @@ async def _trigger_replicated_deploy(
     )
 
 
+
+def _target_node_deploy(
+    payload: DeployRequest, tenant: TenantDependency
+) -> _shared.TriggerResponse:
+    """Record a deploy as desired state owned by ``payload.node_id`` (#535).
+
+    This is the half that makes a deploy addressable. Until now a deploy was an
+    event on the shared `docie-serving` app, so it landed on whichever serving
+    node Inngest picked and a specific node could only be reached by running
+    the CLI on it (#576). The desired row is owned by one node, and only that
+    node's reconciler reads it.
+
+    Validated BEFORE writing, because the two failure modes an operator will
+    actually hit are both silent otherwise: targeting a node the catalog has
+    never heard of writes a row nothing will ever read, and targeting a node
+    without the model's blob produces a deploy that fails on that node for a
+    reason the Studio does not show (the catalog knows the model globally --
+    see #573).
+    """
+    from docie_bench.serving.catalog import (
+        CatalogUnavailableError,
+        DesiredStateConflictError,
+        ModelCatalog,
+    )
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    if payload.replicas > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "node_id targets ONE node, so it cannot be combined with "
+                "replicas > 1 — issue one targeted deploy per node instead, "
+                "which is also what makes each replica's placement distinct"
+            ),
+        )
+    try:
+        catalog = ModelCatalog()
+        snapshots = list(catalog.list_node_snapshots())
+    except CatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "targeting a node needs the model catalog, which is not "
+                "configured (DATABASE_URL); deploy without node_id to use the "
+                "untargeted path"
+            ),
+        ) from exc
+
+    known = {str(row.get("node_id") or ""): row for row in snapshots}
+    node = known.get(payload.node_id or "")
+    if node is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no serving node {payload.node_id!r} has reported; known nodes: "
+                f"{sorted(name for name in known if name) or 'none'}"
+            ),
+        )
+    if str(payload.node_id) in stale_node_ids(snapshots):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"serving node {payload.node_id!r} has stopped reporting, so it "
+                f"would not converge on this deploy; check that node before "
+                f"targeting it"
+            ),
+        )
+    held = node.get("store_models")
+    if isinstance(held, list) and payload.model not in held:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"serving node {payload.node_id!r} does not hold {payload.model!r}. "
+                f"The catalog knows the model globally but the blob store is "
+                f"node-local, so seed it there first "
+                f"(`docie-serving store seed-ollama ...` on that node)"
+            ),
+        )
+
+    deployment_name = payload.name or mint_deployment_name(payload.model)
+    spec = {
+        "model": payload.model,
+        "context_length": payload.context_length,
+    }
+    if payload.port is not None:
+        spec["port"] = payload.port
+    try:
+        written = catalog.set_desired_deployment(
+            str(payload.node_id),
+            deployment_name,
+            desired_state="running",
+            spec=spec,
+        )
+    except DesiredStateConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"desired state for {deployment_name!r} changed under us: {exc}",
+        ) from exc
+    return _shared.TriggerResponse(
+        event_ids=[],
+        channel=None,
+        topics=[],
+        detail=(
+            f"recorded as desired state for node {payload.node_id!r} "
+            f"(generation {written['node_desired_generation']}); that node's "
+            f"reconciler converges within one cycle"
+        ),
+    )
+
+
 @router.post("/deploy", response_model=_shared.TriggerResponse)
 async def trigger_deploy(
     payload: DeployRequest, tenant: TenantDependency
 ) -> _shared.TriggerResponse:
+    if payload.node_id:
+        return _target_node_deploy(payload, tenant)
     if payload.replicas > 1:
         return await _trigger_replicated_deploy(payload, tenant)
     channel = f"deploy:{uuid.uuid4().hex}"
