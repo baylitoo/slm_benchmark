@@ -330,3 +330,64 @@ def test_starts_happen_before_stops_and_removals(
     reconciler._converge_desired_state()
 
     assert order == ["start:replacement", "remove:retired"]
+def test_a_failed_action_does_not_record_the_generation(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconciler that gives up after one attempt is not reconciling.
+
+    Recording the generation after a failure would make the generations match
+    on the next cycle, so the decision becomes NOTHING forever and a single
+    transient failure -- a port briefly held, a GGUF on a slow disk -- wedges
+    the deployment until somebody writes desired state again.
+    """
+    from docie_bench.serving.reconciler import ServingReconciler
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("keep")
+    supervisor = _FakeSupervisor(["doomed"])
+    write_applied_state(AppliedState(generation=0, names=frozenset({"doomed"})))
+
+    def explode(name: str) -> None:
+        raise RuntimeError("will not remove")
+
+    monkeypatch.setattr(supervisor, "remove", explode)
+    reconciler = ServingReconciler.__new__(ServingReconciler)
+    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
+    reconciler._deployer = None  # type: ignore[attr-defined]
+    reconciler._converge_desired_state()
+
+    # Not recorded, so the next cycle re-plans and tries again.
+    assert read_applied_state().generation == 0
+
+
+def test_a_start_that_cannot_be_performed_does_not_record_the_generation(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no deployer wired a start is logged, not performed -- so the plan
+    was not applied and must not be marked as done."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("wanted")
+
+    _converge(_FakeSupervisor([]))
+
+    assert read_applied_state().generation == 0
+
+
+def test_a_fully_applied_plan_does_record_the_generation(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: success must still converge exactly once."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("keep")
+    # "keep" is already running, so the plan has no start -- with no deployer
+    # wired a start would (correctly) block the generation from being recorded.
+    supervisor = _FakeSupervisor(["keep", "retired"])
+    write_applied_state(AppliedState(generation=0, names=frozenset({"keep", "retired"})))
+
+    _converge(supervisor)
+
+    assert supervisor.removed == ["retired"]
+    assert read_applied_state().generation == 1
