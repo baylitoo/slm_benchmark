@@ -314,6 +314,7 @@ def init_engine(database_url: str | None = None) -> None:
     from docie_bench.serving.catalog import (
         ensure_model_activity_table,
         ensure_placement_observed_columns,
+        ensure_serving_desired_table,
         ensure_serving_node_table,
         ensure_size_bytes_bigint,
     )
@@ -338,6 +339,12 @@ def init_engine(database_url: str | None = None) -> None:
     # lock on PostgreSQL) makes the creation race-safe (PR-2, mirroring the
     # PR-1 observed-columns pattern above).
     ensure_serving_node_table(_engine)
+    # AFTER serving_node, and the order is load-bearing: desired-state writes
+    # bump serving_node.desired_generation, which is a LATE column added by
+    # ensure_serving_node_table above. Creating this table first would leave a
+    # database that predates that column one write away from UndefinedColumn --
+    # the same ordering mistake that took the api down in #549.
+    ensure_serving_desired_table(_engine)
     # Same race as serving_node above: model_activity is also new, also
     # created by every process's concurrent init_engine() at stack-up.
     ensure_model_activity_table(_engine)
