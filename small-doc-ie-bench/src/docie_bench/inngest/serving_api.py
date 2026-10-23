@@ -778,6 +778,24 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     return name, eta
 
 
+def _owning_node(name: str) -> str | None:
+    """Which node runs ``name``, from the placement table (#566).
+
+    Best-effort and advisory: an unreadable catalog means "unknown", which
+    leaves the caller's own 404 in place rather than inventing an owner.
+    """
+    from docie_bench.serving.catalog import ModelCatalog
+
+    try:
+        for row in ModelCatalog().list_placements():
+            if str(row.get("name") or "") == name:
+                owner = str(row.get("node_id") or "")
+                return owner or None
+    except Exception:  # noqa: BLE001 - attribution must not change the status code
+        return None
+    return None
+
+
 async def _fire_lifecycle_event(
     name: str,
     *,
@@ -796,6 +814,24 @@ async def _fire_lifecycle_event(
     try:
         await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
+        # Not on THIS node's disk. It may still exist, on another node (#562):
+        # these handlers read the local deployments.json, so a perfectly live
+        # remote deployment reaches here. A 404 would tell the operator it does
+        # not exist, which is both wrong and the kind of wrong that sends them
+        # looking in the right place last.
+        owner = _owning_node(name)
+        if owner is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"deployment {name!r} runs on serving node {owner!r}, and "
+                    f"lifecycle events are delivered to whichever node Inngest "
+                    f"picks -- so this cannot act on it. Run it on that node "
+                    f"(`docie-serving stop {name}`), or deploy with node_id so "
+                    f"the deployment is managed as desired state (#535)"
+                ),
+                headers=_DOMAIN_404,
+            ) from exc
         raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
     channel = f"{prefix}:{uuid.uuid4().hex}"
     data: dict[str, Any] = {"name": name, "channel": channel, **(extra or {})}
