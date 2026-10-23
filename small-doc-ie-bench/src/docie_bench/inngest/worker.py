@@ -162,24 +162,31 @@ def _build_reconciler(instance_id: str) -> Any:
 def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]], object]:
     """Adapt the control plane's deploy path to the reconciler's start hook.
 
+    Uses the SYNCHRONOUS ``supervisor.serve_store_model``, not the async
+    ``ControlPlane.up`` that wraps it -- the same choice ``repair`` already
+    makes (``control_plane.supervisor.repair``). ``up`` exists to offload that
+    synchronous call to a thread so it does not stall the worker's asyncio
+    loop, and the reconcile cycle already runs in a worker thread
+    (``asyncio.to_thread(run_cycle)``). Going through ``up`` from there would
+    mean starting a fresh event loop only for it to hand the work to yet
+    another thread, and would couple a repair-loop start to loop-affine state
+    that is not this thread's.
+
     The desired row's ``spec`` carries the intent the central side recorded;
-    anything it omits falls back to the deploy path's own defaults rather than
-    being guessed here.
+    anything it omits is simply not passed, so the deploy path's own defaults
+    apply rather than being guessed here.
     """
 
     def deploy(name: str, spec: dict[str, Any]) -> object:
-        model = str(spec.get("model") or name)
+        kwargs: dict[str, Any] = {"deployment_name": name}
         port = spec.get("port")
+        if isinstance(port, int):
+            kwargs["port"] = port
         context_length = spec.get("context_length")
-        return asyncio.run(
-            control_plane.up(
-                model,
-                port=int(port) if isinstance(port, int) else None,
-                context_length=(
-                    int(context_length) if isinstance(context_length, int) else None
-                ),
-                deployment_name=name,
-            )
+        if isinstance(context_length, int):
+            kwargs["context_length"] = context_length
+        return control_plane.supervisor.serve_store_model(
+            str(spec.get("model") or name), **kwargs
         )
 
     return deploy
