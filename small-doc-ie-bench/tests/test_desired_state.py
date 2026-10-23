@@ -240,3 +240,75 @@ def test_an_unknown_node_is_reported_apart_from_the_generation(
     known = catalog.desired_snapshot(NODE)
     assert known["node_known"] is True
     assert known["generation"] is None  # capacity published, nothing desired yet
+
+
+# --- the placeholder must not look like capacity -------------------------
+
+
+def test_staging_a_deploy_does_not_disable_sizing(catalog: ModelCatalog) -> None:
+    """A cross-change regression. Staging a deploy for a node that has never
+    started creates a node row so the generation counter has somewhere to live.
+    That row has zeroed capacity and source="unreported" -- and the sizing
+    engine withholds pricing whenever more than one node is publishing, so a
+    single-node stack silently lost its fit table the moment anyone staged a
+    targeted deploy.
+    """
+    from docie_bench.inngest.serving_api import _sizing_inputs
+
+    catalog.publish_node_snapshot(
+        node_id="node-a",
+        total_bytes=8 * 1024**3,
+        free_bytes=4 * 1024**3,
+        source="cgroup",
+        sum_rss_bytes=1024**3,
+    )
+    _models, before, _placements, _detail = _sizing_inputs()
+    assert before is not None
+
+    catalog.set_desired_deployment(
+        "never-started", "lfm2.5-350m", desired_state="running", spec={}
+    )
+
+    _models, after, _placements, detail = _sizing_inputs()
+    assert after is not None, f"sizing withheld after staging: {detail}"
+    assert after["node_id"] == "node-a"
+
+
+def test_the_resources_view_does_not_count_a_staged_node_as_capacity(
+    catalog: ModelCatalog,
+) -> None:
+    """It would also have claimed the fleet had a node with 0 bytes free,
+    which reads as "no room" rather than "not measured"."""
+    import asyncio
+
+    from docie_bench.inngest.serving_api import serving_resources
+
+    catalog.publish_node_snapshot(
+        node_id="node-a",
+        total_bytes=8 * 1024**3,
+        free_bytes=4 * 1024**3,
+        source="cgroup",
+        sum_rss_bytes=1024**3,
+    )
+    catalog.set_desired_deployment(
+        "never-started", "lfm2.5-350m", desired_state="running", spec={}
+    )
+
+    payload = asyncio.run(serving_resources())
+
+    assert payload["node_count"] == 1
+    assert payload["node"]["node_id"] == "node-a"
+
+
+def test_a_staged_node_still_appears_in_the_node_list(catalog: ModelCatalog) -> None:
+    """The row is not hidden -- it is real, and the store-presence view needs
+    it so an operator can see the node has not reported yet. Only the readers
+    that PRICE capacity skip it."""
+    catalog.set_desired_deployment(
+        "never-started", "lfm2.5-350m", desired_state="running", spec={}
+    )
+
+    listed = {row["node_id"]: row for row in catalog.list_node_snapshots()}
+
+    assert "never-started" in listed
+    assert listed["never-started"]["source"] == "unreported"
