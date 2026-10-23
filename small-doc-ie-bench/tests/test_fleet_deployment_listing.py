@@ -194,3 +194,68 @@ def test_the_listing_survives_an_unreachable_catalog(serving_home: Path) -> None
 
     assert [str((r.get("spec") or {}).get("name")) for r in listing] == [LOCAL]
     assert listing[0]["observed_available"] is False
+
+
+# --- lifecycle on a remote deployment (#562) ----------------------------
+
+
+def test_a_lifecycle_action_on_a_remote_deployment_names_its_node(
+    serving_home: Path,
+) -> None:
+    """These handlers read THIS node's deployments.json, so a live deployment
+    on another node reaches the not-found path. A 404 would say it does not
+    exist -- wrong, and the kind of wrong that sends an operator looking in the
+    right place last.
+    """
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import _fire_lifecycle_event
+
+    _place(REMOTE, node_id="node-b")  # catalogued, no local record
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(_fire_lifecycle_event(REMOTE, event="serving/x", prefix="x"))
+
+    assert caught.value.status_code == 409
+    detail = str(caught.value.detail)
+    assert "node-b" in detail
+    assert "docie-serving stop" in detail  # tells them what to do instead
+
+
+def test_a_genuinely_unknown_deployment_is_still_a_404(serving_home: Path) -> None:
+    """The new branch must not swallow the real not-found case."""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import _fire_lifecycle_event
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(_fire_lifecycle_event("never-existed", event="serving/x", prefix="x"))
+
+    assert caught.value.status_code == 404
+
+
+def test_a_placement_with_no_owner_is_still_a_404(serving_home: Path) -> None:
+    """A pre-#530 row has an unknown owner, not a remote one, so there is no
+    node to point at and the honest answer stays 404."""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import _fire_lifecycle_event
+
+    ModelCatalog().record_placement(
+        "legacy",
+        model_name="legacy",
+        engine="llama-server",
+        endpoint="http://legacy:8088/v1",
+        state="ready",
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(_fire_lifecycle_event("legacy", event="serving/x", prefix="x"))
+
+    assert caught.value.status_code == 404
