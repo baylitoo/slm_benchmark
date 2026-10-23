@@ -144,6 +144,26 @@ def _observed_placements() -> dict[str, dict[str, Any]] | None:
         return None
 
 
+# A node row can exist before that node has ever measured anything: staging a
+# desired-state deploy for a node that has not started creates one so the
+# generation counter has somewhere to live (#534). Its capacity numbers are
+# zeroes with source="unreported", and anything that PRICES capacity has to
+# skip it -- a zero-capacity node reads as "no room", and merely counting it
+# made a single-node stack look like a fleet and withhold sizing entirely.
+_UNREPORTED_CAPACITY = "unreported"
+
+
+def _capacity_reporting(snapshots: object) -> list[dict[str, Any]]:
+    """Only the nodes that have actually measured their capacity."""
+    if not isinstance(snapshots, (list, tuple)):
+        return []
+    return [
+        row
+        for row in snapshots
+        if isinstance(row, dict) and row.get("source") != _UNREPORTED_CAPACITY
+    ]
+
+
 def _nodes_that_stopped_reporting() -> frozenset[str]:
     """Nodes whose capacity snapshot has gone stale (best-effort)."""
     from docie_bench.serving.catalog import ModelCatalog
@@ -297,7 +317,10 @@ async def serving_resources() -> dict[str, Any]:
         # Every node that has published, newest measurement first. Reading the
         # list rather than "the" snapshot is what keeps this view honest once a
         # second node reports: it describes ONE machine, and says which.
-        snapshots = catalog.list_node_snapshots()
+        # Capacity-bearing nodes only: a node staged by a desired-state write
+        # has published no measurement, so counting it here would claim the
+        # fleet has capacity nobody has measured.
+        snapshots = _capacity_reporting(catalog.list_node_snapshots())
         node_count = len(snapshots)
         if not snapshots:
             detail = (
@@ -374,7 +397,7 @@ def _sizing_inputs() -> tuple[
     try:
         catalog = ModelCatalog()
         models = catalog.list()
-        snapshots = catalog.list_node_snapshots()
+        snapshots = _capacity_reporting(catalog.list_node_snapshots())
         placements = list(catalog.list_placements())
     except CatalogUnavailableError:
         return [], None, [], "observed state unavailable: DATABASE_URL is not configured"
