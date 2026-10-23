@@ -707,29 +707,47 @@ class ServingReconciler:
             plan.to_stop,
             plan.to_remove,
         )
-        self._apply_plan(plan, specs)
-        write_applied_state(
-            AppliedState(generation=int(generation or 0), names=frozenset(desired))
-        )
+        if self._apply_plan(plan, specs):
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+        else:
+            # Leave the applied generation where it is, so the NEXT cycle
+            # re-plans and retries. Recording it here would mean a single
+            # transient failure -- a port briefly held, a GGUF on a slow disk
+            # -- wedges the deployment until somebody writes desired state
+            # again, because the generations would match and the decision
+            # would be NOTHING forever. A reconciler that gives up after one
+            # attempt is not reconciling.
+            logger.warning(
+                "desired generation %s only partly applied; retrying next cycle",
+                generation,
+            )
         return decision
 
-    def _apply_plan(self, plan: object, specs: dict[str, dict[str, Any]]) -> None:
-        """Carry out a convergence plan, one deployment at a time.
+    def _apply_plan(self, plan: object, specs: dict[str, dict[str, Any]]) -> bool:
+        """Carry out a convergence plan, returning whether ALL of it succeeded.
 
         Each action is contained: one deployment that refuses to stop must not
         prevent the rest of the plan, and the next cycle re-plans from what
         actually happened rather than from what was intended.
 
+        The return value is what keeps that promise. The caller records the
+        applied generation only on full success, so anything that failed is
+        attempted again next cycle instead of being treated as done.
+
         Starts go through the injected deployer, which is the control plane's
         own deploy path -- resolving a store entry, allocating a port and
         blocking on readiness is not work the repair loop should reimplement.
-        With no deployer injected the starts are logged rather than dropped, so
-        a misconfigured loop is visible instead of quietly doing half its job.
+        With no deployer injected a start cannot be performed, which counts as
+        NOT applied: logging it and recording the generation anyway would mean
+        wiring the deployer later never retries the starts it had missed.
 
         Stops and removals are ordered after starts on purpose: converging
         towards MORE capacity before less means a generation that replaces one
         deployment with another never leaves the model unserved in between.
         """
+        ok = True
         for name in getattr(plan, "to_start", ()):
             if self._deployer is None:
                 logger.warning(
@@ -737,21 +755,26 @@ class ServingReconciler:
                     "deploy it on this node",
                     name,
                 )
+                ok = False
                 continue
             try:
                 self._deployer(name, specs.get(name, {}))
             except Exception:  # noqa: BLE001 - one failure must not stall the plan
                 logger.warning("desired-state start of %s failed", name, exc_info=True)
+                ok = False
         for name in getattr(plan, "to_stop", ()):
             try:
                 self.supervisor.stop(name)
             except Exception:  # noqa: BLE001 - one failure must not stall the plan
                 logger.warning("desired-state stop of %s failed", name, exc_info=True)
+                ok = False
         for name in getattr(plan, "to_remove", ()):
             try:
                 self.supervisor.remove(name)
             except Exception:  # noqa: BLE001 - same containment
                 logger.warning("desired-state removal of %s failed", name, exc_info=True)
+                ok = False
+        return ok
 
     def _observe_locked(self) -> list[ObservedDeployment]:
         records = self.supervisor.records()
