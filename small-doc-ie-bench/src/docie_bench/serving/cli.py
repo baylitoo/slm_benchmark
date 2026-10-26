@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import textwrap
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -304,6 +305,38 @@ def create_app(
         _execute(ctx, lambda plane: plane.plan(model, runtime=runtime, replicas=replicas))
 
     @app.command()
+    def doctor(
+        ctx: typer.Context,
+        probe_ports: bool = typer.Option(
+            True, help="Try binding the deploy port window to see what is already held."
+        ),
+        probe_inngest: bool = typer.Option(
+            True, help="Open a TCP connection to INNGEST_BASE_URL."
+        ),
+    ) -> None:
+        """Check whether THIS machine is correctly configured as a fleet node.
+
+        Run it before a new node takes traffic, and again after changing its
+        .env. Exits non-zero when a check FAILS, so a bringup script can gate
+        on it:
+
+            docie-serving doctor && docker compose -f docker-compose.serving-node.yml up -d
+
+        Every check corresponds to a misconfiguration that is otherwise silent
+        or presents as a wrong answer rather than an error -- see
+        serving/preflight.py for why each one is worth a probe.
+        """
+        from docie_bench.serving.preflight import Severity, collect_facts, evaluate, worst
+
+        checks = evaluate(collect_facts(probe_ports=probe_ports, probe_inngest=probe_inngest))
+        if _state(ctx).json_output:
+            _emit(ctx, [check.as_dict() for check in checks])
+        else:
+            _render_checks(checks)
+        if worst(checks) is Severity.FAIL:
+            raise typer.Exit(code=1)
+
+    @app.command()
     def gateway(
         host: str = typer.Option("127.0.0.1", help="Bind address."),
         port: int = typer.Option(8080, min=1, max=65535, help="Port for the unified endpoint."),
@@ -498,6 +531,29 @@ def _execute(
     _render(result, json_output=state.json_output)
     if hint is not None and not state.json_output:
         typer.echo(hint(result))
+
+
+_SEVERITY_MARKS = {"pass": "ok  ", "info": "note", "warn": "WARN", "fail": "FAIL"}
+
+
+def _render_checks(checks: Sequence[object]) -> None:
+    """One line per verdict, with the consequence indented under the bad ones.
+
+    Consequences are sentences rather than codes on purpose: the operator
+    reading this is usually bringing up their first second node, and "WARN
+    desired-state apply" on its own tells them nothing about what will not
+    happen.
+    """
+    width = max((len(str(getattr(check, "name", ""))) for check in checks), default=0)
+    for check in checks:
+        severity = getattr(getattr(check, "severity", None), "value", "info")
+        mark = _SEVERITY_MARKS.get(str(severity), "note")
+        name = str(getattr(check, "name", ""))
+        typer.echo(f"{mark}  {name:<{width}}  {getattr(check, 'detail', '')}")
+        consequence = str(getattr(check, "consequence", "") or "")
+        if consequence and severity in {"warn", "fail"}:
+            for line in textwrap.wrap(consequence, width=84):
+                typer.echo(f"      {' ' * width}  {line}")
 
 
 def _emit(ctx: typer.Context, value: object) -> None:
