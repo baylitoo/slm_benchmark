@@ -519,6 +519,7 @@ def test_publish_observed_updates_and_creates_rows() -> None:
     catalog = ModelCatalog()
     view = catalog.publish_observed(
         "invoice",
+        node_id="testnode",
         engine="llama-server",
         state="ready",
         endpoint="http://serving:8090/v1",
@@ -536,6 +537,7 @@ def test_publish_observed_updates_and_creates_rows() -> None:
 
     view = catalog.publish_observed(
         "invoice",
+        node_id="testnode",
         engine="llama-server",
         state="failed",
         endpoint="",
@@ -556,6 +558,7 @@ def test_publish_observed_round_trips_slot_count() -> None:
     catalog = ModelCatalog()
     view = catalog.publish_observed(
         "invoice",
+        node_id="testnode",
         engine="llama-server",
         state="ready",
         endpoint="http://serving:8090/v1",
@@ -573,6 +576,7 @@ def test_publish_observed_round_trips_slot_count() -> None:
     # slot count from the last time it was hot (same policy as throughput).
     view = catalog.publish_observed(
         "invoice",
+        node_id="testnode",
         engine="llama-server",
         state="cold",
         endpoint="",
@@ -643,6 +647,7 @@ def test_migration_adds_observed_columns_to_a_legacy_table(tmp_path: Path) -> No
         "throughput_measured_at",
         "throughput_source",
         "slot_count",
+        "node_id",
     ]
     columns = {column["name"] for column in sa_inspect(engine).get_columns("model_placement")}
     assert {"phase", "pid", "rss_bytes", "health_ok", "last_probe_at", "last_error"} <= columns
@@ -654,6 +659,7 @@ def test_migration_adds_observed_columns_to_a_legacy_table(tmp_path: Path) -> No
     try:
         ModelCatalog().publish_observed(
             "legacy",
+            node_id="testnode",
             engine="llama-server",
             state="ready",
             endpoint="http://serving:8088/v1",
@@ -1397,6 +1403,7 @@ def test_publish_observed_never_clobbers_a_fresher_write() -> None:
     stamp_before_ready = dt.datetime.now(dt.UTC)
     catalog.publish_observed(
         "dep",
+        node_id="testnode",
         engine="llama-server",
         state="ready",
         endpoint="http://x:8090/v1",
@@ -1414,6 +1421,7 @@ def test_publish_observed_never_clobbers_a_fresher_write() -> None:
     # The stale cycle snapshot (taken before the load) arrives late: skipped.
     catalog.publish_observed(
         "dep",
+        node_id="testnode",
         engine="llama-server",
         state="stopped",
         endpoint="",
@@ -1433,6 +1441,7 @@ def test_publish_observed_never_clobbers_a_fresher_write() -> None:
     # The NEXT cycle's genuinely fresh observation applies normally.
     catalog.publish_observed(
         "dep",
+        node_id="testnode",
         engine="llama-server",
         state="stopped",
         endpoint="",
@@ -1447,3 +1456,80 @@ def test_publish_observed_never_clobbers_a_fresher_write() -> None:
     row = catalog.get_placement("dep")
     assert row is not None
     assert row["phase"] == "evicted"
+
+
+@pytest.mark.usefixtures("_sqlite_catalog")
+def test_a_placement_records_the_node_that_runs_it() -> None:
+    """Ownership is observed, not declared: the publisher is the process
+    holding the runtime's handle (#530)."""
+    catalog = ModelCatalog()
+
+    view = catalog.publish_observed(
+        "invoice",
+        node_id="ovh-cpu-02",
+        engine="llama-server",
+        state="ready",
+        endpoint="http://10.8.0.3:8090/v1",
+        phase="hot",
+        pid=4242,
+        pid_create_time=111.0,
+        rss_bytes=2_000_000_000,
+        health_ok=True,
+        last_error=None,
+    )
+
+    assert view["node_id"] == "ovh-cpu-02"
+    (stored,) = [p for p in catalog.list_placements() if p["name"] == "invoice"]
+    assert stored["node_id"] == "ovh-cpu-02"
+
+
+@pytest.mark.usefixtures("_sqlite_catalog")
+def test_a_stale_observation_cannot_claim_a_deployment_from_its_node() -> None:
+    """The monotonic guard covers ownership too.
+
+    Two nodes publishing the same deployment name is the collision #530 exists
+    to remove, but until deployment identities are minted it remains possible
+    -- and when it happens the node whose observation is FRESHER must win, not
+    whichever write lands last. Otherwise an older snapshot would point the
+    endpoint at one node while naming the other as owner, which is a row no
+    reader could interpret.
+    """
+    import datetime as dt
+
+    catalog = ModelCatalog()
+    fresh = dt.datetime.now(dt.UTC)
+    stale = fresh - dt.timedelta(minutes=5)
+
+    catalog.publish_observed(
+        "invoice",
+        node_id="node-a",
+        engine="llama-server",
+        state="ready",
+        endpoint="http://10.8.0.2:8090/v1",
+        phase="hot",
+        pid=1,
+        pid_create_time=1.0,
+        rss_bytes=1,
+        health_ok=True,
+        last_error=None,
+        probed_at=fresh,
+    )
+
+    view = catalog.publish_observed(
+        "invoice",
+        node_id="node-b",
+        engine="llama-server",
+        state="ready",
+        endpoint="http://10.8.0.3:8090/v1",
+        phase="hot",
+        pid=2,
+        pid_create_time=2.0,
+        rss_bytes=2,
+        health_ok=True,
+        last_error=None,
+        probed_at=stale,
+    )
+
+    # The stale publish is discarded whole -- owner and endpoint stay together.
+    assert view["node_id"] == "node-a"
+    assert view["endpoint"] == "http://10.8.0.2:8090/v1"

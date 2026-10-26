@@ -673,6 +673,7 @@ def test_resources_endpoint_serves_snapshot_and_source_flag() -> None:
     )
     catalog.publish_observed(
         "invoice",
+        node_id="testnode",
         engine="llama-server",
         state="ready",
         endpoint="http://serving:8090/v1",

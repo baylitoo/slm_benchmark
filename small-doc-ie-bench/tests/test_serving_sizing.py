@@ -717,6 +717,7 @@ def test_sizing_endpoint_reserves_loading_placements() -> None:
     )
     catalog.publish_observed(
         "small",  # placement name == store name => model_name auto-linked
+        node_id="testnode",
         engine="llama-server",
         state="starting",
         endpoint="",
