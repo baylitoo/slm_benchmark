@@ -333,28 +333,138 @@ placement immediately while the first publish is up to one cycle away.
 `missing` and `unreported` are separate for the same reason — one means
 re-seed, the other means wait.
 
-### What still is not
+### Aiming an operation at a node
 
-```{important}
-Seeds and deploys are dispatched as Inngest events on the shared
-`docie-serving` app, so they are delivered to whichever serving node Inngest
-picks and **cannot be aimed at a node**.
+A deploy can now be addressed. `POST /v1/studio/deploy` takes an optional
+`node_id`, and a targeted deploy is recorded as **desired state owned by that
+node** rather than fired as an event. Only that node's reconciler reads it.
+
+It is validated before anything is written, because each mistake is otherwise
+silent: an unknown node produces a row nothing will ever read, a node that
+stopped reporting will not converge, and a node without the model's blob fails
+the deploy for a reason the Studio does not show — the catalog knows the model
+globally while the blob store is node-local.
+
+```{note}
+A targeted deploy has no realtime progress stream: the node converges on its
+own schedule, so the response carries `channel: null`. A caller must treat that
+as "no progress to follow" rather than waiting on it. Untargeted deploys still
+return a channel.
 ```
 
-Until node-scoped desired state lands, both are done per node from its own
-shell:
+Omitting `node_id` keeps the previous behaviour exactly — an event on the
+shared `docie-serving` app, delivered to whichever node Inngest picks. That is
+correct for a single node, which is why targeting is opt-in.
+
+**Seeding still cannot be aimed.** `serving/seed.requested` is an ordinary
+event on that same shared app, and the blob store is node-local, so a model
+must be seeded on each node that will serve it:
 
 ```
 docie-serving store seed-ollama <ref> --name <name> --family <family>
+docie-serving store list
+```
+
+`/v1/serving/store` reports where each blob actually is, so the result is
+checkable rather than guessed. `missing` means re-seed that node;
+`unreported` means it has not published its store yet.
+
+The CLI deploy path remains available and is unchanged:
+
+```
 docie-serving up <name> --deployment-name <name>-<node>
 ```
 
-`--deployment-name` matters: the record name defaults to the store name, which
-is not unique across nodes, and `model_placement.name` is the primary key — two
-nodes using the same name means the second publish overwrites the first and one
-replica goes unroutable while still holding its RAM. The scale path mints names
-to avoid this; the direct path keeps the store name so single-node use is
-unchanged, and offers the override.
+`--deployment-name` matters there: the record name defaults to the store name,
+which is not unique across nodes, and `model_placement.name` is the primary
+key — two nodes using the same name means the second publish overwrites the
+first and one replica goes unroutable while still holding its RAM. The
+targeted and scale paths mint names to avoid this; the direct path keeps the
+store name so single-node use is unchanged, and offers the override.
 
-Logs are also still read from the local serving home, so diagnosing a remote
-node means reaching that node rather than the Studio.
+**Logs are still read from the local serving home**, so a lifecycle action on
+a deployment owned by another node answers with a `409` naming that node
+rather than acting on it. Diagnosing a remote node means reaching that node.
+
+## Desired state
+
+Postgres holds the authoritative global desired state; each node keeps
+`deployments.json` as its local snapshot. The split is deliberate — the local
+file is what lets a node keep repairing and serving with no database, which is
+the requirement that the control plane must never become a dependency for an
+already-running model.
+
+A desired row is keyed `(node_id, name)`, so it belongs to exactly one node and
+moving a deployment between nodes is a delete here and an insert there rather
+than a mutation. **A removal is a DELETE, not a state**: "should not be
+running" and "no longer desired at all" call for different actions, so they are
+represented differently.
+
+### Two generation counters
+
+They answer different questions and are bumped in the same transaction, so they
+cannot disagree.
+
+| | Where | For |
+|---|---|---|
+| per row | `serving_desired_deployment.generation` | concurrency between *writers* — every write carries the generation it read, and a mismatch loses, so two API calls racing on one deployment cannot interleave |
+| per node | `serving_node.desired_generation` | staleness for the *reader* — it lets a node decide in one read whether the catalog is provably current for it |
+
+### Why "the catalog is authoritative" is not enough
+
+Three situations look identical to a node: the catalog is readable and lists
+fewer deployments than the node is running.
+
+1. An operator genuinely removed one while this node was partitioned.
+2. The node is pointed at the wrong database, or a fresh one — a
+   `DOCIE_DB_HOST` typo reaching another stack's Postgres.
+3. The rows were lost to a restore or a migration.
+
+Only the first should converge. A node that treats *readable* as
+*authoritative* tears down every model it is serving in the other two, with no
+error anywhere, because it believes it is converging correctly.
+
+So the test is not readability but whether the catalog is provably **current
+for this node** — a generation strictly newer than the one the node last
+applied. A wrong database cannot produce that, because it has never seen this
+node's id. Everything else holds: keep serving, change nothing, say why.
+
+```{important}
+`HOLD` is a third outcome, not an error and not a no-op. Teardown is
+unreachable from it, and no teardown is ever derived from a row's *absence* —
+only from a complete snapshot at a newer generation.
+```
+
+A node that has never published is **new**, not gone; a node with no desired
+state yet is **ordinary**, not suspicious. Both are distinguished from the
+dangerous cases by the node's own record of what it last applied, persisted in
+`DOCIE_SERVING_HOME` beside `deployments.json` so it shares that file's
+lifecycle.
+
+### What a node removes
+
+Only deployments it previously created **from desired state**. A node also
+holds deployments the catalog was never told about — `docie-serving up` creates
+one directly — so "local but not desired" would tear those down on the first
+pass. The allow-list is remembered rather than inferred.
+
+### Applying is opt-in
+
+```
+DOCIE_SERVING_DESIRED_APPLY=1
+```
+
+Unset, the reconciler still reads its desired state, decides, and **logs the
+plan it would apply** without carrying it out. This is the only path in the
+serving role that can stop a model nobody asked it to stop, so desired rows can
+be written and their consequences read off the logs before anything acts.
+
+Inert in a second sense too: with nothing written, every node sees no
+generation against an applied zero, which reads as "nothing written for this
+node yet". An existing single-node stack is unaffected either way.
+
+Starts are converged before stops and removals, so a generation that replaces
+one deployment with another never leaves the model unserved in between. A
+generation is recorded as applied only when the whole plan succeeded —
+otherwise the next cycle re-plans and retries, because a reconciler that gives
+up after one attempt is not reconciling.
