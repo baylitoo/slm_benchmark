@@ -9,6 +9,7 @@ import {
   ChevronDown,
   ChevronRight,
   AlertCircle,
+  Network,
 } from "lucide-react";
 import {
   getPorts,
@@ -18,7 +19,6 @@ import {
   type PortsView as PortsViewData,
   type TriggerResponse,
 } from "@/lib/api";
-import { Network } from "lucide-react";
 import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
 import { T } from "@/lib/i18n";
