@@ -250,34 +250,71 @@ def test_replica_deployment_name_first_is_bare() -> None:
     assert replica_deployment_name("qwen", 3) == "qwen-3"
 
 
-def test_count_replica_deployments_matches_base_and_suffixed() -> None:
-    existing = ["qwen", "qwen-2", "qwen-vl", "other", "qwen-3"]
-    # "qwen-vl" is a DIFFERENT model, not a numeric replica of "qwen".
-    assert count_replica_deployments("qwen", existing) == 3
+def _rec(name: str, alias: str | None = None) -> dict[str, object]:
+    """A deployment record as the control plane serialises it.
+
+    ``alias`` is what makes two records replicas of each other (#530); it
+    defaults to the name, which is what a bare deploy produces.
+    """
+    return {"spec": {"name": name, "launch": {"alias": alias or name}}}
+
+
+def test_count_replica_deployments_groups_by_launch_alias() -> None:
+    base = "lfm2.5-350m"
+    existing = [
+        _rec(base, base),
+        _rec(f"{base}-2", base),
+        _rec(f"{base}-3", base),
+        # Same model family, deployed on its own: a different alias, so not a
+        # replica of `base` however similar the name looks.
+        _rec("lfm2.5-350m-vision"),
+        _rec("other"),
+    ]
+
+    assert count_replica_deployments(base, existing) == 3
     assert count_replica_deployments("other", existing) == 1
     assert count_replica_deployments("absent", existing) == 0
 
 
+def test_a_deployment_named_like_a_replica_is_not_counted_as_one() -> None:
+    """The mis-count the name regex used to produce (#530).
+
+    A deployment a user deliberately named ``<base>-2`` carries its own alias,
+    so it is its own model and must not inflate ``base``'s replica count --
+    which would silently scale ``base`` one instance short of the target.
+    """
+    base = "lfm2.5-350m"
+    impostor = _rec(f"{base}-2")  # alias defaults to its own name
+
+    assert count_replica_deployments(base, [impostor]) == 0
+    # And the name being taken is still respected when allocating.
+    assert replica_names_to_add(base, [impostor], 2) == [base, f"{base}-3"]
+
+
 def test_replica_names_to_add_from_zero() -> None:
-    assert replica_names_to_add("qwen", [], 3) == ["qwen", "qwen-2", "qwen-3"]
+    base = "lfm2.5-350m"
+    assert replica_names_to_add(base, [], 3) == [base, f"{base}-2", f"{base}-3"]
 
 
 def test_replica_names_to_add_is_idempotent_and_skips_taken() -> None:
-    existing = ["qwen", "qwen-2"]
+    base = "lfm2.5-350m"
+    existing = [_rec(base, base), _rec(f"{base}-2", base)]
     # Already 2 → scaling to 3 adds exactly one, the next free suffix.
-    assert replica_names_to_add("qwen", existing, 3) == ["qwen-3"]
+    assert replica_names_to_add(base, existing, 3) == [f"{base}-3"]
     # Already at target → nothing.
-    assert replica_names_to_add("qwen", existing, 2) == []
+    assert replica_names_to_add(base, existing, 2) == []
     # Below current → never removes; returns [].
-    assert replica_names_to_add("qwen", existing, 1) == []
+    assert replica_names_to_add(base, existing, 1) == []
 
 
 def test_replica_names_to_add_avoids_unrelated_and_gapped_names() -> None:
-    # "qwen-2" already counts as one replica (current=1); scaling to 2 total
-    # adds exactly one — the free BASE name "qwen", not another suffix.
-    assert replica_names_to_add("qwen", ["qwen-2", "zzz"], 2) == ["qwen"]
-    # Scaling to 3 with only "qwen-2" present fills base then the next free suffix.
-    assert replica_names_to_add("qwen", ["qwen-2", "zzz"], 3) == ["qwen", "qwen-3"]
+    base = "lfm2.5-350m"
+    # One replica exists under a suffixed name (current=1); scaling to 2 total
+    # adds exactly one — the free BASE name, not another suffix.
+    existing = [_rec(f"{base}-2", base), _rec("zzz")]
+    assert replica_names_to_add(base, existing, 2) == [base]
+    # Scaling to 3 fills the base name then the next free suffix.
+    assert replica_names_to_add(base, existing, 3) == [base, f"{base}-3"]
 
 
 def test_up_deployment_name_overrides_record_but_keeps_base_alias(tmp_path: Path) -> None:

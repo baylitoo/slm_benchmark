@@ -473,8 +473,17 @@ def test_scale_at_target_is_a_no_op_in_both_directions(
 
 
 def test_replica_names_to_remove_orders_and_bounds() -> None:
-    existing = [MODEL, f"{MODEL}-2", f"{MODEL}-5", "nuextract3"]
-    # Gap-tolerant: highest suffix first, unrelated names untouched.
+    def _rec(name: str, alias: str | None = None) -> dict[str, object]:
+        return {"spec": {"name": name, "launch": {"alias": alias or name}}}
+
+    existing = [
+        _rec(MODEL, MODEL),
+        _rec(f"{MODEL}-2", MODEL),
+        _rec(f"{MODEL}-5", MODEL),
+        _rec("nuextract3"),
+    ]
+    # Group membership is the alias; the suffix only orders the victims, so
+    # this stays gap-tolerant and leaves other models untouched.
     assert replica_names_to_remove(MODEL, existing, 2) == [f"{MODEL}-5"]
     assert replica_names_to_remove(MODEL, existing, 1) == [f"{MODEL}-5", f"{MODEL}-2"]
     # At/above target: nothing to remove (idempotent).
