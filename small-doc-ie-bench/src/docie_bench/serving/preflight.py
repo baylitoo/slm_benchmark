@@ -86,6 +86,11 @@ class NodeFacts:
     serving_home: str = ""
     serving_home_writable: bool = True
     node_id: str | None = None
+    #: Where the id came from: "env", "persisted", "generated", or "" when
+    #: unknown. An operator needs to know which, because a generated id means
+    #: THIS call minted it -- the doctor persists one on a fresh node, exactly
+    #: as the reconciler's first publish would.
+    node_id_source: str = ""
     advertise_host: str = ""
     #: Addresses ``advertise_host`` resolves to here; None when it does not
     #: resolve at all.
@@ -157,7 +162,16 @@ def _node_id_check(facts: NodeFacts) -> Check:
             "unroutable while still holding its RAM. Give this node a unique "
             "DOCIE_SERVING_NODE_ID.",
         )
-    return Check("node id", Severity.PASS, facts.node_id)
+    source = {
+        "env": "from DOCIE_SERVING_NODE_ID",
+        "persisted": "persisted in the serving home",
+        "generated": "generated and persisted just now",
+    }.get(facts.node_id_source, "")
+    return Check(
+        "node id",
+        Severity.PASS,
+        f"{facts.node_id} ({source})" if source else facts.node_id,
+    )
 
 
 def _advertise_check(facts: NodeFacts) -> Check:
@@ -273,7 +287,12 @@ def _ports_check(facts: NodeFacts) -> Check:
         )
     held = facts.ports_in_use
     if held is None:
-        return Check("port window", Severity.INFO, f"{start}-{end} (not probed)")
+        return Check(
+            "port window",
+            Severity.INFO,
+            f"{start}-{end} (not probed; pass --probe-ports inside the "
+            f"serving container to check it)",
+        )
     if held:
         return Check(
             "port window",
@@ -283,7 +302,10 @@ def _ports_check(facts: NodeFacts) -> Check:
             "The allocator skips a bound port, so this only costs capacity -- "
             "unless the port is held by something OUTSIDE this container, in "
             "which case the published range and the allocatable range "
-            "disagree and a deploy can record an endpoint nothing reaches.",
+            "disagree and a deploy can record an endpoint nothing reaches. "
+            "Only trust this when the doctor ran INSIDE the serving container: "
+            "on the host it probes a different network namespace and reports "
+            "conflicts the runtime would never see.",
         )
     return Check("port window", Severity.PASS, f"{start}-{end}, all free")
 
@@ -387,12 +409,18 @@ def _ports_held(bind_host: str, start: int, end: int, *, limit: int = 32) -> tup
     return tuple(held)
 
 
-def collect_facts(*, probe_ports: bool = True, probe_inngest: bool = True) -> NodeFacts:
+def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> NodeFacts:
     """Gather what :func:`evaluate` judges, from this machine.
 
     Every probe is contained: an unreachable database or a DNS failure leaves
     its own fields unknown and lets every other check report. A doctor that
     says nothing because one probe failed is worse than no doctor.
+
+    ``probe_ports`` is off by default because binding the deploy window only
+    means something in the serving container's own network namespace. Run from
+    the host it would report ports held on unrelated interfaces as conflicts
+    the runtime will never see, and a check that cries wolf on first use costs
+    the credibility of every check beside it.
     """
     from docie_bench.serving.paths import serving_home
     from docie_bench.settings import get_settings
@@ -410,12 +438,27 @@ def collect_facts(*, probe_ports: bool = True, probe_inngest: bool = True) -> No
         writable = False
 
     node_id: str | None = None
+    node_id_source = ""
     try:
-        from docie_bench.serving.node_identity import resolve_node_id
+        from docie_bench.serving.node_identity import (
+            NODE_ID_ENV_VAR,
+            node_id_path,
+            resolve_node_id,
+        )
 
+        # Established BEFORE resolving, because resolving a fresh node mints and
+        # persists an id -- so afterwards "generated" and "persisted" look the
+        # same on disk.
+        if os.getenv(NODE_ID_ENV_VAR, "").strip():
+            node_id_source = "env"
+        elif node_id_path().exists():
+            node_id_source = "persisted"
+        else:
+            node_id_source = "generated"
         node_id = resolve_node_id()
     except Exception:  # noqa: BLE001 - an unresolvable id is itself a finding
         node_id = None
+        node_id_source = ""
 
     advertise = str(getattr(settings, "serving_advertise_host", "") or "")
     bind_host = os.getenv("DOCIE_SERVING_BIND_HOST", "0.0.0.0")  # noqa: S104
@@ -471,6 +514,7 @@ def collect_facts(*, probe_ports: bool = True, probe_inngest: bool = True) -> No
         serving_home=str(home),
         serving_home_writable=writable,
         node_id=node_id,
+        node_id_source=node_id_source,
         advertise_host=advertise,
         advertise_resolved=_resolve(advertise) if advertise else None,
         local_addresses=_local_addresses(),

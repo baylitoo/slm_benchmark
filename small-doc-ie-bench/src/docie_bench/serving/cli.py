@@ -308,7 +308,12 @@ def create_app(
     def doctor(
         ctx: typer.Context,
         probe_ports: bool = typer.Option(
-            True, help="Try binding the deploy port window to see what is already held."
+            False,
+            help=(
+                "Try binding the deploy port window. Only meaningful INSIDE the "
+                "serving container -- on the host it probes a different network "
+                "namespace."
+            ),
         ),
         probe_inngest: bool = typer.Option(
             True, help="Open a TCP connection to INNGEST_BASE_URL."

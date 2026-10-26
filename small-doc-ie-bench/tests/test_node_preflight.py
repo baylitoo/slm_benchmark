@@ -297,6 +297,79 @@ def test_a_free_port_window_is_detected_by_binding_it(
     assert facts.ports_in_use == (port,)
 
 
+def test_the_port_probe_is_off_by_default_because_it_is_container_only() -> None:
+    """Binding the deploy window only means something in the serving
+    container's own network namespace. Run from the host it reports ports held
+    on unrelated interfaces as conflicts the runtime will never see, and a
+    check that cries wolf on first use costs the credibility of every check
+    beside it."""
+    import inspect
+
+    default = inspect.signature(collect_facts).parameters["probe_ports"].default
+
+    assert default is False
+
+
+def test_an_unprobed_port_window_says_how_to_probe_it(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+
+    facts = collect_facts(probe_inngest=False)
+
+    assert facts.ports_in_use is None
+    assert "--probe-ports" in _check(facts, "port window").detail  # type: ignore[attr-defined]
+
+
+def test_a_generated_node_id_says_that_this_call_minted_it(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The doctor persists an id on a fresh node, exactly as the reconciler's
+    first publish would. An operator should see which of the three it got
+    rather than reading a hex string of unknown origin."""
+    from docie_bench.serving.node_identity import resolve_node_id
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+    monkeypatch.delenv("DOCIE_SERVING_NODE_ID", raising=False)
+    resolve_node_id.cache_clear()
+    try:
+        first = collect_facts(probe_inngest=False)
+        resolve_node_id.cache_clear()
+        second = collect_facts(probe_inngest=False)
+    finally:
+        resolve_node_id.cache_clear()
+
+    assert first.node_id_source == "generated"
+    # The id is now on disk, so the next run reports it as persisted -- and it
+    # is the SAME id, which is the property that matters.
+    assert second.node_id_source == "persisted"
+    assert second.node_id == first.node_id
+    assert "generated and persisted just now" in _check(first, "node id").detail  # type: ignore[attr-defined]
+
+
+def test_an_explicit_node_id_is_reported_as_coming_from_the_environment(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env var wins over the persisted file, so an operator who sets it
+    after a first doctor run is not silently stuck with a generated id."""
+    from docie_bench.serving.node_identity import resolve_node_id
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+    monkeypatch.delenv("DOCIE_SERVING_NODE_ID", raising=False)
+    resolve_node_id.cache_clear()
+    collect_facts(probe_inngest=False)  # mints and persists one
+
+    monkeypatch.setenv("DOCIE_SERVING_NODE_ID", "ovh-cpu-07")
+    resolve_node_id.cache_clear()
+    try:
+        facts = collect_facts(probe_inngest=False)
+    finally:
+        resolve_node_id.cache_clear()
+
+    assert facts.node_id == "ovh-cpu-07"
+    assert facts.node_id_source == "env"
+
+
 def test_the_report_is_stable_so_a_bringup_script_can_diff_it() -> None:
     """Order is part of the contract: what the node is, then whether the fleet
     can see it, then what it will actually do."""

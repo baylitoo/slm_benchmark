@@ -38,8 +38,12 @@ throughout.
 
    ```
    docker compose -f docker-compose.serving-node.yml run --rm serving \
-     docie-serving doctor
+     docie-serving doctor --probe-ports
    ```
+
+   `--probe-ports` is worth passing here and only here: binding the
+   deploy window means something in the serving container's own network
+   namespace, and nothing on the host.
 
 3. **Start it:**
 

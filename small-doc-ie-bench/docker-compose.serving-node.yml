@@ -10,7 +10,7 @@
 # Check the node BEFORE it takes traffic, and again after editing its .env:
 #
 #   docker compose -f docker-compose.serving-node.yml run --rm serving \
-#     docie-serving doctor
+#     docie-serving doctor --probe-ports
 #
 # It exits non-zero on a configuration that cannot work, and warns about the
 # ones that otherwise present as a wrong answer rather than an error -- an
