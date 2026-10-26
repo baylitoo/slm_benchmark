@@ -43,6 +43,7 @@
 
 export * from "./core";
 export * from "./extract";
+export * from "./fleet";
 export * from "./serving";
 export * from "./lifecycle";
 export * from "./sizing";

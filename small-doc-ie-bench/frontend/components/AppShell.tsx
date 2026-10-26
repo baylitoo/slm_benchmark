@@ -11,6 +11,7 @@ import { Schemas } from "./Schemas";
 import { Review } from "./Review";
 import { Observability } from "./Observability";
 import { ApiKeys } from "./ApiKeys";
+import { Fleet } from "./Fleet";
 import { Sidebar } from "./shell/Sidebar";
 import { TopBar } from "./shell/TopBar";
 import { SectionActivityProvider } from "./shell/SectionActivity";
@@ -117,6 +118,7 @@ export function AppShell() {
                   {id === "benchmark" && <Benchmark view={viewFor(id)} />}
                   {id === "schemas" && <Schemas />}
                   {id === "review" && <Review active={active === "review"} />}
+                  {id === "fleet" && <Fleet active={active === "fleet"} />}
                   {id === "api-keys" && <ApiKeys active={active === "api-keys"} />}
                   {id === "observability" && (
                     <Observability active={active === "observability"} onNavigate={onNavigate} />

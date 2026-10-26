@@ -40,6 +40,21 @@ export function ModelsView({
     );
   }, [all, filter]);
 
+  // Union across ALL entries, not the current page, so paging never changes
+  // the table's shape. One known node means presence carries no information.
+  const fleetSize = useMemo(() => {
+    const ids = new Set<string>();
+    for (const m of all) {
+      const presence = m.nodes;
+      if (!presence) continue;
+      for (const id of [...presence.present, ...presence.missing, ...presence.unreported]) {
+        ids.add(id);
+      }
+    }
+    return ids.size;
+  }, [all]);
+  const showNodes = fleetSize > 1;
+
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const clampedPage = Math.min(page, pageCount);
   const paged = useMemo(
@@ -79,6 +94,16 @@ export function ModelsView({
           <span className="text-muted-foreground">—</span>
         ),
     },
+    ...(showNodes
+      ? [
+          {
+            key: "nodes",
+            header: "Nodes",
+            sortAccessor: (m: StoreEntry) => m.nodes?.present.length ?? -1,
+            render: (m: StoreEntry) => <NodePresence entry={m} />,
+          } satisfies Column<StoreEntry>,
+        ]
+      : []),
     {
       key: "size",
       header: "Size",
@@ -169,5 +194,40 @@ export function ModelsView({
         emptyDescription="Seed one from a local Ollama / HF reference via Add model — it'll show up here automatically."
       />
     </div>
+  );
+}
+
+/**
+ * Which nodes hold this model's blob.
+ *
+ * `missing` and `unreported` stay separate on purpose. "Reported, and does not
+ * have it" calls for a seed on that node; "has not reported yet" calls for
+ * waiting or checking the node. Merging them would turn not-known into
+ * not-there — and the two differ at the API too: a deploy aimed at an
+ * unreported node is accepted, one aimed at a missing node is refused.
+ */
+function NodePresence({ entry }: { entry: StoreEntry }) {
+  const presence = entry.nodes;
+  if (!presence) return <span className="text-muted-foreground">—</span>;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      {presence.present.length > 0 && (
+        <span title={`Blob present on: ${presence.present.join(", ")}`}>
+          <Badge tone="ok">{presence.present.length} present</Badge>
+        </span>
+      )}
+      {presence.missing.length > 0 && (
+        <span
+          title={`Reported without this model: ${presence.missing.join(", ")} — seed it there before deploying on it`}
+        >
+          <Badge tone="warn">{presence.missing.length} missing</Badge>
+        </span>
+      )}
+      {presence.unreported.length > 0 && (
+        <span title={`Has not reported its store yet: ${presence.unreported.join(", ")}`}>
+          <Badge tone="neutral">{presence.unreported.length} unreported</Badge>
+        </span>
+      )}
+    </span>
   );
 }
