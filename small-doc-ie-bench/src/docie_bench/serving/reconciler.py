@@ -508,6 +508,10 @@ class ServingReconciler:
         # (reset to 0), so the budget bounds crash STORMS without becoming a
         # lifetime cap. Any miss or death zeroes the streak.
         self._healthy_streak: dict[str, int] = {}
+        # Last published node snapshot, reused by the mid-plan liveness refresh
+        # so a long desired-state start does not let this node's own evidence
+        # go stale (see _heartbeat).
+        self._last_snapshot: NodeSnapshot | None = None
 
     def claim_singleton(self) -> None:
         """Claim the singleton lease before starting the loop.
@@ -568,6 +572,7 @@ class ServingReconciler:
             # injected publisher that raises (or a non-CatalogUnavailable DB
             # driver surprise) must not abort the cycle tail — the lease
             # heartbeat below is what keeps a second replica refusing.
+            self._last_snapshot = snapshot
             try:
                 self._snapshot_publisher(snapshot)
             except Exception:  # noqa: BLE001 - publish hiccup != broken cycle
@@ -789,17 +794,54 @@ class ServingReconciler:
         return ok
 
     def _heartbeat(self) -> None:
-        """Refresh the singleton lease mid-plan (best-effort).
+        """Keep this node's liveness evidence fresh mid-plan (best-effort).
 
-        Contained: a lease write that fails must not abort a convergence that
-        is otherwise succeeding -- the next cycle's own refresh is the backstop.
+        A start blocks in ``await_ready`` until the model is serving, which
+        delays the NEXT cycle -- and with it both the lease heartbeat and the
+        node snapshot publish. Two separate consequences, and the second is
+        the expensive one:
+
+        * the singleton lease goes unrefreshed, so a newly booting serving
+          container can judge it abandoned and claim it;
+        * this node's ``serving_node.updated_at`` goes stale (30s by default),
+          and the router DEMOTES placements on a node that stopped reporting
+          (#531). So loading a new model on a busy node drained traffic from
+          that node's OTHER, healthy models onto its peers -- for the whole
+          duration of the load.
+
+        The second is why the snapshot is republished rather than just the
+        lease. It is honest to do so: the staleness gate asks "has this node
+        stopped reporting", and a node part-way through a load has not. The
+        memory numbers are re-measured; the per-deployment RSS sum is carried
+        over from the last full pass, since re-deriving it would mean
+        re-recording calibration samples mid-load, which is exactly the mmap
+        ramp the tracker excludes.
+
+        Everything here is contained: this is evidence maintenance, and a
+        failure to maintain it must not abort a convergence that is otherwise
+        succeeding. The next cycle's own refresh is the backstop.
         """
-        if self._lease is None:
+        if self._lease is not None:
+            try:
+                self._lease.refresh()
+            except Exception:  # noqa: BLE001 - heartbeat hiccup != failed plan
+                logger.debug("lease heartbeat during convergence failed", exc_info=True)
+        previous = self._last_snapshot
+        if previous is None:
             return
         try:
-            self._lease.refresh()
-        except Exception:  # noqa: BLE001 - heartbeat hiccup != failed plan
-            logger.debug("lease heartbeat during convergence failed", exc_info=True)
+            memory = read_node_memory()
+            self._snapshot_publisher(
+                NodeSnapshot(
+                    total_bytes=memory.total_bytes,
+                    free_bytes=memory.free_bytes,
+                    source=memory.source,
+                    sum_rss_bytes=previous.sum_rss_bytes,
+                    reclaimable_bytes=memory.reclaimable_bytes,
+                )
+            )
+        except Exception:  # noqa: BLE001 - same containment as the lease
+            logger.debug("snapshot refresh during convergence failed", exc_info=True)
 
     def _observe_locked(self) -> list[ObservedDeployment]:
         records = self.supervisor.records()
