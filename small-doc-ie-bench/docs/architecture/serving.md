@@ -294,6 +294,37 @@ Omitting `node_id` keeps the previous behaviour exactly — an event on the
 shared `docie-serving` app, delivered to whichever node Inngest picks. That is
 correct for a single node, which is why targeting is opt-in.
 
+### Letting the platform choose
+
+`auto_place: true` ranks the nodes and picks, instead of naming one. Naming a
+node is fine when there are two; by the time there are six, "which one has room
+for this" is arithmetic the sizing engine already does per node.
+
+The ranking is four hard gates and one preference. The gates are the same
+conditions the targeted path refuses on — never reported, stopped reporting,
+drained, or missing the model's blob — repeated here because an auto-placed
+deploy has no operator reading a `409`. The one that bites is a node with a row
+and **no measurement**: its capacity fields are zeroes, which price as a
+machine with nothing on it, so a ranking that trusted the numbers would prefer
+a node that has never started over one serving perfectly.
+
+Among the nodes that pass, the emptiest wins first and headroom breaks ties.
+The fit itself is not recomputed: `sizing.compute_sizing` is called once per
+node and `fits_now` is read off it, because a second opinion about what fits
+would be a second set of bugs.
+
+**Replicas go to distinct nodes.** With `replicas: N` and `auto_place`, the
+deploy is placed on N different machines — two replicas on one node share its
+memory, its cgroup limit and its failure, so that is not what asking for two
+replicas means. A partial spread is **refused** rather than delivered: "I asked
+for 3 and got 2" is a capacity decision only the operator can make. The refusal
+names which node failed which gate, since that is what says whether to seed a
+blob, resume a drained node or add a machine.
+
+A node whose fit cannot be priced at all stays eligible but ranks below every
+node whose fit is known — unknown is neither full nor roomy, and preferring it
+would be preferring ignorance.
+
 **Seeding still cannot be aimed.** `serving/seed.requested` is an ordinary
 event on that same shared app, and the blob store is node-local, so a model
 must be seeded on each node that will serve it:

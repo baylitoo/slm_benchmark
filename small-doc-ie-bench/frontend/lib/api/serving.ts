@@ -17,6 +17,11 @@ export interface DeployRequest {
    * deploy per missing replica on auto-allocated ports — store-entry (Auto)
    * deploys only, and incompatible with an explicit name/port. */
   replicas?: number;
+  /** Let the platform choose the node by fit instead of naming one. With
+   * `replicas` > 1 the replicas are spread over DISTINCT nodes, which is the
+   * only arrangement that survives losing a machine — a partial spread is
+   * refused rather than stacked. Mutually exclusive with `node_id`. */
+  auto_place?: boolean;
   /** Pin this deployment to one serving node. Omitted, the deploy is an event
    * on the shared serving app and lands on whichever node Inngest picks — fine
    * on one machine, unaddressable on several. Set, it is written as DESIRED
