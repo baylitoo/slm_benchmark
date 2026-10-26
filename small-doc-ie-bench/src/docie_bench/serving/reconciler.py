@@ -335,6 +335,21 @@ def default_fit_check(
     return decision.fits, decision.reason
 
 
+def _desired_apply_enabled() -> bool:
+    """Whether this node may CARRY OUT a convergence plan (#534).
+
+    Off by default. This is the only path in the serving role that can stop a
+    model nobody asked it to stop, so it opts in explicitly rather than
+    arriving with a deploy.
+    """
+    return os.getenv("DOCIE_SERVING_DESIRED_APPLY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
     """Default publisher: upsert the observed rows (best-effort, DB-optional)."""
     if not observations:
@@ -567,11 +582,177 @@ class ServingReconciler:
         # The measurement lands in the sidecar and is published NEXT cycle, so
         # a slow probe never delays this cycle's honest liveness numbers.
         self._run_due_probes()
+        # Desired-state convergence (#534/#535): read THIS node's rows, decide
+        # whether the catalog is provably current for us, and act. Last in the
+        # cycle and fully contained -- the observation and repair work above is
+        # what keeps already-running models healthy, and must not be skipped
+        # because a desired-state read failed.
+        try:
+            self._converge_desired_state()
+        except Exception:  # noqa: BLE001 - convergence hiccup != broken cycle
+            logger.warning("desired-state convergence failed this cycle", exc_info=True)
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
             self._lease.refresh()
         return observations
+
+
+    # ------------------------------------------------- desired state (#534)
+    def _converge_desired_state(self) -> object:
+        """Converge this node on its own desired-state rows.
+
+        Returns the decision, for tests and for the caller's logs.
+
+        EXECUTION IS OPT-IN. With ``DOCIE_SERVING_DESIRED_APPLY`` unset the
+        plan is computed and logged and nothing is carried out, because this is
+        the one code path in the serving role that can stop a model an operator
+        did not ask it to stop. A dry run lets desired state be written and the
+        consequences read off the logs before anything acts on them.
+
+        Inert by default in a second sense too: with no writer, every node sees
+        generation ``None`` against an applied 0, which the decision table
+        reads as "nothing written for this node yet" -- so an existing
+        single-node stack is unaffected whether or not the flag is set.
+        """
+        from docie_bench.serving.applied_state import (
+            AppliedState,
+            read_applied_state,
+            write_applied_state,
+        )
+        from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+        from docie_bench.serving.convergence import (
+            ConvergeAction,
+            decide_convergence,
+            plan_convergence,
+        )
+        from docie_bench.serving.node_identity import resolve_node_id
+
+        node_id = resolve_node_id()
+        applied = read_applied_state()
+        with self.supervisor.lock:
+            # records() returns the live dict under the lock; copy the keys so
+            # nothing outside the lock reads a mutating mapping.
+            local_names = set(self.supervisor.records())
+
+        snapshot: dict[str, object] | None = None
+        try:
+            snapshot = dict(ModelCatalog().desired_snapshot(node_id))
+        except CatalogUnavailableError:
+            pass
+        except Exception:  # noqa: BLE001 - treated as unreachable, never as empty
+            logger.debug("desired-state read failed", exc_info=True)
+
+        generation = snapshot.get("generation") if snapshot else None
+        decision = decide_convergence(
+            catalog_reachable=snapshot is not None,
+            node_row_present=bool(snapshot and snapshot.get("node_known")),
+            catalog_generation=generation if isinstance(generation, int) else None,
+            applied_generation=applied.generation,
+            local_deployment_count=len(local_names),
+        )
+
+        if decision.action is not ConvergeAction.CONVERGE:
+            if decision.should_alarm:
+                logger.warning("desired state not converged: %s", decision.reason)
+            else:
+                logger.debug("desired state: %s", decision.reason)
+            return decision
+
+        rows = snapshot.get("deployments") if snapshot else []
+        desired = {
+            str(row["name"]): str(row.get("desired_state") or "running")
+            for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict) and row.get("name")
+        }
+        plan = plan_convergence(
+            desired=desired,
+            local_names=local_names,
+            previously_applied=applied.names,
+        )
+        if plan.is_empty:
+            # Still record the generation: the intent HAS been applied, and not
+            # recording it would re-decide CONVERGE on every cycle forever.
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+            return decision
+
+        if not _desired_apply_enabled():
+            logger.warning(
+                "desired-state plan NOT applied (set DOCIE_SERVING_DESIRED_APPLY=1 "
+                "to enable): start=%s stop=%s remove=%s",
+                plan.to_start,
+                plan.to_stop,
+                plan.to_remove,
+            )
+            return decision
+
+        logger.info(
+            "converging on desired generation %s: start=%s stop=%s remove=%s",
+            generation,
+            plan.to_start,
+            plan.to_stop,
+            plan.to_remove,
+        )
+        if self._apply_plan(plan):
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+        else:
+            # Leave the applied generation where it is, so the NEXT cycle
+            # re-plans and retries. Recording it here would mean a single
+            # transient failure -- a port briefly held, a GGUF on a slow disk
+            # -- wedges the deployment until somebody writes desired state
+            # again, because the generations would match and the decision
+            # would be NOTHING forever. A reconciler that gives up after one
+            # attempt is not reconciling.
+            logger.warning(
+                "desired generation %s only partly applied; retrying next cycle",
+                generation,
+            )
+        return decision
+
+    def _apply_plan(self, plan: object) -> bool:
+        """Carry out a convergence plan, returning whether ALL of it succeeded.
+
+        Each action is contained: one deployment that refuses to stop must not
+        prevent the rest of the plan, and the next cycle re-plans from what
+        actually happened rather than from what was intended.
+
+        The return value is what keeps that promise. The caller records the
+        applied generation only on full success, so anything that failed is
+        attempted again next cycle instead of being treated as done.
+
+        Starts are deliberately NOT performed here. Launching a runtime means
+        resolving a store entry, allocating a port and blocking on readiness --
+        the deploy path, which belongs to the lifecycle handlers rather than
+        the repair loop. The plan's starts are logged so the gap is visible;
+        wiring them is the remaining step of #535.
+        """
+        # No deployer on this branch: a start cannot be performed, so the plan
+        # is NOT fully applied and the generation must not be recorded.
+        unstarted = bool(getattr(plan, "to_start", ()))
+        for name in getattr(plan, "to_start", ()):
+            logger.warning(
+                "desired state wants %s started; the reconciler does not launch "
+                "runtimes (see #535) -- deploy it on this node",
+                name,
+            )
+        ok = not unstarted
+        for name in getattr(plan, "to_stop", ()):
+            try:
+                self.supervisor.stop(name)
+            except Exception:  # noqa: BLE001 - one failure must not stall the plan
+                logger.warning("desired-state stop of %s failed", name, exc_info=True)
+                ok = False
+        for name in getattr(plan, "to_remove", ()):
+            try:
+                self.supervisor.remove(name)
+            except Exception:  # noqa: BLE001 - same containment
+                logger.warning("desired-state removal of %s failed", name, exc_info=True)
+                ok = False
+        return ok
 
     def _observe_locked(self) -> list[ObservedDeployment]:
         records = self.supervisor.records()
