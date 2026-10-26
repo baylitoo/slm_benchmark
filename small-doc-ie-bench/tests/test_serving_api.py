@@ -217,11 +217,14 @@ def test_scale_fans_out_one_deploy_event_per_new_replica(
     result = _scale("qwen", 3)  # 2 → 3 adds exactly one: qwen-3
 
     assert result["current"] == 2
-    assert result["adding"] == ["qwen-3"]
+    # Minted names (#530), so assert the shape not the exact name.
+    assert len(result["adding"]) == 1
+    added = str(result["adding"][0])
+    assert added.startswith("qwen-")
     assert result["channel"] is not None
     assert result["channel"].startswith("scale:")
     # One deploy event, carrying the replica name + the base model.
-    assert [e.data["deployment_name"] for e in sent] == ["qwen-3"]  # type: ignore[attr-defined]
+    assert [e.data["deployment_name"] for e in sent] == [added]  # type: ignore[attr-defined]
     assert all(e.name == "serving/deploy.requested" for e in sent)  # type: ignore[attr-defined]
     assert all(e.data["model"] == "qwen" for e in sent)  # type: ignore[attr-defined]
 

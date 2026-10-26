@@ -287,34 +287,57 @@ def test_a_deployment_named_like_a_replica_is_not_counted_as_one() -> None:
     impostor = _rec(f"{base}-2")  # alias defaults to its own name
 
     assert count_replica_deployments(base, [impostor]) == 0
-    # And the name being taken is still respected when allocating.
-    assert replica_names_to_add(base, [impostor], 2) == [base, f"{base}-3"]
+    # It is not a replica, so scaling to 2 still mints two.
+    assert len(replica_names_to_add(base, [impostor], 2)) == 2
 
 
-def test_replica_names_to_add_from_zero() -> None:
+def test_minted_names_carry_the_model_and_are_unique() -> None:
+    """Names are minted, not positional (#530).
+
+    Positional names are unique only while ONE node allocates them: two nodes
+    each deploying `base` both chose `base`, and the second node's publish
+    overwrote the first's placement row.
+    """
     base = "lfm2.5-350m"
-    assert replica_names_to_add(base, [], 3) == [base, f"{base}-2", f"{base}-3"]
+
+    names = replica_names_to_add(base, [], 3)
+
+    assert len(names) == 3
+    assert len(set(names)) == 3
+    assert all(name.startswith(f"{base}-") for name in names)
+    # The base name itself is no longer taken by the first instance.
+    assert base not in names
 
 
-def test_replica_names_to_add_is_idempotent_and_skips_taken() -> None:
+def test_two_nodes_allocating_independently_do_not_collide() -> None:
+    """The bug this fixes. Each node sees only its own records, so with
+    positional naming both picked the same name for their first replica."""
     base = "lfm2.5-350m"
-    existing = [_rec(base, base), _rec(f"{base}-2", base)]
-    # Already 2 → scaling to 3 adds exactly one, the next free suffix.
-    assert replica_names_to_add(base, existing, 3) == [f"{base}-3"]
+
+    node_a = replica_names_to_add(base, [], 1)
+    node_b = replica_names_to_add(base, [], 1)  # a different machine, no shared view
+
+    assert node_a != node_b
+
+
+def test_replica_names_to_add_is_idempotent() -> None:
+    base = "lfm2.5-350m"
+    existing = [_rec(f"{base}-aaa111", base), _rec(f"{base}-bbb222", base)]
+    # Already 2 → scaling to 3 adds exactly one.
+    assert len(replica_names_to_add(base, existing, 3)) == 1
     # Already at target → nothing.
     assert replica_names_to_add(base, existing, 2) == []
     # Below current → never removes; returns [].
     assert replica_names_to_add(base, existing, 1) == []
 
 
-def test_replica_names_to_add_avoids_unrelated_and_gapped_names() -> None:
+def test_only_replicas_of_the_base_count_towards_the_target() -> None:
     base = "lfm2.5-350m"
-    # One replica exists under a suffixed name (current=1); scaling to 2 total
-    # adds exactly one — the free BASE name, not another suffix.
-    existing = [_rec(f"{base}-2", base), _rec("zzz")]
-    assert replica_names_to_add(base, existing, 2) == [base]
-    # Scaling to 3 fills the base name then the next free suffix.
-    assert replica_names_to_add(base, existing, 3) == [base, f"{base}-3"]
+    existing = [_rec(f"{base}-aaa111", base), _rec("zzz")]
+
+    # One replica of `base` exists, so scaling to 2 adds exactly one.
+    assert len(replica_names_to_add(base, existing, 2)) == 1
+    assert len(replica_names_to_add(base, existing, 3)) == 2
 
 
 def test_up_deployment_name_overrides_record_but_keeps_base_alias(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import logging
 import re
+import secrets
 import shutil
 import socket
 import threading
@@ -1371,12 +1372,34 @@ class _DefaultSupervisor:
         return self.backend.pin(name, pinned=pinned)
 
 
-def replica_deployment_name(base: str, index: int) -> str:
-    """The deployment (record) name for the ``index``-th replica of ``base``.
+def mint_deployment_name(base: str) -> str:
+    """A globally unique record name for a new deployment of ``base`` (#530).
 
-    The first instance (index 1) IS the bare store name so a single deploy is
-    unchanged; subsequent replicas get a ``-2``/``-3``/… suffix. This is the
-    naming convention scaling and ``count_replica_deployments`` both key on."""
+    Names used to be positional -- the first instance WAS the bare store name
+    and the rest got ``-2``/``-3`` -- which is unique only while one node
+    allocates them. Two nodes each deploying ``lfm2.5-350m`` both chose that
+    exact name, and since ``ModelPlacement.name`` is the primary key the second
+    node's publish overwrote the first's. Node A's replica became unroutable
+    while still holding its RAM: a silent capacity leak with no error anywhere.
+
+    A random suffix is unique without coordination, which is what lets the
+    allocator stay node-local and keeps the deploy path free of a database
+    read. It is also location-independent, so a deployment keeps its identity
+    if it ever moves node -- a ``<node>-<model>`` scheme would not.
+
+    The model stays legible in the name because the suffix is only appended;
+    `--alias` is unaffected (it remains the base store name, the id the runtime
+    answers to), so routing by model name is unchanged.
+    """
+    return f"{base}-{secrets.token_hex(3)}"
+
+
+def replica_deployment_name(base: str, index: int) -> str:
+    """Deprecated: positional replica naming (#530).
+
+    Kept only because existing deployments carry these names -- nothing mints
+    them any more. See :func:`mint_deployment_name`.
+    """
     return base if index <= 1 else f"{base}-{index}"
 
 
@@ -1429,22 +1452,23 @@ def replica_names_to_add(
     base: str, existing: Iterable[object], target_total: int
 ) -> list[str]:
     """The deployment names to CREATE to bring ``base`` up to ``target_total``
-    replicas, skipping any name already taken (replica of ``base`` or not).
+    replicas (#530: minted, not positional).
 
-    Returns fewer than the delta only if the search is exhausted (bounded). An
-    already-satisfied target returns ``[]`` — scaling is idempotent."""
+    An already-satisfied target returns ``[]`` — scaling is idempotent. Names
+    are minted rather than searched for, so there is no bound to exhaust and no
+    dependence on what any other node has allocated; a collision with a name
+    already on this node is re-minted rather than skipped-past.
+    """
     records = list(existing)
     taken = {deployment_name_of(record) for record in records} - {""}
-    current = count_replica_deployments(base, records)
-    delta = max(0, target_total - current)
+    delta = max(0, target_total - count_replica_deployments(base, records))
     names: list[str] = []
-    index = 1
-    while len(names) < delta and index <= 10_000:
-        candidate = replica_deployment_name(base, index)
-        if candidate not in taken:
-            names.append(candidate)
-            taken.add(candidate)
-        index += 1
+    while len(names) < delta:
+        candidate = mint_deployment_name(base)
+        if candidate in taken:  # pragma: no cover - 24 bits of entropy
+            continue
+        names.append(candidate)
+        taken.add(candidate)
     return names
 
 
@@ -1455,12 +1479,17 @@ def replica_names_to_remove(
     ``target_total`` deployments — the scale-down mirror of
     :func:`replica_names_to_add`.
 
-    Victims are picked highest suffix first (``base-3`` before ``base-2``
-    before the bare ``base``), so scaling down peels off the most recently
-    added instance and the canonical bare-name record survives while any
-    replica remains (a ``target_total >= 1`` can therefore never remove the
-    bare ``base``). Already at/below the target returns ``[]`` — scaling is
-    idempotent in both directions.
+    Victims are picked by descending name, which with minted names (#530) is
+    ARBITRARY but deterministic and idempotent. It used to mean "peel the most
+    recently added and keep the canonical bare-name record", an ordering the
+    ``-2``/``-3`` suffix carried for free. Minted names carry no order, and a
+    record has no creation stamp to substitute (``updated_at`` churns on every
+    state change), so that guarantee is genuinely gone rather than reproduced
+    badly. Legacy positional names still sort suffix-high-first, so an existing
+    deployment scales down exactly as before.
+
+    Already at/below the target returns ``[]`` — scaling is idempotent in both
+    directions.
     """
     pattern = _replica_suffix_re(base)
     matched: list[tuple[int, str]] = []
@@ -1469,9 +1498,8 @@ def replica_names_to_remove(
             continue
         candidate = deployment_name_of(record)
         found = pattern.match(candidate)
-        # Group membership comes from the alias; the suffix only orders the
-        # victims. A replica whose name does not fit the convention sorts as
-        # index 1, beside the canonical record.
+        # Legacy positional names keep their old ordering; a minted name has no
+        # index and falls back to the name itself.
         index = int(found.group(1)) if found and found.group(1) else 1
         matched.append((index, candidate))
     matched.sort(reverse=True)
