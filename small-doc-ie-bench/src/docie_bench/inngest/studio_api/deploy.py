@@ -239,6 +239,15 @@ def _target_node_deploy(
                 f"targeting it"
             ),
         )
+    if node.get("drained_at"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"serving node {payload.node_id!r} is drained, so it is out of "
+                f"the routing rotation and its reconciler stops what it is "
+                f"given. Resume it first, or target a node that is admitting"
+            ),
+        )
     held = node.get("store_models")
     if isinstance(held, list) and payload.model not in held:
         raise HTTPException(

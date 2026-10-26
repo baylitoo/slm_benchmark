@@ -336,6 +336,20 @@ def default_fit_check(
     return decision.fits, decision.reason
 
 
+def _request_timeout(record: object) -> float | None:
+    """A deployment's request timeout, or None when it declares none.
+
+    Read defensively through the chain on purpose. The whole convergence step
+    runs inside a ``try`` that logs and moves on, so an AttributeError here
+    would not surface as a bug -- it would silently disable drain while the
+    cycle kept reporting itself healthy. A timeout that cannot be read
+    contributes the floor instead, which is the same thing an absent one does.
+    """
+    launch = getattr(getattr(record, "spec", None), "launch", None)
+    timeout = getattr(launch, "timeout_seconds", None)
+    return timeout if isinstance(timeout, (int, float)) else None
+
+
 def _desired_apply_enabled() -> bool:
     """Whether this node may CARRY OUT a convergence plan (#534).
 
@@ -639,6 +653,12 @@ class ServingReconciler:
             decide_convergence,
             plan_convergence,
         )
+        from docie_bench.serving.drain import (
+            DrainPhase,
+            drain_grace_seconds,
+            drain_phase,
+            parse_drained_at,
+        )
         from docie_bench.serving.node_identity import resolve_node_id
 
         node_id = resolve_node_id()
@@ -646,7 +666,13 @@ class ServingReconciler:
         with self.supervisor.lock:
             # records() returns the live dict under the lock; copy the keys so
             # nothing outside the lock reads a mutating mapping.
-            local_names = set(self.supervisor.records())
+            records = self.supervisor.records()
+            local_names = set(records)
+            # How long a request on each deployment is allowed to take, which
+            # is how long one admitted just before a drain could still be
+            # running. Read here so the grace period and the name set come from
+            # one consistent view.
+            local_timeouts = [_request_timeout(record) for record in records.values()]
 
         snapshot: dict[str, object] | None = None
         try:
@@ -682,6 +708,27 @@ class ServingReconciler:
             desired[name] = str(row.get("desired_state") or "running")
             spec = row.get("spec")
             specs[name] = spec if isinstance(spec, dict) else {}
+        # A declared drain overrides every desired row for this node: the
+        # operator asked for the machine, not for its deployments to be
+        # re-pointed. Handled INSIDE the CONVERGE branch so it rides the same
+        # generation gate as a deletion does -- a drain read from the wrong
+        # database can no more unload this node's working set than a lost row
+        # can (see catalog.set_node_drain for why the flag bumps the
+        # generation, and convergence.decide_convergence for what that buys).
+        phase = drain_phase(
+            drained_at=parse_drained_at(snapshot.get("drained_at") if snapshot else None),
+            now=dt.datetime.now(dt.UTC),
+            grace_s=drain_grace_seconds(local_timeouts),
+        )
+        if phase is not DrainPhase.ADMITTING:
+            return self._converge_drain(
+                phase,
+                decision=decision,
+                generation=generation,
+                desired=desired,
+                local_names=local_names,
+            )
+
         plan = plan_convergence(
             desired=desired,
             local_names=local_names,
@@ -728,6 +775,92 @@ class ServingReconciler:
                 "desired generation %s only partly applied; retrying next cycle",
                 generation,
             )
+        return decision
+
+    def _converge_drain(
+        self,
+        phase: object,
+        *,
+        decision: object,
+        generation: object,
+        desired: dict[str, str],
+        local_names: set[str],
+    ) -> object:
+        """Carry out a drain on this node: wait, then stop everything.
+
+        Deliberately does NOT go through :func:`plan_convergence`. That
+        function stops only what the catalog names, and a drain is about the
+        MACHINE -- a node still running a deployment created directly with
+        ``docie up`` has not reported empty, so the acceptance criterion is not
+        met. The stop set here is every local deployment.
+
+        The applied-state write is the subtle half. It records the ORIGINAL
+        desired names, never the ones this drain stopped. ``AppliedState.names``
+        is the removal whitelist: writing a locally-created deployment into it
+        would make a later desired-row deletion eligible to remove a deployment
+        the catalog was never told about, which is exactly the teardown that
+        whitelist exists to prevent.
+        """
+        from docie_bench.serving.applied_state import AppliedState, write_applied_state
+        from docie_bench.serving.drain import DrainPhase
+
+        if phase is DrainPhase.DRAINING:
+            # Routing already excludes this node centrally, so nothing is being
+            # admitted; the runtimes stay up for whatever is still in flight.
+            #
+            # Returning WITHOUT recording the generation is what makes the
+            # second half happen. Recording it would make the next cycle decide
+            # NOTHING, and the node would sit in the grace period forever
+            # without ever stopping anything.
+            logger.info(
+                "node is draining: %d deployment(s) kept up for in-flight "
+                "requests; routing already excludes this node",
+                len(local_names),
+            )
+            return decision
+
+        if not local_names:
+            # Already empty: the drain is satisfied, and recording the
+            # generation stops the cycle re-deciding CONVERGE forever.
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+            return decision
+
+        if not _desired_apply_enabled():
+            # Same opt-in as any other convergence action. Worth logging loudly
+            # rather than silently: the operator asked for an empty node and
+            # the central half (routing exclusion) already happened, so the
+            # node looks drained from the outside while still holding its RAM.
+            logger.warning(
+                "node is drained and %d deployment(s) would be stopped, but "
+                "desired-state apply is off (set DOCIE_SERVING_DESIRED_APPLY=1); "
+                "routing already excludes this node, so it is out of the "
+                "rotation but has not released memory: %s",
+                len(local_names),
+                ", ".join(sorted(local_names)),
+            )
+            return decision
+
+        logger.info(
+            "node drained: stopping %d deployment(s): %s",
+            len(local_names),
+            ", ".join(sorted(local_names)),
+        )
+        ok = True
+        for name in sorted(local_names):
+            try:
+                self.supervisor.stop(name)
+            except Exception:  # noqa: BLE001 - one failure must not stall the rest
+                logger.warning("drain stop of %s failed", name, exc_info=True)
+                ok = False
+            self._heartbeat()
+        if ok:
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+        else:
+            logger.warning("drain only partly applied; retrying next cycle")
         return decision
 
     def _apply_plan(self, plan: object, specs: dict[str, dict[str, Any]]) -> bool:

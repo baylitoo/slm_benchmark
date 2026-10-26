@@ -217,6 +217,20 @@ class ServingNode(Base):
     # -- see serving/convergence.py for why readability is not enough. NULL
     # means no desired state has ever been written for this node.
     desired_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # When an operator declared this node drained (#536). NULL means admitting.
+    #
+    # Written CENTRALLY, like desired_generation and unlike every other column
+    # here: the node is not the authority on whether an operator wants it in
+    # the rotation. Safe against the node's own heartbeat because
+    # publish_node_snapshot upserts a fixed column whitelist that excludes it.
+    #
+    # A timestamp rather than a flag because the grace period is measured from
+    # it: a request admitted an instant before the drain may legitimately run
+    # until its timeout, so "stop admitting" and "stop the runtime" are
+    # different moments (see serving/drain.py).
+    drained_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -323,13 +337,34 @@ _SERVING_NODE_LOCK_KEY = 0x0D0C1E02
 # serving_node columns added AFTER the table first shipped on the PR-2 branch
 # (create_all never ALTERs an existing table — the documented size_bytes
 # hazard). Module-level tuple so the migration and tests agree on one list.
-_SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
-    ("reclaimable_bytes", BigInteger()),
+# (name, type, nullable). Nullability is per column because a timestamp has
+# no honest NOT NULL default: 0 would read as 1970, and "never drained" is
+# exactly the absence this column has to be able to express.
+_SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any], bool], ...] = (
+    ("reclaimable_bytes", BigInteger(), False),
     # Which store models this node actually holds on disk (#562). JSON array.
-    ("store_models", Text()),
+    ("store_models", Text(), False),
     # Monotonic counter bumped by any desired-state write for this node (#534).
-    ("desired_generation", Integer()),
+    ("desired_generation", Integer(), False),
+    # When an operator declared this node drained (#536).
+    ("drained_at", DateTime(timezone=True), True),
 )
+
+
+def _added_column_ddl(
+    name: str, column_type: TypeEngine[Any], nullable: bool, engine: Engine
+) -> str:
+    """``<name> <TYPE>`` plus the constraint that column was defined with.
+
+    The pre-existing columns are integer counters whose readers treat 0 as
+    absent, so NOT NULL DEFAULT 0 is right for them and must not change on
+    databases that already ran it. A nullable column is added bare: NULL is the
+    value that means "this never happened".
+    """
+    compiled = column_type.compile(dialect=engine.dialect)
+    if nullable:
+        return f"{name} {compiled}"
+    return f"{name} {compiled} NOT NULL DEFAULT 0"
 
 
 def _ensure_serving_node_columns(connection: Connection, engine: Engine) -> None:
@@ -340,23 +375,18 @@ def _ensure_serving_node_columns(connection: Connection, engine: Engine) -> None
     inspect-then-ALTER, safe there because sqlite is single-process dev/test.
     """
     if engine.dialect.name == "postgresql":
-        for name, column_type in _SERVING_NODE_ADDED_COLUMNS:
-            compiled = column_type.compile(dialect=engine.dialect)
+        for name, column_type, nullable in _SERVING_NODE_ADDED_COLUMNS:
+            clause = _added_column_ddl(name, column_type, nullable, engine)
             connection.execute(
-                sa_text(
-                    f"ALTER TABLE serving_node ADD COLUMN IF NOT EXISTS "
-                    f"{name} {compiled} NOT NULL DEFAULT 0"
-                )
+                sa_text(f"ALTER TABLE serving_node ADD COLUMN IF NOT EXISTS {clause}")
             )
         return
     existing = {column["name"] for column in sa_inspect(connection).get_columns("serving_node")}
-    for name, column_type in _SERVING_NODE_ADDED_COLUMNS:
+    for name, column_type, nullable in _SERVING_NODE_ADDED_COLUMNS:
         if name in existing:
             continue
-        compiled = column_type.compile(dialect=engine.dialect)
-        connection.execute(
-            sa_text(f"ALTER TABLE serving_node ADD COLUMN {name} {compiled} NOT NULL DEFAULT 0")
-        )
+        clause = _added_column_ddl(name, column_type, nullable, engine)
+        connection.execute(sa_text(f"ALTER TABLE serving_node ADD COLUMN {clause}"))
 
 
 def ensure_serving_node_table(engine: Engine) -> bool:
@@ -696,6 +726,10 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         "node_id": row.id,
         "store_models": _decode_store_models(row.store_models),
         "desired_generation": row.desired_generation,
+        # None means admitting. Reported on the capacity row because every
+        # reader that sizes or routes against a node needs to know the operator
+        # has taken it out, and they all read this view.
+        "drained_at": isoformat(row.drained_at),
         "total_bytes": row.total_bytes,
         "free_bytes": row.free_bytes,
         "source": row.source,
@@ -1243,7 +1277,43 @@ class ModelCatalog:
                 # generation=None. See convergence.decide_convergence.
                 "node_known": node is not None,
                 "generation": node.desired_generation if node is not None else None,
+                # Carried in the SAME snapshot as the generation, so a node
+                # cannot read a drain without the generation that proves the
+                # catalog is describing this node (see set_node_drain).
+                "drained_at": isoformat(node.drained_at) if node is not None else None,
                 "deployments": [_desired_view(row) for row in rows],
+            }
+
+    def set_node_drain(self, node_id: str, *, drained: bool) -> dict[str, Any]:
+        """Declare ``node_id`` drained, or admit it again (#536).
+
+        Bumps the node's desired generation on purpose, and this is the whole
+        reason drain is stored next to desired state rather than on its own.
+        The flag has to reach the node through the SAME gate as everything else
+        it converges on: a node that read ``drained`` unconditionally would
+        unload its entire working set the moment it was pointed at the wrong
+        database -- precisely the failure
+        :func:`docie_bench.serving.convergence.decide_convergence` exists to
+        prevent. Riding the generation means a drain is only ever acted on by a
+        node that has proven the catalog is describing *it*.
+
+        Creates a minimal row for a node that has never reported, mirroring
+        ``_bump_desired_generation``: a machine can be drained before it has
+        ever published, and refusing would leave an operator unable to take a
+        node out of the rotation until it came back.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            generation = _bump_desired_generation(session, node_id)
+            row = session.get(ServingNode, node_id)
+            assert row is not None  # _bump_desired_generation just ensured it
+            row.drained_at = _utcnow() if drained else None
+            session.flush()
+            return {
+                "node_id": node_id,
+                "drained_at": isoformat(row.drained_at),
+                "desired_generation": generation,
             }
 
     def list_node_snapshots(self) -> Sequence[dict[str, Any]]:

@@ -324,6 +324,56 @@ store name so single-node use is unchanged, and offers the override.
 a deployment owned by another node answers with a `409` naming that node
 rather than acting on it. Diagnosing a remote node means reaching that node.
 
+### Taking a node out
+
+`POST /v1/serving/nodes/{id}/drain` removes a node from the rotation, and
+`/resume` puts it back. The Fleet page offers both per row.
+
+A drain has **two effects with different timings**, and conflating them is
+what makes a naive implementation drop requests:
+
+| | When | Needs the node? |
+|---|---|---|
+| Stops admitting | Immediately | No — it is a central routing decision |
+| Stops the runtimes | After a grace period | Yes — its reconciler does it |
+
+The grace period is the longest `timeout_seconds` among the node's own
+deployments, clamped to `[30s, 600s]`. That is exactly how long a request
+admitted an instant before the drain could still legitimately be running, so
+unloading sooner would kill work a client is waiting on. The two phases are
+reported separately as `draining` and `drained`, because an operator waiting
+on a machine needs to know which one they are in.
+
+**A drain excludes, where staleness only demotes.** The two rules look alike
+and are deliberately opposite:
+
+- Staleness is *inferred*. A node that stopped publishing may still be
+  serving perfectly, so routing prefers a live replica but will still use the
+  stale one rather than refuse the only one.
+- A drain is *declared*. An operator said to take the machine out, so routing
+  excludes it even when it holds the last replica — "unless it is the only
+  one" is not something they asked for, and a drain that kept serving would
+  never let the node report empty.
+
+Because of that, draining the last node serving a model takes the model
+offline. The API refuses with a `409` naming the affected models, and the
+refusal is overridable (`acknowledge_outage: true`) — taking a machine out
+even at that cost is a legitimate thing to want, and only the operator knows
+whether it is.
+
+The flag rides the node's **desired generation**, which is the reason it lives
+beside desired state rather than on its own. A node reading `drained`
+unconditionally would unload its whole working set the moment it was pointed
+at the wrong database — precisely the failure the convergence gate below
+exists to prevent. Riding the generation means only a node that has proven the
+catalog is describing *it* ever acts on a drain. The unload therefore also
+needs `DOCIE_SERVING_DESIRED_APPLY` (see *Applying is opt-in*); without it the
+node leaves the rotation but keeps its memory, and says so in its log.
+
+During a catalog outage the router falls back to last-known-good placements,
+which cannot carry drain state — so a drained node keeps receiving traffic
+until the catalog is readable again.
+
 ## Desired state
 
 Postgres holds the authoritative global desired state; each node keeps
