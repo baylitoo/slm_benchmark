@@ -1,12 +1,25 @@
-"""JSON-file agent registry in the shared serving home.
+"""JSON-file agent registry — CENTRAL config, not node state (#562).
 
-Same persistence philosophy as the serving supervisor: one small JSON file
-(``<DOCIE_SERVING_HOME>/agents.json``) on the volume every service mounts,
+Same persistence philosophy as the serving supervisor: one small JSON file,
 read FRESH on every operation (no caching — the API replica that serves a
 request may not be the one that wrote the record) and written atomically via
 temp-file + ``os.replace``. Writes are last-writer-wins, which is fine for the
 single-operator Studio; a multi-writer control plane would move this to the
 Postgres catalog like the model store did.
+
+WHERE IT LIVES, decided explicitly. The dependency map (#528) listed this as
+one of the ``serving_home()`` readers, and #562 asked whether agents should be
+catalog-backed or accepted as per-node config. Neither: an agent is **not node
+state at all**. Nothing outside this package reads the registry, and the only
+caller is the api router — a serving node has no use for ``agents.json`` and
+should not carry one.
+
+It sat under ``DOCIE_SERVING_HOME`` because that was the one shared volume, not
+because the data is node-scoped. ``DOCIE_AGENTS_PATH`` now names it directly,
+defaulting to the old location so existing deployments are unaffected. The
+point of the setting is that a fleet can give the api its own config path
+without the serving home — a per-node concept — deciding where fleet-wide
+agent definitions live.
 """
 
 from __future__ import annotations
@@ -33,6 +46,14 @@ class AgentConflictError(AgentRegistryError):
 
 
 def default_agents_path() -> Path:
+    """Where the agent registry lives.
+
+    ``DOCIE_AGENTS_PATH`` when set; otherwise the historical location under the
+    serving home, so nothing moves for an existing deployment.
+    """
+    configured = os.environ.get("DOCIE_AGENTS_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
     return serving_home() / "agents.json"
 
 
