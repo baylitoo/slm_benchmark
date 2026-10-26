@@ -28,6 +28,7 @@ import {
   FileStack,
   Wrench,
   KeyRound,
+  Network,
   type LucideIcon,
 } from "lucide-react";
 
@@ -39,6 +40,7 @@ export type SectionId =
   | "schemas"
   | "review"
   | "observability"
+  | "fleet"
   | "api-keys";
 
 export interface NavItem {
@@ -66,6 +68,9 @@ export const NAV_GROUPS: NavGroup[] = [
       { id: "deploy", label: "Downloads", icon: Download, view: "downloads" },
       { id: "deploy", label: "MCP Tools", icon: Wrench, view: "mcp" },
       { id: "deploy", label: "Sizing", icon: Gauge, view: "sizing" },
+      // Separate section, not a Deploy sub-view: it is about the NODES
+      // rather than what is deployed on them, and it has its own endpoint.
+      { id: "fleet", label: "Fleet", icon: Network },
     ],
   },
   {
@@ -119,6 +124,7 @@ export const SECTIONS: SectionId[] = [
   "schemas",
   "review",
   "observability",
+  "fleet",
   "api-keys",
 ];
 
@@ -131,5 +137,6 @@ export const DEFAULT_VIEW: Record<SectionId, string> = {
   schemas: "",
   review: "",
   observability: "",
+  fleet: "",
   "api-keys": "",
 };

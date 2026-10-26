@@ -574,6 +574,20 @@ export function DeploymentsView({
       .sort((a, b) => a.base.localeCompare(b.base));
   }, [all, storeNames]);
 
+  // Distinct owning nodes across the records. One node (or none, on rows
+  // written before ownership was tracked) means there is nothing to
+  // disambiguate, so the Node column stays hidden rather than showing the same
+  // id on every row — the single-node default should not pay for the fleet.
+  const nodeIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const record of all ?? []) {
+      const id = typeof record.node_id === "string" ? record.node_id : "";
+      if (id) ids.add(id);
+    }
+    return ids;
+  }, [all]);
+  const showNode = nodeIds.size > 1;
+
   const columns: Column<DeploymentRecord>[] = [
     {
       key: "name",
@@ -667,6 +681,16 @@ export function DeploymentsView({
         );
       },
     },
+    ...(showNode
+      ? [
+          {
+            key: "node",
+            header: "Node",
+            sortAccessor: (r: DeploymentRecord) => r.node_id ?? "",
+            render: (r: DeploymentRecord) => <NodeCell record={r} />,
+          } satisfies Column<DeploymentRecord>,
+        ]
+      : []),
     {
       key: "phase",
       header: "Phase",
@@ -686,6 +710,24 @@ export function DeploymentsView({
       render: (r) => {
         const name = r.spec?.name;
         if (!name) return null;
+        // A catalog projection: the owning node holds the deployments.json
+        // record and every mutation below needs it. The API does answer 409
+        // naming that node, but refusing here beats a toast after the click —
+        // and on a single node no row is ever a projection, so nothing changes.
+        if (r.record_source === "catalog") {
+          return (
+            <span
+              className="text-xs text-muted-foreground"
+              title={
+                `Runs on serving node ${r.node_id ?? "unknown"}. Lifecycle events reach ` +
+                `whichever node Inngest picks, so they cannot be aimed at it — act on ` +
+                `that node, or redeploy with a target node to manage it as desired state.`
+              }
+            >
+              managed on {r.node_id ?? "another node"}
+            </span>
+          );
+        }
         const phase = derivePhase(r);
         const running = phase === "hot" || phase === "loading";
         const transitioning =
@@ -1082,5 +1124,46 @@ function RepairControls({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Which node runs a deployment, and how much this row can be trusted to say
+ * about it.
+ *
+ * `record_source` matters for more than display: a "catalog" row is a
+ * projection for a deployment this process has no file for, so it carries no
+ * desired state, restart policy or pin. Actions that need those are not
+ * offered on it — the 409 the API would return is correct but late.
+ *
+ * `node_reporting: false` leaves the row listed rather than hiding it:
+ * unreachable is not the same as gone, and a deployment that has vanished from
+ * the UI is harder to reason about than one marked unreachable.
+ */
+function NodeCell({ record }: { record: DeploymentRecord }) {
+  const nodeId = typeof record.node_id === "string" ? record.node_id : null;
+  if (!nodeId) {
+    return (
+      <span className="text-muted" title="Recorded before node ownership was tracked">
+        —
+      </span>
+    );
+  }
+  const projection = record.record_source === "catalog";
+  const silent = record.node_reporting === false;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="font-mono text-[11px]">{nodeId}</span>
+      {silent && (
+        <span title="This node has stopped reporting; its placements are demoted in routing">
+          <Badge tone="err">unreachable</Badge>
+        </span>
+      )}
+      {projection && (
+        <span title="Projected from the catalog — this process has no local record, so lifecycle actions must run on the owning node">
+          <Badge tone="neutral">remote</Badge>
+        </span>
+      )}
+    </span>
   );
 }

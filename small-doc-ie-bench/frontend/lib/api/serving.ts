@@ -17,6 +17,12 @@ export interface DeployRequest {
    * deploy per missing replica on auto-allocated ports — store-entry (Auto)
    * deploys only, and incompatible with an explicit name/port. */
   replicas?: number;
+  /** Pin this deployment to one serving node. Omitted, the deploy is an event
+   * on the shared serving app and lands on whichever node Inngest picks — fine
+   * on one machine, unaddressable on several. Set, it is written as DESIRED
+   * STATE owned by that node, which is what makes it survive a restart and
+   * reachable at all. Incompatible with replicas > 1 (one target, one node). */
+  node_id?: string;
   /** llama-server request slots (default 1, meaningless for non-llamacpp
    * runtimes). context_length is divided across slots by the runtime, so the
    * caller must size context_length for a single slot's worth of context. */
@@ -156,14 +162,31 @@ export interface DeploymentRecord {
   /** How many deployment records share `replica_group` right now (1 = not
    * scaled). Derived server-side from the records, never stored. */
   replicas?: number;
+  /** Which serving node runs this deployment. Null on rows written before
+   * ownership was tracked — an unknown owner, not a missing one. */
+  node_id?: string | null;
+  /** "node" when this is the owning node's own record, read from its
+   * deployments.json; "catalog" when it is a projection for a deployment this
+   * process has no file for. A catalog projection is deliberately partial —
+   * desired state, restart policy and pins live in the owning node's file — so
+   * the UI must not offer actions that need them. */
+  record_source?: "node" | "catalog" | string | null;
+  /** False when the owning node's snapshot has gone stale. The deployment is
+   * still listed rather than hidden: unreachable is not the same as gone. */
+  node_reporting?: boolean;
   [k: string]: unknown;
 }
 
 /** Response of the lifecycle action endpoints (load/unload/pin/delete). */
 export interface LifecycleActionResponse {
   event_ids: string[];
+  /** Always set here: every lifecycle action is delivered as an event, and an
+   * event always has a channel. Only the DEPLOY path can answer without one
+   * (see DesiredStateAck). */
   channel: string;
-  name: string;
+  name?: string;
+  /** Human-readable outcome for triggers that complete without streaming. */
+  detail?: string | null;
   [k: string]: unknown;
 }
 
@@ -185,6 +208,21 @@ export interface StoreEntry {
   size_bytes?: number | null;
   created_at?: string | null;
   updated_at?: string | null;
+  /** Where this model's blob actually is. The catalog is global and the blob
+   * store is node-local, so a model being listed says nothing about which
+   * nodes can serve it.
+   *
+   * `missing` and `unreported` mean different things and call for different
+   * actions: re-seed that node, versus wait for its next publish. Collapsing
+   * them would turn "we do not know" into "it is not there". */
+  nodes?: {
+    present: string[];
+    missing: string[];
+    unreported: string[];
+  } | null;
+  /** "catalog" when this row is known to the catalog but THIS process has no
+   * blob for it, so size and mmproj presence are unknown rather than absent. */
+  store_view?: string | null;
   [k: string]: unknown;
 }
 
@@ -275,8 +313,25 @@ export function getPorts(): Promise<PortsView> {
 }
 
 /** Deploy returns the same trigger shape as extract: { event_ids, channel, topics }. */
-export function deployModel(payload: DeployRequest): Promise<TriggerResponse> {
-  return request<TriggerResponse>("/v1/studio/deploy", {
+/**
+ * A deploy that was RECORDED rather than fired. A targeted deploy writes
+ * desired state for one node and returns no event and no channel, because the
+ * owning node converges it on its own reconcile cycle — there is nothing to
+ * subscribe to. `channel: null` is the discriminant, and a caller that mounts a
+ * progress panel on it would wait forever.
+ */
+export interface DesiredStateAck {
+  event_ids: string[];
+  channel: null;
+  topics: string[];
+  detail: string;
+}
+
+/** Either an event with a progress stream, or a desired-state acknowledgement. */
+export type DeployResponse = TriggerResponse | DesiredStateAck;
+
+export function deployModel(payload: DeployRequest): Promise<DeployResponse> {
+  return request<DeployResponse>("/v1/studio/deploy", {
     method: "POST",
     body: JSON.stringify(payload),
   });

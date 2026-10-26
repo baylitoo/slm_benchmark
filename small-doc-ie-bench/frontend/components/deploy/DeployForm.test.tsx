@@ -136,3 +136,79 @@ describe("DeployForm — parallel slots", () => {
     expect(payload).not.toHaveProperty("n_parallel");
   });
 });
+
+describe("DeployForm — target node", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getPorts).mockResolvedValue({
+      range: { start: 8088, end: 8188 },
+      deployments: [],
+      used: [],
+      free_sample: [8088],
+      recommended_next: 8088,
+    });
+    vi.mocked(api.deployModel).mockResolvedValue({
+      event_ids: ["evt-1"],
+      channel: "deploy:test",
+      topics: [],
+    });
+  });
+
+  it("hides the picker when only one node knows the model, and sends no node_id", async () => {
+    const user = userEvent.setup();
+    renderForm([
+      {
+        name: "lfm2.5-350m",
+        available_backends: ["llamacpp"],
+        nodes: { present: ["node-a"], missing: [], unreported: [] },
+      },
+    ]);
+
+    await user.click(screen.getByText("lfm2.5-350m"));
+    expect(screen.queryByText("Target node")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /Deploy/i }));
+    await waitFor(() => expect(api.deployModel).toHaveBeenCalled());
+    expect(vi.mocked(api.deployModel).mock.calls[0][0]).not.toHaveProperty("node_id");
+  });
+
+  it("offers the nodes that hold the blob, disables the ones that do not, and reports a recorded deploy without mounting progress", async () => {
+    const user = userEvent.setup();
+    // A targeted deploy is DESIRED STATE: no event, no channel. The form must
+    // show the server's sentence instead of a progress panel that would never
+    // connect.
+    vi.mocked(api.deployModel).mockResolvedValue({
+      event_ids: [],
+      channel: null,
+      topics: [],
+      detail: "recorded as desired state for node 'node-b' (generation 4)",
+    });
+    renderForm([
+      {
+        name: "lfm2.5-350m",
+        available_backends: ["llamacpp"],
+        nodes: { present: ["node-a", "node-b"], missing: ["node-c"], unreported: [] },
+      },
+    ]);
+
+    await user.click(screen.getByText("lfm2.5-350m"));
+    const picker = screen.getByLabelText("Target node") as HTMLSelectElement;
+
+    // A node that reported its store WITHOUT the model is refused by the
+    // server, so it must not be selectable here.
+    const missing = within(picker).getByRole("option", {
+      name: /node-c/,
+    }) as HTMLOptionElement;
+    expect(missing.disabled).toBe(true);
+
+    await user.selectOptions(picker, "node-b");
+    await user.click(screen.getByRole("button", { name: /Deploy/i }));
+
+    await waitFor(() => expect(api.deployModel).toHaveBeenCalled());
+    expect(vi.mocked(api.deployModel).mock.calls[0][0].node_id).toBe("node-b");
+    expect(
+      await screen.findByText(/recorded as desired state for node 'node-b'/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Connecting to live updates/)).not.toBeInTheDocument();
+  });
+});

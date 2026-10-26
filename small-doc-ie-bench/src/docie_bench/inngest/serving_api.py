@@ -424,6 +424,88 @@ def _sizing_inputs() -> tuple[
     return models, snapshot, placements, detail
 
 
+@router.get("/nodes")
+async def serving_nodes() -> dict[str, Any]:
+    """Every serving node that has a row, with its capacity and what it holds.
+
+    The fleet view. ``/resources`` answers "how much room is there", which is a
+    question about ONE node and is what the sizing engine consumes; this answers
+    "what is the fleet", which no endpoint could previously report -- the
+    per-node rows existed in ``serving_node`` and nothing exposed them.
+
+    Deliberately includes nodes that have never reported capacity. A node can
+    have a row before it first publishes (desired state staged for a machine
+    that has not started yet), and hiding it would make the one case an
+    operator most needs to see -- a node that is expected but silent --
+    indistinguishable from a node that does not exist. Such a row carries
+    ``reporting: false`` and ``source: "unreported"``, and the capacity numbers
+    are zeroes that no reader should price against.
+
+    ``reporting`` is the same staleness rule the router uses to demote a node's
+    placements, so the Studio and the routing layer cannot disagree about which
+    nodes are alive.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.node_liveness import snapshot_stale_after_s
+
+    try:
+        catalog = ModelCatalog()
+        snapshots = list(catalog.list_node_snapshots())
+        placements = list(catalog.list_placements())
+    except CatalogUnavailableError:
+        return {
+            "nodes": [],
+            "observed_available": False,
+            "detail": "observed state unavailable: DATABASE_URL is not configured",
+        }
+    except Exception:  # noqa: BLE001 - a DB hiccup must not 500 the fleet view
+        return {
+            "nodes": [],
+            "observed_available": False,
+            "detail": "observed state unavailable: database error",
+        }
+
+    stale = _nodes_that_stopped_reporting()
+    owned: dict[str, int] = {}
+    for row in placements:
+        node_id = str(row.get("node_id") or "")
+        if node_id:
+            owned[node_id] = owned.get(node_id, 0) + 1
+
+    nodes: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        node_id = str(snapshot.get("node_id") or "")
+        if not node_id:
+            continue
+        unreported = snapshot.get("source") == _UNREPORTED_CAPACITY
+        nodes.append(
+            {
+                **snapshot,
+                # False when this node published before and has stopped, and
+                # when it has never published at all -- the UI distinguishes
+                # those two by `source`, which is the honest signal.
+                "reporting": not (unreported or node_id in stale),
+                "never_reported": unreported,
+                # A row created for desired state carries a timestamp -- its
+                # OWN creation time, not a measurement. Reporting that as an
+                # age would read as "last seen 2s ago" for a machine that has
+                # never been seen at all, so an absent measurement has no age.
+                "age_s": None if unreported else _snapshot_age_s(snapshot),
+                # How many placements name this node as their owner. Counted
+                # here rather than in the UI so one definition of ownership
+                # serves every reader.
+                "deployments": owned.get(node_id, 0),
+            }
+        )
+    nodes.sort(key=lambda row: str(row.get("node_id") or ""))
+    return {
+        "nodes": nodes,
+        "observed_available": True,
+        "stale_after_s": snapshot_stale_after_s(),
+        "detail": None,
+    }
+
+
 @router.get("/sizing")
 async def serving_sizing() -> dict[str, Any]:
     """Per-model fit table: how many MORE instances fit right now.

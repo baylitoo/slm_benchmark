@@ -18,6 +18,7 @@ import {
   type PortsView as PortsViewData,
   type TriggerResponse,
 } from "@/lib/api";
+import { Network } from "lucide-react";
 import { usePolling } from "@/lib/usePolling";
 import { cn } from "@/lib/cn";
 import { T } from "@/lib/i18n";
@@ -89,9 +90,16 @@ export function DeployForm({
   const [cpuThreads, setCpuThreads] = useState("");
   const [cpuThreadsBatch, setCpuThreadsBatch] = useState("");
 
+  // "" = untargeted (an event, any node). A node id = desired state owned by
+  // that node.
+  const [nodeId, setNodeId] = useState("");
+
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trigger, setTrigger] = useState<TriggerResponse | null>(null);
+  // Outcome of a deploy that recorded desired state instead of firing an event:
+  // there is no stream, so the server's own sentence is the whole result.
+  const [ack, setAck] = useState<string | null>(null);
 
   // Live port view — only polled while the Advanced panel is open (and Deploy is
   // the active, visible section), so a collapsed panel costs nothing.
@@ -126,16 +134,39 @@ export function DeployForm({
   // "llamacpp" — never vllm/ollama/remote, where the flag is meaningless.
   const showNParallel = !isSnapshotEntry && (runtime === "" || runtime === "llamacpp");
 
+  // Candidate target nodes for the SELECTED model, from its own blob presence.
+  // Deliberately not a fleet listing: the catalog is global and the blob store
+  // is node-local, so "which nodes could serve this" is a per-model question
+  // and the answer is already in the store entry. One node — or a backend that
+  // reports no presence at all — collapses the control away, which is how
+  // single-machine mode stays exactly as it was.
+  const nodeTargets = useMemo(() => {
+    const presence = selectedEntry?.nodes;
+    if (!presence) return null;
+    const rows = [
+      ...presence.present.map((id) => ({ id, state: "present" as const })),
+      ...presence.unreported.map((id) => ({ id, state: "unreported" as const })),
+      ...presence.missing.map((id) => ({ id, state: "missing" as const })),
+    ];
+    return rows.length > 1 ? rows : null;
+  }, [selectedEntry]);
+
   function pick(modelName: string) {
     setSelected(modelName);
     setRuntime(""); // reset to auto when the model changes
+    // Presence is per-model, so a node that could serve the old pick may not
+    // hold the new one — carrying the target over would submit a deploy the
+    // server refuses.
+    setNodeId("");
     setError(null);
+    setAck(null);
   }
 
   async function onDeploy(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setTrigger(null);
+    setAck(null);
     if (!selected) {
       setError("Select a model to deploy.");
       return;
@@ -145,6 +176,14 @@ export function DeployForm({
       // Mirrors the server's 422: N instances are auto-named on auto ports.
       setError(
         "Replicas auto-name each instance on auto-allocated ports — clear the deployment name and port override to deploy replicas.",
+      );
+      return;
+    }
+    if (nodeId && replicaCount > 1) {
+      // Mirrors the server's 422: a target names ONE node, and each replica
+      // needs a distinct placement.
+      setError(
+        "A target node names one node, so it cannot be combined with replicas > 1 — issue one targeted deploy per node instead.",
       );
       return;
     }
@@ -161,6 +200,7 @@ export function DeployForm({
         ...(contextLength.trim() ? { context_length: Number(contextLength) } : {}),
         ...(maxTokens.trim() ? { max_tokens: Number(maxTokens) } : {}),
         ...(replicaCount > 1 ? { replicas: replicaCount } : {}),
+        ...(nodeId ? { node_id: nodeId } : {}),
         ...(showNParallel && Number(nParallel) > 1 ? { n_parallel: Number(nParallel) } : {}),
         ...(showNParallel && batchSize.trim() ? { batch_size: Number(batchSize) } : {}),
         ...(showNParallel && ubatchSize.trim() ? { ubatch_size: Number(ubatchSize) } : {}),
@@ -179,10 +219,17 @@ export function DeployForm({
         ...(showNParallel && cpuThreadsBatch.trim() ? { cpu_threads_batch: Number(cpuThreadsBatch) } : {}),
       };
       const res = await deployModel(payload);
-      setTrigger(res);
+      if (res.channel === null) {
+        // Recorded as desired state: no event, no stream. Mounting the progress
+        // panel here would sit on "Connecting to live updates…" for good, so
+        // the server's own sentence is the result.
+        setAck(res.detail);
+      } else {
+        setTrigger(res);
+      }
       toast({
-        title: "Deployment started",
-        description: `${selected}${runtime ? ` · ${runtime}` : ""}`,
+        title: res.channel === null ? "Deployment recorded" : "Deployment started",
+        description: `${selected}${runtime ? ` · ${runtime}` : ""}${nodeId ? ` → ${nodeId}` : ""}`,
         tone: "success",
       });
       onDeployed();
@@ -255,6 +302,52 @@ export function DeployForm({
                 : backends.length > 0
                   ? "Backends compatible with this model, from its store entry."
                   : "This model lists no explicit backends — Auto lets the server choose."}
+            </p>
+          </div>
+        )}
+
+        {/* Target node — only rendered when the fleet offers a choice */}
+        {selected && nodeTargets && (
+          <div className="animate-fade-in">
+            <Field
+              label="Target node"
+              hint={
+                nodeId
+                  ? "Recorded as desired state owned by that node. It converges on its next reconcile cycle, so there is no live progress to watch — and the deployment survives a restart."
+                  : "Untargeted: delivered as an event to whichever node picks it up. Pick a node to make the deployment addressable."
+              }
+            >
+              <Select
+                aria-label="Target node"
+                value={nodeId}
+                onChange={(e) => setNodeId(e.target.value)}
+              >
+                <option value="">Any node (untargeted)</option>
+                {nodeTargets.map((target) => (
+                  <option
+                    key={target.id}
+                    value={target.id}
+                    // The server refuses a node that reported its store without
+                    // this model in it. A node that has NOT reported is allowed
+                    // — unknown is not absent — so it stays selectable.
+                    disabled={target.state === "missing"}
+                  >
+                    {target.id}
+                    {target.state === "missing"
+                      ? " — blob not seeded here"
+                      : target.state === "unreported"
+                        ? " — store not reported yet"
+                        : ""}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <p className="mt-1.5 flex items-start gap-1.5 text-xs text-muted-foreground">
+              <Network className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <T>
+                A node is listed as unavailable when it has reported its store
+                without this model — seed the model there first.
+              </T>
             </p>
           </div>
         )}
@@ -472,6 +565,12 @@ export function DeployForm({
           {submitting ? "Deploying…" : "Deploy model"}
         </Button>
       </form>
+
+      {ack && (
+        <div className="mt-5 border-t border-border pt-5">
+          <Alert tone="info">{ack}</Alert>
+        </div>
+      )}
 
       {trigger && (
         <div className="mt-5 border-t border-border pt-5">
