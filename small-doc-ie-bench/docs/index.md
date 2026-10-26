@@ -31,6 +31,7 @@ development/testing
 :maxdepth: 1
 
 reference/glossary
+reference/embedding-models
 ```
 
 ## Where to start
