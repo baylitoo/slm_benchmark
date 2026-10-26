@@ -249,11 +249,31 @@ def create_app(
         ctx_size: int = typer.Option(
             DEFAULT_DEPLOY_CONTEXT_LENGTH, "--ctx-size", min=1, help="llama.cpp context size."
         ),
+        deployment_name: str | None = typer.Option(
+            None,
+            "--deployment-name",
+            help="Record name. Defaults to the store name, which is NOT unique "
+            "across nodes -- pass a distinct name per node in a fleet.",
+        ),
     ) -> None:
-        """Serve a store model in the background with its family's llama-server flags."""
+        """Serve a store model in the background with its family's llama-server flags.
+
+        FLEET NOTE: the record name defaults to the store name, so running this
+        on two nodes for the same model creates two records with the same name.
+        `ModelPlacement.name` is the primary key, so the second node's publish
+        overwrites the first's and one replica becomes unroutable while still
+        holding its RAM. Pass ``--deployment-name`` to give each node's record a
+        distinct name. The scale path mints names for this reason (#530); this
+        direct path keeps the store name so single-node use is unchanged.
+        """
         _execute(
             ctx,
-            lambda plane: plane.up(name, port=port, context_length=ctx_size),
+            lambda plane: plane.up(
+                name,
+                port=port,
+                context_length=ctx_size,
+                deployment_name=deployment_name,
+            ),
             # Read the actual port back off the record: with no --port the control
             # plane allocates one, so a hardcoded 8088 hint would be wrong.
             hint=lambda record: (

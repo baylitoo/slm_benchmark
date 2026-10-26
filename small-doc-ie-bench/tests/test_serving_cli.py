@@ -118,7 +118,25 @@ def test_human_list_output_is_a_readable_table() -> None:
         ),
         (
             ["up", "nuextract3", "--port", "9000"],
-            ("up", "nuextract3", {"context_length": 8192, "port": 9000}),
+            (
+                "up",
+                "nuextract3",
+                {"context_length": 8192, "port": 9000, "deployment_name": None},
+            ),
+        ),
+        (
+            # A fleet names each node's record distinctly: the store name is
+            # not unique across nodes (#530).
+            ["up", "nuextract3", "--deployment-name", "nuextract3-ovh-02"],
+            (
+                "up",
+                "nuextract3",
+                {
+                    "context_length": 8192,
+                    "port": None,
+                    "deployment_name": "nuextract3-ovh-02",
+                },
+            ),
         ),
         (["start", "invoice"], ("start", "invoice")),
         (["stop", "invoice"], ("stop", "invoice")),
