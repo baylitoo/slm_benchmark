@@ -136,6 +136,24 @@ def test_an_existing_spec_is_preserved_rather_than_replaced(remote: None) -> Non
     assert _desired_rows()[0]["desired_state"] == "stopped"
 
 
+def test_a_spec_without_a_model_gains_one_instead_of_being_left_unstartable(
+    remote: None,
+) -> None:
+    """Preserving the row blindly is not enough. A spec that carries the
+    operator's context length but no model would leave a later start with
+    nothing to launch, so the model is merged in rather than the dict
+    replaced."""
+    ModelCatalog().set_desired_deployment(
+        OWNER, RECORD, desired_state="running", spec={"context_length": 32768}
+    )
+
+    _unload()
+
+    spec = _desired_rows()[0]["spec"]
+    assert spec["model"] == MODEL
+    assert spec["context_length"] == 32768
+
+
 def test_unloading_twice_changes_nothing_the_second_time(remote: None) -> None:
     """The local unload is documented as idempotent; the remote one says the
     same rather than bumping a generation for no change."""

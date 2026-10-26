@@ -959,10 +959,14 @@ def _remote_unload(name: str, placement: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
-    spec = existing.get("spec") if existing else None
-    if not isinstance(spec, dict) or not spec:
-        model = str(placement.get("model_name") or name)
-        spec = {"model": model}
+    # Preserve what the row already carries and only fill in what a start
+    # would need. Replacing the dict would drop the context length and port an
+    # operator chose; leaving a spec that has those but no model would leave a
+    # later start with nothing to launch.
+    model = str(placement.get("model_name") or name)
+    existing_spec = existing.get("spec") if existing else None
+    spec = dict(existing_spec) if isinstance(existing_spec, dict) else {}
+    spec.setdefault("model", model)
 
     try:
         written = catalog.set_desired_deployment(

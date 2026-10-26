@@ -1165,8 +1165,10 @@ function RepairControls({
  *
  * `record_source` matters for more than display: a "catalog" row is a
  * projection for a deployment this process has no file for, so it carries no
- * desired state, restart policy or pin. Actions that need those are not
- * offered on it — the 409 the API would return is correct but late.
+ * desired state, restart policy or pin. The actions that need those are not
+ * offered on it — the 409 the API would return is correct but late. Unload IS
+ * offered, because it is expressible as desired state and so can be aimed at
+ * the owning node (#536); load, delete, pin and repair are not yet (#590).
  *
  * `node_reporting: false` leaves the row listed rather than hiding it:
  * unreachable is not the same as gone, and a deployment that has vanished from
