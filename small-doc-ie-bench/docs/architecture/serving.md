@@ -71,22 +71,33 @@ They differ in where truth lives, and it matters.
 | Source of truth | `deployments.json`, read fresh per call | Postgres placements |
 | Needs a database | no | yes |
 | Replicas | no | yes, with load balancing |
-| Works from another machine | no | **yes** |
+| Works from another machine | yes, via the placement row | **yes** |
 
-The `store:` path is already network-transparent: a placement row carries a
-full endpoint URL, and the resolver picks among live replicas. This is why the
-platform is closer to multi-node than it looks — the data plane already
-distributes; it is the control plane that is single-node.
+Both paths now work across machines, but for different reasons. The `store:`
+path always did: a placement row carries a full endpoint URL and the resolver
+picks among live replicas. The `deployment=` and bare-name paths read
+`deployments.json`, which is one node's file, so they used to refuse a
+deployment running anywhere else; they now fall back to the deployment's
+placement row when the local file has no answer. The local file still wins when
+it does — it is fresher and carries launch detail a placement row lacks.
 
 Replica choice is `round_robin_choice` by default, or `session_affinity_choice`
-when a `session_id` is supplied, which pins a conversation to one replica to
-keep llama.cpp's prefix KV cache warm.
+when a `session_id` is supplied, which keeps a conversation on one replica so
+llama.cpp's prefix KV cache stays warm.
+
+Affinity is **computed, not remembered**: highest-random-weight (rendezvous)
+selection over the live replicas, hashed with `hashlib` rather than the builtin
+`hash`, which is salted per process. The assignment is therefore a pure
+function of the session id and the live set, so every API and worker process
+agrees without coordinating — which matters because extraction resolves
+placements on the `worker` service, the one built to scale. Removing a replica
+reassigns only the sessions that were on it.
 
 ```{warning}
-Both choosers keep **process-local** state. The round-robin counter is a
-per-process dict and resets on restart; the affinity map is never evicted. With
-several API replicas the distribution is uneven rather than wrong — but it is
-not coordinated, and that is a known limitation, not an oversight.
+The round-robin counter is still **process-local**: a per-process dict that
+resets on restart. With several API or worker replicas the distribution is
+uneven rather than wrong. Expect that when measuring spread across nodes —
+both nodes receiving traffic is the property, not an even split.
 ```
 
 A `store:` reference that resolves to nothing live does not simply fail: the
@@ -141,8 +152,13 @@ The reconciler must also use the **shared** control plane, not a freshly
 constructed supervisor, because only the shared instance holds the adapters'
 process handles.
 
-The node resource snapshot is likewise exactly one row, upserted, written only
-by the serving reconciler.
+The node resource snapshot is one row **per node**, upserted, written only by
+that node's own reconciler. It is keyed by a node id generated once and
+persisted beside `deployments.json`, so it survives a restart on the same
+volume and is lost exactly when the deployments it describes are.
+
+So "single replica" is a statement about one node, not about the fleet: each
+node runs exactly one serving process, and several nodes publish side by side.
 
 ## Memory
 
@@ -292,3 +308,53 @@ Each node's capacity row is keyed by its own node id, generated on first
 publish and persisted in `DOCIE_SERVING_HOME` beside `deployments.json`. That
 volume is node-local by construction: two machines sharing it would fight over
 one `deployments.json` and adopt each other's identity.
+
+### What is fleet-aware, and what is not
+
+With several nodes publishing, these behave as a fleet:
+
+| Surface | Behaviour |
+|---|---|
+| `serving_node` | one row per node, each written by its own reconciler |
+| `model_placement` | carries `node_id`, set by the node that launched the runtime and rewritten each cycle under the staleness guard, so a stale publish cannot claim a deployment away from the node that holds it |
+| `store:` routing | load-balances across replicas on any node, and **demotes** replicas whose node stopped reporting |
+| `deployment=` / bare name | falls back to the placement row, so a deployment on any node resolves |
+| Deployment listing | unions the local records with catalog rows for deployments this process has no file for, each tagged `node_id`, `record_source` and `node_reporting` |
+| Model store listing | annotates every model with `nodes: {present, missing, unreported}` — the blob store is node-local, so the catalog knowing a model says nothing about which nodes hold it |
+
+Demotion rather than exclusion is deliberate. A stale snapshot proves the
+*reconciler* stopped publishing, not that the runtime died — a crashed
+reconciler leaves `llama-server` answering. So staleness only ever prefers a
+better replica; if every candidate is on a node that stopped reporting, all are
+kept and the request is attempted anyway.
+
+A node that has *never* published is not stale, it is new: a deploy records its
+placement immediately while the first publish is up to one cycle away.
+`missing` and `unreported` are separate for the same reason — one means
+re-seed, the other means wait.
+
+### What still is not
+
+```{important}
+Seeds and deploys are dispatched as Inngest events on the shared
+`docie-serving` app, so they are delivered to whichever serving node Inngest
+picks and **cannot be aimed at a node**.
+```
+
+Until node-scoped desired state lands, both are done per node from its own
+shell:
+
+```
+docie-serving store seed-ollama <ref> --name <name> --family <family>
+docie-serving up <name> --deployment-name <name>-<node>
+```
+
+`--deployment-name` matters: the record name defaults to the store name, which
+is not unique across nodes, and `model_placement.name` is the primary key — two
+nodes using the same name means the second publish overwrites the first and one
+replica goes unroutable while still holding its RAM. The scale path mints names
+to avoid this; the direct path keeps the store name so single-node use is
+unchanged, and offers the override.
+
+Logs are also still read from the local serving home, so diagnosing a remote
+node means reaching that node rather than the Studio.
