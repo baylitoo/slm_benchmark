@@ -48,6 +48,35 @@ class _FakeSupervisor:
         self.removed.append(name)
 
 
+def _reconciler(
+    supervisor: _FakeSupervisor,
+    *,
+    deployer: object = None,
+    lease: object = None,
+) -> object:
+    """Build a reconciler through its REAL constructor.
+
+    These tests used ``ServingReconciler.__new__`` to skip ``__init__`` and set
+    only the attributes convergence reads. That broke three times as
+    convergence grew -- ``_deployer``, then ``_lease``, then ``_last_snapshot``
+    -- each time surfacing as an AttributeError in a test rather than as a
+    signal about the code. Going through ``__init__`` means a new field arrives
+    initialised, while a field convergence genuinely needs and nobody wires
+    still fails loudly.
+
+    ``snapshot_publisher`` is a no-op: these tests are about the convergence
+    decision, not about publishing capacity.
+    """
+    from docie_bench.serving.reconciler import ServingReconciler
+
+    return ServingReconciler(
+        supervisor,  # type: ignore[arg-type]
+        snapshot_publisher=lambda _snapshot: None,
+        deployer=deployer,  # type: ignore[arg-type]
+        lease=lease,  # type: ignore[arg-type]
+    )
+
+
 @pytest.fixture
 def node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path / "serving"))
@@ -67,14 +96,8 @@ def node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 def _converge(supervisor: _FakeSupervisor) -> object:
     """Call the convergence step with a stand-in supervisor."""
-    from docie_bench.serving.reconciler import ServingReconciler
 
-    reconciler = ServingReconciler.__new__(ServingReconciler)
-    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
-    reconciler._lease = None  # type: ignore[attr-defined]  # __new__ skips __init__
-    # __new__ skips __init__, so set what convergence reads. No deployer: these
-    # cases are about stops, removals and the decisions, not starts.
-    reconciler._deployer = None  # type: ignore[attr-defined]
+    reconciler = _reconciler(supervisor)
     return reconciler._converge_desired_state()
 
 
@@ -241,12 +264,8 @@ def test_one_failing_action_does_not_stall_the_rest(
 def _converge_with_deployer(
     supervisor: _FakeSupervisor, started: list[tuple[str, dict[str, object]]]
 ) -> object:
-    from docie_bench.serving.reconciler import ServingReconciler
 
-    reconciler = ServingReconciler.__new__(ServingReconciler)
-    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
-    reconciler._lease = None  # type: ignore[attr-defined]  # __new__ skips __init__
-    reconciler._deployer = lambda name, spec: started.append((name, spec))  # type: ignore[attr-defined]
+    reconciler = _reconciler(supervisor, deployer=lambda name, spec: started.append((name, spec)))
     return reconciler._converge_desired_state()
 
 
@@ -287,7 +306,6 @@ def test_a_start_is_not_attempted_without_the_opt_in(
 def test_a_failing_start_does_not_stall_the_plan(
     node: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from docie_bench.serving.reconciler import ServingReconciler
 
     monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
     _publish_capacity()
@@ -301,10 +319,7 @@ def test_a_failing_start_does_not_stall_the_plan(
             raise RuntimeError("port exhausted")
         started.append(name)
 
-    reconciler = ServingReconciler.__new__(ServingReconciler)
-    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
-    reconciler._lease = None  # type: ignore[attr-defined]  # __new__ skips __init__
-    reconciler._deployer = deployer  # type: ignore[attr-defined]
+    reconciler = _reconciler(supervisor, deployer=deployer)
     reconciler._converge_desired_state()
 
     assert started == ["second"]
@@ -315,7 +330,6 @@ def test_starts_happen_before_stops_and_removals(
 ) -> None:
     """Converging towards MORE capacity first means a generation that replaces
     one deployment with another never leaves the model unserved in between."""
-    from docie_bench.serving.reconciler import ServingReconciler
 
     monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
     _publish_capacity()
@@ -324,10 +338,7 @@ def test_starts_happen_before_stops_and_removals(
     write_applied_state(AppliedState(generation=0, names=frozenset({"retired"})))
     order: list[str] = []
 
-    reconciler = ServingReconciler.__new__(ServingReconciler)
-    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
-    reconciler._lease = None  # type: ignore[attr-defined]  # __new__ skips __init__
-    reconciler._deployer = lambda name, spec: order.append(f"start:{name}")  # type: ignore[attr-defined]
+    reconciler = _reconciler(supervisor, deployer=lambda name, spec: order.append(f"start:{name}"))
     monkeypatch.setattr(
         supervisor, "remove", lambda name: order.append(f"remove:{name}")
     )
@@ -344,7 +355,6 @@ def test_a_failed_action_does_not_record_the_generation(
     transient failure -- a port briefly held, a GGUF on a slow disk -- wedges
     the deployment until somebody writes desired state again.
     """
-    from docie_bench.serving.reconciler import ServingReconciler
 
     monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
     _publish_capacity()
@@ -356,10 +366,7 @@ def test_a_failed_action_does_not_record_the_generation(
         raise RuntimeError("will not remove")
 
     monkeypatch.setattr(supervisor, "remove", explode)
-    reconciler = ServingReconciler.__new__(ServingReconciler)
-    reconciler.supervisor = supervisor  # type: ignore[attr-defined]
-    reconciler._lease = None  # type: ignore[attr-defined]  # __new__ skips __init__
-    reconciler._deployer = None  # type: ignore[attr-defined]
+    reconciler = _reconciler(supervisor)
     reconciler._converge_desired_state()
 
     # Not recorded, so the next cycle re-plans and tries again.
@@ -406,7 +413,6 @@ def test_the_lease_is_heartbeated_between_actions(
     with several starts leaves the lease unrefreshed long enough for a newly
     booting serving container to judge it abandoned and claim it.
     """
-    from docie_bench.serving.reconciler import ServingReconciler
 
     monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
     _publish_capacity()
@@ -418,10 +424,7 @@ def test_the_lease_is_heartbeated_between_actions(
         def refresh(self) -> None:
             beats.append("beat")
 
-    reconciler = ServingReconciler.__new__(ServingReconciler)
-    reconciler.supervisor = _FakeSupervisor([])  # type: ignore[attr-defined]
-    reconciler._lease = _Lease()  # type: ignore[attr-defined]
-    reconciler._deployer = lambda name, spec: None  # type: ignore[attr-defined]
+    reconciler = _reconciler(_FakeSupervisor([]), deployer=lambda name, spec: None, lease=_Lease())
     reconciler._converge_desired_state()
 
     # One per action, not one per plan.
@@ -433,7 +436,6 @@ def test_a_failing_heartbeat_does_not_fail_the_plan(
 ) -> None:
     """The next cycle's own refresh is the backstop, so a lease write that
     fails must not abort a convergence that is otherwise succeeding."""
-    from docie_bench.serving.reconciler import ServingReconciler
 
     monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
     _publish_capacity()
@@ -444,11 +446,69 @@ def test_a_failing_heartbeat_does_not_fail_the_plan(
         def refresh(self) -> None:
             raise OSError("volume is read-only")
 
-    reconciler = ServingReconciler.__new__(ServingReconciler)
-    reconciler.supervisor = _FakeSupervisor([])  # type: ignore[attr-defined]
-    reconciler._lease = _BrokenLease()  # type: ignore[attr-defined]
-    reconciler._deployer = lambda name, spec: started.append(name)  # type: ignore[attr-defined]
+    reconciler = _reconciler(
+        _FakeSupervisor([]),
+        deployer=lambda name,
+        spec: started.append(name),
+        lease=_BrokenLease(),
+    )
     reconciler._converge_desired_state()
 
     assert started == ["wanted"]
     assert read_applied_state().generation == 1
+
+
+def test_the_node_snapshot_is_refreshed_between_actions(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A start blocks until the model is serving, which delays the NEXT cycle
+    and with it the snapshot publish. Once this node's `serving_node` row goes
+    stale (30s by default) the router demotes placements on it (#531) -- so
+    loading a model on a busy node drained traffic from that node's OTHER,
+    healthy models onto its peers, for the whole duration of the load.
+    """
+    from docie_bench.serving.reconciler import ServingReconciler
+    from docie_bench.serving.resources import NodeSnapshot
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("first")
+    _desire("second")
+    published: list[NodeSnapshot] = []
+
+    reconciler = ServingReconciler(
+        _FakeSupervisor([]),  # type: ignore[arg-type]
+        snapshot_publisher=published.append,
+        deployer=lambda name, spec: None,
+    )
+    # Stand in for a completed earlier cycle, which is what supplies the RSS
+    # sum a mid-plan refresh carries forward.
+    reconciler._last_snapshot = NodeSnapshot(
+        total_bytes=8 * 1024**3,
+        free_bytes=4 * 1024**3,
+        source="cgroup",
+        sum_rss_bytes=1024**3,
+    )
+    reconciler._converge_desired_state()
+
+    # One per action: the node keeps saying it is alive while it loads.
+    assert len(published) == 2
+    # And it carries the measured RSS forward rather than claiming zero.
+    assert all(snap.sum_rss_bytes == 1024**3 for snap in published)
+
+
+def test_no_snapshot_is_published_before_a_full_cycle_has_run(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no previous snapshot there is no RSS sum to carry forward, and
+    inventing one would publish a measurement nothing took."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("wanted")
+    published: list[object] = []
+
+    reconciler = _reconciler(_FakeSupervisor([]), deployer=lambda name, spec: None)
+    reconciler._snapshot_publisher = published.append  # type: ignore[attr-defined]
+    reconciler._converge_desired_state()  # type: ignore[attr-defined]
+
+    assert published == []
