@@ -33,6 +33,7 @@ two-node run (#533) then verifies the wiring rather than the logic.
 from __future__ import annotations
 
 import enum
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
 
@@ -149,8 +150,79 @@ def decide_convergence(
     )
 
 
+@dataclass(frozen=True)
+class ConvergencePlan:
+    """What a node must do to match the desired state it just read.
+
+    Separate from carrying it out, and pure, for the same reason
+    :func:`decide_convergence` is: these are the cases that destroy running
+    capacity when wrong, and a table-driven test is a cheaper place to be wrong
+    than a two-node hardware session.
+    """
+
+    to_start: tuple[str, ...] = ()
+    """Desired, running, and not present locally."""
+
+    to_stop: tuple[str, ...] = ()
+    """Desired to be stopped, and currently present locally."""
+
+    to_remove: tuple[str, ...] = ()
+    """No longer desired, AND previously applied from desired state."""
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.to_start or self.to_stop or self.to_remove)
+
+
+def plan_convergence(
+    *,
+    desired: Mapping[str, str],
+    local_names: Collection[str],
+    previously_applied: Collection[str],
+) -> ConvergencePlan:
+    """Diff desired state against what this node is running.
+
+    ``desired`` maps deployment name to desired state ("running"/"stopped").
+    ``previously_applied`` is what this node created from desired state on an
+    earlier pass -- see :mod:`docie_bench.serving.applied_state` for why that
+    is tracked rather than inferred.
+
+    REMOVAL IS NARROW BY CONSTRUCTION. A node also holds deployments the
+    catalog was never told about: ``docie up`` creates one directly, which is
+    the documented way to deploy on a chosen node while lifecycle events are
+    not node-addressable. "Local but not desired" would therefore tear those
+    down on the first pass. Only names this node previously applied FROM
+    desired state are removal candidates; anything else is left alone, and a
+    node's own deployments survive a convergence it was never part of.
+
+    Note that an absent desired row and a ``stopped`` one produce different
+    actions -- remove versus stop -- which is why the catalog represents a
+    removal as a deleted row rather than a state.
+    """
+    local = {str(name) for name in local_names}
+    applied = {str(name) for name in previously_applied}
+
+    to_start = sorted(
+        name
+        for name, state in desired.items()
+        if state == "running" and name not in local
+    )
+    to_stop = sorted(
+        name for name, state in desired.items() if state != "running" and name in local
+    )
+    # Previously applied, no longer desired at all, and still here to remove.
+    to_remove = sorted((applied - set(desired)) & local)
+    return ConvergencePlan(
+        to_start=tuple(to_start),
+        to_stop=tuple(to_stop),
+        to_remove=tuple(to_remove),
+    )
+
+
 __all__ = [
     "ConvergeAction",
     "ConvergeDecision",
+    "ConvergencePlan",
     "decide_convergence",
+    "plan_convergence",
 ]
