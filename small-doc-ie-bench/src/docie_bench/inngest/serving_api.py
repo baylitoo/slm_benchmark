@@ -22,7 +22,6 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +33,17 @@ from docie_bench.inngest.client import inngest_client, send_or_503
 from docie_bench.security import TenantDependency
 from docie_bench.serving.control_plane import ControlPlane
 from docie_bench.serving.failure import classify_failure
+from docie_bench.serving.node_liveness import (
+    SNAPSHOT_STALE_FLOOR_S as _SNAPSHOT_STALE_FLOOR_S,
+)
+from docie_bench.serving.node_liveness import (
+    SNAPSHOT_STALE_INTERVALS as _SNAPSHOT_STALE_INTERVALS,
+)
+from docie_bench.serving.node_liveness import (
+    reconcile_interval_s,
+    snapshot_age_s,
+    snapshot_stale_after_s,
+)
 from docie_bench.serving.paths import serving_home
 from docie_bench.settings import get_settings
 
@@ -57,44 +67,16 @@ PIN_EVENT = "serving/pin.requested"
 # endpoint just fans out one deploy event per new replica name.
 DEPLOY_EVENT = "serving/deploy.requested"
 
-# Snapshot-staleness gate: a published node snapshot is only trusted while it
-# is at most this many reconcile intervals old. If the serving reconciler dies,
-# its last snapshot must NOT keep backing "observed_available: true" sizing
-# forever — /resources promises "never a stale number", and that promise has to
-# cover the reconciler-died case, not just the never-published one.
-SNAPSHOT_STALE_INTERVALS = 3.0
-# Floor so a very short dev interval (e.g. 1s) does not flap the gate on one
-# slow DB round-trip.
-SNAPSHOT_STALE_FLOOR_S = 30.0
-
-
-def _reconcile_interval_s() -> float:
-    """The reconciler's cycle interval — same env knob worker.py reads."""
-    try:
-        interval = float(os.getenv("DOCIE_SERVING_RECONCILE_INTERVAL", "10"))
-    except ValueError:
-        return 10.0
-    return interval if interval > 0 else 10.0
-
-
-def snapshot_stale_after_s() -> float:
-    return max(SNAPSHOT_STALE_INTERVALS * _reconcile_interval_s(), SNAPSHOT_STALE_FLOOR_S)
-
-
-def _snapshot_age_s(snapshot: Mapping[str, Any], *, now: dt.datetime | None = None) -> float | None:
-    """Seconds since the snapshot's ``updated_at`` (None when unparseable)."""
-    raw = snapshot.get("updated_at")
-    if not raw:
-        return None
-    try:
-        stamp = dt.datetime.fromisoformat(str(raw))
-    except ValueError:
-        return None
-    if stamp.tzinfo is None:
-        # sqlite round-trips the reconciler's UTC stamp as a naive datetime.
-        stamp = stamp.replace(tzinfo=dt.UTC)
-    current = now if now is not None else dt.datetime.now(dt.UTC)
-    return (current - stamp).total_seconds()
+# The snapshot-staleness gate now lives in serving/node_liveness.py, so the
+# router can apply the SAME definition of "this node is still reporting" when
+# deciding whether its placements should keep receiving traffic (#531). Two
+# definitions of reporting would drift, and the capacity view and the router
+# disagreeing about whether a node is alive is the worst version of that.
+# Re-exported under the original names: these are this module's public surface.
+SNAPSHOT_STALE_FLOOR_S = _SNAPSHOT_STALE_FLOOR_S
+SNAPSHOT_STALE_INTERVALS = _SNAPSHOT_STALE_INTERVALS
+_reconcile_interval_s = reconcile_interval_s
+_snapshot_age_s = snapshot_age_s
 
 
 def _gate_snapshot_staleness(
@@ -162,6 +144,89 @@ def _observed_placements() -> dict[str, dict[str, Any]] | None:
         return None
 
 
+# A node row can exist before that node has ever measured anything: staging a
+# desired-state deploy for a node that has not started creates one so the
+# generation counter has somewhere to live (#534). Its capacity numbers are
+# zeroes with source="unreported", and anything that PRICES capacity has to
+# skip it -- a zero-capacity node reads as "no room", and merely counting it
+# made a single-node stack look like a fleet and withhold sizing entirely.
+_UNREPORTED_CAPACITY = "unreported"
+
+
+def _capacity_reporting(snapshots: object) -> list[dict[str, Any]]:
+    """Only the nodes that have actually measured their capacity."""
+    if not isinstance(snapshots, (list, tuple)):
+        return []
+    return [
+        row
+        for row in snapshots
+        if isinstance(row, dict) and row.get("source") != _UNREPORTED_CAPACITY
+    ]
+
+
+def _nodes_that_stopped_reporting() -> frozenset[str]:
+    """Nodes whose capacity snapshot has gone stale (best-effort)."""
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    try:
+        return stale_node_ids(ModelCatalog().list_node_snapshots())
+    except Exception:  # noqa: BLE001 - attribution must not 500 the Board
+        return frozenset()
+
+
+def _records_for_other_nodes(
+    local: list[Any], observed: dict[str, dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """Catalog-derived records for deployments this process has no file for.
+
+    The api reads one node's ``deployments.json`` -- the shared `serving-state`
+    volume -- so every deployment on another machine is simply absent from its
+    listing, presented as though the fleet were that one node (#562). These
+    rows fill that gap from ``model_placement``, which carries the owner since
+    #530.
+
+    Deliberately partial and marked as such. A placement row has no desired
+    state, restart policy or pin -- those live in the owning node's file, and
+    publishing them is the phase-2 desired-state work (#534). What it does
+    carry is enough to show the deployment exists, where it is, what state it
+    is in and how it is behaving, which beats omitting it.
+    """
+    if not observed:
+        return []
+    known = {
+        str((record.get("spec") or {}).get("name") or "")
+        for record in local
+        if isinstance(record, dict)
+    }
+    remote: list[dict[str, Any]] = []
+    for name, row in sorted(observed.items()):
+        if name in known:
+            continue
+        remote.append(
+            {
+                "spec": {
+                    "name": name,
+                    # model_name is the launch alias for a store deploy, which
+                    # is what groups replicas (`_replica_base`).
+                    "launch": {
+                        "alias": row.get("model_name") or name,
+                        "model": row.get("model_name"),
+                    },
+                },
+                "state": row.get("state"),
+                "endpoint": row.get("endpoint"),
+                "last_error": row.get("last_error"),
+                "node_id": row.get("node_id"),
+                # The UI needs to know this record is a catalog projection and
+                # not the owning node's own record, so it does not offer
+                # actions that need the file it does not have.
+                "record_source": "catalog",
+            }
+        )
+    return remote
+
+
 def _replica_base(record: dict[str, Any]) -> str | None:
     """The routable base a record belongs to: the launch ``--alias`` (shared by
     every replica of a scaled store model), falling back to the record name."""
@@ -190,6 +255,11 @@ async def list_deployments() -> Any:
     observed = _observed_placements()
     if not isinstance(records, list):
         return records
+    # Deployments owned by OTHER nodes, which this process has no file for
+    # (#562). Without this the listing silently presents one node's disk as the
+    # whole fleet; a missing deployment is worse than a partial one.
+    records.extend(_records_for_other_nodes(records, observed))
+    stale_nodes = _nodes_that_stopped_reporting()
     group_sizes: dict[str, int] = {}
     for record in records:
         if isinstance(record, dict) and (base := _replica_base(record)):
@@ -202,6 +272,13 @@ async def list_deployments() -> Any:
         record["observed_available"] = observed is not None
         obs = observed.get(name) if observed and name else None
         record["observed"] = obs
+        # Which node runs this, and whether that node is still reporting. Both
+        # come from the catalog, so a locally-read record gets attributed too
+        # rather than being implicitly "here".
+        record.setdefault("node_id", (obs or {}).get("node_id"))
+        record.setdefault("record_source", "node")
+        node_id = record.get("node_id")
+        record["node_reporting"] = not (node_id and node_id in stale_nodes)
         base = _replica_base(record)
         record["replica_group"] = base
         record["replicas"] = group_sizes.get(base, 1) if base else 1
@@ -240,7 +317,10 @@ async def serving_resources() -> dict[str, Any]:
         # Every node that has published, newest measurement first. Reading the
         # list rather than "the" snapshot is what keeps this view honest once a
         # second node reports: it describes ONE machine, and says which.
-        snapshots = catalog.list_node_snapshots()
+        # Capacity-bearing nodes only: a node staged by a desired-state write
+        # has published no measurement, so counting it here would claim the
+        # fleet has capacity nobody has measured.
+        snapshots = _capacity_reporting(catalog.list_node_snapshots())
         node_count = len(snapshots)
         if not snapshots:
             detail = (
@@ -317,7 +397,7 @@ def _sizing_inputs() -> tuple[
     try:
         catalog = ModelCatalog()
         models = catalog.list()
-        snapshots = catalog.list_node_snapshots()
+        snapshots = _capacity_reporting(catalog.list_node_snapshots())
         placements = list(catalog.list_placements())
     except CatalogUnavailableError:
         return [], None, [], "observed state unavailable: DATABASE_URL is not configured"
@@ -721,6 +801,24 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     return name, eta
 
 
+def _owning_node(name: str) -> str | None:
+    """Which node runs ``name``, from the placement table (#566).
+
+    Best-effort and advisory: an unreadable catalog means "unknown", which
+    leaves the caller's own 404 in place rather than inventing an owner.
+    """
+    from docie_bench.serving.catalog import ModelCatalog
+
+    try:
+        for row in ModelCatalog().list_placements():
+            if str(row.get("name") or "") == name:
+                owner = str(row.get("node_id") or "")
+                return owner or None
+    except Exception:  # noqa: BLE001 - attribution must not change the status code
+        return None
+    return None
+
+
 async def _fire_lifecycle_event(
     name: str,
     *,
@@ -739,6 +837,24 @@ async def _fire_lifecycle_event(
     try:
         await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
+        # Not on THIS node's disk. It may still exist, on another node (#562):
+        # these handlers read the local deployments.json, so a perfectly live
+        # remote deployment reaches here. A 404 would tell the operator it does
+        # not exist, which is both wrong and the kind of wrong that sends them
+        # looking in the right place last.
+        owner = _owning_node(name)
+        if owner is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"deployment {name!r} runs on serving node {owner!r}, and "
+                    f"lifecycle events are delivered to whichever node Inngest "
+                    f"picks -- so this cannot act on it. Run it on that node "
+                    f"(`docie-serving stop {name}`), or deploy with node_id so "
+                    f"the deployment is managed as desired state (#535)"
+                ),
+                headers=_DOMAIN_404,
+            ) from exc
         raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
     channel = f"{prefix}:{uuid.uuid4().hex}"
     data: dict[str, Any] = {"name": name, "channel": channel, **(extra or {})}
@@ -1157,15 +1273,100 @@ async def list_store() -> Any:
     except Exception:  # noqa: BLE001 - catalog hiccup must not blank the store list
         logger.warning("store catalog enrichment failed; serving on-disk view", exc_info=True)
         catalog = {}
+    # Models the catalog knows but THIS node has no blob for -- i.e. seeded on
+    # another node (#562). Without them the Studio shows one node's disk as the
+    # fleet's store, and a deploy of a model it cannot see simply fails.
+    known = {entry["name"] for entry in entries}
+    for name, row in sorted(catalog.items()):
+        if name in known:
+            continue
+        entries.append(_store_entry_from_catalog(name, row))
+    node_stores = _store_models_by_node()
     for entry in entries:
         extra = catalog.get(entry["name"])
         if extra:
             entry["placement"] = extra.get("placement")
             entry["created_at"] = extra.get("created_at")
             entry["updated_at"] = extra.get("updated_at")
+        entry["nodes"] = _presence_across_nodes(str(entry["name"]), node_stores)
         entry.pop("model_path", None)
         entry.pop("mmproj_path", None)
     return entries
+
+
+def _store_models_by_node() -> dict[str, list[str] | None]:
+    """What each node reports holding, ``None`` for a node that has not said.
+
+    Best-effort: an unreadable node table yields nothing, so the store listing
+    degrades to un-annotated rather than failing.
+    """
+    from docie_bench.serving.catalog import ModelCatalog
+
+    try:
+        snapshots = ModelCatalog().list_node_snapshots()
+    except Exception:  # noqa: BLE001 - annotation must not blank the store list
+        return {}
+    return {
+        str(row.get("node_id") or ""): row.get("store_models")
+        for row in snapshots
+        if row.get("node_id")
+    }
+
+
+def _presence_across_nodes(
+    name: str, node_stores: dict[str, list[str] | None]
+) -> dict[str, list[str]]:
+    """Which nodes hold ``name``, which do not, and which have not reported.
+
+    The distinction matters for what an operator does next: `missing` means
+    re-seed that node, `unreported` means wait for its next publish (or check
+    whether it is reporting at all). Collapsing them into one list would turn
+    "we do not know" into "it is not there".
+    """
+    present: list[str] = []
+    missing: list[str] = []
+    unreported: list[str] = []
+    for node_id, models in sorted(node_stores.items()):
+        if models is None:
+            unreported.append(node_id)
+        elif name in models:
+            present.append(node_id)
+        else:
+            missing.append(node_id)
+    return {"present": present, "missing": missing, "unreported": unreported}
+
+
+def _store_entry_from_catalog(name: str, row: dict[str, Any]) -> dict[str, Any]:
+    """A store row for a model seeded on another node (#562).
+
+    Deliberately thin: size and mmproj presence are properties of a blob this
+    process cannot see. What it can say is that the model exists, what family
+    it is, and -- via the `nodes` annotation added by the caller -- where its
+    blob actually is.
+    """
+    from docie_bench.serving.catalog import available_backends
+    from docie_bench.serving.model_store import FAMILIES
+
+    family = str(row.get("family") or "")
+    contract = FAMILIES.get(family)
+    return {
+        "name": name,
+        "family": family,
+        "vision": bool(contract and contract.vision),
+        "embedding": bool(contract and contract.embedding),
+        "reranker": bool(contract and contract.reranker),
+        "analyzer": bool(contract and contract.analyzer),
+        "structured_extraction": bool(contract and contract.structured_extraction),
+        "available_backends": available_backends(family),
+        "has_mmproj": None,
+        "source": row.get("source"),
+        "size_bytes": row.get("size_bytes"),
+        "placement": None,
+        "created_at": None,
+        "updated_at": None,
+        # This process has no blob for it, so nothing here was read from disk.
+        "store_view": "catalog",
+    }
 
 
 @router.get("/families")

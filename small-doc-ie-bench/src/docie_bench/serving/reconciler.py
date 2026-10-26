@@ -66,6 +66,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from docie_bench.serving import recency
 from docie_bench.serving.lifecycle import assess_fit
@@ -335,6 +336,21 @@ def default_fit_check(
     return decision.fits, decision.reason
 
 
+def _desired_apply_enabled() -> bool:
+    """Whether this node may CARRY OUT a convergence plan (#534).
+
+    Off by default. This is the only path in the serving role that can stop a
+    model nobody asked it to stop, so it opts in explicitly rather than
+    arriving with a deploy.
+    """
+    return os.getenv("DOCIE_SERVING_DESIRED_APPLY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
     """Default publisher: upsert the observed rows (best-effort, DB-optional)."""
     if not observations:
@@ -394,6 +410,7 @@ class ServingReconciler:
         min_hot_s: float = 0.0,
         clock: Callable[[], float] = time.time,
         repair: Callable[[str], object] | None = None,
+        deployer: Callable[[str, dict[str, Any]], object] | None = None,
         throughput: ThroughputStore | None = None,
         probe: Callable[[ProbeRequest], ThroughputSample | None] = probe_deployment,
         probe_hot_cycles: int = _PROBE_HOT_CYCLES,
@@ -462,6 +479,12 @@ class ServingReconciler:
         # clicking Repair recovers. Repairs run OUTSIDE the observation lock
         # (they block on await_ready) and are throttled per deployment.
         self._repair = repair
+        # Desired-state starts (#535). Injected like `repair` rather than built
+        # here: launching a runtime is the deploy path (resolve a store entry,
+        # allocate a port, block on readiness) and belongs to the control
+        # plane, not the repair loop. Unset, the loop logs the starts it cannot
+        # perform instead of silently dropping them.
+        self._deployer = deployer
         self._repairs_due: list[str] = []
         self._repair_last: dict[str, float] = {}
         # Measured throughput: one fixed generation probe per model path, run
@@ -567,11 +590,216 @@ class ServingReconciler:
         # The measurement lands in the sidecar and is published NEXT cycle, so
         # a slow probe never delays this cycle's honest liveness numbers.
         self._run_due_probes()
+        # Desired-state convergence (#534/#535): read THIS node's rows, decide
+        # whether the catalog is provably current for us, and act. Last in the
+        # cycle and fully contained -- the observation and repair work above is
+        # what keeps already-running models healthy, and must not be skipped
+        # because a desired-state read failed.
+        try:
+            self._converge_desired_state()
+        except Exception:  # noqa: BLE001 - convergence hiccup != broken cycle
+            logger.warning("desired-state convergence failed this cycle", exc_info=True)
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
             self._lease.refresh()
         return observations
+
+
+    # ------------------------------------------------- desired state (#534)
+    def _converge_desired_state(self) -> object:
+        """Converge this node on its own desired-state rows.
+
+        Returns the decision, for tests and for the caller's logs.
+
+        EXECUTION IS OPT-IN. With ``DOCIE_SERVING_DESIRED_APPLY`` unset the
+        plan is computed and logged and nothing is carried out, because this is
+        the one code path in the serving role that can stop a model an operator
+        did not ask it to stop. A dry run lets desired state be written and the
+        consequences read off the logs before anything acts on them.
+
+        Inert by default in a second sense too: with no writer, every node sees
+        generation ``None`` against an applied 0, which the decision table
+        reads as "nothing written for this node yet" -- so an existing
+        single-node stack is unaffected whether or not the flag is set.
+        """
+        from docie_bench.serving.applied_state import (
+            AppliedState,
+            read_applied_state,
+            write_applied_state,
+        )
+        from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+        from docie_bench.serving.convergence import (
+            ConvergeAction,
+            decide_convergence,
+            plan_convergence,
+        )
+        from docie_bench.serving.node_identity import resolve_node_id
+
+        node_id = resolve_node_id()
+        applied = read_applied_state()
+        with self.supervisor.lock:
+            # records() returns the live dict under the lock; copy the keys so
+            # nothing outside the lock reads a mutating mapping.
+            local_names = set(self.supervisor.records())
+
+        snapshot: dict[str, object] | None = None
+        try:
+            snapshot = dict(ModelCatalog().desired_snapshot(node_id))
+        except CatalogUnavailableError:
+            pass
+        except Exception:  # noqa: BLE001 - treated as unreachable, never as empty
+            logger.debug("desired-state read failed", exc_info=True)
+
+        generation = snapshot.get("generation") if snapshot else None
+        decision = decide_convergence(
+            catalog_reachable=snapshot is not None,
+            node_row_present=bool(snapshot and snapshot.get("node_known")),
+            catalog_generation=generation if isinstance(generation, int) else None,
+            applied_generation=applied.generation,
+            local_deployment_count=len(local_names),
+        )
+
+        if decision.action is not ConvergeAction.CONVERGE:
+            if decision.should_alarm:
+                logger.warning("desired state not converged: %s", decision.reason)
+            else:
+                logger.debug("desired state: %s", decision.reason)
+            return decision
+
+        rows = snapshot.get("deployments") if snapshot else []
+        desired: dict[str, str] = {}
+        specs: dict[str, dict[str, Any]] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not row.get("name"):
+                continue
+            name = str(row["name"])
+            desired[name] = str(row.get("desired_state") or "running")
+            spec = row.get("spec")
+            specs[name] = spec if isinstance(spec, dict) else {}
+        plan = plan_convergence(
+            desired=desired,
+            local_names=local_names,
+            previously_applied=applied.names,
+        )
+        if plan.is_empty:
+            # Still record the generation: the intent HAS been applied, and not
+            # recording it would re-decide CONVERGE on every cycle forever.
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+            return decision
+
+        if not _desired_apply_enabled():
+            logger.warning(
+                "desired-state plan NOT applied (set DOCIE_SERVING_DESIRED_APPLY=1 "
+                "to enable): start=%s stop=%s remove=%s",
+                plan.to_start,
+                plan.to_stop,
+                plan.to_remove,
+            )
+            return decision
+
+        logger.info(
+            "converging on desired generation %s: start=%s stop=%s remove=%s",
+            generation,
+            plan.to_start,
+            plan.to_stop,
+            plan.to_remove,
+        )
+        if self._apply_plan(plan, specs):
+            write_applied_state(
+                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+            )
+        else:
+            # Leave the applied generation where it is, so the NEXT cycle
+            # re-plans and retries. Recording it here would mean a single
+            # transient failure -- a port briefly held, a GGUF on a slow disk
+            # -- wedges the deployment until somebody writes desired state
+            # again, because the generations would match and the decision
+            # would be NOTHING forever. A reconciler that gives up after one
+            # attempt is not reconciling.
+            logger.warning(
+                "desired generation %s only partly applied; retrying next cycle",
+                generation,
+            )
+        return decision
+
+    def _apply_plan(self, plan: object, specs: dict[str, dict[str, Any]]) -> bool:
+        """Carry out a convergence plan, returning whether ALL of it succeeded.
+
+        Each action is contained: one deployment that refuses to stop must not
+        prevent the rest of the plan, and the next cycle re-plans from what
+        actually happened rather than from what was intended.
+
+        The return value is what keeps that promise. The caller records the
+        applied generation only on full success, so anything that failed is
+        attempted again next cycle instead of being treated as done.
+
+        Starts go through the injected deployer, which is the control plane's
+        own deploy path -- resolving a store entry, allocating a port and
+        blocking on readiness is not work the repair loop should reimplement.
+        With no deployer injected a start cannot be performed, which counts as
+        NOT applied: logging it and recording the generation anyway would mean
+        wiring the deployer later never retries the starts it had missed.
+
+        Stops and removals are ordered after starts on purpose: converging
+        towards MORE capacity before less means a generation that replaces one
+        deployment with another never leaves the model unserved in between.
+
+        The singleton lease is heartbeated between actions. A start blocks in
+        ``await_ready`` until the model is serving, which for a multi-GB GGUF
+        is longer than the lease's staleness window -- so a plan with several
+        starts would otherwise leave the heartbeat unrefreshed long enough for
+        a *newly booting* serving container to judge the lease abandoned and
+        claim it. This bounds that gap to one model load instead of the whole
+        plan; see the note on #582 for why a single load is still a gap and
+        what fixing it properly needs.
+        """
+        ok = True
+        for name in getattr(plan, "to_start", ()):
+            if self._deployer is None:
+                logger.warning(
+                    "desired state wants %s started but no deployer is wired; "
+                    "deploy it on this node",
+                    name,
+                )
+                ok = False
+                continue
+            try:
+                self._deployer(name, specs.get(name, {}))
+            except Exception:  # noqa: BLE001 - one failure must not stall the plan
+                logger.warning("desired-state start of %s failed", name, exc_info=True)
+                ok = False
+            self._heartbeat()
+        for name in getattr(plan, "to_stop", ()):
+            try:
+                self.supervisor.stop(name)
+            except Exception:  # noqa: BLE001 - one failure must not stall the plan
+                logger.warning("desired-state stop of %s failed", name, exc_info=True)
+                ok = False
+            self._heartbeat()
+        for name in getattr(plan, "to_remove", ()):
+            try:
+                self.supervisor.remove(name)
+            except Exception:  # noqa: BLE001 - same containment
+                logger.warning("desired-state removal of %s failed", name, exc_info=True)
+                ok = False
+            self._heartbeat()
+        return ok
+
+    def _heartbeat(self) -> None:
+        """Refresh the singleton lease mid-plan (best-effort).
+
+        Contained: a lease write that fails must not abort a convergence that
+        is otherwise succeeding -- the next cycle's own refresh is the backstop.
+        """
+        if self._lease is None:
+            return
+        try:
+            self._lease.refresh()
+        except Exception:  # noqa: BLE001 - heartbeat hiccup != failed plan
+            logger.debug("lease heartbeat during convergence failed", exc_info=True)
 
     def _observe_locked(self) -> list[ObservedDeployment]:
         records = self.supervisor.records()

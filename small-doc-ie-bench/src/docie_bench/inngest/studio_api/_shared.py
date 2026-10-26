@@ -63,8 +63,16 @@ MODELS_CONFIG_PATH = Path("configs/models.yaml")
 
 class TriggerResponse(BaseModel):
     event_ids: list[str]
-    channel: str
-    topics: list[str]
+    # None when the trigger produced no realtime progress stream. A deploy
+    # recorded as DESIRED STATE for a node (#535) is converged by that node's
+    # own reconciler on its own schedule, so there is no channel to subscribe
+    # to -- a caller must treat null as "no progress stream" rather than
+    # waiting on one. Every event-producing trigger still returns a channel.
+    channel: str | None = None
+    topics: list[str] = []
+    # Human-readable outcome for triggers that complete synchronously instead
+    # of streaming progress.
+    detail: str | None = None
 
 
 def _record_event_owners(event_ids: list[str], tenant_id: str) -> None:

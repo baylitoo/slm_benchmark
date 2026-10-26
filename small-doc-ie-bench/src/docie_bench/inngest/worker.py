@@ -152,7 +152,44 @@ def _build_reconciler(instance_id: str) -> Any:
         # Port-collision self-healing: redeploy on a reallocated port when a
         # respawn keeps dying on EADDRINUSE (orphan process holding the port).
         repair=control_plane.supervisor.repair,
+        # Desired-state starts (#535): the control plane's own deploy path, so
+        # the repair loop does not reimplement store lookup, port allocation
+        # and readiness. Only ever reached for rows tagged with THIS node.
+        deployer=_desired_state_deployer(control_plane),
     )
+
+
+def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]], object]:
+    """Adapt the control plane's deploy path to the reconciler's start hook.
+
+    Uses the SYNCHRONOUS ``supervisor.serve_store_model``, not the async
+    ``ControlPlane.up`` that wraps it -- the same choice ``repair`` already
+    makes (``control_plane.supervisor.repair``). ``up`` exists to offload that
+    synchronous call to a thread so it does not stall the worker's asyncio
+    loop, and the reconcile cycle already runs in a worker thread
+    (``asyncio.to_thread(run_cycle)``). Going through ``up`` from there would
+    mean starting a fresh event loop only for it to hand the work to yet
+    another thread, and would couple a repair-loop start to loop-affine state
+    that is not this thread's.
+
+    The desired row's ``spec`` carries the intent the central side recorded;
+    anything it omits is simply not passed, so the deploy path's own defaults
+    apply rather than being guessed here.
+    """
+
+    def deploy(name: str, spec: dict[str, Any]) -> object:
+        kwargs: dict[str, Any] = {"deployment_name": name}
+        port = spec.get("port")
+        if isinstance(port, int):
+            kwargs["port"] = port
+        context_length = spec.get("context_length")
+        if isinstance(context_length, int):
+            kwargs["context_length"] = context_length
+        return control_plane.supervisor.serve_store_model(
+            str(spec.get("model") or name), **kwargs
+        )
+
+    return deploy
 
 
 # How often a replica that found the lease HELD retries claiming it. A held

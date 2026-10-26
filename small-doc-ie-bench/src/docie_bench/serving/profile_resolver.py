@@ -34,9 +34,10 @@ import json
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.serving.gateway import GatewayRoutingError
@@ -45,6 +46,7 @@ from docie_bench.serving.model_store import FAMILIES
 from docie_bench.serving.paths import serving_home
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
+    PlacementError,
     resolve_store_profile,
 )
 from docie_bench.serving.runtime import LifecycleState, RuntimeKind, RuntimeLaunchSpec
@@ -340,6 +342,123 @@ def _env_fallback_profile(settings: Settings) -> ModelProfile:
     )
 
 
+def _profile_from_placement(
+    row: Mapping[str, Any], yaml_profiles: dict[str, ModelProfile]
+) -> ModelProfile | None:
+    """A passthrough profile for a deployment running on ANOTHER node (#562).
+
+    The ``deployment=`` and bare-name routes synthesize from the supervisor's
+    ``deployments.json``, which on this process is one node's file -- so a
+    deployment on any other machine resolves to nothing and the request is
+    REFUSED, however healthy that deployment is. This builds the same profile
+    from the deployment's ``model_placement`` row instead.
+
+    Returns None unless the row is genuinely servable, so the route's contract
+    ("must resolve to a LIVE deployment, otherwise refuse") is unchanged -- a
+    row that is not ready, or carries no endpoint, is not a fallback.
+
+    The local file still wins wherever it has an answer: it is fresher (the
+    reconciler saves it every cycle with no database involved) and it carries
+    launch detail a placement row does not.
+    """
+    if str(row.get("state") or "") != "ready":
+        return None
+    endpoint = str(row.get("endpoint") or "").rstrip("/")
+    name = str(row.get("name") or "")
+    if not endpoint or not name:
+        return None
+    # model_name is the launch alias for a store deploy, which is the id the
+    # runtime actually answers to -- the same rule _synthesize_profile applies.
+    served_id = str(row.get("model_name") or name)
+    slot_count = row.get("slot_count")
+    negotiated = row.get("negotiated_style")
+
+    match = _match_yaml_profile(served_id, yaml_profiles)
+    if match is not None:
+        return replace(
+            match,
+            name=name,
+            model=served_id,
+            base_url=endpoint,
+            kind="passthrough",
+            response_format_style=str(negotiated) if negotiated else match.response_format_style,
+            deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+        )
+    traits = _family_traits(served_id)
+    if traits is None:
+        traits = _Traits(
+            response_format_style="openai_json_schema",
+            prompt_profile="strict_extraction_v1",
+            vision=False,
+        )
+    return ModelProfile(
+        name=name,
+        model=served_id,
+        base_url=endpoint,
+        api_key="local-not-used",
+        response_format_style=str(negotiated) if negotiated else traits.response_format_style,
+        prompt_profile=traits.prompt_profile,
+        vision=traits.vision,
+        stop_sequences=traits.stop_sequences,
+        temperature=traits.temperature,
+        max_tokens=traits.max_tokens,
+        timeout_seconds=traits.timeout_seconds,
+        deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+    )
+
+
+def _profile_for_model_name(name: str, *, session_id: str | None) -> ModelProfile | None:
+    """Resolve ``name`` as a store MODEL rather than a deployment record.
+
+    Record names are minted since #530, so a model's own name is no longer the
+    name of its first deployment. A caller naming the model therefore means
+    "whichever replica is live", which is exactly what ``store:`` resolution
+    answers -- load-balanced, session-affine, node-liveness aware, and backed
+    by the last-known-good cache. This keeps ``deployment=<model>`` and a bare
+    ``<model>`` working after minting, without them meaning "this one exact
+    instance", which for a minted name is no longer something a caller could
+    have known.
+
+    Returns None when ``name`` is not a store model with a live placement, so
+    the caller's own refusal still applies.
+    """
+    try:
+        return resolve_store_profile(name, session_id=session_id)
+    except PlacementError:
+        return None
+    except Exception:  # noqa: BLE001 - a lookup must not mask the real refusal
+        logger.debug("store-model fallback failed for %r", name, exc_info=True)
+        return None
+
+
+def _profiles_on_other_nodes(
+    known: Collection[str], yaml_profiles: dict[str, ModelProfile]
+) -> dict[str, ModelProfile]:
+    """Passthrough profiles for live deployments this process has no file for.
+
+    Best-effort: an unreachable catalog yields nothing, so behaviour with no
+    DATABASE_URL is exactly what it was.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        rows = ModelCatalog().list_placements()
+    except CatalogUnavailableError:
+        return {}
+    except Exception:  # noqa: BLE001 - routing must not break on a DB hiccup
+        logger.debug("could not list placements for fleet-wide routing", exc_info=True)
+        return {}
+    remote: dict[str, ModelProfile] = {}
+    for row in rows:
+        name = str(row.get("name") or "")
+        if not name or name in known:
+            continue
+        profile = _profile_from_placement(row, yaml_profiles)
+        if profile is not None:
+            remote[name] = profile
+    return remote
+
+
 def build_profile_table(
     yaml_profiles: dict[str, ModelProfile],
     live: dict[str, DeploymentRecord],
@@ -350,6 +469,9 @@ def build_profile_table(
     profile name routes to the (running) deployment.
     """
     table: dict[str, ModelProfile] = dict(yaml_profiles)
+    # Deployments on other nodes first, so a local record always wins: its file
+    # is fresher and carries launch detail a placement row does not (#562).
+    table.update(_profiles_on_other_nodes(live.keys(), yaml_profiles))
     for name, record in live.items():
         table[name] = _synthesize_profile(record, yaml_profiles)
     return table
@@ -390,6 +512,18 @@ def resolve_extraction_profile(
     if deployment:
         record = live.get(deployment)
         if record is None:
+            # Not on this node's disk -- it may be running on another (#562).
+            remote = _profiles_on_other_nodes({}, yaml_profiles).get(deployment)
+            if remote is not None:
+                _record_activity_if_cataloged(deployment)
+                return remote
+            # Not a record name at all. Since #530 mints record names, the
+            # model's own name is no longer one of them -- so a caller naming
+            # the MODEL means "a live deployment of this", which is what
+            # store: resolution answers (load-balanced, session-affine).
+            by_model = _profile_for_model_name(deployment, session_id=session_id)
+            if by_model is not None:
+                return by_model
             raise ProfileResolutionError(
                 f"deployment {deployment!r} is not a live (ready) deployment"
             )
@@ -415,6 +549,12 @@ def resolve_extraction_profile(
         try:
             resolved = gateway_resolve_profile(model_profile, table)
         except GatewayRoutingError as exc:
+            # Same fallback as the `deployment=` route: the name may be a store
+            # MODEL rather than a record, which since #530 is the normal way to
+            # address "whatever replica is live" (#562).
+            by_model = _profile_for_model_name(model_profile, session_id=session_id)
+            if by_model is not None:
+                return by_model
             raise ProfileResolutionError(exc.message) from exc
         if model_profile in live:
             _record_activity_if_cataloged(model_profile)
