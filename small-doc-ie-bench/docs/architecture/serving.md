@@ -134,7 +134,7 @@ fabrication — memory bandwidth, CPU quota, co-resident runtimes and
 quantization all move it by multiples — so an un-probed deployment publishes
 nothing at all.
 
-## Singletons, and why
+## One reconciler per node
 
 ```{important}
 The serving role is single-replica **by design**. It is the only process that
@@ -202,75 +202,13 @@ the TTL, not pinned.
 | `DOCIE_SERVING_MEM_LIMIT` | — | the cgroup limit; makes readings authoritative |
 | `DOCIE_SERVING_PORT_RANGE_START` / `_END` | 8088 / 8188 | allocation range |
 
-## EmbeddingGemma 2
+## Running a fleet
 
-Both artifact formats serve **text** on `/v1/embeddings`, not chat or extraction:
+Several serving nodes publish into one catalog. Each runs exactly one
+reconciler over its own `deployments.json`; nothing is shared between them but
+Postgres and Inngest, both of which live with the central stack.
 
-| Hub repository | Family | Runtime |
-|---|---|---|
-| `google/embeddinggemma-2` | `embeddinggemma2` | `docie dense-embedding` / SentenceTransformers |
-| `ggml-org/embeddinggemma-2-GGUF` | `embedding` | llama-server with `--embedding --pooling mean` |
-
-Select the repository in Hub onboarding, seed its snapshot or GGUF, then deploy
-the detected family. For GGUF text embeddings no `mmproj` is required. The
-serving image pins llama.cpp to the v0.7.0 / b11669 commit
-`620d2225cc436ab0b001e3200e590e3b286ef9ab`; older binaries may not recognize
-`gemma-embedding2`. Rebuild the serving image to pick up the pin.
-
-The native checkpoint requires SentenceTransformers >=6.1 and Transformers
->=5.19. These conflict with the analyzer stack's Transformers constraint.
-The serving image therefore installs the `embeddings` extra into
-`/opt/docie-embeddings`, separate from `encoders`, and selects its CLI via
-`DOCIE_DENSE_EMBEDDING_EXECUTABLE`. Do not install both extras in one environment.
-The extra includes `torchvision`: the checkpoint's shared processor requires it
-even when only the text encoder is loaded.
-For standalone native serving in a separate virtual environment:
-
-```sh
-pip install 'small-doc-ie-bench[embeddings]'
-docie dense-embedding --model google/embeddinggemma-2 --port 8093
-```
-
-Native inference disables the unused vision/audio encoders and uses bfloat16
-on supported CUDA hardware, otherwise float32. It never uses float16.
-The API accepts a string or a batch of strings; image/audio/video objects and
-token-ID inputs are not supported by this text endpoint.
-
-### Retrieval prefixes and output dimensions
-
-For either runtime, format query and document inputs explicitly:
-
-```json
-{
-  "model": "store:your-embedding-deployment",
-  "input": [
-    "task: search result | query: What causes the northern lights?",
-    "title: none | text: The northern lights are caused by charged particles from the sun."
-  ]
-}
-```
-
-Use `title: {title} | text: {content}` when a document has a title. The native
-runtime also accepts `prompt_name: "SearchQuery"` or `"Document"` for an entire
-batch of unformatted strings. Omit `prompt_name` for already formatted inputs;
-no task prefix is chosen implicitly. For GGUF use the explicit text prefixes,
-not the native runtime's `prompt_name` extension.
-
-Native output defaults to 768 dimensions. `dimensions` accepts 128, 256, 512,
-or 768 and the result is L2-normalized **after** truncation. Use the same
-dimension for queries and indexed documents. `encoding_format` accepts
-`"float"` or `"base64"` (little-endian float32). Native inputs exceeding the
-8,192-token context, including prefixes and special tokens, are rejected rather
-than silently truncated.
-
-Sources: [Google model card](https://huggingface.co/google/embeddinggemma-2),
-[GGUF conversion](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF).
-
-## Where this is going
-
-The control plane is single-node; the `store:` data plane is not. Extending to
-several serving nodes is tracked in the distributed-serving issue, which also
-records why a separate manager service was rejected — the placement table is
+A separate manager service was considered and rejected: the placement table is
 already the registry such a service would have had to invent.
 
 ### What a second node runs
@@ -468,3 +406,24 @@ one deployment with another never leaves the model unserved in between. A
 generation is recorded as applied only when the whole plan succeeded —
 otherwise the next cycle re-plans and retries, because a reconciler that gives
 up after one attempt is not reconciling.
+
+## Where this is going
+
+What the fleet still cannot do, in the order it bites:
+
+- **Seeding and logs are not node-addressable.** A model must be seeded on each
+  node that will serve it, and a lifecycle action on another node's deployment
+  answers `409` naming the owner rather than acting. Both want the same thing:
+  an operation addressed to a node, which desired state now provides for
+  deploys and not yet for anything else.
+- **A long start blocks its own cycle.** `await_ready` is synchronous, so a
+  multi-gigabyte load holds the reconcile loop for its duration. The lease and
+  the node snapshot are refreshed between actions to keep that from looking
+  like a dead node, but a single long load still delays everything else that
+  cycle. Performing starts off-cycle is the fix.
+- **No placement policy.** A deploy is aimed at a node by name; nothing chooses
+  one for you, so `replicas > 1` with an explicit node is refused rather than
+  guessed.
+- **Round-robin is process-local.** Spread across nodes is approximately even
+  rather than coordinated, and uneven counts across a scaled `worker` are
+  expected rather than a fault.
