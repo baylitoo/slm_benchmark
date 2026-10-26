@@ -883,8 +883,8 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     return name, eta
 
 
-def _owning_node(name: str) -> str | None:
-    """Which node runs ``name``, from the placement table (#566).
+def _owning_placement(name: str) -> dict[str, Any] | None:
+    """The placement row for ``name``, whatever node owns it (#566).
 
     Best-effort and advisory: an unreadable catalog means "unknown", which
     leaves the caller's own 404 in place rather than inventing an owner.
@@ -894,11 +894,111 @@ def _owning_node(name: str) -> str | None:
     try:
         for row in ModelCatalog().list_placements():
             if str(row.get("name") or "") == name:
-                owner = str(row.get("node_id") or "")
-                return owner or None
+                return dict(row)
     except Exception:  # noqa: BLE001 - attribution must not change the status code
         return None
     return None
+
+
+def _remote_unload(name: str, placement: dict[str, Any]) -> dict[str, Any]:
+    """Record an unload for a deployment this process does not own (#536).
+
+    Lifecycle EVENTS cannot be aimed -- they reach whichever node Inngest
+    picks -- so a remote action has to go through the one channel that is
+    node-scoped: desired state. Writing ``stopped`` for the owning node is a
+    plan ``plan_convergence`` already produces correctly (``to_stop`` covers a
+    name that is desired stopped and present locally), which is why unload is
+    the verb that works today. Load, delete, pin and repair each need a plan
+    state that does not exist yet -- see #590 for why, and why that is a
+    decision rather than an edit.
+
+    The row's existing spec is PRESERVED when there is one. The spec is unused
+    for a stop, but it is what a later start reads, so replacing it with a thin
+    one here would quietly drop the context length and port an operator chose
+    when they deployed.
+    """
+    from docie_bench.serving.catalog import (
+        CatalogUnavailableError,
+        DesiredStateConflictError,
+        ModelCatalog,
+    )
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    owner = str(placement.get("node_id") or "")
+    try:
+        catalog = ModelCatalog()
+        snapshot = catalog.desired_snapshot(owner)
+        snapshots = list(catalog.list_node_snapshots())
+    except CatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "acting on a deployment owned by another node needs the model "
+                "catalog, which is not configured (DATABASE_URL)"
+            ),
+        ) from exc
+
+    rows = snapshot.get("deployments")
+    existing: dict[str, Any] | None = None
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict) and str(row.get("name") or "") == name:
+            existing = row
+            break
+
+    if existing is not None and str(existing.get("desired_state") or "") != "running":
+        # Already recorded as stopped. The local unload is documented as
+        # idempotent, so the remote one says the same thing rather than
+        # bumping a generation for no change.
+        return {
+            "event_ids": [],
+            "channel": None,
+            "name": name,
+            "detail": (
+                f"{name!r} is already recorded as stopped for node {owner!r}; "
+                f"nothing to change"
+            ),
+        }
+
+    spec = existing.get("spec") if existing else None
+    if not isinstance(spec, dict) or not spec:
+        model = str(placement.get("model_name") or name)
+        spec = {"model": model}
+
+    try:
+        written = catalog.set_desired_deployment(
+            owner,
+            name,
+            desired_state="stopped",
+            spec=spec,
+            expected_generation=(
+                int(existing["generation"]) if existing is not None else None
+            ),
+        )
+    except DesiredStateConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"desired state for {name!r} changed under us: {exc}",
+        ) from exc
+
+    caveat = ""
+    if owner in stale_node_ids(snapshots):
+        # Recorded rather than refused: the intent is durable and applies when
+        # the node returns. Saying nothing would let an operator read "unload
+        # requested" as "unloaded".
+        caveat = (
+            f" Node {owner!r} has stopped reporting, so this will not take "
+            f"effect until it is converging again."
+        )
+    return {
+        "event_ids": [],
+        "channel": None,
+        "name": name,
+        "detail": (
+            f"recorded as desired state for node {owner!r} (generation "
+            f"{written['node_desired_generation']}); that node's reconciler "
+            f"stops it within one cycle.{caveat}"
+        ),
+    }
 
 
 async def _fire_lifecycle_event(
@@ -907,6 +1007,7 @@ async def _fire_lifecycle_event(
     event: str,
     prefix: str,
     extra: dict[str, Any] | None = None,
+    remote: bool = False,
 ) -> dict[str, Any]:
     """404-gate ``name`` then fire one ``serving/*`` lifecycle event.
 
@@ -924,16 +1025,22 @@ async def _fire_lifecycle_event(
         # remote deployment reaches here. A 404 would tell the operator it does
         # not exist, which is both wrong and the kind of wrong that sends them
         # looking in the right place last.
-        owner = _owning_node(name)
-        if owner is not None:
+        placement = _owning_placement(name)
+        owner = str(placement.get("node_id") or "") if placement else ""
+        if placement is not None and owner and remote:
+            # Expressible as desired state, which IS node-scoped. Only unload
+            # opts in; see _remote_unload and #590.
+            return _remote_unload(name, placement)
+        if owner:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"deployment {name!r} runs on serving node {owner!r}, and "
                     f"lifecycle events are delivered to whichever node Inngest "
-                    f"picks -- so this cannot act on it. Run it on that node "
-                    f"(`docie-serving stop {name}`), or deploy with node_id so "
-                    f"the deployment is managed as desired state (#535)"
+                    f"picks -- so this cannot act on it. Unload works remotely "
+                    f"(it is expressible as desired state); load, delete, pin "
+                    f"and repair are not yet (#590). Run it on that node "
+                    f"(`docie-serving stop {name}`)"
                 ),
                 headers=_DOMAIN_404,
             ) from exc
@@ -975,9 +1082,17 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     all survive — the deployment is marked ``phase=evicted`` /
     ``activation=managed``, and the next request to it reloads it
     automatically instead of failing.
+
+    Works on a deployment owned by ANOTHER node (#536): an unload is
+    expressible as desired state, which is the one channel that can be aimed at
+    a node, so this records it for the owner instead of answering 409. The
+    response then carries no channel -- the owning node converges on its own
+    cycle, so there is no progress stream to follow.
     """
     del tenant
-    return await _fire_lifecycle_event(name, event=UNLOAD_EVENT, prefix="unload")
+    return await _fire_lifecycle_event(
+        name, event=UNLOAD_EVENT, prefix="unload", remote=True
+    )
 
 
 async def existing_deployment_records() -> list[dict[str, Any]]:
