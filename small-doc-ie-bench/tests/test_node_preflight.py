@@ -11,6 +11,8 @@ constructed, so there is no node, no database and no socket to simulate.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from docie_bench.serving.preflight import (
@@ -20,6 +22,8 @@ from docie_bench.serving.preflight import (
     evaluate,
     worst,
 )
+
+MODEL = "lfm2.5-350m"
 
 
 def _check(facts: NodeFacts, name: str) -> object:
@@ -259,6 +263,94 @@ def test_collect_facts_survives_a_node_with_nothing_configured(
     assert facts.desired_apply is False
     # And it still produced a full report rather than stopping at the failure.
     assert len(evaluate(facts)) == len(evaluate(_healthy()))
+
+
+def test_the_blob_comparison_actually_runs_against_this_nodes_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression this file missed the first time.
+
+    ``collect_facts`` built its ModelStore without the required root, which
+    raised a TypeError that the handler turned into ``store_models=None`` --
+    the same value an unreadable store produces. So the blob check reported
+    "cannot compare" on every node, and the existing tests agreed with it:
+    the pure ones set ``store_models`` by hand, and the impure one asserted the
+    degraded path. A three-state value makes a broken probe look like an honest
+    "we do not know", which is why this asserts the WORKING path.
+    """
+    import docie_bench.storage.db as db
+    from docie_bench.serving.model_store import ModelStore
+
+    home = tmp_path / "serving"
+    (home / "models").mkdir(parents=True)
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(home))
+    gguf = tmp_path / "weights.gguf"
+    gguf.write_bytes(b"GGUF-model-weights")
+    ModelStore(home / "models").add_gguf(
+        name=MODEL, family="openai_chat", model_gguf=gguf
+    )
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path}/catalog.db")
+    try:
+        facts = collect_facts(probe_ports=False, probe_inngest=False)
+    finally:
+        db.dispose_engine()
+
+    assert facts.store_models == (MODEL,)
+    # An empty catalog and a held blob: nothing is missing, so this must be a
+    # PASS rather than the "cannot compare" note.
+    assert _check(facts, "blob store").severity is Severity.PASS  # type: ignore[attr-defined]
+
+
+def test_an_empty_store_is_empty_rather_than_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """() and None are different answers, and the whole blob check turns on
+    which one a fresh node reports."""
+    import docie_bench.storage.db as db
+
+    home = tmp_path / "serving"
+    (home / "models").mkdir(parents=True)
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(home))
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path}/catalog.db")
+    try:
+        facts = collect_facts(probe_ports=False, probe_inngest=False)
+    finally:
+        db.dispose_engine()
+
+    assert facts.store_models == ()
+    assert facts.store_models is not None
+
+
+def test_a_node_missing_a_catalogued_model_is_told_which_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check's actual job on a fleet: say what to seed here."""
+    import docie_bench.storage.db as db
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.model_store import StoreEntry
+
+    home = tmp_path / "serving"
+    (home / "models").mkdir(parents=True)
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(home))
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path}/catalog.db")
+    try:
+        ModelCatalog().upsert(
+            StoreEntry(
+                name="nuextract3",
+                family="openai_chat",
+                model_path=Path("/models/nuextract3/model.gguf"),
+            )
+        )
+        facts = collect_facts(probe_ports=False, probe_inngest=False)
+    finally:
+        db.dispose_engine()
+
+    check = _check(facts, "blob store")
+    assert check.severity is Severity.INFO  # type: ignore[attr-defined]
+    assert "nuextract3" in check.detail  # type: ignore[attr-defined]
 
 
 def test_collect_facts_reads_the_desired_apply_flag(

@@ -33,10 +33,13 @@ from __future__ import annotations
 
 import datetime as dt
 import enum
+import logging
 import os
 import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 #: Loopback and wildcard addresses that cannot work as an advertise host: the
 #: central api resolves the recorded endpoint in ITS network, where "localhost"
@@ -500,8 +503,19 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
     try:
         from docie_bench.serving.model_store import ModelStore
 
-        store_models = tuple(sorted(entry.name for entry in ModelStore().list()))
+        # The root is required, and every other caller passes this same path
+        # (functions.py, serving_api.py, cli.py, resources.py). Omitting it
+        # raised a TypeError that the handler below turned into "unknown",
+        # so the comparison silently never ran on any node.
+        store_models = tuple(
+            sorted(entry.name for entry in ModelStore(home / "models").list())
+        )
     except Exception:  # noqa: BLE001 - an unreadable store leaves the compare unknown
+        # Logged rather than swallowed: the first version of this hid a
+        # programming error as a legitimate degraded result, and a check that
+        # reports "we cannot tell" when it is actually broken is worse than one
+        # that fails, because nothing ever looks wrong.
+        logger.debug("could not read this node's blob store", exc_info=True)
         store_models = None
 
     inngest_url = os.getenv("INNGEST_BASE_URL") or None
