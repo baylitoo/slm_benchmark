@@ -330,20 +330,34 @@ def _read_catalog(
     return entry, placements, False
 
 
-def _nodes_that_stopped_reporting(catalog: ModelCatalog) -> frozenset[str]:
-    """Node ids that published a capacity snapshot before and have stopped.
+def _node_snapshots(catalog: ModelCatalog) -> list[dict[str, Any]]:
+    """Every node's published snapshot, read ONCE per resolution.
 
-    Best-effort: an unreadable node table returns the empty set, so routing is
-    never withheld because liveness could not be established.
+    Both node rules below need this table -- liveness to demote a node that
+    stopped reporting, drain to exclude one an operator took out -- and each
+    used to fetch it for itself. That is two SELECTs on the hot path of every
+    request, for one answer that cannot change between them.
+
+    Best-effort, which is what lets the read move out here: an unreadable node
+    table returns an empty list, and both rules degrade to no-ops on it exactly
+    as they did when each swallowed its own failure. Routing is never withheld
+    because liveness or drain state could not be established.
     """
     try:
-        return stale_node_ids(catalog.list_node_snapshots())
-    except Exception:  # noqa: BLE001 - liveness is advisory, never a gate on routing
-        logger.debug("could not read node snapshots for liveness", exc_info=True)
-        return frozenset()
+        return list(catalog.list_node_snapshots())
+    except Exception:  # noqa: BLE001 - node state is advisory, never a gate on routing
+        logger.debug("could not read node snapshots", exc_info=True)
+        return []
 
 
-def _drained_node_ids(catalog: ModelCatalog) -> frozenset[str]:
+def _nodes_that_stopped_reporting(
+    snapshots: Sequence[dict[str, Any]],
+) -> frozenset[str]:
+    """Node ids that published a capacity snapshot before and have stopped."""
+    return stale_node_ids(snapshots)
+
+
+def _drained_node_ids(snapshots: Sequence[dict[str, Any]]) -> frozenset[str]:
     """Node ids an operator has declared drained.
 
     Best-effort in the same way liveness is: an unreadable node table returns
@@ -352,19 +366,15 @@ def _drained_node_ids(catalog: ModelCatalog) -> frozenset[str]:
     drain means traffic keeps going to a node the operator is taking out, which
     they will see and can retry. Neither is worth refusing to route over.
     """
-    try:
-        return frozenset(
-            str(row.get("node_id") or "")
-            for row in catalog.list_node_snapshots()
-            if row.get("drained_at") and row.get("node_id")
-        )
-    except Exception:  # noqa: BLE001 - drain state is advisory to the router
-        logger.debug("could not read node snapshots for drain state", exc_info=True)
-        return frozenset()
+    return frozenset(
+        str(row.get("node_id") or "")
+        for row in snapshots
+        if row.get("drained_at") and row.get("node_id")
+    )
 
 
 def _exclude_drained_nodes(
-    name: str, live: list[dict[str, Any]], catalog: ModelCatalog
+    name: str, live: list[dict[str, Any]], snapshots: Sequence[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Drop candidates on nodes an operator declared drained (#536).
 
@@ -389,7 +399,7 @@ def _exclude_drained_nodes(
     Rows with no ``node_id`` are never excluded: their owner is unknown, not
     drained.
     """
-    drained = _drained_node_ids(catalog)
+    drained = _drained_node_ids(snapshots)
     if not drained:
         return live
     admitting = [
@@ -416,7 +426,7 @@ def _exclude_drained_nodes(
 
 
 def _prefer_live_nodes(
-    name: str, live: list[dict[str, Any]], catalog: ModelCatalog
+    name: str, live: list[dict[str, Any]], snapshots: Sequence[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Drop candidates whose owning node stopped reporting (#531).
 
@@ -436,7 +446,7 @@ def _prefer_live_nodes(
     Rows with no ``node_id`` (written before ownership was tracked) are never
     demoted -- their owner is unknown, not dead.
     """
-    stale = _nodes_that_stopped_reporting(catalog)
+    stale = _nodes_that_stopped_reporting(snapshots)
     if not stale:
         return live
     on_live_nodes = [
@@ -522,8 +532,13 @@ def resolve_store_profile(
         # node must not come back through _prefer_live_nodes, whose "keep every
         # candidate rather than refuse the only one" fallback would otherwise
         # resurrect it the moment the remaining nodes also looked stale.
-        live = _exclude_drained_nodes(name, live, catalog)
-        live = _prefer_live_nodes(name, live, catalog)
+        #
+        # One read for both rules: each used to fetch the node table itself,
+        # which is two SELECTs per request for an answer that cannot change
+        # between them.
+        snapshots = _node_snapshots(catalog)
+        live = _exclude_drained_nodes(name, live, snapshots)
+        live = _prefer_live_nodes(name, live, snapshots)
     if len(live) == 1:
         placement = live[0]
     elif chooser is not None:
