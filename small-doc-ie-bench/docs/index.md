@@ -26,6 +26,14 @@ operations/fleet-runbook
 ```
 
 ```{toctree}
+:caption: Models
+:maxdepth: 1
+
+models/onboarding
+models/reasoning
+```
+
+```{toctree}
 :caption: Development
 :maxdepth: 1
 
@@ -39,6 +47,7 @@ development/testing
 
 reference/glossary
 reference/embedding-models
+decisions/index
 ```
 
 ## Where to start
@@ -59,6 +68,7 @@ After that it depends what you are doing:
 - **Running a fleet of serving nodes** — {doc}`operations/fleet-runbook`.
   Start there before adding a second machine; most of what can be
   misconfigured fails as a wrong answer rather than an error.
+- **Adding a model the platform has not seen** — {doc}`models/onboarding`.
 - **Your first change** — {doc}`development/contributing`, then
   {doc}`development/testing`.
 
@@ -82,4 +92,5 @@ deleted — see the README there for what maps to what.
 Design decisions live in GitHub issues rather than being re-narrated here. The
 issue carries the alternatives and why they lost, which is the part that is
 expensive to reconstruct and impossible to read out of a diff. Where a page
-describes a decision, it links to the issue that made it.
+describes a decision, it links to the issue that made it; {doc}`decisions/index`
+lists the ones that shape the system today.
