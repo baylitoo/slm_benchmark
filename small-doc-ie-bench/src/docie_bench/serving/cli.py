@@ -216,8 +216,19 @@ def create_app(
         copy: bool = typer.Option(
             False, "--copy", help="Copy instead of hard-linking the file."
         ),
+        publish: bool = typer.Option(
+            False,
+            "--publish",
+            help="Also publish to the shared repository once the import succeeds.",
+        ),
     ) -> None:
-        """Register a GGUF already on THIS node's disk."""
+        """Register a GGUF already on THIS node's disk.
+
+        The path an operator uses for a model downloaded onto this machine,
+        so it carries ``--publish`` for the same reason ``seed-ollama`` does:
+        otherwise the one route that handles an arbitrary local GGUF is also
+        the one that cannot share it with the fleet.
+        """
         try:
             entry = _store().add_gguf(
                 name=name,
@@ -227,10 +238,22 @@ def create_app(
                 source="cli",
                 link=not copy,
             )
-            _emit(ctx, {"name": entry.name, "model_path": entry.model_path.as_posix()})
+            payload = {
+                "name": entry.name,
+                "model_path": entry.model_path.as_posix(),
+            }
         except Exception as exc:
             _emit_error(ctx, exc)
             raise typer.Exit(code=1) from exc
+        # The import has SUCCEEDED by here; a publication failure is its own
+        # outcome and must not make the local result look wrong.
+        if publish:
+            try:
+                payload["published"] = _publish_entry(ctx, entry.name)
+            except Exception as exc:  # noqa: BLE001 - reported, not fatal
+                payload["published"] = None
+                payload["publish_error"] = str(exc)
+        _emit(ctx, payload)
 
     @model_app.command("list")
     def model_list(ctx: typer.Context) -> None:
