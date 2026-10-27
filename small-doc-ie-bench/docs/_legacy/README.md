@@ -22,7 +22,3 @@ page instead.
 | `docie-studio.md`, `studio-schemas.md`, `demo.md`, `demo-agents.md` | an operations section, not yet written |
 | `model-onboarding.md`, `lfm25-reasoning.md` | a models section, deliberately deferred |
 | `adr-agent-sandboxing.md` | the decision index |
-| `server-integration.md` | a reference page for the `/v1` surface |
-
-`server-integration.md` is the one to be careful with: it is a contract another
-team integrates against. Its replacement has to exist before it is removed.

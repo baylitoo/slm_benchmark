@@ -38,6 +38,7 @@ development/testing
 :maxdepth: 1
 
 reference/glossary
+reference/api
 reference/embedding-models
 ```
 
@@ -59,6 +60,8 @@ After that it depends what you are doing:
 - **Running a fleet of serving nodes** — {doc}`operations/fleet-runbook`.
   Start there before adding a second machine; most of what can be
   misconfigured fails as a wrong answer rather than an error.
+- **Integrating an application** — {doc}`reference/api`. Use a Studio-issued
+  key, not an operator key.
 - **Your first change** — {doc}`development/contributing`, then
   {doc}`development/testing`.
 
