@@ -7,6 +7,16 @@
 #
 #   docker compose -f docker-compose.serving-node.yml up -d
 #
+# Check the node BEFORE it takes traffic, and again after editing its .env:
+#
+#   docker compose -f docker-compose.serving-node.yml run --rm serving \
+#     docie-serving doctor --probe-ports
+#
+# It exits non-zero on a configuration that cannot work, and warns about the
+# ones that otherwise present as a wrong answer rather than an error -- an
+# advertise host that resolves to another machine, a duplicate node id, a
+# port window something else is holding. See docs/operations/fleet-runbook.md.
+#
 # The node reads one `.env`, same as the central stack. Copy the central `.env`
 # so every application setting matches, then append the node block from
 # `.env.serving-node.example` and correct the values it marks.
@@ -84,6 +94,24 @@ services:
       DOCIE_SERVING_PORT_RANGE_END: ${DOCIE_SERVING_PORT_RANGE_END:-8107}
 
       DOCIE_SERVING_RECONCILE_INTERVAL: ${DOCIE_SERVING_RECONCILE_INTERVAL:-10}
+
+      # Converge on the desired state the central API writes for this node.
+      # Defaulted ON here while the CODE default is off, and the difference is
+      # deliberate: the code protects an EXISTING single-node stack from
+      # acquiring, on upgrade, the one path that can stop a model nobody asked
+      # it to stop. A node started from this file has no working set to lose
+      # and exists to be managed centrally, so off would make it join the
+      # fleet, report healthy, and then silently ignore every deploy aimed at
+      # it, every auto-placed deploy that picks it, and the unload half of a
+      # drain -- the node would leave the routing rotation but keep its memory.
+      #
+      # Safe on a fresh node: a node with no local deployments and no row in
+      # the catalog converges on nothing (serving/convergence.py), so this
+      # cannot act on another stack's rows if the database host is wrong.
+      #
+      # Set to 0 to bring a node up in observe-only mode: it publishes
+      # capacity and serves, and logs the plans it would have carried out.
+      DOCIE_SERVING_DESIRED_APPLY: ${DOCIE_SERVING_DESIRED_APPLY:-1}
     ports:
       # Bound to ONE explicit interface, not 0.0.0.0. A deployed runtime has no
       # authentication of its own -- the api gateway in front of it is what
@@ -99,7 +127,16 @@ services:
     # this node may boot before the central stack is reachable.
     restart: unless-stopped
     volumes:
-      # Same model definitions as the central stack -- keep this copy in sync.
+      # A convenience, NOT a dependency: nothing the serving role runs reads
+      # configs/. The nine serving functions (deploy/seed/delete/load/unload/
+      # repair/reconfigure/pin) take their launch arguments from the family
+      # contract in model_store.FAMILIES plus the store entry; the routing
+      # table in configs/models.yaml is read by the central api and by the
+      # worker role, neither of which runs here.
+      #
+      # Mounted so `docie-serving gateway`/`plan` work if you exec them in
+      # here to debug. This copy going stale cannot affect what the node
+      # serves, so do not go looking at it during an incident (#593).
       - ./configs:/app/configs:ro
       # Node-local. Not shareable: see DOCIE_SERVING_HOME above.
       - serving-state:/app/.serving

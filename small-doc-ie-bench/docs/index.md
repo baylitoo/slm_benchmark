@@ -19,6 +19,13 @@ architecture/auth
 ```
 
 ```{toctree}
+:caption: Operations
+:maxdepth: 1
+
+operations/fleet-runbook
+```
+
+```{toctree}
 :caption: Development
 :maxdepth: 1
 
@@ -49,6 +56,9 @@ After that it depends what you are doing:
 - **Changing what extraction produces** — {doc}`architecture/extraction`.
 - **Anything touching credentials** — {doc}`architecture/auth`. Three
   credential kinds that are deliberately not interchangeable.
+- **Running a fleet of serving nodes** — {doc}`operations/fleet-runbook`.
+  Start there before adding a second machine; most of what can be
+  misconfigured fails as a wrong answer rather than an error.
 - **Your first change** — {doc}`development/contributing`, then
   {doc}`development/testing`.
 
@@ -61,9 +71,11 @@ This is the first pass, covering the core of the framework: the job layer, the
 serving control plane, the extraction path, and the credential model. It is
 deliberately incomplete.
 
-Not yet written, in rough order of likely usefulness: operations (getting
-started, configuration, deployment), a reference for the `/v1` surface, the
-Studio's own features, and model onboarding. Pages from the previous ad-hoc
+Operations has its first page, {doc}`operations/fleet-runbook`, covering a
+multi-node serving fleet. Not yet written, in rough order of likely
+usefulness: the rest of operations (getting started, configuration, central
+deployment), a reference for the `/v1` surface, the Studio's own features, and
+model onboarding. Pages from the previous ad-hoc
 documentation are parked in `docs/_legacy/` and are being absorbed rather than
 deleted — see the README there for what maps to what.
 
