@@ -480,7 +480,20 @@ class SeedHfRequest(BaseModel):
     # back to best-available instead of failing. False: quant is an explicit
     # pick and an unavailable one errors.
     quant_prefer: bool = False
-    name: str | None = None  # store name; None = derived from the repo
+    # The store name becomes a directory under the serving store, the catalog
+    # primary key, and the id a request names as `store:<name>`. Constrained
+    # here so a name that cannot work is a 422 on the request rather than a
+    # failure inside a job that has already downloaded several gigabytes --
+    # the job validates it too, since events also arrive from other callers.
+    name: str | None = Field(
+        default=None,
+        # ^...$ rather than \A...\Z: pydantic compiles this with the Rust
+        # regex crate, which rejects those anchors. Both ends are still
+        # absolute here -- `$` is end-of-haystack without multiline mode.
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        max_length=200,
+        description="Store name; omitted = derived from the repo.",
+    )
     family: str = "openai_chat"
 
 
