@@ -1840,7 +1840,12 @@ async def _run_seed_hf(
         pick_gguf,
         pick_mmproj,
     )
-    from docie_bench.serving.model_store import ModelStore, ModelStoreError, get_family
+    from docie_bench.serving.model_store import (
+        ModelStore,
+        ModelStoreError,
+        get_family,
+        validate_store_name,
+    )
 
     repo = data.get("repo")
     if not repo:
@@ -1854,6 +1859,13 @@ async def _run_seed_hf(
     family = str(data.get("family") or "openai_chat")
     name = str(data.get("name") or "") or default_store_name(repo)
     contract = get_family(family)  # fail fast on an unknown family
+
+    # Validated BEFORE it becomes a path. `name` comes straight from the
+    # request body (SeedHfRequest.name, unconstrained until now), and the very
+    # next line joins it under the store root -- so a name carrying parent
+    # segments put the download itself outside the store, beside the node id
+    # and deployments.json, before anything else in this job ran.
+    validate_store_name(name)
 
     store = ModelStore(serving_home() / "models")
     tmp_dir = store.root / ".hf-downloads" / name

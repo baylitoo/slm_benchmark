@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from enum import StrEnum
@@ -444,6 +445,41 @@ def get_family(name: str) -> FamilyContract:
 
 class ModelStoreError(RuntimeError):
     pass
+
+
+# A store name is a directory under the store root, the ``model_store_entry``
+# primary key, and the id a request names as ``store:<name>``. It arrives from
+# an API body, so it is RESTRICTED rather than sanitized -- the same reasoning
+# as ``node_identity.validate_node_id``: quietly rewriting a caller's name
+# produces an entry they cannot address, while refusing it says what is wrong.
+_MAX_STORE_NAME_LEN = 200  # ModelStoreEntry.name is String(200)
+_STORE_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def validate_store_name(name: str) -> str:
+    """Return ``name`` if it is usable as a store key and a directory, else raise.
+
+    The pattern admits every name the system generates --
+    ``hf_hub.default_store_name`` already emits ``[a-z0-9._-]`` with the ends
+    stripped -- and excludes the separators that make a name a path: ``/``,
+    ``\\`` and a leading dot, so ``..`` and ``../elsewhere`` cannot survive it.
+
+    Callers that join a name into a filesystem path should ALSO contain the
+    result (see ``_assert_within``). This is the earlier, cheaper gate: it
+    rejects at the boundary, where the error can name the field, instead of
+    deep inside a job that has already downloaded several gigabytes.
+    """
+    if not name or len(name) > _MAX_STORE_NAME_LEN:
+        raise ModelStoreError(
+            f"store name {name!r} must be 1-{_MAX_STORE_NAME_LEN} characters"
+        )
+    if not _STORE_NAME_PATTERN.match(name):
+        raise ModelStoreError(
+            f"store name {name!r} must start alphanumeric and contain only "
+            f"letters, digits, '.', '_' or '-' (it becomes a directory and a "
+            f"catalog key)"
+        )
+    return name
 
 
 @dataclass(frozen=True)
