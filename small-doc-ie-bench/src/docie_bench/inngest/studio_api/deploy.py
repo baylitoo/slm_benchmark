@@ -22,7 +22,16 @@ router = APIRouter()
 
 class DeployRequest(BaseModel):
     model: str
-    name: str | None = None
+    # The deployment name is the placement primary key, the deployments.json
+    # key and a log filename. Constrained for NEW deployments only -- the
+    # supervisor maps an unsafe legacy name to a safe file rather than
+    # refusing to start it, so an existing node keeps working.
+    name: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        max_length=200,
+        description="Deployment name; omitted = minted from the model.",
+    )
     runtime: str | None = None
     # None => the control plane auto-allocates a free port at deploy time; the
     # UI sends no port unless the operator explicitly overrides it. model_dump(
