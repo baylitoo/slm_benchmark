@@ -13,6 +13,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from docie_bench.serving.paths import deployment_log_path
+
 logger = logging.getLogger("docie_bench.serving.supervisor")
 
 from docie_bench.serving.runtime import (
@@ -376,7 +378,7 @@ class PersistentSupervisor:
             if shutdown:
                 self._reap(record)
             if error is None and record.pid is not None:
-                log_path = self.logs_dir / f"{record.spec.name}.log"
+                log_path = deployment_log_path(self.logs_dir, record.spec.name)
                 error = self._log_tail(log_path, record.log_offset) or "runtime process exited"
             record.pid = None
             record.pid_create_time = None
@@ -510,7 +512,7 @@ class PersistentSupervisor:
             self._save()
             return record
 
-        log_path = self.logs_dir / f"{record.spec.name}.log"
+        log_path = deployment_log_path(self.logs_dir, record.spec.name)
         running = record.endpoint is not None and adapter.is_running(record.pid)
         if not running:
             is_restart = record.endpoint is not None

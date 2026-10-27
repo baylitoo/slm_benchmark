@@ -44,7 +44,7 @@ from docie_bench.serving.node_liveness import (
     snapshot_age_s,
     snapshot_stale_after_s,
 )
-from docie_bench.serving.paths import serving_home
+from docie_bench.serving.paths import deployment_log_path, serving_home
 from docie_bench.settings import get_settings
 
 logger = logging.getLogger("docie_bench.inngest.serving_api")
@@ -958,10 +958,13 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
     is an empty tail, not an error.
     """
     max_lines = max(1, min(int(lines), 1000))
-    # Path containment: the name is joined into a filesystem path.
+    # Both sides come through the same helper. They used to build this path
+    # independently -- this one with a containment check, the supervisor's
+    # writer without -- so any name they disagreed about was a log that
+    # existed and could not be read.
     logs_dir = _serving_logs_dir().resolve()
-    log_path = (logs_dir / f"{name}.log").resolve()
-    if logs_dir not in log_path.parents:
+    log_path = deployment_log_path(logs_dir, name).resolve()
+    if logs_dir not in log_path.parents:  # pragma: no cover - the helper guarantees it
         raise HTTPException(status_code=400, detail="invalid deployment name")
 
     last_error: str | None = None
