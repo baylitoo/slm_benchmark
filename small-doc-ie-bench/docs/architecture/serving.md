@@ -351,9 +351,21 @@ first and one replica goes unroutable while still holding its RAM. The
 targeted and scale paths mint names to avoid this; the direct path keeps the
 store name so single-node use is unchanged, and offers the override.
 
-**Logs are still read from the local serving home**, so a lifecycle action on
-a deployment owned by another node answers with a `409` naming that node
-rather than acting on it. Diagnosing a remote node means reaching that node.
+**Logs are still read from the local serving home**, so diagnosing a remote
+node means reaching that node.
+
+**Unload is the one lifecycle action that works remotely.** A stop is the
+single intent `plan_convergence` already derives correctly for a deployment
+present on its node, so an unload aimed at a deployment another node owns is
+recorded as desired state for that owner — and the response carries no channel,
+because that node converges on its own cycle. The row's existing spec is
+preserved: a stop does not read it, but a later start does, so replacing it
+would quietly drop the context length and port an operator chose.
+
+Load, delete, pin and repair still answer `409`. Each needs something desired
+state cannot currently express — a plan state for "present but not running", an
+explicitly declared removal, or configuration the desired spec does not
+carry — which is a design decision rather than an edit (#590).
 
 ### Taking a node out
 

@@ -9,6 +9,7 @@ import {
   Pin,
   PinOff,
   Pencil,
+  PowerOff,
   RefreshCw,
   Trash2,
 } from "lucide-react";
@@ -486,9 +487,15 @@ export function DeploymentsView({
     }
     setBusy(`${name}:${action}`);
     try {
+      let detail: string | null = null;
       if (action === "load") await loadDeployment(name);
-      else if (action === "unload") await unloadDeployment(name);
-      else if (action === "delete") await deleteDeployment(name);
+      else if (action === "unload") {
+        // A remote unload answers with no channel and a sentence describing
+        // what was recorded for which node. Reporting a bare "requested"
+        // would read as "done".
+        const res = await unloadDeployment(name);
+        detail = res.channel === null ? (res.detail ?? null) : null;
+      } else if (action === "delete") await deleteDeployment(name);
       else if (action === "repair") await repairDeployment(name, port ?? null);
       else await pinDeployment(name, action === "pin");
       toast({
@@ -506,7 +513,7 @@ export function DeploymentsView({
                   : action === "pin"
                     ? "Pinned"
                     : "Unpinned",
-        description: name,
+        description: detail ?? name,
         tone: "success",
       });
       deployments.refresh();
@@ -715,17 +722,42 @@ export function DeploymentsView({
         // naming that node, but refusing here beats a toast after the click —
         // and on a single node no row is ever a projection, so nothing changes.
         if (r.record_source === "catalog") {
+          // A catalog projection: this process holds no local record, so the
+          // actions that need one cannot run here. Unload is the exception —
+          // it is expressible as desired state, which is the one channel that
+          // can be aimed at a node, so the owner converges it. Load, delete,
+          // pin and repair each need a plan state that does not exist yet
+          // (#590), so they stay off the row rather than offering a 409.
           return (
-            <span
-              className="text-xs text-muted-foreground"
-              title={
-                `Runs on serving node ${r.node_id ?? "unknown"}. Lifecycle events reach ` +
-                `whichever node Inngest picks, so they cannot be aimed at it — act on ` +
-                `that node, or redeploy with a target node to manage it as desired state.`
-              }
+            <div
+              className="flex items-center justify-end gap-2"
+              onClick={(e) => e.stopPropagation()}
             >
-              managed on {r.node_id ?? "another node"}
-            </span>
+              <span
+                className="text-xs text-muted-foreground"
+                title={
+                  `Runs on serving node ${r.node_id ?? "unknown"}. This process has no ` +
+                  `local record for it, so load, delete, pin and repair must run on ` +
+                  `that node.`
+                }
+              >
+                on {r.node_id ?? "another node"}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                loading={busy === `${name}:unload`}
+                disabled={busy !== null}
+                title={
+                  `Unload on ${r.node_id ?? "its node"}: recorded as desired state, ` +
+                  `which that node converges on its own cycle. Frees its memory and ` +
+                  `keeps the record.`
+                }
+                onClick={() => act(name, "unload")}
+              >
+                <PowerOff className="h-3.5 w-3.5" />
+              </Button>
+            </div>
           );
         }
         const phase = derivePhase(r);
@@ -1133,8 +1165,10 @@ function RepairControls({
  *
  * `record_source` matters for more than display: a "catalog" row is a
  * projection for a deployment this process has no file for, so it carries no
- * desired state, restart policy or pin. Actions that need those are not
- * offered on it — the 409 the API would return is correct but late.
+ * desired state, restart policy or pin. The actions that need those are not
+ * offered on it — the 409 the API would return is correct but late. Unload IS
+ * offered, because it is expressible as desired state and so can be aimed at
+ * the owning node (#536); load, delete, pin and repair are not yet (#590).
  *
  * `node_reporting: false` leaves the row listed rather than hiding it:
  * unreachable is not the same as gone, and a deployment that has vanished from

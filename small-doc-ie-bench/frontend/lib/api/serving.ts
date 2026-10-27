@@ -185,10 +185,11 @@ export interface DeploymentRecord {
 /** Response of the lifecycle action endpoints (load/unload/pin/delete). */
 export interface LifecycleActionResponse {
   event_ids: string[];
-  /** Always set here: every lifecycle action is delivered as an event, and an
-   * event always has a channel. Only the DEPLOY path can answer without one
-   * (see DesiredStateAck). */
-  channel: string;
+  /** Null when the action was RECORDED rather than fired. An unload aimed at a
+   * deployment another node owns becomes desired state for that node, which it
+   * converges on its own cycle — so there is no progress stream to subscribe
+   * to. Every action delivered as an event still carries a channel. */
+  channel: string | null;
   name?: string;
   /** Human-readable outcome for triggers that complete without streaming. */
   detail?: string | null;
