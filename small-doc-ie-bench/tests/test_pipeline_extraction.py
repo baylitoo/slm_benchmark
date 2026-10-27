@@ -319,7 +319,7 @@ async def test_pipeline_vlm_ocr_surfaces_upstream_http_error(
         _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
     )
 
-    with pytest.raises(ValueError, match="404"):
+    with pytest.raises(ValueError, match="upstream_error"):
         await service.extract_from_file(
             path=document, ocr_backend_name="tesseract", schema_name="invoice"
         )
@@ -353,7 +353,7 @@ async def test_pipeline_vlm_ocr_surfaces_upstream_unreachable(
         _pipeline_profile(ocr_model="vision-profile"), profiles=profiles
     )
 
-    with pytest.raises(ValueError, match="unreachable"):
+    with pytest.raises(ValueError, match="upstream_unavailable"):
         await service.extract_from_file(
             path=document, ocr_backend_name="tesseract", schema_name="invoice"
         )

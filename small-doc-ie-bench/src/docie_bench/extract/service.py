@@ -30,6 +30,7 @@ from docie_bench.extract.postprocess import (
     split_currency,
 )
 from docie_bench.extract.validators import validate_extraction
+from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
 from docie_bench.llm.openai_client import OpenAICompatibleClient
@@ -47,6 +48,7 @@ from docie_bench.llm.prompts import (
     build_vision_user_prompt,
 )
 from docie_bench.llm.reasoning import uses_native_reasoning
+from docie_bench.llm.upstream_transport import model_error_type, post_upstream_response
 from docie_bench.ocr.base import text_to_blocks
 from docie_bench.ocr.service import processor_from_settings
 from docie_bench.schemas.common import ExtractionResponse, OCRBlock, Usage
@@ -642,32 +644,29 @@ class ExtractionService:
             request["chat_template_kwargs"] = {"enable_thinking": False}
         async with httpx.AsyncClient() as client:
             try:
-                resp = await client.post(
-                    f"{vision.base_url}/chat/completions",
-                    json=request,
-                    headers={
-                        "Authorization": f"Bearer {vision.api_key}",
-                        "Content-Type": "application/json",
-                    },
+                resp = await post_upstream_response(
+                    vision,
+                    client,
+                    request,
                     # Floored, not raw vision.timeout_seconds: a CPU-bound
                     # multi-page transcription at single-digit tok/s
                     # routinely outlasts a model's default 180s chat
                     # timeout mid-response -- the exact scenario this
                     # benchmark exists to measure. Matches the gateway's
                     # own floor on this same call (PipelineSolution._vlm_ocr).
-                    timeout=max(vision.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
+                    timeout_seconds=max(vision.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
                 )
-            except httpx.RequestError as exc:
+            except ModelGatewayError as exc:
                 raise ValueError(
-                    f"pipeline ocr_model {vision.name!r} upstream is unreachable: {exc}"
+                    f"pipeline ocr_model {vision.name!r} failed ({model_error_type(exc)})"
                 ) from exc
         if resp.status_code >= 400:
             raise ValueError(
-                f"pipeline ocr_model {vision.name!r} returned {resp.status_code}: "
-                f"{resp.text[:200]}"
+                f"pipeline ocr_model {vision.name!r} returned {resp.status_code}"
             )
         try:
-            text = resp.json()["choices"][0]["message"]["content"]
+            completion = resp.json()
+            text = completion["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError, ValueError):
             text = ""
         if isinstance(text, list):  # multimodal parts -> concatenate text
