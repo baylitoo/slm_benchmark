@@ -13,6 +13,7 @@ The property most of these circle is the decided one:
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 from pathlib import Path
 
@@ -592,3 +593,125 @@ def test_concurrent_fetches_do_not_share_one_temp_file(
     watching.fetch_blob(entry, tmp_path / "cache2" / "model.gguf")
 
     assert len(set(seen)) == 2, f"both pulls used the same temp name: {seen}"
+
+# --- the digest is a content address --------------------------------------
+
+
+def _advancing_clock(monkeypatch: pytest.MonkeyPatch, *, step_s: int = 30) -> None:
+    """Make every manifest built in this test carry a different ``created_at``.
+
+    The real flake needed two publications to straddle a one-second boundary,
+    which happens on roughly one run in N. Stepping the clock makes the same
+    condition certain.
+    """
+    import docie_bench.serving.model_repository as repo_mod
+
+    real_build = manifest_mod.build
+    clock = [dt.datetime(2026, 10, 28, 12, 0, 0, tzinfo=dt.UTC)]
+
+    def advancing(**kwargs: object):
+        kwargs["now"] = clock[0]
+        clock[0] = clock[0] + dt.timedelta(seconds=step_s)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(repo_mod.manifest_mod, "build", advancing)
+
+
+def test_republishing_unchanged_weights_keeps_one_digest_across_a_clock_tick(
+    repo: ModelRepository, local: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``created_at`` is in the manifest document, so it is in the manifest's
+    digest. Building a fresh manifest for unchanged weights therefore minted a
+    new digest, wrote a near-duplicate manifest and repointed current.json --
+    purely because time passed. A digest that is not a function of content is
+    not a content address.
+    """
+    _advancing_clock(monkeypatch)
+
+    first = _publish(repo, local)
+    second = _publish(repo, local)
+
+    assert second.manifest_digest == first.manifest_digest
+    assert second.already_complete is True
+    assert repo.resolve("nuextract3") == first.manifest_digest
+
+
+def test_one_manifest_object_is_written_however_often_it_is_republished(
+    repo: ModelRepository, local: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Otherwise every republish litters ``models/<name>/`` with another
+    near-identical manifest."""
+    _advancing_clock(monkeypatch)
+    for _ in range(3):
+        _publish(repo, local)
+
+    manifests = sorted(
+        p.name for p in (tmp_path / "bucket" / "docie" / "models" / "nuextract3").iterdir()
+    )
+
+    assert len(manifests) == 2, manifests  # one manifest + current.json
+    assert "current.json" in manifests
+
+
+def test_two_nodes_publishing_the_same_weights_agree_on_one_digest(
+    repo: ModelRepository, local: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provenance (``source``, ``published_by``) is deliberately not part of
+    the comparison: identical bytes must resolve to one content address, and
+    the manifest keeps the first publication's provenance."""
+    _advancing_clock(monkeypatch)
+
+    first = _publish(repo, local, published_by="ovh-cpu-01")
+    second = _publish(repo, local, published_by="ovh-cpu-02")
+
+    assert second.manifest_digest == first.manifest_digest
+    assert repo.manifest("nuextract3", first.manifest_digest).published_by == "ovh-cpu-01"
+
+
+def test_changed_weights_still_publish_a_new_digest(
+    repo: ModelRepository, local: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reuse must be content-gated, not unconditional."""
+    _advancing_clock(monkeypatch)
+    first = _publish(repo, local)
+    model, _mmproj = local
+    model.write_bytes(b"GGUF-model-weights-v2")
+
+    second = _publish(repo, local)
+
+    assert second.manifest_digest != first.manifest_digest
+    assert second.already_complete is False
+    assert repo.resolve("nuextract3") == second.manifest_digest
+
+
+def test_a_changed_family_publishes_a_new_digest(
+    repo: ModelRepository, local: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Family drives how the model is served, so it is content, not provenance."""
+    _advancing_clock(monkeypatch)
+    first = _publish(repo, local)
+
+    second = _publish(repo, local, family="openai_chat")
+
+    assert second.manifest_digest != first.manifest_digest
+
+
+def test_a_blob_deleted_under_a_published_model_is_restored_and_reported(
+    repo: ModelRepository, local: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reuse must not short-circuit the blob loop: the manifest can be right
+    while a blob has gone missing, and that republish is not a no-op."""
+    _advancing_clock(monkeypatch)
+    first = _publish(repo, local)
+    manifest = repo.manifest("nuextract3", first.manifest_digest)
+    missing = tmp_path / "bucket" / "docie" / manifest.files[0].blob_key
+    missing.unlink()
+
+    second = _publish(repo, local)
+
+    assert second.manifest_digest == first.manifest_digest
+    assert second.uploaded == (manifest.files[0].path,)
+    assert second.already_complete is False  # it had to repair something
+    assert missing.is_file()

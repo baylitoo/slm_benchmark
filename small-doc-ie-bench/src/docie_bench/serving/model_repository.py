@@ -126,6 +126,25 @@ class PublishResult:
         return self.was_already_published and not self.uploaded
 
 
+def _describes(
+    manifest: Manifest, *, family: str, kind: str, entries: Sequence[ManifestFile]
+) -> bool:
+    """Whether ``manifest`` already describes exactly these artifacts.
+
+    Content only -- ``source`` and ``published_by`` are provenance and are
+    deliberately NOT compared, so publishing identical weights from two nodes
+    resolves to one content address instead of two. The manifest keeps the
+    first publication's provenance, which says more than the latest redundant
+    one.
+    """
+    if manifest.family != family or manifest.kind != kind:
+        return False
+    def key(entry: ManifestFile) -> tuple[str, str, str, int]:
+        return (entry.role, entry.path, entry.digest, entry.size_bytes)
+
+    return sorted(map(key, manifest.files)) == sorted(map(key, entries))
+
+
 def local_for(files: Sequence[tuple[str, str, Path]], relative: str) -> Path:
     """The local path a manifest entry came from.
 
@@ -206,15 +225,6 @@ class ModelRepository:
                 ManifestFile(role=role, path=relative, digest=digest, size_bytes=size)
             )
 
-        manifest = manifest_mod.build(
-            name=name,
-            family=family,
-            kind=kind,
-            files=entries,
-            source=source,
-            published_by=published_by,
-        )
-        payload = manifest.to_json()
         pointer = self._key(pointer_key(name))
 
         # What the pointer names right now, so "already published" can be told
@@ -225,6 +235,40 @@ class ModelRepository:
             previously = manifest_mod.parse_pointer(self._store.get(pointer))
         except (ObjectNotFoundError, manifest_mod.InvalidManifestError):
             previously = None
+
+        # Reuse the manifest already published when it describes exactly these
+        # artifacts.
+        #
+        # ``created_at`` is part of the manifest document and therefore of its
+        # digest, so building a fresh one for unchanged weights mints a NEW
+        # digest, writes a near-duplicate manifest and repoints current.json --
+        # entirely because the clock moved. At second precision that also made
+        # ``was_already_published`` depend on whether two publications landed in
+        # the same second, which is what made it flaky.
+        #
+        # A manifest whose digest is not a function of its content is not a
+        # content address: two nodes publishing the same weights would pin two
+        # different builds of identical bytes.
+        reused: Manifest | None = None
+        if previously is not None:
+            try:
+                candidate = self.manifest(name, previously)
+            except (ModelRepositoryError, manifest_mod.InvalidManifestError):
+                candidate = None  # unreadable or substituted: publish afresh
+            if candidate is not None and _describes(
+                candidate, family=family, kind=kind, entries=entries
+            ):
+                reused = candidate
+
+        manifest = reused if reused is not None else manifest_mod.build(
+            name=name,
+            family=family,
+            kind=kind,
+            files=entries,
+            source=source,
+            published_by=published_by,
+        )
+        payload = manifest.to_json()
 
         uploaded: list[str] = []
         skipped: list[str] = []
@@ -240,12 +284,21 @@ class ModelRepository:
             if progress is not None:
                 progress(entry.path, entry.size_bytes, entry.size_bytes)
 
-        digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
-        key = self._key(manifest.manifest_key(digest))
-        self._store.put(key, payload)
+        if reused is not None and previously is not None:
+            # The manifest and the pointer are already exactly right. Writing
+            # them again is the only way to change a digest that must not
+            # change, so this path writes NEITHER -- note that the blob loop
+            # above still ran, so a blob deleted from under a published model
+            # is restored and reported in ``uploaded``.
+            digest = previously
+            key = self._key(manifest.manifest_key(digest))
+        else:
+            digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+            key = self._key(manifest.manifest_key(digest))
+            self._store.put(key, payload)
 
-        # LAST. Everything above is inert until this exists.
-        self._store.put(pointer, pointer_document(digest))
+            # LAST. Everything above is inert until this exists.
+            self._store.put(pointer, pointer_document(digest))
 
         return PublishResult(
             name=name,
