@@ -52,6 +52,25 @@
 
   body {
     @apply bg-background text-foreground font-sans antialiased;
+    /* Inter's defaults leave headings loose at UI sizes and let digits shift
+       width between renders, which a console full of ports, token counts and
+       RAM figures notices. `cv11` is Inter's single-storey a/g, which reads
+       closer to the geometric sans this UI is aiming at. */
+    font-feature-settings: "cv11", "ss01";
+    letter-spacing: -0.006em;
+  }
+
+  /* Any figure that changes while you watch it gets fixed-width digits, so a
+     reading does not jitter its column on every poll. */
+  .tabular-nums,
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.018em;
   }
 
   /* Visible, consistent keyboard focus across interactive elements. */
