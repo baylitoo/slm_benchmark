@@ -46,6 +46,12 @@ class DeployRequest(BaseModel):
     # required. Given, the deploy is recorded as desired state owned by that
     # node and its own reconciler converges on it.
     node_id: str | None = None
+    # Let the platform choose the node(s) by fit instead of naming one. With
+    # replicas > 1 this spreads them over DISTINCT nodes, which is the only
+    # arrangement that survives losing a machine -- a separate field from
+    # node_id rather than a magic node_id value, so a node that happens to be
+    # called "auto" is still addressable.
+    auto_place: bool = False
     # llama-server request slots (#248/#321). 32 is an operator sanity ceiling,
     # not a llama.cpp hard limit. Meaningless for non-llamacpp runtimes; the
     # build_command for those simply never reads it.
@@ -261,18 +267,12 @@ def _target_node_deploy(
         )
 
     deployment_name = payload.name or mint_deployment_name(payload.model)
-    spec = {
-        "model": payload.model,
-        "context_length": payload.context_length,
-    }
-    if payload.port is not None:
-        spec["port"] = payload.port
     try:
         written = catalog.set_desired_deployment(
             str(payload.node_id),
             deployment_name,
             desired_state="running",
-            spec=spec,
+            spec=_desired_spec(payload),
         )
     except DesiredStateConflictError as exc:
         raise HTTPException(
@@ -291,10 +291,168 @@ def _target_node_deploy(
     )
 
 
+def _desired_spec(payload: DeployRequest) -> dict[str, Any]:
+    """The spec a desired-state row carries for a deploy.
+
+    Deliberately thin. The owning node resolves the store entry, allocates the
+    port and builds the launch command itself, so a desired row carries intent
+    rather than a frozen command line -- which is also what lets a node that
+    joins later converge on a row written before it existed.
+    """
+    spec: dict[str, Any] = {
+        "model": payload.model,
+        "context_length": payload.context_length,
+    }
+    if payload.port is not None:
+        spec["port"] = payload.port
+    return spec
+
+
+def _auto_place_deploy(
+    payload: DeployRequest, tenant: TenantDependency
+) -> _shared.TriggerResponse:
+    """Choose the node(s) by fit and record the deploy as desired state (#536).
+
+    The half of #536 that makes a fleet worth having. Naming a node is fine
+    when there are two; by the time there are six, an operator asking "which
+    one has room for this" is doing arithmetic the sizing engine already does
+    per node.
+
+    For ``replicas > 1`` the nodes are DISTINCT. Two replicas on one machine
+    share its memory, its cgroup limit and its failure, so stacking them is not
+    what asking for two replicas means -- and a partial placement is refused
+    rather than silently delivered, because "I asked for 3 and got 2" is a
+    capacity decision only the operator can make.
+
+    Refuses with the per-node reasons rather than a bare "no node fits": which
+    node failed which gate is what tells an operator whether to seed a blob,
+    resume a drained node or add a machine.
+    """
+    from docie_bench.serving.catalog import (
+        CatalogUnavailableError,
+        DesiredStateConflictError,
+        ModelCatalog,
+    )
+    from docie_bench.serving.node_liveness import stale_node_ids
+    from docie_bench.serving.node_selection import select_nodes
+
+    if payload.name and payload.replicas > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "replicas auto-name each instance so their records stay "
+                "distinct across nodes, so an explicit name cannot be combined "
+                "with replicas > 1"
+            ),
+        )
+    try:
+        catalog = ModelCatalog()
+        models = catalog.list()
+        snapshots = list(catalog.list_node_snapshots())
+        placements = list(catalog.list_placements())
+    except CatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "choosing a node needs the model catalog, which is not "
+                "configured (DATABASE_URL); deploy without auto_place to use "
+                "the untargeted path"
+            ),
+        ) from exc
+
+    if not any(str(row.get("node_id") or "") for row in snapshots):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no serving node has reported, so there is nothing to choose "
+                "between; deploy without auto_place"
+            ),
+        )
+
+    chosen, candidates = select_nodes(
+        payload.model,
+        count=payload.replicas,
+        models=models,
+        snapshots=snapshots,
+        placements=placements,
+        stale=stale_node_ids(snapshots),
+        context_length=payload.context_length,
+        n_parallel=payload.n_parallel,
+    )
+    if len(chosen) < payload.replicas:
+        rejected = [
+            f"{candidate.node_id}: {candidate.reason}"
+            for candidate in candidates
+            if not candidate.eligible
+        ]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{payload.replicas} replica(s) of {payload.model!r} need "
+                f"{payload.replicas} distinct nodes and only {len(chosen)} can "
+                f"take it. Replicas are never stacked on one node, since two on "
+                f"one machine share its failure. "
+                + (f"Rejected -- {'; '.join(rejected)}" if rejected else "")
+            ).strip(),
+        )
+
+    placed: list[dict[str, Any]] = []
+    for node_id in chosen:
+        deployment_name = payload.name or mint_deployment_name(payload.model)
+        try:
+            written = catalog.set_desired_deployment(
+                node_id,
+                deployment_name,
+                desired_state="running",
+                spec=_desired_spec(payload),
+            )
+        except DesiredStateConflictError as exc:
+            # A minted name collided, or a concurrent write touched this row.
+            # Reported with what HAS been placed: silently rolling back would
+            # mean undoing desired state another writer may already be acting
+            # on, and reporting nothing would hide rows that now exist.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"desired state for {deployment_name!r} on {node_id!r} "
+                    f"changed under us: {exc}. Already placed: "
+                    f"{placed or 'nothing'}"
+                ),
+            ) from exc
+        placed.append(
+            {
+                "node_id": node_id,
+                "name": deployment_name,
+                "generation": written["node_desired_generation"],
+            }
+        )
+
+    where = ", ".join(f"{row['name']} on {row['node_id']}" for row in placed)
+    return _shared.TriggerResponse(
+        event_ids=[],
+        channel=None,
+        topics=[],
+        detail=(
+            f"placed by fit as desired state: {where}. Each node's reconciler "
+            f"converges within one cycle"
+        ),
+    )
+
+
 @router.post("/deploy", response_model=_shared.TriggerResponse)
 async def trigger_deploy(
     payload: DeployRequest, tenant: TenantDependency
 ) -> _shared.TriggerResponse:
+    if payload.node_id and payload.auto_place:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "node_id names a node and auto_place asks the platform to "
+                "choose one; send one or the other"
+            ),
+        )
+    if payload.auto_place:
+        return _auto_place_deploy(payload, tenant)
     if payload.node_id:
         return _target_node_deploy(payload, tenant)
     if payload.replicas > 1:

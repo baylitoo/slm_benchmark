@@ -31,6 +31,7 @@ import {
   Card,
   EmptyState,
   Field,
+  Checkbox,
   Select,
   Skeleton,
   TextInput,
@@ -93,6 +94,9 @@ export function DeployForm({
   // "" = untargeted (an event, any node). A node id = desired state owned by
   // that node.
   const [nodeId, setNodeId] = useState("");
+  // Ask the platform to rank the nodes by fit and pick. With replicas > 1 it
+  // spreads them over distinct nodes, which is the reason to want it.
+  const [autoPlace, setAutoPlace] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -158,6 +162,7 @@ export function DeployForm({
     // hold the new one — carrying the target over would submit a deploy the
     // server refuses.
     setNodeId("");
+    setAutoPlace(false);
     setError(null);
     setAck(null);
   }
@@ -179,7 +184,9 @@ export function DeployForm({
       );
       return;
     }
-    if (nodeId && replicaCount > 1) {
+    // Deliberately NOT applied to auto-placement: spreading replicas over
+    // distinct nodes is the whole reason to ask for it.
+    if (nodeId && !autoPlace && replicaCount > 1) {
       // Mirrors the server's 422: a target names ONE node, and each replica
       // needs a distinct placement.
       setError(
@@ -200,7 +207,7 @@ export function DeployForm({
         ...(contextLength.trim() ? { context_length: Number(contextLength) } : {}),
         ...(maxTokens.trim() ? { max_tokens: Number(maxTokens) } : {}),
         ...(replicaCount > 1 ? { replicas: replicaCount } : {}),
-        ...(nodeId ? { node_id: nodeId } : {}),
+        ...(autoPlace ? { auto_place: true } : nodeId ? { node_id: nodeId } : {}),
         ...(showNParallel && Number(nParallel) > 1 ? { n_parallel: Number(nParallel) } : {}),
         ...(showNParallel && batchSize.trim() ? { batch_size: Number(batchSize) } : {}),
         ...(showNParallel && ubatchSize.trim() ? { ubatch_size: Number(ubatchSize) } : {}),
@@ -321,6 +328,7 @@ export function DeployForm({
                 aria-label="Target node"
                 value={nodeId}
                 onChange={(e) => setNodeId(e.target.value)}
+                disabled={autoPlace}
               >
                 <option value="">Any node (untargeted)</option>
                 {nodeTargets.map((target) => (
@@ -342,6 +350,18 @@ export function DeployForm({
                 ))}
               </Select>
             </Field>
+            <div className="mt-2">
+              <Checkbox
+                checked={autoPlace}
+                onChange={(e) => setAutoPlace(e.target.checked)}
+                label="Let the platform choose"
+                hint={
+                  Number(replicas) > 1
+                    ? "Ranks the nodes by what actually fits and spreads the replicas over distinct nodes. A partial spread is refused rather than stacking two on one machine."
+                    : "Ranks the nodes by what actually fits — skipping any that is drained, silent, or missing this model's blob — and records the deploy on the best one."
+                }
+              />
+            </div>
             <p className="mt-1.5 flex items-start gap-1.5 text-xs text-muted-foreground">
               <Network className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <T>
@@ -436,6 +456,7 @@ export function DeployForm({
                     hint="Target instances of this model, load-balanced behind one id. Each uses an auto port; RAM is checked for all of them."
                   >
                     <TextInput
+                      aria-label="Replicas"
                       type="number"
                       min={1}
                       max={16}

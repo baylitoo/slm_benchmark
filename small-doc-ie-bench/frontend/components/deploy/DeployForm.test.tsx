@@ -212,3 +212,83 @@ describe("DeployForm — target node", () => {
     expect(screen.queryByText(/Connecting to live updates/)).not.toBeInTheDocument();
   });
 });
+
+describe("DeployForm — auto placement", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getPorts).mockResolvedValue({
+      range: { start: 8088, end: 8188 },
+      deployments: [],
+      used: [],
+      free_sample: [8088],
+      recommended_next: 8088,
+    });
+    vi.mocked(api.deployModel).mockResolvedValue({
+      event_ids: [],
+      channel: null,
+      topics: [],
+      detail: "placed by fit as desired state: lfm2.5-350m-ab12 on node-b",
+    });
+  });
+
+  const FLEET: StoreEntry[] = [
+    {
+      name: "lfm2.5-350m",
+      available_backends: ["llamacpp"],
+      nodes: { present: ["node-a", "node-b"], missing: [], unreported: [] },
+    },
+  ];
+
+  it("asks the platform to choose instead of naming a node", async () => {
+    const user = userEvent.setup();
+    renderForm(FLEET);
+
+    await user.click(screen.getByText("lfm2.5-350m"));
+    await user.click(screen.getByLabelText(/Let the platform choose/));
+    await user.click(screen.getByRole("button", { name: /Deploy/i }));
+
+    await waitFor(() => expect(api.deployModel).toHaveBeenCalled());
+    const payload = vi.mocked(api.deployModel).mock.calls[0][0];
+    expect(payload.auto_place).toBe(true);
+    // Naming a node and asking for one to be chosen is a 422; the form must
+    // not send both.
+    expect(payload).not.toHaveProperty("node_id");
+  });
+
+  it("allows replicas above 1, because spreading them is the point", async () => {
+    // A TARGETED deploy with replicas > 1 is refused (one target, one node).
+    // Auto placement is the opposite case: it spreads them over distinct
+    // nodes, so the same guard must not block it.
+    const user = userEvent.setup();
+    renderForm(FLEET);
+
+    await user.click(screen.getByText("lfm2.5-350m"));
+    await user.click(screen.getByLabelText(/Let the platform choose/));
+    await openAdvanced(user);
+    const replicas = screen.getByLabelText("Replicas");
+    await user.clear(replicas);
+    await user.type(replicas, "2");
+    await user.click(screen.getByRole("button", { name: /Deploy/i }));
+
+    await waitFor(() => expect(api.deployModel).toHaveBeenCalled());
+    const payload = vi.mocked(api.deployModel).mock.calls[0][0];
+    expect(payload.replicas).toBe(2);
+    expect(payload.auto_place).toBe(true);
+  });
+
+  it("still refuses replicas on a deploy aimed at ONE named node", async () => {
+    const user = userEvent.setup();
+    renderForm(FLEET);
+
+    await user.click(screen.getByText("lfm2.5-350m"));
+    await user.selectOptions(screen.getByLabelText("Target node"), "node-b");
+    await openAdvanced(user);
+    const replicas = screen.getByLabelText("Replicas");
+    await user.clear(replicas);
+    await user.type(replicas, "2");
+    await user.click(screen.getByRole("button", { name: /Deploy/i }));
+
+    expect(await screen.findByText(/cannot be combined with replicas/)).toBeInTheDocument();
+    expect(api.deployModel).not.toHaveBeenCalled();
+  });
+});
