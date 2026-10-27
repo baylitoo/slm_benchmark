@@ -1,0 +1,1 @@
+Example fixture: the quarterly support report records 18 open requests and 4 requests awaiting customer replies.

@@ -31,6 +31,7 @@ operations/fleet-runbook
 
 development/contributing
 development/testing
+hybrid-execution
 ```
 
 ```{toctree}
