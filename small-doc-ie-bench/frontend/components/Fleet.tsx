@@ -1,17 +1,22 @@
 "use client";
 
-import { useMemo } from "react";
-import { Server, HardDrive, Boxes, Network } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Server, HardDrive, Boxes, Network, PauseCircle, PlayCircle } from "lucide-react";
 import {
+  ApiError,
+  drainNode,
   getFleet,
   formatBytes,
   getStore,
+  resumeNode,
   type FleetNode,
   type FleetView,
   type StoreEntry,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
-import { Alert, Badge, Card } from "./ui";
+import { toUserMessage } from "@/lib/errors";
+import { useToast } from "./Toast";
+import { Alert, Badge, Button, Card } from "./ui";
 import { LiveIndicator } from "./LiveIndicator";
 import { Table, type Column } from "./patterns/Table";
 
@@ -60,6 +65,7 @@ export function Fleet({ active = true }: { active?: boolean }) {
 
   const silent = (nodes ?? []).filter((n) => !n.reporting && !n.never_reported);
   const isSingle = nodes != null && nodes.length === 1;
+  const draining = (nodes ?? []).filter((n) => n.drain_state === "draining");
 
   return (
     <div className="space-y-4">
@@ -89,6 +95,16 @@ export function Fleet({ active = true }: { active?: boolean }) {
         </Alert>
       )}
 
+      {draining.length > 0 && (
+        <Alert tone="warn">
+          {draining.length === 1
+            ? `Node ${draining[0].node_id} is draining.`
+            : `${draining.length} nodes are draining.`}{" "}
+          No new requests route to them; their runtimes stop once in-flight
+          requests have had their grace period, and they report empty when done.
+        </Alert>
+      )}
+
       {isSingle ? (
         <SingleNode node={nodes[0]} store={store.data} />
       ) : (
@@ -98,6 +114,7 @@ export function Fleet({ active = true }: { active?: boolean }) {
             staleAfter={staleAfter}
             loading={fleet.loading}
             error={fleet.error}
+            onChanged={refresh}
           />
           <BlobPresence
             store={store.data}
@@ -225,12 +242,56 @@ function NodeTable({
   staleAfter,
   loading,
   error,
+  onChanged,
 }: {
   nodes: FleetNode[] | null;
   staleAfter: number | null;
   loading?: boolean;
   error?: unknown;
+  onChanged: () => void;
 }) {
+  const { toast } = useToast();
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function act(node: FleetNode, drain: boolean) {
+    setBusy(node.node_id);
+    try {
+      if (!drain) {
+        await resumeNode(node.node_id);
+      } else {
+        try {
+          await drainNode(node.node_id);
+        } catch (err) {
+          // The server refuses a drain that would take a model offline, naming
+          // which ones. That sentence is the whole decision, so it is what the
+          // operator is asked to confirm — not a generic "are you sure".
+          if (err instanceof ApiError && err.status === 409) {
+            if (!window.confirm(`${err.message}\n\nDrain anyway?`)) {
+              return;
+            }
+            await drainNode(node.node_id, { acknowledgeOutage: true });
+          } else {
+            throw err;
+          }
+        }
+      }
+      toast({
+        title: drain ? "Node draining" : "Node admitting",
+        description: node.node_id,
+        tone: "success",
+      });
+      onChanged();
+    } catch (err) {
+      const msg = toUserMessage(err, {
+        unavailable: "Draining isn't available on this server.",
+        fallback: drain ? "Drain failed." : "Resume failed.",
+      });
+      toast({ title: drain ? "Drain failed" : "Resume failed", description: msg, tone: "error" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const columns = useMemo<Column<FleetNode>[]>(
     () => [
       {
@@ -295,8 +356,43 @@ function NodeTable({
             <span className="tabular-nums">{n.store_models.length}</span>
           ),
       },
+      {
+        key: "actions",
+        header: "",
+        className: "text-right",
+        render: (n) => {
+          const drained = Boolean(n.drained_at);
+          return (
+            <Button
+              size="sm"
+              variant={drained ? "secondary" : "ghost"}
+              loading={busy === n.node_id}
+              disabled={busy !== null}
+              title={
+                drained
+                  ? "Resume: admit this node again. Its reconciler restores the deployments the drain stopped."
+                  : "Drain: stop routing to this node, then let it stop its runtimes once in-flight requests have finished."
+              }
+              onClick={() => act(n, !drained)}
+            >
+              {drained ? (
+                <>
+                  <PlayCircle className="h-3.5 w-3.5" /> Resume
+                </>
+              ) : (
+                <>
+                  <PauseCircle className="h-3.5 w-3.5" /> Drain
+                </>
+              )}
+            </Button>
+          );
+        },
+      },
     ],
-    [staleAfter],
+    // `act` is redefined each render, so it is referenced rather than listed:
+    // including it would rebuild the columns on every poll tick.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [staleAfter, busy],
   );
 
   return (
@@ -330,6 +426,23 @@ function NodeState({
   node: FleetNode;
   staleAfterS: number | null;
 }) {
+  // Drain is shown ahead of liveness on purpose. A drained node is out of the
+  // rotation by an operator's declaration, which holds whether or not it is
+  // still reporting -- showing "reporting" there would describe the machine
+  // correctly and the routing wrongly.
+  if (node.drain_state === "draining" || node.drain_state === "drained") {
+    const done = node.drain_state === "drained";
+    return (
+      <span className="flex items-center gap-2">
+        <Badge tone="warn">{done ? "drained" : "draining"}</Badge>
+        <span className="text-xs text-muted">
+          {done
+            ? "no placements left"
+            : `${node.deployments} still finishing`}
+        </span>
+      </span>
+    );
+  }
   if (node.never_reported) {
     return (
       <span className="flex items-center gap-2">

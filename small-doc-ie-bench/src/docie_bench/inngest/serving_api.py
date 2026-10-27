@@ -424,6 +424,172 @@ def _sizing_inputs() -> tuple[
     return models, snapshot, placements, detail
 
 
+def _drain_state(snapshot: dict[str, Any], owned: int) -> str:
+    """``admitting`` | ``draining`` | ``drained`` for one node row.
+
+    ``draining`` and ``drained`` are separated because an operator waiting on a
+    machine needs to know which one they are in: draining means requests are
+    still finishing on it and nothing new is being admitted, drained means it
+    has released everything. Collapsing them would make a drain look either
+    instant (and wrong) or stuck.
+    """
+    if not snapshot.get("drained_at"):
+        return "admitting"
+    return "drained" if owned == 0 else "draining"
+
+
+def _models_losing_last_placement(
+    node_id: str, placements: list[dict[str, Any]], already_drained: set[str]
+) -> list[str]:
+    """Models whose only live placement is on ``node_id``.
+
+    The pre-flight for a drain, in the spirit of the three refusals on the
+    targeted-deploy path: the operator is told what the drain costs BEFORE it
+    happens rather than discovering it from failing requests. Nodes already
+    drained do not count as somewhere else to route, since routing excludes
+    them too.
+
+    Uses the router's own liveness predicate rather than a second opinion about
+    what "live" means -- a pre-flight that disagreed with routing would warn
+    about the wrong models.
+    """
+    from docie_bench.serving.placement_resolver import _placement_is_live
+
+    live_elsewhere: set[str] = set()
+    on_this_node: set[str] = set()
+    for row in placements:
+        model = str(row.get("model_name") or row.get("name") or "")
+        if not model or not _placement_is_live(row):
+            continue
+        owner = str(row.get("node_id") or "")
+        if owner == node_id:
+            on_this_node.add(model)
+        elif owner not in already_drained:
+            live_elsewhere.add(model)
+    return sorted(on_this_node - live_elsewhere)
+
+
+class NodeDrainRequest(BaseModel):
+    """Body of a drain request."""
+
+    # Draining the last node serving a model takes that model offline, because
+    # routing excludes a drained node even when it holds the only replica
+    # (serving/drain.py explains why that is the right behaviour). The refusal
+    # is overridable rather than absolute: taking a machine out even at the
+    # cost of a model is a legitimate thing to want, and only the operator
+    # knows whether it is.
+    acknowledge_outage: bool = False
+
+
+@router.post("/nodes/{node_id}/drain")
+async def drain_node(
+    node_id: str, payload: NodeDrainRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    """Take ``node_id`` out of the rotation (#536).
+
+    Two effects with different timings, and the response says so because an
+    operator watching the Fleet page will otherwise read the first as the
+    whole thing:
+
+    * Routing excludes the node's placements immediately. Central,
+      unconditional, and needs nothing from the node itself -- it works on a
+      machine that is already unreachable.
+    * The node stops its runtimes after a grace period measured from the drain,
+      long enough for requests admitted just before it to finish. That half
+      runs on the node, so it needs the node's reconciler to be alive and
+      converging.
+    """
+    del tenant  # authenticated principal required; no per-tenant scoping (ops)
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        catalog = ModelCatalog()
+        snapshots = list(catalog.list_node_snapshots())
+        placements = list(catalog.list_placements())
+    except CatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "draining a node needs the model catalog, which is not "
+                "configured (DATABASE_URL). A single-node deployment has no "
+                "rotation to drain from"
+            ),
+        ) from exc
+
+    known = {str(row.get("node_id") or "") for row in snapshots}
+    if node_id not in known:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no serving node {node_id!r} is known; known nodes: "
+                f"{sorted(name for name in known if name) or 'none'}"
+            ),
+        )
+    already = {
+        str(row.get("node_id") or "") for row in snapshots if row.get("drained_at")
+    }
+    stranded = _models_losing_last_placement(node_id, placements, already)
+    if stranded and not payload.acknowledge_outage:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"draining {node_id!r} would take {len(stranded)} model(s) "
+                f"offline, because this node holds their only live placement: "
+                f"{', '.join(stranded)}. Deploy them on another node first, or "
+                f"repeat with acknowledge_outage=true to drain anyway"
+            ),
+        )
+    result = catalog.set_node_drain(node_id, drained=True)
+    return {
+        **result,
+        "models_offline": stranded,
+        "detail": (
+            f"node {node_id!r} is out of the routing rotation as of now; its "
+            f"runtimes stop once in-flight requests have had their grace period"
+        ),
+    }
+
+
+@router.post("/nodes/{node_id}/resume")
+async def resume_node(node_id: str, tenant: TenantDependency) -> dict[str, Any]:
+    """Admit ``node_id`` again, undoing a drain (#536).
+
+    Routing picks it back up on the next resolution. Deployments its reconciler
+    stopped are restarted by the same convergence that stopped them: their
+    desired rows were never deleted, only overridden while the node was
+    drained, so a resume restores them rather than needing a redeploy.
+    """
+    del tenant  # authenticated principal required; no per-tenant scoping (ops)
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        catalog = ModelCatalog()
+        known = {
+            str(row.get("node_id") or "") for row in catalog.list_node_snapshots()
+        }
+    except CatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="resuming a node needs the model catalog (DATABASE_URL)",
+        ) from exc
+    if node_id not in known:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no serving node {node_id!r} is known; known nodes: "
+                f"{sorted(name for name in known if name) or 'none'}"
+            ),
+        )
+    result = catalog.set_node_drain(node_id, drained=False)
+    return {
+        **result,
+        "detail": (
+            f"node {node_id!r} is admitting again; its reconciler restores the "
+            f"deployments it stopped on its next cycle"
+        ),
+    }
+
+
 @router.get("/nodes")
 async def serving_nodes() -> dict[str, Any]:
     """Every serving node that has a row, with its capacity and what it holds.
@@ -495,6 +661,13 @@ async def serving_nodes() -> dict[str, Any]:
                 # here rather than in the UI so one definition of ownership
                 # serves every reader.
                 "deployments": owned.get(node_id, 0),
+                # Derived from what is observable centrally, NOT from the
+                # node's grace period: that is computed on the node from its
+                # own deployments' request timeouts, and guessing it here would
+                # show "drained" while the machine is still finishing work.
+                # "The node reports empty" is the acceptance criterion, and the
+                # placement count is exactly that, read from the catalog.
+                "drain_state": _drain_state(snapshot, owned.get(node_id, 0)),
             }
         )
     nodes.sort(key=lambda row: str(row.get("node_id") or ""))

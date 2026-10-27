@@ -30,6 +30,53 @@ export interface FleetNode extends NodeSnapshot {
   store_models?: string[] | null;
   /** Desired-state generation last written for this node; null when none. */
   desired_generation?: number | null;
+  /** When an operator declared this node drained; null when it is admitting. */
+  drained_at?: string | null;
+  /** Where the node is between admitting traffic and being free to stop.
+   *
+   * `draining` and `drained` are separate because an operator waiting on a
+   * machine needs to know which one they are in: draining means requests are
+   * still finishing on it, drained means it has released everything. Derived
+   * server-side from the placement count rather than from the node's grace
+   * period, which is computed on the node itself. */
+  drain_state?: "admitting" | "draining" | "drained" | string;
+}
+
+/** Response of the drain/resume endpoints. */
+export interface DrainResponse {
+  node_id: string;
+  drained_at: string | null;
+  desired_generation: number;
+  /** Models whose only live placement was on this node, so draining it took
+   * them offline. Only non-empty when the refusal was acknowledged. */
+  models_offline?: string[];
+  detail?: string | null;
+}
+
+/**
+ * Take a node out of the routing rotation.
+ *
+ * Refuses with 409 when the node holds the last live placement of a model,
+ * naming them; `acknowledgeOutage` repeats the request past that refusal. The
+ * refusal is overridable rather than absolute because taking a machine out
+ * even at the cost of a model is a legitimate thing to want, and only the
+ * operator knows whether it is.
+ */
+export async function drainNode(
+  nodeId: string,
+  opts: { acknowledgeOutage?: boolean } = {},
+): Promise<DrainResponse> {
+  return request<DrainResponse>(`/v1/serving/nodes/${encodeURIComponent(nodeId)}/drain`, {
+    method: "POST",
+    body: JSON.stringify({ acknowledge_outage: opts.acknowledgeOutage ?? false }),
+  });
+}
+
+/** Admit a node again. Its reconciler restores what the drain stopped. */
+export async function resumeNode(nodeId: string): Promise<DrainResponse> {
+  return request<DrainResponse>(`/v1/serving/nodes/${encodeURIComponent(nodeId)}/resume`, {
+    method: "POST",
+  });
 }
 
 export interface FleetView {

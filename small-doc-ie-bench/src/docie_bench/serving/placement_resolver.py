@@ -343,6 +343,78 @@ def _nodes_that_stopped_reporting(catalog: ModelCatalog) -> frozenset[str]:
         return frozenset()
 
 
+def _drained_node_ids(catalog: ModelCatalog) -> frozenset[str]:
+    """Node ids an operator has declared drained.
+
+    Best-effort in the same way liveness is: an unreadable node table returns
+    the empty set. The difference is what that costs. Failing to read liveness
+    means traffic keeps going to a node that may be dead; failing to read a
+    drain means traffic keeps going to a node the operator is taking out, which
+    they will see and can retry. Neither is worth refusing to route over.
+    """
+    try:
+        return frozenset(
+            str(row.get("node_id") or "")
+            for row in catalog.list_node_snapshots()
+            if row.get("drained_at") and row.get("node_id")
+        )
+    except Exception:  # noqa: BLE001 - drain state is advisory to the router
+        logger.debug("could not read node snapshots for drain state", exc_info=True)
+        return frozenset()
+
+
+def _exclude_drained_nodes(
+    name: str, live: list[dict[str, Any]], catalog: ModelCatalog
+) -> list[dict[str, Any]]:
+    """Drop candidates on nodes an operator declared drained (#536).
+
+    EXCLUSION, NOT DEMOTION -- the opposite of :func:`_prefer_live_nodes`, and
+    the contrast is the point. Staleness is INFERRED: a node that stopped
+    publishing may still be serving perfectly, so refusing the only replica
+    over it would turn a reporting problem into an outage. A drain is
+    DECLARED: an operator said to take this machine out of the rotation, and
+    "unless it is the last one" is not a thing they asked for. A drain that
+    silently kept serving the last replica would also make the acceptance
+    criterion untestable -- the node never reports empty.
+
+    So the last replica IS refused, with a reason that names the drain and both
+    ways out. That is a deliberate, operator-caused unavailability, which is
+    why it reads as a placement error rather than being logged and ignored.
+
+    Applied only on the fresh path. The cached path exists for a catalog that
+    cannot be read, and drain state lives in that same catalog -- so during an
+    outage a drained node keeps receiving traffic. Stating that plainly is
+    better than a check that silently cannot run.
+
+    Rows with no ``node_id`` are never excluded: their owner is unknown, not
+    drained.
+    """
+    drained = _drained_node_ids(catalog)
+    if not drained:
+        return live
+    admitting = [
+        candidate
+        for candidate in live
+        if str(candidate.get("node_id") or "") not in drained
+    ]
+    if admitting:
+        if len(admitting) != len(live):
+            logger.info(
+                "excluded %d placement(s) of %r on drained node(s) %s",
+                len(live) - len(admitting),
+                name,
+                ", ".join(sorted(drained)),
+            )
+        return admitting
+    raise PlacementNotReadyError(
+        f"every live placement of store model {name!r} is on a drained node "
+        f"({', '.join(sorted(drained))}). A drained node is excluded from "
+        f"routing by an operator's request, including when it holds the last "
+        f"replica -- resume the node, or deploy {name!r} on a node that is "
+        f"still admitting."
+    )
+
+
 def _prefer_live_nodes(
     name: str, live: list[dict[str, Any]], catalog: ModelCatalog
 ) -> list[dict[str, Any]]:
@@ -445,6 +517,12 @@ def resolve_store_profile(
         # Only on the fresh path: the cached path has no node table to read,
         # and withholding routing during a catalog outage is the failure #532
         # removed.
+        #
+        # Drain is applied BEFORE liveness, and the order matters: a drained
+        # node must not come back through _prefer_live_nodes, whose "keep every
+        # candidate rather than refuse the only one" fallback would otherwise
+        # resurrect it the moment the remaining nodes also looked stale.
+        live = _exclude_drained_nodes(name, live, catalog)
         live = _prefer_live_nodes(name, live, catalog)
     if len(live) == 1:
         placement = live[0]
