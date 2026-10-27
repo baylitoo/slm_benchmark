@@ -190,6 +190,27 @@ next request reloads it.
 Idle unload is separate and simpler: hot for long enough, unused for longer than
 the TTL, not pinned.
 
+### Ceilings on Docker Desktop
+
+The total the tracker reports is the **lowest ceiling that applies**, not the
+host's RAM. On Windows there are three stacked layers:
+
+```text
+host RAM (e.g. 16 GB)
+  └── WSL2 VM — defaults to 50% of host; raise in %UserProfile%\.wslconfig
+        └── serving container mem_limit — DOCIE_SERVING_MEM_LIMIT, default 8g
+              └── what the tracker reports (source=cgroup)
+```
+
+A 16 GB machine on defaults shows 8 GB total, and that is correct: it is what
+the serving node can actually use. The default is deliberately conservative. A
+`mem_limit` larger than the VM never binds, so the tracker would publish an
+authoritative-looking ceiling the node cannot deliver, and runtimes sized to it
+are killed by the VM instead of refused by the fit check. Raise the VM first
+(`[wsl2] memory=24GB`, then `wsl --shutdown`), then the limit.
+
+On a Linux host only the container limit applies, and cgroup numbers are exact.
+
 ### Tuning
 
 | Variable | Default | |
