@@ -247,16 +247,40 @@ class LocalDiskBackend:
         """
         destination = self._path(key_prefix)
         staging = destination.with_name(destination.name + ".tmp")
+        superseded = destination.with_name(destination.name + ".superseded")
         try:
             if staging.exists():
                 shutil.rmtree(staging)
+            if superseded.exists():
+                shutil.rmtree(superseded)
             for file in sorted(p for p in source_dir.rglob("*") if p.is_file()):
                 target = staging / file.relative_to(source_dir)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _transfer(file, target, link=link)
+
+            # Move the existing tree ASIDE rather than deleting it.
+            #
+            # The first version removed the destination and then replaced it,
+            # which left a window where a node had neither: if the replace
+            # failed -- a cross-device rename, a permissions error, or on
+            # Windows simply a running encoder holding the snapshot directory
+            # open -- the working model was already gone, and the handler below
+            # then removed the staged replacement too. Re-seeding a model a
+            # node was serving could destroy it.
+            #
+            # A rename is atomic and reversible, so the old tree survives until
+            # the new one is in place.
+            replaced = False
             if destination.exists():
-                shutil.rmtree(destination)
-            os.replace(staging, destination)
+                os.replace(destination, superseded)
+                replaced = True
+            try:
+                os.replace(staging, destination)
+            except BaseException:
+                if replaced:
+                    os.replace(superseded, destination)
+                raise
+            shutil.rmtree(superseded, ignore_errors=True)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise

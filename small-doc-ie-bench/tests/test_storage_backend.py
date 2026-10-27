@@ -300,3 +300,124 @@ def test_a_backend_failure_surfaces_as_a_store_error_with_its_message(
         store.add_gguf(
             name="m", family="openai_chat", model_gguf=_source(tmp_path)
         )
+
+# --- replacing an existing tree -------------------------------------------
+
+
+def test_a_failed_replace_leaves_the_existing_snapshot_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window this guards.
+
+    The first version removed the destination and THEN replaced it, so a
+    failure in between left the node with neither tree: the working model was
+    already deleted, and the handler then removed the staged replacement too.
+    Re-seeding a model a node was serving could destroy it.
+
+    The replace can fail for ordinary reasons -- a cross-device rename, a
+    permissions error, or on Windows a running encoder simply holding the
+    snapshot directory open -- so this is not an exotic path.
+    """
+    import docie_bench.serving.storage_backend as module
+
+    backend = LocalDiskBackend(tmp_path / "store")
+    first = tmp_path / "v1"
+    first.mkdir()
+    (first / "model.safetensors").write_bytes(b"v1")
+    backend.write_tree(first, "gliner/snapshot", link=True)
+
+    second = tmp_path / "v2"
+    second.mkdir()
+    (second / "model.safetensors").write_bytes(b"v2")
+
+    real = module.os.replace
+
+    def fails_on_the_publish(src: object, dst: object) -> None:
+        if str(dst).endswith("snapshot") and str(src).endswith(".tmp"):
+            raise OSError("replace failed")
+        return real(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module.os, "replace", fails_on_the_publish)
+
+    with pytest.raises(OSError, match="replace failed"):
+        backend.write_tree(second, "gliner/snapshot", link=True)
+
+    published = backend.resolve_local_dir("gliner/snapshot")
+    assert published.is_dir(), "the working snapshot was destroyed"
+    assert (published / "model.safetensors").read_bytes() == b"v1"
+
+
+def test_a_failed_replace_leaves_no_debris(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither the staging tree nor the set-aside copy may survive, or the
+    next publish starts from someone else's leftovers."""
+    import docie_bench.serving.storage_backend as module
+
+    backend = LocalDiskBackend(tmp_path / "store")
+    first = tmp_path / "v1"
+    first.mkdir()
+    (first / "model.safetensors").write_bytes(b"v1")
+    backend.write_tree(first, "gliner/snapshot", link=True)
+
+    second = tmp_path / "v2"
+    second.mkdir()
+    (second / "model.safetensors").write_bytes(b"v2")
+
+    real = module.os.replace
+
+    def fails_on_the_publish(src: object, dst: object) -> None:
+        if str(dst).endswith("snapshot") and str(src).endswith(".tmp"):
+            raise OSError("replace failed")
+        return real(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module.os, "replace", fails_on_the_publish)
+    with pytest.raises(OSError, match="replace failed"):
+        backend.write_tree(second, "gliner/snapshot", link=True)
+
+    parent = backend.resolve_local_dir("gliner/snapshot").parent
+    assert sorted(p.name for p in parent.iterdir()) == ["snapshot"]
+
+
+def test_debris_from_an_earlier_crash_does_not_poison_the_next_publish(
+    tmp_path: Path,
+) -> None:
+    """A process killed mid-publish can leave both temporaries behind. The
+    next attempt must start clean rather than merging them in."""
+    backend = LocalDiskBackend(tmp_path / "store")
+    published = backend.resolve_local_dir("gliner/snapshot")
+    published.parent.mkdir(parents=True, exist_ok=True)
+    (published.parent / "snapshot.tmp").mkdir()
+    (published.parent / "snapshot.tmp" / "stale.bin").write_bytes(b"old")
+    (published.parent / "snapshot.superseded").mkdir()
+    (published.parent / "snapshot.superseded" / "older.bin").write_bytes(b"older")
+
+    source = tmp_path / "v1"
+    source.mkdir()
+    (source / "model.safetensors").write_bytes(b"v1")
+    backend.write_tree(source, "gliner/snapshot", link=True)
+
+    assert sorted(p.name for p in published.iterdir()) == ["model.safetensors"]
+    assert sorted(p.name for p in published.parent.iterdir()) == ["snapshot"]
+
+
+def test_a_successful_replace_still_swaps_the_tree_wholesale(
+    tmp_path: Path,
+) -> None:
+    """The behaviour the fix must preserve: the new tree replaces the old one
+    entirely rather than merging into it."""
+    backend = LocalDiskBackend(tmp_path / "store")
+    first = tmp_path / "v1"
+    first.mkdir()
+    (first / "model.safetensors").write_bytes(b"v1")
+    (first / "config.json").write_bytes(b"{}")
+    backend.write_tree(first, "gliner/snapshot", link=True)
+
+    second = tmp_path / "v2"
+    second.mkdir()
+    (second / "model.safetensors").write_bytes(b"v2")
+    backend.write_tree(second, "gliner/snapshot", link=True)
+
+    published = backend.resolve_local_dir("gliner/snapshot")
+    assert (published / "model.safetensors").read_bytes() == b"v2"
+    assert not (published / "config.json").exists()
