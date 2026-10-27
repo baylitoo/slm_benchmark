@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from docie_bench.serving.model_store import (
     FAMILIES,
+    INDEX_LOCK_NAME,
     ModelStore,
     ModelStoreError,
     TemplateDelivery,
@@ -323,3 +327,165 @@ def test_add_gguf_copy_is_verified_and_faithful(tmp_path: Path) -> None:
     )
     assert entry.model_path.read_bytes() == b"weights-abc"
     assert not entry.model_path.with_name("model.gguf.tmp").exists()
+
+# --- the index is the only record that a model is here ---------------------
+
+
+def _store_with_sources(tmp_path: Path, count: int) -> tuple[ModelStore, dict[str, Path]]:
+    store = ModelStore(tmp_path / "models")
+    sources = {}
+    for i in range(count):
+        name = f"model-{i}"
+        source = tmp_path / f"{name}.gguf"
+        source.write_bytes(b"weights-" + name.encode())
+        sources[name] = source
+    return store, sources
+
+
+def _add_concurrently(
+    store: ModelStore, sources: dict[str, Path], extra: list[threading.Thread] | None = None
+) -> list[BaseException]:
+    start = threading.Barrier(len(sources) + len(extra or []))
+    errors: list[BaseException] = []
+
+    def add(name: str) -> None:
+        start.wait()
+        try:
+            store.add_gguf(
+                name=name, family="nuextract_v1", model_gguf=sources[name], link=False
+            )
+        except BaseException as exc:  # noqa: BLE001 - asserted by the caller
+            errors.append(exc)
+
+    threads = [threading.Thread(target=add, args=(n,)) for n in sources]
+    for thread in threads + (extra or []):
+        thread.start()
+    for thread in threads + (extra or []):
+        thread.join()
+    return errors
+
+
+def test_concurrent_seeds_keep_every_entry_and_leave_no_orphan(tmp_path: Path) -> None:
+    """Two writers of one store root are the documented workflow: the runbook
+    tells an operator to run ``store add-gguf`` on a node that is also seeding.
+
+    Without a cross-process lock the read-modify-write loses the entry the
+    loser wrote — ``add_gguf`` returns an entry and the CLI reports success,
+    but the index never names it, so the weights on disk are invisible to
+    every reader. Measured before the lock: 3 of 12 indexed, 6 orphan
+    directories, 4 raised.
+    """
+    store, sources = _store_with_sources(tmp_path, 12)
+
+    errors = _add_concurrently(store, sources)
+
+    indexed = {entry.name for entry in store.list()}
+    on_disk = {p.name for p in (tmp_path / "models").iterdir() if p.is_dir()}
+    assert errors == [], f"concurrent seeds failed: {errors[:3]}"
+    assert indexed == set(sources)
+    assert on_disk - indexed == set(), "weights on disk the index cannot see"
+
+
+def test_a_concurrent_reader_does_not_break_a_writer(tmp_path: Path) -> None:
+    """A reader holding ``index.json`` open while a writer renames onto it is
+    enough to fail the rename on Windows, so reads take the lock too."""
+    store, sources = _store_with_sources(tmp_path, 6)
+    read_errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def poll() -> None:
+        while not stop.is_set():
+            try:
+                store.list()
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                read_errors.append(exc)
+
+    reader = threading.Thread(target=poll)
+    reader.start()
+    try:
+        errors = _add_concurrently(store, sources)
+    finally:
+        stop.set()
+        reader.join()
+
+    assert errors == [], f"writes failed under a concurrent reader: {errors[:3]}"
+    assert read_errors == [], f"reads failed under concurrent writes: {read_errors[:3]}"
+
+
+def test_the_index_is_flushed_to_disk_before_the_rename(tmp_path: Path) -> None:
+    """``os.replace`` is atomic for the name, not the contents: without the
+    fsync a power loss can land the rename while the payload is buffered."""
+    store, _ = _store_with_sources(tmp_path, 0)
+    calls: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd: int) -> None:
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def replace(src: object, dst: object) -> None:
+        calls.append("replace")
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    with mock.patch.object(os, "fsync", fsync), mock.patch.object(os, "replace", replace):
+        store._write_index({"lfm2.5-350m": {}})
+
+    assert calls == ["fsync", "replace"]
+
+
+def test_a_failed_write_leaves_no_staging_file_behind(tmp_path: Path) -> None:
+    """One temp file per write means debris would otherwise accumulate per crash."""
+    store, _ = _store_with_sources(tmp_path, 0)
+    root = tmp_path / "models"
+
+    with (
+        mock.patch.object(os, "replace", side_effect=OSError("no space")),
+        pytest.raises(OSError, match="no space"),
+    ):
+        store._write_index({"lfm2.5-350m": {}})
+
+    assert [p.name for p in root.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_a_held_lock_times_out_with_an_actionable_error(tmp_path: Path) -> None:
+    """A hung holder has to surface as a named error, not a CLI that never
+    returns."""
+    store, _ = _store_with_sources(tmp_path, 0)
+    store._lock.timeout = 0.2
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with store._lock:
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(5)
+    try:
+        with pytest.raises(ModelStoreError, match=INDEX_LOCK_NAME):
+            store.list()
+    finally:
+        release.set()
+        holder.join()
+
+
+def test_a_corrupt_index_is_an_actionable_error_not_a_json_traceback(
+    tmp_path: Path,
+) -> None:
+    """And specifically not an empty store: treating a damaged index as "this
+    node holds nothing" would re-download every model while the weights sit on
+    disk unreferenced."""
+    store, sources = _store_with_sources(tmp_path, 1)
+    store.add_gguf(
+        name="model-0", family="nuextract_v1", model_gguf=sources["model-0"], link=False
+    )
+    (tmp_path / "models" / "index.json").write_text('{"model-0": {"name": "mod', encoding="utf-8")
+
+    with pytest.raises(ModelStoreError) as caught:
+        store.list()
+
+    message = str(caught.value)
+    assert "index.json" in message
+    assert "re-register" in message

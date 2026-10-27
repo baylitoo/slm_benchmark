@@ -23,6 +23,9 @@ dependencies = [
   # AES-GCM for Studio-issued API key secrets at rest (studio/key_crypto.py).
   # Previously present only transitively via pdfminer.six.
   "cryptography>=42.0.0",
+  # Cross-process lock for the model store index (serving/model_store.py).
+  # Previously present only transitively via huggingface-hub.
+  "filelock>=3.32",
   "psycopg[binary]>=3.2.1",
   "alembic>=1.13.2",
   "liteparse>=2.0.7",
