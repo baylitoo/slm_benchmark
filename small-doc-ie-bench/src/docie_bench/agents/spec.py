@@ -68,16 +68,16 @@ class AgentSpec(BaseModel):
       per-step shape a ``custom`` agent's top-level fields/options use —
       or a reference ``{"agent": "<name>", name?: str, route?: dict}``
       (#336) that resolves to another SAVED ``AgentSpec`` at execution
-      time and uses ITS ``model_profile``/``system_prompt``/
-      ``mcp_servers``/``mcp_tools`` for that step, instead of re-specifying
-      them inline. This keeps a step in sync with the referenced agent —
-      fixing a bug or tuning a prompt on the saved agent propagates to
-      every workflow step that points at it. A referenced agent that is
-      itself ``workflow`` kind runs its own steps nested, sharing the
-      same step-execution budget described below (so a reference cycle
+      time. References to ``custom`` agents execute their saved chat prompt
+      and MCP tool configuration; references to ``workflow`` agents execute
+      their full nested workflow. ``ocr`` and ``proxy_security`` references
+      are rejected because their document and redaction processing cannot be
+      represented by a chat-only step. Supported references stay in sync
+      with the saved agent when its prompt or tool configuration changes.
+      A referenced agent that is itself ``workflow`` kind runs its own steps
+      nested, sharing the same step-execution budget described below (so a reference cycle
       fails the same way a routing loop does — no separate cycle
-      detection); its ``mcp_servers``/``mcp_tools`` apply as-is, with no
-      per-step narrowing. One request runs every step server-side: the
+      detection). One request runs every step server-side: the
       first step receives the caller's own messages, and each later step
       receives only the last SUBSTANTIVE step's answer as its single user
       message ("prompt chaining" — a small model handling one narrow
@@ -94,7 +94,13 @@ class AgentSpec(BaseModel):
       ``model_profile``/``system_prompt`` are unused (each step carries its
       own); the final (non-routing) step's answer is the response, with
       every step's content, route target, and tool calls available via
-      ``docie_agent.steps`` (the "Try it" trace view, #262).
+      ``docie_agent.steps`` (the "Try it" trace view, #262). Workflow options
+      also accept ``allow_remote_profiles`` (default ``true`` for compatibility),
+      ``deadline_seconds``, and ``max_model_calls``. These restrictions are
+      inherited by nested workflows; a child can tighten a parent policy but
+      cannot re-enable remote processing. Model profiles use
+      ``execution_location: local|remote|unknown``; unknown is remote for this
+      policy.
     """
 
     name: str = Field(pattern=_NAME_RE, max_length=63)
