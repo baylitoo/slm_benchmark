@@ -114,12 +114,60 @@ def _record_observability(response: Any, tenant_id: str | None) -> None:
         logger.warning("record_extraction failed for a Studio extraction", exc_info=True)
 
 
+def _remote_deployment(name: str) -> dict[str, Any] | None:
+    """A deployment record projected from ``model_placement`` (#562).
+
+    Reached only when this node's file has no record, so a single-node install
+    issues no catalog query at all and its freshness is untouched.
+
+    Deliberately partial, like the Studio's listing projection: a placement row
+    carries no ``desired_state``, ``activation`` or launch spec, so those keys
+    stay ABSENT rather than guessed. ``_autoload_target`` therefore still
+    declines to autoload a deployment owned by another node -- but now because
+    the record says nothing about desired state, not because the deployment
+    looked nonexistent. Loading on another node needs desired state that can
+    express it (#590).
+
+    No staleness gate, matching ``profile_resolver._profile_from_placement``:
+    a node that stopped reporting has not necessarily stopped serving, and
+    #527 requires an already-running model to keep serving, so staleness
+    demotes a replica rather than erasing it.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        row = ModelCatalog().get_placement(name)
+    except CatalogUnavailableError:
+        return None
+    except Exception:  # noqa: BLE001 - must never fail an extraction
+        logger.debug("could not read the placement for %r", name, exc_info=True)
+        return None
+    if row is None:
+        return None
+    return {
+        "state": row.get("state"),
+        "endpoint": row.get("endpoint"),
+        "last_error": row.get("last_error"),
+        "node_id": row.get("node_id"),
+        # Same marker the Studio projection uses, for the same reason:
+        # a caller must be able to tell a catalog projection from the
+        # owning node's own record.
+        "record_source": "catalog",
+    }
+
+
 def _read_deployment(name: str) -> dict[str, Any] | None:
-    """The raw deployment record dict from the shared deployments.json, or None.
+    """The raw deployment record dict, this node's file first, or None.
 
     Cheap direct read (no supervisor construction, no mkdir side effects);
     best-effort — any hiccup reads as "no such deployment" so the callers
     (recency stamping, autoload detection) can never fail an extraction.
+
+    A name this node has no file for falls back to the catalog, because the
+    api/worker read ONE node's ``deployments.json``: without it a deployment
+    running perfectly well on another machine reads as "no such deployment",
+    and ``_poll_deployment_live`` waits out its whole budget for a replica
+    that has been ready the entire time (#562).
     """
     import json
 
@@ -128,9 +176,11 @@ def _read_deployment(name: str) -> dict[str, Any] | None:
             (serving_home() / "deployments.json").read_text(encoding="utf-8")
         )
         record = (payload.get("deployments") or {}).get(name)
-        return record if isinstance(record, dict) else None
     except (OSError, ValueError):
-        return None
+        record = None
+    if isinstance(record, dict):
+        return record
+    return _remote_deployment(name)
 
 
 def _deployment_is_live(record: dict[str, Any]) -> bool:
@@ -175,6 +225,53 @@ def _read_all_deployments() -> dict[str, dict[str, Any]]:
         return {}
 
 
+def _remote_replica_capacity(pattern: re.Pattern[str], known: set[str]) -> int:
+    """Slot capacity of this deployment's replicas on OTHER nodes (#562).
+
+    #589 spreads replicas across the fleet, so this node's file holds only its
+    own share: a deployment spread over three nodes priced its fan-out at one
+    node's slots and processed a third of what the fleet could run at once.
+
+    Nodes that stopped reporting are skipped, which is where this parts company
+    with routing. ``placement_resolver`` only ever uses staleness to prefer a
+    better replica, never to refuse the only one, because a crashed reconciler
+    still leaves llama-server serving. Pricing is the other case -- the same
+    rule the node table already states for unreported capacity -- since a width
+    counting a machine nobody can confirm fans a batch out onto it. Costing
+    throughput is recoverable; a batch that fails mid-flight is not. The floor
+    of 1 in the caller keeps the batch running either way.
+
+    ``slot_count`` is llama-server's observed ``/slots`` value, so it is the
+    concurrency the replica really offers. NULL (not live, a non-llamacpp
+    engine, ``--no-slots``) contributes the same 1 the local path defaults to,
+    never a guess.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    catalog = ModelCatalog()
+    try:
+        rows = catalog.list_placements()
+        stale = stale_node_ids(catalog.list_node_snapshots())
+    except CatalogUnavailableError:
+        return 0
+    except Exception:  # noqa: BLE001 - a DB hiccup must not fail a batch
+        logger.debug("could not price fleet replica capacity", exc_info=True)
+        return 0
+    capacity = 0
+    for row in rows:
+        name = str(row.get("name") or "")
+        if not name or name in known or not pattern.match(name):
+            continue
+        if row.get("state") != "ready" or not row.get("endpoint"):
+            continue
+        if str(row.get("node_id") or "") in stale:
+            continue
+        slots = row.get("slot_count")
+        capacity += slots if isinstance(slots, int) and slots > 0 else 1
+    return capacity
+
+
 def _batch_fanout_width(data: dict[str, Any]) -> int:
     """How many documents to extract at once for this batch's target deployment.
 
@@ -188,6 +285,10 @@ def _batch_fanout_width(data: dict[str, Any]) -> int:
     tracks what the deployment can actually run at once instead of a fixed
     or unbounded guess.
 
+    Replicas on other nodes count too, from their placement rows -- #589
+    spreads a deployment across the fleet, so this node's file is only part of
+    it (#562).
+
     Falls back to width 1 (today's sequential behaviour) whenever the target
     can't be resolved to any live deployment record -- an unpriceable/unknown
     deployment must never guess a wide fan-out.
@@ -196,18 +297,21 @@ def _batch_fanout_width(data: dict[str, Any]) -> int:
     if name is None:
         return 1
     records = _read_all_deployments()
-    if not records:
-        return 1
     pattern = re.compile(rf"^{re.escape(name)}(?:-\d+)?$")
     capacity = 0
+    # Every local replica NAME, live or not, so a record this node owns is
+    # never counted twice from its own placement row.
+    local_names: set[str] = set()
     for record_name, record in records.items():
         if not isinstance(record, dict) or not pattern.match(record_name):
             continue
+        local_names.add(record_name)
         if not _deployment_is_live(record):
             continue
         launch = (record.get("spec") or {}).get("launch") or {}
         n_parallel = launch.get("n_parallel")
         capacity += n_parallel if isinstance(n_parallel, int) and n_parallel > 0 else 1
+    capacity += _remote_replica_capacity(pattern, local_names)
     return capacity if capacity > 0 else 1
 
 
