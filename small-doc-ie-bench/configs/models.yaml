@@ -330,3 +330,28 @@ profiles:
     vision: true
     vision_max_pages: 8
     vision_pdf_dpi: 150
+
+  # --- LiquidAI LFM3 (families `lfm3` / `lfm3_vl`; needs a llama-server built
+  # after ggml-org/llama.cpp#31252, see serving/README.md) ---
+  lfm3_1_7b:
+    model: lfm3_1_7b
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.0
+    max_tokens: 4096
+    timeout_seconds: 180
+    prompt_profile: strict_extraction_v1
+
+  lfm3_vl_2b:
+    model: lfm3_vl_2b
+    base_url: http://localhost:8088/v1
+    api_key: local-not-used
+    response_format_style: openai_json_schema
+    temperature: 0.1
+    max_tokens: 4096
+    timeout_seconds: 600
+    prompt_profile: strict_extraction_v1
+    vision: true
+    vision_max_pages: 8
+    vision_pdf_dpi: 150

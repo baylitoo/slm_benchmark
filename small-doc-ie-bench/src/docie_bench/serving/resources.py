@@ -118,6 +118,14 @@ LFM2_KV_CACHE_BYTES_PER_TOKEN = 16_384
 # any context length this framework actually deploys at.
 SPARK2_5_KV_CACHE_BYTES_PER_TOKEN = 14_336
 
+# LiquidAI LFM3 (1.7B text, and the same backbone under LFM3-VL-2B), from
+# its published config.json: 24 layers -- 13 "conv" (fixed L_cache=7, no
+# growing state), 5 "sliding_attention" (window=256) and 6 "full_attention" --
+# GQA with 4 KV heads, head_dim=128. bytes_per_token = 2 (K+V) x 6 x 4 x 128
+# x 2 (f16) = 12,288. The sliding layers top out at ~2.5 MiB total (5 x 256
+# x 2 x 4 x 128 x 2), folded into the ~0 approximation like Spark-X2.5's.
+LFM3_KV_CACHE_BYTES_PER_TOKEN = 12_288
+
 # Family -> its own verified per-token KV-cache constant. A family absent
 # here (including "openai_chat", shared by many non-hybrid dense-attention
 # archs) falls back to the generic KV_CACHE_BYTES_PER_TOKEN ceiling --
@@ -128,6 +136,8 @@ _FAMILY_KV_CACHE_BYTES_PER_TOKEN: dict[str, int] = {
     "lfm2": LFM2_KV_CACHE_BYTES_PER_TOKEN,
     "lfm2_vl": LFM2_KV_CACHE_BYTES_PER_TOKEN,
     "spark2_5": SPARK2_5_KV_CACHE_BYTES_PER_TOKEN,
+    "lfm3": LFM3_KV_CACHE_BYTES_PER_TOKEN,
+    "lfm3_vl": LFM3_KV_CACHE_BYTES_PER_TOKEN,
 }
 
 
@@ -678,6 +688,7 @@ __all__ = [
     "DEFAULT_DEPLOY_CONTEXT_LENGTH",
     "KV_CACHE_BYTES_PER_TOKEN",
     "LFM2_KV_CACHE_BYTES_PER_TOKEN",
+    "LFM3_KV_CACHE_BYTES_PER_TOKEN",
     "SPARK2_5_KV_CACHE_BYTES_PER_TOKEN",
     "RUNTIME_OVERHEAD_BYTES",
     "FootprintStore",
