@@ -26,7 +26,7 @@ For workflow kinds, options are:
 - `deadline_seconds`: one wall-clock deadline shared across nested workflows and tool rounds.
 - `max_model_calls`: a total model call limit shared across nested workflows and tool rounds.
 
-Workflow traces include resolved profile/model, local-vs-remote classification, attempts, queue wait, elapsed time, outcome, step identity, and call indexes. Usage totals remain null if any step lacks complete provider usage; they are not context-window occupancy estimates.
+Workflow traces include resolved profile/model, local-vs-remote classification, attempts, queue wait, elapsed time, outcome, and step identity on each model call. Usage totals remain null if any step lacks complete provider usage; they are not context-window occupancy estimates.
 
 ## Local example
 

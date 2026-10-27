@@ -1662,7 +1662,6 @@ async def _run_workflow_steps(
         step = steps[index]
         step_name = names[index]
         execution = _WORKFLOW_EXECUTION.get()
-        call_start = len(execution.model_call_trace) if execution else 0
         if execution:
             execution.active_step = step_name
         step_body = (
@@ -1742,9 +1741,6 @@ async def _run_workflow_steps(
             "model_profile": used_model_profile,
             "content": step_answer,
             "routed_to": None,
-            "model_call_indexes": list(
-                range(call_start, len(execution.model_call_trace)) if execution else ()
-            ),
         }
         if isinstance(agent_ref, str) and agent_ref:
             trace_entry["agent"] = agent_ref
@@ -1918,7 +1914,6 @@ async def stream_workflow(
             step = steps[index]
             step_name = names[index]
             execution.active_step = step_name
-            call_start = len(execution.model_call_trace)
             step_spec = spec.model_copy(
                 update={
                     "model_profile": step["model_profile"],
@@ -1977,9 +1972,6 @@ async def stream_workflow(
                     "model_profile": step["model_profile"],
                     "content": step_answer,
                     "routed_to": target_name,
-                    "model_call_indexes": list(
-                        range(call_start, len(execution.model_call_trace))
-                    ),
                 }
                 step_trace.append(entry)
                 yield {"type": "step", **entry}
@@ -1992,9 +1984,6 @@ async def stream_workflow(
                 "model_profile": step["model_profile"],
                 "content": step_answer,
                 "routed_to": None,
-                "model_call_indexes": list(
-                    range(call_start, len(execution.model_call_trace))
-                ),
             }
             step_trace.append(entry)
             yield {"type": "step", **entry}
