@@ -27,16 +27,22 @@ integrating NuExtract3 (verified 2026-06-17):
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+from docie_bench.serving.storage_backend import (
+    LocalDiskBackend,
+    StorageBackend,
+    StorageBackendError,
+)
 
 
 class TemplateDelivery(StrEnum):
@@ -497,42 +503,24 @@ def _blob_path(ollama_home: Path, digest: str) -> Path:
     return ollama_home / "blobs" / digest.replace(":", "-")
 
 
-def _link_or_copy(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        destination.unlink()
+@contextmanager
+def _as_store_error() -> Iterator[None]:
+    """Re-raise a backend failure as a ``ModelStoreError`` (#595 stage 1).
+
+    The storage seam must not change what a store failure looks like from the
+    outside: callers (and tests) have always seen ``ModelStoreError`` with the
+    transfer's own message, so a ``StorageBackendError`` is translated rather
+    than propagated. The message is preserved verbatim -- it names the model
+    and the digests, which is the whole diagnostic value.
+
+    A context manager rather than a try/except at each call site so the
+    surrounding rollback blocks keep working unchanged: ``ModelStoreError`` is
+    still an exception their ``except BaseException`` sees.
+    """
     try:
-        os.link(source, destination)  # hard link: zero extra disk, instant
-    except OSError:
-        shutil.copy2(source, destination)  # cross-device or unsupported FS
-
-
-def _sha256_file(path: Path) -> str:
-    """Chunked sha256 of ``path`` as bare lowercase hex (no ``sha256:`` prefix).
-
-    Mirrors ``extract.service.hash_file`` but keeps the serving layer
-    self-contained (no cross-layer import) and returns bare hex so it compares
-    directly against an Ollama manifest digest's hex tail.
-    """
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _canonical_hex(digest: str | None) -> str | None:
-    """Hex tail of a canonical ``sha256:<hex>`` digest, else ``None``.
-
-    ``None`` means "no canonical digest to verify against" — the caller falls
-    back to a best-effort copy-fidelity check. Guarding on the ``sha256:`` prefix
-    means a non-sha256 manifest digest (should Ollama ever emit one) skips the
-    canonical comparison rather than false-failing an otherwise valid transfer.
-    """
-    prefix = "sha256:"
-    if digest and digest.startswith(prefix):
-        return digest[len(prefix) :]
-    return None
+        yield
+    except StorageBackendError as exc:
+        raise ModelStoreError(str(exc)) from exc
 
 
 def _assert_within(path: Path, root: Path, *, label: str) -> Path:
@@ -558,10 +546,16 @@ def _assert_within(path: Path, root: Path, *, label: str) -> Path:
 class ModelStore:
     """A canonical on-disk GGUF store served by both llama.cpp and Ollama."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, backend: StorageBackend | None = None) -> None:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._index_path = self.root / "index.json"
+        # Hardcoded in stage 1 of #595: the seam exists, the choice does not.
+        # The parameter is here so a test can inject a double and so stage 2
+        # can wire a remote backend without touching every construction site.
+        self._backend: StorageBackend = (
+            backend if backend is not None else LocalDiskBackend(self.root)
+        )
 
     # ------------------------------------------------------------------ seeding
     def seed_from_ollama(
@@ -638,15 +632,25 @@ class ModelStore:
         # canonical model.gguf / index entry only ever appears fully verified.
         mmproj_digest = None if explicit_mmproj is not None else projector_digest
         destination = self.root / name
-        model_path = destination / "model.gguf"
+        model_path = self._backend.resolve_local_path(f"{name}/model.gguf")
         mmproj_path: Path | None = None
         try:
-            _transfer_verified(model_blob, model_path, link=link, expected_digest=model_digest)
-            if mmproj_blob is not None:
-                mmproj_path = destination / "mmproj.gguf"
-                _transfer_verified(
-                    mmproj_blob, mmproj_path, link=link, expected_digest=mmproj_digest
+            with _as_store_error():
+                self._backend.write_verified(
+                    model_blob,
+                    f"{name}/model.gguf",
+                    link=link,
+                    expected_digest=model_digest,
                 )
+            if mmproj_blob is not None:
+                mmproj_path = self._backend.resolve_local_path(f"{name}/mmproj.gguf")
+                with _as_store_error():
+                    self._backend.write_verified(
+                        mmproj_blob,
+                        f"{name}/mmproj.gguf",
+                        link=link,
+                        expected_digest=mmproj_digest,
+                    )
         except BaseException:
             # A verify failure on either blob must leave zero partial state (no
             # stray model.gguf when mmproj fails). Bounded by ``name``.
@@ -680,18 +684,35 @@ class ModelStore:
             raise ModelStoreError(f"GGUF not found: {model_gguf}")
         if contract.needs_mmproj and mmproj is None:
             raise ModelStoreError(f"Family {family!r} requires an mmproj (vision projector)")
+        # The store NAME is attacker-influenced and joined into a filesystem
+        # path, exactly as in seed_from_ollama / add_snapshot / remove_entry --
+        # and unlike those three this path had no guard, so a name of
+        # ``../elsewhere`` wrote outside the store root. The storage backend
+        # refuses an escaping key too (defence in depth), but the refusal
+        # belongs here so it reads as a store error like its siblings' do.
+        _assert_within(self.root / name, self.root, label=f"store name {name!r}")
+
         # HF/on-disk GGUFs carry no canonical manifest digest, so only
         # copy-fidelity is verifiable (expected_digest=None) — best-effort, per
-        # the HF trust boundary. Still routed through _transfer_verified so no
-        # path writes the canonical name un-verified.
+        # the HF trust boundary. Still routed through the backend's verified
+        # write so no path publishes the canonical name un-verified.
         destination = self.root / name
-        model_path = destination / "model.gguf"
+        model_path = self._backend.resolve_local_path(f"{name}/model.gguf")
         mmproj_path: Path | None = None
         try:
-            _transfer_verified(model_gguf, model_path, link=link, expected_digest=None)
+            with _as_store_error():
+                self._backend.write_verified(
+                    model_gguf, f"{name}/model.gguf", link=link, expected_digest=None
+                )
             if mmproj is not None:
-                mmproj_path = destination / "mmproj.gguf"
-                _transfer_verified(Path(mmproj), mmproj_path, link=link, expected_digest=None)
+                mmproj_path = self._backend.resolve_local_path(f"{name}/mmproj.gguf")
+                with _as_store_error():
+                    self._backend.write_verified(
+                        Path(mmproj),
+                        f"{name}/mmproj.gguf",
+                        link=link,
+                        expected_digest=None,
+                    )
         except BaseException:
             shutil.rmtree(destination, ignore_errors=True)
             raise
@@ -747,22 +768,15 @@ class ModelStore:
         _assert_within(self.root / name, self.root, label=f"store name {name!r}")
 
         destination = self.root / name
-        snapshot_path = destination / "snapshot"
-        staging = destination / "snapshot.tmp"
+        snapshot_path = self._backend.resolve_local_dir(f"{name}/snapshot")
         try:
-            if staging.exists():
-                shutil.rmtree(staging)
-            for file in sorted(p for p in src.rglob("*") if p.is_file()):
-                target = staging / file.relative_to(src)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                _transfer(file, target, link=link)
-            if snapshot_path.exists():
-                shutil.rmtree(snapshot_path)
-            os.replace(staging, snapshot_path)
+            with _as_store_error():
+                self._backend.write_tree(src, f"{name}/snapshot", link=link)
         except BaseException:
-            shutil.rmtree(staging, ignore_errors=True)
-            # A fresh seed with no prior index entry leaves an orphan dir; the
-            # index write below is what makes it canonical, so drop it on failure.
+            # The backend cleans up its own staging; this rollback is store
+            # policy it cannot see. A fresh seed with no prior index entry
+            # leaves an orphan dir, and the index write below is what makes it
+            # canonical, so drop it on failure.
             if name not in self._read_index():
                 shutil.rmtree(destination, ignore_errors=True)
             raise
@@ -916,61 +930,6 @@ def _select_layer(layers: list[dict[str, Any]], needle: str) -> str | None:
         if needle in media_type and layer.get("digest"):
             return str(layer["digest"])
     return None
-
-
-def _transfer(source: Path, destination: Path, *, link: bool) -> None:
-    if link:
-        _link_or_copy(source, destination)
-    else:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-
-
-def _transfer_verified(
-    source: Path,
-    destination: Path,
-    *,
-    link: bool,
-    expected_digest: str | None,
-) -> None:
-    """Transfer ``source`` to ``destination`` and refuse a mislabeled/corrupt result.
-
-    Writes into a sibling ``*.tmp`` first, sha256s it, and ``os.replace`` moves it
-    onto the canonical ``destination`` name ONLY when the hash matches. So the
-    canonical file never appears unless it is fully written and verified; on any
-    mismatch or error the tmp is removed and ``ModelStoreError`` is raised,
-    leaving no partial/mislabeled file behind.
-
-    Verification target:
-      * ``expected_digest`` is a canonical ``sha256:<hex>`` (an Ollama manifest
-        layer digest) -> the dest is checked against the CANONICAL content hash.
-        This catches a wrong-sha even for hard links, i.e. a corrupt SOURCE blob,
-        because a same-inode tmp still hashes to the source's real (wrong) bytes.
-      * ``expected_digest`` is ``None`` (or non-sha256) -> best-effort
-        copy-fidelity only (source hash == dest hash). For a hard link this is
-        trivially true (same inode); for a copy it catches a truncated/altered
-        copy. There is no canonical digest to assert here (HF trust boundary).
-    """
-    tmp = destination.with_name(destination.name + ".tmp")
-    try:
-        _transfer(source, tmp, link=link)
-        got = _sha256_file(tmp)
-        want = _canonical_hex(expected_digest)
-        canonical = want is not None
-        if want is None:
-            want = _sha256_file(source)  # copy-fidelity fallback
-        if got.lower() != want.lower():
-            kind = "manifest digest" if canonical else "source copy"
-            raise ModelStoreError(
-                f"blob integrity check failed for {destination.name}: "
-                f"got sha256:{got} != want sha256:{want} ({kind}; source={source})"
-            )
-        os.replace(tmp, destination)
-    except BaseException:
-        # Never leave a half-written or mislabeled tmp behind, even on
-        # KeyboardInterrupt / a mid-transfer crash.
-        tmp.unlink(missing_ok=True)
-        raise
 
 
 def _entry_from_json(value: dict[str, Any]) -> StoreEntry:
