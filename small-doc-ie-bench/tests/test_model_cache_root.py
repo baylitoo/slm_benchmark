@@ -2,14 +2,20 @@
 
 `serving_home` holds what a node cannot lose: `node_id` is its identity,
 `deployments.json` is what it is running, the applied-state file is how far it
-has converged. Weights are the opposite — once a shared repository can supply
-them, the local copy is a cache that should be clearable and rebuildable.
+has converged. Weights are the opposite — a cache, rebuildable by seeding or
+pulling again.
 
-They were the same volume, so "clear the cache" and "destroy this node's
-identity" were the same command. #595 lists this split as a prerequisite for
-the remote backend rather than a follow-up, which is why it ships on its own.
+**What the default actually costs.** The store is a CHILD of the state root
+(`<serving_home>/models`), so removing the store directory does not remove
+`node_id` beside it. The cost is shared PLACEMENT: one volume holds both, so
+the weights cannot live on a different disk, their growth consumes the volume
+the durable state is on, and destroying or resizing that volume takes both.
 
-The property that matters most here is the boring one: the default must be
+So the separation is a property of a CONFIGURED cache root, not of the
+default. The default deliberately keeps the old shared-volume arrangement, and
+the tests below say which assertions hold in which case.
+
+The property that matters most is the boring one: the default must be
 byte-identical to the old path, or an upgraded node cannot find weights it
 already has.
 """
@@ -23,6 +29,7 @@ import pytest
 
 from docie_bench.serving.paths import (
     MODEL_STORE_DIR_ENV_VAR,
+    InvalidModelStoreRootError,
     model_store_root,
     serving_home,
 )
@@ -51,14 +58,14 @@ def test_an_override_moves_only_the_cache(monkeypatch: pytest.MonkeyPatch) -> No
     assert serving_home() == state_root
 
 
-def test_clearing_the_cache_cannot_touch_node_state(
+def test_a_configured_cache_root_holds_no_durable_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Stated as the invariant an operator relies on: with the override set,
-    the cache root contains none of the files a node cannot lose.
+    """The invariant, and it holds only WITH a configured root.
 
-    Without the split this test is impossible to write -- the cache root IS
-    the state root, so deleting it takes `node_id` with it.
+    With one set, deleting the cache root cannot take anything a node needs to
+    come back. Under the default this assertion is simply false -- the cache
+    root sits inside the state root -- which is what the next test records.
     """
     from docie_bench.serving.applied_state import applied_state_path
     from docie_bench.serving.node_identity import node_id_path
@@ -70,11 +77,15 @@ def test_clearing_the_cache_cannot_touch_node_state(
         assert cache not in durable.parents, f"{durable} would be destroyed with the cache"
 
 
-def test_without_the_override_they_still_overlap() -> None:
-    """The default is honest about what it is: on a single-machine deployment
-    the cache still lives under the state root, and clearing it there is still
-    dangerous. The override is what makes the separation real -- this records
-    that the default has NOT silently changed behaviour.
+def test_the_default_still_nests_the_cache_inside_the_state_root() -> None:
+    """Recorded explicitly so the compatibility default is not mistaken for
+    the separation.
+
+    Under the default the weights are a child of the state directory. That is
+    not dangerous in itself -- removing `<serving_home>/models` leaves
+    `node_id` alone -- but the two share a volume, so only a configured root
+    gives independent placement. This asserts the default has NOT silently
+    changed.
     """
     assert serving_home() in model_store_root().parents
 
@@ -98,6 +109,53 @@ def test_the_override_is_read_per_call_not_cached() -> None:
         assert model_store_root() != first
     finally:
         del os.environ[MODEL_STORE_DIR_ENV_VAR]
+
+
+@pytest.mark.parametrize("relative", ["", "..", "../.."])
+def test_a_root_that_swallows_the_state_root_is_refused(
+    monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
+    """A configured cache root is a promise that its contents are disposable.
+    One that is, or contains, the state root turns "reclaim the cache" into
+    "delete this node's identity and its deployment records" -- the hazard the
+    split exists to remove.
+
+    `..` is included because the check resolves before comparing; a lexical
+    match alone would miss `<serving_home>/..`.
+    """
+    target = serving_home() if not relative else serving_home().joinpath(relative)
+    monkeypatch.setenv(MODEL_STORE_DIR_ENV_VAR, str(target))
+
+    with pytest.raises(InvalidModelStoreRootError, match="disposable|contains"):
+        model_store_root()
+
+
+def test_the_guard_does_not_apply_to_the_compatible_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default IS inside the state root, and every existing node already
+    has that layout -- refusing it would stop them all from starting. The
+    check is about a configuration an operator wrote expecting disposability.
+    """
+    monkeypatch.delenv(MODEL_STORE_DIR_ENV_VAR, raising=False)
+
+    assert model_store_root() == serving_home() / "models"
+
+
+def test_an_explicit_root_inside_the_state_root_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inside is fine; the refusal is about ENCOMPASSING. Writing the default
+    path out explicitly must behave exactly like leaving it unset."""
+    monkeypatch.setenv(MODEL_STORE_DIR_ENV_VAR, str(serving_home() / "models"))
+
+    assert model_store_root() == serving_home() / "models"
+
+
+def test_an_unrelated_root_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(MODEL_STORE_DIR_ENV_VAR, "/mnt/bigdisk/models")
+
+    assert model_store_root() == Path("/mnt/bigdisk/models")
 
 
 def test_every_store_construction_goes_through_the_helper() -> None:

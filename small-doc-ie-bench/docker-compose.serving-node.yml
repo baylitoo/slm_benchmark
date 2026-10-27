@@ -68,15 +68,19 @@ services:
       # identity.
       DOCIE_SERVING_HOME: /app/.serving
 
-      # Where model weights are kept. Defaults to $DOCIE_SERVING_HOME/models,
-      # which is where they have always lived, so leaving this unset changes
-      # nothing.
+      # Where model weights are kept. Unset (the default) means
+      # $DOCIE_SERVING_HOME/models, where they have always lived -- a CHILD of
+      # the state volume, so nothing moves and nothing breaks on upgrade.
       #
-      # Point it at its own volume when you want the weights on a larger or
-      # cheaper disk. Once #595 lands they are a CACHE -- rebuildable by
-      # pulling from the shared repository -- so a separate root is what makes
-      # "reclaim the disk" a safe operation instead of one that also destroys
-      # this node's identity and its deployment records.
+      # What the default costs is placement, not safety: removing the models
+      # directory does not touch node_id beside it, but the weights share one
+      # VOLUME with the durable state, so they cannot live on a different
+      # disk, their growth consumes that volume, and destroying or resizing it
+      # takes both.
+      #
+      # Setting this requires the model-cache mount below AND moving the
+      # existing weights. A root that is or contains $DOCIE_SERVING_HOME is
+      # refused at startup: a disposable cache must not hold node identity.
       DOCIE_MODEL_STORE_DIR: ${DOCIE_MODEL_STORE_DIR:-}
 
       # Optional readable name for this node; generated and persisted in
@@ -151,10 +155,18 @@ services:
       - ./configs:/app/configs:ro
       # Node-local. Not shareable: see DOCIE_SERVING_HOME above.
       - serving-state:/app/.serving
-      # The model cache, separate so it can be cleared, resized or moved to
-      # another disk without touching the state volume above. Left on the
-      # default path, it is simply a subdirectory of serving-state as before.
-      - model-cache:/app/.cache/models
+      # OPT-IN, and deliberately commented out: uncommenting this alone
+      # does nothing, and uncommenting it together with
+      # DOCIE_MODEL_STORE_DIR without migrating makes the node look like it
+      # holds no models.
+      #
+      # The weights do not move by themselves. They stay in serving-state at
+      # /app/.serving/models while the store looks in the new, empty volume,
+      # so the node reports an empty blob store and re-seeds everything.
+      # Copy them across first -- see "Moving the model cache to its own
+      # volume" in docs/operations/fleet-runbook.md.
+      #
+      # - model-cache:/app/.cache/models
       - ocr-cache:/app/.cache/ocr
       - hf-cache:/root/.cache/huggingface
       # Optional: host Ollama blobs, so seed-from-ollama can import an existing
@@ -164,6 +176,8 @@ services:
 
 volumes:
   serving-state:
+  # Only used once the mount above is uncommented and DOCIE_MODEL_STORE_DIR
+  # points at it. Declared so enabling the split is one edit, not two.
   model-cache:
   ocr-cache:
   hf-cache:

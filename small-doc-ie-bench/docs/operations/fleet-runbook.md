@@ -101,22 +101,70 @@ Three things, and nothing else:
 - its own **`DOCIE_SERVING_HOME`** volume, which must never be shared
   between machines.
 
-Those three are durable. The **model weights are not**: `node_id`,
-`deployments.json` and the applied-state file are what a node cannot lose,
-while weights can be seeded again. They live under `DOCIE_SERVING_HOME` by
-default, which means clearing the weights and destroying the node's identity
-are the same command.
+Those three are durable. The **model weights are not** — they can be seeded
+or pulled again.
 
-Set **`DOCIE_MODEL_STORE_DIR`** to separate them:
+By default the weights live at `$DOCIE_SERVING_HOME/models`, a **child** of
+the state directory. Removing that directory does *not* remove `node_id`
+beside it. What the default costs is **placement**: the weights share one
+volume with the durable state, so they cannot be put on a different disk,
+their growth consumes that volume, and destroying or resizing it takes both.
 
-```
-DOCIE_MODEL_STORE_DIR=/app/.cache/models
-```
+### Moving the model cache to its own volume
 
-The node compose already declares a `model-cache` volume at that path. Worth
-doing when the weights outgrow the state volume, or when you want reclaiming
-that space to be a safe operation. Leaving it unset keeps the old layout
-exactly, so nothing has to move to upgrade.
+Optional. Worth doing when the weights outgrow the state volume, or when you
+want to reclaim that space without touching anything durable.
+
+**The weights do not move by themselves.** Setting the variable without
+copying them makes the node report an empty blob store and re-seed
+everything, because the old files are still sitting in the state volume
+where nothing is looking for them.
+
+1. Stop the node:
+
+   ```
+   docker compose -f docker-compose.serving-node.yml stop serving
+   ```
+
+2. Uncomment the `model-cache` mount in `docker-compose.serving-node.yml`
+   and set, in the node `.env`:
+
+   ```
+   DOCIE_MODEL_STORE_DIR=/app/.cache/models
+   ```
+
+3. Copy the existing weights across, with both volumes mounted:
+
+   ```
+   docker compose -f docker-compose.serving-node.yml run --rm \
+     --entrypoint sh serving -c \
+     'mkdir -p /app/.cache/models && cp -a /app/.serving/models/. /app/.cache/models/'
+   ```
+
+4. Start it and confirm the move before deleting anything:
+
+   ```
+   docker compose -f docker-compose.serving-node.yml up -d serving
+   docker compose -f docker-compose.serving-node.yml exec serving \
+     docie-serving store list
+   ```
+
+   The same models should be listed as before. `docie-serving doctor` also
+   reports what this node holds against the catalog.
+
+5. Only then reclaim the old copy:
+
+   ```
+   docker compose -f docker-compose.serving-node.yml exec serving \
+     rm -rf /app/.serving/models
+   ```
+
+A cache root that **is, or contains, `$DOCIE_SERVING_HOME`** is refused at
+startup — a directory you intend to clear must not hold `node_id`,
+`deployments.json` or the applied-state file.
+
+Leaving the variable unset keeps the current layout exactly. Nothing has to
+move to upgrade.
 
 In particular it does **not** need a synchronised copy of `configs/`.
 That file is the routing table, read by the central api and the worker

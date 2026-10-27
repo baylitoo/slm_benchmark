@@ -37,32 +37,74 @@ def serving_home() -> Path:
 MODEL_STORE_DIR_ENV_VAR = "DOCIE_MODEL_STORE_DIR"
 
 
+class InvalidModelStoreRootError(ValueError):
+    """A configured cache root would encompass durable node state."""
+
+
 def model_store_root() -> Path:
     """Where this node keeps model weights on disk.
-
-    Separated from the rest of ``serving_home`` because the two have opposite
-    lifecycles, and #595 turns that difference into a requirement rather than a
-    preference.
 
     ``serving_home`` holds state a node cannot lose: ``node_id`` is its
     identity, ``deployments.json`` is what it is running, and the applied-state
     file is how far it has converged. Weights are the opposite -- once a shared
-    repository can supply them, the local copy is a CACHE. It should be able to
-    live on a large cheap disk, be cleared to reclaim space, and be rebuilt by
+    repository can supply them, the local copy is a CACHE, rebuildable by
     pulling again.
 
-    They are the same volume today, so "clear the cache" and "destroy this
-    node's identity" are the same command. Giving the store its own root is
-    what makes the first safe, and it is why #595 lists this as a prerequisite
-    for the remote backend rather than a follow-up.
+    **What the default actually costs.** Today the store is a CHILD of the
+    state root (``<serving_home>/models``), so removing the store directory
+    does not touch ``node_id`` beside it. The cost is that the two share one
+    VOLUME: the weights cannot be put on a different disk, their growth
+    consumes the volume the durable state lives on, and any volume-level
+    operation -- destroying it, resizing it, moving it to another host --
+    takes both. #595 lists the split as a prerequisite for the remote backend
+    because a cache you cannot place or size independently is not really a
+    cache.
 
     The default is EXACTLY the current location, so an existing node finds its
-    blobs where it left them and nothing has to be moved to upgrade.
+    blobs where it left them and nothing has to be moved to upgrade. The
+    separation is what an explicit override buys; the default deliberately
+    keeps the old shared-volume arrangement.
+
+    A configured root is REFUSED when it would encompass the state root -- see
+    :func:`_reject_root_covering_state`.
     """
     override = os.environ.get(MODEL_STORE_DIR_ENV_VAR, "").strip()
-    if override:
-        return Path(override)
-    return serving_home() / "models"
+    if not override:
+        return serving_home() / "models"
+    root = Path(override)
+    _reject_root_covering_state(root)
+    return root
+
+
+def _reject_root_covering_state(root: Path) -> None:
+    """Refuse a cache root that is, or contains, ``serving_home``.
+
+    The point of configuring a cache root is that its contents are disposable.
+    A root of ``/app/.serving`` (the state root) or ``/app`` (above it) makes
+    "clear the cache" mean "delete this node's identity and its deployment
+    records" -- turning the safety this split exists to provide into the
+    hazard it was meant to remove.
+
+    Deliberately NOT applied to the default. The default IS a child of the
+    state root, which is the compatible arrangement every existing node
+    already has; refusing it would mean no node could start. The check is
+    about a configuration an operator wrote expecting disposability.
+
+    Resolved before comparing so ``/app/.serving/..`` is caught too. Paths that
+    do not exist yet still resolve lexically, which is the normal case on a
+    fresh node.
+    """
+    state = serving_home().expanduser().resolve()
+    candidate = root.expanduser().resolve()
+    if candidate == state or candidate in state.parents:
+        raise InvalidModelStoreRootError(
+            f"{MODEL_STORE_DIR_ENV_VAR}={str(root)!r} resolves to {candidate}, "
+            f"which is or contains the serving state root {state}. The model "
+            f"cache is meant to be disposable, and this would put node_id, "
+            f"deployments.json and the applied-state file inside it. Point it "
+            f"at a directory beside or below them, or leave it unset to keep "
+            f"the default {state / 'models'}."
+        )
 
 
 def deployment_log_path(logs_dir: Path, name: str) -> Path:
