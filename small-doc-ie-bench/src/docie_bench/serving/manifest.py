@@ -63,10 +63,26 @@ BLOB_PREFIX = "blobs/sha256"
 MODEL_PREFIX = "models"
 POINTER_NAME = "current.json"
 
-_DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
-#: A file's path inside the model directory. Relative, forward-slashed, and
-#: with no traversal -- it is joined onto a local directory when materialising.
-_SAFE_PATH = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+DIGEST_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+_DIGEST = DIGEST_PATTERN  # backwards-compatible alias within this module
+
+#: Characters allowed in one path segment inside the model directory.
+#:
+#: A LEADING DOT IS ALLOWED. The first version required an alphanumeric first
+#: character, which refused `.gitattributes` -- a file essentially every
+#: Hugging Face snapshot carries -- so publishing any snapshot family failed.
+#: It also bought nothing: `tokenizer/.dotfile` was accepted all along, because
+#: the rule only ever looked at the first character of the whole path.
+#: Traversal is blocked by rejecting the `.` and `..` segments explicitly,
+#: which is the check that was actually doing the work.
+_SAFE_SEGMENT = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+#: A store name becomes an object-key component (``models/<name>/...``), so it
+#: is constrained the same way the local store constrains it. The CLI already
+#: validates store names, but ``publish``/``resolve``/``manifest`` are the
+#: public API the rest of #595 calls, and a name of ``../x`` would write
+#: outside the model prefix.
+_SAFE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 #: What a file is FOR. Carried explicitly so a reader never has to infer a
 #: role from a filename.
@@ -75,6 +91,32 @@ ROLES = frozenset({"model", "mmproj", "snapshot"})
 
 class InvalidManifestError(ValueError):
     """A document is not a manifest this version can act on."""
+
+
+def digest_hex(digest: str) -> str:
+    """The hex tail of a canonical digest, refusing anything else.
+
+    Callers interpolate this into an object key. A digest arriving without its
+    prefix -- a truncated row, a hand-edited deployment intent, a value written
+    as bare hex -- used to die on ``split(':', 1)[1]`` with a bare IndexError
+    instead of something an operator could act on.
+    """
+    if not isinstance(digest, str) or not DIGEST_PATTERN.match(digest):
+        raise InvalidManifestError(
+            f"{digest!r} is not a canonical 'sha256:<64 hex>' digest"
+        )
+    return digest.split(":", 1)[1]
+
+
+def is_safe_path(path: str) -> bool:
+    """Whether ``path`` is a relative path that stays inside the model dir."""
+    if not path or path.startswith("/") or "\\" in path:
+        return False
+    segments = path.split("/")
+    return all(
+        segment not in {"", ".", ".."} and _SAFE_SEGMENT.match(segment)
+        for segment in segments
+    )
 
 
 @dataclass(frozen=True)
@@ -97,7 +139,7 @@ class ManifestFile:
     @property
     def blob_key(self) -> str:
         """Where this artifact's bytes live, independent of any model name."""
-        return f"{BLOB_PREFIX}/{self.digest.split(':', 1)[1]}"
+        return f"{BLOB_PREFIX}/{digest_hex(self.digest)}"
 
 
 @dataclass(frozen=True)
@@ -158,7 +200,7 @@ class Manifest:
         ).encode("utf-8")
 
     def manifest_key(self, digest: str) -> str:
-        return f"{MODEL_PREFIX}/{self.name}/{digest.split(':', 1)[1]}.json"
+        return f"{MODEL_PREFIX}/{self.name}/{digest_hex(digest)}.json"
 
 
 def pointer_key(name: str) -> str:
@@ -228,6 +270,12 @@ def validate(manifest: Manifest) -> Manifest:
         )
     if not manifest.name or not manifest.family:
         raise InvalidManifestError("a manifest needs both a name and a family")
+    if not _SAFE_NAME.match(manifest.name):
+        raise InvalidManifestError(
+            f"model name {manifest.name!r} is not usable as an object-key "
+            f"component: it must start alphanumeric and contain only letters, "
+            f"digits, '.', '_' or '-'"
+        )
     if manifest.kind not in {"gguf", "snapshot"}:
         raise InvalidManifestError(
             f"unknown manifest kind {manifest.kind!r} (expected 'gguf' or 'snapshot')"
@@ -251,10 +299,11 @@ def validate(manifest: Manifest) -> Manifest:
             )
         if entry.size_bytes < 0:
             raise InvalidManifestError(f"{entry.path!r} has a negative size")
-        # The path is joined onto a local directory when materialising, so it
-        # is restricted the same way a store name is -- a manifest must not be
-        # able to write outside the model it describes.
-        if not _SAFE_PATH.match(entry.path) or ".." in entry.path.split("/"):
+        # The path is joined onto a local directory when materialising, so a
+        # manifest must not be able to write outside the model it describes.
+        # Checked per SEGMENT: a leading dot is fine (`.gitattributes` ships
+        # with virtually every snapshot), `.` and `..` are not.
+        if not is_safe_path(entry.path):
             raise InvalidManifestError(
                 f"{entry.path!r} is not a safe relative path inside the model "
                 f"directory"
@@ -362,12 +411,15 @@ __all__ = [
     "BLOB_PREFIX",
     "MODEL_PREFIX",
     "POINTER_NAME",
+    "DIGEST_PATTERN",
     "ROLES",
     "SCHEMA_VERSION",
     "InvalidManifestError",
     "Manifest",
     "ManifestFile",
     "build",
+    "digest_hex",
+    "is_safe_path",
     "parse",
     "parse_pointer",
     "pointer_document",

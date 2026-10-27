@@ -190,14 +190,68 @@ def test_a_gguf_manifest_listing_snapshot_files_is_refused() -> None:
 
 @pytest.mark.parametrize(
     "path",
-    ["../escape.gguf", "a/../../b.gguf", "/absolute.gguf", ".hidden", "", "a\\b"],
+    [
+        "../escape.gguf",
+        "a/../../b.gguf",
+        "/absolute.gguf",
+        "",
+        "a\\b",
+        ".",
+        "..",
+        "a//b",
+        "a/./b",
+    ],
 )
 def test_a_file_path_that_leaves_the_model_directory_is_refused(path: str) -> None:
     """The path is joined onto a local directory when materialising, so a
     manifest must not be able to write outside the model it describes — the
-    same class as the store-name and log-path guards."""
+    same class as the store-name and log-path guards.
+
+    Checked per SEGMENT, so `.` and `..` are refused anywhere in the path
+    rather than only at the front.
+    """
     with pytest.raises(m.InvalidManifestError, match="safe relative path"):
         gguf(files=[m.ManifestFile("model", path, MODEL_DIGEST, 1)])
+
+
+@pytest.mark.parametrize(
+    "path",
+    [".gitattributes", ".gitignore", "tokenizer/.dotfile", "a.b-c_d/e.json"],
+)
+def test_a_dotfile_is_a_legitimate_snapshot_artifact(path: str) -> None:
+    """The regression this file missed.
+
+    The first rule required an alphanumeric FIRST character, which refused
+    `.gitattributes` — a file essentially every Hugging Face snapshot carries
+    — so publishing any snapshot family failed outright. It was also
+    incoherent: `tokenizer/.dotfile` passed all along, because the rule only
+    ever examined the first character of the whole path.
+
+    The snapshot fixtures here were `config.json` / `model.safetensors` /
+    `tokenizer/tokenizer.json`, none of which start with a dot, so nothing
+    caught it.
+    """
+    manifest = snapshot(files=[m.ManifestFile("snapshot", path, MODEL_DIGEST, 1)])
+
+    assert manifest.files[0].path == path
+
+
+@pytest.mark.parametrize("name", ["../x", "a/b", ".hidden", "", "a" + chr(92) + "b"])
+def test_a_model_name_that_is_not_a_key_component_is_refused(name: str) -> None:
+    """`name` is interpolated into `models/<name>/...`. The CLI validates store
+    names already, but publish/resolve/manifest are the public API the rest of
+    #595 calls, and `../x` would write outside the model prefix."""
+    with pytest.raises(m.InvalidManifestError, match="name"):
+        gguf(name=name)
+
+
+@pytest.mark.parametrize("bad", ["deadbeef", "sha256:short", "", "sha256"])
+def test_a_digest_without_its_prefix_is_a_clear_error(bad: str) -> None:
+    """These values are interpolated into object keys. Splitting on ':' blindly
+    died with a bare IndexError on a truncated or hand-edited digest, instead
+    of something an operator could act on."""
+    with pytest.raises(m.InvalidManifestError, match="canonical"):
+        m.digest_hex(bad)
 
 
 def test_a_nested_snapshot_path_is_allowed() -> None:

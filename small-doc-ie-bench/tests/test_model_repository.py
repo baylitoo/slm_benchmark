@@ -426,3 +426,169 @@ def test_the_manifest_key_is_derived_from_its_own_bytes(
         + result.manifest_digest.split(":")[1]
         + ".json"
     )
+
+# --- what the review found ------------------------------------------------
+
+
+def test_a_substituted_manifest_is_caught_before_it_is_trusted(
+    repo: ModelRepository, local: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The dangerous half of the integrity story.
+
+    Blobs were verified from the start; manifests were not. `fetch_blob`
+    verifies each blob against the manifest it was handed, so a substituted
+    manifest passes every check underneath it and the node serves a different
+    model than its pinned digest named. The digest is now checked on read.
+    """
+    result = _publish(repo, local)
+    store = LocalObjectStore(tmp_path / "bucket")
+    # Replace the object at the pinned key with a different, VALID manifest.
+    other = _publish(repo, local, name="nuextract3", family="other-family")
+    store.put(result.manifest_key, store.get(other.manifest_key))
+
+    with pytest.raises(ModelRepositoryError, match="hashes to"):
+        repo.manifest("nuextract3", result.manifest_digest)
+
+
+def test_a_manifest_that_does_match_its_digest_is_accepted(
+    repo: ModelRepository, local: tuple[Path, Path]
+) -> None:
+    """The negative half: the check must not refuse honest manifests."""
+    result = _publish(repo, local)
+
+    assert repo.manifest("nuextract3", result.manifest_digest).name == "nuextract3"
+
+
+def test_a_malformed_pinned_digest_is_an_actionable_error(
+    repo: ModelRepository,
+) -> None:
+    """A deployment intent carries this value. A truncated row or a digest
+    written as bare hex used to die on split(':')[1] with a bare IndexError."""
+    from docie_bench.serving.manifest import InvalidManifestError
+
+    with pytest.raises((ModelRepositoryError, InvalidManifestError), match="canonical"):
+        repo.manifest("nuextract3", "deadbeef")
+
+
+def test_nothing_is_uploaded_when_the_manifest_would_be_invalid(
+    tmp_path: Path, local: tuple[Path, Path]
+) -> None:
+    """Validation moved ahead of the upload loop.
+
+    Building the manifest afterwards meant an unsafe path or a duplicate entry
+    failed only once a multi-gigabyte transfer had finished — costing the whole
+    upload and leaving orphaned blobs behind.
+    """
+    uploads: list[str] = []
+
+    class Counting(LocalObjectStore):
+        def upload(self, source: Path, key: str) -> None:
+            uploads.append(key)
+            super().upload(source, key)
+
+    repo = ModelRepository(Counting(tmp_path / "bucket"), prefix="docie")
+    model, _ = local
+
+    with pytest.raises(Exception, match="safe relative path"):
+        repo.publish(
+            name="nuextract3",
+            family="nuextract3",
+            kind="gguf",
+            files=[("model", "../escape.gguf", model)],
+        )
+
+    assert uploads == []
+
+
+def test_a_retry_after_an_interrupted_publish_is_not_a_no_op(
+    tmp_path: Path, local: tuple[Path, Path]
+) -> None:
+    """`already_complete` was `not uploaded`, so the retry that finally makes a
+    model visible reported itself as having changed nothing — every blob was
+    uploaded before the crash, so every blob is skipped."""
+
+    class FailsBeforePointer(LocalObjectStore):
+        fail = True
+
+        def put(self, key: str, payload: bytes) -> None:
+            if self.fail and key.endswith("current.json"):
+                raise ModelRepositoryError("connection lost")
+            super().put(key, payload)
+
+    store = FailsBeforePointer(tmp_path / "bucket")
+    repo = ModelRepository(store, prefix="docie")
+    with pytest.raises(ModelRepositoryError):
+        _publish(repo, local)
+
+    store.fail = False
+    retry = _publish(repo, local)
+
+    assert retry.uploaded == ()  # they were all uploaded before the crash
+    assert retry.already_complete is False  # but the model is new to the fleet
+    assert repo.resolve("nuextract3") == retry.manifest_digest
+
+
+def test_republishing_an_unchanged_model_really_is_a_no_op(
+    repo: ModelRepository, local: tuple[Path, Path]
+) -> None:
+    """The other side of it, so the field still means what it says."""
+    _publish(repo, local)
+
+    second = _publish(repo, local)
+
+    assert second.already_complete is True
+
+
+def test_a_local_upload_that_dies_leaves_no_blob_under_the_digest(
+    tmp_path: Path
+) -> None:
+    """Presence is taken as proof of content, so a truncated blob at a
+    canonical key is permanent: every later publish skips it and every fetch
+    fails its integrity check, with no way to self-heal."""
+    store = LocalObjectStore(tmp_path / "bucket")
+    source = tmp_path / "big.gguf"
+    source.write_bytes(b"x" * 64)
+    key = "blobs/sha256/" + "a" * 64
+
+    import shutil as shutil_mod
+
+    original = shutil_mod.copyfile
+
+    def dies(src: object, dst: object, **kwargs: object) -> None:
+        original(src, dst, **kwargs)  # type: ignore[arg-type]
+        raise OSError("disk full")
+
+    import docie_bench.serving.model_repository as repo_mod
+
+    repo_mod.shutil.copyfile = dies  # type: ignore[assignment]
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            store.upload(source, key)
+    finally:
+        repo_mod.shutil.copyfile = original  # type: ignore[assignment]
+
+    assert not store.exists(key)
+    assert list((tmp_path / "bucket" / "blobs" / "sha256").glob("*")) == []
+
+
+def test_concurrent_fetches_do_not_share_one_temp_file(
+    repo: ModelRepository, local: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """A fixed '.partial' name meant two pulls of the same model on one node
+    wrote to the same file — each hashing bytes the other was still writing,
+    and the first one's cleanup deleting the second's transfer."""
+    _publish(repo, local)
+    manifest = repo.manifest("nuextract3", repo.resolve("nuextract3"))
+    entry = manifest.files[0]
+    seen: list[str] = []
+
+    class RecordingTemp(LocalObjectStore):
+        def download(self, key: str, destination: Path) -> None:
+            seen.append(destination.name)
+            super().download(key, destination)
+
+    watching = ModelRepository(RecordingTemp(tmp_path / "bucket"), prefix="docie")
+    watching.fetch_blob(entry, tmp_path / "cache" / "model.gguf")
+    watching.fetch_blob(entry, tmp_path / "cache2" / "model.gguf")
+
+    assert len(set(seen)) == 2, f"both pulls used the same temp name: {seen}"

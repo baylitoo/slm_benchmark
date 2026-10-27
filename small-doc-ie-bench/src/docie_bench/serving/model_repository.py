@@ -111,10 +111,33 @@ class PublishResult:
     manifest_key: str
     uploaded: tuple[str, ...]
     skipped: tuple[str, ...]
+    #: Whether the pointer ALREADY named this manifest before the publish.
+    was_already_published: bool = False
 
     @property
     def already_complete(self) -> bool:
-        return not self.uploaded
+        """Whether this publication changed nothing.
+
+        Derived from the pointer rather than from the upload count. A retry
+        after an interrupted publication skips every blob -- they were all
+        uploaded before the crash -- yet it is the call that makes the model
+        visible for the first time, which is the opposite of a no-op.
+        """
+        return self.was_already_published and not self.uploaded
+
+
+def local_for(files: Sequence[tuple[str, str, Path]], relative: str) -> Path:
+    """The local path a manifest entry came from.
+
+    The publish loop hashes and validates everything first, so by upload time
+    it is iterating manifest entries rather than the caller's tuples; this maps
+    back. Validation has already rejected duplicate paths, so the first match
+    is the only match.
+    """
+    for _role, path, local in files:
+        if path == relative:
+            return local
+    raise ModelRepositoryError(f"no local file for manifest entry {relative!r}")
 
 
 def sha256_file(path: Path, *, chunk: int = _CHUNK) -> tuple[str, int]:
@@ -169,28 +192,19 @@ class ModelRepository:
         safe precisely because blobs are content-addressed: a key that exists
         holds exactly those bytes.
         """
+        # Hash and VALIDATE everything before a single byte is uploaded.
+        # Building the manifest after the upload loop meant any validation
+        # failure -- an unsafe path, a duplicate entry, a kind/role mismatch --
+        # fired only once a multi-gigabyte transfer had finished, costing the
+        # whole upload and leaving orphaned blobs behind.
         entries: list[ManifestFile] = []
-        uploaded: list[str] = []
-        skipped: list[str] = []
-
         for role, relative, local in files:
             if not local.is_file():
                 raise ModelRepositoryError(f"{local} is not a file")
             digest, size = sha256_file(local)
-            entry = ManifestFile(
-                role=role, path=relative, digest=digest, size_bytes=size
+            entries.append(
+                ManifestFile(role=role, path=relative, digest=digest, size_bytes=size)
             )
-            entries.append(entry)
-            key = self._key(entry.blob_key)
-            if self._store.exists(key):
-                skipped.append(relative)
-                continue
-            if progress is not None:
-                progress(relative, 0, size)
-            self._store.upload(local, key)
-            uploaded.append(relative)
-            if progress is not None:
-                progress(relative, size, size)
 
         manifest = manifest_mod.build(
             name=name,
@@ -201,12 +215,37 @@ class ModelRepository:
             published_by=published_by,
         )
         payload = manifest.to_json()
+        pointer = self._key(pointer_key(name))
+
+        # What the pointer names right now, so "already published" can be told
+        # apart from "every blob happened to be present" -- a retry after an
+        # interrupted publication skips every blob and is NOT a no-op.
+        previously: str | None = None
+        try:
+            previously = manifest_mod.parse_pointer(self._store.get(pointer))
+        except (ObjectNotFoundError, manifest_mod.InvalidManifestError):
+            previously = None
+
+        uploaded: list[str] = []
+        skipped: list[str] = []
+        for entry in manifest.files:
+            key = self._key(entry.blob_key)
+            if self._store.exists(key):
+                skipped.append(entry.path)
+                continue
+            if progress is not None:
+                progress(entry.path, 0, entry.size_bytes)
+            self._store.upload(local_for(files, entry.path), key)
+            uploaded.append(entry.path)
+            if progress is not None:
+                progress(entry.path, entry.size_bytes, entry.size_bytes)
+
         digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
         key = self._key(manifest.manifest_key(digest))
         self._store.put(key, payload)
 
         # LAST. Everything above is inert until this exists.
-        self._store.put(self._key(pointer_key(name)), pointer_document(digest))
+        self._store.put(pointer, pointer_document(digest))
 
         return PublishResult(
             name=name,
@@ -214,6 +253,7 @@ class ModelRepository:
             manifest_key=key,
             uploaded=tuple(uploaded),
             skipped=tuple(skipped),
+            was_already_published=previously == digest,
         )
 
     # ---------------------------------------------------------- resolve
@@ -235,9 +275,29 @@ class ModelRepository:
         return manifest_mod.parse_pointer(raw)
 
     def manifest(self, name: str, digest: str) -> Manifest:
-        """Fetch and validate one immutable manifest by digest."""
-        key = self._key(f"{manifest_mod.MODEL_PREFIX}/{name}/{digest.split(':', 1)[1]}.json")
+        """Fetch one immutable manifest by digest, verifying it is that one.
+
+        The bytes are hashed and compared BEFORE parsing. The whole design
+        rests on manifests being content-addressed -- it is what lets a
+        deployment pin a build and know a republish cannot change it -- and
+        that property only holds if the digest is checked on read.
+
+        Blobs were verified from the start; manifests were not, and the gap
+        was the dangerous half: ``fetch_blob`` verifies each blob against the
+        manifest it was handed, so a substituted manifest passes every
+        integrity check and the node serves a different model than the one its
+        pinned digest named.
+        """
+        hex_tail = manifest_mod.digest_hex(digest)
+        key = self._key(f"{manifest_mod.MODEL_PREFIX}/{name}/{hex_tail}.json")
         raw = self._store.get(key)
+        got = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+        if got != digest:
+            raise ModelRepositoryError(
+                f"manifest at {key} hashes to {got}, not the {digest} that was "
+                f"requested -- the object does not hold the build it is named "
+                f"for"
+            )
         parsed = manifest_mod.parse(raw)
         if parsed.name != name:
             raise ModelRepositoryError(
@@ -266,7 +326,15 @@ class ModelRepository:
         is not optional.
         """
         destination.parent.mkdir(parents=True, exist_ok=True)
-        tmp = destination.with_name(destination.name + ".partial")
+        # A UNIQUE temp name. A fixed ".partial" meant two concurrent pulls of
+        # the same model on one node wrote to the same file: each would hash
+        # bytes the other was still writing, both fail, and the first one's
+        # cleanup would delete the second's transfer.
+        handle, staged = tempfile.mkstemp(
+            dir=destination.parent, prefix=destination.name + ".", suffix=".partial"
+        )
+        os.close(handle)
+        tmp = Path(staged)
         try:
             self._store.download(self._key(entry.blob_key), tmp)
             got, size = sha256_file(tmp)
@@ -333,9 +401,24 @@ class LocalObjectStore:
         shutil.copyfile(source, destination)
 
     def upload(self, source: Path, key: str) -> None:
+        """Copy into place atomically.
+
+        A bare ``copyfile`` to the canonical key meant a crash mid-copy left a
+        TRUNCATED blob under a digest's name. Every later publish would then
+        skip it as present, and every fetch would fail its integrity check --
+        a permanently unfetchable model with no way to self-heal, because
+        presence is taken as proof of content.
+        """
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, path)
+        handle, staged = tempfile.mkstemp(dir=path.parent, suffix=".incoming")
+        os.close(handle)
+        try:
+            shutil.copyfile(source, staged)
+            os.replace(staged, path)
+        except BaseException:
+            Path(staged).unlink(missing_ok=True)
+            raise
 
     def list_prefix(self, prefix: str) -> list[str]:
         base = self._path(prefix) if prefix else self.root
@@ -508,6 +591,7 @@ __all__ = [
     "PublishResult",
     "S3ObjectStore",
     "iter_store_files",
+    "local_for",
     "repository_from_settings",
     "sha256_file",
 ]
