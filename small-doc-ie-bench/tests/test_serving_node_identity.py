@@ -9,8 +9,10 @@ capacity number is never priced against an unidentified node.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Iterator
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from sqlalchemy import select
@@ -24,6 +26,7 @@ from docie_bench.serving.catalog import (
 from docie_bench.serving.node_identity import (
     NODE_ID_ENV_VAR,
     InvalidNodeIdError,
+    NodeIdUnreadableError,
     node_id_path,
     resolve_node_id,
     validate_node_id,
@@ -143,6 +146,143 @@ def test_a_racing_second_writer_adopts_the_winners_id() -> None:
 
     assert _persist(path, "bbbb2222") == winner
     assert path.read_text(encoding="utf-8").strip() == winner
+
+
+def _unreadable_node_id(failures: list[int] | None = None):
+    """Make reads of ``node_id`` raise EIO, leaving every other read alone.
+
+    chmod is not a usable lever here: the suite runs on Windows too.
+    """
+    real = Path.read_text
+    budget = failures if failures is not None else [-1]
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "node_id" and budget[0] != 0:
+            budget[0] -= 1
+            raise OSError(5, "Input/output error")
+        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    return mock.patch.object(Path, "read_text", flaky)
+
+
+def test_an_unreadable_id_file_is_not_mistaken_for_an_absent_one() -> None:
+    """The bug: ``_read_persisted`` returned None for BOTH absent and
+    unreadable, so ``os.link`` raising FileExistsError plus a None read read as
+    "a file is there but it is garbage" -- and the node overwrote a perfectly
+    good identity with a fresh one, orphaning the ``serving_node`` and placement
+    rows it had already published.
+    """
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+
+    with _unreadable_node_id(), pytest.raises(NodeIdUnreadableError, match="could not be read"):
+        _persist(path, "b" * 32)
+
+    assert path.read_text(encoding="utf-8").strip() == original
+
+
+def test_resolving_under_an_unreadable_file_refuses_rather_than_re_minting() -> None:
+    """Every caller resolves inside a broad ``except Exception`` that logs and
+    continues, so refusing costs a publish cycle, not the container."""
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+
+    with _unreadable_node_id(), pytest.raises(NodeIdUnreadableError):
+        resolve_node_id()
+
+    assert path.read_text(encoding="utf-8").strip() == original
+
+
+def test_a_transient_read_error_self_heals_under_the_real_id() -> None:
+    """Why refusing beats re-minting: ``lru_cache`` does not cache exceptions,
+    so the next cycle retries and gets the id that was always on disk. Re-minting
+    would have been permanent."""
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+
+    with _unreadable_node_id(failures=[2]):
+        for _ in range(2):
+            with pytest.raises(NodeIdUnreadableError):
+                resolve_node_id()
+        assert resolve_node_id() == original
+
+    assert resolve_node_id() == original  # and it is cached from then on
+
+
+def test_an_invalid_id_file_is_still_regenerated_not_refused() -> None:
+    """The state that must NOT change: readable-but-corrupt content is a
+    documented regenerate, since refusing to serve over it would be worse."""
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not a valid id!!", encoding="utf-8")
+
+    regenerated = resolve_node_id()
+
+    assert validate_node_id(regenerated)
+    assert path.read_text(encoding="utf-8").strip() == regenerated
+
+
+def test_the_id_is_flushed_to_disk_before_it_is_linked() -> None:
+    """The id is published to Postgres as soon as it is minted, so a power loss
+    that takes the buffered write but not the placement rows leaves the node
+    re-minting against rows the old id still owns."""
+    from docie_bench.serving.node_identity import _persist
+
+    calls: list[str] = []
+    real_fsync, real_link = os.fsync, os.link
+
+    def fsync(fd: int) -> None:
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def link(src: object, dst: object) -> None:
+        calls.append("link")
+        real_link(src, dst)  # type: ignore[arg-type]
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with mock.patch.object(os, "fsync", fsync), mock.patch.object(os, "link", link):
+        _persist(path, "a" * 32)
+
+    assert calls[: calls.index("link")] == ["fsync"]
+
+
+def test_a_filesystem_without_hard_links_still_adopts_the_winners_id() -> None:
+    """Some bind mounts reject ``os.link``. That fallback used to rename
+    unconditionally, so on those filesystems it clobbered the very id the
+    FileExistsError branch beside it was written to adopt."""
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    winner = "a" * 32
+    path.write_text(winner, encoding="utf-8")
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "operation not permitted")):
+        assert _persist(path, "b" * 32) == winner
+
+    assert path.read_text(encoding="utf-8").strip() == winner
+
+
+def test_a_failed_persist_leaves_no_staging_file() -> None:
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("a" * 32, encoding="utf-8")
+
+    with _unreadable_node_id(), pytest.raises(NodeIdUnreadableError):
+        _persist(path, "b" * 32)
+
+    assert [p.name for p in path.parent.iterdir() if p.name != "node_id"] == []
 
 
 # --- per-node rows -------------------------------------------------------
