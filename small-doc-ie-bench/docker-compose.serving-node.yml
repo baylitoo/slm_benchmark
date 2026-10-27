@@ -127,7 +127,16 @@ services:
     # this node may boot before the central stack is reachable.
     restart: unless-stopped
     volumes:
-      # Same model definitions as the central stack -- keep this copy in sync.
+      # A convenience, NOT a dependency: nothing the serving role runs reads
+      # configs/. The nine serving functions (deploy/seed/delete/load/unload/
+      # repair/reconfigure/pin) take their launch arguments from the family
+      # contract in model_store.FAMILIES plus the store entry; the routing
+      # table in configs/models.yaml is read by the central api and by the
+      # worker role, neither of which runs here.
+      #
+      # Mounted so `docie-serving gateway`/`plan` work if you exec them in
+      # here to debug. This copy going stale cannot affect what the node
+      # serves, so do not go looking at it during an incident (#593).
       - ./configs:/app/configs:ro
       # Node-local. Not shareable: see DOCIE_SERVING_HOME above.
       - serving-state:/app/.serving

@@ -90,6 +90,24 @@ throughout.
 
    `docie-serving doctor` lists which catalogued models this node is missing.
 
+### What a node actually needs
+
+Three things, and nothing else:
+
+- the central **Postgres**, for the catalog it publishes into and reads
+  desired state from;
+- the central **Inngest**, for lifecycle events (outbound only — a node
+  needs no inbound reachability for job delivery);
+- its own **`DOCIE_SERVING_HOME`** volume, which must never be shared
+  between machines.
+
+In particular it does **not** need a synchronised copy of `configs/`.
+That file is the routing table, read by the central api and the worker
+role; the serving role takes its launch arguments from the family contract
+in code plus the store entry. The node compose mounts it only so
+`docie-serving gateway`/`plan` work if you exec them in the container, and a
+stale copy there cannot change what the node serves (#593).
+
 ## Check the node before it takes traffic
 
 `docie-serving doctor` exits non-zero when a check FAILS, so a bringup script
