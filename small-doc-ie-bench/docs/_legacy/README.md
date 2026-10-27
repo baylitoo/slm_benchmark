@@ -16,10 +16,7 @@ page instead.
 
 | Page | Replaced by |
 |---|---|
-| `ARCHITECTURE.md` | `architecture/overview.md` |
 | `serving-control-plane.md`, `serving-factory.md` | `architecture/serving.md` |
-| `THREAT_MODEL.md` | `architecture/auth.md`, and an operations security page |
-| `docie-studio.md`, `studio-schemas.md`, `demo.md`, `demo-agents.md` | an operations section, not yet written |
 | `model-onboarding.md`, `lfm25-reasoning.md` | a models section, deliberately deferred |
 | `adr-agent-sandboxing.md` | the decision index |
 | `server-integration.md` | a reference page for the `/v1` surface |
