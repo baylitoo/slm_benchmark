@@ -27,7 +27,7 @@ from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 if TYPE_CHECKING:
     from docie_bench.serving.runtime import RuntimeLaunchSpec
 
-from docie_bench.serving.paths import serving_home
+from docie_bench.serving.paths import model_store_root, serving_home
 from docie_bench.serving.placement import (
     clear_placement,
     mark_placement_ready,
@@ -337,7 +337,7 @@ class ControlPlane:
         supervisor = _DefaultSupervisor(
             PersistentSupervisor(home / "deployments.json"),
             planner,
-            model_store_root=home / "models",
+            model_store_root=model_store_root(),
         )
         return cls(
             registry=cast(Registry, registry),

@@ -33,6 +33,38 @@ def serving_home() -> Path:
     )
 
 
+#: Environment override for the model blob store.
+MODEL_STORE_DIR_ENV_VAR = "DOCIE_MODEL_STORE_DIR"
+
+
+def model_store_root() -> Path:
+    """Where this node keeps model weights on disk.
+
+    Separated from the rest of ``serving_home`` because the two have opposite
+    lifecycles, and #595 turns that difference into a requirement rather than a
+    preference.
+
+    ``serving_home`` holds state a node cannot lose: ``node_id`` is its
+    identity, ``deployments.json`` is what it is running, and the applied-state
+    file is how far it has converged. Weights are the opposite -- once a shared
+    repository can supply them, the local copy is a CACHE. It should be able to
+    live on a large cheap disk, be cleared to reclaim space, and be rebuilt by
+    pulling again.
+
+    They are the same volume today, so "clear the cache" and "destroy this
+    node's identity" are the same command. Giving the store its own root is
+    what makes the first safe, and it is why #595 lists this as a prerequisite
+    for the remote backend rather than a follow-up.
+
+    The default is EXACTLY the current location, so an existing node finds its
+    blobs where it left them and nothing has to be moved to upgrade.
+    """
+    override = os.environ.get(MODEL_STORE_DIR_ENV_VAR, "").strip()
+    if override:
+        return Path(override)
+    return serving_home() / "models"
+
+
 def deployment_log_path(logs_dir: Path, name: str) -> Path:
     """Where ``name``'s runtime stdout lives, guaranteed inside ``logs_dir``.
 

@@ -62,11 +62,22 @@ services:
       # the central `worker`; this node registers the serving app alone.
       DOCIE_WORKER_ROLE: serving
 
-      # Node-local state: desired state (deployments.json), the GGUF blob store
-      # and this node's id all live here. NEVER share this volume between
-      # machines -- two nodes would fight over one deployments.json and adopt
-      # each other's identity.
+      # Node-local state: desired state (deployments.json), this node's id and
+      # the applied-state file. NEVER share this volume between machines --
+      # two nodes would fight over one deployments.json and adopt each other's
+      # identity.
       DOCIE_SERVING_HOME: /app/.serving
+
+      # Where model weights are kept. Defaults to $DOCIE_SERVING_HOME/models,
+      # which is where they have always lived, so leaving this unset changes
+      # nothing.
+      #
+      # Point it at its own volume when you want the weights on a larger or
+      # cheaper disk. Once #595 lands they are a CACHE -- rebuildable by
+      # pulling from the shared repository -- so a separate root is what makes
+      # "reclaim the disk" a safe operation instead of one that also destroys
+      # this node's identity and its deployment records.
+      DOCIE_MODEL_STORE_DIR: ${DOCIE_MODEL_STORE_DIR:-}
 
       # Optional readable name for this node; generated and persisted in
       # DOCIE_SERVING_HOME when unset. Must be unique across the fleet.
@@ -140,6 +151,10 @@ services:
       - ./configs:/app/configs:ro
       # Node-local. Not shareable: see DOCIE_SERVING_HOME above.
       - serving-state:/app/.serving
+      # The model cache, separate so it can be cleared, resized or moved to
+      # another disk without touching the state volume above. Left on the
+      # default path, it is simply a subdirectory of serving-state as before.
+      - model-cache:/app/.cache/models
       - ocr-cache:/app/.cache/ocr
       - hf-cache:/root/.cache/huggingface
       # Optional: host Ollama blobs, so seed-from-ollama can import an existing
@@ -149,5 +164,6 @@ services:
 
 volumes:
   serving-state:
+  model-cache:
   ocr-cache:
   hf-cache:

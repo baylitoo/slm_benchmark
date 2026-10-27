@@ -40,7 +40,7 @@ from docie_bench.inngest.realtime import (
     publish,
 )
 from docie_bench.llm.model_profiles import ModelProfile
-from docie_bench.serving.paths import serving_home
+from docie_bench.serving.paths import model_store_root, serving_home
 from docie_bench.serving.placement_resolver import STORE_PROFILE_PREFIX
 from docie_bench.serving.profile_resolver import resolve_extraction_profile
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
@@ -1645,7 +1645,7 @@ async def _run_seed_ollama(data: dict[str, Any]) -> dict[str, Any]:
     if not reference or not name:
         raise ValueError("seed event must include 'reference' and 'name'")
 
-    store = ModelStore(serving_home() / "models")
+    store = ModelStore(model_store_root())
     # Blocking file I/O (hard-link or copy of multi-GB blobs, plus a one-time
     # full-file rehash to verify integrity) -> off the loop. The rehash adds one
     # multi-GB read per seed; acceptable as a one-time, threaded cost.
@@ -1867,7 +1867,7 @@ async def _run_seed_hf(
     # and deployments.json, before anything else in this job ran.
     validate_store_name(name)
 
-    store = ModelStore(serving_home() / "models")
+    store = ModelStore(model_store_root())
     tmp_dir = store.root / ".hf-downloads" / name
 
     throttle = {"at": 0.0, "percent": -100.0}
@@ -2102,7 +2102,7 @@ def _gc_seed_leftovers_sync() -> dict[str, int]:
     from docie_bench.serving.seed_progress import prune_stale
 
     removed_staging = 0
-    staging_root = serving_home() / "models" / ".hf-downloads"
+    staging_root = model_store_root() / ".hf-downloads"
     now = time.time()
     try:
         children = list(staging_root.iterdir())

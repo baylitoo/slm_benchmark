@@ -101,6 +101,23 @@ Three things, and nothing else:
 - its own **`DOCIE_SERVING_HOME`** volume, which must never be shared
   between machines.
 
+Those three are durable. The **model weights are not**: `node_id`,
+`deployments.json` and the applied-state file are what a node cannot lose,
+while weights can be seeded again. They live under `DOCIE_SERVING_HOME` by
+default, which means clearing the weights and destroying the node's identity
+are the same command.
+
+Set **`DOCIE_MODEL_STORE_DIR`** to separate them:
+
+```
+DOCIE_MODEL_STORE_DIR=/app/.cache/models
+```
+
+The node compose already declares a `model-cache` volume at that path. Worth
+doing when the weights outgrow the state volume, or when you want reclaiming
+that space to be a safe operation. Leaving it unset keeps the old layout
+exactly, so nothing has to move to upgrade.
+
 In particular it does **not** need a synchronised copy of `configs/`.
 That file is the routing table, read by the central api and the worker
 role; the serving role takes its launch arguments from the family contract
