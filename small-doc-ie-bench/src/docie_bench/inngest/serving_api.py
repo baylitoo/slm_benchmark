@@ -44,7 +44,7 @@ from docie_bench.serving.node_liveness import (
     snapshot_age_s,
     snapshot_stale_after_s,
 )
-from docie_bench.serving.paths import deployment_log_path, serving_home
+from docie_bench.serving.paths import deployment_log_path, model_store_root, serving_home
 from docie_bench.settings import get_settings
 
 logger = logging.getLogger("docie_bench.inngest.serving_api")
@@ -1595,7 +1595,7 @@ def _ondisk_store_view() -> list[dict[str, Any]]:
     from docie_bench.serving.catalog import available_backends
     from docie_bench.serving.model_store import FAMILIES, ModelStore
 
-    store = ModelStore(serving_home() / "models")
+    store = ModelStore(model_store_root())
     view: list[dict[str, Any]] = []
     for entry in store.list():
         contract = FAMILIES.get(entry.family)

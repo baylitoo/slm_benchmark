@@ -631,10 +631,10 @@ def _local_store_models() -> list[str]:
     cycle must not depend on it.
     """
     from docie_bench.serving.model_store import ModelStore
-    from docie_bench.serving.paths import serving_home
+    from docie_bench.serving.paths import model_store_root
 
     try:
-        return [entry.name for entry in ModelStore(serving_home() / "models").list()]
+        return [entry.name for entry in ModelStore(model_store_root()).list()]
     except Exception:  # noqa: BLE001 - never break the reconcile cycle
         logger.debug("could not list the local model store", exc_info=True)
         return []

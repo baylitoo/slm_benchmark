@@ -43,7 +43,7 @@ from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.serving.gateway import GatewayRoutingError
 from docie_bench.serving.gateway import resolve_profile as gateway_resolve_profile
 from docie_bench.serving.model_store import FAMILIES
-from docie_bench.serving.paths import serving_home
+from docie_bench.serving.paths import model_store_root, serving_home
 from docie_bench.serving.placement_resolver import (
     STORE_PROFILE_PREFIX,
     PlacementError,
@@ -165,7 +165,7 @@ def _store_family(name: str) -> str | None:
     missing/corrupt index or an absent entry yields ``None`` (fall back to the
     catalog).
     """
-    index_path = serving_home() / "models" / "index.json"
+    index_path = model_store_root() / "index.json"
     try:
         if not index_path.is_file():
             return None

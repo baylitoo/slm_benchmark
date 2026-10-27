@@ -79,9 +79,9 @@ def create_app(
 
     def _store() -> Any:
         from docie_bench.serving.model_store import ModelStore
-        from docie_bench.serving.paths import serving_home
+        from docie_bench.serving.paths import model_store_root
 
-        return ModelStore(serving_home() / "models")
+        return ModelStore(model_store_root())
 
     @store_app.command("list")
     def store_list(ctx: typer.Context) -> None:
