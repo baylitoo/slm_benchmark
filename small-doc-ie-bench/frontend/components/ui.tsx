@@ -45,28 +45,32 @@ export function Card({
       )}
     >
       {(title || actions) && (
-        <header className="flex items-start justify-between gap-4 border-b border-border px-5 py-4">
+        <header className="flex items-start justify-between gap-4 px-6 pb-4 pt-5">
           <div className="flex min-w-0 items-start gap-3">
             {icon && (
-              <span className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-border bg-muted text-accent">
+              <span className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/10 text-accent">
                 {icon}
               </span>
             )}
             <div className="min-w-0">
               {title && (
-                <h2 className="truncate text-sm font-semibold text-foreground">
+                <h2 className="truncate text-[15px] font-semibold leading-6 text-foreground">
                   {tx(title)}
                 </h2>
               )}
               {subtitle && (
-                <p className="mt-0.5 text-xs text-muted-foreground">{tx(subtitle)}</p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {tx(subtitle)}
+                </p>
               )}
             </div>
           </div>
           {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
         </header>
       )}
-      <div className={cn("p-5", bodyClassName)}>{children}</div>
+      <div className={cn("px-6 pb-6", !title && !actions && "pt-6", bodyClassName)}>
+        {children}
+      </div>
     </section>
   );
 }

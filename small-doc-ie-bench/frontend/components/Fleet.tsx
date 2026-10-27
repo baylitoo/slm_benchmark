@@ -19,6 +19,7 @@ import { useToast } from "./Toast";
 import { Alert, Badge, Button, Card } from "./ui";
 import { LiveIndicator } from "./LiveIndicator";
 import { Table, type Column } from "./patterns/Table";
+import { Meter, StatRow, StatTile } from "./patterns/StatTile";
 
 const POLL_MS = 5000;
 
@@ -128,94 +129,118 @@ export function Fleet({ active = true }: { active?: boolean }) {
 }
 
 /**
- * One node: the stock deployment. No tables, no empty per-node columns, and no
- * implication that something is missing — because nothing is.
+ * One node: the stock deployment.
+ *
+ * Rebuilt around what the page actually knows. The first version was three
+ * stacked cards whose subtitles explained concepts, and whose content was four
+ * readings, one sentence and a prose runbook -- roughly nine parts chrome to
+ * one part data. Two specific corrections:
+ *
+ * * **Free/total was a string.** It is the one genuinely visual reading here,
+ *   so it gets a meter; the numbers stay beside it because a bar is not a
+ *   quantity and colour alone is not a reading.
+ * * **"Adding a node" was a four-step runbook inside a dashboard**, duplicating
+ *   docs/operations/fleet-runbook.md. Demoted to a disclosure: still one click
+ *   away for a first-time operator, no longer the largest thing on screen.
  */
 function SingleNode({ node, store }: { node: FleetNode; store: StoreEntry[] | null }) {
   const held = node.store_models?.length ?? null;
   const total = store?.length ?? null;
+  const total_bytes = node.total_bytes ?? 0;
+  const free_bytes = node.free_bytes ?? 0;
+  const usedFraction = total_bytes > 0 ? (total_bytes - free_bytes) / total_bytes : 0;
 
   return (
     <div className="space-y-4">
-      <Card
-        title="Single-node deployment"
-        icon={<Server className="h-4 w-4" />}
-        subtitle="One serving node, which is the default. The per-node views below appear once a second node joins."
-      >
-        <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <Stat label="Node">
-            <span className="font-mono text-xs">{node.node_id}</span>
-          </Stat>
-          <Stat label="State">
-            {node.reporting ? (
-              <Badge tone="ok">reporting</Badge>
+      {/* Identity as a strip, not a card. The node id is the least actionable
+          thing here -- it had the most prominent slot and now sits inline. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <NodeState node={node} staleAfterS={null} />
+        <span className="font-mono text-xs text-muted-foreground" title={node.node_id}>
+          {node.node_id}
+        </span>
+        <span className="text-xs text-muted-foreground">· single-node deployment</span>
+      </div>
+
+      <StatRow>
+        <StatTile
+          label="Memory"
+          value={
+            node.never_reported ? (
+              <span className="text-muted-foreground">—</span>
             ) : (
-              <Badge tone="err">not reporting</Badge>
-            )}
-          </Stat>
-          <Stat label="Free / total">
-            {node.never_reported ? (
-              <span className="text-muted">—</span>
-            ) : (
-              <span className="tabular-nums">
-                {formatBytes(node.free_bytes)} / {formatBytes(node.total_bytes)}
+              `${formatBytes(free_bytes)} free`
+            )
+          }
+          meter={
+            node.never_reported ? undefined : (
+              <Meter fraction={usedFraction} label="memory used on this node" />
+            )
+          }
+          detail={
+            node.never_reported
+              ? "No measurement published yet."
+              : `${formatBytes(total_bytes - free_bytes)} used of ${formatBytes(total_bytes)}`
+          }
+        />
+        <StatTile
+          label="Deployments"
+          value={node.deployments}
+          detail={node.deployments === 1 ? "running here" : "running on this node"}
+        />
+        <StatTile
+          label="Models held"
+          value={held ?? "—"}
+          detail={
+            held == null
+              ? "Store not reported yet — it publishes next cycle."
+              : total != null && total !== held
+                ? `${total - held} in the catalog are seeded nowhere yet`
+                : "Everything the catalog lists is here"
+          }
+        />
+      </StatRow>
+
+      {held != null && held > 0 && node.store_models && (
+        <Card title="Models on this node" icon={<HardDrive className="h-4 w-4" />}>
+          <div className="flex flex-wrap gap-1.5">
+            {node.store_models.map((name) => (
+              <span
+                key={name}
+                className="rounded-md border border-border bg-muted/40 px-2 py-1 font-mono text-xs text-foreground/90"
+              >
+                {name}
               </span>
-            )}
-          </Stat>
-          <Stat label="Deployments">
-            <span className="tabular-nums">{node.deployments}</span>
-          </Stat>
-        </dl>
+            ))}
+          </div>
+        </Card>
+      )}
 
-        {looksGenerated(node.node_id) && (
-          <p className="mt-4 text-xs text-muted">
-            The id was generated on first publish and persists in the serving volume.
-            Set <code>DOCIE_SERVING_NODE_ID</code> to give this machine a readable name —
-            optional, and only worth doing when there is more than one.
-          </p>
-        )}
-      </Card>
+      {looksGenerated(node.node_id) && (
+        <p className="text-xs text-muted-foreground">
+          The id was generated on first publish and persists in the serving volume.
+          Set <code>DOCIE_SERVING_NODE_ID</code> to give this machine a readable name —
+          optional, and only worth doing when there is more than one.
+        </p>
+      )}
 
-      <Card
-        title="Models on this node"
-        icon={<HardDrive className="h-4 w-4" />}
-        subtitle="Blob stores are per node, so with one node everything the catalog lists is either here or not seeded at all."
-      >
-        {held == null ? (
-          <p className="text-sm text-muted">
-            This node has not reported its store yet — it publishes on the next
-            reconcile cycle.
-          </p>
-        ) : (
-          <p className="text-sm">
-            <span className="tabular-nums font-medium">{held}</span> model
-            {held === 1 ? "" : "s"} held
-            {total != null && total !== held && (
-              <>
-                {" "}
-                of <span className="tabular-nums">{total}</span> in the catalog — the
-                difference is seeded nowhere yet.
-              </>
-            )}
-            .
-          </p>
-        )}
-      </Card>
-
-      <Card
-        title="Adding a node"
-        icon={<Network className="h-4 w-4" />}
-        subtitle="What a second machine needs. No change is required on this one beyond opening Postgres and Inngest to the private network."
-      >
-        <ol className="list-decimal space-y-2 pl-5 text-sm text-muted">
+      <details className="group rounded-lg border border-border bg-card">
+        <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium text-foreground">
+          <Network className="h-4 w-4 text-muted-foreground" />
+          Adding a second node
+          <span className="ml-auto text-xs font-normal text-muted-foreground">
+            nothing changes on this one
+          </span>
+        </summary>
+        <ol className="list-decimal space-y-2 border-t border-border px-4 py-3 pl-9 text-sm text-muted-foreground">
           <li>
             Set <code>POSTGRES_BIND_HOST</code> and <code>INNGEST_BIND_HOST</code> to this
             host&apos;s private address — both are loopback-bound by default, so a node
             cannot reach them until you do.
           </li>
           <li>
-            Bring the node up with <code>docker-compose.serving-node.yml</code>. Four
-            values have no default and it refuses to start without them.
+            Bring the node up with <code>docker-compose.serving-node.yml</code>, then run{" "}
+            <code>docie-serving doctor --probe-ports</code> on it before it takes traffic.
           </li>
           <li>Seed the model on that node — blob stores are not shared.</li>
           <li>
@@ -223,7 +248,7 @@ function SingleNode({ node, store }: { node: FleetNode; store: StoreEntry[] | nu
             before routing anything through it.
           </li>
         </ol>
-      </Card>
+      </details>
     </div>
   );
 }

@@ -100,22 +100,25 @@ export function Table<T>({
   }
 
   return (
-    <div className="scroll-thin overflow-x-auto rounded-md border border-border">
+    <div className="scroll-thin overflow-x-auto rounded-lg border border-border">
       <table className="w-full text-left text-sm">
-        <thead className="bg-muted/60 text-[11px] uppercase tracking-wider text-muted-foreground">
+        <thead className="border-b border-border bg-muted/40 text-xs font-medium text-muted-foreground">
           <tr>
             {columns.map((col) => {
               const isSorted = sortKey === col.key;
               return (
                 <th
                   key={col.key}
-                  className={cn("whitespace-nowrap px-3 py-2.5 font-medium", col.className)}
+                  className={cn(
+                    "whitespace-nowrap px-4 py-2.5 font-medium",
+                    col.className,
+                  )}
                 >
                   {col.sortAccessor ? (
                     <button
                       type="button"
                       onClick={() => toggleSort(col)}
-                      className="inline-flex items-center gap-1 uppercase hover:text-foreground"
+                      className="inline-flex items-center gap-1 transition-colors hover:text-foreground"
                     >
                       {t(col.header)}
                       {isSorted ? (
@@ -145,14 +148,20 @@ export function Table<T>({
                 <tr
                   onClick={onRowClick ? () => onRowClick(row) : undefined}
                   className={cn(
-                    "border-t border-border transition-colors hover:bg-muted/40",
+                    // Lighter than the header rule, and the first row skips
+                    // its own top border so the two do not stack into 2px.
+                    "border-t border-border/60 transition-colors first:border-t-0",
+                    "hover:bg-muted/40",
                     onRowClick && "cursor-pointer",
                   )}
                 >
                   {columns.map((col) => (
                     <td
                       key={col.key}
-                      className={cn("px-3 py-2.5 align-middle text-foreground/90", col.className)}
+                      className={cn(
+                        "px-4 py-3 align-middle text-foreground/90",
+                        col.className,
+                      )}
                     >
                       {col.render(row)}
                     </td>
@@ -160,7 +169,7 @@ export function Table<T>({
                 </tr>
                 {expanded && renderExpanded && (
                   <tr className="border-t border-border bg-muted/20">
-                    <td colSpan={columns.length} className="px-3 py-3">
+                    <td colSpan={columns.length} className="px-4 py-3">
                       {renderExpanded(row)}
                     </td>
                   </tr>

@@ -35,6 +35,7 @@ const config: Config = {
       },
       fontFamily: {
         sans: [
+          "var(--font-sans)",
           "ui-sans-serif",
           "system-ui",
           "-apple-system",
@@ -45,6 +46,7 @@ const config: Config = {
           "sans-serif",
         ],
         mono: [
+          "var(--font-mono)",
           "ui-monospace",
           "JetBrains Mono",
           "SFMono-Regular",
@@ -54,6 +56,9 @@ const config: Config = {
         ],
       },
       borderRadius: {
+        // `lg` is what Card, Button and Table all reach for, so softening it
+        // here is the whole corner-radius change rather than 40 edits.
+        lg: "0.75rem",
         xl: "0.875rem",
         "2xl": "1.125rem",
       },
