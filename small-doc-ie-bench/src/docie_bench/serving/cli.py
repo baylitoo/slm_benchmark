@@ -100,6 +100,65 @@ def create_app(
             ],
         )
 
+    def _publish_entry(ctx: typer.Context, name: str) -> dict[str, Any]:
+        """Publish one local store entry to the shared repository.
+
+        Separated from the seed commands because a local seed succeeding and a
+        remote publication succeeding are different outcomes (#595). Seeding
+        populates THIS node; publishing makes the model available to the
+        fleet, and either can fail without the other being wrong.
+        """
+        from docie_bench.serving.model_repository import (
+            iter_store_files,
+            repository_from_settings,
+        )
+
+        repository = repository_from_settings()
+        if repository is None:
+            raise RuntimeError(
+                "no shared model repository is configured; set "
+                "DOCIE_MODEL_STORE_S3_BUCKET (and the matching credentials) "
+                "on the node that publishes"
+            )
+        entry = _store().entry(name)
+        from docie_bench.serving.node_identity import resolve_node_id
+
+        kind = "snapshot" if Path(entry.model_path).is_dir() else "gguf"
+        result = repository.publish(
+            name=entry.name,
+            family=entry.family,
+            kind=kind,
+            files=list(iter_store_files(entry)),
+            source=entry.source,
+            published_by=resolve_node_id(),
+        )
+        return {
+            "name": result.name,
+            "manifest": result.manifest_digest,
+            "uploaded": list(result.uploaded),
+            "skipped": list(result.skipped),
+            "already_complete": result.already_complete,
+        }
+
+    @store_app.command("publish")
+    def store_publish(
+        ctx: typer.Context,
+        name: str = typer.Argument(..., help="Store name to publish."),
+    ) -> None:
+        """Publish a model this node holds to the shared repository.
+
+        Uploads every artifact that is not already there, writes the immutable
+        manifest, and moves the pointer LAST -- so an interrupted publication
+        leaves orphaned blobs and no deployable model, never a half-published
+        one. A model whose artifacts are all present re-publishes without
+        uploading anything.
+        """
+        try:
+            _emit(ctx, _publish_entry(ctx, name))
+        except Exception as exc:
+            _emit_error(ctx, exc)
+            raise typer.Exit(code=1) from exc
+
     @store_app.command("seed-ollama")
     def store_seed_ollama(
         ctx: typer.Context,
@@ -109,6 +168,11 @@ def create_app(
         mmproj: str | None = typer.Option(None, help="Explicit vision projector path."),
         copy: bool = typer.Option(
             False, "--copy", help="Copy instead of hard-linking the blob."
+        ),
+        publish: bool = typer.Option(
+            False,
+            "--publish",
+            help="Also publish to the shared repository once the seed succeeds.",
         ),
     ) -> None:
         """Seed from a model Ollama already pulled on THIS machine.
@@ -124,10 +188,23 @@ def create_app(
                 link=not copy,
                 mmproj_source=mmproj,
             )
-            _emit(ctx, {"name": entry.name, "model_path": entry.model_path.as_posix()})
+            payload = {
+                "name": entry.name,
+                "model_path": entry.model_path.as_posix(),
+            }
         except Exception as exc:
             _emit_error(ctx, exc)
             raise typer.Exit(code=1) from exc
+        # The seed has SUCCEEDED by here. A publication failure is reported as
+        # its own outcome and must not make the local result look wrong -- the
+        # weights are on this node either way.
+        if publish:
+            try:
+                payload["published"] = _publish_entry(ctx, entry.name)
+            except Exception as exc:  # noqa: BLE001 - reported, not fatal
+                payload["published"] = None
+                payload["publish_error"] = str(exc)
+        _emit(ctx, payload)
 
     @store_app.command("add-gguf")
     def store_add_gguf(

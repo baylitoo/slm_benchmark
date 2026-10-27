@@ -460,6 +460,28 @@ def _mapped(exc: BaseException, key: str) -> ModelRepositoryError:
     return ModelRepositoryError(f"repository operation failed for {key}: {exc}")
 
 
+def repository_from_settings() -> ModelRepository | None:
+    """The configured repository, or ``None`` when there is not one.
+
+    ``None`` is the ordinary answer, not a failure: a single-machine
+    deployment has no shared repository and every path that would use one
+    falls back to node-local behaviour. Returning ``None`` rather than raising
+    is what keeps that fallback from being an error path.
+    """
+    from docie_bench.settings import get_settings
+
+    settings = get_settings()
+    bucket = getattr(settings, "model_store_s3_bucket", None)
+    if not bucket:
+        return None
+    store = S3ObjectStore(
+        bucket,
+        endpoint_url=getattr(settings, "model_store_s3_endpoint_url", None),
+        region=getattr(settings, "model_store_s3_region", None),
+    )
+    return ModelRepository(store, prefix=getattr(settings, "model_store_s3_prefix", ""))
+
+
 def iter_store_files(entry: Any) -> Iterator[tuple[str, str, Path]]:
     """``(role, relative_path, local_path)`` for a local store entry.
 
@@ -486,5 +508,6 @@ __all__ = [
     "PublishResult",
     "S3ObjectStore",
     "iter_store_files",
+    "repository_from_settings",
     "sha256_file",
 ]
