@@ -213,3 +213,51 @@ def test_a_placement_without_an_owner_is_never_demoted(sqlite_catalog: None) -> 
     urls = {resolve_store_profile(MODEL).base_url for _ in range(8)}
 
     assert "http://legacy:8088/v1" in urls
+
+def test_the_node_table_is_read_once_per_resolution(sqlite_catalog: None) -> None:
+    """Both node rules need this table -- liveness to demote a node that
+    stopped reporting, drain to exclude one an operator took out -- and each
+    used to fetch it for itself. That is two SELECTs on the hot path of every
+    request for an answer that cannot change between them.
+
+    Counted rather than reasoned about, because the second read was invisible:
+    it changed no behaviour, so nothing else in this suite could notice it.
+    """
+    _seed_store()
+    _node("node-a", age_s=0)
+    _place(f"{MODEL}-1", port=8088, node_id="node-a")
+
+    catalog = ModelCatalog()
+    reads: list[int] = []
+    unwrapped = catalog.list_node_snapshots
+
+    def counting() -> object:
+        reads.append(1)
+        return unwrapped()
+
+    catalog.list_node_snapshots = counting  # type: ignore[method-assign]
+
+    resolve_store_profile(MODEL, catalog=catalog)
+
+    assert len(reads) == 1
+
+
+def test_an_unreadable_node_table_still_routes(sqlite_catalog: None) -> None:
+    """The property that lets the read move out of both rules: a failure leaves
+    an empty list, and each rule degrades to a no-op on it exactly as it did
+    when it swallowed its own exception. Routing is never withheld because node
+    state could not be established."""
+    _seed_store()
+    _node("node-a", age_s=0)
+    _place(f"{MODEL}-1", port=8088, node_id="node-a")
+
+    catalog = ModelCatalog()
+
+    def boom() -> object:
+        raise RuntimeError("node table is on fire")
+
+    catalog.list_node_snapshots = boom  # type: ignore[method-assign]
+
+    profile = resolve_store_profile(MODEL, catalog=catalog)
+
+    assert profile.base_url == "http://node-a:8088/v1"
