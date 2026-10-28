@@ -1,7 +1,7 @@
 """Code-interpreter MCP server (#264): sandboxed Python execution via a
 self-hosted Judge0 instance (docker-compose.yml's judge0-server/judge0-worker,
 opt-in via `docker compose --profile sandbox up`). See
-``docs/adr-agent-sandboxing.md`` for why Judge0 was picked over hand-rolling
+``docs/decisions/agent-sandboxing.md`` for why Judge0 was picked over hand-rolling
 a sandbox: `isolate`-based isolation, an actual persistent worker pool
 (rather than a cold spawn per call), and a fixable, understood security
 history rather than an unaudited one-off. Run:
@@ -34,7 +34,7 @@ _STATUS_TIME_LIMIT_EXCEEDED = 5
 
 
 class CodeInterpreterUnavailableError(RuntimeError):
-    """No auth token configured — see docs/adr-agent-sandboxing.md. Fails
+    """No auth token configured — see docs/decisions/agent-sandboxing.md. Fails
     CLOSED: never submits code to an unauthenticated Judge0 instance, the
     same shape as ``mcp_tools.MCPUnavailableError`` for the optional ``mcp``
     SDK dependency."""

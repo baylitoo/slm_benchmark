@@ -38,6 +38,14 @@ benchmarking/model-profiles
 ```
 
 ```{toctree}
+:caption: Models
+:maxdepth: 1
+
+models/onboarding
+models/reasoning
+```
+
+```{toctree}
 :caption: Development
 :maxdepth: 1
 
@@ -53,6 +61,7 @@ reference/glossary
 reference/api
 reference/serving-cli
 reference/embedding-models
+decisions/index
 ```
 
 ## Where to start
@@ -78,6 +87,7 @@ After that it depends what you are doing:
   key, not an operator key.
 - **Choosing or qualifying a model** — {doc}`benchmarking/running`, with
   {doc}`benchmarking/datasets` for the data it runs on.
+- **Adding a model the platform has not seen** — {doc}`models/onboarding`.
 - **Your first change** — {doc}`development/contributing`, then
   {doc}`development/testing`.
 
@@ -86,11 +96,8 @@ When a word seems to mean two things, it probably does:
 
 ## Scope of these pages
 
-Pages from the earlier ad-hoc documentation are parked in `docs/_legacy/` and
-are being absorbed rather than deleted. The README there lists what is left and
-where each piece is going.
-
 Design decisions live in GitHub issues rather than being re-narrated here. The
 issue carries the alternatives and why they lost, which is the part that is
 expensive to reconstruct and impossible to read out of a diff. Where a page
-describes a decision, it links to the issue that made it.
+describes a decision, it links to the issue that made it; {doc}`decisions/index`
+lists the ones that shape the system today.

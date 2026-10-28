@@ -34,9 +34,6 @@ exclude_patterns = [
     # to PDF, not pages of this site, and their README would otherwise be an
     # orphan document -- a warning, and so a failed build.
     "integration/**",
-    # Session-era pages kept until their content is absorbed. See
-    # _legacy/README.md.
-    "_legacy/**",
     "README.md",
 ]
 

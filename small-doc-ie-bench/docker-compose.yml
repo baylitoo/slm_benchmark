@@ -370,7 +370,7 @@ services:
   # Both judge0 services need `privileged: true`: that's a hard requirement
   # of `isolate` (the namespaces+cgroups sandbox judge0 runs internally, the
   # same primitive Piston uses too — verified against judge0's own compose
-  # recipe, not assumed), not a Judge0 choice. See docs/adr-agent-sandboxing.md
+  # recipe, not assumed), not a Judge0 choice. See docs/decisions/agent-sandboxing.md
   # for why this was picked over hand-rolling a sandbox, and for the hardening
   # applied below (auth required, callbacks off) on top of judge0's own
   # (looser) defaults. Dedicated db/redis — never shared with the app's own —
