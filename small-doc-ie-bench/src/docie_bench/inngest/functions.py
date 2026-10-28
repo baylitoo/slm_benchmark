@@ -225,12 +225,33 @@ def _read_all_deployments() -> dict[str, dict[str, Any]]:
         return {}
 
 
-def _remote_replica_capacity(pattern: re.Pattern[str], known: set[str]) -> int:
+def _replica_alias(record: dict[str, Any]) -> str:
+    """The routable base a record belongs to: its launch ``--alias``.
+
+    #530 mints record names as ``<base>-<6 hex>``, so a name pattern no longer
+    identifies the replicas of one model -- it matched the positional
+    ``base`` / ``base-2`` / ``base-3`` scheme that preceded it. The alias stays
+    the base store name, the id the runtime answers to, which is what makes two
+    records replicas of each other. Same rule as ``serving_api._replica_base``.
+    """
+    spec = record.get("spec") or {}
+    launch = spec.get("launch") or {}
+    return str(launch.get("alias") or spec.get("name") or "")
+
+
+def _remote_replica_capacity(
+    selector: str, positional: re.Pattern[str], known: set[str]
+) -> int:
     """Slot capacity of this deployment's replicas on OTHER nodes (#562).
 
     #589 spreads replicas across the fleet, so this node's file holds only its
     own share: a deployment spread over three nodes priced its fan-out at one
     node's slots and processed a third of what the fleet could run at once.
+
+    A row belongs to the group when ``selector`` is its ``name`` (a record on
+    another node), its ``model_name`` (the launch alias every replica of a
+    store model shares -- what ``_records_for_other_nodes`` documents it as),
+    or when its name fits the pre-#530 positional scheme.
 
     Nodes that stopped reporting are skipped, which is where this parts company
     with routing. ``placement_resolver`` only ever uses staleness to prefer a
@@ -240,6 +261,10 @@ def _remote_replica_capacity(pattern: re.Pattern[str], known: set[str]) -> int:
     counting a machine nobody can confirm fans a batch out onto it. Costing
     throughput is recoverable; a batch that fails mid-flight is not. The floor
     of 1 in the caller keeps the batch running either way.
+
+    Drained nodes are skipped for a stronger reason than staleness: a drain is
+    an operator DECLARING a node out of rotation, so pricing its slots fans a
+    batch onto a machine being taken away. Staleness demotes; drain excludes.
 
     ``slot_count`` is llama-server's observed ``/slots`` value, so it is the
     concurrency the replica really offers. NULL (not live, a non-llamacpp
@@ -252,20 +277,33 @@ def _remote_replica_capacity(pattern: re.Pattern[str], known: set[str]) -> int:
     catalog = ModelCatalog()
     try:
         rows = catalog.list_placements()
-        stale = stale_node_ids(catalog.list_node_snapshots())
+        snapshots = catalog.list_node_snapshots()
     except CatalogUnavailableError:
         return 0
     except Exception:  # noqa: BLE001 - a DB hiccup must not fail a batch
         logger.debug("could not price fleet replica capacity", exc_info=True)
         return 0
+    stale = stale_node_ids(snapshots)
+    # A drain is recorded as ``drained_at`` on the node row -- the same
+    # predicate ``placement_resolver._drained_node_ids`` applies.
+    drained = {
+        str(row.get("node_id") or "")
+        for row in snapshots
+        if row.get("drained_at") and row.get("node_id")
+    }
     capacity = 0
     for row in rows:
         name = str(row.get("name") or "")
-        if not name or name in known or not pattern.match(name):
+        if not name or name in known:
+            continue
+        if selector not in (name, str(row.get("model_name") or "")) and not (
+            positional.match(name)
+        ):
             continue
         if row.get("state") != "ready" or not row.get("endpoint"):
             continue
-        if str(row.get("node_id") or "") in stale:
+        owner = str(row.get("node_id") or "")
+        if owner in stale or owner in drained:
             continue
         slots = row.get("slot_count")
         capacity += slots if isinstance(slots, int) and slots > 0 else 1
@@ -285,6 +323,12 @@ def _batch_fanout_width(data: dict[str, Any]) -> int:
     tracks what the deployment can actually run at once instead of a fixed
     or unbounded guess.
 
+    Replicas are grouped by their launch ``--alias``, not by a name pattern:
+    #530 mints record names as ``<base>-<6 hex>``, so the positional
+    ``base``/``base-2`` scheme the pattern matched no longer exists and every
+    scaled deployment priced itself at one replica. A selector naming one
+    RECORD still prices only that record.
+
     Replicas on other nodes count too, from their placement rows -- #589
     spreads a deployment across the fleet, so this node's file is only part of
     it (#562).
@@ -297,21 +341,34 @@ def _batch_fanout_width(data: dict[str, Any]) -> int:
     if name is None:
         return 1
     records = _read_all_deployments()
-    pattern = re.compile(rf"^{re.escape(name)}(?:-\d+)?$")
+    # Three ways to belong to this selector's group, and the UNION of them:
+    # the record named exactly the selector, any record carrying it as a launch
+    # alias (how #530 groups replicas), and the positional ``<base>-<n>`` names
+    # that preceded #530. The alias rule is the one that was missing -- minted
+    # names are ``<base>-<6 hex>``, which no pattern matches -- and the
+    # positional rule is kept rather than replaced, because deployments created
+    # before #530 still carry those names and pricing them costs nothing.
+    positional = re.compile(rf"^{re.escape(name)}(?:-\d+)?$")
+    group = {
+        record_name: record
+        for record_name, record in records.items()
+        if isinstance(record, dict)
+        and (
+            record_name == name
+            or _replica_alias(record) == name
+            or positional.match(record_name)
+        )
+    }
     capacity = 0
-    # Every local replica NAME, live or not, so a record this node owns is
-    # never counted twice from its own placement row.
-    local_names: set[str] = set()
-    for record_name, record in records.items():
-        if not isinstance(record, dict) or not pattern.match(record_name):
-            continue
-        local_names.add(record_name)
+    for record in group.values():
         if not _deployment_is_live(record):
             continue
         launch = (record.get("spec") or {}).get("launch") or {}
         n_parallel = launch.get("n_parallel")
         capacity += n_parallel if isinstance(n_parallel, int) and n_parallel > 0 else 1
-    capacity += _remote_replica_capacity(pattern, local_names)
+    # ``group`` holds every local name, live or not, so a record this node owns
+    # is never counted twice from its own placement row.
+    capacity += _remote_replica_capacity(name, positional, set(group))
     return capacity if capacity > 0 else 1
 
 

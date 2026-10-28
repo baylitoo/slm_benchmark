@@ -283,3 +283,102 @@ def test_a_catalog_outage_leaves_the_local_answer_intact(
 
     assert functions._batch_fanout_width({"deployment": LOCAL}) == 4
     assert functions._read_deployment(REMOTE) is None
+
+# --- replicas are grouped by alias, not by a name pattern (#530) -----------
+
+MINTED = (f"{LOCAL}-a1b2c3", f"{LOCAL}-d4e5f6", f"{LOCAL}-7a8b9c")
+
+
+def _write_minted(home: Path, names: tuple[str, ...], *, n_parallel: int = 4) -> None:
+    """Replicas named the way mint_deployment_name() actually names them."""
+    _write_local(
+        home,
+        {
+            name: {
+                "state": "ready",
+                "endpoint": f"http://local:{8088 + i}/v1",
+                "spec": {
+                    "name": name,
+                    "launch": {"n_parallel": n_parallel, "alias": LOCAL, "model": LOCAL},
+                },
+            }
+            for i, name in enumerate(names)
+        },
+    )
+
+
+def _place_with_model(name: str, *, node_id: str, model: str, slots: int) -> None:
+    """A placement row that carries the launch alias as its model_name, which
+    is what groups a store model's replicas across nodes."""
+    ModelCatalog().record_placement(
+        name,
+        model_name=model,
+        engine="llama-server",
+        endpoint=f"http://{node_id}:8088/v1",
+        state="ready",
+        node_id=node_id,
+    )
+    ModelCatalog().publish_observed(
+        name,
+        node_id=node_id,
+        engine="llama-server",
+        state="ready",
+        endpoint=f"http://{node_id}:8088/v1",
+        phase="hot",
+        pid=None,
+        pid_create_time=None,
+        rss_bytes=0,
+        health_ok=True,
+        last_error=None,
+        slot_count=slots,
+    )
+
+
+def test_minted_replica_names_are_priced_by_their_alias(serving_home: Path) -> None:
+    """#530 mints record names as ``<base>-<6 hex>``, which the positional
+    ``<base>-<n>`` pattern cannot match -- so every scaled deployment priced
+    itself at a single replica. Measured before: 12 real slots, width 1."""
+    _write_minted(serving_home, MINTED)
+
+    assert functions._batch_fanout_width({"deployment": LOCAL}) == 12
+
+
+def test_minted_replicas_on_other_nodes_are_priced_too(serving_home: Path) -> None:
+    """The same rule across the fleet: a placement row's ``model_name`` is the
+    launch alias, so it groups with this node's replicas of that model."""
+    _write_minted(serving_home, MINTED[:1])
+    _place_with_model(f"{LOCAL}-b2c3d4", node_id="node-b", model=LOCAL, slots=4)
+
+    assert functions._batch_fanout_width({"deployment": LOCAL}) == 8
+
+
+def test_a_selector_naming_one_minted_record_prices_only_that_record(
+    serving_home: Path,
+) -> None:
+    """Grouping by alias must not make an explicit record selector mean its
+    siblings. A minted name is nobody's alias, so it stands alone."""
+    _write_minted(serving_home, MINTED)
+
+    assert functions._batch_fanout_width({"deployment": MINTED[0]}) == 4
+
+
+def test_a_drained_node_is_not_priced(serving_home: Path) -> None:
+    """Drain EXCLUDES where staleness only demotes: an operator has declared
+    the node out of rotation, so fanning a batch onto it is the one thing a
+    width must not do."""
+    _write_minted(serving_home, MINTED[:1])
+    _place_with_model(f"{LOCAL}-b2c3d4", node_id="node-b", model=LOCAL, slots=8)
+    _node_snapshot("node-b")
+    ModelCatalog().set_node_drain("node-b", drained=True)
+
+    assert functions._batch_fanout_width({"deployment": LOCAL}) == 4
+
+
+def test_an_undrained_node_is_still_priced(serving_home: Path) -> None:
+    """The negative half, so the drain filter is not just always-on."""
+    _write_minted(serving_home, MINTED[:1])
+    _place_with_model(f"{LOCAL}-b2c3d4", node_id="node-b", model=LOCAL, slots=8)
+    _node_snapshot("node-b")
+
+    assert functions._batch_fanout_width({"deployment": LOCAL}) == 12
+
