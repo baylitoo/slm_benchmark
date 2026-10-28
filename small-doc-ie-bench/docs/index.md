@@ -29,6 +29,15 @@ operations/fleet-runbook
 ```
 
 ```{toctree}
+:caption: Benchmarking
+:maxdepth: 1
+
+benchmarking/running
+benchmarking/datasets
+benchmarking/model-profiles
+```
+
+```{toctree}
 :caption: Development
 :maxdepth: 1
 
@@ -42,6 +51,7 @@ development/testing
 
 reference/glossary
 reference/api
+reference/serving-cli
 reference/embedding-models
 ```
 
@@ -66,6 +76,8 @@ After that it depends what you are doing:
   misconfigured fails as a wrong answer rather than an error.
 - **Integrating an application** — {doc}`reference/api`. Use a Studio-issued
   key, not an operator key.
+- **Choosing or qualifying a model** — {doc}`benchmarking/running`, with
+  {doc}`benchmarking/datasets` for the data it runs on.
 - **Your first change** — {doc}`development/contributing`, then
   {doc}`development/testing`.
 
