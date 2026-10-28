@@ -638,8 +638,13 @@ class ExtractionService:
             ],
             "temperature": 0,
         }
-        if self.disable_thinking or bool(self.profile.options.get("no_think")):
-            request["chat_template_kwargs"] = {"enable_thinking": False}
+        # Transcription never wants thinking -- the same call the extraction
+        # path makes unconditionally in _extract_group. It was conditional
+        # here, and on the WRONG profile: the gate read this pipeline
+        # profile's options while the request goes to `vision`, so a
+        # `no_think` set on the vision deployment was ignored and a thinking
+        # VLM spent its budget reasoning about a verbatim transcript.
+        request["chat_template_kwargs"] = {"enable_thinking": False}
         async with httpx.AsyncClient() as client:
             try:
                 resp = await client.post(
