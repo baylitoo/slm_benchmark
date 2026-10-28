@@ -956,6 +956,19 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
     access. ``last_error`` is the one-line failure summary; ``lines`` is
     the raw tail (capped). Never 500s on a missing/rotated log — an absent file
     is an empty tail, not an error.
+
+    That last rule is why this route needed node attribution (#562). Logs are
+    node-local and deliberately not aggregated, while ``last_error`` comes
+    through the control plane and so resolves for a deployment on ANY node.
+    A deployment owned by another machine therefore answered with its real
+    error and an empty tail — indistinguishable from a rotated log, when in
+    fact the logs exist and are elsewhere. ``owner_node_id`` names the machine
+    that has them, and ``detail`` says so in words.
+
+    It names the OWNER rather than "this node": ``serving_home()`` is shared
+    with the api container, and resolving a node id here would mint a second
+    identity for one machine (see ``serving.node_identity``), so the api only
+    ever reads ownership from a placement row.
     """
     max_lines = max(1, min(int(lines), 1000))
     # Both sides come through the same helper. They used to build this path
@@ -980,14 +993,33 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
 
     tail: list[str] = []
+    found_locally = False
     try:
         with log_path.open("r", encoding="utf-8", errors="replace") as handle:
             tail = handle.read().splitlines()[-max_lines:]
+        found_locally = True
     except FileNotFoundError:
         tail = []
     except OSError as exc:  # pragma: no cover - unreadable log must not 500
         tail = [f"(log unreadable: {exc})"]
-    return {"name": name, "last_error": last_error, "lines": tail}
+        found_locally = True
+    observed = _observed_placements() or {}
+    owner = str((observed.get(name) or {}).get("node_id") or "") or None
+    detail: str | None = None
+    if not found_locally and owner is not None:
+        detail = (
+            f"no log file for {name!r} on the node serving this API. It runs on "
+            f"node {owner!r}, and logs are node-local — there is no central "
+            f"aggregation, so read them on that machine."
+        )
+    return {
+        "name": name,
+        "last_error": last_error,
+        "lines": tail,
+        "owner_node_id": owner,
+        "logs_found_locally": found_locally,
+        "detail": detail,
+    }
 
 
 @router.get("/seed-progress")

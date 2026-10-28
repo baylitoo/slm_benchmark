@@ -532,3 +532,86 @@ def test_domain_404_carries_the_discriminator_header(serving_home: Path) -> None
 
     assert exc.value.status_code == 404
     assert (exc.value.headers or {}).get("X-Docie-Error") == "not_found"
+
+# --- logs are node-local, and now say so (#562) ----------------------------
+
+
+def _place(name: str, *, node_id: str, state: str = "ready") -> None:
+    from docie_bench.serving.catalog import ModelCatalog
+
+    ModelCatalog().record_placement(
+        name,
+        model_name=name,
+        engine="llama-server",
+        endpoint=f"http://{node_id}:8088/v1",
+        state=state,
+        node_id=node_id,
+    )
+
+
+def test_a_log_tail_names_the_node_that_owns_the_deployment(
+    serving_home: Path, sqlite_catalog: None
+) -> None:
+    _seed_deployments(serving_home, {"lfm2.5-350m": 8088})
+    logs_dir = serving_home / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "lfm2.5-350m.log").write_text("line1\nline2\n", encoding="utf-8")
+    _place("lfm2.5-350m", node_id="node-a")
+
+    payload = asyncio.run(deployment_logs("lfm2.5-350m"))
+
+    assert payload["lines"] == ["line1", "line2"]
+    assert payload["owner_node_id"] == "node-a"
+    assert payload["logs_found_locally"] is True
+    assert payload["detail"] is None
+
+
+def test_an_empty_tail_for_a_deployment_on_another_node_says_where_to_look(
+    serving_home: Path, sqlite_catalog: None
+) -> None:
+    """The bug.
+
+    ``last_error`` comes through the control plane, so it resolves for a
+    deployment on ANY node, while the log file is node-local. A deployment
+    owned by another machine therefore answered with its real error and an
+    empty tail -- indistinguishable from a rotated log, per this route's own
+    "an absent file is an empty tail, not an error" rule. The logs existed the
+    whole time, on a machine the response never mentioned.
+    """
+    _seed_deployments(serving_home, {"nuextract3": 8089})
+    _place("nuextract3", node_id="node-b")
+
+    payload = asyncio.run(deployment_logs("nuextract3"))
+
+    assert payload["lines"] == []
+    assert payload["logs_found_locally"] is False
+    assert payload["owner_node_id"] == "node-b"
+    assert "node-b" in (payload["detail"] or "")
+    assert "node-local" in (payload["detail"] or "")
+
+
+def test_a_missing_log_with_no_placement_row_stays_a_plain_empty_tail(
+    serving_home: Path, sqlite_catalog: None
+) -> None:
+    """Single node, nothing published yet: there is no owner to name, and an
+    absent log is still just an absent log. Never invent a node."""
+    _seed_deployments(serving_home, {"lfm2.5-350m": 8088})
+
+    payload = asyncio.run(deployment_logs("lfm2.5-350m"))
+
+    assert payload["lines"] == []
+    assert payload["owner_node_id"] is None
+    assert payload["detail"] is None
+
+
+def test_the_route_never_resolves_a_node_id_of_its_own(serving_home: Path) -> None:
+    """``serving_home()`` is shared with the api container, so resolving an id
+    here would mint a SECOND identity for one machine (#529). Ownership is
+    read from a placement row; the api never asks "who am I".
+    """
+    import inspect
+
+    from docie_bench.inngest import serving_api
+
+    source = inspect.getsource(serving_api.deployment_logs)
+    assert "resolve_node_id" not in source
