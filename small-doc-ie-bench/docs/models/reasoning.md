@@ -12,6 +12,10 @@ ignores both `enable_thinking` and `reasoning_effort`
 ([model card](https://huggingface.co/LiquidAI/LFM2.5-2.6B#chat-template)). The
 smaller LFM2 instruct checkpoints do not share this.
 
+LFM3 thinks by default too, but its template honours `enable_thinking: false`
+by closing the block (`<think></think>`), so it is not an always-thinking
+checkpoint. Extraction already sends the flag.
+
 `llm/reasoning.py` recognises these checkpoints by model or profile name,
 including repository ids and quantised filenames, and excludes base
 checkpoints. For a served alias whose name says nothing, set
