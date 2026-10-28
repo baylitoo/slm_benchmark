@@ -42,6 +42,7 @@ development/testing
 
 reference/glossary
 reference/api
+reference/serving-cli
 reference/embedding-models
 ```
 
