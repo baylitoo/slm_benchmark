@@ -37,8 +37,13 @@ export const RESUME_SCHEMA: DynamicSchemaSpec = {
       { name: "start_date", type: "date", description: "Start of this position, YYYY-MM or YYYY. A single date, never a range." },
       { name: "end_date", type: "date", description: "End of this position, YYYY-MM or YYYY. null when current (Aujourd'hui, present)." },
       { name: "location", type: "string", description: "City written next to this position. null if not stated." },
-      { name: "description", type: "string", description: "Complete responsibilities and achievements for this experience, including text spanning multiple lines." },
-      { name: "env_technique", type: "string", description: "Stack technique / environnement technologique listed under this position only. null when this position lists none." },
+      { name: "description", type: "string", description: "Project or context summary for this position, without the task list and the technical environment. null if absent." },
+      { name: "tasks", type: "list", description: "Each task, responsibility or achievement of this position as its own entry, one per bullet or line. [] when none.", fields: [
+        { name: "task", type: "string" },
+      ] },
+      { name: "env_technique", type: "list", description: "Each technology of the stack technique / environnement technique listed under this position only, one per entry. [] when this position lists none.", fields: [
+        { name: "technology", type: "string" },
+      ] },
     ] },
     { name: "education", type: "list", description: "Degrees and diplomas only. Never work positions.", fields: [
       { name: "degree", type: "string" }, { name: "institution", type: "string" },
