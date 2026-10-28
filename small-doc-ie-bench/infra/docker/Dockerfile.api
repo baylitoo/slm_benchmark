@@ -11,10 +11,11 @@ FROM python:3.11-slim-bookworm AS llama-builder
 # on a stock Docker Desktop). Override on a roomier machine for speed:
 #   docker compose build --build-arg LLAMA_BUILD_JOBS=8 worker
 ARG LLAMA_BUILD_JOBS=2
-# Reproducible llama.cpp release with gemma-embedding2 support (PR #30054).
-# b11669 / v0.7.0 was exercised against ggml-org/embeddinggemma-2-GGUF Q8_0.
+# Reproducible llama.cpp commit: the merge of ggml-org/llama.cpp#31257, which
+# carries LFM3 (#31252, #31257) and gemma-embedding2 (#30054).
+# gemma-embedding2 was last exercised against embeddinggemma-2-GGUF Q8_0 on b11669.
 # Override explicitly to use another release; changing the ARG busts the cache.
-ARG LLAMA_REF=620d2225cc436ab0b001e3200e590e3b286ef9ab
+ARG LLAMA_REF=19ff817fb25e9a1b838b1d7f9f4325f7bf9779c4
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git build-essential cmake ca-certificates \
   && rm -rf /var/lib/apt/lists/*

@@ -185,8 +185,8 @@ services:
         # Isolated native embedding dependencies; GLiNER's transformers cap
         # cannot coexist with EmbeddingGemma 2 in the encoder interpreter.
         INSTALL_EMBEDDINGS: "true"
-        # Tested release with gemma-embedding2 support; an override must retain it.
-        LLAMA_REF: ${LLAMA_REF:-620d2225cc436ab0b001e3200e590e3b286ef9ab}
+        # Pinned commit with gemma-embedding2 and LFM3 support; an override must retain both.
+        LLAMA_REF: ${LLAMA_REF:-19ff817fb25e9a1b838b1d7f9f4325f7bf9779c4}
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
