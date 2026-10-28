@@ -249,3 +249,81 @@ def test_the_node_example_says_the_central_side_must_be_opened_first() -> None:
 
     assert "POSTGRES_BIND_HOST" in text
     assert "INNGEST_BIND_HOST" in text
+
+# --- the cache-root upgrade (#595 2a) -------------------------------------
+#
+# A node that already holds weights keeps them at $DOCIE_SERVING_HOME/models,
+# inside the serving-state volume. Adding a volume for the separated cache
+# root is safe only while nothing mounts over that path: an empty volume
+# mounted there would hide every seeded model, and the node would report an
+# empty blob store and re-seed from scratch.
+#
+# These cannot prove Docker's mount semantics -- only a live upgrade does
+# that. They pin the structural property that makes the upgrade safe, so it
+# cannot regress unnoticed in a later edit.
+
+WEIGHTS_PATH = "/app/.serving/models"
+
+
+def _mount_targets(node: dict[str, Any]) -> list[str]:
+    """Container-side path of every volume entry (``source:target[:opts]``)."""
+    targets = []
+    for entry in node.get("volumes", []):
+        parts = str(entry).split(":")
+        # A Windows-style or variable source can itself contain a colon, so the
+        # target is the second-to-last part when options are present, else the
+        # last. Both forms here are simple, and this keeps it honest.
+        targets.append(parts[1] if len(parts) >= 2 else parts[0])
+    return targets
+
+
+def test_nothing_is_mounted_over_an_existing_nodes_weights(
+    node: dict[str, Any],
+) -> None:
+    """The upgrade invariant. The weights live inside the serving-state volume;
+    any OTHER mount at or above that path would shadow them."""
+    shadowing = [
+        target
+        for target in _mount_targets(node)
+        if target != "/app/.serving"
+        and (target == WEIGHTS_PATH or WEIGHTS_PATH.startswith(target.rstrip("/") + "/"))
+    ]
+
+    assert shadowing == [], f"these mounts would hide seeded weights: {shadowing}"
+
+
+def test_the_weights_volume_is_still_the_state_volume_by_default(
+    node: dict[str, Any],
+) -> None:
+    """The compatibility default: with DOCIE_MODEL_STORE_DIR unset the weights
+    are a child of the state root, so serving-state must still be mounted at
+    exactly that root."""
+    assert "/app/.serving" in _mount_targets(node)
+
+
+def test_the_separate_cache_volume_is_not_mounted_by_default(
+    node: dict[str, Any],
+) -> None:
+    """Opt-in on purpose. An always-mounted empty volume invites setting
+    DOCIE_MODEL_STORE_DIR without moving the weights across, which makes the
+    node report an empty store -- the migration is a documented procedure, not
+    a one-line flip."""
+    mounted = [entry for entry in node.get("volumes", []) if "model-cache" in str(entry)]
+
+    assert mounted == [], f"model-cache should be opt-in, found: {mounted}"
+
+
+def test_the_separate_cache_volume_is_declared_for_when_it_is_wanted() -> None:
+    """Declared but unmounted, so enabling the split is one uncomment rather
+    than two edits in two places."""
+    assert "model-cache" in _load(NODE_COMPOSE).get("volumes", {})
+
+
+def test_the_migration_is_documented_where_the_variable_is(
+    ) -> None:
+    """Setting the variable alone loses sight of the weights, so the env
+    example must not present it as a single-line change."""
+    text = NODE_ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    assert "DOCIE_MODEL_STORE_DIR" in text
+    assert "fleet-runbook.md" in text, "the migration procedure must be pointed at"
