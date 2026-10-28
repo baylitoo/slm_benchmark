@@ -2,8 +2,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  Gauge,
+  Cpu,
+  Database,
   Play,
+  SlidersHorizontal,
   Download,
   GitCompare,
   Route,
@@ -123,6 +125,8 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   const [customRoutingPolicy, setCustomRoutingPolicy] = useState(false);
   const [routingPolicyPath, setRoutingPolicyPath] = useState("");
   const [routingPolicySheetOpen, setRoutingPolicySheetOpen] = useState(false);
+  // Which selector the "Run with" toggle shows; the two are mutually exclusive.
+  const [runWithChoice, setRunWithChoice] = useState<"model" | "routing">("model");
   const [schemaName, setSchemaName] = useState("invoice");
   const [concurrency, setConcurrency] = useState("1");
   const [submitting, setSubmitting] = useState(false);
@@ -184,140 +188,98 @@ export function Benchmark({ view = "run" }: { view?: string }) {
   }
 
   // ── Run console ─────────────────────────────────────────────────────────
+  const runWith: "model" | "routing" =
+    routingPolicyName || customRoutingPolicy ? "routing" : runWithChoice;
+  const selectedDataset = datasets.data?.find((d) => d.name === dataset) ?? null;
+
   return (
     <div>
       <PageHeader
-        title="Run benchmark"
-        subtitle="POST /v1/studio/benchmark — kick off a dataset run and stream progress."
+        title="Run a benchmark"
+        subtitle="Score a model on a labelled dataset. Results land under Benchmark → Results."
       />
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card icon={<Gauge className="h-5 w-5" />} title="New run">
-          <form onSubmit={onRun} className="space-y-4">
-            <Field
-              label="Dataset"
-              required
-              hint={
-                datasets.data && datasets.data.length === 0
-                  ? "No datasets registered — see docie_bench.benchmark.registry to add one."
-                  : "A dataset registered in data/datasets.yaml."
-              }
-            >
-              <div className="flex gap-2">
-                <Select
-                  className="flex-1"
-                  value={dataset}
-                  onChange={(e) => setDataset(e.target.value)}
-                >
-                  <option value="">Select a dataset…</option>
-                  {(datasets.data ?? []).map((d) => (
-                    <option key={d.name} value={d.name}>
-                      {d.name}
-                      {d.latest ? ` (${d.latest})` : ""}
-                      {d.documents != null ? ` — ${d.documents} docs` : ""}
-                    </option>
-                  ))}
-                </Select>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  disabled={!dataset}
-                  onClick={() => setValidateOpen(true)}
-                  title="Run duplicate-doc_id / missing-file / cross-split-leakage checks"
-                >
-                  <ShieldCheck className="h-4 w-4" />
-                  <T>Validate</T>
-                </Button>
-              </div>
-            </Field>
-            <DatasetValidateSheet
-              open={validateOpen}
-              onClose={() => setValidateOpen(false)}
-              dataset={datasets.data?.find((d) => d.name === dataset) ?? null}
-            />
-            <PipelineProfileSheet
-              open={pipelineSheetOpen}
-              onClose={() => setPipelineSheetOpen(false)}
-              profiles={modelProfiles.data ?? []}
-              onCreated={(name) => {
-                setCustomModelProfile(true);
-                setModelProfile(name);
-                modelProfiles.reload();
-              }}
-              onDeleted={(name) => {
-                // The just-deleted profile can't be a valid selection anymore --
-                // clear it out from under the Custom field if it was the one picked.
-                if (customModelProfile && modelProfile === name) {
-                  setCustomModelProfile(false);
-                  setModelProfile("");
-                }
-                modelProfiles.reload();
-              }}
-            />
-            <OcrProfileSheet
-              open={ocrSheetOpen}
-              onClose={() => setOcrSheetOpen(false)}
-              onCreated={() => modelProfiles.reload()}
-            />
-            <div className="grid gap-4 sm:grid-cols-3">
+      <DatasetValidateSheet
+        open={validateOpen}
+        onClose={() => setValidateOpen(false)}
+        dataset={selectedDataset}
+      />
+      <PipelineProfileSheet
+        open={pipelineSheetOpen}
+        onClose={() => setPipelineSheetOpen(false)}
+        profiles={modelProfiles.data ?? []}
+        onCreated={(name) => {
+          setCustomModelProfile(true);
+          setModelProfile(name);
+          modelProfiles.reload();
+        }}
+        onDeleted={(name) => {
+          // The just-deleted profile can't be a valid selection anymore --
+          // clear it out from under the Custom field if it was the one picked.
+          if (customModelProfile && modelProfile === name) {
+            setCustomModelProfile(false);
+            setModelProfile("");
+          }
+          modelProfiles.reload();
+        }}
+      />
+      <OcrProfileSheet
+        open={ocrSheetOpen}
+        onClose={() => setOcrSheetOpen(false)}
+        onCreated={() => modelProfiles.reload()}
+      />
+      <RoutingPolicySheet
+        open={routingPolicySheetOpen}
+        onClose={() => setRoutingPolicySheetOpen(false)}
+        onCreated={(name) => {
+          setCustomRoutingPolicy(false);
+          setRoutingPolicyName(name);
+          routingPolicies.reload();
+        }}
+      />
+
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
+        <form onSubmit={onRun} className="space-y-6">
+          <Card icon={<Database className="h-5 w-5" />} title="What to test" subtitle="The documents to score and the fields to extract from them.">
+            <div className="grid gap-4 sm:grid-cols-2">
               <Field
-                label="Model profile"
-                hint="A live deployment, a models.yaml profile by name (e.g. a pipeline OCR->LLM profile -- pick Custom), or leave empty for the default."
+                label="Dataset"
+                required
+                hint={
+                  datasets.data && datasets.data.length === 0
+                    ? "No dataset is registered yet."
+                    : "Labelled documents with their expected values."
+                }
               >
-                <Select
-                  value={
-                    customModelProfile
-                      ? "__custom__"
-                      : modelOptions.includes(modelProfile)
-                        ? modelProfile
-                        : ""
-                  }
-                  onChange={(e) => {
-                    if (e.target.value === "__custom__") {
-                      setCustomModelProfile(true);
-                      setModelProfile("");
-                    } else {
-                      setCustomModelProfile(false);
-                      setModelProfile(e.target.value);
-                    }
-                  }}
-                >
-                  <option value="">(default)</option>
-                  {modelOptions.map((n) => (
-                    <option key={n} value={n}>
-                      {n}
-                    </option>
-                  ))}
-                  <option value="__custom__">Custom (models.yaml profile name)…</option>
-                </Select>
-                {customModelProfile && (
-                  <TextInput
-                    className="mt-2"
-                    value={modelProfile}
-                    onChange={(e) => setModelProfile(e.target.value)}
-                    placeholder="profile name from models.yaml"
-                  />
-                )}
-                <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
-                  <button
-                    type="button"
-                    onClick={() => setPipelineSheetOpen(true)}
-                    className="inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                <div className="flex gap-2">
+                  <Select
+                    aria-label="Dataset"
+                    className="flex-1"
+                    value={dataset}
+                    onChange={(e) => setDataset(e.target.value)}
                   >
-                    <Workflow className="h-3 w-3" />
-                    <T>New pipeline (OCR→LLM) profile…</T>
-                  </button>
-                  <button
+                    <option value="">Select a dataset…</option>
+                    {(datasets.data ?? []).map((d) => (
+                      <option key={d.name} value={d.name}>
+                        {d.name}
+                        {d.latest ? ` (${d.latest})` : ""}
+                        {d.documents != null ? ` — ${d.documents} docs` : ""}
+                      </option>
+                    ))}
+                  </Select>
+                  <Button
                     type="button"
-                    onClick={() => setOcrSheetOpen(true)}
-                    className="inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                    variant="secondary"
+                    disabled={!dataset}
+                    onClick={() => setValidateOpen(true)}
+                    title="Check for duplicate documents, missing files and leakage between splits"
                   >
-                    <ScanText className="h-3 w-3" />
-                    <T>New OCR-only profile…</T>
-                  </button>
+                    <ShieldCheck className="h-4 w-4" />
+                    <T>Check</T>
+                  </Button>
                 </div>
               </Field>
-              <Field label="Schema name">
-                <Select value={schemaName} onChange={(e) => setSchemaName(e.target.value)}>
+              <Field label="Schema" hint="The fields every document is extracted into.">
+                <Select aria-label="Schema" value={schemaName} onChange={(e) => setSchemaName(e.target.value)}>
                   {(schemas.data ?? []).map((s) => (
                     <option key={s} value={s}>
                       {s}
@@ -325,91 +287,170 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                   ))}
                 </Select>
               </Field>
-              <Field label="Concurrency">
-                <TextInput
-                  type="number"
-                  min={1}
-                  value={concurrency}
-                  onChange={(e) => setConcurrency(e.target.value)}
-                  placeholder="1"
-                />
-              </Field>
             </div>
+          </Card>
 
-            <RoutingPolicySheet
-              open={routingPolicySheetOpen}
-              onClose={() => setRoutingPolicySheetOpen(false)}
-              onCreated={(name) => {
-                setCustomRoutingPolicy(false);
-                setRoutingPolicyName(name);
-                routingPolicies.reload();
-              }}
-            />
-            <Field
-              label="Routing policy (optional)"
-              hint={
-                modelProfile.trim()
-                  ? "Disabled while a Model profile is set above -- clear it first. A routing policy already selects which profile(s) a document runs through."
-                  : "Multi-stage fallback/escalation across several profiles (e.g. a fast model, escalating to a stronger one on low confidence). Mutually exclusive with Model profile above."
-              }
-            >
-              <Select
-                value={customRoutingPolicy ? "__custom__" : routingPolicyName}
-                onChange={(e) => {
-                  if (e.target.value === "__custom__") {
-                    setCustomRoutingPolicy(true);
+          <Card
+            icon={<Cpu className="h-5 w-5" />}
+            title="Run with"
+            subtitle="One model, or a routing policy that picks between several."
+            actions={
+              <Segmented<"model" | "routing">
+                value={runWith}
+                onChange={(value) => {
+                  setRunWithChoice(value);
+                  if (value === "model") {
                     setRoutingPolicyName("");
-                  } else {
                     setCustomRoutingPolicy(false);
-                    setRoutingPolicyName(e.target.value);
+                    setRoutingPolicyPath("");
+                  } else {
+                    setModelProfile("");
+                    setCustomModelProfile(false);
                   }
                 }}
-                disabled={Boolean(modelProfile.trim())}
-              >
-                <option value="">(none)</option>
-                {(routingPolicies.data ?? []).map((p) => (
-                  <option key={p.name} value={p.name}>
-                    {p.name}
-                  </option>
-                ))}
-                <option value="__custom__">Custom (server-side YAML path)…</option>
-              </Select>
-              {customRoutingPolicy && (
-                <TextInput
-                  className="mt-2"
-                  value={routingPolicyPath}
-                  onChange={(e) => setRoutingPolicyPath(e.target.value)}
-                  placeholder="configs/routing-policy.example.yaml"
-                  disabled={Boolean(modelProfile.trim())}
-                />
-              )}
-              <button
-                type="button"
-                onClick={() => setRoutingPolicySheetOpen(true)}
-                disabled={Boolean(modelProfile.trim())}
-                className="mt-1.5 inline-flex items-center gap-1 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
-              >
-                <Route className="h-3 w-3" />
-                <T>New routing policy…</T>
-              </button>
+                options={[
+                  { value: "model", label: "Model", icon: Cpu },
+                  { value: "routing", label: "Routing policy", icon: Route },
+                ]}
+              />
+            }
+          >
+            {runWith === "model" ? (
+              <div className="space-y-3">
+                <Field
+                  label="Model"
+                  hint="A deployed model. Leave on Default to use the server's default, or pick Other to type a profile name."
+                >
+                  <Select
+                    aria-label="Model"
+                    value={
+                      customModelProfile
+                        ? "__custom__"
+                        : modelOptions.includes(modelProfile)
+                          ? modelProfile
+                          : ""
+                    }
+                    onChange={(e) => {
+                      if (e.target.value === "__custom__") {
+                        setCustomModelProfile(true);
+                        setModelProfile("");
+                      } else {
+                        setCustomModelProfile(false);
+                        setModelProfile(e.target.value);
+                      }
+                    }}
+                  >
+                    <option value="">Default</option>
+                    {modelOptions.map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                    <option value="__custom__">Other (type a profile name)…</option>
+                  </Select>
+                  {customModelProfile && (
+                    <TextInput
+                      className="mt-2"
+                      value={modelProfile}
+                      onChange={(e) => setModelProfile(e.target.value)}
+                      placeholder="profile name"
+                    />
+                  )}
+                </Field>
+                <div className="flex flex-wrap gap-2">
+                  <Button type="button" variant="ghost" size="sm" onClick={() => setPipelineSheetOpen(true)}>
+                    <Workflow className="h-3.5 w-3.5" />
+                    <T>New OCR → LLM pipeline</T>
+                  </Button>
+                  <Button type="button" variant="ghost" size="sm" onClick={() => setOcrSheetOpen(true)}>
+                    <ScanText className="h-3.5 w-3.5" />
+                    <T>New OCR-only profile</T>
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <Field
+                  label="Routing policy"
+                  hint="Starts with a fast model and escalates to a stronger one when confidence is low."
+                >
+                  <Select
+                    aria-label="Routing policy"
+                    value={customRoutingPolicy ? "__custom__" : routingPolicyName}
+                    onChange={(e) => {
+                      if (e.target.value === "__custom__") {
+                        setCustomRoutingPolicy(true);
+                        setRoutingPolicyName("");
+                      } else {
+                        setCustomRoutingPolicy(false);
+                        setRoutingPolicyName(e.target.value);
+                      }
+                    }}
+                  >
+                    <option value="">Select a policy…</option>
+                    {(routingPolicies.data ?? []).map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.name}
+                      </option>
+                    ))}
+                    <option value="__custom__">Other (a policy file on the server)…</option>
+                  </Select>
+                  {customRoutingPolicy && (
+                    <TextInput
+                      className="mt-2"
+                      value={routingPolicyPath}
+                      onChange={(e) => setRoutingPolicyPath(e.target.value)}
+                      placeholder="configs/routing-policy.example.yaml"
+                    />
+                  )}
+                </Field>
+                <Button type="button" variant="ghost" size="sm" onClick={() => setRoutingPolicySheetOpen(true)}>
+                  <Route className="h-3.5 w-3.5" />
+                  <T>New routing policy</T>
+                </Button>
+              </div>
+            )}
+          </Card>
+
+          <Card icon={<SlidersHorizontal className="h-5 w-5" />} title="Options">
+            <Field label="Parallel documents" hint="How many documents are extracted at the same time." className="max-w-xs">
+              <TextInput
+                type="number"
+                min={1}
+                value={concurrency}
+                onChange={(e) => setConcurrency(e.target.value)}
+                placeholder="1"
+              />
             </Field>
+          </Card>
 
-            {error && <Alert tone="err">{error}</Alert>}
+          {error && <Alert tone="err">{error}</Alert>}
 
+          <div className="flex items-center gap-3">
             <Button type="submit" loading={submitting}>
               <Play className="h-4 w-4" />
               {submitting ? "Starting…" : "Start benchmark"}
             </Button>
-          </form>
+            {dataset && (
+              <span className="text-xs text-muted-foreground">
+                {dataset}
+                {selectedDataset?.documents != null ? ` · ${selectedDataset.documents} docs` : ""}
+                {" · "}
+                {runWith === "routing"
+                  ? routingPolicyName || routingPolicyPath || "no policy"
+                  : modelProfile || "default model"}
+              </span>
+            )}
+          </div>
 
           {trigger && (
-            <div className="mt-5 border-t border-border pt-5">
+            <Card title="Run started">
               <ResultPanel trigger={trigger} noun="benchmark" />
-            </div>
+            </Card>
           )}
-        </Card>
+        </form>
 
-        <Card title="Latest results" subtitle="A quick peek — the full history lives under Results.">
+        <Card title="Recent runs" subtitle="Full scores are under Results.">
           <ResultsSummary runs={runs.data} loading={runs.loading} />
         </Card>
       </div>
@@ -1697,7 +1738,7 @@ function ResultsSummary({
   if (recent.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
-        No runs yet. Start one with the form — it&apos;ll appear here and under Results.
+        <T>No runs yet. Start one with the form.</T>
       </p>
     );
   }
@@ -1710,7 +1751,13 @@ function ResultsSummary({
             key={r.event_id ?? r.run ?? `run-${i}`}
             className="flex items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2"
           >
-            <span className="truncate font-mono text-xs text-foreground">{label}</span>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-medium text-foreground">{r.model_profile ?? "default"}</div>
+              <div className="truncate text-xs text-muted-foreground">
+                {label}
+                {r.created_at ? ` · ${r.created_at.slice(0, 16).replace("T", " ")}` : ""}
+              </div>
+            </div>
             {r.status && (
               <Badge tone={r.status === "completed" ? "ok" : r.status === "failed" ? "err" : "neutral"}>
                 {r.status}
