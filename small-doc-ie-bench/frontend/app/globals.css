@@ -5,7 +5,9 @@
 /*
  * Theme tokens. Values are space-separated RGB triples consumed by Tailwind via
  * `rgb(var(--token) / <alpha-value>)` (see tailwind.config.ts). The `.dark`
- * class (toggled by next-themes) flips the palette. Dark is the default.
+ * class (toggled by next-themes) flips the palette. Light is the default
+ * (see Providers.tsx); dark is reachable from the toggle and carries a full
+ * parallel token set, so every token here must exist in both blocks.
  */
 @layer base {
   :root {
