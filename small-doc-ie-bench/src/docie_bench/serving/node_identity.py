@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
@@ -39,6 +40,9 @@ NODE_ID_ENV_VAR = "DOCIE_SERVING_NODE_ID"
 # value is restricted rather than sanitized -- a silently truncated id is a
 # collision between two nodes, the bug this module exists to prevent.
 _MAX_NODE_ID_LEN = 32
+#: Bounded wait for a racing creator's 32-byte write to land.
+_CREATE_RACE_ATTEMPTS = 20
+_CREATE_RACE_SLEEP_S = 0.01
 _NODE_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
@@ -124,6 +128,48 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _create_exclusively(path: Path, node_id: str) -> str:
+    """Create ``path`` holding ``node_id``, or adopt whoever got there first.
+
+    Writes the final name directly, which temp-then-rename exists to avoid,
+    so the loser cannot assume a file it can see is complete. It waits for
+    content that validates instead of minting a second id -- the same rule
+    :func:`_read_persisted` applies to an unreadable file, for the same reason:
+    a node that cannot read its identity must not invent a new one and orphan
+    the rows the old one owns.
+    """
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return _await_persisted(path, node_id)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(node_id)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        _fsync_dir(path.parent)
+    return node_id
+
+
+def _await_persisted(path: Path, fallback: str) -> str:
+    """The winner's id once its write lands; raise rather than mint a second.
+
+    The wait is bounded and tiny -- an id is 32 bytes -- and happens at most
+    once per process, when two creators raced on a filesystem that refused the
+    hardlink protocol.
+    """
+    for _ in range(_CREATE_RACE_ATTEMPTS):
+        existing = _read_persisted(path)
+        if existing is not None:
+            return existing
+        time.sleep(_CREATE_RACE_SLEEP_S)
+    raise NodeIdUnreadableError(
+        f"{path} was created by another process but has not become readable; "
+        f"refusing to mint a second identity for this node"
+    )
+
+
 def _persist(path: Path, node_id: str) -> str:
     """Create-if-absent write; returns the id that is actually on disk.
 
@@ -153,16 +199,16 @@ def _persist(path: Path, node_id: str) -> str:
                 return existing
             temporary.replace(path)
         except OSError:
-            # Filesystems without hard links (some bind mounts): fall back to a
-            # plain rename. Adopt an id that landed in the meantime rather than
-            # clobbering it -- the same rule as the FileExistsError branch, which
-            # this one used to skip.
-            existing = _read_persisted(path)
-            if existing is not None:
-                return existing
-            temporary.replace(path)
-            _fsync_dir(path.parent)
-            return _read_persisted(path) or node_id
+            # Filesystems without hard links (some bind mounts).
+            #
+            # O_EXCL rather than read-then-rename: reading, finding nothing and
+            # then renaming lets two creators BOTH observe absence and both
+            # write, so each returns its own id while the disk keeps only the
+            # loser's. Because resolution is cached per process, the two then
+            # disagree about who this node is for the rest of their lives --
+            # which is the split identity this module exists to prevent.
+            # Exclusive creation makes exactly one of them the winner.
+            return _create_exclusively(path, node_id)
         _fsync_dir(path.parent)
     finally:
         temporary.unlink(missing_ok=True)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from unittest import mock
@@ -467,3 +468,59 @@ def test_sizing_withholds_a_number_it_cannot_attribute_to_a_node() -> None:
     assert snapshot is None  # fail-open, per admit_replica_ram's contract
     assert detail is not None
     assert "2 serving nodes" in detail
+
+def test_simultaneous_creators_agree_when_hardlinks_are_unavailable() -> None:
+    """The race the earlier fallback left open.
+
+    Some bind mounts refuse os.link, and the fallback read the file, found
+    nothing and renamed its own in. Two creators could both observe absence
+    and both write: each returned its OWN id while the disk kept only the
+    loser's, and because resolution is cached per process the two then
+    disagreed about who this node is for the rest of their lives.
+
+    The existing coverage only had a second writer ADOPT an id already on
+    disk, which is the easy half -- the winner is already decided there.
+    """
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start = threading.Barrier(8)
+    returned: list[str] = []
+    errors: list[BaseException] = []
+
+    def create(worker: int) -> None:
+        start.wait()
+        try:
+            returned.append(_persist(path, f"{worker:032d}"))
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")):
+        threads = [threading.Thread(target=create, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert errors == [], f"creation failed: {errors[:3]}"
+    on_disk = path.read_text(encoding="utf-8").strip()
+    assert len(set(returned)) == 1, f"creators disagreed about this node: {set(returned)}"
+    assert returned[0] == on_disk, "a creator returned an id the disk does not hold"
+
+
+def test_the_winner_is_whoever_the_filesystem_let_create_the_file() -> None:
+    """And the losers adopt it rather than minting their own, with hardlinks
+    unavailable so the exclusive-creation path is the one under test."""
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")):
+        winner = _persist(path, "a" * 32)
+        loser = _persist(path, "b" * 32)
+
+    assert loser == winner
+    assert path.read_text(encoding="utf-8").strip() == winner
+
