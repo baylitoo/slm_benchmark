@@ -760,3 +760,91 @@ def test_an_unchanged_source_publishes_without_the_extra_check_firing(
     assert repo.resolve("nuextract3") == result.manifest_digest
     assert sorted(result.uploaded) == ["mmproj.gguf", "model.gguf"]
 
+# --- interrupted publication leaves garbage, never a half-deployable model -
+
+
+class _DyingStore(LocalObjectStore):
+    """Stops writing at a chosen key, the way a killed process would.
+
+    KeyboardInterrupt rather than an exception the repository handles: the
+    property under test is what survives when NO cleanup runs. Exception
+    rollback is a different property, and testing only that is how a crash gap
+    hides behind a green suite.
+    """
+
+    def __init__(self, root: Path, *, die_before) -> None:
+        super().__init__(root)
+        self._die_before = die_before
+        self.armed = False
+
+    def _check(self, key: str) -> None:
+        if self.armed and self._die_before(key):
+            raise KeyboardInterrupt(f"killed before {key}")
+
+    def put(self, key: str, payload: bytes) -> None:
+        self._check(key)
+        super().put(key, payload)
+
+    def upload(self, source: Path, key: str) -> None:
+        self._check(key)
+        super().upload(source, key)
+
+
+def _is_blob(key: str) -> bool:
+    return "blobs/" in key
+
+
+def _is_manifest(key: str) -> bool:
+    return key.endswith(".json") and "current" not in key
+
+
+def _is_pointer(key: str) -> bool:
+    return key.endswith("current.json")
+
+
+@pytest.mark.parametrize(
+    ("label", "die_before"),
+    [("blob", _is_blob), ("manifest", _is_manifest), ("pointer", _is_pointer)],
+)
+def test_a_first_publication_killed_anywhere_publishes_nothing(
+    tmp_path: Path, local: tuple[Path, Path], label: str, die_before
+) -> None:
+    """Blobs first, manifest next, pointer last: until the pointer exists,
+    everything above it is inert. Nothing a consumer can reach appears."""
+    store = _DyingStore(tmp_path / "bucket", die_before=die_before)
+    repo = ModelRepository(store, prefix="docie")
+    store.armed = True
+
+    with pytest.raises(KeyboardInterrupt):
+        _publish(repo, local)
+
+    with pytest.raises(ObjectNotFoundError):
+        repo.resolve("nuextract3")
+
+
+@pytest.mark.parametrize(
+    ("label", "die_before"), [("manifest", _is_manifest), ("pointer", _is_pointer)]
+)
+def test_a_republication_killed_anywhere_leaves_the_old_build_deployable(
+    tmp_path: Path, local: tuple[Path, Path], label: str, die_before
+) -> None:
+    """The case that matters on a fleet: nodes are already pinned to the
+    published digest, so an interrupted republish must not disturb it. The
+    pointer is written last precisely so it never names a build whose manifest
+    or blobs are missing.
+    """
+    store = _DyingStore(tmp_path / "bucket", die_before=die_before)
+    repo = ModelRepository(store, prefix="docie")
+    first = _publish(repo, local)
+
+    model, _mmproj = local
+    model.write_bytes(b"GGUF-model-weights-v2-different-bytes")
+    store.armed = True
+    with pytest.raises(KeyboardInterrupt):
+        _publish(repo, local)
+
+    assert repo.resolve("nuextract3") == first.manifest_digest
+    manifest = repo.manifest("nuextract3", first.manifest_digest)
+    for entry in manifest.files:
+        repo.fetch_blob(entry, tmp_path / "cache" / entry.path)
+
