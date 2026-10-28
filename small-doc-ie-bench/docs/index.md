@@ -22,6 +22,9 @@ architecture/auth
 :caption: Operations
 :maxdepth: 1
 
+operations/getting-started
+operations/studio
+operations/security
 operations/fleet-runbook
 ```
 
@@ -44,8 +47,9 @@ reference/embedding-models
 
 ## Where to start
 
-Read {doc}`architecture/overview` first — it is the map, and the other pages
-assume it.
+To run it, start with {doc}`operations/getting-started`. To change it, read
+{doc}`architecture/overview` first — it is the map, and the other pages assume
+it.
 
 After that it depends what you are doing:
 
