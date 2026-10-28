@@ -524,3 +524,79 @@ def test_the_winner_is_whoever_the_filesystem_let_create_the_file() -> None:
     assert loser == winner
     assert path.read_text(encoding="utf-8").strip() == winner
 
+@pytest.mark.parametrize("content", ["", "   ", "!!! not an id !!!"])
+def test_a_corrupt_id_still_regenerates_where_hardlinks_are_refused(
+    content: str,
+) -> None:
+    """The cost of writing the final name directly.
+
+    temp-then-rename never leaves a partial id, so exclusive creation made a
+    new state reachable: a process killed between the create and the write
+    leaves a file that is present, readable and invalid. Waiting for it
+    forever would leave the node unable to resolve an identity at all, which
+    contradicts the rule this module already states -- a corrupt file is not a
+    reason to refuse to serve.
+    """
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")):
+        regenerated = _persist(path, "b" * 32)
+
+    assert validate_node_id(regenerated)
+    assert path.read_text(encoding="utf-8").strip() == regenerated
+
+
+def test_an_unreadable_id_is_still_never_overwritten_in_that_path() -> None:
+    """The distinction that must survive the change above: a file that cannot
+    be READ may hold a perfectly good id, so regenerating over it is the one
+    case that is wrong."""
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+    real_read = Path.read_text
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "node_id":
+            raise OSError(5, "Input/output error")
+        return real_read(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")),
+        mock.patch.object(Path, "read_text", flaky),
+        pytest.raises(NodeIdUnreadableError),
+    ):
+        _persist(path, "b" * 32)
+
+    assert real_read(path, encoding="utf-8").strip() == original
+
+
+def test_a_replacement_of_a_corrupt_id_is_never_seen_half_written() -> None:
+    """The replacement itself goes through temp-then-rename, so a concurrent
+    reader sees the old content or the new one, never a partial id."""
+    from docie_bench.serving.node_identity import _replace_corrupt
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("!!! corrupt !!!", encoding="utf-8")
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def watching(src: object, dst: object) -> None:
+        seen.append(Path(str(src)).name)
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    with mock.patch.object(os, "replace", watching):
+        _replace_corrupt(path, "c" * 32)
+
+    assert path.read_text(encoding="utf-8").strip() == "c" * 32
+    assert seen, "os.replace was never called"
+    assert seen[0].endswith(".tmp"), f"wrote the final name directly: {seen}"
+    assert [p.name for p in path.parent.iterdir() if p.name.endswith(".tmp")] == []
+

@@ -153,21 +153,53 @@ def _create_exclusively(path: Path, node_id: str) -> str:
 
 
 def _await_persisted(path: Path, fallback: str) -> str:
-    """The winner's id once its write lands; raise rather than mint a second.
+    """The winner's id once its write lands, else claim the corrupt file.
 
     The wait is bounded and tiny -- an id is 32 bytes -- and happens at most
     once per process, when two creators raced on a filesystem that refused the
     hardlink protocol.
+
+    What follows the wait is the distinction between a racing writer and a dead
+    one. A creator still mid-write finishes within the wait; a file that is
+    present and STILL invalid afterwards was left by a process killed between
+    the create and the write. Writing the final name directly is what makes
+    that state reachable at all -- temp-then-rename never leaves a partial id
+    -- so this path has to clean up after itself. Refusing instead would leave
+    the node unable to resolve an identity at all, which contradicts the rule
+    the module already states for a corrupt file: it is not a reason to refuse
+    to serve.
+
+    An UNREADABLE file still raises, from ``_read_persisted``. That is the one
+    case where regenerating is wrong, because the id may be perfectly good and
+    merely unreachable.
     """
     for _ in range(_CREATE_RACE_ATTEMPTS):
         existing = _read_persisted(path)
         if existing is not None:
             return existing
         time.sleep(_CREATE_RACE_SLEEP_S)
-    raise NodeIdUnreadableError(
-        f"{path} was created by another process but has not become readable; "
-        f"refusing to mint a second identity for this node"
-    )
+    return _replace_corrupt(path, fallback)
+
+
+def _replace_corrupt(path: Path, node_id: str) -> str:
+    """Overwrite a corrupt id file atomically, then re-read what landed.
+
+    Temp-then-rename, so the replacement is complete-or-absent for anyone
+    reading concurrently. Two processes both finding corruption both write, and
+    the final re-read is what makes them agree on whichever rename landed --
+    last-writer-wins, never two live identities.
+    """
+    temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(node_id)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_dir(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return _read_persisted(path) or node_id
 
 
 def _persist(path: Path, node_id: str) -> str:
