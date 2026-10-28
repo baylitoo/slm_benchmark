@@ -82,35 +82,51 @@ it("creates the complete ADBI resume starter with variable-length nested lists",
   expect(structure(spec.fields)).toEqual([
     { name: "name", type: "string" },
     { name: "title", type: "string" },
-    { name: "years_experience", type: "string" },
+    { name: "years_experience", type: "number" },
     { name: "contact", type: "object", fields: [
-      { name: "email", type: "string" }, { name: "phone", type: "string" },
-      { name: "linkedin", type: "string" }, { name: "github", type: "string" },
+      { name: "email", type: "string" },
+      { name: "phone", type: "string" },
+      { name: "linkedin", type: "string" },
+      { name: "github", type: "string" },
       { name: "location", type: "string" },
     ] },
     { name: "experience", type: "list", fields: [
-      { name: "company", type: "string" }, { name: "title", type: "string" },
-      { name: "start_date", type: "date" }, { name: "end_date", type: "date" },
-      { name: "location", type: "string" }, { name: "description", type: "string" },
-      { name: "tasks", type: "list", fields: [{ name: "task", type: "string" }] },
-      { name: "env_technique", type: "list", fields: [{ name: "technology", type: "string" }] },
+      { name: "company", type: "string" },
+      { name: "end_client", type: "string" },
+      { name: "via", type: "string" },
+      { name: "title", type: "string" },
+      { name: "start_date", type: "date" },
+      { name: "end_date", type: "date" },
+      { name: "location", type: "string" },
+      { name: "context", type: "string" },
+      { name: "achievements", type: "list", fields: [
+        { name: "achievement", type: "string" },
+      ] },
+      { name: "env_technique", type: "string" },
     ] },
     { name: "education", type: "list", fields: [
-      { name: "degree", type: "string" }, { name: "institution", type: "string" },
+      { name: "degree", type: "string" },
+      { name: "institution", type: "string" },
       { name: "year", type: "string" },
     ] },
     { name: "skills", type: "list", fields: [
       { name: "category", type: "string" },
-      { name: "items", type: "list", fields: [{ name: "item", type: "string" }] },
+      { name: "items", type: "list", fields: [
+        { name: "item", type: "string" },
+      ] },
     ] },
     { name: "languages", type: "list", fields: [
-      { name: "language", type: "string" }, { name: "level", type: "string" },
+      { name: "language", type: "string" },
+      { name: "level", type: "string" },
     ] },
     { name: "certifications", type: "list", fields: [
-      { name: "name", type: "string" }, { name: "issuer", type: "string" },
+      { name: "name", type: "string" },
+      { name: "issuer", type: "string" },
       { name: "year", type: "string" },
     ] },
-    { name: "interests", type: "list", fields: [{ name: "interest", type: "string" }] },
+    { name: "interests", type: "list", fields: [
+      { name: "interest", type: "string" },
+    ] },
   ]);
 });
 
