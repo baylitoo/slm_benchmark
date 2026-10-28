@@ -20,8 +20,8 @@ serve and prompt it faithfully:
 | capability flags | `vision`, `needs_mmproj`, `embedding`, `analyzer` |
 | generation defaults | temperature, `max_tokens`, timeout |
 
-The families today: `openai_chat`, `lfm2`, `lfm2_vl`, `spark2_5`,
-`nuextract_v1`, `nuextract3`, `vision_ocr`, `embedding`, `embeddinggemma2`,
+The families today: `openai_chat`, `lfm2`, `lfm2_vl`, `lfm3`, `lfm3_vl`,
+`spark2_5`, `nuextract_v1`, `nuextract3`, `vision_ocr`, `embedding`, `embeddinggemma2`,
 `reranker`, `multi_vector`, `encoder_gliner`, `encoder_gliner2`,
 `encoder_gliformer`, `transformers`, `transformers_trust_remote_code`.
 
@@ -101,6 +101,22 @@ architecture, the GGUF fails to load and the deployment's log says so. Newly
 supported architectures carry a note in `RUNTIME_NOTES` naming the llama.cpp
 change they need, because "supported" for those means "after rebuilding the
 serving image".
+
+### One architecture, several modalities
+
+Every LFM3 GGUF reports the architecture `lfm3`: text, VL, Audio and Omni
+alike. The arch string cannot tell them apart, so the projector and the repo's
+Hub tags do:
+
+| Repo | Family |
+|---|---|
+| `LiquidAI/LFM3-1.7B-GGUF` (no projector) | `lfm3` |
+| `LiquidAI/LFM3-VL-2B-GGUF`, `LiquidAI/LFM3-Omni-2B-GGUF` | `lfm3_vl` |
+| `LiquidAI/LFM3-Audio-2B-GGUF` | refused: its projector is an audio encoder |
+
+A projector tagged `audio` with no image signal is refused rather than
+promoted to a vision family. LFM3 needs a llama-server built after
+ggml-org/llama.cpp#31252.
 
 ## Preflight
 

@@ -44,6 +44,8 @@ A `FamilyContract` records how to serve and prompt a family:
 | `lfm2` | OpenAI `response_format` | `--jinja` | yes (embedded template) |
 | `lfm2_vl` | OpenAI `response_format` | `--jinja` (+`--mmproj`, vision) | no* (llama-server only) |
 | `spark2_5` | OpenAI `response_format` | `--jinja` | yes (embedded template) |
+| `lfm3` | OpenAI `response_format` | `--jinja` | yes (embedded template) |
+| `lfm3_vl` | OpenAI `response_format` | `--jinja` (+`--mmproj`, vision) | no (llama-server only) |
 
 \* LFM2.5's custom `<|startoftext|>`+ChatML template renders faithfully only via
 the GGUF's embedded jinja template, so both LFM2.5 families launch with `--jinja`
@@ -69,6 +71,18 @@ published GGUF (converted with the model author's own llama.cpp fork) loads
 against mainline. Its own KV-cache constant
 (`serving.resources.SPARK2_5_KV_CACHE_BYTES_PER_TOKEN`) is why it isn't just
 `openai_chat`, same reasoning as `lfm2`.
+
+**LFM3** (`LiquidAI/LFM3-1.7B-GGUF`, family `lfm3`; `LiquidAI/LFM3-VL-2B-GGUF`
++ its `mmproj-LFM3-VL-2B-*.gguf`, family `lfm3_vl`): every variant's GGUF
+reports arch `lfm3`, so the projector decides the family. Support landed in
+`ggml-org/llama.cpp#31252` (merged 2026-10-27) — **rebuild the serving image**
+with a `LLAMA_REF` after it. The template thinks by default and honours
+`enable_thinking=false`, which extraction always sends. LFM3-Audio-2B's
+projector is an audio encoder and is refused; LFM3-Omni-2B (vision + audio)
+resolves to `lfm3_vl` and needs `ggml-org/llama.cpp#31257` too. The
+safetensors repo `LiquidAI/LFM3-1.7B` ships custom code (`auto_map`) — use the
+GGUF repo. Own KV-cache constant:
+`serving.resources.LFM3_KV_CACHE_BYTES_PER_TOKEN`.
 
 `ollama_modelfile()` **refuses** families that Ollama can't serve faithfully, so
 you can't accidentally deploy a NuExtract3 that ignores its template.

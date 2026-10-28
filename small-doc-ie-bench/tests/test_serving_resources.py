@@ -32,6 +32,7 @@ from docie_bench.serving.resources import (
     DEFAULT_CONTEXT_LENGTH,
     KV_CACHE_BYTES_PER_TOKEN,
     LFM2_KV_CACHE_BYTES_PER_TOKEN,
+    LFM3_KV_CACHE_BYTES_PER_TOKEN,
     RUNTIME_OVERHEAD_BYTES,
     SPARK2_5_KV_CACHE_BYTES_PER_TOKEN,
     FootprintStore,
@@ -224,6 +225,15 @@ def test_spark2_5_family_uses_its_own_smaller_kv_cache_constant() -> None:
     spark = predict_footprint_bytes(weights, context_length=context, family="spark2_5")
     assert spark < generic
     assert spark == weights + SPARK2_5_KV_CACHE_BYTES_PER_TOKEN * context + RUNTIME_OVERHEAD_BYTES
+
+
+def test_lfm3_families_share_their_own_kv_cache_constant() -> None:
+    weights = 1 * GIB
+    context = 65_536
+    text = predict_footprint_bytes(weights, context_length=context, family="lfm3")
+    vl = predict_footprint_bytes(weights, context_length=context, family="lfm3_vl")
+    assert text == vl == weights + LFM3_KV_CACHE_BYTES_PER_TOKEN * context + RUNTIME_OVERHEAD_BYTES
+    assert LFM3_KV_CACHE_BYTES_PER_TOKEN == 2 * 6 * 4 * 128 * 2
 
 
 def test_unknown_or_missing_family_keeps_the_generic_constant() -> None:

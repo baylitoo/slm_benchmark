@@ -88,6 +88,51 @@ def test_resolve_spark2_5_arch_carries_a_runtime_note() -> None:
     assert "llama.cpp#27868" in v.runtime_note
 
 
+def test_lfm3_variants_resolve_by_projector_and_tags() -> None:
+    # Every LFM3 GGUF reports "lfm3"; the projector and Hub tags pick the family.
+    text = resolve_family(
+        "lfm3",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=False,
+        repo_id="LiquidAI/LFM3-1.7B-GGUF",
+        pipeline_tag="text-generation",
+    )
+    assert (text.verdict, text.family) == ("supported", "lfm3")
+    assert text.runtime_note is not None
+    assert "llama.cpp#31252" in text.runtime_note
+    vl = resolve_family(
+        "lfm3",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=True,
+        repo_id="LiquidAI/LFM3-VL-2B-GGUF",
+        tags=("image-text-to-text",),
+        pipeline_tag="image-text-to-text",
+    )
+    assert (vl.verdict, vl.family) == ("supported", "lfm3_vl")
+    omni = resolve_family(
+        "lfm3",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=True,
+        repo_id="LiquidAI/LFM3-Omni-2B-GGUF",
+        tags=("audio", "vision", "any-to-any"),
+        pipeline_tag="any-to-any",
+    )
+    assert omni.family == "lfm3_vl"
+    audio = resolve_family(
+        "lfm3",
+        has_gguf=True,
+        has_safetensors=False,
+        has_mmproj=True,
+        repo_id="LiquidAI/LFM3-Audio-2B-GGUF",
+        tags=("audio", "any-to-any"),
+        pipeline_tag="any-to-any",
+    )
+    assert (audio.verdict, audio.family) == ("unsupported", None)
+
+
 def test_qwen35_nuextract3_confirmed_by_base_model_lineage() -> None:
     # NuExtract3 shares the qwen35 backbone but needs its own contract.
     # "confirmed" tier: cardData.base_model traces lineage back to NuExtract,

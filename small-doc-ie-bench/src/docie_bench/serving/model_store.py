@@ -254,6 +254,26 @@ FAMILIES: dict[str, FamilyContract] = {
         default_timeout_seconds=180.0,
         ollama_faithful=True,
     ),
+    # LiquidAI LFM3 (1.7B, arch "lfm3"). Same wire contract as "lfm2" -- its
+    # own family so the sizing engine prices its hybrid conv/attention KV
+    # cache (serving.resources.LFM3_KV_CACHE_BYTES_PER_TOKEN). Its template
+    # thinks by default but honours enable_thinking=False, which extraction
+    # always sends, so it is not an always-thinking checkpoint
+    # (llm/reasoning.py).
+    "lfm3": FamilyContract(
+        name="lfm3",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja",),
+        tools=True,
+        needs_mmproj=False,
+        vision=False,
+        default_temperature=0.0,  # Liquid's 0.1 + repetition_penalty 1.1 is a chat rec
+        default_max_tokens=4096,
+        default_timeout_seconds=180.0,
+        ollama_faithful=True,
+    ),
     # LiquidAI LFM2.5-VL (1.6B). SigLIP2 encoder + connector on the LFM2 backbone;
     # ships a projector, so `needs_mmproj=True` (family_launch_args appends
     # `--mmproj <path>` automatically -> ("--jinja", "--mmproj", <path>)). KEY diff
@@ -273,6 +293,22 @@ FAMILIES: dict[str, FamilyContract] = {
         default_timeout_seconds=600.0,  # vision on CPU is slow (nuextract3 precedent)
         # Ollama mmproj/ADAPTER support for lfm2-vl is unverified; serve VL via
         # llama-server only (mirrors nuextract3 — refuses an Ollama Modelfile).
+        ollama_faithful=False,
+    ),
+    # LiquidAI LFM3-VL (2B): the LFM3 backbone plus a projector. Its GGUF
+    # reports "lfm3", promoted here by the mmproj (arch_registry
+    # TEXT_ARCH_TO_VISION_FAMILY). Mirrors lfm2_vl.
+    "lfm3_vl": FamilyContract(
+        name="lfm3_vl",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja",),
+        needs_mmproj=True,
+        vision=True,
+        default_temperature=0.1,
+        default_max_tokens=4096,
+        default_timeout_seconds=600.0,
         ollama_faithful=False,
     ),
     # Vision OCR models: a vision GGUF whose job is FREE-TEXT OCR (image ->

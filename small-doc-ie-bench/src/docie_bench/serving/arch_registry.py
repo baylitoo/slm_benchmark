@@ -53,6 +53,10 @@ ARCH_TO_FAMILY: dict[str, str] = {
     # instead of the generic dense-attention ceiling, same reason "lfm2" is
     # its own family and not just "openai_chat" underneath.
     "spark2_5": "spark2_5",
+    # LiquidAI LFM3 (ggml-org/llama.cpp#31252). Every variant's GGUF reports
+    # "lfm3" -- text, VL, Audio and Omni alike -- so modality comes from the
+    # projector and the repo's tags, not the arch string.
+    "lfm3": "lfm3",
     # vision (need an mmproj projector)
     "qwen2vl": "lfm2_vl",
     "qwen2_vl": "lfm2_vl",
@@ -96,7 +100,7 @@ VISION_ARCHS = frozenset(
 
 # Families that are multimodal — a repo whose family resolves to one of these
 # is already vision, no upgrade needed.
-VISION_FAMILIES = frozenset({"lfm2_vl", "nuextract3", "vision_ocr"})
+VISION_FAMILIES = frozenset({"lfm2_vl", "lfm3_vl", "nuextract3", "vision_ocr"})
 
 # When a repo ships an mmproj it is MULTIMODAL regardless of the reported base
 # LM architecture: llama.cpp reports the backbone (e.g. "lfm2" for LFM2-VL,
@@ -106,6 +110,7 @@ VISION_FAMILIES = frozenset({"lfm2_vl", "nuextract3", "vision_ocr"})
 # can switch to vision_ocr for OCR).
 TEXT_ARCH_TO_VISION_FAMILY: dict[str, str] = {
     "lfm2": "lfm2_vl",
+    "lfm3": "lfm3_vl",
     "qwen2": "lfm2_vl",
     "qwen3": "lfm2_vl",
     "qwen35": "lfm2_vl",  # generic Qwen3.5-VL (a NuExtract3 is caught by name first)
@@ -145,6 +150,12 @@ RUNTIME_NOTES: dict[str, str] = {
         "converted from THIS SAME checkpoint — a projector from a different "
         "Qwen3.5 size/variant has a mismatched output dimension and will not "
         "load (e.g. the 27B variant projects to 5120 dims, 35B-A3B to 2048)."
+    ),
+    "lfm3": (
+        "serving needs a llama-server built after ggml-org/llama.cpp#31252 "
+        "(merged 2026-10-27, LFM3-1.7B + LFM3-VL-2B) — rebuild the serving "
+        "image if the deploy fails to load. LFM3-Omni-2B additionally needs "
+        "ggml-org/llama.cpp#31257 (same day)."
     ),
 }
 
@@ -203,6 +214,18 @@ def _is_gliformer(signals: RepoSignals) -> bool:
     if any(str(tag).strip().lower() == "gliformer" for tag in signals.tags or ()):
         return True
     return "gliformer" in (signals.repo_id or "").lower()
+
+
+def _audio_only(signals: RepoSignals) -> bool:
+    """A projector repo tagged for audio with no image signal (LFM3-Audio-2B):
+    its mmproj is an audio encoder, so a vision upgrade would be wrong."""
+    tag_set = {str(t).strip().lower() for t in signals.tags or ()}
+    if "audio" not in tag_set:
+        return False
+    return not ({"vision", "image-text-to-text"} & tag_set) and signals.pipeline_tag not in {
+        "image-text-to-text",
+        "image-to-text",
+    }
 
 
 
@@ -524,6 +547,14 @@ def resolve_family(
         # backbone (LFM2-VL → "lfm2", Qwen2-VL → "qwen2"): upgrade to a vision
         # family so the deploy gets --mmproj + the right response contract.
         if has_mmproj and family not in VISION_FAMILIES:
+            if _audio_only(signals):
+                return SupportVerdict(
+                    "unsupported",
+                    None,
+                    f"architecture {architecture!r} with an audio projector — "
+                    "audio input has no serving path here",
+                    runtime_note=runtime_note,
+                )
             vision_family = TEXT_ARCH_TO_VISION_FAMILY.get(arch, DEFAULT_VISION_FAMILY)
             return SupportVerdict(
                 "supported",
