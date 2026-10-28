@@ -8,7 +8,7 @@ api/worker read/write races). The worker is the single writer (seed/deploy run
 there); the API only reads.
 
 Never store GGUF blobs in the DB — only metadata. See
-``serving/model_store.py`` for the blob layer and ``docs/docie-studio.md``.
+``serving/model_store.py`` for the blob layer and ``docs/operations/studio.md``.
 """
 
 from __future__ import annotations

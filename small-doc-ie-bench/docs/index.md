@@ -22,6 +22,9 @@ architecture/auth
 :caption: Operations
 :maxdepth: 1
 
+operations/getting-started
+operations/studio
+operations/security
 operations/fleet-runbook
 ```
 
@@ -47,13 +50,16 @@ development/testing
 :maxdepth: 1
 
 reference/glossary
+reference/api
+reference/serving-cli
 reference/embedding-models
 ```
 
 ## Where to start
 
-Read {doc}`architecture/overview` first — it is the map, and the other pages
-assume it.
+To run it, start with {doc}`operations/getting-started`. To change it, read
+{doc}`architecture/overview` first — it is the map, and the other pages assume
+it.
 
 After that it depends what you are doing:
 
@@ -68,6 +74,8 @@ After that it depends what you are doing:
 - **Running a fleet of serving nodes** — {doc}`operations/fleet-runbook`.
   Start there before adding a second machine; most of what can be
   misconfigured fails as a wrong answer rather than an error.
+- **Integrating an application** — {doc}`reference/api`. Use a Studio-issued
+  key, not an operator key.
 - **Choosing or qualifying a model** — {doc}`benchmarking/running`, with
   {doc}`benchmarking/datasets` for the data it runs on.
 - **Your first change** — {doc}`development/contributing`, then
@@ -78,17 +86,9 @@ When a word seems to mean two things, it probably does:
 
 ## Scope of these pages
 
-This is the first pass, covering the core of the framework: the job layer, the
-serving control plane, the extraction path, and the credential model. It is
-deliberately incomplete.
-
-Operations has its first page, {doc}`operations/fleet-runbook`, covering a
-multi-node serving fleet. Not yet written, in rough order of likely
-usefulness: the rest of operations (getting started, configuration, central
-deployment), a reference for the `/v1` surface, the Studio's own features, and
-model onboarding. Pages from the previous ad-hoc
-documentation are parked in `docs/_legacy/` and are being absorbed rather than
-deleted — see the README there for what maps to what.
+Pages from the earlier ad-hoc documentation are parked in `docs/_legacy/` and
+are being absorbed rather than deleted. The README there lists what is left and
+where each piece is going.
 
 Design decisions live in GitHub issues rather than being re-narrated here. The
 issue carries the alternatives and why they lost, which is the part that is
