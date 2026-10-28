@@ -247,16 +247,56 @@ class LocalDiskBackend:
         """
         destination = self._path(key_prefix)
         staging = destination.with_name(destination.name + ".tmp")
+        superseded = destination.with_name(destination.name + ".superseded")
         try:
+            # CRASH RECOVERY, before any cleanup.
+            #
+            # A superseded copy with no canonical directory beside it is not
+            # debris: it is the only copy of the model, left by a process that
+            # died between the rename-aside and the publish, so no exception
+            # handler ever ran. Clearing it as debris and then failing the new
+            # transfer loses the model outright -- both copies gone.
+            #
+            # Exception rollback does not cover this. The handler below restores
+            # the old tree when os.replace RAISES; a crash has no handler, and
+            # the evidence it leaves is exactly this directory.
+            if superseded.exists() and not destination.exists():
+                os.replace(superseded, destination)
             if staging.exists():
                 shutil.rmtree(staging)
+            # Only now is a superseded copy genuinely stale: the canonical
+            # directory exists beside it, so a previous publish completed and
+            # only its cleanup was interrupted.
+            if superseded.exists():
+                shutil.rmtree(superseded)
             for file in sorted(p for p in source_dir.rglob("*") if p.is_file()):
                 target = staging / file.relative_to(source_dir)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _transfer(file, target, link=link)
+
+            # Move the existing tree ASIDE rather than deleting it.
+            #
+            # The first version removed the destination and then replaced it,
+            # which left a window where a node had neither: if the replace
+            # failed -- a cross-device rename, a permissions error, or on
+            # Windows simply a running encoder holding the snapshot directory
+            # open -- the working model was already gone, and the handler below
+            # then removed the staged replacement too. Re-seeding a model a
+            # node was serving could destroy it.
+            #
+            # A rename is atomic and reversible, so the old tree survives until
+            # the new one is in place.
+            replaced = False
             if destination.exists():
-                shutil.rmtree(destination)
-            os.replace(staging, destination)
+                os.replace(destination, superseded)
+                replaced = True
+            try:
+                os.replace(staging, destination)
+            except BaseException:
+                if replaced:
+                    os.replace(superseded, destination)
+                raise
+            shutil.rmtree(superseded, ignore_errors=True)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
