@@ -239,7 +239,7 @@ CATALOG: dict[str, CatalogEntry] = {
                 "(docker-compose.yml's judge0-server, start with "
                 "`docker compose --profile sandbox up`) — lets an agent "
                 "actually run a snippet instead of reasoning about it. See "
-                "docs/adr-agent-sandboxing.md. Refuses to run without a "
+                "docs/decisions/agent-sandboxing.md. Refuses to run without a "
                 "matching auth token; never falls back to running code "
                 "unsandboxed."
             ),

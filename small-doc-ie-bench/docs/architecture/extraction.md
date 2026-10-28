@@ -131,6 +131,45 @@ sequential rather than guessing a width.
 
 A group failing fails the whole extraction. There is no partial result.
 
+## Routing policies
+
+A routing policy runs an extraction through a cascade of models instead of
+one: a cheap model first, a stronger one only when the first result is not
+good enough. `ExtractionRouter` (`extract/routing.py`) wraps ordinary
+extraction services, so a single-stage call is unchanged by its existence.
+
+A policy is a list of stages and a budget. Each stage names a model profile,
+optionally a selector, and ordered rules:
+
+```yaml
+version: "2026-06"
+stages:
+  - name: fast
+    rules:
+      - when: {status: success, validation_valid: true, min_confidence: 0.85}
+        decision: accept
+        reason: fast model passed the quality gate
+  - name: accurate
+    rules:
+      - when: {status: success, validation_valid: true}
+        decision: accept
+        reason: fallback model returned a valid extraction
+budget: {max_stages: 2, max_total_tokens: 4096, max_latency_ms: 30000}
+```
+
+The first matching rule decides: `accept`, `fallback` to the next stage,
+`escalate`, or `fail`. A stage with no matching rule falls back. A **selector**
+decides whether a stage runs at all, from the request — file type, language,
+OCR confidence, page and block counts, caller-supplied metadata — or from the
+previous stage's outcome. The budget caps stages, requests, latency, tokens and
+cost across the whole cascade.
+
+The response carries a `routing` audit: every stage's output, attempt and
+decision, the stages skipped, the budget spent, and the terminal outcome.
+Policies are saved through the Studio or `/v1/studio/routing-policies` and
+selected per request with `routing_policy`, which excludes naming a single
+model. `configs/routing-policy.example.yaml` is a runnable CPU cascade.
+
 ## Failure modes
 
 The gateway classifies errors rather than treating them alike:
