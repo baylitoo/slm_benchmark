@@ -23,40 +23,53 @@ const isContainer = (field: DynamicFieldSpec) => field.type === "object" || fiel
 export const RESUME_SCHEMA: DynamicSchemaSpec = {
   document_type: "adbi_resume",
   fields: [
-    { name: "name", type: "string", description: "Candidate's full name as printed." },
-    { name: "title", type: "string", description: "Current job title or headline shown under the name." },
-    { name: "years_experience", type: "string", description: "A total number of years of experience only when the CV literally states one. null otherwise; never compute it, never copy dates or job lines." },
+    { name: "name", type: "string" },
+    { name: "title", type: "string", description: "Intitule de poste affiche en tete du CV, pas l'intitule d'une mission particuliere" },
+    { name: "years_experience", type: "number", description: "Nombre total d'annees d'experience professionnelle, en chiffres" },
     { name: "contact", type: "object", fields: [
-      { name: "email", type: "string" }, { name: "phone", type: "string" },
-      { name: "linkedin", type: "string" }, { name: "github", type: "string" },
-      { name: "location", type: "string", description: "Candidate's city / country from the header." },
+      { name: "email", type: "string" },
+      { name: "phone", type: "string" },
+      { name: "linkedin", type: "string" },
+      { name: "github", type: "string" },
+      { name: "location", type: "string", description: "Ville de residence du candidat, pas le lieu d'une mission" },
     ] },
-    { name: "experience", type: "list", description: "Professional positions only (jobs, internships, freelance). Never degrees or education entries.", fields: [
-      { name: "company", type: "string", description: "Employer name as written." },
-      { name: "title", type: "string", description: "Job title held in this position." },
-      { name: "start_date", type: "date", description: "Start of this position, YYYY-MM or YYYY. A single date, never a range." },
-      { name: "end_date", type: "date", description: "End of this position, YYYY-MM or YYYY. null when current (Aujourd'hui, present)." },
-      { name: "location", type: "string", description: "City written next to this position. null if not stated." },
-      { name: "description", type: "string", description: "Complete responsibilities and achievements for this experience, including text spanning multiple lines." },
-      { name: "env_technique", type: "string", description: "Stack technique / environnement technologique listed under this position only. null when this position lists none." },
+    { name: "experience", type: "list", fields: [
+      { name: "company", type: "string", description: "Employeur qui salarie ou porte le consultant sur cette mission, pas le client final" },
+      { name: "end_client", type: "string", description: "Client final chez qui la mission a ete realisee, quand le CV le nomme, distinct de l'employeur" },
+      { name: "via", type: "string", description: "Societe intermediaire par laquelle la mission a ete realisee, quand le CV en nomme une, distincte du client final et de l'employeur" },
+      { name: "title", type: "string", description: "Role tenu sur cette mission, pas l'intitule de poste affiche en tete du CV" },
+      { name: "start_date", type: "date", description: "Date de debut de cette mission" },
+      { name: "end_date", type: "date", description: "Date de fin de cette mission, vide si la mission est en cours" },
+      { name: "location", type: "string", description: "Lieu ou cette mission a ete realisee, pas la ville de residence du candidat" },
+      { name: "context", type: "string", description: "Contexte de la mission en une ou deux phrases (projet, enjeu, client), sans les realisations ni la stack" },
+      { name: "achievements", type: "list", description: "Realisations ou taches de la mission, une par entree, recopiees telles qu'ecrites : une puce du CV = une entree", fields: [
+        { name: "achievement", type: "string" },
+      ] },
+      { name: "env_technique", type: "string", description: "Technologies et outils de la mission, separes par des virgules, sans phrase" },
     ] },
-    { name: "education", type: "list", description: "Degrees and diplomas only. Never work positions.", fields: [
-      { name: "degree", type: "string" }, { name: "institution", type: "string" },
-      { name: "year", type: "string", description: "Graduation year, YYYY." },
-    ] },
-    { name: "skills", type: "list", description: "Technical skill groups only (programming languages, frameworks, tools, methods). Exclude spoken languages and hobbies.", fields: [
-      { name: "category", type: "string", description: "Skill group heading exactly as written in the document." },
-      { name: "items", type: "list", fields: [{ name: "item", type: "string" }] },
-    ] },
-    { name: "languages", type: "list", description: "Spoken / natural languages only, from the languages section. Never programming languages.", fields: [
-      { name: "language", type: "string" },
-      { name: "level", type: "string", description: "Proficiency level exactly as written. null if absent." },
-    ] },
-    { name: "certifications", type: "list", description: "Certifications explicitly listed. [] when the CV has none.", fields: [
-      { name: "name", type: "string" }, { name: "issuer", type: "string" },
+    { name: "education", type: "list", fields: [
+      { name: "degree", type: "string" },
+      { name: "institution", type: "string" },
       { name: "year", type: "string" },
     ] },
-    { name: "interests", type: "list", description: "Hobbies from a Centres d'interet / Loisirs section only. [] when the CV has none. Never skills, tools or languages.", fields: [{ name: "interest", type: "string" }] },
+    { name: "skills", type: "list", fields: [
+      { name: "category", type: "string" },
+      { name: "items", type: "list", fields: [
+        { name: "item", type: "string" },
+      ] },
+    ] },
+    { name: "languages", type: "list", fields: [
+      { name: "language", type: "string" },
+      { name: "level", type: "string", description: "Niveau declare pour cette langue, recopie tel qu'imprime" },
+    ] },
+    { name: "certifications", type: "list", fields: [
+      { name: "name", type: "string" },
+      { name: "issuer", type: "string" },
+      { name: "year", type: "string" },
+    ] },
+    { name: "interests", type: "list", fields: [
+      { name: "interest", type: "string" },
+    ] },
   ],
 };
 
