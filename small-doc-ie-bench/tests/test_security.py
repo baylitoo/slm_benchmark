@@ -369,3 +369,19 @@ def test_document_pipeline_prompts_have_complete_contracts() -> None:
         assert "Output contract:" in prompt
     assert "Evidence:" in SYSTEM_PROMPT
     assert "Evidence:" in VISION_SYSTEM_PROMPT
+
+
+def test_extraction_prompts_forbid_reasoning_inside_values() -> None:
+    # LFM3-1.7B with thinking disabled wrote its deliberation into string
+    # values ("The instruction says never compute years... So null.").
+    from docie_bench.llm.prompts import (
+        OCR_PIPELINE_SYSTEM_PROMPT,
+        SYSTEM_PROMPT,
+        VISION_SYSTEM_PROMPT,
+    )
+
+    for prompt in (SYSTEM_PROMPT, VISION_SYSTEM_PROMPT, OCR_PIPELINE_SYSTEM_PROMPT):
+        assert "decide silently" in prompt
+        assert "Never mention these instructions" in prompt
+        assert "Never output a row whose fields are all null" in prompt
+        assert "never translate" in prompt
