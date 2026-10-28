@@ -37,6 +37,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+from filelock import FileLock, Timeout
 
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 from docie_bench.serving.storage_backend import (
@@ -44,6 +47,9 @@ from docie_bench.serving.storage_backend import (
     StorageBackend,
     StorageBackendError,
 )
+
+INDEX_LOCK_NAME = ".index.lock"
+"""Guards the index's read-modify-write; lives in the store root."""
 
 
 class TemplateDelivery(StrEnum):
@@ -622,6 +628,13 @@ class ModelStore:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._index_path = self.root / "index.json"
+        # Cross-PROCESS, because the two writers are two processes: a node's
+        # seed job and an operator running `store add-gguf` / `store publish`,
+        # which the fleet runbook asks for. Unlike the supervisor's state file
+        # there is no single-writer contract to lean on. Singleton so the
+        # nested acquire inside the read-modify-write reuses this instance's
+        # counter instead of blocking on itself.
+        self._lock = FileLock(self.root / INDEX_LOCK_NAME, timeout=60, is_singleton=True)
         # Hardcoded in stage 1 of #595: the seam exists, the choice does not.
         # The parameter is here so a test can inject a double and so stage 2
         # can wire a remote backend without touching every construction site.
@@ -939,43 +952,83 @@ class ModelStore:
         return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------------ private
+    @contextmanager
+    def _index_lock(self) -> Iterator[None]:
+        try:
+            with self._lock:
+                yield
+        except Timeout as exc:
+            raise ModelStoreError(
+                f"Timed out waiting for the store index lock "
+                f"{self.root / INDEX_LOCK_NAME}. Another seed or `store` command "
+                f"is holding it; wait for it to finish or stop it."
+            ) from exc
+
     def _read_index(self) -> dict[str, Any]:
-        if not self._index_path.is_file():
-            return {}
-        data = json.loads(self._index_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ModelStoreError(f"Corrupt store index: {self._index_path}")
-        return data
+        with self._index_lock():
+            if not self._index_path.is_file():
+                return {}
+            try:
+                data = json.loads(self._index_path.read_text(encoding="utf-8"))
+            except ValueError as exc:
+                # Raise, never fall back to {}. The index is the only record
+                # that root/<name> holds a usable model, so reading a damaged
+                # one as "this node holds nothing" would re-download every
+                # model while the weights sit on disk unreferenced.
+                raise ModelStoreError(
+                    f"Corrupt store index: {self._index_path} ({exc}). The model "
+                    f"directories beside it are untouched -- move the index aside "
+                    f"and re-register them, or restore it from a backup."
+                ) from exc
+            if not isinstance(data, dict):
+                raise ModelStoreError(f"Corrupt store index: {self._index_path}")
+            return data
 
     def _write_entry(self, entry: StoreEntry) -> None:
-        index = self._read_index()
-        # A NEW name: the blob transfer just created root/name and this is the
-        # first index reference to it. If the index write then crashes, that dir
-        # is an orphan (no index key) -> clean it up so no partial state remains.
-        # An EXISTING name (re-seed): the on-disk index already references
-        # root/name; _write_index is atomic (temp + replace), so a failure leaves
-        # the OLD index entry intact and still pointing at root/name. Deleting the
-        # dir there would create a dangling reference — exactly the state this
-        # store avoids — so only orphan-clean the fresh-seed case.
-        is_new = entry.name not in index
-        index[entry.name] = entry.to_json()
-        try:
-            self._write_index(index)
-        except BaseException:
-            if is_new:
-                destination = _assert_within(
-                    self.root / entry.name, self.root, label=f"store name {entry.name!r}"
-                )
-                shutil.rmtree(destination, ignore_errors=True)
-            raise
+        with self._index_lock():
+            index = self._read_index()
+            # A NEW name: the blob transfer just created root/name and this is the
+            # first index reference to it. If the index write then crashes, that dir
+            # is an orphan (no index key) -> clean it up so no partial state remains.
+            # An EXISTING name (re-seed): the on-disk index already references
+            # root/name; _write_index is atomic (temp + replace), so a failure leaves
+            # the OLD index entry intact and still pointing at root/name. Deleting the
+            # dir there would create a dangling reference — exactly the state this
+            # store avoids — so only orphan-clean the fresh-seed case.
+            is_new = entry.name not in index
+            index[entry.name] = entry.to_json()
+            try:
+                self._write_index(index)
+            except BaseException:
+                if is_new:
+                    destination = _assert_within(
+                        self.root / entry.name, self.root, label=f"store name {entry.name!r}"
+                    )
+                    shutil.rmtree(destination, ignore_errors=True)
+                raise
 
     def _write_index(self, index: dict[str, Any]) -> None:
-        temporary = self._index_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(index, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self._index_path)
+        """Stage, fsync, rename -- as ``PersistentSupervisor._save`` does.
+
+        ``os.replace`` is atomic with respect to the name, not the contents, so
+        without the fsync a power loss can land the rename while the payload is
+        still buffered. The per-write temp name keeps a second writer from
+        staging onto the same path if it ever runs without the lock.
+        """
+        with self._index_lock():
+            payload = json.dumps(index, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            temporary = self._index_path.with_name(
+                f".{self._index_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+            )
+            try:
+                with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self._index_path)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
 
     def remove_entry(self, name: str) -> None:
         """Remove store entry ``name``: drop its index key, then delete its dir.
@@ -989,10 +1042,11 @@ class ModelStore:
         ``root/name`` and that one index key, never a pre-existing unrelated entry.
         """
         destination = _assert_within(self.root / name, self.root, label=f"store name {name!r}")
-        index = self._read_index()
-        if name in index:
-            del index[name]
-            self._write_index(index)
+        with self._index_lock():
+            index = self._read_index()
+            if name in index:
+                del index[name]
+                self._write_index(index)
         shutil.rmtree(destination, ignore_errors=True)
 
 

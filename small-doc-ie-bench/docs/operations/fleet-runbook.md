@@ -90,6 +90,11 @@ throughout.
 
    `docie-serving doctor` lists which catalogued models this node is missing.
 
+   Store writes on a node serialise on a lock in the store root
+   (`.index.lock`), so a `store` command run by hand and a seed job landing
+   at the same time cannot lose each other's registration. A `store`
+   command that reports a lock timeout is waiting on one of those.
+
 ### What a node actually needs
 
 Three things, and nothing else:
@@ -247,6 +252,7 @@ leaves that model's requests going to a machine that is off.
 | A node's replica holds RAM but takes no traffic | Duplicate node id: another node's publish overwrote its placement row. |
 | Every deploy on a node fails to allocate a port | Something outside the container holds the published window. |
 | A node flaps between reporting and not | Clock skew between it and the central API, or a reconcile interval longer than the staleness window. |
+| A `store` command exits on a store index lock timeout | A seed job or another `store` command on that node still holds `.index.lock`. Wait for it, or look for a stuck seed. |
 
 Logs are node-local. `docker compose -f docker-compose.serving-node.yml logs -f
 serving` on the machine itself; there is no central log aggregation, and a
