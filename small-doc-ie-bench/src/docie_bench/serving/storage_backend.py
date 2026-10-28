@@ -249,8 +249,24 @@ class LocalDiskBackend:
         staging = destination.with_name(destination.name + ".tmp")
         superseded = destination.with_name(destination.name + ".superseded")
         try:
+            # CRASH RECOVERY, before any cleanup.
+            #
+            # A superseded copy with no canonical directory beside it is not
+            # debris: it is the only copy of the model, left by a process that
+            # died between the rename-aside and the publish, so no exception
+            # handler ever ran. Clearing it as debris and then failing the new
+            # transfer loses the model outright -- both copies gone.
+            #
+            # Exception rollback does not cover this. The handler below restores
+            # the old tree when os.replace RAISES; a crash has no handler, and
+            # the evidence it leaves is exactly this directory.
+            if superseded.exists() and not destination.exists():
+                os.replace(superseded, destination)
             if staging.exists():
                 shutil.rmtree(staging)
+            # Only now is a superseded copy genuinely stale: the canonical
+            # directory exists beside it, so a previous publish completed and
+            # only its cleanup was interrupted.
             if superseded.exists():
                 shutil.rmtree(superseded)
             for file in sorted(p for p in source_dir.rglob("*") if p.is_file()):

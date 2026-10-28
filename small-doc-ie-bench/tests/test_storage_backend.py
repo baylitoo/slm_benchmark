@@ -15,6 +15,7 @@ key in stage 2 it would have been badly wrong.
 from __future__ import annotations
 
 import hashlib
+import shutil
 from pathlib import Path
 
 import pytest
@@ -379,25 +380,95 @@ def test_a_failed_replace_leaves_no_debris(
     assert sorted(p.name for p in parent.iterdir()) == ["snapshot"]
 
 
-def test_debris_from_an_earlier_crash_does_not_poison_the_next_publish(
+def test_stale_debris_beside_a_published_tree_does_not_poison_the_next_publish(
     tmp_path: Path,
 ) -> None:
-    """A process killed mid-publish can leave both temporaries behind. The
-    next attempt must start clean rather than merging them in."""
+    """Staging debris and a superseded copy LEFT BESIDE a published tree are
+    both stale: the publish completed and only the cleanup was interrupted."""
     backend = LocalDiskBackend(tmp_path / "store")
+    source = tmp_path / "v1"
+    source.mkdir()
+    (source / "model.safetensors").write_bytes(b"v1")
+    backend.write_tree(source, "gliner/snapshot", link=True)
     published = backend.resolve_local_dir("gliner/snapshot")
-    published.parent.mkdir(parents=True, exist_ok=True)
     (published.parent / "snapshot.tmp").mkdir()
     (published.parent / "snapshot.tmp" / "stale.bin").write_bytes(b"old")
     (published.parent / "snapshot.superseded").mkdir()
     (published.parent / "snapshot.superseded" / "older.bin").write_bytes(b"older")
 
+    second = tmp_path / "v2"
+    second.mkdir()
+    (second / "model.safetensors").write_bytes(b"v2")
+    backend.write_tree(second, "gliner/snapshot", link=True)
+
+    assert sorted(p.name for p in published.iterdir()) == ["model.safetensors"]
+    assert (published / "model.safetensors").read_bytes() == b"v2"
+    assert sorted(p.name for p in published.parent.iterdir()) == ["snapshot"]
+
+
+def test_a_crash_between_the_rename_aside_and_the_publish_keeps_the_model(
+    tmp_path: Path,
+) -> None:
+    """The gap exception rollback does not cover.
+
+    The handler restores the old tree when ``os.replace`` RAISES. A process
+    that DIES between the rename-aside and the publish runs no handler, and
+    leaves the only copy of the model in ``snapshot.superseded`` with no
+    canonical directory beside it. Clearing that as debris and then failing the
+    new transfer lost the model outright -- reproduced before this fix: both
+    copies gone.
+    """
+    backend = LocalDiskBackend(tmp_path / "store")
+    source = tmp_path / "v1"
+    source.mkdir()
+    (source / "model.safetensors").write_bytes(b"v1-the-working-model")
+    backend.write_tree(source, "gliner/snapshot", link=True)
+    published = backend.resolve_local_dir("gliner/snapshot")
+
+    # The crash state, built by hand: renamed aside, never published.
+    superseded = published.with_name(published.name + ".superseded")
+    shutil.move(str(published), str(superseded))
+    assert not published.exists()
+
+    # Restart, and the next attempt's transfer fails.
+    second = tmp_path / "v2"
+    second.mkdir()
+    (second / "model.safetensors").write_bytes(b"v2")
+    import docie_bench.serving.storage_backend as module
+
+    def failing_transfer(src: object, dst: object, *, link: bool) -> None:
+        raise OSError("disk full mid-transfer")
+
+    real = module._transfer
+    module._transfer = failing_transfer  # type: ignore[assignment]
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            backend.write_tree(second, "gliner/snapshot", link=True)
+    finally:
+        module._transfer = real  # type: ignore[assignment]
+
+    assert published.is_dir(), "the crash survivor was deleted as debris"
+    assert (published / "model.safetensors").read_bytes() == b"v1-the-working-model"
+
+
+def test_a_crash_survivor_is_recovered_then_properly_replaced(
+    tmp_path: Path,
+) -> None:
+    """Recovery must not block the publish it was holding the fort for."""
+    backend = LocalDiskBackend(tmp_path / "store")
     source = tmp_path / "v1"
     source.mkdir()
     (source / "model.safetensors").write_bytes(b"v1")
     backend.write_tree(source, "gliner/snapshot", link=True)
+    published = backend.resolve_local_dir("gliner/snapshot")
+    shutil.move(str(published), str(published.with_name(published.name + ".superseded")))
 
-    assert sorted(p.name for p in published.iterdir()) == ["model.safetensors"]
+    second = tmp_path / "v2"
+    second.mkdir()
+    (second / "model.safetensors").write_bytes(b"v2")
+    backend.write_tree(second, "gliner/snapshot", link=True)
+
+    assert (published / "model.safetensors").read_bytes() == b"v2"
     assert sorted(p.name for p in published.parent.iterdir()) == ["snapshot"]
 
 
