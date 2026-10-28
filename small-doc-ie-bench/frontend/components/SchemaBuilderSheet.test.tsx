@@ -155,6 +155,28 @@ it("edits nested objects and lists without flattening their item structure", asy
   ] });
 });
 
+it("reorders a nested field in place, keeping its description and children", async () => {
+  updateDynamicSchema.mockResolvedValue({ name: "adbi_resume" });
+  const initialSpec = { document_type: "adbi_resume", fields: [{ name: "experience", type: "list" as const, fields: [
+    { name: "env_technique", type: "string" as const, description: "Technologies" },
+    { name: "context", type: "string" as const },
+    { name: "achievements", type: "list" as const, fields: [{ name: "achievement", type: "string" as const }] },
+  ] }] };
+  render(<SchemaBuilderSheet open initialSpec={initialSpec} editName="adbi_resume" onClose={vi.fn()} onCreated={vi.fn()} />);
+  expect(screen.getByRole("button", { name: "Move experience up" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Move experience.achievements down" })).toBeDisabled();
+  await userEvent.click(screen.getByRole("button", { name: "Move experience.env_technique down" }));
+  await userEvent.click(screen.getByRole("button", { name: "Move experience.env_technique down" }));
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  expect(updateDynamicSchema).toHaveBeenCalledWith("adbi_resume", { document_type: "adbi_resume", fields: [
+    { name: "experience", type: "list", fields: [
+      { name: "context", type: "string" },
+      { name: "achievements", type: "list", fields: [{ name: "achievement", type: "string" }] },
+      { name: "env_technique", type: "string", description: "Technologies" },
+    ] },
+  ] });
+});
+
 it("rejects duplicate names inside a nested item", async () => {
   createDynamicSchema.mockClear();
   render(<SchemaBuilderSheet open onClose={vi.fn()} onCreated={vi.fn()} initialSpec={{

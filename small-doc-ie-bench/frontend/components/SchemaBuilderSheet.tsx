@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
 import {
   createDynamicSchema, updateDynamicSchema,
   type DynamicFieldSpec, type DynamicFieldType, type DynamicSchemaSpec,
@@ -118,6 +118,11 @@ function FieldEditor({ fields, onChange, path = "", depth = 0 }: {
   const { t } = useI18n();
   const patch = (index: number, change: Partial<DynamicFieldSpec>) =>
     onChange(fields.map((field, i) => i === index ? { ...field, ...change } : field));
+  const move = (index: number, offset: -1 | 1) => {
+    const next = [...fields];
+    [next[index], next[index + offset]] = [next[index + offset], next[index]];
+    onChange(next);
+  };
   return <div className="space-y-3">
     {fields.map((field, index) => {
       const fieldPath = [path, field.name || `field ${index + 1}`].filter(Boolean).join(".");
@@ -134,6 +139,14 @@ function FieldEditor({ fields, onChange, path = "", depth = 0 }: {
             }}>
             {TYPES.map(({ value, label }) => <option key={value} value={value}>{t(label)}</option>)}
           </Select>
+          <button type="button" disabled={index === 0} onClick={() => move(index, -1)}
+            className="text-muted-foreground hover:text-foreground disabled:opacity-30" aria-label={`Move ${fieldPath} up`}>
+            <ArrowUp className="h-4 w-4" />
+          </button>
+          <button type="button" disabled={index === fields.length - 1} onClick={() => move(index, 1)}
+            className="text-muted-foreground hover:text-foreground disabled:opacity-30" aria-label={`Move ${fieldPath} down`}>
+            <ArrowDown className="h-4 w-4" />
+          </button>
           <button type="button" onClick={() => onChange(fields.filter((_, i) => i !== index))}
             className="text-muted-foreground hover:text-red-500" aria-label={`Remove ${fieldPath}`}>
             <Trash2 className="h-4 w-4" />
