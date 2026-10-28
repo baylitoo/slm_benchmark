@@ -13,6 +13,29 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _ENV_FILE = None if os.environ.get("DOCIE_IGNORE_ENV_FILE") == "1" else ".env"
 
 
+_SIZE_SUFFIXES = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+
+
+def _parse_size_bytes(value: str) -> int:
+    """A byte count or a ``k``/``m``/``g``/``t``-suffixed size; 0 if unusable.
+
+    Mirrors how an operator already writes ``mem_limit: 8g`` in the compose
+    file, so the soft budget beside it does not need different units.
+    """
+    text = str(value or "").strip().lower().removesuffix("ib").removesuffix("b")
+    if not text:
+        return 0
+    multiplier = 1
+    if text[-1] in _SIZE_SUFFIXES:
+        multiplier = _SIZE_SUFFIXES[text[-1]]
+        text = text[:-1].strip()
+    try:
+        parsed = float(text)
+    except ValueError:
+        return 0
+    return int(parsed * multiplier) if parsed > 0 else 0
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_ENV_FILE, extra="ignore", case_sensitive=False)
 
@@ -259,6 +282,20 @@ class Settings(BaseSettings):
     # in the API/UI, never a hidden fudge factor. Design doc §3 brackets it at
     # 10-15%; default the low end. DOCIE_-prefixed alias mirrors the other
     # serving knobs.
+    # DocIE's own share of a SHARED host (#539). The serving nodes run other
+    # applications too, so free host RAM is not DocIE's to take: whatever is
+    # free now belongs to whichever co-tenant asks for it next. Accepts a byte
+    # count or a size suffix ("6g", "6144m"); empty disables.
+    #
+    # This is the soft budget, enforced by DocIE's own admission. The hard
+    # ceiling stays `mem_limit` (cgroup memory.max), which is what stops a
+    # DocIE bug from eating a neighbour's memory. Admission sizes against
+    # min(budget, cgroup free).
+    serving_mem_budget: str = Field(
+        default="",
+        validation_alias=AliasChoices("DOCIE_SERVING_MEM_BUDGET", "serving_mem_budget"),
+    )
+
     serving_sizing_margin_fraction: float = Field(
         default=0.10,
         ge=0.0,
@@ -331,6 +368,16 @@ class Settings(BaseSettings):
     openai_compat_response_format_style: str = "openai_json_schema"
 
     prometheus_multiproc_dir: str | None = None
+
+    @property
+    def serving_mem_budget_bytes(self) -> int:
+        """``serving_mem_budget`` in bytes; 0 when unset or unparseable.
+
+        Unparseable reads as unset rather than raising: a typo in an optional
+        knob must not stop a node from serving. It is surfaced by the doctor's
+        sizing view instead, where an operator will see the budget missing.
+        """
+        return _parse_size_bytes(self.serving_mem_budget)
 
     @property
     def max_upload_bytes(self) -> int:

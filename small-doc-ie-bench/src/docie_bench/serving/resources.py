@@ -56,7 +56,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -178,6 +178,21 @@ class NodeMemory:
     free_bytes: int
     source: str  # "cgroup" (authoritative limit) | "vm" (soft: VM/host view)
     reclaimable_bytes: int = 0  # inactive_file page cache excluded from "used"
+    #: The operator's soft budget, when one applied to this reading (#539).
+    #: ``source`` still says whether the ceiling is kernel-enforced, so a
+    #: ``"vm"`` reading with a budget is DocIE's own restraint on a host it
+    #: does not control -- not a limit anything else will honour.
+    budget_bytes: int | None = None
+    #: This container's working set, kept even when ``free_bytes`` clamps to 0,
+    #: so an over-budget node can say BY HOW MUCH instead of just "full".
+    working_set_bytes: int | None = None
+
+    @property
+    def over_budget_bytes(self) -> int:
+        """How far past the budget this node's working set already is."""
+        if self.budget_bytes is None or self.working_set_bytes is None:
+            return 0
+        return max(self.working_set_bytes - self.budget_bytes, 0)
 
 
 def _read_inactive_file_bytes(root: Path) -> int:
@@ -225,6 +240,32 @@ def read_cgroup_memory(root: Path = CGROUP_V2_ROOT) -> NodeMemory | None:
     adjustment is flagged in the reading (``reclaimable_bytes``) so the
     published snapshot can say the number is reclaim-adjusted.
     """
+    limit = read_cgroup_limit(root)
+    if limit is None:
+        return None
+    # An unreadable memory.current reads as 0 used rather than discarding an
+    # authoritative limit -- the documented contract above. The BUDGET path in
+    # read_node_memory is deliberately stricter: with no kernel ceiling, an
+    # unmeasurable working set means the budget cannot be exact, so it falls
+    # back to capping the VM reading instead of inventing 0 usage.
+    measured = read_cgroup_working_set(root)
+    working_set, reclaimable = measured if measured is not None else (0, 0)
+    return NodeMemory(
+        total_bytes=limit,
+        free_bytes=max(limit - working_set, 0),
+        source="cgroup",
+        reclaimable_bytes=reclaimable,
+        working_set_bytes=working_set,
+    )
+
+
+def read_cgroup_limit(root: Path = CGROUP_V2_ROOT) -> int | None:
+    """``memory.max`` as a usable ceiling, or ``None``.
+
+    ``None`` covers both "no cgroup-v2 files" and the ``max`` sentinel, which
+    for a CEILING are the same answer: there is no kernel-enforced number to
+    size against.
+    """
     try:
         raw_limit = (root / "memory.max").read_text(encoding="ascii").strip()
     except (OSError, UnicodeDecodeError):
@@ -235,21 +276,31 @@ def read_cgroup_memory(root: Path = CGROUP_V2_ROOT) -> NodeMemory | None:
         total = int(raw_limit)
     except ValueError:
         return None
-    if total <= 0:
-        return None
+    return total if total > 0 else None
+
+
+def read_cgroup_working_set(root: Path = CGROUP_V2_ROOT) -> tuple[int, int] | None:
+    """``(working_set, reclaimable)`` for THIS container, or ``None``.
+
+    Split out from :func:`read_cgroup_memory` because the two halves fail
+    independently, and #539 needs exactly that: a shared host often runs the
+    container with no ``memory.max`` at all, and the old code returned ``None``
+    for the whole reading on the sentinel -- before it ever looked at
+    ``memory.current``. The ceiling was missing; the container's own usage was
+    readable the entire time.
+
+    That is what lets a soft budget be EXACT rather than a cap: with a budget
+    supplying the ceiling and ``memory.current`` supplying the usage, a node
+    with no kernel limit gets a real denominator instead of a host-wide VM
+    reading that "says nothing about what THIS container may use".
+    """
     try:
         current = int((root / "memory.current").read_text(encoding="ascii").strip())
     except (OSError, ValueError, UnicodeDecodeError):
-        current = 0
+        return None
     # Never subtract more than what is actually accounted as used.
     reclaimable = min(_read_inactive_file_bytes(root), max(current, 0))
-    working_set = max(current - reclaimable, 0)
-    return NodeMemory(
-        total_bytes=total,
-        free_bytes=max(total - working_set, 0),
-        source="cgroup",
-        reclaimable_bytes=reclaimable,
-    )
+    return max(current - reclaimable, 0), reclaimable
 
 
 def read_vm_memory() -> NodeMemory:
@@ -268,16 +319,89 @@ def read_vm_memory() -> NodeMemory:
     )
 
 
+def configured_budget_bytes() -> int | None:
+    """The operator's soft budget for this node, or ``None`` (#539)."""
+    from docie_bench.settings import get_settings
+
+    try:
+        value = int(get_settings().serving_mem_budget_bytes)
+    except Exception:  # noqa: BLE001 - an unreadable knob must not break sizing
+        return None
+    return value if value > 0 else None
+
+
 def read_node_memory(
     *,
     cgroup_root: Path = CGROUP_V2_ROOT,
     vm_reader: Callable[[], NodeMemory] = read_vm_memory,
+    budget_bytes: int | None = None,
 ) -> NodeMemory:
-    """cgroup-v2-first node memory; VM fallback is flagged, never silent."""
+    """cgroup-v2-first node memory; VM fallback is flagged, never silent.
+
+    With a soft budget (#539) the ceiling becomes ``min(cgroup limit, budget)``
+    -- and the budget alone when there is no cgroup limit, which on a shared
+    host is the only safe denominator: free host RAM belongs to whichever
+    co-tenant asks for it next, so sizing against it admits a model into memory
+    another application is about to need and lets the OOM killer pick the loser.
+
+    Three cases, only the last inexact:
+
+    * a cgroup limit, budget or not -- exact, kernel-enforced.
+    * no cgroup limit but a readable ``memory.current``, with a budget -- exact,
+      enforced by DocIE alone, so it stays ``source="vm"``.
+    * no cgroup files at all (a bare dev host) -- the VM reading CAPPED at the
+      budget. Inexact: a host-wide "used" includes co-tenants and cannot be
+      subtracted from DocIE's own allowance, so this bounds the denominator
+      without tracking DocIE's share.
+    """
+    budget = budget_bytes if budget_bytes is not None else configured_budget_bytes()
+
+    # 1. A kernel-enforced ceiling. Delegated, so its documented degradation
+    #    (an unreadable memory.current reads as 0 used rather than throwing
+    #    away an authoritative limit) stays in one place.
     reading = read_cgroup_memory(cgroup_root)
     if reading is not None:
+        if budget is None or budget >= reading.total_bytes:
+            # A budget at or above the hard ceiling changes no number, but it
+            # is still recorded so the Studio can show what was asked for.
+            return replace(reading, budget_bytes=budget)
+        working_set = reading.working_set_bytes or 0
+        return replace(
+            reading,
+            total_bytes=budget,
+            free_bytes=max(budget - working_set, 0),
+            budget_bytes=budget,
+        )
+
+    # 2. No ceiling, but this container's own usage is readable and a budget
+    #    supplies the missing denominator. Exact, and the case that matters on
+    #    a shared host. Stays "vm": nothing but DocIE enforces it.
+    if budget is not None:
+        measured = read_cgroup_working_set(cgroup_root)
+        if measured is not None:
+            working_set, reclaimable = measured
+            return NodeMemory(
+                total_bytes=budget,
+                free_bytes=max(budget - working_set, 0),
+                source="vm",
+                reclaimable_bytes=reclaimable,
+                budget_bytes=budget,
+                working_set_bytes=working_set,
+            )
+
+    # 3. No cgroup files at all. The VM reading, capped: a host-wide "used"
+    #    counts co-tenants and cannot be subtracted from DocIE's own
+    #    allowance, so the budget bounds the denominator without pretending to
+    #    know DocIE's share.
+    reading = vm_reader()
+    if budget is None:
         return reading
-    return vm_reader()
+    return replace(
+        reading,
+        total_bytes=min(reading.total_bytes, budget),
+        free_bytes=min(reading.free_bytes, budget),
+        budget_bytes=budget,
+    )
 
 
 # ---------------------------------------------------------- per-process RSS
