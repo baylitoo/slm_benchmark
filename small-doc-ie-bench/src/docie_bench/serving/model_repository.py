@@ -279,7 +279,25 @@ class ModelRepository:
                 continue
             if progress is not None:
                 progress(entry.path, 0, entry.size_bytes)
-            self._store.upload(local_for(files, entry.path), key)
+            source_path = local_for(files, entry.path)
+            self._store.upload(source_path, key)
+            # The digest was taken BEFORE this loop, so the bytes that just
+            # landed under a content-addressed key are not yet provably the
+            # bytes that key names. A source rewritten in between -- a
+            # concurrent re-seed of the same store entry is the realistic one
+            # -- uploads cleanly and publishes a manifest every consumer then
+            # refuses, because the object holds the wrong content under the
+            # right name. Re-read the source and refuse BEFORE the pointer
+            # moves, so the fleet never pins a build that cannot be fetched.
+            settled, _ = sha256_file(source_path)
+            if settled != entry.digest:
+                raise ModelRepositoryError(
+                    f"{source_path} changed while it was being published: it "
+                    f"hashed to {entry.digest} before the upload and {settled} "
+                    f"after, so the object now at {key} is not the bytes that "
+                    f"key names. Nothing points at it -- remove that object, "
+                    f"then publish again from a source nothing else is writing."
+                )
             uploaded.append(entry.path)
             if progress is not None:
                 progress(entry.path, entry.size_bytes, entry.size_bytes)

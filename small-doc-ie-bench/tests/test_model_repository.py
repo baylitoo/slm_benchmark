@@ -715,3 +715,48 @@ def test_a_blob_deleted_under_a_published_model_is_restored_and_reported(
     assert second.uploaded == (manifest.files[0].path,)
     assert second.already_complete is False  # it had to repair something
     assert missing.is_file()
+
+def test_a_source_rewritten_mid_publication_is_refused_before_the_pointer_moves(
+    repo: ModelRepository, local: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The window between hashing a file and uploading it.
+
+    The digest is taken before the upload loop, so a source rewritten in
+    between -- a concurrent re-seed of the same store entry is the realistic
+    one -- uploaded cleanly under a key naming the OLD bytes. Publication
+    reported success, the pointer advanced, and every consumer then refused the
+    manifest: the object holds the wrong content under the right name, which is
+    exactly the guarantee content addressing exists to provide.
+
+    The store index lock does not cover this; it serialises index writes, not
+    the hash/upload interval.
+    """
+    model, _mmproj = local
+
+    def rewrite(path: str, done: int, total: int) -> None:
+        if path == "model.gguf" and done == 0:
+            model.write_bytes(b"rewritten-under-the-publisher")
+
+    with pytest.raises(ModelRepositoryError, match="changed while it was being published"):
+        repo.publish(
+            name="nuextract3",
+            family="nuextract3",
+            kind="gguf",
+            files=[("model", "model.gguf", model)],
+            progress=rewrite,
+        )
+
+    with pytest.raises(ObjectNotFoundError):
+        repo.resolve("nuextract3")
+
+
+def test_an_unchanged_source_publishes_without_the_extra_check_firing(
+    repo: ModelRepository, local: tuple[Path, Path]
+) -> None:
+    """The guard must not refuse honest publications -- the re-read has to
+    agree with the pre-upload digest for every ordinary publish."""
+    result = _publish(repo, local)
+
+    assert repo.resolve("nuextract3") == result.manifest_digest
+    assert sorted(result.uploaded) == ["mmproj.gguf", "model.gguf"]
+
