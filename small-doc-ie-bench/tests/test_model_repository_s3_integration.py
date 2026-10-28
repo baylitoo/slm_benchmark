@@ -14,16 +14,20 @@ real bucket would have it create and delete objects there.
 
 To run it::
 
-    docker compose --profile minio up -d minio
-    export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9000
+    docker compose --profile s3mock up -d s3mock
+    export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9090
     export DOCIE_TEST_S3_BUCKET=docie-test
-    export AWS_ACCESS_KEY_ID=docieminio
-    export AWS_SECRET_ACCESS_KEY=docieminio
+    export AWS_ACCESS_KEY_ID=test
+    export AWS_SECRET_ACCESS_KEY=test
     export AWS_DEFAULT_REGION=us-east-1
     pytest tests/test_model_repository_s3_integration.py -v
 
 No production bucket or credentials are needed; the compose profile brings up
-a throwaway MinIO with those literal credentials.
+a throwaway server. Any S3-compatible endpoint works -- point the variable at
+a self-hosted MinIO or a scratch bucket and the file runs unchanged. A server
+that does not validate signatures skips the credential-denial test instead of
+failing it, so what a given server actually proved stays visible in pytest's
+summary.
 """
 
 from __future__ import annotations
@@ -226,12 +230,31 @@ def test_a_substituted_blob_fails_its_digest_check(
     assert blobs, "the published blob should be listable"
     _client().put_object(Bucket=bucket, Key=blobs[0], Body=b"not-the-weights")
 
-    with pytest.raises(ModelRepositoryError, match="hashes to"):
+    with pytest.raises(ModelRepositoryError, match="integrity check failed"):
         repo.fetch_blob(entry, tmp_path / "cache" / "model.gguf")
 
 
 def test_bad_credentials_surface_as_a_repository_error(bucket: str) -> None:
-    """Denied access must not look like "not published"."""
+    """Denied access must not look like "not published".
+
+    Only meaningful against a server that validates signatures. Several
+    S3-compatible servers accept any key, and there a passing assertion would
+    prove nothing, so the rejection is established first and the test skips
+    when it cannot be.
+    """
+    probe = _client(
+        aws_access_key_id="wrong",
+        aws_secret_access_key="also-wrong",  # noqa: S106 - wrong on purpose
+    )
+    try:
+        probe.list_objects_v2(Bucket=bucket, MaxKeys=1)
+    except Exception:  # noqa: BLE001 - any rejection is enough
+        rejected = True
+    else:
+        rejected = False
+    if not rejected:
+        pytest.skip("this server accepts any credentials; nothing to assert")
+
     store = S3ObjectStore(
         bucket,
         client=_client(

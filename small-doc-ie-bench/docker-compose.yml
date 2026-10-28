@@ -331,32 +331,30 @@ services:
   # real server rather than a mock -- how botocore reports a missing key versus
   # a denied one is exactly what a directory-backed double cannot tell you.
   #
-  #   docker compose --profile minio up -d minio
-  #   export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9000
+  # Not MinIO, which is no longer installable: its community images were
+  # withdrawn from Docker Hub and quay.io (minio/minio#21647) and dl.min.io
+  # answers 410 Gone. LocalStack's image now requires a licence token. s3mock
+  # is a real HTTP S3 server, so botocore's own paths are exercised, but it
+  # does not validate signatures -- the credential-denial test detects that
+  # and skips rather than asserting something vacuous.
+  #
+  #   docker compose --profile s3mock up -d s3mock
+  #   export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9090
   #   export DOCIE_TEST_S3_BUCKET=docie-test
-  #   export AWS_ACCESS_KEY_ID=docieminio AWS_SECRET_ACCESS_KEY=docieminio
+  #   export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
   #   export AWS_DEFAULT_REGION=us-east-1
   #   pytest tests/test_model_repository_s3_integration.py -v
   #
-  # The credentials are deliberately literal and local-only. Data lives in an
-  # unnamed volume, so `docker compose down -v` leaves nothing behind.
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    profiles: ["minio"]
-    command: ["server", "/data", "--console-address", ":9001"]
+  # DOCIE_TEST_S3_ENDPOINT_URL accepts any S3-compatible server, so a
+  # self-hosted MinIO or a scratch bucket runs the same file unchanged.
+  s3mock:
+    image: adobe/s3mock:5.2.3
+    profiles: ["s3mock"]
     environment:
-      MINIO_ROOT_USER: docieminio
-      MINIO_ROOT_PASSWORD: docieminio
+      initialBuckets: docie-test
+      retainFilesOnExit: "false"
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
+      - "127.0.0.1:9090:9090"
 
   # Local CPU GGUF server. Bring your own model at ./models/model.gguf or set MODEL_PATH.
   # This uses llama-cpp-python's OpenAI-compatible server, not an external SaaS endpoint.
@@ -651,7 +649,6 @@ services:
       - prometheus
 
 volumes:
-  minio-data:
   postgres-data:
   grafana-data:
   ocr-cache:
