@@ -1,7 +1,7 @@
 """Durable store for extraction-run outcomes.
 
 See ``ExtractionRunResult`` (studio/models.py) for why this exists: the
-plain-HTTP polling contract documented in docs/server-integration.md needs
+plain-HTTP polling contract documented in docs/reference/api.md needs
 the extraction's actual output, and proxying Inngest's own run-status API
 does not reliably carry it on this project's self-hosted Inngest server.
 """
