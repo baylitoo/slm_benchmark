@@ -61,6 +61,8 @@ import {
 } from "./ui";
 import { ResultPanel } from "./ResultPanel";
 import { PageHeader } from "./patterns/PageHeader";
+import { Meter, StatRow, StatTile } from "./patterns/StatTile";
+import { formatAgo, formatLatency, formatPct, runHeadline, STATUS_TONE } from "./benchmark/runMetrics";
 import { BatchView } from "./benchmark/BatchView";
 import { Toolbar } from "./patterns/Toolbar";
 import { ResultLine } from "./patterns/ResultLine";
@@ -419,8 +421,11 @@ export function Benchmark({ view = "run" }: { view?: string }) {
 // Results view — filterable, paginated table over the past runs.
 // ---------------------------------------------------------------------------
 
+type StatusFilter = "all" | "completed" | "failed" | "running";
+
 function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]>> }) {
   const [filter, setFilter] = useState("");
+  const [status, setStatus] = useState<StatusFilter>("all");
   const [page, setPage] = useState(1);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [compareOpen, setCompareOpen] = useState(false);
@@ -430,15 +435,16 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    if (!q) return all;
     return all.filter((r) => {
+      if (status !== "all" && r.status !== status) return false;
+      if (!q) return true;
       const hay = [r.dataset, r.run, r.event_id, r.status, r.model_profile]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [all, filter]);
+  }, [all, filter, status]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const clampedPage = Math.min(page, pageCount);
@@ -447,16 +453,81 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
     [filtered, clampedPage],
   );
 
+  const overview = useMemo(() => {
+    const completed = all.filter((r) => r.status === "completed");
+    let best: { run: BenchmarkRun; accuracy: number } | null = null;
+    for (const r of completed) {
+      const accuracy = runHeadline(r).fieldAccuracy;
+      if (accuracy != null && (!best || accuracy > best.accuracy)) best = { run: r, accuracy };
+    }
+    return {
+      completed: completed.length,
+      failed: all.filter((r) => r.status === "failed").length,
+      best,
+      latest: all.reduce<string | null>(
+        (acc, r) => (r.created_at && (!acc || r.created_at > acc) ? r.created_at : acc),
+        null,
+      ),
+    };
+  }, [all]);
+
   const columns: Column<BenchmarkRun>[] = [
     {
-      key: "run",
-      header: "Run / Dataset",
-      sortAccessor: (r) => r.dataset ?? r.run ?? r.event_id ?? "",
-      render: (r) => (
-        <span className="font-mono text-xs text-foreground">
-          {r.dataset || r.run || r.event_id || "run"}
-        </span>
-      ),
+      key: "model",
+      header: "Model",
+      sortAccessor: (r) => runHeadline(r).profile ?? "",
+      render: (r) => {
+        const h = runHeadline(r);
+        return (
+          <div className="min-w-0">
+            <div className="truncate font-medium text-foreground">{h.profile ?? "default"}</div>
+            <div className="truncate text-xs text-muted-foreground">
+              {r.dataset || r.run || r.event_id || "run"}
+              {h.extraProfiles > 0 ? ` · +${h.extraProfiles} routed` : ""}
+            </div>
+          </div>
+        );
+      },
+    },
+    {
+      key: "accuracy",
+      header: "Field accuracy",
+      sortAccessor: (r) => runHeadline(r).fieldAccuracy ?? -1,
+      render: (r) => {
+        const value = runHeadline(r).fieldAccuracy;
+        return value == null ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          <div className="w-28">
+            <div className="text-sm font-semibold tabular-nums text-foreground">{formatPct(value)}</div>
+            <Meter fraction={value} tone={value >= 0.8 ? "ok" : value >= 0.6 ? "warn" : "err"} className="mt-1" label="field accuracy" />
+          </div>
+        );
+      },
+    },
+    {
+      key: "valid",
+      header: "Valid JSON",
+      sortAccessor: (r) => runHeadline(r).validRate ?? -1,
+      render: (r) => <span className="tabular-nums">{formatPct(runHeadline(r).validRate)}</span>,
+    },
+    {
+      key: "hallucination",
+      header: "Ungrounded",
+      sortAccessor: (r) => runHeadline(r).hallucinationRate ?? -1,
+      render: (r) => <span className="tabular-nums">{formatPct(runHeadline(r).hallucinationRate)}</span>,
+    },
+    {
+      key: "latency",
+      header: "Latency p50",
+      sortAccessor: (r) => runHeadline(r).p50LatencyMs ?? -1,
+      render: (r) => <span className="tabular-nums">{formatLatency(runHeadline(r).p50LatencyMs)}</span>,
+    },
+    {
+      key: "docs",
+      header: "Docs",
+      sortAccessor: (r) => runHeadline(r).docs ?? -1,
+      render: (r) => <span className="tabular-nums text-muted-foreground">{runHeadline(r).docs ?? "—"}</span>,
     },
     {
       key: "status",
@@ -464,51 +535,28 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
       sortAccessor: (r) => r.status ?? "",
       render: (r) =>
         r.status ? (
-          <Badge tone={r.status === "completed" ? "ok" : r.status === "failed" ? "err" : "neutral"}>
-            {r.status}
-          </Badge>
+          <Badge tone={STATUS_TONE[r.status] ?? "neutral"}>{r.status}</Badge>
         ) : (
           <span className="text-muted-foreground">—</span>
         ),
-    },
-    {
-      key: "metrics",
-      header: "Metrics",
-      render: (r) => {
-        // "metrics.json exists" is a metadata-availability flag, not a
-        // pass/fail signal -- the real run outcome is the Status column
-        // right before this one (ok/err/neutral for completed/failed/
-        // other). tone="ok" here would read as "this run succeeded",
-        // which isn't what it means.
-        const has = Boolean(r.metrics?.summary?.length);
-        return <Badge tone={has ? "info" : "neutral"}>{has ? "metrics" : "—"}</Badge>;
-      },
     },
     {
       key: "created",
-      header: "Created",
+      header: "When",
       sortAccessor: (r) => r.created_at ?? "",
       render: (r) => (
-        <span className="tabular-nums text-xs text-muted-foreground">{r.created_at ?? "—"}</span>
+        <span className="whitespace-nowrap text-xs text-muted-foreground" title={r.created_at ?? undefined}>
+          {formatAgo(r.created_at)}
+        </span>
       ),
-    },
-    {
-      key: "artifacts",
-      header: "Artifacts",
-      render: (r) =>
-        (r.artifacts ?? []).length > 0 ? (
-          <ArtifactLinks artifacts={r.artifacts!} />
-        ) : (
-          <span className="text-muted-foreground">—</span>
-        ),
     },
   ];
 
   return (
     <div>
       <PageHeader
-        title="Runs"
-        subtitle="GET /v1/studio/runs — durable, addressable benchmark runs."
+        title="Benchmark results"
+        subtitle="Every run scores one model on one dataset. Open a run for its full scores and files."
         actions={
           <Button type="button" variant="secondary" onClick={() => setCompareOpen(true)}>
             <GitCompare className="h-4 w-4" />
@@ -519,12 +567,33 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
 
       <ComparisonSheet open={compareOpen} onClose={() => setCompareOpen(false)} runs={all} />
 
+      {total > 0 && (
+        <StatRow className="mb-6 lg:grid-cols-4">
+          <StatTile label="Runs" value={total} detail={`${overview.completed} completed · ${overview.failed} failed`} />
+          <StatTile
+            label="Best field accuracy"
+            value={overview.best ? formatPct(overview.best.accuracy) : "—"}
+            detail={
+              overview.best
+                ? `${runHeadline(overview.best.run).profile ?? "default"} on ${overview.best.run.dataset ?? "?"}`
+                : "No completed run with ground truth yet"
+            }
+          />
+          <StatTile label="Last run" value={formatAgo(overview.latest)} />
+          <StatTile
+            label="Datasets"
+            value={new Set(all.map((r) => r.dataset).filter(Boolean)).size}
+          />
+        </StatRow>
+      )}
+
       <Toolbar
         onReset={() => {
           setFilter("");
+          setStatus("all");
           setPage(1);
         }}
-        resetDisabled={filter === ""}
+        resetDisabled={filter === "" && status === "all"}
       >
         <TextInput
           value={filter}
@@ -532,8 +601,21 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
             setFilter(e.target.value);
             setPage(1);
           }}
-          placeholder="Filter by dataset, status, id…"
+          placeholder="Search model or dataset…"
           className="h-8 w-64 text-xs"
+        />
+        <Segmented<StatusFilter>
+          value={status}
+          onChange={(value) => {
+            setStatus(value);
+            setPage(1);
+          }}
+          options={[
+            { value: "all", label: "All" },
+            { value: "completed", label: "Completed" },
+            { value: "failed", label: "Failed" },
+            { value: "running", label: "Running" },
+          ]}
         />
       </Toolbar>
 
@@ -559,24 +641,69 @@ function ResultsView({ runs }: { runs: ReturnType<typeof useAsync<BenchmarkRun[]
         getRowKey={(r, i) => r.event_id ?? r.run ?? `run-${i}`}
         loading={runs.loading}
         error={runs.error}
-        emptyLabel="No benchmark runs found"
-        emptyDescription="Start a run under Benchmark → Run — completed runs and their metrics show up here."
+        emptyLabel="No benchmark runs yet"
+        emptyDescription="Start one from Benchmark → Run. Its scores appear here once it completes."
         onRowClick={(r) => {
           const id = r.event_id ?? r.run ?? "";
           setExpanded((cur) => (cur === id ? null : id));
         }}
         expandedKey={expanded}
-        renderExpanded={(r) => {
-          const summary = r.metrics?.summary;
-          return summary?.length ? (
-            <MetricsTable summary={summary} />
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              <T>No metrics.json for this run.</T>
-            </p>
-          );
-        }}
+        renderExpanded={(r) => <RunDetail run={r} />}
       />
+    </div>
+  );
+}
+
+/** A run's scores as tiles, its files, and the raw metrics behind a toggle. */
+function RunDetail({ run }: { run: BenchmarkRun }) {
+  const [showAll, setShowAll] = useState(false);
+  const summary = run.metrics?.summary;
+  if (!summary?.length) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        <T>This run has no scores yet.</T>
+      </p>
+    );
+  }
+  const h = runHeadline(run);
+  return (
+    <div className="space-y-4">
+      <StatRow className="lg:grid-cols-4">
+        <StatTile label="Field accuracy" value={formatPct(h.fieldAccuracy)} detail="Fields matching the ground truth" />
+        <StatTile label="Valid JSON" value={formatPct(h.validRate)} detail="Responses that passed schema validation" />
+        <StatTile label="Grounded in document" value={formatPct(h.evidenceCoverage)} detail="Values traced back to the source text" />
+        <StatTile label="List rows F1" value={formatPct(h.rowF1)} detail="Line items and other repeated rows" />
+        <StatTile label="Latency" value={formatLatency(h.p50LatencyMs)} detail={`p95 ${formatLatency(h.p95LatencyMs)}`} />
+        <StatTile
+          label="Throughput"
+          value={h.throughputPerMin == null ? "—" : `${h.throughputPerMin} docs/min`}
+          detail={h.docs == null ? undefined : `${h.docs} documents`}
+        />
+      </StatRow>
+      {(run.artifacts ?? []).length > 0 && (
+        <div>
+          <p className="mb-1.5 text-xs font-medium text-muted-foreground"><T>Files</T></p>
+          <ArtifactLinks artifacts={run.artifacts!} />
+        </div>
+      )}
+      <div>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowAll((v) => !v);
+          }}
+        >
+          <T>{showAll ? "Hide all metrics" : "Show all metrics"}</T>
+        </Button>
+        {showAll && (
+          <div className="mt-2">
+            <MetricsTable summary={summary} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
