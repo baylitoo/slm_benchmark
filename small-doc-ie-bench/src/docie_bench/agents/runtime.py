@@ -9,9 +9,12 @@ deployment being unloaded and reloaded on another port.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -38,6 +41,11 @@ from docie_bench.extract.service import ExtractionService
 from docie_bench.extract.validators import INVOICE_TOLERANCE, money_amount
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.llm.upstream_transport import (
+    model_error_type,
+    open_chat_stream,
+    post_chat_completion,
+)
 from docie_bench.mcp_servers.calculator import check_sum
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
@@ -71,6 +79,88 @@ class AgentError(Exception):
         self.message = message
         self.status_code = status_code
         self.error_type = error_type
+
+
+@dataclass
+class _WorkflowExecutionContext:
+    allow_remote_profiles: bool = True
+    deadline_at: float | None = None
+    max_model_calls: int | None = None
+    model_calls: int = 0
+    model_call_trace: list[dict[str, Any]] = field(default_factory=list)
+    active_step: str | None = None
+
+    def apply(self, spec: AgentSpec) -> None:
+        options = spec.options
+        allow_remote = options.get("allow_remote_profiles", True)
+        if not isinstance(allow_remote, bool):
+            raise AgentError(
+                f"agent {spec.name!r}: options.allow_remote_profiles must be a boolean",
+                status_code=400,
+                error_type="invalid_agent_config",
+            )
+        self.allow_remote_profiles = self.allow_remote_profiles and allow_remote
+        deadline_seconds = options.get("deadline_seconds")
+        if deadline_seconds is not None:
+            if (
+                isinstance(deadline_seconds, bool)
+                or not isinstance(deadline_seconds, (int, float))
+                or deadline_seconds <= 0
+            ):
+                raise AgentError(
+                    f"agent {spec.name!r}: options.deadline_seconds must be positive",
+                    status_code=400,
+                    error_type="invalid_agent_config",
+                )
+            candidate = time.monotonic() + float(deadline_seconds)
+            self.deadline_at = (
+                candidate if self.deadline_at is None else min(self.deadline_at, candidate)
+            )
+        max_calls = options.get("max_model_calls")
+        if max_calls is not None:
+            if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1:
+                raise AgentError(
+                    f"agent {spec.name!r}: options.max_model_calls must be a positive integer",
+                    status_code=400,
+                    error_type="invalid_agent_config",
+                )
+            self.max_model_calls = (
+                max_calls if self.max_model_calls is None else min(self.max_model_calls, max_calls)
+            )
+
+    def before_model_call(self, profile: ModelProfile) -> float | None:
+        if not self.allow_remote_profiles and profile.execution_location != "local":
+            raise AgentError(
+                "workflow policy blocks calls to remote or unclassified model profiles",
+                status_code=403,
+                error_type="remote_processing_forbidden",
+            )
+        remaining = None
+        if self.deadline_at is not None:
+            remaining = self.deadline_at - time.monotonic()
+            if remaining <= 0:
+                raise AgentError(
+                    "workflow deadline exceeded",
+                    status_code=504,
+                    error_type="workflow_deadline_exceeded",
+                )
+        if self.max_model_calls is not None and self.model_calls >= self.max_model_calls:
+            raise AgentError(
+                "workflow model-call limit exceeded",
+                status_code=429,
+                error_type="workflow_model_call_limit",
+            )
+        self.model_calls += 1
+        return min(profile.timeout_seconds, remaining) if remaining is not None else None
+
+    def record_model_call(self, trace: dict[str, Any]) -> None:
+        trace["step_name"] = self.active_step
+        self.model_call_trace.append(trace)
+
+
+_WORKFLOW_EXECUTION: contextvars.ContextVar[_WorkflowExecutionContext | None] = (
+    contextvars.ContextVar("agent_workflow_execution", default=None)
+)
 
 
 async def complete_agent(
@@ -376,7 +466,7 @@ async def _complete_structured_document(
         raise AgentError(
             str(exc),
             status_code=exc.status_code or 502,
-            error_type="upstream_error",
+            error_type=model_error_type(exc),
         ) from exc
     except ValueError as exc:
         raise AgentError(str(exc), status_code=400, error_type="invalid_request_error") from exc
@@ -404,9 +494,6 @@ async def _complete_structured_document(
         response = outcome
 
     usage = response.usage.model_dump(exclude_none=True) if response.usage else {}
-    usage.setdefault("prompt_tokens", 0)
-    usage.setdefault("completion_tokens", 0)
-    usage.setdefault("total_tokens", 0)
     agent_result = _flatten_agent_result(response.result)
     docie_agent: dict[str, Any] = {
         "agent": spec.name,
@@ -1439,7 +1526,16 @@ def _resolve_step_agent(spec: AgentSpec, step_name: str, agent_name: str) -> Age
     this module do (500, ``invalid_agent_config``) instead of leaking a
     raw registry exception."""
     try:
-        return AgentRegistry().get(agent_name)
+        referenced = AgentRegistry().get(agent_name)
+        if referenced.kind not in {"custom", "workflow"}:
+            raise AgentError(
+                f"agent {spec.name!r}: step {step_name!r} cannot reference a "
+                f"{referenced.kind!r} agent; workflow references execute custom "
+                "chat/tool behavior or nested workflows only",
+                status_code=400,
+                error_type="unsupported_agent_reference_kind",
+            )
+        return referenced
     except AgentNotFoundError as exc:
         raise AgentError(
             f"agent {spec.name!r}: step {step_name!r} references unknown agent {agent_name!r}",
@@ -1515,7 +1611,8 @@ async def _run_workflow_steps(
     *,
     http_client: httpx.AsyncClient,
     budget: list[int],
-    totals: dict[str, int],
+    totals: dict[str, int | None],
+    usage_complete: list[bool],
     step_trace: list[dict[str, Any]],
     tool_call_trace: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], str | None]:
@@ -1564,6 +1661,9 @@ async def _run_workflow_steps(
         budget[0] += 1
         step = steps[index]
         step_name = names[index]
+        execution = _WORKFLOW_EXECUTION.get()
+        if execution:
+            execution.active_step = step_name
         step_body = (
             dict(body)
             if first
@@ -1577,29 +1677,22 @@ async def _run_workflow_steps(
             if ref_spec.kind == "workflow":
                 is_nested = True
                 used_model_profile = None
+                if execution:
+                    execution.apply(ref_spec)
                 completion, step_answer = await _run_workflow_steps(
                     ref_spec,
                     step_body,
                     http_client=http_client,
                     budget=budget,
                     totals=totals,
+                    usage_complete=usage_complete,
                     step_trace=step_trace,
                     tool_call_trace=tool_call_trace,
                 )
             else:
                 used_model_profile = ref_spec.model_profile
-                step_spec = spec.model_copy(
-                    update={
-                        "model_profile": ref_spec.model_profile,
-                        "system_prompt": ref_spec.system_prompt,
-                        "options": {
-                            "mcp_servers": ref_spec.options.get("mcp_servers"),
-                            "mcp_tools": ref_spec.options.get("mcp_tools"),
-                        },
-                    }
-                )
                 completion = await _run_one_step(
-                    step_spec,
+                    ref_spec,
                     step_body,
                     index=index,
                     step_name=step_name,
@@ -1634,11 +1727,13 @@ async def _run_workflow_steps(
         # that nested call's last step.
         if not is_nested:
             usage = completion.get("usage")
-            if isinstance(usage, dict):
+            if not isinstance(usage, dict) or any(
+                not isinstance(usage.get(key), int) for key in totals
+            ):
+                usage_complete[0] = False
+            else:
                 for key in totals:
-                    value = usage.get(key)
-                    if isinstance(value, int):
-                        totals[key] += value
+                    totals[key] = (totals[key] or 0) + usage[key]
         first = False
         trace_entry: dict[str, Any] = {
             "step": index,
@@ -1688,19 +1783,61 @@ async def _complete_workflow(
     ``step_name`` that made it, so a multi-step workflow's calls aren't
     flattened into one unattributed list.
     """
-    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    totals: dict[str, int | None] = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
     step_trace: list[dict[str, Any]] = []
     tool_call_trace: list[dict[str, Any]] = []
-    completion, _ = await _run_workflow_steps(
-        spec,
-        body,
-        http_client=http_client,
-        budget=[0],
-        totals=totals,
-        step_trace=step_trace,
-        tool_call_trace=tool_call_trace,
-    )
+    usage_complete = [True]
+    execution = _WorkflowExecutionContext()
+    execution.apply(spec)
+    execution_token = _WORKFLOW_EXECUTION.set(execution)
+    try:
+        if execution.deadline_at is None:
+            completion, _ = await _run_workflow_steps(
+                spec,
+                body,
+                http_client=http_client,
+                budget=[0],
+                totals=totals,
+                usage_complete=usage_complete,
+                step_trace=step_trace,
+                tool_call_trace=tool_call_trace,
+            )
+        else:
+            async with asyncio.timeout_at(execution.deadline_at):
+                completion, _ = await _run_workflow_steps(
+                    spec,
+                    body,
+                    http_client=http_client,
+                    budget=[0],
+                    totals=totals,
+                    usage_complete=usage_complete,
+                    step_trace=step_trace,
+                    tool_call_trace=tool_call_trace,
+                )
+    except TimeoutError as exc:
+        raise AgentError(
+            "workflow deadline exceeded", status_code=504, error_type="workflow_deadline_exceeded"
+        ) from exc
+    finally:
+        _WORKFLOW_EXECUTION.reset(execution_token)
+    if not usage_complete[0]:
+        totals = dict.fromkeys(totals)
     docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind, "steps": step_trace}
+    docie_agent["model_calls"] = execution.model_call_trace
+    docie_agent["execution_policy"] = {
+        "allow_remote_profiles": execution.allow_remote_profiles,
+        "max_model_calls": execution.max_model_calls,
+        "deadline_configured": execution.deadline_at is not None,
+        "deadline_remaining_seconds": (
+            round(max(execution.deadline_at - time.monotonic(), 0), 3)
+            if execution.deadline_at is not None
+            else None
+        ),
+    }
     if tool_call_trace:
         docie_agent["tool_calls"] = tool_call_trace
     final = dict(completion)
@@ -1731,13 +1868,40 @@ async def stream_workflow(
     except AgentError as exc:
         yield _agent_error_event(exc)
         return
-    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    completion: dict[str, Any] | None = None
+    if any(isinstance(step, dict) and step.get("agent") for step in steps):
+        # Saved-agent and nested-workflow behavior shares the buffered
+        # executor, which carries the complete policy and budget context.
+        try:
+            completion = await _complete_workflow(spec, body, http_client=http_client)
+        except AgentError as exc:
+            yield _agent_error_event(exc)
+            return
+        trace = completion.get("docie_agent", {})
+        for entry in trace.get("steps", []):
+            yield {"type": "step", **entry}
+        for entry in trace.get("tool_calls", []):
+            yield {"type": "tool_call", **entry}
+        yield {"type": "content", "completion": completion}
+        return
+    totals: dict[str, int | None] = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+    usage_complete = True
     step_trace: list[dict[str, Any]] = []
     tool_call_trace: list[dict[str, Any]] = []
     chain_content: str | None = _last_message_content(body)
-    completion: dict[str, Any] | None = None
     index = 0
     visited = 0
+    execution = _WorkflowExecutionContext()
+    try:
+        execution.apply(spec)
+    except AgentError as exc:
+        yield _agent_error_event(exc)
+        return
+    execution_token = _WORKFLOW_EXECUTION.set(execution)
     try:
         while True:
             if visited >= _MAX_WORKFLOW_STEPS:
@@ -1749,6 +1913,7 @@ async def stream_workflow(
                 )
             step = steps[index]
             step_name = names[index]
+            execution.active_step = step_name
             step_spec = spec.model_copy(
                 update={
                     "model_profile": step["model_profile"],
@@ -1787,11 +1952,13 @@ async def stream_workflow(
             else:
                 completion = await _forward_chat(step_spec, step_body, http_client=http_client)
             usage = completion.get("usage")
-            if isinstance(usage, dict):
+            if not isinstance(usage, dict) or any(
+                not isinstance(usage.get(key), int) for key in totals
+            ):
+                usage_complete = False
+            else:
                 for key in totals:
-                    value = usage.get(key)
-                    if isinstance(value, int):
-                        totals[key] += value
+                    totals[key] = (totals[key] or 0) + usage[key]
             step_answer = _message_content(completion)
             visited += 1
             route = step.get("route")
@@ -1826,8 +1993,13 @@ async def stream_workflow(
     except AgentError as exc:
         yield _agent_error_event(exc)
         return
+    finally:
+        _WORKFLOW_EXECUTION.reset(execution_token)
+    if not usage_complete:
+        totals = dict.fromkeys(totals)
     assert completion is not None  # _resolve_workflow_steps guarantees >=1 step
     docie_agent: dict[str, Any] = {"agent": spec.name, "kind": spec.kind, "steps": step_trace}
+    docie_agent["model_calls"] = execution.model_call_trace
     if tool_call_trace:
         docie_agent["tool_calls"] = tool_call_trace
     final = dict(completion)
@@ -1925,44 +2097,28 @@ async def _post_chat(
     process) — see ``_post_chat_stream`` for the sibling used by call sites
     that don't share that constraint.
     """
-    body["model"] = upstream.model
-    body.pop("stream", None)
-    url = f"{upstream.base_url}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {upstream.api_key}",
-        "Content-Type": "application/json",
-    }
+    execution = _WORKFLOW_EXECUTION.get()
+    timeout_seconds = execution.before_model_call(upstream) if execution else None
     try:
-        response = await http_client.post(
-            url, json=body, headers=headers, timeout=upstream.timeout_seconds
+        return await post_chat_completion(
+            upstream,
+            http_client,
+            body,
+            timeout_seconds=timeout_seconds,
+            on_call=execution.record_model_call if execution else None,
         )
-    except httpx.RequestError as exc:
+    except AgentError:
+        raise
+    except ModelGatewayError as exc:
+        if exc.status_code == 504:
+            raise AgentError(
+                "workflow deadline exceeded",
+                status_code=504,
+                error_type="workflow_deadline_exceeded",
+            ) from exc
         raise AgentError(
-            f"backing model upstream {upstream.base_url} is unreachable: {exc}",
-            status_code=502,
-            error_type="upstream_unavailable",
+            str(exc), status_code=exc.status_code or 502, error_type=model_error_type(exc)
         ) from exc
-    if response.status_code >= 400:
-        raise AgentError(
-            f"backing model returned {response.status_code}: {response.text[:300]}",
-            status_code=response.status_code,
-            error_type="upstream_error",
-        )
-    try:
-        completion = response.json()
-    except ValueError as exc:
-        raise AgentError(
-            "backing model returned a non-JSON response",
-            status_code=502,
-            error_type="upstream_error",
-        ) from exc
-    if not isinstance(completion, dict):
-        raise AgentError(
-            "backing model returned an unexpected payload shape",
-            status_code=502,
-            error_type="upstream_error",
-        )
-    return completion
 
 
 async def _post_chat_stream(
@@ -1982,52 +2138,28 @@ async def _post_chat_stream(
     to a normal ``AgentError`` (the API layer returns it as one JSON error
     response) rather than starting a stream that immediately errors.
     """
-    body["model"] = upstream.model
-    body["stream"] = True
-    # The API layer scans the relayed bytes for a trailing usage block to
-    # keep recording token counts on the usage ledger (see agents/api.py's
-    # _serve_raw_stream) -- llama-server/OpenAI only emit one when asked,
-    # same opt-in chat_api._stream_chat_completions sets.
-    stream_options = body.get("stream_options")
-    if not isinstance(stream_options, dict):
-        stream_options = {}
-    stream_options.setdefault("include_usage", True)
-    body["stream_options"] = stream_options
-    url = f"{upstream.base_url}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {upstream.api_key}",
-        "Content-Type": "application/json",
-    }
-    stream_ctx = http_client.stream(
-        "POST", url, json=body, headers=headers, timeout=upstream.timeout_seconds
-    )
+    execution = _WORKFLOW_EXECUTION.get()
+    timeout_seconds = execution.before_model_call(upstream) if execution else None
     try:
-        response = await stream_ctx.__aenter__()
-    except httpx.RequestError as exc:
-        raise AgentError(
-            f"backing model upstream {upstream.base_url} is unreachable: {exc}",
-            status_code=502,
-            error_type="upstream_unavailable",
-        ) from exc
-    media_type = response.headers.get("content-type", "text/event-stream")
-    if response.status_code >= 400:
-        raw = await response.aread()
-        await stream_ctx.__aexit__(None, None, None)
-        raise AgentError(
-            f"backing model returned {response.status_code}: "
-            f"{raw[:300].decode('utf-8', 'replace')}",
-            status_code=response.status_code,
-            error_type="upstream_error",
+        return await open_chat_stream(
+            upstream,
+            http_client,
+            body,
+            timeout_seconds=timeout_seconds,
+            on_call=execution.record_model_call if execution else None,
         )
-
-    async def body_iterator() -> AsyncIterator[bytes]:
-        try:
-            async for chunk in response.aiter_raw():
-                yield chunk
-        finally:
-            await stream_ctx.__aexit__(None, None, None)
-
-    return response.status_code, media_type, body_iterator()
+    except AgentError:
+        raise
+    except ModelGatewayError as exc:
+        if exc.status_code == 504:
+            raise AgentError(
+                "workflow deadline exceeded",
+                status_code=504,
+                error_type="workflow_deadline_exceeded",
+            ) from exc
+        raise AgentError(
+            str(exc), status_code=exc.status_code or 502, error_type=model_error_type(exc)
+        ) from exc
 
 
 async def stream_agent_raw(

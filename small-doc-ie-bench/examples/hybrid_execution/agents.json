@@ -1,0 +1,82 @@
+{
+  "frontier-files": {
+    "name": "frontier-files",
+    "kind": "custom",
+    "display_name": "Frontier file assistant",
+    "description": "Uses only the allowlisted local filesystem read tools.",
+    "model_profile": "frontier",
+    "system_prompt": "Answer from files you read. If no file supports the answer, say so.",
+    "options": {
+      "mcp_servers": ["filesystem"],
+      "mcp_tools": {"filesystem": ["list_directory", "read_file"]}
+    },
+    "enabled": true,
+    "created_at": "2026-10-27T00:00:00Z",
+    "updated_at": "2026-10-27T00:00:00Z"
+  },
+  "hybrid-router": {
+    "name": "hybrid-router",
+    "kind": "workflow",
+    "display_name": "Hybrid local router",
+    "description": "Routes locally to a local or frontier specialist.",
+    "model_profile": null,
+    "system_prompt": null,
+    "options": {
+      "allow_remote_profiles": true,
+      "deadline_seconds": 90,
+      "max_model_calls": 4,
+      "steps": [
+        {
+          "name": "route",
+          "model_profile": "local",
+          "system_prompt": "Classify the request as local or frontier. Reply with only one word: local or frontier.",
+          "route": {
+            "routes": {"local": "local-specialist", "frontier": "frontier-specialist"},
+            "default": "local-specialist"
+          }
+        },
+        {
+          "name": "local-specialist",
+          "model_profile": "local",
+          "system_prompt": "Answer the user's request using only the supplied text."
+        },
+        {
+          "name": "frontier-specialist",
+          "model_profile": "frontier",
+          "system_prompt": "Answer carefully using only the supplied text."
+        }
+      ]
+    },
+    "enabled": true,
+    "created_at": "2026-10-27T00:00:00Z",
+    "updated_at": "2026-10-27T00:00:00Z"
+  },
+  "transform-then-reason": {
+    "name": "transform-then-reason",
+    "kind": "workflow",
+    "display_name": "Local transform then frontier reasoning",
+    "description": "Transforms locally, then sends that substantive result for remote reasoning.",
+    "model_profile": null,
+    "system_prompt": null,
+    "options": {
+      "allow_remote_profiles": true,
+      "deadline_seconds": 90,
+      "max_model_calls": 3,
+      "steps": [
+        {
+          "name": "transform",
+          "model_profile": "local",
+          "system_prompt": "Extract and normalize the facts in the user's text. Preserve relevant values."
+        },
+        {
+          "name": "reason",
+          "model_profile": "frontier",
+          "system_prompt": "Reason about the normalized facts and answer the user's implied question."
+        }
+      ]
+    },
+    "enabled": true,
+    "created_at": "2026-10-27T00:00:00Z",
+    "updated_at": "2026-10-27T00:00:00Z"
+  }
+}

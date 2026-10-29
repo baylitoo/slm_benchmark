@@ -55,7 +55,7 @@ from docie_bench.settings import Settings, get_settings
 
 logger = logging.getLogger("docie_bench.serving.profile_resolver")
 
-DEFAULT_MODELS_CONFIG = Path("configs/models.yaml")
+DEFAULT_MODELS_CONFIG = Path(os.environ.get("DOCIE_MODELS_CONFIG", "configs/models.yaml"))
 
 # Runtimes whose served id is the launch *alias* (they are started with
 # ``--alias`` / ``--served-model-name``); everything else answers to the model id.
@@ -126,9 +126,12 @@ def _is_live(record: DeploymentRecord) -> bool:
     heuristic only when there is no fresh verdict (reconciler off/never ran —
     the DB-optional, reconciler-optional contract).
     """
-    if record.observed_phase is not None and record.observed_at is not None:
-        if time.time() - record.observed_at <= _observed_stale_after_s():
-            return record.observed_phase == "hot" and bool(record.endpoint)
+    if (
+        record.observed_phase is not None
+        and record.observed_at is not None
+        and time.time() - record.observed_at <= _observed_stale_after_s()
+    ):
+        return record.observed_phase == "hot" and bool(record.endpoint)
     return record.state == LifecycleState.READY and bool(record.endpoint)
 
 

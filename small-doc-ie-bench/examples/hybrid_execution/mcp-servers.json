@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "./examples/hybrid_execution/docs"
+      ],
+      "env": {}
+    }
+  }
+}

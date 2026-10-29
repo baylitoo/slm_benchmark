@@ -201,6 +201,77 @@ def test_custom_agent_runs_the_tool_loop_when_mcp_servers_set(api, monkeypatch) 
     assert round2[-1] == {"role": "tool", "tool_call_id": "call_1", "content": "5"}
 
 
+def test_provider_retry_after_tool_execution_does_not_repeat_tool_side_effect(
+    api, monkeypatch
+) -> None:
+    from docie_bench.agents import runtime
+
+    client, captured = api
+    monkeypatch.setattr(
+        runtime,
+        "resolve_extraction_profile",
+        lambda **_: replace(
+            UPSTREAM, retry_backoff_base_seconds=0, retry_backoff_max_seconds=0
+        ),
+    )
+    effects: list[str] = []
+    server = MCPServer("effect")
+
+    @server.tool()
+    def commit(value: str) -> str:
+        effects.append(value)
+        return "committed"
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_mcp_registry",
+        lambda path=None: {
+            "effect": MCPServerSpec(
+                name="effect", transport="streamable-http", url="http://unused"
+            )
+        },
+    )
+
+    async def fake_open(stack, specs):
+        session = await stack.enter_async_context(_memory_session(server))
+        return {"effect": session}
+
+    monkeypatch.setattr(mcp_tools, "open_mcp_sessions", fake_open)
+    attempts_after_tool = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts_after_tool
+        captured.append(request)
+        body = json.loads(request.content)
+        has_tool_result = any(m.get("role") == "tool" for m in body["messages"])
+        if not has_tool_result:
+            return httpx.Response(
+                200,
+                json=_tool_calls_completion("effect__commit", '{"value":"one-time"}'),
+            )
+        attempts_after_tool += 1
+        if attempts_after_tool == 1:
+            return httpx.Response(500, json={"detail": "provider failure"})
+        return httpx.Response(200, json=_final_completion("done"))
+
+    from docie_bench.agents.api import configure_http_transport
+
+    configure_http_transport(httpx.MockTransport(handler))
+    try:
+        _create_agent(client, options={"mcp_servers": ["effect"]})
+        response = client.post(
+            "/v1/agents/tool-helper/chat/completions",
+            json={"messages": [{"role": "user", "content": "commit once"}]},
+        )
+    finally:
+        configure_http_transport(None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "done"
+    assert effects == ["one-time"]
+    assert attempts_after_tool == 2
+
+
 def test_custom_agent_with_tools_streams_tool_call_and_content_events(api, monkeypatch) -> None:
     # #346: a `custom` agent with options.mcp_servers gets REAL incremental
     # SSE events -- the executed tool call arrives the moment it finishes,

@@ -1,0 +1,44 @@
+profiles:
+  local:
+    model: local-chat
+    base_url: http://127.0.0.1:8088/v1
+    api_key: local-not-used
+    execution_location: local
+    temperature: 0.1
+    top_p: 0.9
+    max_tokens: 512
+    timeout_seconds: 60
+    max_concurrency: 2
+    queue_limit: 8
+    retry_max_attempts: 2
+    capability_discovery: optional
+    capabilities:
+      tools: false
+      tool_choice: false
+      structured_output: true
+      vision: false
+      streaming: true
+      usage: true
+
+  frontier:
+    model: frontier-model
+    base_url: ${HYBRID_FRONTIER_BASE_URL}
+    api_key_env: HYBRID_FRONTIER_API_KEY
+    execution_location: remote
+    temperature: 0.2
+    top_p: 0.95
+    max_tokens: 1200
+    timeout_seconds: 120
+    max_concurrency: 4
+    queue_limit: 16
+    retry_max_attempts: 3
+    retry_backoff_base_seconds: 1
+    retry_backoff_max_seconds: 8
+    capability_discovery: optional
+    capabilities:
+      tools: true
+      tool_choice: true
+      structured_output: true
+      vision: null
+      streaming: true
+      usage: true

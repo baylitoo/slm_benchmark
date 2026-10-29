@@ -906,20 +906,21 @@ async def _stream_chat_with_mcp_tools(
         from ``content``/``tool_calls``. Answers "is there a hidden
         thinking step before the tool call" with the model's own words
         instead of leaving it invisible.
-      ``{"type": "usage", "round": {...}, "cumulative": {...}}`` — that
-        round's own token usage plus the running cumulative totals through
-        this round (``run_tool_loop``'s ``on_usage``), the raw counts with
-        no context-window denominator. Lets a client show how much a live
+      ``{"type": "usage", "round": {...}, "cumulative": {...},
+      "context_tokens": n, "billed_tokens": n}`` — that round's usage,
+        cumulative billed counts, and this request's context occupancy as
+        separate values. Missing provider usage remains unknown. Lets a client show how much a live
         agentic exchange is consuming before the final completion lands,
         instead of only after the whole exchange finishes.
-      ``{"type": "context_budget", "cumulative_tokens", "context_length",
+      ``{"type": "context_budget", "context_tokens", "billed_tokens",
+        "context_length",
         "threshold_fraction"}`` — fired AT MOST ONCE per exchange (#344),
-        the first round whose cumulative usage crosses
+        the first round whose current context occupancy crosses
         ``settings.mcp_context_budget_warn_fraction`` (default 80%) of the
         resolved deployment's own ``context_length`` (see
         ``_context_length_for_profile``). A WARNING only — a long agentic
         exchange can otherwise run several real rounds before a LATER
-        round's cumulative usage exceeds the deployment's context window and
+        round's prompt-plus-completion usage exceeds the deployment's context window and
         llama-server hard-400s, losing the whole in-progress exchange with
         no prior warning. Never fires when the ceiling can't be resolved
         (an unknown/unpriceable deployment) — fail-open, same as every
