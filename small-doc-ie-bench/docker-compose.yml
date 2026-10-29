@@ -324,6 +324,38 @@ services:
       - ocr-cache:/app/.cache/ocr
     entrypoint: ["docie-bench"]
 
+  # Throwaway S3-compatible server for the model-repository integration test
+  # (#595). Not part of any runtime path: the repository talks to whatever
+  # bucket DOCIE_MODEL_STORE_S3_* names, and a single-machine deployment never
+  # contacts one at all. This exists so the S3 adapter can be proved against a
+  # real server rather than a mock -- how botocore reports a missing key versus
+  # a denied one is exactly what a directory-backed double cannot tell you.
+  #
+  # Not MinIO, which is no longer installable: its community images were
+  # withdrawn from Docker Hub and quay.io (minio/minio#21647) and dl.min.io
+  # answers 410 Gone. LocalStack's image now requires a licence token. s3mock
+  # is a real HTTP S3 server, so botocore's own paths are exercised, but it
+  # does not validate signatures -- the credential-denial test detects that
+  # and skips rather than asserting something vacuous.
+  #
+  #   docker compose --profile s3mock up -d s3mock
+  #   export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9090
+  #   export DOCIE_TEST_S3_BUCKET=docie-test
+  #   export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+  #   export AWS_DEFAULT_REGION=us-east-1
+  #   pytest tests/test_model_repository_s3_integration.py -v
+  #
+  # DOCIE_TEST_S3_ENDPOINT_URL accepts any S3-compatible server, so a
+  # self-hosted MinIO or a scratch bucket runs the same file unchanged.
+  s3mock:
+    image: adobe/s3mock:5.2.3
+    profiles: ["s3mock"]
+    environment:
+      initialBuckets: docie-test
+      retainFilesOnExit: "false"
+    ports:
+      - "127.0.0.1:9090:9090"
+
   # Local CPU GGUF server. Bring your own model at ./models/model.gguf or set MODEL_PATH.
   # This uses llama-cpp-python's OpenAI-compatible server, not an external SaaS endpoint.
   llm-llamacpp:

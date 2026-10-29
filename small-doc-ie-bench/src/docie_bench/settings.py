@@ -254,6 +254,37 @@ class Settings(BaseSettings):
         ),
     )
 
+    # The shared model repository (#595). Its own namespace, separate from
+    # the Studio artifact store: different data, different lifecycle, and
+    # plausibly a different bucket. Unset = no repository, and every path that
+    # would use one degrades to node-local behaviour rather than failing.
+    model_store_s3_bucket: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DOCIE_MODEL_STORE_S3_BUCKET", "model_store_s3_bucket"
+        ),
+    )
+    # Set for MinIO, R2 or B2; left unset for AWS S3 itself.
+    model_store_s3_endpoint_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DOCIE_MODEL_STORE_S3_ENDPOINT_URL", "model_store_s3_endpoint_url"
+        ),
+    )
+    model_store_s3_region: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DOCIE_MODEL_STORE_S3_REGION", "model_store_s3_region"
+        ),
+    )
+    # Namespaces one bucket across fleets or environments.
+    model_store_s3_prefix: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "DOCIE_MODEL_STORE_S3_PREFIX", "model_store_s3_prefix"
+        ),
+    )
+
     # Sizing safety margin (PR-3): the slice of node TOTAL RAM the fit table
     # holds back before pricing prospective instances — explicit and surfaced
     # in the API/UI, never a hidden fudge factor. Design doc §3 brackets it at
