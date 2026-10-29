@@ -9,8 +9,11 @@ capacity number is never priced against an unidentified node.
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from sqlalchemy import select
@@ -24,6 +27,7 @@ from docie_bench.serving.catalog import (
 from docie_bench.serving.node_identity import (
     NODE_ID_ENV_VAR,
     InvalidNodeIdError,
+    NodeIdUnreadableError,
     node_id_path,
     resolve_node_id,
     validate_node_id,
@@ -143,6 +147,143 @@ def test_a_racing_second_writer_adopts_the_winners_id() -> None:
 
     assert _persist(path, "bbbb2222") == winner
     assert path.read_text(encoding="utf-8").strip() == winner
+
+
+def _unreadable_node_id(failures: list[int] | None = None):
+    """Make reads of ``node_id`` raise EIO, leaving every other read alone.
+
+    chmod is not a usable lever here: the suite runs on Windows too.
+    """
+    real = Path.read_text
+    budget = failures if failures is not None else [-1]
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "node_id" and budget[0] != 0:
+            budget[0] -= 1
+            raise OSError(5, "Input/output error")
+        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    return mock.patch.object(Path, "read_text", flaky)
+
+
+def test_an_unreadable_id_file_is_not_mistaken_for_an_absent_one() -> None:
+    """The bug: ``_read_persisted`` returned None for BOTH absent and
+    unreadable, so ``os.link`` raising FileExistsError plus a None read read as
+    "a file is there but it is garbage" -- and the node overwrote a perfectly
+    good identity with a fresh one, orphaning the ``serving_node`` and placement
+    rows it had already published.
+    """
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+
+    with _unreadable_node_id(), pytest.raises(NodeIdUnreadableError, match="could not be read"):
+        _persist(path, "b" * 32)
+
+    assert path.read_text(encoding="utf-8").strip() == original
+
+
+def test_resolving_under_an_unreadable_file_refuses_rather_than_re_minting() -> None:
+    """Every caller resolves inside a broad ``except Exception`` that logs and
+    continues, so refusing costs a publish cycle, not the container."""
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+
+    with _unreadable_node_id(), pytest.raises(NodeIdUnreadableError):
+        resolve_node_id()
+
+    assert path.read_text(encoding="utf-8").strip() == original
+
+
+def test_a_transient_read_error_self_heals_under_the_real_id() -> None:
+    """Why refusing beats re-minting: ``lru_cache`` does not cache exceptions,
+    so the next cycle retries and gets the id that was always on disk. Re-minting
+    would have been permanent."""
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+
+    with _unreadable_node_id(failures=[2]):
+        for _ in range(2):
+            with pytest.raises(NodeIdUnreadableError):
+                resolve_node_id()
+        assert resolve_node_id() == original
+
+    assert resolve_node_id() == original  # and it is cached from then on
+
+
+def test_an_invalid_id_file_is_still_regenerated_not_refused() -> None:
+    """The state that must NOT change: readable-but-corrupt content is a
+    documented regenerate, since refusing to serve over it would be worse."""
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not a valid id!!", encoding="utf-8")
+
+    regenerated = resolve_node_id()
+
+    assert validate_node_id(regenerated)
+    assert path.read_text(encoding="utf-8").strip() == regenerated
+
+
+def test_the_id_is_flushed_to_disk_before_it_is_linked() -> None:
+    """The id is published to Postgres as soon as it is minted, so a power loss
+    that takes the buffered write but not the placement rows leaves the node
+    re-minting against rows the old id still owns."""
+    from docie_bench.serving.node_identity import _persist
+
+    calls: list[str] = []
+    real_fsync, real_link = os.fsync, os.link
+
+    def fsync(fd: int) -> None:
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def link(src: object, dst: object) -> None:
+        calls.append("link")
+        real_link(src, dst)  # type: ignore[arg-type]
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with mock.patch.object(os, "fsync", fsync), mock.patch.object(os, "link", link):
+        _persist(path, "a" * 32)
+
+    assert calls[: calls.index("link")] == ["fsync"]
+
+
+def test_a_filesystem_without_hard_links_still_adopts_the_winners_id() -> None:
+    """Some bind mounts reject ``os.link``. That fallback used to rename
+    unconditionally, so on those filesystems it clobbered the very id the
+    FileExistsError branch beside it was written to adopt."""
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    winner = "a" * 32
+    path.write_text(winner, encoding="utf-8")
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "operation not permitted")):
+        assert _persist(path, "b" * 32) == winner
+
+    assert path.read_text(encoding="utf-8").strip() == winner
+
+
+def test_a_failed_persist_leaves_no_staging_file() -> None:
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("a" * 32, encoding="utf-8")
+
+    with _unreadable_node_id(), pytest.raises(NodeIdUnreadableError):
+        _persist(path, "b" * 32)
+
+    assert [p.name for p in path.parent.iterdir() if p.name != "node_id"] == []
 
 
 # --- per-node rows -------------------------------------------------------
@@ -327,3 +468,135 @@ def test_sizing_withholds_a_number_it_cannot_attribute_to_a_node() -> None:
     assert snapshot is None  # fail-open, per admit_replica_ram's contract
     assert detail is not None
     assert "2 serving nodes" in detail
+
+def test_simultaneous_creators_agree_when_hardlinks_are_unavailable() -> None:
+    """The race the earlier fallback left open.
+
+    Some bind mounts refuse os.link, and the fallback read the file, found
+    nothing and renamed its own in. Two creators could both observe absence
+    and both write: each returned its OWN id while the disk kept only the
+    loser's, and because resolution is cached per process the two then
+    disagreed about who this node is for the rest of their lives.
+
+    The existing coverage only had a second writer ADOPT an id already on
+    disk, which is the easy half -- the winner is already decided there.
+    """
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start = threading.Barrier(8)
+    returned: list[str] = []
+    errors: list[BaseException] = []
+
+    def create(worker: int) -> None:
+        start.wait()
+        try:
+            returned.append(_persist(path, f"{worker:032d}"))
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")):
+        threads = [threading.Thread(target=create, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert errors == [], f"creation failed: {errors[:3]}"
+    on_disk = path.read_text(encoding="utf-8").strip()
+    assert len(set(returned)) == 1, f"creators disagreed about this node: {set(returned)}"
+    assert returned[0] == on_disk, "a creator returned an id the disk does not hold"
+
+
+def test_the_winner_is_whoever_the_filesystem_let_create_the_file() -> None:
+    """And the losers adopt it rather than minting their own, with hardlinks
+    unavailable so the exclusive-creation path is the one under test."""
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")):
+        winner = _persist(path, "a" * 32)
+        loser = _persist(path, "b" * 32)
+
+    assert loser == winner
+    assert path.read_text(encoding="utf-8").strip() == winner
+
+@pytest.mark.parametrize("content", ["", "   ", "!!! not an id !!!"])
+def test_a_corrupt_id_still_regenerates_where_hardlinks_are_refused(
+    content: str,
+) -> None:
+    """The cost of writing the final name directly.
+
+    temp-then-rename never leaves a partial id, so exclusive creation made a
+    new state reachable: a process killed between the create and the write
+    leaves a file that is present, readable and invalid. Waiting for it
+    forever would leave the node unable to resolve an identity at all, which
+    contradicts the rule this module already states -- a corrupt file is not a
+    reason to refuse to serve.
+    """
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    with mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")):
+        regenerated = _persist(path, "b" * 32)
+
+    assert validate_node_id(regenerated)
+    assert path.read_text(encoding="utf-8").strip() == regenerated
+
+
+def test_an_unreadable_id_is_still_never_overwritten_in_that_path() -> None:
+    """The distinction that must survive the change above: a file that cannot
+    be READ may hold a perfectly good id, so regenerating over it is the one
+    case that is wrong."""
+    from docie_bench.serving.node_identity import _persist
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "a" * 32
+    path.write_text(original, encoding="utf-8")
+    real_read = Path.read_text
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "node_id":
+            raise OSError(5, "Input/output error")
+        return real_read(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        mock.patch.object(os, "link", side_effect=OSError(1, "no hardlinks here")),
+        mock.patch.object(Path, "read_text", flaky),
+        pytest.raises(NodeIdUnreadableError),
+    ):
+        _persist(path, "b" * 32)
+
+    assert real_read(path, encoding="utf-8").strip() == original
+
+
+def test_a_replacement_of_a_corrupt_id_is_never_seen_half_written() -> None:
+    """The replacement itself goes through temp-then-rename, so a concurrent
+    reader sees the old content or the new one, never a partial id."""
+    from docie_bench.serving.node_identity import _replace_corrupt
+
+    path = node_id_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("!!! corrupt !!!", encoding="utf-8")
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def watching(src: object, dst: object) -> None:
+        seen.append(Path(str(src)).name)
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    with mock.patch.object(os, "replace", watching):
+        _replace_corrupt(path, "c" * 32)
+
+    assert path.read_text(encoding="utf-8").strip() == "c" * 32
+    assert seen, "os.replace was never called"
+    assert seen[0].endswith(".tmp"), f"wrote the final name directly: {seen}"
+    assert [p.name for p in path.parent.iterdir() if p.name.endswith(".tmp")] == []
+
