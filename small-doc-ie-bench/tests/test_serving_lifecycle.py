@@ -38,6 +38,7 @@ from docie_bench.serving.lifecycle import (
     FitDecision,
     LoadCoordinator,
     LoadError,
+    assess_fit,
     load_timeout_s,
     select_victims,
 )
@@ -951,3 +952,138 @@ def test_operator_load_forgives_exhausted_restart_budget(tmp_path: Path) -> None
     # The budget was reset; the respawn itself legitimately counts as one
     # restart (the record had an endpoint), leaving plenty of headroom.
     assert record.restart_count == 1
+
+# ------------------------------------------- over budget refuses (#539)
+
+
+def _over_budget(*, needed: int, free: int = 0) -> FitDecision:
+    return FitDecision(
+        False, needed, free, 0, "over budget (scripted)", over_budget=True
+    )
+
+
+def test_a_node_over_its_memory_budget_refuses_and_unloads_nothing(
+    tmp_path: Path,
+) -> None:
+    """The decided behaviour for #539's open question: refuse-new.
+
+    Admission normally evicts LRU victims to cover a deficit, and that is
+    right while DocIE is inside the share its operator declared for it. Past
+    that share it must refuse instead: a budget is a number an operator
+    types, and typing a smaller one must not unload models as a side effect,
+    which would cost a cold start on the next request to whatever went. Making
+    room under a budget is an explicit action, never a consequence of the next
+    load.
+    """
+    adapter = ScriptedAdapter()
+    supervisor = _supervisor(tmp_path, adapter)
+    gguf = tmp_path / "alpha.gguf"
+    gguf.write_bytes(b"g" * 1024)
+    supervisor.deploy(
+        _spec(
+            "alpha",
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.LLAMACPP, model=str(gguf), alias="alpha", port=8091
+            ),
+        )
+    )
+    supervisor.fold_recency({"alpha": 100.0})
+    supervisor.deploy(_spec("gamma", port=8093))
+    supervisor.unload("gamma")
+    starts_before = adapter.starts
+
+    unloaded: list[str] = []
+
+    coordinator = LoadCoordinator(
+        supervisor,
+        # A deficit one eviction of alpha could easily cover -- which is the
+        # point: it must not be covered that way.
+        assess=lambda record: _over_budget(needed=100, free=90),
+        unload=lambda name: (unloaded.append(name), supervisor.unload(name))[1],
+        min_hot_s=0.0,
+        max_evictions=10,
+        sleep=lambda seconds: None,
+    )
+    with pytest.raises(LoadError, match="over its memory budget"):
+        coordinator.load("gamma")
+
+    assert unloaded == []  # nothing evicted to make room
+    assert supervisor.get("alpha").state == LifecycleState.READY
+    assert adapter.starts == starts_before  # nothing spawned
+
+
+def test_inside_the_budget_a_deficit_still_evicts_to_fit(tmp_path: Path) -> None:
+    """The guard: refuse-new applies only PAST the budget. Reclaiming DocIE's
+    own idle models inside its own allowance affects no co-tenant, so the
+    existing LRU behaviour has to survive."""
+    adapter = ScriptedAdapter()
+    supervisor = _supervisor(tmp_path, adapter)
+    gguf = tmp_path / "alpha.gguf"
+    gguf.write_bytes(b"g" * 1024)
+    supervisor.deploy(
+        _spec(
+            "alpha",
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.LLAMACPP, model=str(gguf), alias="alpha", port=8091
+            ),
+        )
+    )
+    supervisor.fold_recency({"alpha": 100.0})
+    supervisor.deploy(_spec("gamma", port=8093))
+    supervisor.unload("gamma")
+
+    unloaded: list[str] = []
+    decisions = iter([_no_fit(needed=100, free=90, margin=0)])
+
+    coordinator = LoadCoordinator(
+        supervisor,
+        assess=lambda record: next(decisions, _fits()),
+        unload=lambda name: (unloaded.append(name), supervisor.unload(name))[1],
+        min_hot_s=0.0,
+        max_evictions=2,
+        sleep=lambda seconds: None,
+    )
+    record = coordinator.load("gamma")
+
+    assert record.state == LifecycleState.READY
+    assert unloaded == ["alpha"]  # unchanged: evict-to-fit inside the budget
+
+
+def test_assess_fit_marks_a_reading_that_is_already_over_budget(tmp_path: Path) -> None:
+    """Where the flag comes from: the reading, not the caller.
+
+    Needs a PRICEABLE model: an unpriceable one fails open before the node is
+    ever measured, and that contract is unchanged here -- a node over budget
+    still admits a model whose footprint cannot be predicted. Worth knowing,
+    and out of scope to change.
+    """
+    from docie_bench.serving.resources import NodeMemory
+
+    gib = 1024**3
+    over = NodeMemory(
+        total_bytes=6 * gib,
+        free_bytes=0,
+        source="cgroup",
+        budget_bytes=6 * gib,
+        working_set_bytes=9 * gib,
+    )
+    inside = NodeMemory(
+        total_bytes=6 * gib,
+        free_bytes=4 * gib,
+        source="cgroup",
+        budget_bytes=6 * gib,
+        working_set_bytes=2 * gib,
+    )
+    gguf = tmp_path / "delta.gguf"
+    gguf.write_bytes(b"g" * 4096)
+    record = DeploymentRecord(
+        spec=DeploymentSpec(
+            name="delta",
+            launch=RuntimeLaunchSpec(
+                runtime=RuntimeKind.LLAMACPP, model=str(gguf), alias="delta", port=8099
+            ),
+        )
+    )
+
+    assert assess_fit(record, memory_reader=lambda: over).over_budget is True
+    assert assess_fit(record, memory_reader=lambda: inside).over_budget is False
