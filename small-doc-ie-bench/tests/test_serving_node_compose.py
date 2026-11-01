@@ -334,3 +334,15 @@ def test_the_migration_is_documented_where_the_variable_is(
 
     assert "DOCIE_MODEL_STORE_DIR" in text
     assert "fleet-runbook.md" in text, "the migration procedure must be pointed at"
+
+
+def test_a_generated_node_id_is_not_offered_without_its_condition() -> None:
+    """``node_id`` is the one thing in the state volume that cannot be
+    rebuilt, so the example must not present generation as unconditionally
+    safe: where the volume can be replaced, a generated id is replaced with
+    it and the node's catalog rows are orphaned."""
+    text = NODE_ENV_EXAMPLE.read_text(encoding="utf-8")
+    identity = text.split("--- Node identity")[1].split("# ---")[0]
+
+    assert "SET IT EXPLICITLY" in identity
+    assert "orphaned" in identity

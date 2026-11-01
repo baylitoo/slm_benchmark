@@ -106,6 +106,13 @@ Three things, and nothing else:
 - its own **`DOCIE_SERVING_HOME`** volume, which must never be shared
   between machines.
 
+Of what that volume holds, only `node_id` cannot be rebuilt. Everything else
+reconverges: `deployments.json` from the desired state in the catalog, the
+weights from a seed. So when the volume's lifecycle belongs to something other
+than you — a PaaS, an orchestrator, an infrastructure-as-code run — set
+`DOCIE_SERVING_NODE_ID` in the node's `.env` and the identity stops depending
+on the volume surviving.
+
 Those three are durable. The **model weights are not** — they can be seeded
 or pulled again.
 
@@ -251,6 +258,7 @@ leaves that model's requests going to a machine that is off.
 | A model deploys fine centrally but fails on one node | Its blob is not seeded there. The doctor lists what is missing. |
 | A node's replica holds RAM but takes no traffic | Duplicate node id: another node's publish overwrote its placement row. |
 | The doctor reports `no node id could be resolved` | The `node_id` file in the serving home is there but unreadable (failing volume, wrong ownership). The node refuses to mint a second identity rather than orphan the rows the old one owns, so repair the volume -- deleting the file is what loses them. |
+| A node rejoins as new after a platform redeploy, leaving its old row behind | Its state volume was replaced, so a generated `node_id` was regenerated. Set `DOCIE_SERVING_NODE_ID` explicitly, then delete the orphaned deployments. |
 | Every deploy on a node fails to allocate a port | Something outside the container holds the published window. |
 | A node flaps between reporting and not | Clock skew between it and the central API, or a reconcile interval longer than the staleness window. |
 | A `store` command exits on a store index lock timeout | A seed job or another `store` command on that node still holds `.index.lock`. Wait for it, or look for a stuck seed. |
