@@ -339,6 +339,38 @@ FAMILIES: dict[str, FamilyContract] = {
         default_timeout_seconds=600.0,  # vision on CPU is slow
         ollama_faithful=False,
     ),
+    # Xiaomi-OCR-0: one vision GGUF that does BOTH free-text OCR and
+    # schema-driven key information extraction, depending only on how it is
+    # prompted. The family declares the extraction contract, because that is
+    # the one the ExtractionService reads; the OCR mode is reached by the
+    # `xiaomi` OCR backend, which talks to the same deployment and sends its
+    # own unconstrained request. One deployment, two callers -- nothing here
+    # has to switch modes, which is why this needs no new concept.
+    #
+    # prompt_profile is NOT strict_extraction_v1: the model was trained on a
+    # documented phrasing carrying a key skeleton rather than a JSON Schema,
+    # and the generic vision prompt sends the latter. The schema still rides
+    # response_format, so the grammar constrains the answer in both cases --
+    # the profile changes the wording, not the contract.
+    #
+    # Runtime support is a separate gate, as for every vision family: the
+    # published GGUFs are community conversions of a qwen35-based model, built
+    # with a llama.cpp older than the pinned LLAMA_REF, so the pinned engine
+    # reads them. Xiaomi has not evaluated those conversions.
+    "xiaomi_ocr": FamilyContract(
+        name="xiaomi_ocr",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="xiaomi_kie_v1",
+        llama_server_args=("--jinja",),
+        needs_mmproj=True,
+        vision=True,
+        structured_extraction=True,
+        default_temperature=0.0,
+        default_max_tokens=4096,
+        default_timeout_seconds=600.0,
+        ollama_faithful=False,
+    ),
     # Embedding models (LFM2.5-Embedding-350M, or any GGUF embedding model).
     # llama-server exposes /v1/embeddings when launched with --embedding; mean
     # pooling is the standard sentence-embedding reduction. No template, no
