@@ -49,7 +49,13 @@ services:
         # INSIDE this container and need the analyzer library.
         PIP_EXTRAS: "ocr,encoders"
         INSTALL_EMBEDDINGS: "true"
-        LLAMA_REF: ${LLAMA_REF:-}
+        # The same pinned commit the central stack builds from, for the same
+        # reason an override there "must retain both": a node whose engine
+        # differs from the rest of the fleet answers differently for the same
+        # model, and nothing reports it. Empty here meant master HEAD on the
+        # day the node was built, so two nodes added a month apart ran
+        # different engines.
+        LLAMA_REF: ${LLAMA_REF:-19ff817fb25e9a1b838b1d7f9f4325f7bf9779c4}
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:

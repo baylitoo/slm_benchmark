@@ -153,12 +153,19 @@ def test_the_image_is_built_the_same_way_as_the_central_serving_service(
     node: dict[str, Any], central: dict[str, Any]
 ) -> None:
     """Encoder deployments spawn inside the container, so a node missing the
-    extras would accept an encoder deploy and fail at launch."""
+    extras would accept an encoder deploy and fail at launch.
+
+    ``LLAMA_REF`` is here for a different failure: it decides the inference
+    engine, and an empty default resolves to whatever llama.cpp master was on
+    the day that node happened to be built. Nodes added weeks apart would then
+    answer the same model differently, with nothing to report it.
+    """
     assert node["build"]["dockerfile"] == central["build"]["dockerfile"]
     assert node["build"]["args"]["PIP_EXTRAS"] == central["build"]["args"]["PIP_EXTRAS"]
     assert node["build"]["args"]["INSTALL_EMBEDDINGS"] == (
         central["build"]["args"]["INSTALL_EMBEDDINGS"]
     )
+    assert node["build"]["args"]["LLAMA_REF"] == central["build"]["args"]["LLAMA_REF"]
 
 
 @pytest.mark.parametrize(
