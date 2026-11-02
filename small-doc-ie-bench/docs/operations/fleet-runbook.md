@@ -1,7 +1,9 @@
 # Fleet runbook: adding, checking and removing a serving node
 
 Operating a multi-node fleet (#538). For *how* the pieces work, read
-{doc}`../architecture/serving`; this page is the sequence of things you do.
+{doc}`../architecture/serving`; for the order to do things in the first time,
+including turning an existing single machine into the first node, read
+{doc}`fleet-cookbook`. This page is the per-task reference.
 
 The single most useful thing on this page is
 [`docie-serving doctor`](#check-the-node-before-it-takes-traffic). Most of what
