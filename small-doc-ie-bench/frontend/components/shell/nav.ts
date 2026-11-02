@@ -29,6 +29,7 @@ import {
   Wrench,
   KeyRound,
   Network,
+  GitBranch,
   type LucideIcon,
 } from "lucide-react";
 
@@ -41,6 +42,7 @@ export type SectionId =
   | "review"
   | "observability"
   | "fleet"
+  | "routing"
   | "api-keys";
 
 export interface NavItem {
@@ -88,6 +90,10 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     heading: "Benchmark",
     items: [
+      // Above Run on purpose: a policy is a thing you build once and then
+      // select, so it belongs beside the runs that consume it rather than
+      // buried in the run form that needed one.
+      { id: "routing", label: "Routing", icon: GitBranch },
       { id: "benchmark", label: "Run", icon: Play, view: "run" },
       { id: "benchmark", label: "Results", icon: History, view: "results" },
       { id: "benchmark", label: "Batch", icon: FileStack, view: "batch" },
@@ -125,6 +131,7 @@ export const SECTIONS: SectionId[] = [
   "review",
   "observability",
   "fleet",
+  "routing",
   "api-keys",
 ];
 
@@ -138,5 +145,6 @@ export const DEFAULT_VIEW: Record<SectionId, string> = {
   review: "",
   observability: "",
   fleet: "",
+  routing: "",
   "api-keys": "",
 };

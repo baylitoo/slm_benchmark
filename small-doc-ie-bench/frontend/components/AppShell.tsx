@@ -12,6 +12,7 @@ import { Review } from "./Review";
 import { Observability } from "./Observability";
 import { ApiKeys } from "./ApiKeys";
 import { Fleet } from "./Fleet";
+import { Routing } from "./Routing";
 import { Sidebar } from "./shell/Sidebar";
 import { TopBar } from "./shell/TopBar";
 import { SectionActivityProvider } from "./shell/SectionActivity";
@@ -119,6 +120,7 @@ export function AppShell() {
                   {id === "schemas" && <Schemas />}
                   {id === "review" && <Review active={active === "review"} />}
                   {id === "fleet" && <Fleet active={active === "fleet"} />}
+                  {id === "routing" && <Routing active={active === "routing"} />}
                   {id === "api-keys" && <ApiKeys active={active === "api-keys"} />}
                   {id === "observability" && (
                     <Observability active={active === "observability"} onNavigate={onNavigate} />
