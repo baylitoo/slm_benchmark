@@ -90,7 +90,8 @@ else.
 reach models over HTTP. **Never scale `serving`.** It holds the model processes
 and the desired-state file, and a second one refuses to start rather than fight
 the first. More serving capacity means another node — see
-{doc}`fleet-runbook`.
+{doc}`fleet-cookbook` for the sequence and {doc}`fleet-runbook` for the
+per-node tasks.
 
 ## Developing without Docker
 

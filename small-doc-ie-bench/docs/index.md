@@ -25,6 +25,7 @@ architecture/auth
 operations/getting-started
 operations/studio
 operations/security
+operations/fleet-cookbook
 operations/fleet-runbook
 ```
 
