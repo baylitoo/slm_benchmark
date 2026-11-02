@@ -331,30 +331,42 @@ services:
   # real server rather than a mock -- how botocore reports a missing key versus
   # a denied one is exactly what a directory-backed double cannot tell you.
   #
-  # Not MinIO, which is no longer installable: its community images were
-  # withdrawn from Docker Hub and quay.io (minio/minio#21647) and dl.min.io
-  # answers 410 Gone. LocalStack's image now requires a licence token. s3mock
-  # is a real HTTP S3 server, so botocore's own paths are exercised, but it
-  # does not validate signatures -- the credential-denial test detects that
-  # and skips rather than asserting something vacuous.
+  # RustFS, because the credential half of that question needs a server that
+  # actually validates signatures. It answers InvalidAccessKeyId for an unknown
+  # key and SignatureDoesNotMatch for a wrong secret -- AWS's own taxonomy, so
+  # an assertion here means the same thing against a production bucket. It is
+  # also what this repository is expected to run against: MinIO's community
+  # images were withdrawn (minio/minio#21647) and dl.min.io answers 410 Gone,
+  # and LocalStack's image now requires a licence token.
   #
-  #   docker compose --profile s3mock up -d s3mock
-  #   export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9090
+  #   docker compose --profile s3 up -d rustfs
+  #   export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9000
   #   export DOCIE_TEST_S3_BUCKET=docie-test
-  #   export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+  #   export AWS_ACCESS_KEY_ID=docietestkey
+  #   export AWS_SECRET_ACCESS_KEY=docietestsecret0123456789
   #   export AWS_DEFAULT_REGION=us-east-1
   #   pytest tests/test_model_repository_s3_integration.py -v
   #
-  # DOCIE_TEST_S3_ENDPOINT_URL accepts any S3-compatible server, so a
-  # self-hosted MinIO or a scratch bucket runs the same file unchanged.
-  s3mock:
-    image: adobe/s3mock:5.2.3
-    profiles: ["s3mock"]
+  # No volume: /data lives in the container layer, so `down` takes the test
+  # objects with it. The credentials are fixtures, not secrets -- the server
+  # listens on loopback and holds nothing but what the suite writes.
+  #
+  # DOCIE_TEST_S3_ENDPOINT_URL accepts any S3-compatible server, so a bucket on
+  # the fleet's own RustFS, or a scratch bucket anywhere, runs the file
+  # unchanged.
+  rustfs:
+    image: rustfs/rustfs:1.0.4
+    profiles: ["s3"]
     environment:
-      initialBuckets: docie-test
-      retainFilesOnExit: "false"
+      RUSTFS_ACCESS_KEY: docietestkey
+      RUSTFS_SECRET_KEY: docietestsecret0123456789
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      # The browser console is off by default: this service exists for pytest.
+      # Set it to true and publish 9001 to inspect blobs by hand.
+      RUSTFS_CONSOLE_ENABLE: "false"
     ports:
-      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:9000:9000"
 
   # Local CPU GGUF server. Bring your own model at ./models/model.gguf or set MODEL_PATH.
   # This uses llama-cpp-python's OpenAI-compatible server, not an external SaaS endpoint.

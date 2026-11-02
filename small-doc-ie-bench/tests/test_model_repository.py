@@ -3,7 +3,7 @@
 Run against a directory rather than a bucket, on purpose: these are the
 repository's RULES -- publication order, deduplication, verification, what
 counts as published -- and they should be provable without a network. The
-MinIO integration test exists to prove the S3 adapter, not this logic.
+live-server integration test exists to prove the S3 adapter, not this logic.
 
 The property most of these circle is the decided one:
 

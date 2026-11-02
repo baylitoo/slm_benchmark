@@ -436,7 +436,7 @@ class LocalObjectStore:
 
     Not a test double for its own sake: it makes every rule in
     ``ModelRepository`` -- publication order, dedup, verification, what counts
-    as published -- testable without a network, so the MinIO run is left to
+    as published -- testable without a network, so the live-server run is left to
     prove the S3 adapter rather than the logic.
     """
 
@@ -504,7 +504,7 @@ class LocalObjectStore:
 
 
 class S3ObjectStore:
-    """An S3-compatible bucket (AWS, MinIO, R2, B2).
+    """An S3-compatible bucket (AWS, RustFS, R2, B2).
 
     ``boto3`` is imported lazily and is an optional dependency: a deployment
     that never configures a repository must not be forced to install it, and

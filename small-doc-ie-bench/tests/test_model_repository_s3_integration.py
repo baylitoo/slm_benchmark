@@ -14,20 +14,23 @@ real bucket would have it create and delete objects there.
 
 To run it::
 
-    docker compose --profile s3mock up -d s3mock
-    export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9090
+    docker compose --profile s3 up -d rustfs
+    export DOCIE_TEST_S3_ENDPOINT_URL=http://localhost:9000
     export DOCIE_TEST_S3_BUCKET=docie-test
-    export AWS_ACCESS_KEY_ID=test
-    export AWS_SECRET_ACCESS_KEY=test
+    export AWS_ACCESS_KEY_ID=docietestkey
+    export AWS_SECRET_ACCESS_KEY=docietestsecret0123456789
     export AWS_DEFAULT_REGION=us-east-1
     pytest tests/test_model_repository_s3_integration.py -v
 
 No production bucket or credentials are needed; the compose profile brings up
-a throwaway server. Any S3-compatible endpoint works -- point the variable at
-a self-hosted MinIO or a scratch bucket and the file runs unchanged. A server
-that does not validate signatures skips the credential-denial test instead of
-failing it, so what a given server actually proved stays visible in pytest's
-summary.
+a throwaway RustFS. Any S3-compatible endpoint works -- point the variable at
+a bucket on the fleet's own server and the file runs unchanged.
+
+The server has to validate signatures for this file to mean what it says: a
+double that accepts any key cannot tell a denied request from a missing one,
+which is the distinction this module exists to pin. So the credential test
+asserts rather than establishing-then-skipping, and a server that lets the
+wrong secret through fails here instead of quietly proving nothing.
 """
 
 from __future__ import annotations
@@ -71,7 +74,7 @@ def _client(**overrides: str):
 
 @pytest.fixture(scope="module")
 def bucket() -> str:
-    """Make sure the bucket exists; MinIO starts empty."""
+    """Make sure the bucket exists; a fresh server starts empty."""
     client = _client()
     try:
         client.head_bucket(Bucket=BUCKET)
@@ -237,24 +240,13 @@ def test_a_substituted_blob_fails_its_digest_check(
 def test_bad_credentials_surface_as_a_repository_error(bucket: str) -> None:
     """Denied access must not look like "not published".
 
-    Only meaningful against a server that validates signatures. Several
-    S3-compatible servers accept any key, and there a passing assertion would
-    prove nothing, so the rejection is established first and the test skips
-    when it cannot be.
-    """
-    probe = _client(
-        aws_access_key_id="wrong",
-        aws_secret_access_key="also-wrong",  # noqa: S106 - wrong on purpose
-    )
-    try:
-        probe.list_objects_v2(Bucket=bucket, MaxKeys=1)
-    except Exception:  # noqa: BLE001 - any rejection is enough
-        rejected = True
-    else:
-        rejected = False
-    if not rejected:
-        pytest.skip("this server accepts any credentials; nothing to assert")
+    The two are a 403 and a 404 on the wire, and the repository has to keep
+    them apart: a denied listing reported as "nothing published" would have a
+    node conclude the catalog is empty and a deploy fail for the wrong reason.
 
+    This asserts unconditionally. A server that accepts any key fails it, which
+    is correct -- it cannot answer the question the module was written to ask.
+    """
     store = S3ObjectStore(
         bucket,
         client=_client(
