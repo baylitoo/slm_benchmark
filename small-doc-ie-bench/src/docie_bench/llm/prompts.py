@@ -423,6 +423,7 @@ def build_xiaomi_kie_prompts(
         "Please output the key information in JSON format according to the "
         f"following schema:\n{skeleton}"
     )
+    instruction = _with_field_notes(instruction, schema)
     if has_images:
         return "", instruction
     return "", (
@@ -434,6 +435,68 @@ def build_xiaomi_kie_prompts(
 
 
 MISSING_FIELD_SENTINEL = "###"
+
+
+def render_field_notes(schema: dict[str, Any], prefix: str = "") -> str:
+    """Every described field, path-qualified, one per line -- or "".
+
+    A grammar constrains SHAPE; it carries no meaning. ``description`` is
+    the only channel a schema has for what a field means, and the models
+    with their own documented key formats have no slot for it -- a key
+    skeleton and an inline key list both say what the fields are CALLED and
+    nothing about what belongs in them.
+
+    That is survivable for ``invoice_number`` and not for a schema whose
+    fields are distinguished only by their descriptions: ``company`` versus
+    ``end_client`` versus ``via`` are three strings in the same object, and
+    without the prose the model fills each with whatever text sits nearest.
+
+    Paths are qualified (``experience[].title``) because a nested name can
+    repeat with a DIFFERENT meaning -- a resume's top-level ``title`` is the
+    headline role and ``experience[].title`` is the role on one mission, and
+    the schema says so in two descriptions that would otherwise collide.
+
+    Empty when nothing is described, so a schema with no prose leaves the
+    model's documented prompt format exactly as it was.
+    """
+    props = _structured_branch(schema).get("properties")
+    if not isinstance(props, dict):
+        return ""
+    lines: list[str] = []
+    for name, raw in props.items():
+        if not isinstance(raw, dict):
+            continue
+        node = _structured_branch(raw)
+        types = _node_types(raw)
+        desc = raw.get("description") or node.get("description")
+        items = node.get("items") if "array" in types else None
+        nested = isinstance(items, dict) and _structured_branch(items).get("properties")
+        path = f"{prefix}{name}"
+        if isinstance(desc, str) and desc:
+            lines.append(f"{path}: {desc}")
+        if nested:
+            inner = render_field_notes(items, f"{path}[].")
+            if inner:
+                lines.append(inner)
+        elif "object" in types and isinstance(node.get("properties"), dict):
+            inner = render_field_notes(node, f"{path}.")
+            if inner:
+                lines.append(inner)
+    return "\n".join(lines)
+
+
+def _with_field_notes(instruction: str, schema: dict[str, Any]) -> str:
+    """Append the described fields, or return the instruction untouched.
+
+    Appended rather than substituted: the key skeleton and the inline key
+    list are the formats these models were TRAINED on, and replacing them
+    trades a known-good framing for prose. The notes are an annotation on
+    that framing, not a different prompt.
+    """
+    notes = render_field_notes(schema)
+    if not notes:
+        return instruction
+    return f"{instruction}\n\nWhat each field means:\n{notes}"
 
 
 def build_minicpm_kie_prompts(
@@ -462,6 +525,7 @@ def build_minicpm_kie_prompts(
         f"Format the output as a JSON object with keys: {quoted}. "
         f'If an item is not in the image, use "{MISSING_FIELD_SENTINEL}".'
     )
+    instruction = _with_field_notes(instruction, schema)
     if has_images:
         return "", instruction
     return "", (
