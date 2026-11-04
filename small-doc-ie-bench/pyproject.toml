@@ -51,6 +51,12 @@ ocr = [
 paddle = [
   "paddleocr>=2.8.0"
 ]
+# The shared model repository (#595). Optional: a single-machine deployment
+# never contacts a bucket, and boto3 is imported lazily so its absence is an
+# actionable message rather than an import error at startup.
+s3 = [
+  "boto3>=1.35"
+]
 encoders = [
   "gliner>=0.2.13",
   "gliner2[local]",
