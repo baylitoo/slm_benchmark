@@ -141,6 +141,12 @@ class FamilyContract:
     default_timeout_seconds: float = 180.0
     # Can Ollama serve this family *faithfully* (respecting its template)?
     # False for CHAT_TEMPLATE_KWARGS families: Ollama drops chat_template_kwargs.
+    #: This checkpoint was trained to reason, and suppressing it degrades the
+    #: answer rather than merely shortening it -- reasoning leaks into the JSON
+    #: instead of preceding it. Declared by the family because a
+    #: store-deployed model has no models.yaml entry to carry the option.
+    native_reasoning: bool = False
+
     ollama_faithful: bool = True
 
     @property
@@ -266,8 +272,13 @@ FAMILIES: dict[str, FamilyContract] = {
     # thinks by default but honours enable_thinking=False, which extraction
     # always sends, so it is not an always-thinking checkpoint
     # (llm/reasoning.py).
+    # Reasoning stays ON, extraction included. The model card warns against
+    # disabling it and the symptom when it is disabled is not a shorter answer
+    # but a wrong one -- the reasoning appears INSIDE the JSON instead of
+    # before it, because the template has nowhere else to put it.
     "lfm3": FamilyContract(
         name="lfm3",
+        native_reasoning=True,
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",
@@ -304,8 +315,13 @@ FAMILIES: dict[str, FamilyContract] = {
     # LiquidAI LFM3-VL (2B): the LFM3 backbone plus a projector. Its GGUF
     # reports "lfm3", promoted here by the mmproj (arch_registry
     # TEXT_ARCH_TO_VISION_FAMILY). Mirrors lfm2_vl.
+    # Reasoning stays ON, extraction included. The model card warns against
+    # disabling it and the symptom when it is disabled is not a shorter answer
+    # but a wrong one -- the reasoning appears INSIDE the JSON instead of
+    # before it, because the template has nowhere else to put it.
     "lfm3_vl": FamilyContract(
         name="lfm3_vl",
+        native_reasoning=True,
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",

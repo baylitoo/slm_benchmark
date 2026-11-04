@@ -83,6 +83,7 @@ class _Traits:
     temperature: float = 0.0
     max_tokens: int = 900
     timeout_seconds: float = 180.0
+    native_reasoning: bool = False
 
 
 def _default_live_deployments() -> list[DeploymentRecord]:
@@ -227,6 +228,7 @@ def _family_traits(name: str) -> _Traits | None:
         temperature=family.default_temperature,
         max_tokens=family.default_max_tokens,
         timeout_seconds=family.default_timeout_seconds,
+        native_reasoning=family.native_reasoning,
     )
 
 
@@ -281,6 +283,10 @@ def _synthesize_profile(
         max_tokens=launch.max_tokens or traits.max_tokens,
         timeout_seconds=launch.timeout_seconds or traits.timeout_seconds,
         deployment_slot_count=launch.n_parallel,
+        # Reuses the option `uses_native_reasoning` already honours, so a
+        # family-declared checkpoint and a models.yaml-declared one reach
+        # every caller through one path rather than two.
+        options={"native_reasoning": True} if traits.native_reasoning else {},
     )
 
 

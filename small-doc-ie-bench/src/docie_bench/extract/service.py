@@ -756,7 +756,16 @@ class ExtractionService:
         # build_response_format's own extra_body (see build_payload), so
         # overriding "template" here for this one case is enough -- the
         # static-schema path (nuextract_template is None) is untouched.
-        extra_template_kwargs: dict[str, Any] = {"enable_thinking": False}
+        # Extraction used to suppress thinking unconditionally. For a
+        # checkpoint TRAINED to reason that is not a shorter answer but a wrong
+        # one: the template has nowhere to put the reasoning, so it appears
+        # inside the JSON rather than before it. `_clean_content` already
+        # strips a <think> block, so letting such a model think costs tokens
+        # and buys back the behaviour it was trained with.
+        #
+        # An explicit `disable_thinking` still wins -- the operator asked.
+        think = uses_native_reasoning(self.profile) and not self.disable_thinking
+        extra_template_kwargs: dict[str, Any] = {"enable_thinking": think}
         if self.profile.prompt_profile == "nuextract3" and nuextract_template is not None:
             extra_template_kwargs["template"] = json.dumps(
                 nuextract_template, ensure_ascii=False
@@ -773,9 +782,16 @@ class ExtractionService:
                 # LFM2.5-2.6B's template opens <think> unconditionally and
                 # ignores enable_thinking; continuing an assistant JSON turn is
                 # the only thing that skips it. Extraction never wants thinking.
+                # Prefilling an open brace is how thinking is actually
+                # ENFORCED off for a template that opens <think> regardless of
+                # the flag -- continuing an assistant JSON turn is the only
+                # thing that skips it. So it must not be sent when thinking is
+                # wanted: it would truncate the reasoning the model was told to
+                # produce, which is the bug this whole change exists to undo.
                 assistant_prefill=(
                     "{"
                     if self.profile.prompt_profile == "strict_extraction_v1"
+                    and not think
                     and (self.disable_thinking or uses_native_reasoning(self.profile))
                     else None
                 ),
