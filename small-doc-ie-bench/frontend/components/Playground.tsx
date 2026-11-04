@@ -622,7 +622,7 @@ export function ChatPanel({
 
   const {
     containerRef: transcriptRef,
-    onScroll: onTranscriptScroll,
+    handlers: transcriptHandlers,
     pin: pinTranscript,
   } = useStickToBottom<HTMLDivElement>([msgs, busy]);
 
@@ -1550,7 +1550,11 @@ export function ChatPanel({
 
         <div
           ref={transcriptRef}
-          onScroll={onTranscriptScroll}
+          {...transcriptHandlers}
+          // tabIndex so the navigation keys reach onKeyDown: a div is not
+          // focusable by default, and PageUp on an unfocusable element never
+          // tells us the reader moved.
+          tabIndex={-1}
           className="scroll-thin max-h-[50vh] min-h-40 space-y-3 overflow-y-auto rounded-md border border-border bg-muted/20 p-4"
         >
           {msgs.length === 0 && (
@@ -2156,7 +2160,7 @@ export function ArenaPanel({
 
   const {
     containerRef: transcriptRef,
-    onScroll: onTranscriptScroll,
+    handlers: transcriptHandlers,
     pin: pinTranscript,
   } = useStickToBottom<HTMLDivElement>([turns, busy]);
 
@@ -2320,7 +2324,8 @@ export function ArenaPanel({
 
         <div
           ref={transcriptRef}
-          onScroll={onTranscriptScroll}
+          {...transcriptHandlers}
+          tabIndex={-1}
           className="scroll-thin max-h-[55vh] min-h-40 space-y-4 overflow-y-auto rounded-md border border-border bg-muted/20 p-4"
         >
           {turns.length === 0 && (
