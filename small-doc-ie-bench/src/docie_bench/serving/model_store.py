@@ -141,6 +141,19 @@ class FamilyContract:
     default_timeout_seconds: float = 180.0
     # Can Ollama serve this family *faithfully* (respecting its template)?
     # False for CHAT_TEMPLATE_KWARGS families: Ollama drops chat_template_kwargs.
+    #: Keep reasoning ON during EXTRACTION for this family.
+    #:
+    #: Deliberately NOT the same question as ``uses_native_reasoning``, which
+    #: asks whether a template always opens a think block. LFM2.5-2.6B answers
+    #: yes to that and is still suppressed here, by prefilling an open brace --
+    #: a decision this repo already made and tests. This flag is the policy:
+    #: suppressing THIS family degrades the answer rather than shortening it,
+    #: because the reasoning ends up inside the JSON instead of before it.
+    #:
+    #: Declared by the family because a store-deployed model has no models.yaml
+    #: entry to carry an option.
+    reasoning_during_extraction: bool = False
+
     ollama_faithful: bool = True
 
     @property
@@ -266,8 +279,13 @@ FAMILIES: dict[str, FamilyContract] = {
     # thinks by default but honours enable_thinking=False, which extraction
     # always sends, so it is not an always-thinking checkpoint
     # (llm/reasoning.py).
+    # Reasoning stays ON, extraction included. The model card warns against
+    # disabling it and the symptom when it is disabled is not a shorter answer
+    # but a wrong one -- the reasoning appears INSIDE the JSON instead of
+    # before it, because the template has nowhere else to put it.
     "lfm3": FamilyContract(
         name="lfm3",
+        reasoning_during_extraction=True,
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",
@@ -304,8 +322,13 @@ FAMILIES: dict[str, FamilyContract] = {
     # LiquidAI LFM3-VL (2B): the LFM3 backbone plus a projector. Its GGUF
     # reports "lfm3", promoted here by the mmproj (arch_registry
     # TEXT_ARCH_TO_VISION_FAMILY). Mirrors lfm2_vl.
+    # Reasoning stays ON, extraction included. The model card warns against
+    # disabling it and the symptom when it is disabled is not a shorter answer
+    # but a wrong one -- the reasoning appears INSIDE the JSON instead of
+    # before it, because the template has nowhere else to put it.
     "lfm3_vl": FamilyContract(
         name="lfm3_vl",
+        reasoning_during_extraction=True,
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",

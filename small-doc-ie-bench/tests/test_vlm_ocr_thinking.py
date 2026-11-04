@@ -1,11 +1,13 @@
 """VLM OCR transcription never asks the model to think.
 
-``_extract_group`` sends ``enable_thinking: False`` unconditionally, because
-extraction never wants thinking. Transcription has the same property for a
-stronger reason -- it asks for a verbatim transcript -- but the suppression was
-conditional there, and the condition read the wrong profile: the gate consulted
-the PIPELINE profile's options while the request goes to the ``ocr_model``
-vision deployment.
+Transcription asks for a verbatim transcript, so it suppresses thinking for
+every model without exception -- including the checkpoints that keep reasoning
+during extraction, where a reasoning trace is strippable and here it would be
+transcript the document never contained.
+
+The suppression used to be conditional, and the condition read the wrong
+profile: the gate consulted the PIPELINE profile's options while the request
+goes to the ``ocr_model`` vision deployment.
 """
 
 from __future__ import annotations
