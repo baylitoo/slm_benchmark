@@ -88,6 +88,12 @@ class FitDecision:
     free_bytes: int | None
     margin_bytes: int
     reason: str
+    #: This node's working set is already at or past its soft budget (#539).
+    #: Admission then REFUSES rather than evicting to fit: the budget is
+    #: DocIE's declared share of a shared host, and typing a smaller number
+    #: must not unload models as a side effect. Freeing memory under a budget
+    #: is an explicit operator action, never a consequence of the next load.
+    over_budget: bool = False
 
 
 def mmproj_bytes_from_launch(launch: RuntimeLaunchSpec) -> int:
@@ -182,9 +188,16 @@ def assess_fit(
         else get_settings().serving_sizing_margin_fraction
     )
     margin = safety_margin_bytes(memory.total_bytes, fraction)
+    over_budget = memory.over_budget_bytes > 0
     if memory.free_bytes - margin < needed:
         provenance = (
             "measured" if calibrated is not None and calibrated >= predicted else "estimated"
+        )
+        budget_note = (
+            f"; this node is {memory.over_budget_bytes} bytes OVER its "
+            f"{memory.budget_bytes}-byte memory budget"
+            if over_budget
+            else ""
         )
         return FitDecision(
             False,
@@ -194,10 +207,11 @@ def assess_fit(
             (
                 f"needs ~{needed} bytes ({provenance}) but only {memory.free_bytes} "
                 f"free minus the {margin}-byte safety margin leaves "
-                f"{memory.free_bytes - margin} available"
+                f"{memory.free_bytes - margin} available{budget_note}"
             ),
+            over_budget=over_budget,
         )
-    return FitDecision(True, needed, memory.free_bytes, margin, "")
+    return FitDecision(True, needed, memory.free_bytes, margin, "", over_budget=over_budget)
 
 
 def load_timeout_s(
@@ -466,6 +480,17 @@ class LoadCoordinator:
         effective_free = decision.free_bytes - reserved
         if effective_free - decision.margin_bytes >= decision.needed_bytes:
             return decision
+        if decision.over_budget:
+            # Refuse rather than evict. The node is past the share its operator
+            # declared for DocIE on this shared host, and reclaiming room by
+            # unloading other deployments would make a budget edit silently
+            # cost a cold start on the next request to whatever it evicted.
+            # Already-loaded models keep serving; the overage is reported.
+            raise LoadError(
+                f"deployment {name!r} is refused: this node is over its memory "
+                f"budget and nothing was unloaded. Raise the budget, or unload a "
+                f"deployment explicitly. {decision.reason}"
+            )
         deficit = decision.needed_bytes + decision.margin_bytes - effective_free
         min_hot_s, max_evictions = self._eviction_knobs()
         with self.supervisor.lock:
