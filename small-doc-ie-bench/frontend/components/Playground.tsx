@@ -1579,18 +1579,34 @@ export function ChatPanel({
                     // phone a two-column split makes each one too narrow to
                     // use, so the page goes above the output rather than
                     // beside it.
-                    m.document?.preview
+                    m.document
                       ? "grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]"
                       : "block",
                   )}
                 >
-                  {m.document?.preview && (
-                    <figure className="min-w-0 lg:sticky lg:top-2 lg:self-start">
-                      <img
-                        src={m.document.preview}
-                        alt={m.document.name}
-                        className="max-h-[70vh] w-full rounded border border-border object-contain"
-                      />
+                  {m.document && (
+                    <figure className="min-w-0">
+                      {m.document.preview ? (
+                        <img
+                          src={m.document.preview}
+                          alt={m.document.name}
+                          // max-h-64 matches the live-output pane beside it.
+                          // 70vh was taller than the transcript's own 50vh
+                          // scrollport, so one card filled the window and
+                          // scrolling it only ever revealed more of the same
+                          // image. Nothing sticky either: a figure as tall as
+                          // the scrollport has nowhere to stick to.
+                          className="max-h-64 w-full rounded border border-border bg-muted/30 object-contain"
+                        />
+                      ) : (
+                        // A PDF rasterizes asynchronously, so a fast Run can
+                        // reach here before the page exists. Naming the file
+                        // beats showing nothing, which reads as the feature
+                        // being broken.
+                        <div className="flex h-24 items-center justify-center rounded border border-dashed border-border text-xs text-muted-foreground">
+                          <T>No preview for this file</T>
+                        </div>
+                      )}
                       <figcaption className="mt-1 truncate text-xs text-muted-foreground">
                         {m.document.name}
                         {m.document.totalPages && m.document.totalPages > 1 ? (
