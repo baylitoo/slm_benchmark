@@ -264,7 +264,8 @@ class Settings(BaseSettings):
             "DOCIE_MODEL_STORE_S3_BUCKET", "model_store_s3_bucket"
         ),
     )
-    # Set for MinIO, R2 or B2; left unset for AWS S3 itself.
+    # Set for a self-hosted server (RustFS, Garage, SeaweedFS) or for R2 or
+    # B2; left unset for AWS S3 itself.
     model_store_s3_endpoint_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
