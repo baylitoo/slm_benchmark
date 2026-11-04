@@ -68,6 +68,7 @@ import {
   type SamplingParams,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
+import { useStickToBottom } from "@/lib/useStickToBottom";
 import { useAsync } from "@/lib/useAsync";
 import { cn } from "@/lib/cn";
 import { T, useI18n } from "@/lib/i18n";
@@ -417,7 +418,6 @@ export function ChatPanel({
   const [awaitingInput, setAwaitingInput] = useState<AgentAwaitingInputTrace | null>(null);
   const [answerText, setAnswerText] = useState("");
   const [respondBusy, setRespondBusy] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Index of a user message currently being edited (its content is loaded
   // into the main input box). null when nothing is being edited. Consumed by
@@ -620,9 +620,11 @@ export function ChatPanel({
   const [parallelExtraction, setParallelExtraction] = useState(false);
   const [responseFormatStyle, setResponseFormatStyle] = useState("");
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [msgs, busy]);
+  const {
+    containerRef: transcriptRef,
+    onScroll: onTranscriptScroll,
+    pin: pinTranscript,
+  } = useStickToBottom<HTMLDivElement>([msgs, busy]);
 
   function isPdfFile(f: File): boolean {
     return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
@@ -718,6 +720,9 @@ export function ChatPanel({
           .filter((p): p is string => typeof p === "string" && p.startsWith("blob:")),
       ),
     );
+    // Sending is an explicit "show me what happens next", so it re-pins even
+    // if the reader had scrolled up to check something earlier.
+    pinTranscript();
     setBusy(true);
 
     // Every job's user turn + live extraction placeholder is appended up
@@ -904,6 +909,9 @@ export function ChatPanel({
     setInput("");
     setEditingIndex(null);
     clearAttachments();
+    // Sending is an explicit "show me what happens next", so it re-pins even
+    // if the reader had scrolled up to check something earlier.
+    pinTranscript();
     setBusy(true);
     const payload = [
       ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
@@ -925,6 +933,9 @@ export function ChatPanel({
     const last = lastRequestRef.current;
     if (!last) return;
     setError(null);
+    // Sending is an explicit "show me what happens next", so it re-pins even
+    // if the reader had scrolled up to check something earlier.
+    pinTranscript();
     setBusy(true);
     await attempt(last.next, last.payload, 0);
     setBusy(false);
@@ -1537,7 +1548,11 @@ export function ChatPanel({
           </div>
         )}
 
-        <div className="scroll-thin max-h-[50vh] min-h-40 space-y-3 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
+        <div
+          ref={transcriptRef}
+          onScroll={onTranscriptScroll}
+          className="scroll-thin max-h-[50vh] min-h-40 space-y-3 overflow-y-auto rounded-md border border-border bg-muted/20 p-4"
+        >
           {msgs.length === 0 && (
             <p className="text-sm text-muted-foreground">
               <T>
@@ -1713,7 +1728,6 @@ export function ChatPanel({
               <Spinner /> <T>Waiting for the model…</T>
             </p>
           )}
-          <div ref={bottomRef} />
         </div>
 
         {attachmentCapMessage && <Alert tone="warn">{attachmentCapMessage}</Alert>}
@@ -2123,11 +2137,12 @@ export function ArenaPanel({
   const [turns, setTurns] = useState<ArenaTurn[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [turns, busy]);
+  const {
+    containerRef: transcriptRef,
+    onScroll: onTranscriptScroll,
+    pin: pinTranscript,
+  } = useStickToBottom<HTMLDivElement>([turns, busy]);
 
   function patchAnswer(turnIndex: number, side: ArenaSide, patch: Partial<ArenaAnswer>) {
     setTurns((prev) =>
@@ -2235,6 +2250,9 @@ export function ArenaPanel({
       { prompt: text, historySide: 0, answers: [blank(modelA), blank(modelB)] },
     ]);
     setInput("");
+    // Sending is an explicit "show me what happens next", so it re-pins even
+    // if the reader had scrolled up to check something earlier.
+    pinTranscript();
     setBusy(true);
     // Both sides get the exact same payload, concurrently. Each side settles
     // on its own — one failing never cancels the other.
@@ -2284,7 +2302,11 @@ export function ArenaPanel({
           />
         </Field>
 
-        <div className="scroll-thin max-h-[55vh] min-h-40 space-y-4 overflow-y-auto rounded-md border border-border bg-muted/20 p-4">
+        <div
+          ref={transcriptRef}
+          onScroll={onTranscriptScroll}
+          className="scroll-thin max-h-[55vh] min-h-40 space-y-4 overflow-y-auto rounded-md border border-border bg-muted/20 p-4"
+        >
           {turns.length === 0 && (
             <p className="text-sm text-muted-foreground">
               <T>Send one prompt to both deployments and compare the answers side by side.</T>
@@ -2354,7 +2376,6 @@ export function ArenaPanel({
               <Spinner /> <T>Waiting for the models…</T>
             </p>
           )}
-          <div ref={bottomRef} />
         </div>
 
         {error && <Alert tone="err">{error}</Alert>}
