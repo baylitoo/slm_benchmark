@@ -32,7 +32,7 @@ def stable_block_id(page: int, index: int, text: str) -> str:
 def text_to_blocks(
     text: str,
     source: Literal[
-        "pdf_text", "tesseract", "paddleocr", "xiaomi", "manual", "unknown"
+        "pdf_text", "tesseract", "paddleocr", "xiaomi", "minicpm", "manual", "unknown"
     ] = "manual",
 ) -> list[OCRBlock]:
     blocks: list[OCRBlock] = []

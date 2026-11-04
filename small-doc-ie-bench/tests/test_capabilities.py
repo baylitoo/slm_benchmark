@@ -62,7 +62,7 @@ def test_the_mime_types_are_sorted_so_a_consumer_can_compare_them(
 
 def test_every_ocr_backend_the_factory_accepts_is_listed(client: TestClient) -> None:
     listed = {entry["name"] for entry in client.get("/v1/capabilities").json()["ocr_backends"]}
-    assert listed == {"liteparse", "tesseract", "paddleocr", "xiaomi"}
+    assert listed == {"liteparse", "tesseract", "paddleocr", "xiaomi", "minicpm"}
 
 
 def test_a_served_backend_is_listed_even_while_it_has_no_deployment(

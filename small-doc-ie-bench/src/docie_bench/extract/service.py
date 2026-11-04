@@ -40,6 +40,7 @@ from docie_bench.llm.prompts import (
     SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
     build_document_only_prompts,
+    build_minicpm_kie_prompts,
     build_nuextract3_prompts,
     build_nuextract_prompts,
     build_schema_proposer_prompt,
@@ -718,6 +719,16 @@ class ExtractionService:
             # document — as the page image (vision) or OCR text. This must win
             # over the generic vision branch below.
             system_prompt, user_prompt = build_nuextract3_prompts(
+                blocks=blocks,
+                has_images=bool(images),
+            )
+        elif self.profile.prompt_profile == "minicpm_kie_v1":
+            # MiniCPM-OCR names the fields inline and declares "###" for the
+            # ones it cannot see. Above the generic vision branch for the same
+            # reason as the others: this family is a vision model, so `images`
+            # would otherwise claim it.
+            system_prompt, user_prompt = build_minicpm_kie_prompts(
+                schema=generation_schema,
                 blocks=blocks,
                 has_images=bool(images),
             )

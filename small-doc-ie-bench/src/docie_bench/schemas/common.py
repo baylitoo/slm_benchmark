@@ -24,6 +24,7 @@ class OCRBlock(BaseModel):
         "tesseract",
         "paddleocr",
         "xiaomi",
+        "minicpm",
         "manual",
         "unknown",
     ] = (

@@ -371,6 +371,56 @@ FAMILIES: dict[str, FamilyContract] = {
         default_timeout_seconds=600.0,
         ollama_faithful=False,
     ),
+    # MiniCPM-OCR-1.0: the same dual-mode shape as xiaomi_ocr -- this family
+    # carries the extraction contract, and the `minicpm` OCR backend transcribes
+    # through the same deployment with no grammar.
+    #
+    # Its key-extraction prompt names the fields inline and declares "###" for
+    # anything absent from the image, which is a different convention from
+    # Xiaomi's key skeleton, hence a prompt profile of its own. "###" is in the
+    # placeholder set in extract.postprocess, so an absent field normalises to
+    # None rather than being stored as that string.
+    #
+    # `--reasoning off` is from the model card's own serve arguments. Belt and
+    # braces with the enable_thinking=False the extraction path already sends:
+    # a template that ignores the flag is still covered by the server-side
+    # setting, and the reverse.
+    "minicpm_ocr": FamilyContract(
+        name="minicpm_ocr",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="minicpm_kie_v1",
+        llama_server_args=("--jinja", "--reasoning", "off"),
+        needs_mmproj=True,
+        vision=True,
+        structured_extraction=True,
+        default_temperature=0.0,
+        default_max_tokens=4096,
+        default_timeout_seconds=600.0,
+        ollama_faithful=False,
+    ),
+    # MiniCPM-V 4.7: a GENERAL vision model, not an OCR specialist, so it gets
+    # the ordinary vision-extraction contract rather than a bespoke prompt --
+    # it documents no extraction convention of its own, and inventing one
+    # would be a guess dressed as a contract.
+    #
+    # Its GGUF thinking variants emit a [Start thinking] ... [End thinking]
+    # trace instead of <think> tags. `openai_client._clean_content` strips both
+    # shapes; this family additionally asks the server not to produce one.
+    "minicpm_v": FamilyContract(
+        name="minicpm_v",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="openai_json_schema",
+        prompt_profile="strict_extraction_v1",
+        llama_server_args=("--jinja", "--reasoning", "off"),
+        needs_mmproj=True,
+        vision=True,
+        structured_extraction=True,
+        default_temperature=0.0,
+        default_max_tokens=4096,
+        default_timeout_seconds=600.0,
+        ollama_faithful=False,
+    ),
     # Embedding models (LFM2.5-Embedding-350M, or any GGUF embedding model).
     # llama-server exposes /v1/embeddings when launched with --embedding; mean
     # pooling is the standard sentence-embedding reduction. No template, no

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from docie_bench.ocr.base import OCRBackend
+from docie_bench.ocr.minicpm_backend import MiniCPMOCRBackend
 from docie_bench.ocr.paddle_backend import PaddleOCRBackend
 from docie_bench.ocr.pdf_text import PdfTextBackend
 from docie_bench.ocr.tesseract_backend import TesseractBackend
@@ -18,6 +19,7 @@ OCR_BACKENDS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
     # separately -- an import check would call it available on a fleet that
     # has never deployed it.
     ("xiaomi", (), None),
+    ("minicpm", (), None),
 )
 
 
@@ -40,7 +42,7 @@ def available_ocr_backends() -> list[dict[str, object]]:
 
 
 #: Backends that are a served model rather than an importable library.
-_SERVED_BACKENDS = frozenset({"xiaomi"})
+_SERVED_BACKENDS = frozenset({"xiaomi", "minicpm"})
 
 
 def _served_backend_available(name: str) -> bool:
@@ -54,10 +56,12 @@ def _served_backend_available(name: str) -> bool:
     its control plane per request: a backend that became deployable a moment
     ago should appear, and one whose node went away should stop appearing.
     """
-    if name != "xiaomi":
+    backends = {"xiaomi": XiaomiOCRBackend, "minicpm": MiniCPMOCRBackend}
+    factory = backends.get(name)
+    if factory is None:
         return False
     try:
-        XiaomiOCRBackend()._profile()
+        factory()._profile()
     except Exception:  # noqa: BLE001 - unavailable is the answer, not an error
         return False
     return True
@@ -76,7 +80,9 @@ def get_ocr_backend(name: str, *, language: str | None = None) -> OCRBackend:
         return PaddleOCRBackend(lang=language or "en")
     if normalized == "xiaomi":
         return XiaomiOCRBackend()
+    if normalized == "minicpm":
+        return MiniCPMOCRBackend()
     raise ValueError(
         f"Unknown OCR backend {name!r}. "
-        "Expected liteparse, tesseract, paddleocr, or xiaomi."
+        "Expected liteparse, tesseract, paddleocr, xiaomi, or minicpm."
     )
