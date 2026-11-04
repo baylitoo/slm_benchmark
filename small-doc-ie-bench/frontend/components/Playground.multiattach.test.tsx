@@ -205,9 +205,40 @@ describe("ChatPanel multi-attach", () => {
     expect(await screen.findByText(/"invoice1\.png"/)).toBeInTheDocument();
     expect(await screen.findByText(/"invoice2\.png"/)).toBeInTheDocument();
 
-    // Attachments are cleared once the run starts, same as the single-file
-    // path.
-    expect(screen.queryByText("invoice1.png")).not.toBeInTheDocument();
+    // The COMPOSER is cleared once the run starts, same as the single-file
+    // path. Asserted on the remove buttons rather than on the filename: the
+    // filename is now also the caption of the page shown beside each result,
+    // so its presence no longer tells you where it is.
+    expect(screen.queryAllByRole("button", { name: "Remove attachment" })).toHaveLength(0);
+  });
+
+  it("keeps each document on screen beside the result it produced", async () => {
+    // The preview used to live only in the composer, which clears on send, so
+    // the page vanished at exactly the moment the output began arriving --
+    // when having both on screen is the entire point of reading one against
+    // the other.
+    let settle: ((value: unknown) => void) | undefined;
+    vi.mocked(api.extractStream).mockImplementation(
+      () => new Promise((resolve) => { settle = resolve; }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("checkbox"));
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await user.upload(input, [pngFile("invoice1.png")]);
+    await user.click(await screen.findByRole("button", { name: "Run extraction" }));
+
+    // Still generating: no result yet, and the page is already visible.
+    await waitFor(() => expect(api.extractStream).toHaveBeenCalled());
+    const page = await screen.findByAltText("invoice1.png");
+    expect(page).toBeInTheDocument();
+    expect(screen.queryAllByRole("button", { name: "Remove attachment" })).toHaveLength(0);
+
+    settle?.({ invoice_number: { value: "INV-1" } });
+
+    // And still visible once the result lands, which is when it is read.
+    await screen.findByText(/"INV-1"/);
+    expect(screen.getByAltText("invoice1.png")).toBeInTheDocument();
   });
 
   it("shows the specific API error, not a generic count, when a single attached file's extraction fails (N=1 regression guard)", async () => {

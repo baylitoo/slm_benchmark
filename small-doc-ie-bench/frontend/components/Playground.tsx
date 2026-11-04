@@ -240,6 +240,14 @@ interface ChatMsg {
   content: string;
   /** Only set when role === "extraction". */
   extraction?: ExtractionLiveState;
+  /** The page the extraction is reading, kept beside its output.
+   *
+   * The preview used to live only in the composer, which clears on send -- so
+   * the document vanished at exactly the moment the result started arriving,
+   * when having both on screen is the whole point. Ownership of the object URL
+   * moves here with it; `clearAttachments` no longer revokes a preview it has
+   * handed to a message. */
+  document?: { name: string; preview: string | null; totalPages: number | null };
   /** Only set on an assistant turn that ran MCP tools (selectedMcp). */
   toolCalls?: AgentToolCallTrace[];
   /** Reasoning-capable model's "why" for a round (calling a tool, or the
@@ -456,10 +464,15 @@ export function ChatPanel({
   // CHAT mode (extraction rasterizes server-side via its own OCR backend).
   const [dpi, setDpi] = useState(200);
 
-  function clearAttachments() {
+  function clearAttachments(keepPreviews?: ReadonlySet<string>) {
     setAttachments((prev) => {
       for (const a of prev) {
-        if (a.preview?.startsWith("blob:")) URL.revokeObjectURL(a.preview);
+        // A preview handed to an extraction message is that message's now:
+        // revoking it here would blank the image the user is reading the
+        // result against.
+        if (a.preview?.startsWith("blob:") && !keepPreviews?.has(a.preview)) {
+          URL.revokeObjectURL(a.preview);
+        }
       }
       return [];
     });
@@ -663,7 +676,11 @@ export function ChatPanel({
     // run and its OWN live-streamed placeholder, same per-file call the app
     // already makes for one file. N=0/N=1 both reduce to exactly the single
     // call the pre-multi-attach code made.
-    type Job = { payload: ExtractRequest; displayLabel: string };
+    type Job = {
+      payload: ExtractRequest;
+      displayLabel: string;
+      document?: ChatMsg["document"];
+    };
     let jobs: Job[];
     if (attached.length === 0) {
       const payload = buildPayload();
@@ -676,7 +693,15 @@ export function ChatPanel({
             const payload = buildPayload();
             payload.content_b64 = await fileToBase64(a.file);
             payload.filename = a.file.name;
-            return { payload, displayLabel: `📎 ${a.file.name}` };
+            return {
+              payload,
+              displayLabel: `📎 ${a.file.name}`,
+              document: {
+                name: a.file.name,
+                preview: a.preview,
+                totalPages: a.previewTotalPages,
+              },
+            };
           }),
         );
       } catch {
@@ -686,7 +711,13 @@ export function ChatPanel({
     }
 
     setInput("");
-    clearAttachments();
+    clearAttachments(
+      new Set(
+        attached
+          .map((a) => a.preview)
+          .filter((p): p is string => typeof p === "string" && p.startsWith("blob:")),
+      ),
+    );
     setBusy(true);
 
     // Every job's user turn + live extraction placeholder is appended up
@@ -701,6 +732,7 @@ export function ChatPanel({
         role: "extraction",
         content: dynamicSchemaName || schemaName || "invoice",
         extraction: { liveText: "" },
+        document: job.document,
       });
     }
     setMsgs([...base, ...newEntries]);
@@ -1525,8 +1557,39 @@ export function ChatPanel({
                   <Sparkles className="h-3.5 w-3.5" />
                   <T>Extraction</T> · {m.content}
                 </div>
-                <div className="p-3">
-                  {m.extraction && <ExtractionLiveView state={m.extraction} />}
+                <div
+                  className={cn(
+                    "gap-3 p-3",
+                    // Side by side only where both halves stay readable. On a
+                    // phone a two-column split makes each one too narrow to
+                    // use, so the page goes above the output rather than
+                    // beside it.
+                    m.document?.preview
+                      ? "grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]"
+                      : "block",
+                  )}
+                >
+                  {m.document?.preview && (
+                    <figure className="min-w-0 lg:sticky lg:top-2 lg:self-start">
+                      <img
+                        src={m.document.preview}
+                        alt={m.document.name}
+                        className="max-h-[70vh] w-full rounded border border-border object-contain"
+                      />
+                      <figcaption className="mt-1 truncate text-xs text-muted-foreground">
+                        {m.document.name}
+                        {m.document.totalPages && m.document.totalPages > 1 ? (
+                          <>
+                            {" · "}
+                            <T>page 1 of</T> {m.document.totalPages}
+                          </>
+                        ) : null}
+                      </figcaption>
+                    </figure>
+                  )}
+                  <div className="min-w-0">
+                    {m.extraction && <ExtractionLiveView state={m.extraction} />}
+                  </div>
                 </div>
               </div>
             ) : (
@@ -1925,6 +1988,11 @@ export function ChatPanel({
             variant="secondary"
             disabled={msgs.length === 0 || busy}
             onClick={() => {
+              for (const m of msgs) {
+                if (m.document?.preview?.startsWith("blob:")) {
+                  URL.revokeObjectURL(m.document.preview);
+                }
+              }
               setMsgs([]);
               setError(null);
               docsSearchSessionIdRef.current = undefined;
