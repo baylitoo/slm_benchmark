@@ -764,7 +764,15 @@ class ExtractionService:
         # and buys back the behaviour it was trained with.
         #
         # An explicit `disable_thinking` still wins -- the operator asked.
-        think = uses_native_reasoning(self.profile) and not self.disable_thinking
+        #
+        # Keyed on the family's POLICY, not on `uses_native_reasoning`: that
+        # predicate is true for LFM2.5-2.6B, whose reasoning this path
+        # deliberately suppresses with the prefill below. Driving the policy
+        # off it would quietly change that model too.
+        think = (
+            bool(self.profile.options.get("reasoning_during_extraction"))
+            and not self.disable_thinking
+        )
         extra_template_kwargs: dict[str, Any] = {"enable_thinking": think}
         if self.profile.prompt_profile == "nuextract3" and nuextract_template is not None:
             extra_template_kwargs["template"] = json.dumps(

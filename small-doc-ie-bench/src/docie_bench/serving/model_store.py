@@ -141,11 +141,18 @@ class FamilyContract:
     default_timeout_seconds: float = 180.0
     # Can Ollama serve this family *faithfully* (respecting its template)?
     # False for CHAT_TEMPLATE_KWARGS families: Ollama drops chat_template_kwargs.
-    #: This checkpoint was trained to reason, and suppressing it degrades the
-    #: answer rather than merely shortening it -- reasoning leaks into the JSON
-    #: instead of preceding it. Declared by the family because a
-    #: store-deployed model has no models.yaml entry to carry the option.
-    native_reasoning: bool = False
+    #: Keep reasoning ON during EXTRACTION for this family.
+    #:
+    #: Deliberately NOT the same question as ``uses_native_reasoning``, which
+    #: asks whether a template always opens a think block. LFM2.5-2.6B answers
+    #: yes to that and is still suppressed here, by prefilling an open brace --
+    #: a decision this repo already made and tests. This flag is the policy:
+    #: suppressing THIS family degrades the answer rather than shortening it,
+    #: because the reasoning ends up inside the JSON instead of before it.
+    #:
+    #: Declared by the family because a store-deployed model has no models.yaml
+    #: entry to carry an option.
+    reasoning_during_extraction: bool = False
 
     ollama_faithful: bool = True
 
@@ -278,7 +285,7 @@ FAMILIES: dict[str, FamilyContract] = {
     # before it, because the template has nowhere else to put it.
     "lfm3": FamilyContract(
         name="lfm3",
-        native_reasoning=True,
+        reasoning_during_extraction=True,
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",
@@ -321,7 +328,7 @@ FAMILIES: dict[str, FamilyContract] = {
     # before it, because the template has nowhere else to put it.
     "lfm3_vl": FamilyContract(
         name="lfm3_vl",
-        native_reasoning=True,
+        reasoning_during_extraction=True,
         template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
         response_format_style="openai_json_schema",
         prompt_profile="strict_extraction_v1",

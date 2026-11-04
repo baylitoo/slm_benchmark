@@ -83,7 +83,7 @@ class _Traits:
     temperature: float = 0.0
     max_tokens: int = 900
     timeout_seconds: float = 180.0
-    native_reasoning: bool = False
+    reasoning_during_extraction: bool = False
 
 
 def _default_live_deployments() -> list[DeploymentRecord]:
@@ -228,7 +228,7 @@ def _family_traits(name: str) -> _Traits | None:
         temperature=family.default_temperature,
         max_tokens=family.default_max_tokens,
         timeout_seconds=family.default_timeout_seconds,
-        native_reasoning=family.native_reasoning,
+        reasoning_during_extraction=family.reasoning_during_extraction,
     )
 
 
@@ -283,10 +283,15 @@ def _synthesize_profile(
         max_tokens=launch.max_tokens or traits.max_tokens,
         timeout_seconds=launch.timeout_seconds or traits.timeout_seconds,
         deployment_slot_count=launch.n_parallel,
-        # Reuses the option `uses_native_reasoning` already honours, so a
-        # family-declared checkpoint and a models.yaml-declared one reach
-        # every caller through one path rather than two.
-        options={"native_reasoning": True} if traits.native_reasoning else {},
+        # A policy option of its own, NOT `native_reasoning`: that one tells
+        # `uses_native_reasoning` whether a template always thinks, and
+        # answering yes for LFM3 would also change how the client treats
+        # LFM2.5-2.6B's suppression. Two questions, two keys.
+        options=(
+            {"reasoning_during_extraction": True}
+            if traits.reasoning_during_extraction
+            else {}
+        ),
     )
 
 

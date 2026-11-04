@@ -38,25 +38,43 @@ def profile(**overrides: Any) -> ModelProfile:
 
 
 @pytest.mark.parametrize("family", ["lfm3", "lfm3_vl"])
-def test_the_lfm3_families_declare_native_reasoning(family: str) -> None:
+def test_the_lfm3_families_keep_reasoning_during_extraction(family: str) -> None:
     """The card warns against disabling it, so the default must not disable it."""
-    assert FAMILIES[family].native_reasoning is True
+    assert FAMILIES[family].reasoning_during_extraction is True
 
 
 @pytest.mark.parametrize("family", ["lfm2", "nuextract3", "vision_ocr"])
 def test_other_families_are_unchanged(family: str) -> None:
-    assert FAMILIES[family].native_reasoning is False
+    assert FAMILIES[family].reasoning_during_extraction is False
 
 
-def test_a_family_declaration_reaches_the_profile_as_the_existing_option() -> None:
-    """A store-deployed model has no models.yaml entry to carry the option.
+def test_the_policy_is_a_different_question_from_the_template_fact() -> None:
+    """Two predicates that look like one, and conflating them is a real bug.
 
-    Reusing the option `uses_native_reasoning` already honours means a
-    family-declared checkpoint and a yaml-declared one reach every caller
-    through one path, not two.
+    ``uses_native_reasoning`` asks whether a template ALWAYS opens a think
+    block. LFM2.5-2.6B answers yes and is still suppressed here, deliberately,
+    by the prefill. The family flag is the POLICY -- whether suppressing this
+    model makes its answer worse rather than shorter.
+
+    Driving the policy off the predicate silently flips LFM2.5-2.6B to
+    thinking during extraction, which is what this pins.
     """
-    assert uses_native_reasoning(profile(options={"native_reasoning": True})) is True
-    assert uses_native_reasoning(profile(options={})) is False
+    lfm25 = profile(name="lfm2.5-2.6b", model="lfm2.5-2.6b", options={})
+
+    assert uses_native_reasoning(lfm25) is True
+    assert bool(lfm25.options.get("reasoning_during_extraction")) is False
+
+
+def test_a_family_declaration_reaches_the_profile_as_a_policy_option() -> None:
+    """A store-deployed model has no models.yaml entry to carry an option.
+
+    Its own key, not ``native_reasoning``: answering that one yes for LFM3
+    would also change how the client treats LFM2.5-2.6B's suppression.
+    """
+    declared = profile(options={"reasoning_during_extraction": True})
+
+    assert bool(declared.options.get("reasoning_during_extraction")) is True
+    assert bool(profile(options={}).options.get("reasoning_during_extraction")) is False
 
 
 # --- what extraction now sends ---------------------------------------------
@@ -97,7 +115,7 @@ async def _extract(service: ExtractionService) -> None:
 
 @pytest.mark.anyio
 async def test_a_native_reasoning_model_is_allowed_to_think(sent: list[dict[str, Any]]) -> None:
-    service = ExtractionService(profile(options={"native_reasoning": True}))
+    service = ExtractionService(profile(options={"reasoning_during_extraction": True}))
 
     await _extract(service)
 
@@ -111,7 +129,7 @@ async def test_and_is_not_prefilled_while_it_thinks(sent: list[dict[str, Any]]) 
     Sending it here would truncate exactly the reasoning the model was just
     told to produce — the two mechanisms are opposites, not companions.
     """
-    service = ExtractionService(profile(options={"native_reasoning": True}))
+    service = ExtractionService(profile(options={"reasoning_during_extraction": True}))
 
     await _extract(service)
 
@@ -124,7 +142,7 @@ async def test_an_explicit_request_to_stop_thinking_still_wins(
 ) -> None:
     """The operator asked. The prefill comes back to enforce it."""
     service = ExtractionService(
-        profile(options={"native_reasoning": True}), disable_thinking=True
+        profile(options={"reasoning_during_extraction": True}), disable_thinking=True
     )
 
     await _extract(service)
