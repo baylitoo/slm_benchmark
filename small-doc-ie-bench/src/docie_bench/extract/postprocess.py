@@ -15,7 +15,11 @@ from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-_PLACEHOLDERS = {"", "null", "none", "n/a", "na", "-", "–", "—", "nan"}
+# "###" is MiniCPM-OCR's documented "not in the image" marker. It belongs
+# here rather than in that family's own code: a sentinel that reaches a
+# stored field is wrong whichever model produced it, and the schema gives
+# string fields no way to be "absent" otherwise.
+_PLACEHOLDERS = {"", "null", "none", "n/a", "na", "-", "–", "—", "nan", "###"}
 _CURRENT = {
     "aujourd'hui",
     "aujourd’hui",

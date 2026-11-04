@@ -18,7 +18,16 @@ class OCRBlock(BaseModel):
     text: str
     page: int = 1
     bbox: BoundingBox | None = None
-    source: Literal["pdf_text", "pdf_inspector", "tesseract", "paddleocr", "manual", "unknown"] = (
+    source: Literal[
+        "pdf_text",
+        "pdf_inspector",
+        "tesseract",
+        "paddleocr",
+        "xiaomi",
+        "minicpm",
+        "manual",
+        "unknown",
+    ] = (
         "unknown"
     )
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)

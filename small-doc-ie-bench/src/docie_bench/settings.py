@@ -121,6 +121,24 @@ class Settings(BaseSettings):
     ocr_cache_enabled: bool = True
     # PDF/image ingestion via liteparse (PDFium spatial text + pluggable OCR).
     ocr_dpi: int = Field(default=150, ge=72, le=600)
+    # Which deployment the `xiaomi` OCR backend transcribes through. A name,
+    # not a URL: it goes through the placement resolver, so on a fleet the
+    # request lands on whichever node holds a live replica.
+    ocr_xiaomi_model: str = Field(
+        default="xiaomi-ocr-0",
+        validation_alias=AliasChoices("DOCIE_OCR_XIAOMI_MODEL", "ocr_xiaomi_model"),
+    )
+    ocr_minicpm_model: str = Field(
+        default="minicpm-ocr-1.0",
+        validation_alias=AliasChoices("DOCIE_OCR_MINICPM_MODEL", "ocr_minicpm_model"),
+    )
+    # Which of MiniCPM-OCR's five documented recognition tasks the backend
+    # asks for: text | table | formula | seal | chart. One deployment answers
+    # all of them, so this is the prompt rather than a different model.
+    ocr_minicpm_mode: str = Field(
+        default="text",
+        validation_alias=AliasChoices("DOCIE_OCR_MINICPM_MODE", "ocr_minicpm_mode"),
+    )
     # Optional VLM-backed OCR server implementing the liteparse OCR API spec. When
     # set, the pdf_text backend routes text-poor/scanned pages through it instead
     # of the built-in Tesseract. Relevant only for text-only extraction models that

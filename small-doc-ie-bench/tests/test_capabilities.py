@@ -62,7 +62,19 @@ def test_the_mime_types_are_sorted_so_a_consumer_can_compare_them(
 
 def test_every_ocr_backend_the_factory_accepts_is_listed(client: TestClient) -> None:
     listed = {entry["name"] for entry in client.get("/v1/capabilities").json()["ocr_backends"]}
-    assert listed == {"liteparse", "tesseract", "paddleocr"}
+    assert listed == {"liteparse", "tesseract", "paddleocr", "xiaomi", "minicpm"}
+
+
+def test_a_served_backend_is_listed_even_while_it_has_no_deployment(
+    client: TestClient,
+) -> None:
+    """``xiaomi`` is a model, not a library, so its availability is whether a
+    deployment resolves. It stays listed either way -- a consumer has to be
+    able to tell "this build accepts it" from "it is usable right now"."""
+    backends = {e["name"]: e for e in client.get("/v1/capabilities").json()["ocr_backends"]}
+
+    assert backends["xiaomi"]["aliases"] == []
+    assert isinstance(backends["xiaomi"]["available"], bool)
 
 
 def test_the_canonical_backend_carries_its_legacy_alias(client: TestClient) -> None:

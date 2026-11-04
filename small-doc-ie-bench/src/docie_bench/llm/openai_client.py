@@ -35,6 +35,8 @@ def _clean_content(text: str) -> str:
 
     Handles:
     - NuExtract3 reasoning mode's <think>...</think> block (keep only the answer)
+    - MiniCPM-V 4.7 GGUF's [Start thinking]...[End thinking] trace, which is
+      the same idea in different delimiters
     - NuExtract v1's <|end-output|> continuation (take only what comes before it)
     - Markdown code fences (```json ... ```)
     - Run-on text after a complete JSON object (bracket-balance extraction)
@@ -50,6 +52,17 @@ def _clean_content(text: str) -> str:
     # failure. Confirmed reproducible, not hypothetical.
     if "<think>" in text and "</think>" not in text:
         return text
+
+    # MiniCPM-V 4.7's GGUF thinking variants delimit the same thing with
+    # [Start thinking] / [End thinking] instead of tags. Handled identically,
+    # and separately rather than by generalising the tag logic, because the
+    # delimiters are literal text a document could contain -- the narrow,
+    # exact-pair match is what keeps a transcript mentioning "[End thinking]"
+    # from truncating a legitimate answer.
+    if "[Start thinking]" in text and "[End thinking]" not in text:
+        return text
+    if "[End thinking]" in text:
+        text = text.rsplit("[End thinking]", 1)[1]
 
     # NuExtract3 reasoning mode prefixes the answer with a <think>...</think>
     # block; keep only what follows the final </think>.

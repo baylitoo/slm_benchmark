@@ -40,11 +40,13 @@ from docie_bench.llm.prompts import (
     SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
     build_document_only_prompts,
+    build_minicpm_kie_prompts,
     build_nuextract3_prompts,
     build_nuextract_prompts,
     build_schema_proposer_prompt,
     build_user_prompt,
     build_vision_user_prompt,
+    build_xiaomi_kie_prompts,
 )
 from docie_bench.llm.reasoning import uses_native_reasoning
 from docie_bench.ocr.base import text_to_blocks
@@ -717,6 +719,29 @@ class ExtractionService:
             # document — as the page image (vision) or OCR text. This must win
             # over the generic vision branch below.
             system_prompt, user_prompt = build_nuextract3_prompts(
+                blocks=blocks,
+                has_images=bool(images),
+            )
+        elif self.profile.prompt_profile == "minicpm_kie_v1":
+            # MiniCPM-OCR names the fields inline and declares "###" for the
+            # ones it cannot see. Above the generic vision branch for the same
+            # reason as the others: this family is a vision model, so `images`
+            # would otherwise claim it.
+            system_prompt, user_prompt = build_minicpm_kie_prompts(
+                schema=generation_schema,
+                blocks=blocks,
+                has_images=bool(images),
+            )
+        elif self.profile.prompt_profile == "xiaomi_kie_v1":
+            # Xiaomi-OCR-0's key-information-extraction prompt is a documented
+            # phrasing carrying a key SKELETON, not a JSON Schema. Above the
+            # generic vision branch for the reason nuextract3 is: this family
+            # is a vision model, so `images` would otherwise claim it and send
+            # the schema-and-instructions prompt it was not trained on. The
+            # schema still rides response_format, so the grammar constrains
+            # the answer; only the wording differs.
+            system_prompt, user_prompt = build_xiaomi_kie_prompts(
+                schema=generation_schema,
                 blocks=blocks,
                 has_images=bool(images),
             )
