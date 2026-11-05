@@ -330,14 +330,23 @@ def read_vm_memory() -> NodeMemory:
 
 
 def configured_budget_bytes() -> int | None:
-    """The operator's soft budget for this node, or ``None`` (#539)."""
-    from docie_bench.settings import get_settings
+    """The operator's soft budget for this node, or ``None`` (#539).
+
+    THE SEAM. Every sizing decision reaches the budget through here, so making
+    it catalog-backed makes a live edit reach the fit check, the gated restart,
+    LRU/idle eviction and the published snapshot without touching any of them.
+
+    Precedence and outage behaviour live in
+    :mod:`docie_bench.serving.node_budget`: a catalog override wins, then this
+    node's bootstrap setting, then nothing. An unreadable catalog reuses the
+    last answer it gave rather than widening.
+    """
+    from docie_bench.serving.node_budget import resolve_budget
 
     try:
-        value = int(get_settings().serving_mem_budget_bytes)
+        return resolve_budget().budget_bytes
     except Exception:  # noqa: BLE001 - an unreadable knob must not break sizing
         return None
-    return value if value > 0 else None
 
 
 def read_node_memory(

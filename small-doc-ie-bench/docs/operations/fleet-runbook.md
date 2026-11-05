@@ -124,6 +124,79 @@ beside it. What the default costs is **placement**: the weights share one
 volume with the durable state, so they cannot be put on a different disk,
 their growth consumes that volume, and destroying or resizing it takes both.
 
+### How much RAM a node may use
+
+Two numbers, and conflating them is how a co-tenant application gets
+OOM-killed.
+
+:::{list-table}
+:header-rows: 1
+:widths: 20 40 40
+
+* -
+  - Hard ceiling
+  - Soft budget
+* - Where
+  - `DOCIE_SERVING_MEM_LIMIT` → cgroup `memory.max`
+  - the node's row in the catalog
+* - Enforced by
+  - the kernel
+  - DocIE's own admission
+* - Changed
+  - rarely, and it **recreates the container**, unloading every resident model
+  - live, with nothing unloaded
+* - Protects
+  - the other applications on the host
+  - DocIE's own placement decisions
+:::
+
+Admission sizes against `min(soft budget, cgroup free)`. The ceiling is the
+guardrail; the budget is the number you actually turn.
+
+Set a budget live:
+
+```bash
+curl -fsS -X POST https://<central>/v1/serving/nodes/<node-id>/budget \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"budget_bytes": 6442450944, "expected_version": null}'
+```
+
+`expected_version` is the version you last read from `GET /v1/serving/nodes`
+(`mem_budget_version`), or `null` if none has ever been set. A mismatch is a
+409 rather than an overwrite, so two operators tuning one machine's share
+cannot interleave. It needs an **operator** key — the env-configured
+`API_KEYS` tier, not a Studio-issued one.
+
+`"budget_bytes": null` clears the override, falling back to the node's own
+`DOCIE_SERVING_MEM_BUDGET` and then to its cgroup ceiling. Zero is refused: it
+would mean "refuse every load", and nobody means that by typing it.
+
+Precedence, highest first: catalog override → the node's
+`DOCIE_SERVING_MEM_BUDGET` → nothing (the ceiling alone).
+
+:::{important}
+**Lowering a budget below current usage unloads nothing.** The node refuses
+*new* loads, reports the overage, and keeps serving what it already holds.
+Eviction would have been the easy implementation — admission already evicts
+LRU victims to cover a deficit — and it would mean typing a smaller number
+cost a cold start on whatever got unloaded next. A budget edit is not a
+surprise unload.
+
+**A node with no cgroup limit is budget-only.** Its capacity row reads
+`source: "vm"`, and nothing but DocIE enforces the number. That is the case a
+budget matters most for, since free host RAM on a shared machine belongs to
+whichever co-tenant asks for it next.
+
+**An unreachable catalog never widens a budget.** The node reuses the last
+answer the catalog gave, persisted beside its other state, and reports it as
+stale. A node that has never read its own row uses its bootstrap setting.
+:::
+
+One exception, stated rather than hidden: a model whose footprint cannot be
+priced (a non-GGUF encoder) still fails open, so an over-budget node can admit
+one. Refusing there would mean an over-budget node could load no such model at
+all, which is a wider change than this.
+
 ### Moving the model cache to its own volume
 
 Optional. Worth doing when the weights outgrow the state volume, or when you
