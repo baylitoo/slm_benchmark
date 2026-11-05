@@ -885,6 +885,24 @@ class ServingReconciler:
         towards MORE capacity before less means a generation that replaces one
         deployment with another never leaves the model unserved in between.
 
+        Ordering alone is not enough, though, and that was the bug (#590). A
+        start that FAILS used to record the failure and fall through to the
+        stops regardless, so a replacement generation whose new deployment
+        could not start still removed the old one -- ending with neither. The
+        ordering preserved availability only on the path where nothing went
+        wrong, which is the path that did not need it.
+
+        So a failed start abandons the reducing half of the plan for this
+        cycle. The generation is not recorded either way, so the next cycle
+        re-plans and retries the start, and the stop happens once there is
+        something to stop in favour of.
+
+        Deliberately ALL stops, not just one paired with the failed start: the
+        plan is two name lists with no link between them, so which stop was
+        meant to pair with which start is not expressible here. Skipping every
+        stop delays an unrelated one by a cycle; guessing the pairing wrong
+        takes a model offline. One of those is recoverable.
+
         The singleton lease is heartbeated between actions. A start blocks in
         ``await_ready`` until the model is serving, which for a multi-GB GGUF
         is longer than the lease's staleness window -- so a plan with several
@@ -910,6 +928,16 @@ class ServingReconciler:
                 logger.warning("desired-state start of %s failed", name, exc_info=True)
                 ok = False
             self._heartbeat()
+
+        if not ok:
+            # Capacity is only ever reduced on a cycle where the additions
+            # all succeeded. See the note above.
+            logger.warning(
+                "a desired-state start failed; holding this cycle's stops and "
+                "removals so the capacity being replaced stays up"
+            )
+            return False
+
         for name in getattr(plan, "to_stop", ()):
             try:
                 self.supervisor.stop(name)
