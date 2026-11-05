@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -207,3 +208,179 @@ def test_json_errors_are_machine_readable_and_exit_nonzero() -> None:
     assert json.loads(result.output) == {
         "error": {"message": "unknown model: missing", "type": "RuntimeError"}
     }
+
+
+# --- fleet: the drain/resume path through the CENTRAL api (#634) -----------
+#
+# Exit codes are the contract here, not the output: a deployment hook gates on
+# them, so every one of them is asserted rather than eyeballed.
+
+
+class _Response:
+    def __init__(self, status_code: int, payload: object) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = str(payload)
+
+    def json(self) -> object:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx
+
+            raise httpx.HTTPStatusError(
+                f"{self.status_code}", request=None, response=None  # type: ignore[arg-type]
+            )
+
+
+@pytest.fixture
+def fleet_api(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A central api that answers from a script the test controls."""
+    import httpx
+
+    monkeypatch.setenv("DOCIE_API_URL", "https://studio.example.test")
+    monkeypatch.setenv("DOCIE_API_KEY", "test-key")
+    state: dict[str, Any] = {
+        "posts": [],
+        "post_response": _Response(200, {"node_id": "node-a", "models_offline": []}),
+        "node_states": ["drained"],
+        "gets": 0,
+    }
+
+    def fake_post(url: str, **kwargs: Any) -> _Response:
+        state["posts"].append((url, kwargs.get("json"), kwargs.get("headers")))
+        return state["post_response"]
+
+    def fake_get(url: str, **kwargs: Any) -> _Response:
+        state["gets"] += 1
+        states = state["node_states"]
+        drain_state = states[min(state["gets"] - 1, len(states) - 1)]
+        return _Response(
+            200,
+            {
+                "nodes": [
+                    {
+                        "node_id": "node-a",
+                        "drain_state": drain_state,
+                        "reporting": True,
+                        "deployments": 1,
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "get", fake_get)
+    return state
+
+
+def test_fleet_drain_sends_the_acknowledgement_flag_and_the_key(
+    fleet_api: dict[str, Any],
+) -> None:
+    result = runner.invoke(create_app(), ["fleet", "drain", "node-a"])
+
+    assert result.exit_code == 0
+    url, body, headers = fleet_api["posts"][0]
+    assert url.endswith("/v1/serving/nodes/node-a/drain")
+    assert body == {"acknowledge_outage": False}
+    assert headers["Authorization"] == "Bearer test-key"
+
+
+def test_fleet_drain_never_adds_the_acknowledgement_by_itself(
+    fleet_api: dict[str, Any],
+) -> None:
+    """#634 is explicit: a refusal must not be worked around automatically."""
+    fleet_api["post_response"] = _Response(
+        409, {"detail": "would take 1 model(s) offline: lfm2.5-350m"}
+    )
+
+    result = runner.invoke(create_app(), ["fleet", "drain", "node-a", "--wait"])
+
+    assert result.exit_code == 1
+    # The api's own sentence, naming the model, not a generic failure.
+    assert "lfm2.5-350m" in result.output
+    assert len(fleet_api["posts"]) == 1
+    assert fleet_api["posts"][0][1] == {"acknowledge_outage": False}
+
+
+def test_fleet_drain_wait_exits_zero_once_the_runtimes_stop(
+    fleet_api: dict[str, Any],
+) -> None:
+    fleet_api["node_states"] = ["draining", "drained"]
+
+    result = runner.invoke(
+        create_app(),
+        ["--json", "fleet", "drain", "node-a", "--wait", "--timeout", "30"],
+    )
+
+    assert result.exit_code == 0
+    assert '"safe_to_replace":true' in result.output.replace(" ", "")
+
+
+def test_fleet_drain_wait_exits_nonzero_on_a_timeout(
+    fleet_api: dict[str, Any],
+) -> None:
+    """The case a hook must not mistake for success: still holding runtimes
+    when the deadline passes."""
+    fleet_api["node_states"] = ["draining"]
+
+    result = runner.invoke(
+        create_app(),
+        ["--json", "fleet", "drain", "node-a", "--wait", "--timeout", "0.1"],
+    )
+
+    assert result.exit_code == 1
+    assert '"safe_to_replace":false' in result.output.replace(" ", "")
+
+
+def test_fleet_status_names_the_readiness(fleet_api: dict[str, Any]) -> None:
+    fleet_api["node_states"] = ["draining"]
+
+    result = runner.invoke(create_app(), ["--json", "fleet", "status", "node-a"])
+
+    assert result.exit_code == 0
+    assert "routing_excluded" in result.output
+
+
+def test_fleet_status_on_an_unknown_node_exits_nonzero(
+    fleet_api: dict[str, Any],
+) -> None:
+    result = runner.invoke(create_app(), ["fleet", "status", "not-a-node"])
+
+    assert result.exit_code == 1
+
+
+def test_fleet_commands_refuse_without_a_central_api_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every other command in this CLI is node-local, so the missing variable
+    has to say which commands need it."""
+    monkeypatch.delenv("DOCIE_API_URL", raising=False)
+    monkeypatch.setenv("DOCIE_API_KEY", "test-key")
+
+    result = runner.invoke(create_app(), ["fleet", "status"])
+
+    assert result.exit_code != 0
+    assert "DOCIE_API_URL" in result.output
+
+
+def test_fleet_commands_refuse_without_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCIE_API_URL", "https://studio.example.test")
+    monkeypatch.delenv("DOCIE_API_KEY", raising=False)
+
+    result = runner.invoke(create_app(), ["fleet", "status"])
+
+    assert result.exit_code != 0
+    assert "DOCIE_API_KEY" in result.output
+
+
+def test_fleet_resume_posts_and_says_nothing_about_waiting(
+    fleet_api: dict[str, Any],
+) -> None:
+    result = runner.invoke(create_app(), ["fleet", "resume", "node-a"])
+
+    assert result.exit_code == 0
+    assert fleet_api["posts"][0][0].endswith("/v1/serving/nodes/node-a/resume")
