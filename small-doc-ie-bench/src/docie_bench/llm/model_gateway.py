@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import email.utils
 import logging
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -35,6 +36,8 @@ class ErrorClassification(StrEnum):
     CAPABILITY = "capability"
     CIRCUIT_OPEN = "circuit_open"
     QUEUE_FULL = "queue_full"
+    AUTHENTICATION = "authentication"
+    TRANSPORT = "transport"
 
 
 class ModelGatewayError(RuntimeError):
@@ -61,6 +64,14 @@ class TransientModelError(ModelGatewayError):
 class RateLimitedModelError(ModelGatewayError):
     classification = ErrorClassification.RATE_LIMITED
     retryable = True
+
+
+class ModelAuthenticationError(ModelGatewayError):
+    classification = ErrorClassification.AUTHENTICATION
+
+
+class ModelTransportError(ModelGatewayError):
+    classification = ErrorClassification.TRANSPORT
 
 
 class InvalidModelResponseError(ModelGatewayError):
@@ -93,6 +104,8 @@ class ModelCapabilities:
     model: str
     vision: bool | None = None
     response_format_styles: frozenset[str] | None = None
+    configured: dict[str, bool | None] = field(default_factory=dict, compare=False)
+    observed: dict[str, bool | None] = field(default_factory=dict, compare=False)
     raw: dict[str, Any] = field(default_factory=dict, compare=False)
 
 
@@ -174,8 +187,29 @@ def _retry_after(response: httpx.Response) -> float | None:
 
 def classify_response_error(response: httpx.Response) -> ModelGatewayError:
     status = response.status_code
-    body = response.text[:500]
-    message = f"Model endpoint returned {status}: {body}"
+    # Provider error bodies can echo prompts, credentials, or document text.
+    # Keep diagnostics safe to return and record.
+    message = f"Model endpoint returned HTTP {status}"
+    safe_body = response.text[:1000].lower()
+    capability_markers = (
+        "tool_choice",
+        "tools are not supported",
+        "unsupported tool",
+        "tool calling is not supported",
+        "does not support tools",
+        "unsupported parameter",
+        "unknown parameter",
+        "response_format",
+        "json_schema",
+        "vision is not supported",
+        "streaming is not supported",
+    )
+    if status == 400 and any(marker in safe_body for marker in capability_markers):
+        return ModelCapabilityError(
+            "Model endpoint rejected a requested capability", status_code=status
+        )
+    if status in {401, 403}:
+        return ModelAuthenticationError("Model endpoint authentication failed", status_code=status)
     if status == 429:
         return RateLimitedModelError(
             message,
@@ -209,6 +243,7 @@ class ModelGateway:
         # OpenAICompatibleClient.__init__), so this is safe to read right
         # after execute() returns without racing a concurrent caller.
         self.last_wait_seconds: float = 0.0
+        self.last_attempts: int = 0
 
     async def execute(self, operation: Callable[[], Awaitable[T]]) -> T:
         await self._acquire()
@@ -217,6 +252,7 @@ class ModelGateway:
         try:
             is_probe = self._check_circuit()
             for attempt in range(1, self.profile.retry_max_attempts + 1):
+                self.last_attempts = attempt
                 try:
                     result = await operation()
                 except Exception as exc:
@@ -259,6 +295,27 @@ class ModelGateway:
             if is_probe:
                 self._state.half_open_in_flight = False
             MODEL_GATEWAY_IN_FLIGHT.labels(self.profile.name, self.profile.model).dec()
+            self._release()
+
+    @contextlib.asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        """Hold profile capacity across a stream without retrying its body.
+
+        Streaming calls cannot use ``execute``: once a byte is exposed, a
+        transparent retry would duplicate visible output. The caller owns the
+        stream and this lease until it closes or is cancelled.
+        """
+        await self._acquire()
+        try:
+            is_probe = self._check_circuit()
+        except BaseException:
+            self._release()
+            raise
+        try:
+            yield
+        finally:
+            if is_probe:
+                self._state.half_open_in_flight = False
             self._release()
 
     async def request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
@@ -356,6 +413,24 @@ class ModelGateway:
             model=self.profile.model,
             vision=vision,
             response_format_styles=response_formats,
+            configured=dict(self.profile.capabilities),
+            observed={
+                name: value if isinstance(value, bool) else None
+                for name, value in {
+                    **capabilities,
+                    **{key: model_data.get(key) for key in (
+                        "tools", "tool_choice", "structured_output", "vision", "streaming", "usage"
+                    )},
+                }.items()
+                if name
+                in {"tools", "tool_choice", "structured_output", "vision", "streaming", "usage"}
+            }
+            | ({"vision": vision} if vision is not None else {})
+            | (
+                {"structured_output": bool(response_formats)}
+                if response_formats is not None
+                else {}
+            ),
             raw=model_data,
         )
 
@@ -370,6 +445,35 @@ class ModelGateway:
             self._raise_capability_error(
                 f"Vision profile {self.profile.name!r} targets a model without vision support"
             )
+
+    async def validate_capabilities(self, required: set[str]) -> ModelCapabilities:
+        """Validate required OpenAI-compatible features without guessing.
+
+        Configured expectations and endpoint observations remain separate;
+        unknown support is allowed through to the provider and any rejection
+        is normalized as a capability error.
+        """
+        mode = self.profile.capability_discovery
+        capabilities = ModelCapabilities(
+            model=self.profile.model,
+            configured=dict(self.profile.capabilities),
+            observed={},
+        )
+        if mode != "disabled":
+            try:
+                capabilities = await self.discover_capabilities()
+            except ModelGatewayError:
+                if mode == "required":
+                    raise
+        for name in required:
+            configured = self.profile.capabilities.get(name)
+            observed = capabilities.observed.get(name)
+            if configured is False or observed is False:
+                self._raise_capability_error(
+                    f"Model profile {self.profile.name!r} does not support required "
+                    f"capability {name!r}"
+                )
+        return capabilities
 
     def _raise_capability_error(self, message: str) -> Never:
         MODEL_GATEWAY_REQUESTS.labels(
@@ -476,13 +580,12 @@ class ModelGateway:
         if isinstance(exc, ModelGatewayError):
             return exc
         if isinstance(exc, httpx.ReadTimeout):
-            return ModelGatewayError(
-                f"Model did not finish within timeout_seconds; not retried (a retry would "
-                f"queue a duplicate prompt behind the still-running one): {exc}"
+            return ModelTransportError(
+                "Model response timed out; not retried to avoid queuing a duplicate generation"
             )
         if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
-            return TransientModelError(f"Model endpoint transport failure: {exc}")
-        return ModelGatewayError(f"Model gateway operation failed: {exc}")
+            return TransientModelError("Model endpoint transport failure")
+        return ModelGatewayError("Model gateway operation failed")
 
     def _retry_delay(self, error: ModelGatewayError, attempt: int) -> float:
         if error.retry_after is not None:

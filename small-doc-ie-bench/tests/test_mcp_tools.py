@@ -594,18 +594,21 @@ async def test_run_tool_loop_reports_per_round_and_cumulative_usage() -> None:
         {
             "round": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             "cumulative": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "billed_tokens": 15,
+            "context_tokens": 15,
         },
         {
             "round": {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27},
             "cumulative": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
+            "billed_tokens": 42,
+            "context_tokens": 27,
         },
     ]
 
 
-async def test_run_tool_loop_context_budget_fires_once_when_crossed() -> None:
-    # on_context_budget fires the FIRST round cumulative usage reaches the
-    # default 80% threshold of context_length_ceiling, and never again on a
-    # later round even though cumulative usage keeps growing.
+async def test_run_tool_loop_context_budget_uses_context_not_cumulative_billing() -> None:
+    # Cumulative billed usage reaches 85 tokens, but no individual request's
+    # context occupancy reaches the 80-token warning threshold.
     responses = [
         _tool_calls_completion(
             "calc__add",
@@ -642,12 +645,7 @@ async def test_run_tool_loop_context_budget_fires_once_when_crossed() -> None:
             on_context_budget=budget_events.append,
         )
 
-    # Round 1 cumulative = 50 (< 80% of 100 = 80): no warning yet.
-    # Round 2 cumulative = 85 (>= 80): fires here, exactly once.
-    # Round 3 (final) cumulative = 105: already warned, must not fire again.
-    assert budget_events == [
-        {"cumulative_tokens": 85, "context_length": 100, "threshold_fraction": 0.8}
-    ]
+    assert budget_events == []
 
 
 async def test_run_tool_loop_context_budget_does_not_fire_under_threshold() -> None:
@@ -743,12 +741,13 @@ async def test_run_tool_loop_context_budget_line_present_from_round_one_and_upda
     # Round 1 (index 0)'s request already carries the initial 0/100 line --
     # aware from the very first round, not only once things get tight.
     assert budget_lines(0) == [mcp_tools._context_budget_line(0, 100)]
-    # Round 2's request reflects round 1's actual usage (50 tokens) --
+    # Round 2's request reflects round 1's current context occupancy (50 tokens) --
     # updated, not appended alongside the stale initial line.
     assert budget_lines(1) == [mcp_tools._context_budget_line(50, 100)]
-    # Round 3's request reflects cumulative after round 2 (50 + 35 = 85) --
+    # Round 3 reflects the new request occupancy (30 + 5 = 35), not billed
+    # usage across prior rounds --
     # still exactly one line, always current.
-    assert budget_lines(2) == [mcp_tools._context_budget_line(85, 100)]
+    assert budget_lines(2) == [mcp_tools._context_budget_line(35, 100)]
 
 
 async def test_run_tool_loop_context_budget_skips_when_ceiling_unresolvable() -> None:

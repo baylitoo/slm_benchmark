@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.llm.mojibake import fix_mojibake
 from docie_bench.llm.prompts import (
@@ -30,6 +31,7 @@ from docie_bench.llm.prompts import (
     OCR_TRANSCRIPTION_USER_PROMPT,
 )
 from docie_bench.llm.reasoning import apply_native_reasoning, uses_native_reasoning
+from docie_bench.llm.upstream_transport import model_error_type, post_upstream_response
 from docie_bench.ocr.factory import get_ocr_backend
 from docie_bench.settings import get_settings
 from docie_bench.vision import DocumentImage, decode_data_uri, load_document_images
@@ -296,44 +298,46 @@ class PipelineSolution:
         prefilled = not native_reasoning and wants_json_schema(llm_request.get("response_format"))
         if prefilled:
             prefill_json_object(llm_request)
-        url = f"{self.extractor.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.extractor.api_key}",
-            "Content-Type": "application/json",
-        }
-        resp = await self._post_extractor(url, headers, llm_request)
+        resp = await self._post_extractor(llm_request)
         # Prefill can break some models' grammar-sampler init ("Failed to
         # initialize samplers"); retry WITHOUT the prefill, keeping the grammar
         # (mirrors the agent vision ladder's grammar-no-prefill rung).
         if prefilled and resp.status_code == 400 and _is_grammar_sampler_400(resp.text):
             no_prefill = {**llm_request, "messages": _strip_json_prefill(llm_request["messages"])}
-            resp = await self._post_extractor(url, headers, no_prefill)
+            resp = await self._post_extractor(no_prefill)
         if resp.status_code >= 400:
             raise SolutionError(
-                f"pipeline extractor returned {resp.status_code}: {resp.text[:200]}",
+                f"pipeline extractor returned HTTP {resp.status_code}",
                 status_code=resp.status_code,
                 error_type="upstream_error",
             )
         completion = resp.json()
+        if not isinstance(completion, dict):
+            raise SolutionError(
+                "pipeline extractor returned a malformed response",
+                status_code=502,
+                error_type="malformed_upstream_response",
+            )
         if prefilled:
             repair_prefilled_content(completion)  # no-op after a no-prefill retry
         return completion
 
-    async def _post_extractor(
-        self, url: str, headers: dict[str, str], body: dict[str, Any]
-    ) -> httpx.Response:
+    async def _post_extractor(self, body: dict[str, Any]) -> httpx.Response:
         try:
-            return await self.http.post(
-                url,
-                json=body,
-                headers=headers,
-                timeout=max(self.extractor.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
+            return await post_upstream_response(
+                self.extractor,
+                self.http,
+                body,
+                allowed_statuses=frozenset({400}),
+                timeout_seconds=max(
+                    self.extractor.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S
+                ),
             )
-        except httpx.RequestError as exc:
+        except ModelGatewayError as exc:
             raise SolutionError(
-                f"pipeline extractor upstream is unreachable: {exc}",
-                status_code=502,
-                error_type="upstream_unavailable",
+                str(exc),
+                status_code=exc.status_code or 502,
+                error_type=model_error_type(exc),
             ) from exc
 
     async def _vlm_ocr(self, request: dict[str, Any]) -> str:
@@ -370,27 +374,24 @@ class PipelineSolution:
         }
         if self.no_think:
             apply_no_think(ocr_request)
-        url = f"{vision.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {vision.api_key}",
-            "Content-Type": "application/json",
-        }
         try:
-            resp = await self.http.post(
-                url,
-                json=ocr_request,
-                headers=headers,
-                timeout=max(vision.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S),
+            resp = await post_upstream_response(
+                vision,
+                self.http,
+                ocr_request,
+                timeout_seconds=max(
+                    vision.timeout_seconds, _PIPELINE_UPSTREAM_TIMEOUT_S
+                ),
             )
-        except httpx.RequestError as exc:
+        except ModelGatewayError as exc:
             raise SolutionError(
-                f"pipeline ocr_model upstream is unreachable: {exc}",
-                status_code=502,
-                error_type="upstream_unavailable",
+                str(exc),
+                status_code=exc.status_code or 502,
+                error_type=model_error_type(exc),
             ) from exc
         if resp.status_code >= 400:
             raise SolutionError(
-                f"pipeline ocr_model returned {resp.status_code}: {resp.text[:200]}",
+                f"pipeline ocr_model returned HTTP {resp.status_code}",
                 status_code=resp.status_code,
                 error_type="upstream_error",
             )

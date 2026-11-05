@@ -821,22 +821,26 @@ async def run_tool_loop(
     budget from the FIRST round on, not just warned once late: a
     ``_CONTEXT_BUDGET_PREFIX``-marked line is folded into the system message
     before round 1 (``0/ceiling``), then RE-FOLDED (replacing that same
-    line, never appended anew) after every round with the latest cumulative
-    total -- continuous awareness the model can pace itself against for the
-    whole exchange, not a single late warning near the wall.
+    line, never appended anew) after every round with the latest known
+    prompt-plus-completion count for that request -- continuous awareness
+    the model can pace itself against for the whole exchange, not a single
+    late warning near the wall.
 
     Separately, ``on_context_budget``, when given, is invoked ONCE -- the
-    first round cumulative ``total_tokens`` reaches
+    first round's prompt-plus-completion ``context_tokens`` reaches
     ``settings.mcp_context_budget_warn_fraction`` (default 80%) of the
-    ceiling -- with ``{"cumulative_tokens": <int>, "context_length": <int>,
-    "threshold_fraction": <float>}``. This is the human/UI-facing mirror,
+    ceiling -- with ``{"context_tokens": <int>, "billed_tokens": <int|null>,
+    "cumulative_tokens": <int>, "context_length": <int>,
+    "threshold_fraction": <float>}``. ``cumulative_tokens`` remains a compatibility
+    alias for the UI; ``billed_tokens`` is cumulative spend-relevant usage when
+    every round reported it. This is the human/UI-facing mirror,
     for a caller that wants a one-time actionable warning of its own (the
     Playground renders it as a banner); it is independent of the continuous
     model-facing line above, which happens regardless of whether this
     callback is given.
 
     Neither truncates, summarizes, or otherwise forces the exchange to end --
-    a cumulative total several real rounds deep can still hit a hard
+    a current context several real rounds deep can still hit a hard
     ``exceed_context_size_error`` from llama-server on some LATER round if
     the model doesn't act on its own budget awareness; this narrows that
     risk, it doesn't eliminate it.
@@ -910,6 +914,9 @@ async def run_tool_loop(
         caller_tools + mcp_tools + ([ASK_USER_TOOL_SCHEMA] if exchange_id is not None else [])
     )
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    usage_complete = True
+    usage_seen = False
+    context_tokens: int | None = None
     context_budget_warned = False
     rounds_used = 0
 
@@ -952,27 +959,48 @@ async def run_tool_loop(
         if not isinstance(completion, dict):
             return completion
         round_usage = completion.get("usage")
-        _accumulate_usage(totals, round_usage)
-        if on_usage is not None:
+        round_has_billed_usage = isinstance(round_usage, dict) and all(
+            isinstance(round_usage.get(key), int)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        )
+        if round_has_billed_usage:
+            usage_seen = True
+            _accumulate_usage(totals, round_usage)
+        else:
+            usage_complete = False
+        if isinstance(round_usage, dict) and all(
+            isinstance(round_usage.get(key), int)
+            for key in ("prompt_tokens", "completion_tokens")
+        ):
+            context_tokens = round_usage["prompt_tokens"] + round_usage["completion_tokens"]
+        else:
+            context_tokens = None
+        if on_usage is not None and usage_complete and round_has_billed_usage:
             on_usage(
                 {
-                    "round": round_usage if isinstance(round_usage, dict) else {},
+                    "round": round_usage,
                     "cumulative": dict(totals),
+                    "billed_tokens": totals["total_tokens"],
+                    "context_tokens": context_tokens,
                 }
             )
-        if context_length_ceiling is not None:
-            # Model-facing: re-fold every round with the latest cumulative
-            # total, independent of the one-time human-facing signal below.
+        if context_length_ceiling is not None and context_tokens is not None:
+            # Prompt tokens describe the current request's context; cumulative
+            # completion usage describes billed work across all rounds.
             messages = _with_context_budget_line(
-                messages, _context_budget_line(totals["total_tokens"], context_length_ceiling)
+                messages, _context_budget_line(context_tokens, context_length_ceiling)
             )
             if on_context_budget is not None and not context_budget_warned:
                 threshold_fraction = get_settings().mcp_context_budget_warn_fraction
-                if totals["total_tokens"] >= context_length_ceiling * threshold_fraction:
+                if context_tokens >= context_length_ceiling * threshold_fraction:
                     context_budget_warned = True
                     on_context_budget(
                         {
-                            "cumulative_tokens": totals["total_tokens"],
+                            # Keep the old field as a compatibility alias for
+                            # the UI; its value is current context occupancy.
+                            "cumulative_tokens": context_tokens,
+                            "context_tokens": context_tokens,
+                            "billed_tokens": totals["total_tokens"] if usage_complete else None,
                             "context_length": context_length_ceiling,
                             "threshold_fraction": threshold_fraction,
                         }
@@ -1014,8 +1042,11 @@ async def run_tool_loop(
             for name in names:
                 if name and not _is_known(name) and name not in caller_tool_names:
                     logger.warning("model called unknown tool %r — returning to caller", name)
-            if any(totals.values()):
+            if usage_complete and usage_seen:
                 completion = {**completion, "usage": dict(totals)}
+            else:
+                completion = dict(completion)
+                completion.pop("usage", None)
             return completion
         assert message is not None  # all_mcp implies a message with tool_calls
         messages.append(message)

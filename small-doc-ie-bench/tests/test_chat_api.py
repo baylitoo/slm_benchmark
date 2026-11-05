@@ -804,6 +804,8 @@ def test_chat_mcp_stream_relays_context_budget_as_its_own_sse_event(api, monkeyp
         on_context_budget(
             {
                 "cumulative_tokens": 3300,
+                "context_tokens": 3300,
+                "billed_tokens": None,
                 "context_length": 4096,
                 "threshold_fraction": 0.8,
             }
@@ -834,6 +836,8 @@ def test_chat_mcp_stream_relays_context_budget_as_its_own_sse_event(api, monkeyp
     assert budget_event == {
         "type": "context_budget",
         "cumulative_tokens": 3300,
+        "context_tokens": 3300,
+        "billed_tokens": None,
         "context_length": 4096,
         "threshold_fraction": 0.8,
     }

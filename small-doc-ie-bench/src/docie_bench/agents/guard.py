@@ -19,7 +19,9 @@ from typing import Any
 import httpx
 
 from docie_bench.agents.pii import PiiEntity
+from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
+from docie_bench.llm.upstream_transport import post_upstream_response
 
 
 @dataclass(frozen=True)
@@ -146,23 +148,10 @@ async def guard_analyze(
         body["threshold"] = threshold
     if tasks:
         body["tasks"] = tasks
-    url = f"{guard.base_url}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {guard.api_key}",
-        "Content-Type": "application/json",
-    }
     try:
-        response = await http_client.post(
-            url, json=body, headers=headers, timeout=guard.timeout_seconds
-        )
-    except httpx.RequestError as exc:
-        raise GuardAnalysisError(
-            f"guard encoder {guard.base_url} is unreachable: {exc}"
-        ) from exc
-    if response.status_code >= 400:
-        raise GuardAnalysisError(
-            f"guard encoder returned {response.status_code}: {response.text[:300]}"
-        )
+        response = await post_upstream_response(guard, http_client, body)
+    except ModelGatewayError as exc:
+        raise GuardAnalysisError(str(exc)) from exc
     try:
         completion = response.json()
     except ValueError as exc:

@@ -22,6 +22,7 @@ circuit-breaker. Those layer on top later.
 from __future__ import annotations
 
 import contextlib
+import os
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from docie_bench.llm.model_profiles import ModelProfile, load_model_profiles
 from docie_bench.openai_protocol import openai_error, single_chunk_stream
 from docie_bench.serving.solutions import SolutionError, build_solution
 
-DEFAULT_MODELS_CONFIG = Path("configs/models.yaml")
+DEFAULT_MODELS_CONFIG = Path(os.environ.get("DOCIE_MODELS_CONFIG", "configs/models.yaml"))
 
 
 class GatewayRoutingError(Exception):

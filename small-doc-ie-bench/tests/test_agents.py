@@ -120,7 +120,13 @@ def api(tmp_path, monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
     def fake_resolver(*, model_profile: str | None = None, **_: object) -> ModelProfile:
         if model_profile in (None, "alpha"):
             return UPSTREAM
-        return replace(UPSTREAM, name=str(model_profile), model=str(model_profile))
+        location = "local" if str(model_profile).startswith("local-") else "remote"
+        return replace(
+            UPSTREAM,
+            name=str(model_profile),
+            model=str(model_profile),
+            execution_location=location,
+        )
 
     monkeypatch.setattr(
         "docie_bench.agents.runtime.resolve_extraction_profile", fake_resolver
@@ -137,6 +143,14 @@ def api(tmp_path, monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
         captured.append(request)
         body = json.loads(request.content)
         last = body["messages"][-1]["content"]
+        if body["model"] == "local-router":
+            answer = "frontier"
+        elif body["model"] == "local-transform":
+            answer = "normalized invoice excerpt"
+        elif body["model"] == "frontier":
+            answer = f"reasoned: {last}"
+        else:
+            answer = f"echo: {last}"
         if body.get("stream"):
             return httpx.Response(
                 200,
@@ -152,7 +166,7 @@ def api(tmp_path, monkeypatch) -> tuple[TestClient, list[httpx.Request]]:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": f"echo: {last}"},
+                        "message": {"role": "assistant", "content": answer},
                         "finish_reason": "stop",
                     }
                 ],
@@ -718,6 +732,166 @@ def test_custom_agent_injects_system_prompt(api) -> None:
     sent = json.loads(captured[-1].content)
     assert sent["messages"][0] == {"role": "system", "content": "You are terse."}
     assert sent["model"] == "up-alpha"
+
+
+def test_hybrid_workflow_routes_locally_and_preserves_the_original_input(api) -> None:
+    client, captured = api
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "hybrid-router",
+            "kind": "workflow",
+            "options": {
+                "steps": [
+                    {
+                        "name": "route",
+                        "model_profile": "local-router",
+                        "route": {
+                            "routes": {"frontier": "remote-specialist"},
+                            "default": "remote-specialist",
+                        },
+                    },
+                    {"name": "remote-specialist", "model_profile": "frontier"},
+                ]
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.post(
+        "/v1/agents/hybrid-router/chat/completions",
+        json={"messages": [{"role": "user", "content": "substantive source text"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert [json.loads(request.content)["model"] for request in captured] == [
+        "local-router",
+        "frontier",
+    ]
+    remote_body = json.loads(captured[-1].content)
+    assert remote_body["messages"][-1]["content"] == "substantive source text"
+    trace = response.json()["docie_agent"]
+    assert [call["execution"] for call in trace["model_calls"]] == ["local", "remote"]
+    assert trace["model_calls"][1]["step_name"] == "remote-specialist"
+    assert trace["steps"][0]["routed_to"] == "remote-specialist"
+
+
+def test_workflow_remote_policy_blocks_before_sending_the_next_step(api) -> None:
+    client, captured = api
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "local-only",
+            "kind": "workflow",
+            "options": {
+                "allow_remote_profiles": False,
+                "steps": [
+                    {"name": "transform", "model_profile": "local-transform"},
+                    {"name": "reason", "model_profile": "frontier"},
+                ],
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+    response = client.post(
+        "/v1/agents/local-only/chat/completions",
+        json={"messages": [{"role": "user", "content": "private content"}]},
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "remote_processing_forbidden"
+    assert [json.loads(request.content)["model"] for request in captured] == ["local-transform"]
+
+
+def test_local_transformation_is_chained_into_remote_reasoning(api) -> None:
+    client, captured = api
+    created = client.post(
+        "/v1/agents",
+        json={
+            "name": "transform-reason",
+            "kind": "workflow",
+            "options": {
+                "steps": [
+                    {"name": "transform", "model_profile": "local-transform"},
+                    {"name": "reason", "model_profile": "frontier"},
+                ]
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+    response = client.post(
+        "/v1/agents/transform-reason/chat/completions",
+        json={"messages": [{"role": "user", "content": "source facts"}]},
+    )
+    assert response.status_code == 200, response.text
+    remote_body = json.loads(captured[-1].content)
+    assert remote_body["model"] == "frontier"
+    assert remote_body["messages"][-1]["content"] == "normalized invoice excerpt"
+
+
+def test_nested_workflow_cannot_reenable_remote_processing(api) -> None:
+    client, captured = api
+    nested = client.post(
+        "/v1/agents",
+        json={
+            "name": "remote-child",
+            "kind": "workflow",
+            "options": {"steps": [{"name": "reason", "model_profile": "frontier"}]},
+        },
+    )
+    assert nested.status_code == 201, nested.text
+    outer = client.post(
+        "/v1/agents",
+        json={
+            "name": "local-parent",
+            "kind": "workflow",
+            "options": {
+                "allow_remote_profiles": False,
+                "steps": [{"agent": "remote-child"}],
+            },
+        },
+    )
+    assert outer.status_code == 201, outer.text
+    response = client.post(
+        "/v1/agents/local-parent/chat/completions",
+        json={"messages": [{"role": "user", "content": "private"}]},
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "remote_processing_forbidden"
+    assert captured == []
+
+
+def test_model_call_limit_is_shared_with_nested_workflows(api) -> None:
+    client, captured = api
+    nested = client.post(
+        "/v1/agents",
+        json={
+            "name": "local-child",
+            "kind": "workflow",
+            "options": {"steps": [{"name": "child-call", "model_profile": "local-transform"}]},
+        },
+    )
+    assert nested.status_code == 201, nested.text
+    outer = client.post(
+        "/v1/agents",
+        json={
+            "name": "one-call-only",
+            "kind": "workflow",
+            "options": {
+                "max_model_calls": 1,
+                "steps": [
+                    {"name": "first", "model_profile": "local-transform"},
+                    {"agent": "local-child"},
+                ],
+            },
+        },
+    )
+    assert outer.status_code == 201, outer.text
+    response = client.post(
+        "/v1/agents/one-call-only/chat/completions",
+        json={"messages": [{"role": "user", "content": "source"}]},
+    )
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "workflow_model_call_limit"
+    assert len(captured) == 1
 
 
 def test_platform_route_requires_known_agent(api) -> None:

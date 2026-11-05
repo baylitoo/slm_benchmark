@@ -52,6 +52,7 @@ models/reasoning
 
 development/contributing
 development/testing
+hybrid-execution
 ```
 
 ```{toctree}
