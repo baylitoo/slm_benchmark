@@ -425,6 +425,7 @@ class ServingReconciler:
         clock: Callable[[], float] = time.time,
         repair: Callable[[str], object] | None = None,
         deployer: Callable[[str, dict[str, Any]], object] | None = None,
+        loader: Callable[[str], object] | None = None,
         throughput: ThroughputStore | None = None,
         probe: Callable[[ProbeRequest], ThroughputSample | None] = probe_deployment,
         probe_hot_cycles: int = _PROBE_HOT_CYCLES,
@@ -499,6 +500,13 @@ class ServingReconciler:
         # plane, not the repair loop. Unset, the loop logs the starts it cannot
         # perform instead of silently dropping them.
         self._deployer = deployer
+        # Restoring a drain's working set (#634). A DIFFERENT hook from
+        # `deployer`, not a convenience: the records are already here, with
+        # their ports and their launches, so the cold-start path is what this
+        # needs -- idempotent, fit-gated, and able to evict for memory if the
+        # machine came back smaller. A deploy would reallocate a port and
+        # rebuild a launch that never went away.
+        self._loader = loader
         self._repairs_due: list[str] = []
         self._repair_last: dict[str, float] = {}
         # Measured throughput: one fixed generation probe per model path, run
@@ -668,6 +676,16 @@ class ServingReconciler:
             # nothing outside the lock reads a mutating mapping.
             records = self.supervisor.records()
             local_names = set(records)
+            # Which of them are MEANT to be running, which is the question a
+            # drain's working set asks -- not which are READY. A model still
+            # loading, or momentarily failed and being restarted, is part of
+            # this node's working set and must come back after maintenance.
+            running_names = {
+                name
+                for name, record in records.items()
+                if getattr(getattr(record, "spec", None), "desired_state", None)
+                == DesiredState.RUNNING
+            }
             # How long a request on each deployment is allowed to take, which
             # is how long one admitted just before a drain could still be
             # running. Read here so the grace period and the name set come from
@@ -727,7 +745,23 @@ class ServingReconciler:
                 generation=generation,
                 desired=desired,
                 local_names=local_names,
+                running_names=running_names,
             )
+
+        # Admitting again, and a drain may have left a working set to put back.
+        # BEFORE the plan, because a stopped record is "present locally" and so
+        # produces no start: restoring is the drain's own inverse, not something
+        # the name-based diff can express (#590).
+        #
+        # Its result gates the GENERATION WRITE and nothing else. Returning
+        # early on a failed restore would be the same containment mistake
+        # `_apply_plan` is built to avoid, one level up: a single model that
+        # cannot load -- the machine came back smaller, its blob was cleaned --
+        # would stop every stop, removal and targeted start on this node from
+        # ever converging. It also livelocks the case where the deployment that
+        # will not load was DELETED during the maintenance, since the removal
+        # that would resolve it is computed below.
+        restored = self._restore_drained(desired=desired)
 
         plan = plan_convergence(
             desired=desired,
@@ -735,11 +769,14 @@ class ServingReconciler:
             previously_applied=applied.names,
         )
         if plan.is_empty:
-            # Still record the generation: the intent HAS been applied, and not
-            # recording it would re-decide CONVERGE on every cycle forever.
-            write_applied_state(
-                AppliedState(generation=int(generation or 0), names=frozenset(desired))
-            )
+            if restored:
+                # Record the generation: the intent HAS been applied, and not
+                # recording it would re-decide CONVERGE on every cycle forever.
+                write_applied_state(
+                    AppliedState(
+                        generation=int(generation or 0), names=frozenset(desired)
+                    )
+                )
             return decision
 
         if not _desired_apply_enabled():
@@ -759,7 +796,7 @@ class ServingReconciler:
             plan.to_stop,
             plan.to_remove,
         )
-        if self._apply_plan(plan, specs):
+        if self._apply_plan(plan, specs) and restored:
             write_applied_state(
                 AppliedState(generation=int(generation or 0), names=frozenset(desired))
             )
@@ -785,6 +822,7 @@ class ServingReconciler:
         generation: object,
         desired: dict[str, str],
         local_names: set[str],
+        running_names: set[str],
     ) -> object:
         """Carry out a drain on this node: wait, then stop everything.
 
@@ -800,9 +838,20 @@ class ServingReconciler:
         would make a later desired-row deletion eligible to remove a deployment
         the catalog was never told about, which is exactly the teardown that
         whitelist exists to prevent.
+
+        The WORKING SET is recorded here for the same reason, from the other
+        direction: a resume has to put back what this drain stopped, and after
+        the stops nothing in the records says which ones those were (see
+        :mod:`docie_bench.serving.drain_working_set`). ``running_names`` is
+        taken BEFORE anything is stopped, so a deployment an operator had
+        already turned off is not resurrected by maintenance.
         """
         from docie_bench.serving.applied_state import AppliedState, write_applied_state
         from docie_bench.serving.drain import DrainPhase
+        from docie_bench.serving.drain_working_set import (
+            read_drain_working_set,
+            write_drain_working_set,
+        )
 
         if phase is DrainPhase.DRAINING:
             # Routing already excludes this node centrally, so nothing is being
@@ -847,6 +896,15 @@ class ServingReconciler:
             len(local_names),
             ", ".join(sorted(local_names)),
         )
+        # Written BEFORE the stops: a container killed mid-drain must still
+        # know what to restore, and recording a deployment that then failed to
+        # stop costs nothing -- restoring an already-running one is a no-op.
+        #
+        # Unioned with any set still pending, so a drain landing on top of an
+        # unfinished restore carries that work forward instead of dropping it.
+        # Those names are stopped right now, so they are not in `running_names`
+        # and would otherwise be lost by this drain.
+        write_drain_working_set(frozenset(running_names) | read_drain_working_set())
         ok = True
         for name in sorted(local_names):
             try:
@@ -862,6 +920,114 @@ class ServingReconciler:
         else:
             logger.warning("drain only partly applied; retrying next cycle")
         return decision
+
+    def _restore_drained(self, *, desired: dict[str, str]) -> bool:
+        """Put back what a drain stopped, now that this node admits again.
+
+        Returns whether there is nothing left pending -- True when the working
+        set was empty, and True when every name in it was restored or dropped
+        for a reason. The caller records the applied generation only on True,
+        so a load that failed is retried next cycle rather than being forgotten
+        the moment the generations match.
+
+        WHY THIS IS NOT A CONVERGENCE ACTION. ``plan_convergence`` derives
+        starts from names ABSENT locally, and a drain leaves its records
+        present and stopped -- so a desired row saying ``running`` against a
+        stopped record produces an empty plan, and the resume endpoint's claim
+        that "its reconciler restores the deployments it stopped" was not true
+        of any code. Expressing it in the plan needs the diff to carry record
+        STATE rather than names, which is #590 and a wider change; the drain's
+        own inverse needs neither.
+
+        Three reasons a name is dropped rather than restored, each the
+        operator's intent rather than a failure:
+
+        * it is no longer local -- the deployment was removed while the node
+          was out, so there is nothing to start;
+        * its desired row now says ``stopped`` -- somebody unloaded it
+          centrally during the maintenance, which is a later instruction than
+          the drain;
+        * no loader is wired, which cannot restore anything and is reported as
+          not done so that wiring one later retries.
+
+        A False return holds the generation write ONLY. The caller carries on
+        with the rest of the plan, because a model that will not load must not
+        stop this node converging on anything else.
+        """
+        from docie_bench.serving.drain_working_set import (
+            clear_drain_working_set,
+            read_drain_working_set,
+            write_drain_working_set,
+        )
+
+        pending = read_drain_working_set()
+        if not pending:
+            return True
+
+        if not _desired_apply_enabled():
+            logger.warning(
+                "node is admitting again and %d deployment(s) the drain stopped "
+                "would be restored, but desired-state apply is off (set "
+                "DOCIE_SERVING_DESIRED_APPLY=1): %s",
+                len(pending),
+                ", ".join(sorted(pending)),
+            )
+            return False
+
+        with self.supervisor.lock:
+            local = set(self.supervisor.records())
+
+        restorable = {
+            name
+            for name in pending
+            if name in local and desired.get(name, "running") == "running"
+        }
+        dropped = pending - restorable
+        if dropped:
+            logger.info(
+                "not restoring %d deployment(s) the drain stopped: gone or no "
+                "longer desired running: %s",
+                len(dropped),
+                ", ".join(sorted(dropped)),
+            )
+        if not restorable:
+            clear_drain_working_set()
+            return True
+
+        if self._loader is None:
+            logger.warning(
+                "the drain stopped %d deployment(s) and no loader is wired to "
+                "restore them; load them on this node: %s",
+                len(restorable),
+                ", ".join(sorted(restorable)),
+            )
+            return False
+
+        logger.info(
+            "resumed: restoring %d deployment(s) the drain stopped: %s",
+            len(restorable),
+            ", ".join(sorted(restorable)),
+        )
+        failed: set[str] = set()
+        for name in sorted(restorable):
+            try:
+                self._loader(name)
+            except Exception:  # noqa: BLE001 - one failure must not stall the rest
+                logger.warning("restoring %s after a drain failed", name, exc_info=True)
+                failed.add(name)
+            # A cold load blocks until the model is serving, which for a
+            # multi-GB GGUF outlasts the lease's staleness window -- the same
+            # reason _apply_plan heartbeats between its own starts.
+            self._heartbeat()
+
+        write_drain_working_set(failed)
+        if failed:
+            logger.warning(
+                "%d deployment(s) the drain stopped are still down; retrying "
+                "next cycle",
+                len(failed),
+            )
+        return not failed
 
     def _apply_plan(self, plan: object, specs: dict[str, dict[str, Any]]) -> bool:
         """Carry out a convergence plan, returning whether ALL of it succeeded.

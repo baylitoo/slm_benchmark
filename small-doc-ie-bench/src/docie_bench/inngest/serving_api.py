@@ -563,9 +563,19 @@ async def resume_node(node_id: str, tenant: TenantDependency) -> dict[str, Any]:
     """Admit ``node_id`` again, undoing a drain (#536).
 
     Routing picks it back up on the next resolution. Deployments its reconciler
-    stopped are restarted by the same convergence that stopped them: their
-    desired rows were never deleted, only overridden while the node was
-    drained, so a resume restores them rather than needing a redeploy.
+    stopped are restored from the working set the drain recorded, on the node's
+    next cycle, rather than needing a redeploy.
+
+    NOT by convergence, though it reads as if it should be. A drain stops
+    through ``supervisor.stop``, which keeps the record -- so the deployment is
+    still present locally and a desired row saying ``running`` produces no
+    start. The restore is the drain's own inverse; see
+    :mod:`docie_bench.serving.drain_working_set`.
+
+    One thing this cannot promise: the node must be converging. A resume on a
+    node whose reconciler is down, or whose ``DOCIE_SERVING_DESIRED_APPLY`` is
+    off, puts the node back in the rotation with its runtimes still stopped --
+    the same asymmetry the drain has, in the other direction.
     """
     del tenant  # authenticated principal required; no per-tenant scoping (ops)
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
