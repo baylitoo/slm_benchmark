@@ -28,6 +28,19 @@ function looksGenerated(nodeId: string): boolean {
   return /^[0-9a-f]{12}$/.test(nodeId);
 }
 
+/** "Deployments" counts what a node HOLDS, which is not what it is running.
+ *
+ * A stopped deployment keeps its record, its port reservation and its
+ * placement row, so a node can hold three and run none. This tile used to be
+ * labelled "running on this node", which is the one reading the number does
+ * not support. */
+function deploymentsDetail(node: FleetNode): string {
+  const live = node.deployments_live;
+  if (live == null) return "on this node";
+  if (live === node.deployments) return live === 1 ? "running" : "all running";
+  return `${live} running, ${node.deployments - live} stopped`;
+}
+
 /**
  * Fleet tab (#536): the serving nodes, their capacity, and which of them holds
  * each model's blob.
@@ -186,7 +199,7 @@ function SingleNode({ node, store }: { node: FleetNode; store: StoreEntry[] | nu
         <StatTile
           label="Deployments"
           value={node.deployments}
-          detail={node.deployments === 1 ? "running here" : "running on this node"}
+          detail={deploymentsDetail(node)}
         />
         <StatTile
           label="Models held"
@@ -367,7 +380,14 @@ function NodeTable({
         key: "deployments",
         header: "Deployments",
         sortAccessor: (n) => n.deployments,
-        render: (n) => <span className="tabular-nums">{n.deployments}</span>,
+        render: (n) => (
+          <span className="tabular-nums">
+            {n.deployments}
+            {n.deployments_live != null && n.deployments_live !== n.deployments ? (
+              <span className="text-xs text-muted"> ({n.deployments_live} running)</span>
+            ) : null}
+          </span>
+        ),
       },
       {
         key: "store",
@@ -462,8 +482,8 @@ function NodeState({
         <Badge tone="warn">{done ? "drained" : "draining"}</Badge>
         <span className="text-xs text-muted">
           {done
-            ? "no placements left"
-            : `${node.deployments} still finishing`}
+            ? "no runtime left"
+            : `${node.deployments_live ?? node.deployments} still finishing`}
         </span>
       </span>
     );
