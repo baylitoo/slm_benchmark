@@ -9,6 +9,7 @@ import {
   Pin,
   PinOff,
   Pencil,
+  Power,
   PowerOff,
   RefreshCw,
   Trash2,
@@ -488,12 +489,11 @@ export function DeploymentsView({
     setBusy(`${name}:${action}`);
     try {
       let detail: string | null = null;
-      if (action === "load") await loadDeployment(name);
-      else if (action === "unload") {
-        // A remote unload answers with no channel and a sentence describing
-        // what was recorded for which node. Reporting a bare "requested"
-        // would read as "done".
-        const res = await unloadDeployment(name);
+      if (action === "load" || action === "unload") {
+        // A remote load or unload answers with no channel and a sentence
+        // describing what was recorded for which node. Reporting a bare
+        // "requested" would read as "done".
+        const res = await (action === "load" ? loadDeployment(name) : unloadDeployment(name));
         detail = res.channel === null ? (res.detail ?? null) : null;
       } else if (action === "delete") await deleteDeployment(name);
       else if (action === "repair") await repairDeployment(name, port ?? null);
@@ -723,11 +723,13 @@ export function DeploymentsView({
         // and on a single node no row is ever a projection, so nothing changes.
         if (r.record_source === "catalog") {
           // A catalog projection: this process holds no local record, so the
-          // actions that need one cannot run here. Unload is the exception —
-          // it is expressible as desired state, which is the one channel that
-          // can be aimed at a node, so the owner converges it. Load, delete,
-          // pin and repair each need a plan state that does not exist yet
+          // actions that need one cannot run here. Load and unload are the
+          // exceptions: both are expressible as desired state, the one channel
+          // that can be aimed at a node. Delete, pin and repair are not yet
           // (#590), so they stay off the row rather than offering a 409.
+          const remotePhase = derivePhase(r);
+          const remoteRunning = remotePhase === "hot" || remotePhase === "loading";
+          const remoteAction = remoteRunning ? "unload" : "load";
           return (
             <div
               className="flex items-center justify-end gap-2"
@@ -737,7 +739,7 @@ export function DeploymentsView({
                 className="text-xs text-muted-foreground"
                 title={
                   `Runs on serving node ${r.node_id ?? "unknown"}. This process has no ` +
-                  `local record for it, so load, delete, pin and repair must run on ` +
+                  `local record for it, so delete, pin and repair must run on ` +
                   `that node.`
                 }
               >
@@ -746,16 +748,20 @@ export function DeploymentsView({
               <Button
                 size="sm"
                 variant="ghost"
-                loading={busy === `${name}:unload`}
+                loading={busy === `${name}:${remoteAction}`}
                 disabled={busy !== null}
+                aria-label={remoteRunning ? "Unload" : "Load"}
                 title={
-                  `Unload on ${r.node_id ?? "its node"}: recorded as desired state, ` +
-                  `which that node converges on its own cycle. Frees its memory and ` +
-                  `keeps the record.`
+                  `${remoteRunning ? "Unload" : "Load"} on ${r.node_id ?? "its node"}: ` +
+                  `recorded as desired state, which that node converges on its own cycle.`
                 }
-                onClick={() => act(name, "unload")}
+                onClick={() => act(name, remoteAction)}
               >
-                <PowerOff className="h-3.5 w-3.5" />
+                {remoteRunning ? (
+                  <PowerOff className="h-3.5 w-3.5" />
+                ) : (
+                  <Power className="h-3.5 w-3.5" />
+                )}
               </Button>
             </div>
           );
@@ -1166,9 +1172,9 @@ function RepairControls({
  * `record_source` matters for more than display: a "catalog" row is a
  * projection for a deployment this process has no file for, so it carries no
  * desired state, restart policy or pin. The actions that need those are not
- * offered on it — the 409 the API would return is correct but late. Unload IS
- * offered, because it is expressible as desired state and so can be aimed at
- * the owning node (#536); load, delete, pin and repair are not yet (#590).
+ * offered on it — the 409 the API would return is correct but late. Load and
+ * unload ARE offered, because they are expressible as desired state and so can
+ * be aimed at the owning node; delete, pin and repair are not yet (#590).
  *
  * `node_reporting: false` leaves the row listed rather than hiding it:
  * unreachable is not the same as gone, and a deployment that has vanished from

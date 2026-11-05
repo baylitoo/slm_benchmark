@@ -63,7 +63,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -719,6 +719,7 @@ class ServingReconciler:
         rows = snapshot.get("deployments") if snapshot else []
         desired: dict[str, str] = {}
         specs: dict[str, dict[str, Any]] = {}
+        load_requests: dict[str, str] = {}
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict) or not row.get("name"):
                 continue
@@ -726,6 +727,9 @@ class ServingReconciler:
             desired[name] = str(row.get("desired_state") or "running")
             spec = row.get("spec")
             specs[name] = spec if isinstance(spec, dict) else {}
+            request = specs[name].get("load_request")
+            if request:
+                load_requests[name] = str(request)
         # A declared drain overrides every desired row for this node: the
         # operator asked for the machine, not for its deployments to be
         # re-pointed. Handled INSIDE the CONVERGE branch so it rides the same
@@ -746,6 +750,7 @@ class ServingReconciler:
                 desired=desired,
                 local_names=local_names,
                 running_names=running_names,
+                applied_loads=applied.loads,
             )
 
         # Admitting again, and a drain may have left a working set to put back.
@@ -767,39 +772,42 @@ class ServingReconciler:
             desired=desired,
             local_names=local_names,
             previously_applied=applied.names,
+            load_requests=load_requests,
+            applied_loads=applied.loads,
+        )
+        applied_now = AppliedState(
+            generation=int(generation or 0),
+            names=frozenset(desired),
+            loads=load_requests,
         )
         if plan.is_empty:
             if restored:
                 # Record the generation: the intent HAS been applied, and not
                 # recording it would re-decide CONVERGE on every cycle forever.
-                write_applied_state(
-                    AppliedState(
-                        generation=int(generation or 0), names=frozenset(desired)
-                    )
-                )
+                write_applied_state(applied_now)
             return decision
 
         if not _desired_apply_enabled():
             logger.warning(
                 "desired-state plan NOT applied (set DOCIE_SERVING_DESIRED_APPLY=1 "
-                "to enable): start=%s stop=%s remove=%s",
+                "to enable): start=%s load=%s stop=%s remove=%s",
                 plan.to_start,
+                plan.to_load,
                 plan.to_stop,
                 plan.to_remove,
             )
             return decision
 
         logger.info(
-            "converging on desired generation %s: start=%s stop=%s remove=%s",
+            "converging on desired generation %s: start=%s load=%s stop=%s remove=%s",
             generation,
             plan.to_start,
+            plan.to_load,
             plan.to_stop,
             plan.to_remove,
         )
         if self._apply_plan(plan, specs) and restored:
-            write_applied_state(
-                AppliedState(generation=int(generation or 0), names=frozenset(desired))
-            )
+            write_applied_state(applied_now)
         else:
             # Leave the applied generation where it is, so the NEXT cycle
             # re-plans and retries. Recording it here would mean a single
@@ -823,6 +831,7 @@ class ServingReconciler:
         desired: dict[str, str],
         local_names: set[str],
         running_names: set[str],
+        applied_loads: Mapping[str, str],
     ) -> object:
         """Carry out a drain on this node: wait, then stop everything.
 
@@ -845,6 +854,9 @@ class ServingReconciler:
         :mod:`docie_bench.serving.drain_working_set`). ``running_names`` is
         taken BEFORE anything is stopped, so a deployment an operator had
         already turned off is not resurrected by maintenance.
+
+        ``applied_loads`` is carried through unchanged: a load requested while
+        drained has not been carried out, and the resume's plan has to see that.
         """
         from docie_bench.serving.applied_state import AppliedState, write_applied_state
         from docie_bench.serving.drain import DrainPhase
@@ -872,7 +884,11 @@ class ServingReconciler:
             # Already empty: the drain is satisfied, and recording the
             # generation stops the cycle re-deciding CONVERGE forever.
             write_applied_state(
-                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+                AppliedState(
+                    generation=int(generation or 0),
+                    names=frozenset(desired),
+                    loads=applied_loads,
+                )
             )
             return decision
 
@@ -915,7 +931,11 @@ class ServingReconciler:
             self._heartbeat()
         if ok:
             write_applied_state(
-                AppliedState(generation=int(generation or 0), names=frozenset(desired))
+                AppliedState(
+                    generation=int(generation or 0),
+                    names=frozenset(desired),
+                    loads=applied_loads,
+                )
             )
         else:
             logger.warning("drain only partly applied; retrying next cycle")
@@ -1079,6 +1099,20 @@ class ServingReconciler:
         what fixing it properly needs.
         """
         ok = True
+        for name in getattr(plan, "to_load", ()):
+            if self._loader is None:
+                logger.warning(
+                    "desired state requests a load of %s but no loader is wired",
+                    name,
+                )
+                ok = False
+                continue
+            try:
+                self._loader(name)
+            except Exception:  # noqa: BLE001 - one failure must not stall the plan
+                logger.warning("desired-state load of %s failed", name, exc_info=True)
+                ok = False
+            self._heartbeat()
         for name in getattr(plan, "to_start", ()):
             if self._deployer is None:
                 logger.warning(

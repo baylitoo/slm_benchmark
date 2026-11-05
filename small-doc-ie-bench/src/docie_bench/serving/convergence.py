@@ -169,9 +169,12 @@ class ConvergencePlan:
     to_remove: tuple[str, ...] = ()
     """No longer desired, AND previously applied from desired state."""
 
+    to_load: tuple[str, ...] = ()
+    """Desired running, present locally, with a load request not yet carried out."""
+
     @property
     def is_empty(self) -> bool:
-        return not (self.to_start or self.to_stop or self.to_remove)
+        return not (self.to_start or self.to_stop or self.to_remove or self.to_load)
 
 
 def plan_convergence(
@@ -179,6 +182,8 @@ def plan_convergence(
     desired: Mapping[str, str],
     local_names: Collection[str],
     previously_applied: Collection[str],
+    load_requests: Mapping[str, str] | None = None,
+    applied_loads: Mapping[str, str] | None = None,
 ) -> ConvergencePlan:
     """Diff desired state against what this node is running.
 
@@ -198,6 +203,12 @@ def plan_convergence(
     Note that an absent desired row and a ``stopped`` one produce different
     actions -- remove versus stop -- which is why the catalog represents a
     removal as a deleted row rather than a state.
+
+    A LOAD IS A REQUEST, NOT A STATE. A stopped local record desired ``running``
+    is ambiguous: an operator may have stopped it on the node, or the autoloader
+    may have evicted it, and neither may be undone because an unrelated write
+    bumped the generation. So only a request id this node has not carried out
+    produces a load (#590).
     """
     local = {str(name) for name in local_names}
     applied = {str(name) for name in previously_applied}
@@ -212,10 +223,20 @@ def plan_convergence(
     )
     # Previously applied, no longer desired at all, and still here to remove.
     to_remove = sorted((applied - set(desired)) & local)
+    requests = load_requests or {}
+    carried_out = applied_loads or {}
+    to_load = sorted(
+        name
+        for name, request in requests.items()
+        if desired.get(name) == "running"
+        and name in local
+        and carried_out.get(name) != request
+    )
     return ConvergencePlan(
         to_start=tuple(to_start),
         to_stop=tuple(to_stop),
         to_remove=tuple(to_remove),
+        to_load=tuple(to_load),
     )
 
 

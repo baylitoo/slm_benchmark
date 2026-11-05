@@ -383,10 +383,15 @@ because that node converges on its own cycle. The row's existing spec is
 preserved: a stop does not read it, but a later start does, so replacing it
 would quietly drop the context length and port an operator chose.
 
-Load, delete, pin and repair still answer `409`. Each needs something desired
-state cannot currently express — a plan state for "present but not running", an
-explicitly declared removal, or configuration the desired spec does not
-carry — which is a design decision rather than an edit (#590).
+`POST /v1/serving/deployments/{name}/load` works the same way. It writes
+`running` plus a new `load_request` id, and the owner loads the deployment once
+for that id. A stopped record desired `running` is not enough on its own: an
+operator may have stopped it on the node or the autoloader may have evicted it,
+and an unrelated generation bump must not undo either.
+
+Delete, pin and repair still answer `409`. Each needs something desired state
+cannot currently express — an explicitly declared removal, or configuration the
+desired spec does not carry (#590).
 
 ### Taking a node out
 

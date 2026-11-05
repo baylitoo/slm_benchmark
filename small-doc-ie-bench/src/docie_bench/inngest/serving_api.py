@@ -1141,17 +1141,17 @@ def _owning_placement(name: str) -> dict[str, Any] | None:
     return None
 
 
-def _remote_unload(name: str, placement: dict[str, Any]) -> dict[str, Any]:
-    """Record an unload for a deployment this process does not own (#536).
+def _remote_lifecycle(
+    name: str, placement: dict[str, Any], *, action: str
+) -> dict[str, Any]:
+    """Record an unload or load for a deployment this process does not own.
 
     Lifecycle EVENTS cannot be aimed -- they reach whichever node Inngest
     picks -- so a remote action has to go through the one channel that is
-    node-scoped: desired state. Writing ``stopped`` for the owning node is a
-    plan ``plan_convergence`` already produces correctly (``to_stop`` covers a
-    name that is desired stopped and present locally), which is why unload is
-    the verb that works today. Load, delete, pin and repair each need a plan
-    state that does not exist yet -- see #590 for why, and why that is a
-    decision rather than an edit.
+    node-scoped: desired state. An unload writes ``stopped``. A load writes
+    ``running`` plus a new ``load_request`` id, which the owner carries out once
+    (``plan_convergence``). Delete, pin and repair are not expressible yet
+    (#590).
 
     The row's existing spec is PRESERVED when there is one. The spec is unused
     for a stop, but it is what a later start reads, so replacing it with a thin
@@ -1164,7 +1164,9 @@ def _remote_unload(name: str, placement: dict[str, Any]) -> dict[str, Any]:
         ModelCatalog,
     )
     from docie_bench.serving.node_liveness import stale_node_ids
+    from docie_bench.serving.placement_resolver import _placement_is_live
 
+    loading = action == "load"
     owner = str(placement.get("node_id") or "")
     try:
         catalog = ModelCatalog()
@@ -1186,7 +1188,15 @@ def _remote_unload(name: str, placement: dict[str, Any]) -> dict[str, Any]:
             existing = row
             break
 
-    if existing is not None and str(existing.get("desired_state") or "") != "running":
+    stopped = existing is not None and str(existing.get("desired_state") or "") != "running"
+    if loading and not stopped and _placement_is_live(placement):
+        return {
+            "event_ids": [],
+            "channel": None,
+            "name": name,
+            "detail": f"{name!r} is already serving on node {owner!r}; nothing to change",
+        }
+    if not loading and stopped:
         # Already recorded as stopped. The local unload is documented as
         # idempotent, so the remote one says the same thing rather than
         # bumping a generation for no change.
@@ -1208,12 +1218,14 @@ def _remote_unload(name: str, placement: dict[str, Any]) -> dict[str, Any]:
     existing_spec = existing.get("spec") if existing else None
     spec = dict(existing_spec) if isinstance(existing_spec, dict) else {}
     spec.setdefault("model", model)
+    if loading:
+        spec["load_request"] = uuid.uuid4().hex
 
     try:
         written = catalog.set_desired_deployment(
             owner,
             name,
-            desired_state="stopped",
+            desired_state="running" if loading else "stopped",
             spec=spec,
             expected_generation=(
                 int(existing["generation"]) if existing is not None else None
@@ -1241,7 +1253,7 @@ def _remote_unload(name: str, placement: dict[str, Any]) -> dict[str, Any]:
         "detail": (
             f"recorded as desired state for node {owner!r} (generation "
             f"{written['node_desired_generation']}); that node's reconciler "
-            f"stops it within one cycle.{caveat}"
+            f"{'loads' if loading else 'stops'} it on its next cycle.{caveat}"
         ),
     }
 
@@ -1252,7 +1264,7 @@ async def _fire_lifecycle_event(
     event: str,
     prefix: str,
     extra: dict[str, Any] | None = None,
-    remote: bool = False,
+    remote_action: str | None = None,
 ) -> dict[str, Any]:
     """404-gate ``name`` then fire one ``serving/*`` lifecycle event.
 
@@ -1272,19 +1284,18 @@ async def _fire_lifecycle_event(
         # looking in the right place last.
         placement = _owning_placement(name)
         owner = str(placement.get("node_id") or "") if placement else ""
-        if placement is not None and owner and remote:
-            # Expressible as desired state, which IS node-scoped. Only unload
-            # opts in; see _remote_unload and #590.
-            return _remote_unload(name, placement)
+        if placement is not None and owner and remote_action:
+            # Expressible as desired state, which IS node-scoped.
+            return _remote_lifecycle(name, placement, action=remote_action)
         if owner:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"deployment {name!r} runs on serving node {owner!r}, and "
                     f"lifecycle events are delivered to whichever node Inngest "
-                    f"picks -- so this cannot act on it. Unload works remotely "
-                    f"(it is expressible as desired state); load, delete, pin "
-                    f"and repair are not yet (#590). Run it on that node "
+                    f"picks -- so this cannot act on it. Load and unload work "
+                    f"remotely (they are expressible as desired state); delete, "
+                    f"pin and repair are not yet (#590). Run it on that node "
                     f"(`docie-serving stop {name}`)"
                 ),
                 headers=_DOMAIN_404,
@@ -1314,9 +1325,14 @@ async def load_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]
     Idempotent — loading an already-running deployment is a no-op. May
     unload least-recently-used unpinned deployments when that makes the
     load fit. Also starts manually stopped deployments.
+
+    A deployment owned by another node gets a durable load request instead of
+    an event, and the response carries no channel.
     """
     del tenant
-    return await _fire_lifecycle_event(name, event=LOAD_EVENT, prefix="load")
+    return await _fire_lifecycle_event(
+        name, event=LOAD_EVENT, prefix="load", remote_action="load"
+    )
 
 
 @router.post("/deployments/{name}/unload")
@@ -1336,7 +1352,7 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     """
     del tenant
     return await _fire_lifecycle_event(
-        name, event=UNLOAD_EVENT, prefix="unload", remote=True
+        name, event=UNLOAD_EVENT, prefix="unload", remote_action="unload"
     )
 
 

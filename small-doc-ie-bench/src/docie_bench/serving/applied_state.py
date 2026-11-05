@@ -8,6 +8,8 @@ Two facts, persisted together beside ``deployments.json``:
   written was lost, and only the node's own history separates them (see
   ``convergence.decide_convergence``).
 * ``names`` — which deployments this node created *from desired state*.
+* ``loads`` — the load request last carried out per deployment, so a request
+  acts once however many later generations repeat it.
 
 ``names`` exists for safety, and it is the more important of the two.
 Convergence has to be able to remove a deployment the catalog no longer wants,
@@ -32,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
@@ -49,6 +52,7 @@ class AppliedState:
 
     generation: int = 0
     names: frozenset[str] = field(default_factory=frozenset)
+    loads: Mapping[str, str] = field(default_factory=dict)
 
 
 def applied_state_path() -> Path:
@@ -76,9 +80,15 @@ def read_applied_state() -> AppliedState:
         return AppliedState()
     generation = decoded.get("generation")
     names = decoded.get("names")
+    loads = decoded.get("loads")
     return AppliedState(
         generation=generation if isinstance(generation, int) and generation >= 0 else 0,
         names=frozenset(str(name) for name in names) if isinstance(names, list) else frozenset(),
+        loads=(
+            {str(name): str(request) for name, request in loads.items()}
+            if isinstance(loads, dict)
+            else {}
+        ),
     )
 
 
@@ -91,7 +101,11 @@ def write_applied_state(state: AppliedState) -> None:
     path = applied_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-    payload = {"generation": state.generation, "names": sorted(state.names)}
+    payload = {
+        "generation": state.generation,
+        "names": sorted(state.names),
+        "loads": dict(sorted(state.loads.items())),
+    }
     try:
         temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(temporary, path)
