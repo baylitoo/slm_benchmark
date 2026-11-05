@@ -8,8 +8,9 @@ must never be swapped for an engine default) > per-engine generic default.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import HTTPException
@@ -430,3 +431,75 @@ def test_inngest_resolve_profile_unknown_plain_name_refuses(_sqlite_catalog: Non
 
     with pytest.raises(ProfileResolutionError):
         _resolve_profile(model_profile="no-such-profile")
+
+
+# --- which replica answered (#533 check 2) --------------------------------
+
+
+def test_the_resolved_profile_names_the_replica_it_picked(
+    _sqlite_catalog: None,
+) -> None:
+    """Nothing else in the profile can tell replicas apart.
+
+    `name` is `store:<base>` and `model` is the llama-server alias, both
+    identical for every replica of a model -- deliberately, since routing to a
+    replica by its record name would ask for a model the server does not answer
+    to. So the record name and its owning node are carried separately.
+    """
+    _seed("lfm2.5-350m", family="openai_chat")
+    ModelCatalog().record_placement(
+        "lfm2.5-350m-2",
+        model_name="lfm2.5-350m",
+        engine="llama-server",
+        endpoint="http://10.8.0.3:8089/v1",
+        state="ready",
+        node_id="ovh-cpu-02",
+    )
+
+    profile = resolve_store_profile("lfm2.5-350m")
+
+    assert profile.served_by_deployment == "lfm2.5-350m-2"
+    assert profile.served_by_node == "ovh-cpu-02"
+    # Unchanged, and the reason the fields above are needed.
+    assert profile.name == "store:lfm2.5-350m"
+    assert profile.model == "lfm2.5-350m"
+
+
+def test_a_placement_with_no_owner_resolves_without_a_node(
+    _sqlite_catalog: None,
+) -> None:
+    """A single-node stack records no node id. Reporting one would invent it."""
+    _seed("lfm2.5-350m", family="openai_chat")
+    _place("lfm2.5-350m")
+
+    profile = resolve_store_profile("lfm2.5-350m")
+
+    assert profile.served_by_deployment == "lfm2.5-350m"
+    assert profile.served_by_node is None
+
+
+def test_each_replica_of_a_scaled_model_identifies_itself(
+    _sqlite_catalog: None,
+) -> None:
+    """The point of the field: observing spread across a fleet from the client
+    side, which was otherwise only possible at the node."""
+    _seed("lfm2.5-350m", family="openai_chat")
+    for suffix, node in (("", "ovh-cpu-01"), ("-2", "ovh-cpu-02")):
+        ModelCatalog().record_placement(
+            f"lfm2.5-350m{suffix}",
+            model_name="lfm2.5-350m",
+            engine="llama-server",
+            endpoint=f"http://10.8.0.{2 if not suffix else 3}:8088/v1",
+            state="ready",
+            node_id=node,
+        )
+
+    def pick(index: int) -> tuple[str | None, str | None]:
+        def chooser(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+            return sorted(rows, key=lambda row: str(row["name"]))[index]
+
+        profile = resolve_store_profile("lfm2.5-350m", chooser=chooser)
+        return profile.served_by_deployment, profile.served_by_node
+
+    assert pick(0) == ("lfm2.5-350m", "ovh-cpu-01")
+    assert pick(1) == ("lfm2.5-350m-2", "ovh-cpu-02")

@@ -230,6 +230,21 @@ def hash_file(path: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
+def _served_by(profile: ModelProfile) -> dict[str, Any] | None:
+    """Which replica answered, or None when there is nothing to disambiguate.
+
+    Only a profile resolved from a live placement knows this. A configured
+    profile names one endpoint, so reporting "node: None" for it would read as
+    a missing measurement rather than an inapplicable question.
+    """
+    if not profile.served_by_deployment:
+        return None
+    return {
+        "deployment": profile.served_by_deployment,
+        "node": profile.served_by_node,
+    }
+
+
 def _data_urls(images: list[DocumentImage]) -> list[str]:
     """Base64-encode every page image -- synchronous, CPU-bound for a
     many-page document, so callers run this through asyncio.to_thread rather
@@ -1112,6 +1127,7 @@ class ExtractionService:
             response_format_style=effective_style,
             queue_wait_ms=queue_wait_ms,
             parallel_groups=len(groups) if groups else None,
+            served_by=_served_by(self.profile),
             ocr_blocks=blocks or None,
         )
 

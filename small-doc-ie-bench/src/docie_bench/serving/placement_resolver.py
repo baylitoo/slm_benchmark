@@ -578,6 +578,13 @@ def resolve_store_profile(
         deployment_slot_count=(
             placement["slot_count"] if isinstance(placement.get("slot_count"), int) else None
         ),
+        # The replica this call picked, which nothing else in the profile
+        # records: `name` and `model` are the same for every replica of a
+        # model, by design. Carried so an extraction can say which machine
+        # answered it -- the only client-side way to observe load spread
+        # across a fleet, and the first thing worth knowing about a slow one.
+        served_by_deployment=str(placement.get("name") or "") or None,
+        served_by_node=str(placement.get("node_id") or "") or None,
     )
 
 

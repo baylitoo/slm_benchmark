@@ -53,6 +53,18 @@ class ModelProfile:
     # features (see `logprob_confidence`) treat unknown as "not llama.cpp"
     # rather than guessing, so they fail closed on an unlabeled profile.
     runtime: str | None = None
+    # WHICH REPLICA this profile resolved to, when it was resolved from a live
+    # placement (`store:` routing). None for a configured profile, which names
+    # one endpoint and has no replica to disambiguate.
+    #
+    # The resolved profile otherwise drops this entirely -- `name` is
+    # `store:<base>` and `model` is the llama-server alias, both identical
+    # across every replica of a model -- so without it a caller cannot tell
+    # which machine answered, and neither can an operator reading a slow
+    # response. `base_url` knows, but it is an internal fleet address and is
+    # not something to hand to a client.
+    served_by_deployment: str | None = None
+    served_by_node: str | None = None
     # Opt-in (#335): request llama-server's per-token logprobs on extraction
     # calls and surface a MIN-aggregated per-field `model_confidence` (see
     # extract/logprob_confidence.py). Off by default -- extra token-count and

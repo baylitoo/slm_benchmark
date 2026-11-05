@@ -97,6 +97,15 @@ class ExtractionResponse(BaseModel):
     # for non-LLM adapters (e.g. the router's audit stages don't set it),
     # separating queueing from actual generation time in `latency_ms`.
     queue_wait_ms: int | None = None
+    # Which serving replica answered: {"deployment": ..., "node": ...}. Set
+    # only for a model routed through a live placement (`store:` routing),
+    # where several replicas of one model exist and the rest of this response
+    # cannot tell them apart -- `model_profile` is `store:<base>` for all of
+    # them. None for a configured profile, which has one endpoint.
+    #
+    # The node id is an operator's label, not an address: the endpoint stays
+    # internal to the fleet.
+    served_by: dict[str, Any] | None = None
     # Number of concurrent schema groups when the request opted into
     # parallel_extraction and the schema had list fields to split; None for
     # a single model call.
