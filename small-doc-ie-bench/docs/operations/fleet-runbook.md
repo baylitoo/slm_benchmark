@@ -226,6 +226,48 @@ immediately and lets it stop its runtimes once in-flight requests have
 finished. See *Taking a node out* in {doc}`../architecture/serving` for the two
 phases and why a drain excludes even the last replica.
 
+### Unattended, from a deployment hook
+
+Replacing a node's container kills every `llama-server` it holds, because they
+are its children. A pre-stop hook that drains first and blocks is one command:
+
+```bash
+export DOCIE_API_URL=https://<central>
+export DOCIE_API_KEY=<key>
+docie-serving fleet drain <node-id> --wait --timeout 900
+```
+
+Non-zero means **do not replace the container**: a timeout, a node that stopped
+reporting while still holding runtimes, or a node that was not draining at all.
+The command never adds `--acknowledge-outage` by itself, so a refusal naming a
+model about to lose its last replica stops the deploy rather than being worked
+around. See {doc}`../reference/serving-cli` for exactly what exit 0 claims —
+the guarantee is bounded by the deployments' declared request timeouts, not a
+proof that every request finished.
+
+Afterwards:
+
+```bash
+docie-serving fleet resume <node-id>
+```
+
+Resume is explicit, and comes **after** the replacement container is up and
+healthy — a resume puts the node back in the routing rotation, so doing it
+first routes requests at a machine that is restarting. The node restores the
+deployments the drain stopped on its next cycle; `docie-serving fleet status`
+shows that happening.
+
+:::{warning}
+Both halves of a drain need the node's reconciler to be converging. A node with
+`DOCIE_SERVING_DESIRED_APPLY` off leaves the routing rotation and keeps its
+memory, and a resume on it restores nothing. `docie-serving doctor` reports that
+setting for exactly this reason.
+
+Note that `docker-compose.serving-node.yml` defaults it ON while the central
+`docker-compose.yml` does not set it at all — so on a machine that is central
+*and* serving, drain is routing-exclusion only until you set it there.
+:::
+
 If drain is not available on your build, stopping the container is the blunt
 version:
 

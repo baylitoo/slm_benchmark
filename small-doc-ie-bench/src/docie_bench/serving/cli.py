@@ -6,7 +6,9 @@ Run with ``python -m docie_bench.serving.cli``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import textwrap
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -16,7 +18,19 @@ from typing import Any
 import typer
 
 from docie_bench.serving.control_plane import ControlPlane, to_data
+from docie_bench.serving.drain_wait import (
+    DEFAULT_WAIT_TIMEOUT_S,
+    assess_node,
+    find_node,
+    wait_for_drain,
+)
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
+#: Where the central api lives, as whatever runs these commands reaches
+#: it, and the key to call it with. Only the `fleet` commands read these;
+#: every other command in this CLI is node-local and needs neither.
+API_URL_ENV_VAR = "DOCIE_API_URL"
+API_KEY_ENV_VAR = "DOCIE_API_KEY"
 
 
 @dataclass
@@ -48,9 +62,14 @@ def create_app(
     store_app = typer.Typer(
         help="Seed and inspect THIS node's blob store.", no_args_is_help=True
     )
+    fleet_app = typer.Typer(
+        help="Drain and resume nodes through the CENTRAL api (needs a key).",
+        no_args_is_help=True,
+    )
     app.add_typer(model_app, name="model")
     app.add_typer(runtime_app, name="runtime")
     app.add_typer(store_app, name="store")
+    app.add_typer(fleet_app, name="fleet")
     state = _Context(
         plane_factory=(lambda: control_plane) if control_plane is not None else plane_factory
     )
@@ -594,6 +613,121 @@ def create_app(
         typer.echo(f"docie dense-embedding [{model}] -> http://{host}:{port}/v1")
         uvicorn.run(create_embedding_app(model_id=model), host=host, port=port)
 
+    # ----------------------------------------------------------------- fleet
+    # The ONE group in this CLI that is not node-local. Every other command
+    # operates on the control plane of whichever machine runs it; these speak
+    # HTTP to the central api, because draining is a central decision -- it
+    # has to refuse a drain that would strand a model, which only the catalog
+    # can see -- and #634 settled that the DEPLOYMENT RUNNER calls the api
+    # rather than the node writing its own drain straight to the catalog.
+    #
+    # So a serving node needs no new credential for this. Whatever replaces a
+    # container does, and it already has one.
+
+    @fleet_app.command("drain")
+    def fleet_drain(
+        ctx: typer.Context,
+        node_id: str = typer.Argument(..., help="Node to take out of rotation."),
+        wait: bool = typer.Option(
+            False,
+            "--wait",
+            help="Block until the node holds no live runtime, or the timeout.",
+        ),
+        timeout: float = typer.Option(
+            DEFAULT_WAIT_TIMEOUT_S,
+            "--timeout",
+            help="Seconds to wait with --wait. Exceeding it exits non-zero.",
+        ),
+        acknowledge_outage: bool = typer.Option(
+            False,
+            "--acknowledge-outage",
+            help=(
+                "Drain even though this node holds a model's only live "
+                "placement, taking that model offline."
+            ),
+        ),
+    ) -> None:
+        """Take a node out of the rotation, optionally waiting until it is free.
+
+        With --wait this is the whole of a pre-stop hook: it exits 0 only once
+        the node holds no live runtime, and non-zero on a timeout, an
+        unreachable node, or a node that is not draining at all.
+
+        WHAT EXIT 0 CLAIMS, precisely. The node waited out the longest request
+        timeout its deployments declared -- capped at the drain ceiling -- and
+        then stopped them. It does NOT prove every in-flight request finished.
+        Raise the deployments' timeout_seconds if that bound is too tight, or
+        accept the residual risk knowingly; serving/drain_wait.py says why no
+        stronger claim is available.
+
+        --acknowledge-outage is never added automatically, by this command or
+        anything else. A refusal means a model is about to lose its last live
+        replica, which is a decision rather than an obstacle.
+        """
+        result = _fleet_post(
+            f"/v1/serving/nodes/{node_id}/drain",
+            {"acknowledge_outage": acknowledge_outage},
+        )
+        if not wait:
+            _emit(ctx, result)
+            return
+
+        outcome = wait_for_drain(_fleet_nodes, node_id, timeout_s=timeout)
+        _emit(
+            ctx,
+            {
+                **result,
+                "readiness": str(outcome.readiness),
+                "safe_to_replace": outcome.safe_to_replace,
+                "waited_s": round(outcome.elapsed_s, 1),
+                "polls": outcome.polls,
+                "detail": outcome.detail,
+            },
+        )
+        if not outcome.safe_to_replace:
+            raise typer.Exit(code=1)
+
+    @fleet_app.command("resume")
+    def fleet_resume(
+        ctx: typer.Context,
+        node_id: str = typer.Argument(..., help="Node to admit again."),
+    ) -> None:
+        """Admit a node again, undoing a drain.
+
+        Deliberately has no --wait: there is nothing to block on that would
+        mean more than "the flag is cleared". The node restores the
+        deployments the drain stopped on its own next cycle, and `fleet status`
+        is how to watch that happen.
+        """
+        _emit(ctx, _fleet_post(f"/v1/serving/nodes/{node_id}/resume", None))
+
+    @fleet_app.command("status")
+    def fleet_status(
+        ctx: typer.Context,
+        node_id: str = typer.Argument("", help="One node, or omit for the fleet."),
+    ) -> None:
+        """What the central api says about the fleet, with drain readiness."""
+        rows: list[Mapping[str, Any]] = list(_fleet_nodes())
+        if node_id:
+            row = find_node(rows, node_id)
+            if row is None:
+                typer.echo(f"no node {node_id!r} in the fleet", err=True)
+                raise typer.Exit(code=1)
+            rows = [row]
+        _emit(
+            ctx,
+            [
+                {
+                    "node_id": row.get("node_id"),
+                    "reporting": row.get("reporting"),
+                    "deployments": row.get("deployments"),
+                    "drain_state": row.get("drain_state"),
+                    "readiness": str(assess_node(row)),
+                }
+                for row in rows
+            ],
+        )
+
     return app
 
 
@@ -697,6 +831,77 @@ def _render(value: object, *, json_output: bool) -> None:
             typer.echo(f"{str(key).upper():<{width}}  {_cell(item)}")
     else:
         typer.echo(_cell(data))
+
+
+def _fleet_base_url() -> str:
+    url = os.environ.get(API_URL_ENV_VAR, "").strip().rstrip("/")
+    if not url:
+        raise typer.BadParameter(
+            f"set {API_URL_ENV_VAR} to the central api's base url "
+            f"(e.g. https://studio.example.com). The fleet commands talk to "
+            f"the central api, unlike the rest of this CLI"
+        )
+    return url
+
+
+def _fleet_headers() -> dict[str, str]:
+    key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+    if not key:
+        raise typer.BadParameter(
+            f"set {API_KEY_ENV_VAR} to an api key the central api accepts. "
+            f"Draining is an operator action and the api authenticates it"
+        )
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _fleet_post(path: str, body: dict[str, Any] | None) -> dict[str, Any]:
+    """POST to the central api, turning its refusals into readable exits.
+
+    A 409 is the stranded-model refusal and carries the api's own sentence
+    naming the models, which IS the decision the operator has to make -- so it
+    is printed verbatim rather than summarised into a generic failure.
+    """
+    import httpx
+
+    try:
+        response = httpx.post(
+            f"{_fleet_base_url()}{path}",
+            json=body if body is not None else {},
+            headers=_fleet_headers(),
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        typer.echo(f"cannot reach the central api: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if response.status_code >= 400:
+        detail = response.text
+        with contextlib.suppress(ValueError, AttributeError):
+            detail = str(response.json().get("detail") or detail)
+        typer.echo(f"{response.status_code}: {detail}", err=True)
+        raise typer.Exit(code=1)
+    decoded = response.json()
+    return decoded if isinstance(decoded, dict) else {"result": decoded}
+
+
+def _fleet_nodes() -> list[dict[str, Any]]:
+    """The fleet as the central api reports it.
+
+    Raises on a failed read rather than returning nothing: ``wait_for_drain``
+    treats an exception as a transient read failure and retries, where an empty
+    list would look like a node that has vanished.
+    """
+    import httpx
+
+    response = httpx.get(
+        f"{_fleet_base_url()}/v1/serving/nodes",
+        headers=_fleet_headers(),
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    rows = response.json().get("nodes")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
 
 
 def _render_rows(rows: list[object]) -> None:
