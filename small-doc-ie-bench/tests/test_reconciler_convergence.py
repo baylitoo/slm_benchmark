@@ -240,9 +240,17 @@ def test_an_already_satisfied_plan_still_records_the_generation(
 def test_one_failing_action_does_not_stall_the_rest(
     node: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Containment WITHIN a phase: one removal that refuses must not prevent
+    the others.
+
+    ``keep`` is already local so this plan has no start in it. Capacity is only
+    ever reduced on a cycle whose additions all succeeded (#590), and with no
+    deployer wired a desired-but-absent ``keep`` would hold these removals --
+    which is correct behaviour, and a different property from the one here.
+    """
     monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
     _publish_capacity()
-    supervisor = _FakeSupervisor(["bad", "good"])
+    supervisor = _FakeSupervisor(["bad", "good", "keep"])
     write_applied_state(AppliedState(generation=0, names=frozenset({"bad", "good"})))
     _desire("keep")
 
@@ -345,6 +353,83 @@ def test_starts_happen_before_stops_and_removals(
     reconciler._converge_desired_state()
 
     assert order == ["start:replacement", "remove:retired"]
+
+
+def test_a_failed_replacement_keeps_the_capacity_it_was_replacing(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering alone does not preserve availability (#590).
+
+    Starts came before stops so a replacement generation never left the model
+    unserved -- but a start that FAILED recorded the failure and fell through
+    to the stops anyway, so the old deployment went away and the new one had
+    never arrived. The ordering protected the path that did not need it.
+    """
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("replacement")
+    supervisor = _FakeSupervisor(["retired"])
+    write_applied_state(AppliedState(generation=0, names=frozenset({"retired"})))
+
+    def _fails(name: str, spec: object) -> None:
+        raise RuntimeError("no free port")
+
+    reconciler = _reconciler(supervisor, deployer=_fails)
+    reconciler._converge_desired_state()
+
+    assert supervisor.removed == []
+    assert supervisor.stopped == []
+
+
+def test_the_held_stop_happens_once_the_replacement_starts(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Held, not abandoned. The generation is not recorded on a failure, so
+    the next cycle re-plans; the stop lands as soon as there is something to
+    stop in favour of."""
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("replacement")
+    supervisor = _FakeSupervisor(["retired"])
+    write_applied_state(AppliedState(generation=0, names=frozenset({"retired"})))
+    attempts: list[str] = []
+
+    def _fails_once(name: str, spec: object) -> None:
+        attempts.append(name)
+        if len(attempts) == 1:
+            raise RuntimeError("no free port")
+
+    reconciler = _reconciler(supervisor, deployer=_fails_once)
+    reconciler._converge_desired_state()
+    assert supervisor.removed == []
+
+    reconciler._converge_desired_state()
+
+    assert attempts == ["replacement", "replacement"]
+    assert supervisor.removed == ["retired"]
+
+
+def test_a_start_with_no_deployer_wired_also_holds_the_stops(
+    node: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same hazard by a different route.
+
+    No deployer means the start cannot be performed at all, which is already
+    treated as not-applied -- so it must not reduce capacity either.
+    """
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    _publish_capacity()
+    _desire("replacement")
+    supervisor = _FakeSupervisor(["retired"])
+    write_applied_state(AppliedState(generation=0, names=frozenset({"retired"})))
+
+    reconciler = _reconciler(supervisor, deployer=None)
+    reconciler._converge_desired_state()
+
+    assert supervisor.removed == []
 def test_a_failed_action_does_not_record_the_generation(
     node: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
