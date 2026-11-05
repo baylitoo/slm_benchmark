@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -36,6 +36,7 @@ from docie_bench.serving.drain import (
     parse_drained_at,
 )
 from docie_bench.serving.model_store import StoreEntry
+from docie_bench.serving.supervisor import DesiredState
 from docie_bench.settings import get_settings
 
 MODEL = "lfm2.5-350m"
@@ -313,22 +314,46 @@ class _Launch:
 
 
 class _Spec:
-    def __init__(self, timeout_seconds: float | None) -> None:
+    def __init__(
+        self,
+        timeout_seconds: float | None,
+        desired_state: DesiredState = DesiredState.RUNNING,
+    ) -> None:
         self.launch = _Launch(timeout_seconds)
+        self.desired_state = desired_state
 
 
 class _Record:
-    def __init__(self, timeout_seconds: float | None = None) -> None:
-        self.spec = _Spec(timeout_seconds)
+    def __init__(
+        self,
+        timeout_seconds: float | None = None,
+        desired_state: DesiredState = DesiredState.RUNNING,
+    ) -> None:
+        self.spec = _Spec(timeout_seconds, desired_state)
 
 
 class _FakeSupervisor:
-    """Just the surface convergence and drain touch."""
+    """Just the surface convergence and drain touch.
 
-    def __init__(self, names: list[str]) -> None:
-        self._records = {name: _Record() for name in names}
+    ``stop`` behaves like the real one in the way that matters here: the record
+    SURVIVES with its desired state flipped. That is what makes a stopped
+    deployment still "present locally", which is the whole reason a resume
+    needs its own restore path rather than a convergence start.
+    """
+
+    def __init__(self, names: list[str], *, stopped: list[str] | None = None) -> None:
+        already = set(stopped or ())
+        self._records = {
+            name: _Record(
+                desired_state=(
+                    DesiredState.STOPPED if name in already else DesiredState.RUNNING
+                )
+            )
+            for name in names
+        }
         self.stopped: list[str] = []
         self.removed: list[str] = []
+        self.loaded: list[str] = []
 
     class _Lock:
         def __enter__(self) -> None:
@@ -344,9 +369,15 @@ class _FakeSupervisor:
 
     def stop(self, name: str) -> None:
         self.stopped.append(name)
+        self._records[name].spec.desired_state = DesiredState.STOPPED
 
     def remove(self, name: str) -> None:
         self.removed.append(name)
+        self._records.pop(name, None)
+
+    def load(self, name: str) -> None:
+        self.loaded.append(name)
+        self._records[name].spec.desired_state = DesiredState.RUNNING
 
 
 @pytest.fixture
@@ -368,12 +399,17 @@ def node_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]
         get_settings.cache_clear()
 
 
-def _converge(supervisor: _FakeSupervisor) -> object:
+def _converge(
+    supervisor: _FakeSupervisor,
+    *,
+    loader: Callable[[str], object] | None = None,
+) -> object:
     from docie_bench.serving.reconciler import ServingReconciler
 
     reconciler = ServingReconciler(
         supervisor,  # type: ignore[arg-type]
         snapshot_publisher=lambda _snapshot: None,
+        loader=loader if loader is not None else supervisor.load,
     )
     return reconciler._converge_desired_state()
 
@@ -486,6 +522,259 @@ def test_a_drain_stops_nothing_without_the_apply_opt_in(node_home: None) -> None
     _converge(supervisor)
 
     assert supervisor.stopped == []
+
+
+# --- resume restores what the drain stopped (#634) -------------------------
+
+
+def _resume(node_id: str = NODE) -> None:
+    """What the resume endpoint does: clear the flag, bumping the generation."""
+    ModelCatalog().set_node_drain(node_id, drained=False)
+
+
+def _drain_then_stop(
+    supervisor: _FakeSupervisor, *, names: list[str] | None = None
+) -> None:
+    """Declare a drain whose grace has elapsed and let the node act on it."""
+    for name in names or []:
+        ModelCatalog().set_desired_deployment(
+            NODE, name, desired_state="running", spec={}
+        )
+    _backdate_drain(NODE, seconds=DRAIN_GRACE_CEILING_S * 2)
+    _converge(supervisor)
+
+
+def test_a_resume_restores_the_deployments_the_drain_stopped(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The acceptance criterion, and what the resume endpoint already claimed.
+
+    It did not happen. A drain stops through ``supervisor.stop``, which KEEPS
+    the record -- so the deployment is still "present locally" and
+    ``plan_convergence`` derives no start for it. A resume produced an empty
+    plan and left the node admitting traffic with its runtimes down.
+    """
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1", f"{OTHER}-1"])
+    assert supervisor.stopped == [f"{MODEL}-1", f"{OTHER}-1"]
+
+    _resume()
+    _converge(supervisor)
+
+    assert supervisor.loaded == [f"{MODEL}-1", f"{OTHER}-1"]
+
+
+def test_a_resume_restores_a_deployment_the_catalog_never_knew_about(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drain stops every local deployment, `docie up` ones included, so the
+    restore has to put those back too -- they have no desired row to start
+    from, which is exactly why the working set is recorded rather than
+    derived."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-local"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1"])
+    assert f"{OTHER}-local" in supervisor.stopped
+
+    _resume()
+    _converge(supervisor)
+
+    assert supervisor.loaded == [f"{MODEL}-1", f"{OTHER}-local"]
+
+
+def test_a_resume_leaves_alone_what_was_already_stopped_before_the_drain(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Maintenance must not resurrect a deployment an operator turned off.
+
+    The working set is taken BEFORE the stops, from the records that were meant
+    to be running -- which is the one moment the two are still distinguishable.
+    """
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-1"], stopped=[f"{OTHER}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1"])
+
+    _resume()
+    _converge(supervisor)
+
+    assert supervisor.loaded == [f"{MODEL}-1"]
+
+
+def test_a_deployment_unloaded_centrally_during_the_drain_stays_down(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A desired row saying ``stopped`` is a LATER instruction than the drain,
+    so it wins over the working set."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1", f"{OTHER}-1"])
+
+    rows = ModelCatalog().desired_snapshot(NODE)["deployments"]
+    current = next(r for r in rows if r["name"] == f"{OTHER}-1")["generation"]
+    ModelCatalog().set_desired_deployment(
+        NODE,
+        f"{OTHER}-1",
+        desired_state="stopped",
+        spec={},
+        expected_generation=current,
+    )
+    _resume()
+    _converge(supervisor)
+
+    assert supervisor.loaded == [f"{MODEL}-1"]
+
+
+def test_a_deployment_removed_during_the_drain_is_not_restored(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1", f"{OTHER}-1"])
+    supervisor.remove(f"{OTHER}-1")
+
+    _resume()
+    _converge(supervisor)
+
+    assert supervisor.loaded == [f"{MODEL}-1"]
+
+
+def test_a_restore_that_fails_is_retried_on_the_next_cycle(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generation gate makes this the trap it is.
+
+    Recording the applied generation after a partial restore would make the
+    next cycle decide NOTHING and return before the restore ran -- so a model
+    that failed to load once would stay down until somebody wrote desired state
+    again.
+    """
+    from docie_bench.serving.applied_state import read_applied_state
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1", f"{OTHER}-1"])
+    _resume()
+    generation_after_resume = ModelCatalog().desired_snapshot(NODE)["generation"]
+
+    attempts: list[str] = []
+
+    def refuse_one(name: str) -> object:
+        attempts.append(name)
+        if name == f"{OTHER}-1" and attempts.count(f"{OTHER}-1") == 1:
+            raise RuntimeError("no fit")
+        return supervisor.load(name)
+
+    _converge(supervisor, loader=refuse_one)
+    assert supervisor.loaded == [f"{MODEL}-1"]
+    assert read_applied_state().generation != generation_after_resume
+
+    # Next cycle: the one that failed is tried again, the one that worked is
+    # not, because it left the working set.
+    _converge(supervisor, loader=refuse_one)
+
+    assert supervisor.loaded == [f"{MODEL}-1", f"{OTHER}-1"]
+    assert read_applied_state().generation == generation_after_resume
+
+
+def test_a_second_drain_carries_an_unfinished_restore_forward(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drain landing on a pending restore must not drop it.
+
+    The pending names are stopped right now, so they are not part of the new
+    drain's running set -- recording only that set would lose them.
+    """
+    from docie_bench.serving.drain_working_set import read_drain_working_set
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1", f"{OTHER}-1"])
+    _resume()
+
+    def refuse_everything(name: str) -> object:
+        raise RuntimeError("no fit")
+
+    _converge(supervisor, loader=refuse_everything)
+    assert read_drain_working_set() == frozenset({f"{MODEL}-1", f"{OTHER}-1"})
+
+    _backdate_drain(NODE, seconds=DRAIN_GRACE_CEILING_S * 2)
+    _converge(supervisor)
+
+    assert read_drain_working_set() == frozenset({f"{MODEL}-1", f"{OTHER}-1"})
+
+
+def test_the_restore_needs_the_same_apply_opt_in(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starting a model is a mutation, under the same flag as the rest."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1"])
+    _resume()
+    monkeypatch.delenv("DOCIE_SERVING_DESIRED_APPLY")
+
+    _converge(supervisor)
+
+    assert supervisor.loaded == []
+
+
+def test_a_node_that_was_never_drained_restores_nothing(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary path: no working set, no extra read, nothing started."""
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    ModelCatalog().set_desired_deployment(
+        NODE, f"{MODEL}-1", desired_state="running", spec={}
+    )
+    supervisor = _FakeSupervisor([f"{MODEL}-1"])
+
+    _converge(supervisor)
+
+    assert supervisor.loaded == []
+    assert supervisor.stopped == []
+
+
+# --- the working-set file itself ------------------------------------------
+
+
+def test_the_working_set_round_trips(node_home: None) -> None:
+    from docie_bench.serving.drain_working_set import (
+        read_drain_working_set,
+        write_drain_working_set,
+    )
+
+    write_drain_working_set({f"{MODEL}-1", f"{OTHER}-1"})
+
+    assert read_drain_working_set() == frozenset({f"{MODEL}-1", f"{OTHER}-1"})
+
+
+def test_an_empty_working_set_removes_the_file(node_home: None) -> None:
+    """Nothing pending must not read as a file waiting to be interpreted."""
+    from docie_bench.serving.drain_working_set import (
+        drain_working_set_path,
+        write_drain_working_set,
+    )
+
+    write_drain_working_set({f"{MODEL}-1"})
+    write_drain_working_set(frozenset())
+
+    assert not drain_working_set_path().exists()
+
+
+def test_an_unreadable_working_set_restores_nothing(node_home: None) -> None:
+    """Erring towards empty: the cost is a deployment left stopped, against
+    starting one somebody deliberately turned off."""
+    from docie_bench.serving.drain_working_set import (
+        drain_working_set_path,
+        read_drain_working_set,
+    )
+
+    path = drain_working_set_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    assert read_drain_working_set() == frozenset()
 
 
 # --- the endpoints --------------------------------------------------------

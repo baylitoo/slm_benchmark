@@ -156,6 +156,12 @@ def _build_reconciler(instance_id: str) -> Any:
         # the repair loop does not reimplement store lookup, port allocation
         # and readiness. Only ever reached for rows tagged with THIS node.
         deployer=_desired_state_deployer(control_plane),
+        # Restoring a drain's working set (#634). The cold-start path, not the
+        # deploy path: these records still exist with their ports and their
+        # launches, and `load` is idempotent, fit-gated and refreshes the
+        # placement row -- a deploy would reallocate a port that was never
+        # released.
+        loader=control_plane.supervisor.load,
     )
 
 
