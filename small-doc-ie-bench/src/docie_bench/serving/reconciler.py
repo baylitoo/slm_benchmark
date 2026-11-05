@@ -684,7 +684,7 @@ class ServingReconciler:
                 name
                 for name, record in records.items()
                 if getattr(getattr(record, "spec", None), "desired_state", None)
-                is DesiredState.RUNNING
+                == DesiredState.RUNNING
             }
             # How long a request on each deployment is allowed to take, which
             # is how long one admitted just before a drain could still be
@@ -752,11 +752,16 @@ class ServingReconciler:
         # BEFORE the plan, because a stopped record is "present locally" and so
         # produces no start: restoring is the drain's own inverse, not something
         # the name-based diff can express (#590).
-        if not self._restore_drained(desired=desired):
-            # Deliberately without recording the generation. Recording it would
-            # make the next cycle decide NOTHING and return above, so a restore
-            # that failed once would never be retried.
-            return decision
+        #
+        # Its result gates the GENERATION WRITE and nothing else. Returning
+        # early on a failed restore would be the same containment mistake
+        # `_apply_plan` is built to avoid, one level up: a single model that
+        # cannot load -- the machine came back smaller, its blob was cleaned --
+        # would stop every stop, removal and targeted start on this node from
+        # ever converging. It also livelocks the case where the deployment that
+        # will not load was DELETED during the maintenance, since the removal
+        # that would resolve it is computed below.
+        restored = self._restore_drained(desired=desired)
 
         plan = plan_convergence(
             desired=desired,
@@ -764,11 +769,14 @@ class ServingReconciler:
             previously_applied=applied.names,
         )
         if plan.is_empty:
-            # Still record the generation: the intent HAS been applied, and not
-            # recording it would re-decide CONVERGE on every cycle forever.
-            write_applied_state(
-                AppliedState(generation=int(generation or 0), names=frozenset(desired))
-            )
+            if restored:
+                # Record the generation: the intent HAS been applied, and not
+                # recording it would re-decide CONVERGE on every cycle forever.
+                write_applied_state(
+                    AppliedState(
+                        generation=int(generation or 0), names=frozenset(desired)
+                    )
+                )
             return decision
 
         if not _desired_apply_enabled():
@@ -788,7 +796,7 @@ class ServingReconciler:
             plan.to_stop,
             plan.to_remove,
         )
-        if self._apply_plan(plan, specs):
+        if self._apply_plan(plan, specs) and restored:
             write_applied_state(
                 AppliedState(generation=int(generation or 0), names=frozenset(desired))
             )
@@ -941,6 +949,10 @@ class ServingReconciler:
           the drain;
         * no loader is wired, which cannot restore anything and is reported as
           not done so that wiring one later retries.
+
+        A False return holds the generation write ONLY. The caller carries on
+        with the rest of the plan, because a model that will not load must not
+        stop this node converging on anything else.
         """
         from docie_bench.serving.drain_working_set import (
             clear_drain_working_set,

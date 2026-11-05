@@ -735,6 +735,48 @@ def test_a_node_that_was_never_drained_restores_nothing(
     assert supervisor.stopped == []
 
 
+def test_a_failing_restore_does_not_stall_the_rest_of_the_plan(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that will not load must not stop this node converging.
+
+    The livelock it would otherwise cause: the deployment that refuses to load
+    was DELETED during the maintenance, so the thing that resolves it is the
+    removal the plan computes -- and returning early on the failed restore
+    means that removal is never reached, on any cycle, forever.
+    """
+    from docie_bench.serving.drain_working_set import read_drain_working_set
+
+    monkeypatch.setenv("DOCIE_SERVING_DESIRED_APPLY", "1")
+    supervisor = _FakeSupervisor([f"{MODEL}-1", f"{OTHER}-1"])
+    _drain_then_stop(supervisor, names=[f"{MODEL}-1", f"{OTHER}-1"])
+
+    # Deleted centrally while the node was out, and it refuses to load.
+    rows = ModelCatalog().desired_snapshot(NODE)["deployments"]
+    current = next(r for r in rows if r["name"] == f"{OTHER}-1")["generation"]
+    ModelCatalog().delete_desired_deployment(
+        NODE, f"{OTHER}-1", expected_generation=current
+    )
+    _resume()
+
+    def refuse_the_deleted_one(name: str) -> object:
+        if name == f"{OTHER}-1":
+            raise RuntimeError("blob is gone")
+        return supervisor.load(name)
+
+    _converge(supervisor, loader=refuse_the_deleted_one)
+
+    assert supervisor.loaded == [f"{MODEL}-1"]
+    # The removal happened on the SAME cycle as the failed restore.
+    assert supervisor.removed == [f"{OTHER}-1"]
+
+    # And the next cycle settles: it is no longer local, so it leaves the
+    # working set rather than being retried for ever.
+    _converge(supervisor, loader=refuse_the_deleted_one)
+
+    assert read_drain_working_set() == frozenset()
+
+
 # --- the working-set file itself ------------------------------------------
 
 
