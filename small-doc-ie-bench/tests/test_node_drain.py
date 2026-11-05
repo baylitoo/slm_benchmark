@@ -251,6 +251,15 @@ def _place(record: str, *, node_id: str, port: int, model: str = MODEL) -> None:
     )
 
 
+def _stop_placement(record: str) -> None:
+    """What a drained node's placement looks like once it stops its runtime.
+
+    Not a deletion. ``stop`` and ``unload`` keep the row with ``endpoint=""``
+    so nothing routes to it; only ``remove`` deletes it.
+    """
+    assert ModelCatalog().mark_placement_stopped(record)
+
+
 def test_routing_skips_a_drained_node_when_another_admits(catalog_db: None) -> None:
     from docie_bench.serving.placement_resolver import resolve_store_profile
 
@@ -599,10 +608,57 @@ def test_the_fleet_view_separates_draining_from_drained(catalog_db: None) -> Non
     assert rows["node-a"]["drain_state"] == "draining"
     assert rows["node-b"]["drain_state"] == "admitting"
 
-    # Its placement is gone: the node has reported empty.
-    ModelCatalog().clear_placement(f"{MODEL}-1")
+    # Its runtime stopped. The row stays, with no endpoint.
+    _stop_placement(f"{MODEL}-1")
 
     assert _nodes()["node-a"]["drain_state"] == "drained"
+
+
+def test_a_drained_node_reports_empty_without_its_deployments_being_deleted(
+    catalog_db: None,
+) -> None:
+    """The state a drain actually reaches, which nothing used to.
+
+    A drain stops runtimes; a stop RETAINS the placement row with
+    ``endpoint=""``. Counting rows rather than live endpoints meant the only
+    way to reach ``drained`` was to DELETE the deployment -- so a node that had
+    released every runtime read ``draining`` indefinitely, and any caller
+    waiting for ``drained`` before replacing the machine waited forever.
+    """
+    _seed_store()
+    _publish("node-a")
+    _place(f"{MODEL}-1", node_id="node-a", port=8088)
+    _place(f"{MODEL}-2", node_id="node-a", port=8089)
+    _drain("node-a", acknowledge=True)
+
+    _stop_placement(f"{MODEL}-1")
+    assert _nodes()["node-a"]["drain_state"] == "draining"
+
+    _stop_placement(f"{MODEL}-2")
+    row = _nodes()["node-a"]
+    assert row["drain_state"] == "drained"
+    # Still responsible for both: the records, ports and placements are this
+    # node's until someone deletes them.
+    assert row["deployments"] == 2
+    assert row["deployments_live"] == 0
+
+
+def test_a_stopped_deployment_is_not_counted_as_capacity_in_use(
+    catalog_db: None,
+) -> None:
+    """``deployments`` is what the node holds; ``deployments_live`` is what it
+    is running. A node holding three and running none is a real state."""
+    _seed_store()
+    _publish("node-a")
+    _place(f"{MODEL}-1", node_id="node-a", port=8088)
+    _place(f"{MODEL}-2", node_id="node-a", port=8089)
+    _stop_placement(f"{MODEL}-2")
+
+    row = _nodes()["node-a"]
+    assert row["deployments"] == 2
+    assert row["deployments_live"] == 1
+    # Not drained: nobody asked for this machine.
+    assert row["drain_state"] == "admitting"
 
 
 def test_resuming_puts_the_node_back_in_the_rotation(catalog_db: None) -> None:

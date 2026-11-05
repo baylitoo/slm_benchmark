@@ -142,4 +142,32 @@ describe("Fleet — drain", () => {
 
     await waitFor(() => expect(api.resumeNode).toHaveBeenCalledWith("node-a"));
   });
+
+  it("counts what is still finishing, not what the node holds", async () => {
+    // A stopped deployment keeps its placement row, so "deployments" includes
+    // the ones that already released. Reporting that as still finishing told
+    // an operator to keep waiting on work that had finished.
+    renderFleet([
+      node({
+        node_id: "node-a",
+        drained_at: new Date().toISOString(),
+        drain_state: "draining",
+        deployments: 3,
+        deployments_live: 1,
+      }),
+      node({ node_id: "node-b" }),
+    ]);
+
+    expect(await screen.findByText("1 still finishing")).toBeInTheDocument();
+    expect(screen.queryByText("3 still finishing")).not.toBeInTheDocument();
+  });
+
+  it("says how many of the deployments a node holds are running", async () => {
+    renderFleet([
+      node({ node_id: "node-a", deployments: 3, deployments_live: 0 }),
+      node({ node_id: "node-b" }),
+    ]);
+
+    expect(await screen.findByText("(0 running)")).toBeInTheDocument();
+  });
 });

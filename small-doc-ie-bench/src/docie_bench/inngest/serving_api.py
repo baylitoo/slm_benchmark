@@ -424,7 +424,7 @@ def _sizing_inputs() -> tuple[
     return models, snapshot, placements, detail
 
 
-def _drain_state(snapshot: dict[str, Any], owned: int) -> str:
+def _drain_state(snapshot: dict[str, Any], live_owned: int) -> str:
     """``admitting`` | ``draining`` | ``drained`` for one node row.
 
     ``draining`` and ``drained`` are separated because an operator waiting on a
@@ -432,10 +432,18 @@ def _drain_state(snapshot: dict[str, Any], owned: int) -> str:
     still finishing on it and nothing new is being admitted, drained means it
     has released everything. Collapsing them would make a drain look either
     instant (and wrong) or stuck.
+
+    ``live_owned`` counts placements with a LIVE endpoint, not placement rows.
+    A drain stops runtimes, and a stop RETAINS the row with ``endpoint=""``
+    (``catalog.mark_placement_stopped`` -- deletion is ``remove``'s job alone).
+    Counting rows therefore left a fully drained node reading ``draining``
+    forever, since the only thing that removed a row was deleting the
+    deployment: the state an operator and any automated caller are waiting for
+    was unreachable by draining.
     """
     if not snapshot.get("drained_at"):
         return "admitting"
-    return "drained" if owned == 0 else "draining"
+    return "drained" if live_owned == 0 else "draining"
 
 
 def _models_losing_last_placement(
@@ -613,6 +621,7 @@ async def serving_nodes() -> dict[str, Any]:
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
     from docie_bench.serving.node_liveness import snapshot_stale_after_s
+    from docie_bench.serving.placement_resolver import _placement_is_live
 
     try:
         catalog = ModelCatalog()
@@ -632,11 +641,20 @@ async def serving_nodes() -> dict[str, Any]:
         }
 
     stale = _nodes_that_stopped_reporting()
+    # Two counts, because two questions. "How many deployments does this node
+    # hold" includes the stopped ones -- their records, ports and placements
+    # are still this node's, and a Fleet page that hid them would under-report
+    # what a machine is responsible for. "Has it released everything" is about
+    # runtimes, so it counts only rows with a live endpoint.
     owned: dict[str, int] = {}
+    live_owned: dict[str, int] = {}
     for row in placements:
         node_id = str(row.get("node_id") or "")
-        if node_id:
-            owned[node_id] = owned.get(node_id, 0) + 1
+        if not node_id:
+            continue
+        owned[node_id] = owned.get(node_id, 0) + 1
+        if _placement_is_live(row):
+            live_owned[node_id] = live_owned.get(node_id, 0) + 1
 
     nodes: list[dict[str, Any]] = []
     for snapshot in snapshots:
@@ -661,13 +679,18 @@ async def serving_nodes() -> dict[str, Any]:
                 # here rather than in the UI so one definition of ownership
                 # serves every reader.
                 "deployments": owned.get(node_id, 0),
+                # Of those, how many are actually serving. The difference is
+                # the stopped ones, which keep their row and their port
+                # reservation: a node showing 3 and 0 is holding three
+                # deployments and running none.
+                "deployments_live": live_owned.get(node_id, 0),
                 # Derived from what is observable centrally, NOT from the
                 # node's grace period: that is computed on the node from its
                 # own deployments' request timeouts, and guessing it here would
                 # show "drained" while the machine is still finishing work.
-                # "The node reports empty" is the acceptance criterion, and the
-                # placement count is exactly that, read from the catalog.
-                "drain_state": _drain_state(snapshot, owned.get(node_id, 0)),
+                # "The node reports empty" is the acceptance criterion, which
+                # is the LIVE count -- a stopped deployment keeps its row.
+                "drain_state": _drain_state(snapshot, live_owned.get(node_id, 0)),
             }
         )
     nodes.sort(key=lambda row: str(row.get("node_id") or ""))

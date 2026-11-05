@@ -22,8 +22,13 @@ export interface FleetNode extends NodeSnapshot {
   never_reported: boolean;
   /** Seconds since its last publish; null when never published or unparseable. */
   age_s?: number | null;
-  /** How many placements name this node as their owner. */
+  /** How many placements name this node as their owner, running or not. A
+   * stopped deployment keeps its row and its port reservation, so this is what
+   * the node is responsible for rather than what it is doing. */
   deployments: number;
+  /** Of those, how many have a live endpoint. The difference is the stopped
+   * ones. Absent on an older api. */
+  deployments_live?: number;
   /** The store models whose blobs this node actually holds. `null` means the
    * node has not reported its store yet — which is NOT the same as holding
    * nothing, and the UI must not conflate them. */
@@ -37,8 +42,8 @@ export interface FleetNode extends NodeSnapshot {
    * `draining` and `drained` are separate because an operator waiting on a
    * machine needs to know which one they are in: draining means requests are
    * still finishing on it, drained means it has released everything. Derived
-   * server-side from the placement count rather than from the node's grace
-   * period, which is computed on the node itself. */
+   * server-side from the LIVE placement count rather than from the node's
+   * grace period, which is computed on the node itself. */
   drain_state?: "admitting" | "draining" | "drained" | string;
 }
 
