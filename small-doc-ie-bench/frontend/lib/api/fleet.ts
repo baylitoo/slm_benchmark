@@ -45,6 +45,22 @@ export interface FleetNode extends NodeSnapshot {
    * server-side from the LIVE placement count rather than from the node's
    * grace period, which is computed on the node itself. */
   drain_state?: "admitting" | "draining" | "drained" | string;
+  /** Operator override of DocIE's RAM share on this node; null = none set. */
+  mem_budget_bytes?: number | null;
+  /** Version to send back as `expected_version` when changing the override. */
+  mem_budget_version?: number | null;
+  mem_budget_updated_at?: string | null;
+  mem_budget_actor?: string | null;
+  /** Kernel memory limit (cgroup memory.max); null when nothing enforces one. */
+  ceiling_bytes?: number | null;
+  /** What DocIE's container is using now. */
+  working_set_bytes?: number | null;
+  /** The budget the node is actually sizing against. */
+  effective_budget_bytes?: number | null;
+  /** "catalog" | "catalog_cache" | "setting" | "none". */
+  budget_source?: string | null;
+  /** True when the node could not read the catalog and kept its last budget. */
+  budget_stale?: boolean | null;
 }
 
 /** Response of the drain/resume endpoints. */
@@ -94,4 +110,29 @@ export interface FleetView {
 
 export async function getFleet(): Promise<FleetView> {
   return request<FleetView>("/v1/serving/nodes");
+}
+
+export interface NodeBudgetResponse {
+  node_id: string;
+  mem_budget_bytes: number | null;
+  mem_budget_version: number | null;
+  mem_budget_updated_at: string | null;
+  mem_budget_actor: string | null;
+  detail?: string | null;
+}
+
+/**
+ * Set or clear a node's RAM budget override. `expectedVersion` is the
+ * `mem_budget_version` last read (null when none was ever set); a mismatch is
+ * a 409. Needs an operator key.
+ */
+export async function setNodeBudget(
+  nodeId: string,
+  budgetBytes: number | null,
+  expectedVersion: number | null,
+): Promise<NodeBudgetResponse> {
+  return request<NodeBudgetResponse>(`/v1/serving/nodes/${encodeURIComponent(nodeId)}/budget`, {
+    method: "POST",
+    body: JSON.stringify({ budget_bytes: budgetBytes, expected_version: expectedVersion }),
+  });
 }

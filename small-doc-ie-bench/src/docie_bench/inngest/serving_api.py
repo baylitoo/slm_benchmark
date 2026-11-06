@@ -608,6 +608,95 @@ async def resume_node(node_id: str, tenant: TenantDependency) -> dict[str, Any]:
     }
 
 
+class NodeBudgetRequest(BaseModel):
+    """Body of a memory-budget write."""
+
+    # None CLEARS the override, which is not a budget of zero: the node falls
+    # back to its bootstrap setting and then to its kernel ceiling. Zero is
+    # refused by the catalog, because a budget of nothing refuses every load
+    # and nobody means that by typing it.
+    budget_bytes: int | None = None
+    # The version the caller read. None means "no budget has ever been set for
+    # this node". A mismatch is a 409 rather than an overwrite: two operators
+    # editing one node's share of a shared host must not interleave, and the
+    # loser needs to see the number that actually won before deciding again.
+    expected_version: int | None = None
+
+
+@router.post("/nodes/{node_id}/budget")
+async def set_node_budget(
+    node_id: str, payload: NodeBudgetRequest, tenant: TenantDependency
+) -> dict[str, Any]:
+    """Set or clear ``node_id``'s soft memory budget (#539).
+
+    Reaches the node's next sizing decision without a redeploy and without
+    unloading anything -- the budget is read fresh at decision time through
+    ``resources.configured_budget_bytes``, so there is no restart to wait for.
+
+    LOWERING IT BELOW CURRENT USAGE REFUSES NEW LOADS AND UNLOADS NOTHING.
+    Admission already evicts LRU victims to cover a deficit, so simply
+    shrinking the denominator would have made eviction the behaviour -- typing
+    a smaller number would cost a cold start on whatever got unloaded next.
+    ``FitDecision.over_budget`` short-circuits before that path instead. The
+    node reports the overage and keeps serving what it has.
+
+    Operator tier only. A Studio-issued client key calls the serving surfaces;
+    it must not be able to shrink a node's share of a shared host and refuse
+    everybody's loads. (Drain and resume currently require only
+    authentication, which is a weaker gate for a more disruptive action --
+    worth aligning, as its own change rather than silently here.)
+    """
+    from docie_bench.serving.catalog import (
+        CatalogUnavailableError,
+        ModelCatalog,
+        NodeBudgetConflictError,
+    )
+
+    if not tenant.operator:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "setting a node's memory budget needs an operator key (the "
+                "env-configured API_KEYS tier), not a Studio-issued key"
+            ),
+        )
+    try:
+        result = ModelCatalog().set_node_budget(
+            node_id,
+            budget_bytes=payload.budget_bytes,
+            expected_version=payload.expected_version,
+            # Truncated to the column, and a tenant id rather than a key: the
+            # question this answers is "who changed it", and a key can be
+            # rotated out from under the answer.
+            actor=tenant.tenant_id[:128],
+        )
+    except CatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "a per-node memory budget is stored in the model catalog, "
+                "which is not configured (DATABASE_URL). A single-node stack "
+                "uses DOCIE_SERVING_MEM_BUDGET on the node instead"
+            ),
+        ) from exc
+    except NodeBudgetConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        **result,
+        "detail": (
+            f"node {node_id!r} sizes against this budget from its next "
+            f"decision; nothing was unloaded. An over-budget node refuses new "
+            f"loads and keeps serving what it holds"
+            if payload.budget_bytes is not None
+            else f"node {node_id!r} has no budget override: it falls back to "
+            f"its own DOCIE_SERVING_MEM_BUDGET, then to its cgroup ceiling"
+        ),
+    }
+
+
 @router.get("/nodes")
 async def serving_nodes() -> dict[str, Any]:
     """Every serving node that has a row, with its capacity and what it holds.
