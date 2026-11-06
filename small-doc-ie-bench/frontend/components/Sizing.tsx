@@ -31,6 +31,7 @@ import { Alert, Badge, Button, Card, Select, TextInput } from "./ui";
 import { LiveIndicator } from "./LiveIndicator";
 import { useToast } from "./Toast";
 import { Table, type Column } from "./patterns/Table";
+import { NodeBudgets } from "./NodeBudgets";
 
 const POLL_MS = 5000;
 
@@ -69,6 +70,7 @@ export function Sizing({ active = true }: { active?: boolean }) {
       )}
 
       <CapacityBar data={data} />
+      <NodeBudgets active={active} />
       <FitTable sizing={sizing} />
       <WhatIf data={data} />
     </div>

@@ -258,6 +258,14 @@ class ServingNode(Base):
         DateTime(timezone=True), nullable=True
     )
     mem_budget_actor: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # What the node measured and applied, published each cycle beside the
+    # capacity numbers. `total_bytes` is already min(budget, ceiling), so these
+    # are what let a reader tell the two apart and see an overage.
+    ceiling_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    working_set_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    effective_budget_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    budget_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    budget_stale: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -382,6 +390,11 @@ _SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any], bool], ...] = (
     ("mem_budget_version", Integer(), True),
     ("mem_budget_updated_at", DateTime(timezone=True), True),
     ("mem_budget_actor", String(128), True),
+    ("ceiling_bytes", BigInteger(), True),
+    ("working_set_bytes", BigInteger(), True),
+    ("effective_budget_bytes", BigInteger(), True),
+    ("budget_source", String(16), True),
+    ("budget_stale", Boolean(), True),
 )
 
 
@@ -801,6 +814,11 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         "mem_budget_version": row.mem_budget_version,
         "mem_budget_updated_at": isoformat(row.mem_budget_updated_at),
         "mem_budget_actor": row.mem_budget_actor,
+        "ceiling_bytes": row.ceiling_bytes,
+        "working_set_bytes": row.working_set_bytes,
+        "effective_budget_bytes": row.effective_budget_bytes,
+        "budget_source": row.budget_source,
+        "budget_stale": row.budget_stale,
         "updated_at": isoformat(row.updated_at),
     }
 
@@ -1173,6 +1191,11 @@ class ModelCatalog:
         sum_rss_bytes: int,
         reclaimable_bytes: int = 0,
         store_models: Sequence[str] | None = None,
+        ceiling_bytes: int | None = None,
+        working_set_bytes: int | None = None,
+        effective_budget_bytes: int | None = None,
+        budget_source: str | None = None,
+        budget_stale: bool | None = None,
     ) -> dict[str, Any]:
         """Upsert ``node_id``'s ``serving_node`` row (its reconciler is the sole caller).
 
@@ -1192,6 +1215,11 @@ class ModelCatalog:
             "source": source,
             "sum_rss_bytes": sum_rss_bytes,
             "reclaimable_bytes": reclaimable_bytes,
+            "ceiling_bytes": ceiling_bytes,
+            "working_set_bytes": working_set_bytes,
+            "effective_budget_bytes": effective_budget_bytes,
+            "budget_source": budget_source,
+            "budget_stale": budget_stale,
             "updated_at": stamped,
         }
         if store_models is not None:

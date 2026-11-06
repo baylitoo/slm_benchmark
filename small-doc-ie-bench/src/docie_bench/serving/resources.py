@@ -196,6 +196,9 @@ class NodeMemory:
     #: This container's working set, kept even when ``free_bytes`` clamps to 0,
     #: so an over-budget node can say BY HOW MUCH instead of just "full".
     working_set_bytes: int | None = None
+    #: The kernel-enforced limit (cgroup ``memory.max``), kept when a smaller
+    #: budget replaces ``total_bytes``. None when nothing enforces a ceiling.
+    ceiling_bytes: int | None = None
 
     @property
     def over_budget_bytes(self) -> int:
@@ -266,6 +269,7 @@ def read_cgroup_memory(root: Path = CGROUP_V2_ROOT) -> NodeMemory | None:
         source="cgroup",
         reclaimable_bytes=reclaimable,
         working_set_bytes=working_set,
+        ceiling_bytes=limit,
     )
 
 
@@ -678,6 +682,15 @@ class NodeSnapshot:
     # (cgroup working-set accounting; 0 = no adjustment applied). Published so
     # readers know the free number is reclaim-adjusted, not raw memory.current.
     reclaimable_bytes: int = 0
+    #: Budget detail for the Studio (#539). ``budget_bytes`` is the budget in
+    #: force, ``budget_source`` where it came from
+    #: (catalog/catalog_cache/setting/none) and ``budget_stale`` whether the
+    #: catalog could not be read.
+    ceiling_bytes: int | None = None
+    working_set_bytes: int | None = None
+    budget_bytes: int | None = None
+    budget_source: str | None = None
+    budget_stale: bool | None = None
 
 
 class ResourceTracker:
@@ -724,12 +737,27 @@ class ResourceTracker:
             for observed in observations
             if observed.phase in {"hot", "loading"} and observed.rss_bytes > 0
         )
+        budget_source: str | None = None
+        budget_stale: bool | None = None
+        if memory.budget_bytes is not None:
+            try:
+                from docie_bench.serving.node_budget import resolve_budget
+
+                resolution = resolve_budget()
+                budget_source, budget_stale = resolution.source, resolution.stale
+            except Exception:  # noqa: BLE001 - provenance must never break the snapshot
+                logger.debug("budget provenance unavailable", exc_info=True)
         return NodeSnapshot(
             total_bytes=memory.total_bytes,
             free_bytes=memory.free_bytes,
             source=memory.source,
             sum_rss_bytes=sum_rss,
             reclaimable_bytes=memory.reclaimable_bytes,
+            ceiling_bytes=memory.ceiling_bytes,
+            working_set_bytes=memory.working_set_bytes,
+            budget_bytes=memory.budget_bytes,
+            budget_source=budget_source,
+            budget_stale=budget_stale,
         )
 
     def footprint_for(self, model: str, predicted: int) -> int:
@@ -808,6 +836,11 @@ def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
             source=snapshot.source,
             sum_rss_bytes=snapshot.sum_rss_bytes,
             reclaimable_bytes=snapshot.reclaimable_bytes,
+            ceiling_bytes=snapshot.ceiling_bytes,
+            working_set_bytes=snapshot.working_set_bytes,
+            effective_budget_bytes=snapshot.budget_bytes,
+            budget_source=snapshot.budget_source,
+            budget_stale=snapshot.budget_stale,
         )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: node snapshot not published this cycle")

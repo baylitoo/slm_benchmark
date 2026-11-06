@@ -503,3 +503,100 @@ def test_without_a_catalog_the_endpoint_points_at_the_node_setting(
 
     assert excinfo.value.status_code == 503
     assert "DOCIE_SERVING_MEM_BUDGET" in str(excinfo.value.detail)
+
+
+# --- what the node publishes for the Studio --------------------------------
+
+
+def _cgroup(root: Path, *, limit: int, current: int) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "memory.max").write_text(str(limit), encoding="utf-8")
+    (root / "memory.current").write_text(str(current), encoding="utf-8")
+    (root / "memory.stat").write_text("inactive_file 0\n", encoding="utf-8")
+    return root
+
+
+def test_a_smaller_budget_keeps_the_kernel_ceiling_visible(tmp_path: Path) -> None:
+    """`total_bytes` becomes the budget, so the ceiling is carried separately."""
+    from docie_bench.serving.resources import read_node_memory
+
+    root = _cgroup(tmp_path / "cg", limit=8 * GIB, current=5 * GIB)
+
+    memory = read_node_memory(cgroup_root=root, budget_bytes=4 * GIB)
+
+    assert memory.total_bytes == 4 * GIB
+    assert memory.ceiling_bytes == 8 * GIB
+    assert memory.working_set_bytes == 5 * GIB
+    assert memory.over_budget_bytes == 1 * GIB
+
+
+def test_a_node_with_no_cgroup_limit_reports_no_ceiling(tmp_path: Path) -> None:
+    from docie_bench.serving.resources import NodeMemory, read_node_memory
+
+    memory = read_node_memory(
+        cgroup_root=tmp_path / "absent",
+        vm_reader=lambda: NodeMemory(total_bytes=64 * GIB, free_bytes=32 * GIB, source="vm"),
+        budget_bytes=6 * GIB,
+    )
+
+    assert memory.ceiling_bytes is None
+    assert memory.total_bytes == 6 * GIB
+
+
+def test_the_snapshot_carries_the_budget_and_where_it_came_from(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving.resources import NodeMemory, ResourceTracker
+
+    _setting(monkeypatch, "6g")
+    reading = NodeMemory(
+        total_bytes=6 * GIB,
+        free_bytes=1 * GIB,
+        source="cgroup",
+        budget_bytes=6 * GIB,
+        working_set_bytes=5 * GIB,
+        ceiling_bytes=8 * GIB,
+    )
+    tracker = ResourceTracker(memory_reader=lambda: reading)
+
+    snapshot = tracker.observe_cycle([])
+
+    assert snapshot.ceiling_bytes == 8 * GIB
+    assert snapshot.working_set_bytes == 5 * GIB
+    assert snapshot.budget_bytes == 6 * GIB
+    assert snapshot.budget_source == "setting"
+    assert snapshot.budget_stale is False
+
+
+def test_published_budget_fields_reach_the_fleet_view(node_home: None) -> None:
+    ModelCatalog().publish_node_snapshot(
+        node_id=NODE,
+        total_bytes=6 * GIB,
+        free_bytes=GIB,
+        source="cgroup",
+        sum_rss_bytes=0,
+        ceiling_bytes=8 * GIB,
+        working_set_bytes=5 * GIB,
+        effective_budget_bytes=6 * GIB,
+        budget_source="catalog_cache",
+        budget_stale=True,
+    )
+
+    row = next(r for r in ModelCatalog().list_node_snapshots() if r["node_id"] == NODE)
+
+    assert row["ceiling_bytes"] == 8 * GIB
+    assert row["working_set_bytes"] == 5 * GIB
+    assert row["effective_budget_bytes"] == 6 * GIB
+    assert row["budget_source"] == "catalog_cache"
+    assert row["budget_stale"] is True
+
+
+def test_a_node_publish_does_not_overwrite_the_operators_budget(node_home: None) -> None:
+    """The node owns the measurements, the central API owns the override."""
+    ModelCatalog().set_node_budget(NODE, budget_bytes=6 * GIB, expected_version=None)
+
+    ModelCatalog().publish_node_snapshot(
+        node_id=NODE, total_bytes=1, free_bytes=1, source="cgroup", sum_rss_bytes=0
+    )
+
+    assert ModelCatalog().read_node_budget(NODE)["mem_budget_bytes"] == 6 * GIB
