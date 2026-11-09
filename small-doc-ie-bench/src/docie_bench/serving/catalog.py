@@ -231,6 +231,41 @@ class ServingNode(Base):
     drained_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The operator's SOFT memory budget for this node (#539), in bytes. NULL
+    # means no override: the node falls back to its bootstrap setting, and
+    # then to the hard cgroup ceiling.
+    #
+    # Written CENTRALLY, like drained_at and unlike the measurements beside it.
+    # The two numbers are different things: `total_bytes` is what the kernel
+    # allows this container, and this is DocIE's declared share of a machine it
+    # does not own. Admission sizes against min(budget, cgroup free), so the
+    # hard ceiling stays the guardrail and this is the number an operator turns.
+    #
+    # Here rather than in the environment because `mem_limit` is a
+    # container-CREATION parameter: changing it recreates the container and
+    # unloads every resident model, which is the opposite of what tuning a
+    # budget is for.
+    mem_budget_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Optimistic-concurrency token for the budget alone. Deliberately NOT
+    # desired_generation: bumping that would make the node re-converge its
+    # deployments because somebody edited a number, and the two writes race on
+    # different things.
+    mem_budget_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # When, and by whom. An operator lowering a budget below current usage
+    # produces an over-budget node that refuses new loads, and "who did that
+    # and when" is the first question asked about it.
+    mem_budget_updated_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    mem_budget_actor: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # What the node measured and applied, published each cycle beside the
+    # capacity numbers. `total_bytes` is already min(budget, ceiling), so these
+    # are what let a reader tell the two apart and see an overage.
+    ceiling_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    working_set_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    effective_budget_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    budget_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    budget_stale: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -348,6 +383,18 @@ _SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any], bool], ...] = (
     ("desired_generation", Integer(), False),
     # When an operator declared this node drained (#536).
     ("drained_at", DateTime(timezone=True), True),
+    # The operator's soft memory budget and its concurrency token (#539).
+    # Nullable: NULL is "no override", which a NOT NULL DEFAULT 0 could not
+    # express -- 0 would read as a budget of nothing and refuse every load.
+    ("mem_budget_bytes", BigInteger(), True),
+    ("mem_budget_version", Integer(), True),
+    ("mem_budget_updated_at", DateTime(timezone=True), True),
+    ("mem_budget_actor", String(128), True),
+    ("ceiling_bytes", BigInteger(), True),
+    ("working_set_bytes", BigInteger(), True),
+    ("effective_budget_bytes", BigInteger(), True),
+    ("budget_source", String(16), True),
+    ("budget_stale", Boolean(), True),
 )
 
 
@@ -425,6 +472,10 @@ _DESIRED_LOCK_KEY = 0x0D0C1E03
 
 class DesiredStateConflictError(RuntimeError):
     """A desired-state write lost its optimistic-concurrency check (#534)."""
+
+
+class NodeBudgetConflictError(RuntimeError):
+    """A memory-budget write lost its optimistic-concurrency check (#539)."""
 
 
 def ensure_serving_desired_table(engine: Engine) -> bool:
@@ -693,6 +744,30 @@ def _desired_view(row: ServingDesiredDeployment) -> dict[str, Any]:
     }
 
 
+def _minimal_node_row(node_id: str) -> ServingNode:
+    """A node row carrying no capacity measurement.
+
+    Written when something central needs a row for a machine that has not
+    published yet -- desired state staged for a node that is not started, or a
+    budget set before one is added. ``source="unreported"`` is what keeps those
+    zeroes from being priced against; the node's first real publish overwrites
+    them.
+
+    One definition, because two call sites inventing their own would drift the
+    moment a column is added -- and a column missing from one of them is a row
+    that reads as a measurement of zero.
+    """
+    return ServingNode(
+        id=node_id,
+        total_bytes=0,
+        free_bytes=0,
+        source="unreported",
+        sum_rss_bytes=0,
+        reclaimable_bytes=0,
+        desired_generation=0,
+    )
+
+
 def _bump_desired_generation(session: Session, node_id: str) -> int:
     """Advance ``node_id``'s desired generation, creating no capacity numbers.
 
@@ -704,15 +779,7 @@ def _bump_desired_generation(session: Session, node_id: str) -> int:
     """
     row = session.get(ServingNode, node_id)
     if row is None:
-        row = ServingNode(
-            id=node_id,
-            total_bytes=0,
-            free_bytes=0,
-            source="unreported",
-            sum_rss_bytes=0,
-            reclaimable_bytes=0,
-            desired_generation=0,
-        )
+        row = _minimal_node_row(node_id)
         session.add(row)
     row.desired_generation = (row.desired_generation or 0) + 1
     session.flush()
@@ -735,6 +802,23 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         "source": row.source,
         "sum_rss_bytes": row.sum_rss_bytes,
         "reclaimable_bytes": row.reclaimable_bytes,
+        # The operator's soft budget as REQUESTED (#539), which is not the same
+        # question as what the node is sizing against: the node reports that in
+        # `total_bytes`, having already taken min(budget, cgroup ceiling) and
+        # subtracted its own working set. A reader that conflated them would
+        # show a budget as though it were enforced on a node whose kernel
+        # ceiling is lower.
+        #
+        # None means no override is set for this node.
+        "mem_budget_bytes": row.mem_budget_bytes,
+        "mem_budget_version": row.mem_budget_version,
+        "mem_budget_updated_at": isoformat(row.mem_budget_updated_at),
+        "mem_budget_actor": row.mem_budget_actor,
+        "ceiling_bytes": row.ceiling_bytes,
+        "working_set_bytes": row.working_set_bytes,
+        "effective_budget_bytes": row.effective_budget_bytes,
+        "budget_source": row.budget_source,
+        "budget_stale": row.budget_stale,
         "updated_at": isoformat(row.updated_at),
     }
 
@@ -1107,6 +1191,11 @@ class ModelCatalog:
         sum_rss_bytes: int,
         reclaimable_bytes: int = 0,
         store_models: Sequence[str] | None = None,
+        ceiling_bytes: int | None = None,
+        working_set_bytes: int | None = None,
+        effective_budget_bytes: int | None = None,
+        budget_source: str | None = None,
+        budget_stale: bool | None = None,
     ) -> dict[str, Any]:
         """Upsert ``node_id``'s ``serving_node`` row (its reconciler is the sole caller).
 
@@ -1126,6 +1215,11 @@ class ModelCatalog:
             "source": source,
             "sum_rss_bytes": sum_rss_bytes,
             "reclaimable_bytes": reclaimable_bytes,
+            "ceiling_bytes": ceiling_bytes,
+            "working_set_bytes": working_set_bytes,
+            "effective_budget_bytes": effective_budget_bytes,
+            "budget_source": budget_source,
+            "budget_stale": budget_stale,
             "updated_at": stamped,
         }
         if store_models is not None:
@@ -1314,6 +1408,90 @@ class ModelCatalog:
                 "node_id": node_id,
                 "drained_at": isoformat(row.drained_at),
                 "desired_generation": generation,
+            }
+
+    def read_node_budget(self, node_id: str) -> dict[str, Any] | None:
+        """This node's soft budget override, or None when it has no row.
+
+        A row with ``mem_budget_bytes`` NULL is a real answer -- "no override
+        set" -- and is returned as such, distinct from the None that means
+        "nothing is known about this node". The node caches both, because
+        falling back to its bootstrap setting on a validated NULL is correct
+        while doing so on an unknown is a guess.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ServingNode, node_id)
+            if row is None:
+                return None
+            return {
+                "node_id": row.id,
+                "mem_budget_bytes": row.mem_budget_bytes,
+                "mem_budget_version": row.mem_budget_version,
+                "mem_budget_updated_at": isoformat(row.mem_budget_updated_at),
+                "mem_budget_actor": row.mem_budget_actor,
+            }
+
+    def set_node_budget(
+        self,
+        node_id: str,
+        *,
+        budget_bytes: int | None,
+        expected_version: int | None,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        """Set (or clear) ``node_id``'s soft memory budget (#539).
+
+        ``budget_bytes=None`` clears the override, which is NOT a budget of
+        zero: the node falls back to its bootstrap setting and then to its
+        kernel ceiling.
+
+        ``expected_version`` is the version the caller read; ``None`` means
+        "no budget has been set for this node yet". A mismatch raises
+        :class:`NodeBudgetConflictError` rather than overwriting, so two
+        operators editing one node's budget cannot interleave -- the loser
+        re-reads and decides again against the number that actually won.
+
+        Deliberately does NOT bump ``desired_generation``. A budget edit is
+        not a change to what this node should be running, and bumping it would
+        make the node re-converge its deployments because somebody typed a
+        number.
+
+        Creates a minimal row for a node that has never reported, mirroring
+        ``set_node_drain``: a budget can be staged for a machine before it
+        first publishes, which is the normal order when adding one.
+        """
+        if budget_bytes is not None and budget_bytes <= 0:
+            raise ValueError(
+                "budget_bytes must be positive; pass None to clear the override "
+                "(a budget of zero would refuse every load)"
+            )
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(ServingNode, node_id)
+            if row is None:
+                row = _minimal_node_row(node_id)
+                session.add(row)
+                session.flush()
+            if row.mem_budget_version != expected_version:
+                raise NodeBudgetConflictError(
+                    f"memory budget for node {node_id!r} is at version "
+                    f"{row.mem_budget_version!r}, not {expected_version!r}; "
+                    f"re-read and retry"
+                )
+            row.mem_budget_bytes = budget_bytes
+            row.mem_budget_version = (row.mem_budget_version or 0) + 1
+            row.mem_budget_updated_at = _utcnow()
+            row.mem_budget_actor = actor
+            session.flush()
+            return {
+                "node_id": node_id,
+                "mem_budget_bytes": row.mem_budget_bytes,
+                "mem_budget_version": row.mem_budget_version,
+                "mem_budget_updated_at": isoformat(row.mem_budget_updated_at),
+                "mem_budget_actor": row.mem_budget_actor,
             }
 
     def list_node_snapshots(self) -> Sequence[dict[str, Any]]:
