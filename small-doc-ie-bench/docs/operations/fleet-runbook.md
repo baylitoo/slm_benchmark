@@ -190,15 +190,26 @@ stale copy there cannot change what the node serves (#593).
 ## Check the node before it takes traffic
 
 `docie-serving doctor` exits non-zero when a check FAILS, so a bringup script
-can gate on it. Each check maps to a failure that is otherwise invisible:
+can gate on it. Behind a deployment platform such as Coolify, where
+`compose run` is not available, run it from a terminal in the running
+`serving` container. It initialises its own database connection, so nothing
+needs to be set up by hand first.
+
+The routine check needs no shell on the node: the Fleet page lists every node
+with the age of its last snapshot. A fresh node with valid configuration
+appears there within one reconcile interval. Reach for the doctor when it does
+not, or when it shows as unreachable.
+
+Each check maps to a failure that is otherwise invisible:
 
 | Check | What a bad result means |
 |---|---|
 | **worker role** | `DOCIE_WORKER_ROLE` without `serving`: the process registers no serving functions and will never deploy, reconcile or publish. |
 | **serving home** | Not writable: the node cannot remember what it is running, or what it is called. |
 | **node id** | Duplicated across nodes. `ModelPlacement.name` is a primary key, so two nodes sharing an id overwrite each other's rows — one node's replica goes unroutable while still holding its RAM. |
-| **advertise host** | Resolves to loopback or to *another machine*. Deploys record `http://{this}:{port}/v1`, and the central API resolves that in **its** network. This is the failure that returns a 200 with the wrong model. |
-| **model catalog** | Unreachable Postgres. The node keeps serving what is loaded, but it is invisible to the fleet and converges on nothing. |
+| **advertise host** | Resolves to loopback or to *another machine*. Deploys record `http://{this}:{port}/v1`, and the central API resolves that in **its** network. This is the failure that returns a 200 with the wrong model. Inside Docker the WireGuard address belongs to the host, so it passes when it equals `DOCIE_SERVING_PUBLISH_IP`, and fails when the two differ. |
+| **model catalog** | Unreachable Postgres. The node keeps serving what is loaded, but it is invisible to the fleet and converges on nothing. The detail names the host, port and database it tried, never the credentials. |
+| **fleet heartbeat** | This node has not published a snapshot, or its last one is stale. The same reading the Fleet page shows: if the node is listed there with a recent age, it has registered. |
 | **inngest** | Unreachable: no lifecycle events arrive. Desired state still converges, since that is read from the catalog. |
 | **desired-state apply** | Off: the node joins, reports healthy, and ignores every deploy aimed at it, every auto-placed deploy that picks it, and the unload half of a drain. Routing exclusion and capacity publishing work regardless. |
 | **port window** | Inverted, or ports held by something else. A runtime on an unpublished port records an endpoint nothing can reach. |

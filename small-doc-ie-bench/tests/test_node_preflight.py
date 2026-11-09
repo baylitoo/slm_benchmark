@@ -248,16 +248,22 @@ def test_collect_facts_survives_a_node_with_nothing_configured(
     database. Every probe is contained, so this must return facts rather than
     raise -- a doctor that cannot run on a broken node is useless."""
     import docie_bench.storage.db as db
+    from docie_bench.settings import get_settings
 
     monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
     monkeypatch.delenv("INNGEST_BASE_URL", raising=False)
     monkeypatch.delenv("DOCIE_SERVING_DESIRED_APPLY", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    get_settings.cache_clear()
     db.dispose_engine()
 
-    facts = collect_facts(probe_ports=False, probe_inngest=False)
+    try:
+        facts = collect_facts(probe_ports=False, probe_inngest=False)
+    finally:
+        get_settings.cache_clear()
 
     assert facts.db_reachable is False
-    assert facts.db_detail  # a reason, not just a flag
+    assert facts.db_detail == "DATABASE_URL is not configured"
     assert facts.db_clock_skew_s is None
     assert facts.catalog_models is None
     assert facts.desired_apply is False
@@ -473,6 +479,7 @@ def test_the_report_is_stable_so_a_bringup_script_can_diff_it() -> None:
         "node id",
         "advertise host",
         "model catalog",
+        "fleet heartbeat",
         "inngest",
         "desired-state apply",
         "port window",
@@ -513,3 +520,170 @@ def test_a_reachable_catalog_is_reported_with_a_usable_skew(
     # A naive stamp read as UTC can be hours off a local clock; the point is
     # that it is a NUMBER and nothing raised.
     assert _check(facts, "clocks").severity is Severity.INFO  # type: ignore[attr-defined]
+
+
+# --- a fresh process, as `docie-serving doctor` runs ----------------------
+
+
+def test_a_fresh_process_with_a_configured_url_reaches_the_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Rocky false negative. The worker initialises the engine at startup,
+    but the doctor is its own process: with a URL set and no session factory
+    yet, it reported "DATABASE_URL is not configured"."""
+    import docie_bench.storage.db as db
+    from docie_bench.settings import get_settings
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path / "serving"))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/catalog.db")
+    get_settings.cache_clear()
+    db.dispose_engine()
+    assert db.get_session_factory() is None
+    try:
+        facts = collect_facts(probe_ports=False, probe_inngest=False)
+    finally:
+        db.dispose_engine()
+        get_settings.cache_clear()
+
+    assert facts.db_reachable is True, facts.db_detail
+    assert facts.catalog_models == ()
+
+
+def test_a_failed_connection_names_the_target_and_hides_the_password(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import docie_bench.storage.db as db
+    from docie_bench.settings import get_settings
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path / "serving"))
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://docie:s3cr3t-pw@127.0.0.1:1/docie"
+    )
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "1")
+    get_settings.cache_clear()
+    db.dispose_engine()
+    try:
+        facts = collect_facts(probe_ports=False, probe_inngest=False)
+    finally:
+        db.dispose_engine()
+        get_settings.cache_clear()
+
+    assert facts.db_reachable is False
+    assert "127.0.0.1:1/docie" in str(facts.db_detail)
+    assert "s3cr3t-pw" not in str(facts.db_detail)
+    assert "docie:s3" not in str(facts.db_detail)
+
+
+def test_redaction_removes_credentials_wherever_they_appear() -> None:
+    from docie_bench.serving.preflight import _redact
+
+    url = "postgresql+psycopg://docie:s3cr3t-pw@10.7.0.19:5432/docie"
+    line = _redact(
+        "failed: postgresql://docie:s3cr3t-pw@10.7.0.19/docie (password s3cr3t-pw)\nmore",
+        url,
+    )
+
+    assert "s3cr3t-pw" not in line
+    assert "more" not in line
+
+
+# --- the advertise host under Docker ---------------------------------------
+
+
+def _docker(advertise: str, publish: str, resolved: tuple[str, ...]) -> NodeFacts:
+    """Inside a container: the WireGuard address belongs to the host."""
+    from dataclasses import replace
+
+    return replace(
+        _healthy(),
+        advertise_host=advertise,
+        advertise_resolved=resolved,
+        local_addresses=frozenset({"172.18.0.4", "127.0.0.1"}),
+        publish_ip=publish,
+    )
+
+
+def test_a_docker_node_advertising_its_published_address_passes() -> None:
+    check = _check(_docker("10.7.0.20", "10.7.0.20", ("10.7.0.20",)), "advertise host")
+
+    assert check.severity is Severity.PASS
+    assert "published" in check.detail
+
+
+def test_advertising_an_address_the_ports_are_not_published_on_fails() -> None:
+    """A real wrong endpoint: nothing listens where deploys say it does."""
+    check = _check(_docker("10.7.0.19", "10.7.0.20", ("10.7.0.19",)), "advertise host")
+
+    assert check.severity is Severity.FAIL
+    assert "10.7.0.20" in check.detail
+
+
+def test_without_a_publish_ip_another_machines_address_still_warns() -> None:
+    check = _check(_docker("10.7.0.19", "", ("10.7.0.19",)), "advertise host")
+
+    assert check.severity is Severity.WARN
+
+
+def test_a_loopback_advertise_host_still_fails_under_docker() -> None:
+    check = _check(_docker("localhost", "10.7.0.20", ("127.0.0.1",)), "advertise host")
+
+    assert check.severity is Severity.FAIL
+
+
+# --- the heartbeat the Fleet page shows ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("published", "age", "expected"),
+    [
+        (None, None, Severity.INFO),
+        (False, None, Severity.WARN),
+        (True, 4.0, Severity.PASS),
+        (True, 400.0, Severity.WARN),
+    ],
+)
+def test_the_heartbeat_check(
+    published: bool | None, age: float | None, expected: Severity
+) -> None:
+    from dataclasses import replace
+
+    facts = replace(
+        _healthy(),
+        heartbeat_published=published,
+        heartbeat_age_s=age,
+        heartbeat_stale_after_s=30.0,
+    )
+
+    assert _check(facts, "fleet heartbeat").severity is expected
+
+
+def test_collect_facts_reads_this_nodes_own_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import docie_bench.storage.db as db
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.node_identity import resolve_node_id
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path / "serving"))
+    monkeypatch.setenv("DOCIE_SERVING_NODE_ID", "rocky-llm-1")
+    resolve_node_id.cache_clear()
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path}/catalog.db")
+    try:
+        before = collect_facts(probe_ports=False, probe_inngest=False)
+        ModelCatalog().publish_node_snapshot(
+            node_id="rocky-llm-1",
+            total_bytes=1,
+            free_bytes=1,
+            source="cgroup",
+            sum_rss_bytes=0,
+        )
+        after = collect_facts(probe_ports=False, probe_inngest=False)
+    finally:
+        db.dispose_engine()
+        resolve_node_id.cache_clear()
+
+    assert before.heartbeat_published is False
+    assert after.heartbeat_published is True
+    assert after.heartbeat_age_s is not None
+    assert after.heartbeat_age_s < 60
