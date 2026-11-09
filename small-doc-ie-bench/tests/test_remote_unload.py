@@ -5,7 +5,7 @@ against a named node". Unload is the one that works with the machinery that
 exists, and the reason is worth stating because it is also why the other three
 do not: a stop is the single intent ``plan_convergence`` already derives
 correctly for a deployment that is present on its node (``to_stop``). Load
-needs a plan state for "present but not running", delete needs an explicitly
+goes through a durable request (test_remote_load.py), delete needs an explicitly
 declared removal, and pin/repair are not expressible in a desired spec at all
 -- see #590.
 
@@ -194,20 +194,18 @@ def test_an_unknown_deployment_is_still_a_404(remote: None) -> None:
     assert _desired_rows() == []
 
 
-def test_the_other_verbs_still_refuse_and_say_which_one_works(
+def test_delete_still_refuses_and_says_which_verbs_work(
     remote: None,
 ) -> None:
-    """Load, delete, pin and repair need plan states that do not exist (#590),
-    so they refuse rather than writing desired state that would be ignored --
-    and the refusal names the verb that does work."""
+    """Delete, pin and repair are not expressible as desired state yet (#590),
+    so they refuse rather than writing a row that would be ignored."""
     from fastapi import HTTPException
 
-    from docie_bench.inngest.serving_api import delete_deployment, load_deployment
+    from docie_bench.inngest.serving_api import delete_deployment
 
-    for endpoint in (load_deployment, delete_deployment):
-        with pytest.raises(HTTPException) as excinfo:
-            asyncio.run(endpoint(RECORD, tenant=None))  # type: ignore[arg-type]
-        assert excinfo.value.status_code == 409
-        assert "Unload works remotely" in str(excinfo.value.detail)
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(delete_deployment(RECORD, tenant=None))  # type: ignore[arg-type]
+    assert excinfo.value.status_code == 409
+    assert "Load and unload work" in str(excinfo.value.detail)
 
     assert _desired_rows() == []
