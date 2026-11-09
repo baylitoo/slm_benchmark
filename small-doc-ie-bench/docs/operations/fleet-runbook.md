@@ -180,7 +180,7 @@ with the values assigned to your fleet.
 
    Update the per-node settings:
 
-   ```dotenv
+   ```text
    DOCIE_SERVING_NODE_ID=new-node-id
    DOCIE_SERVING_ADVERTISE_HOST=NEW_NODE_VPN_IP
    DOCIE_SERVING_PUBLISH_IP=NEW_NODE_VPN_IP
@@ -192,7 +192,7 @@ with the values assigned to your fleet.
    Verify these shared settings in the clone (substitute your central
    endpoints):
 
-   ```dotenv
+   ```text
    DOCIE_DB_HOST=CENTRAL_VPN_IP
    DOCIE_DB_PORT=CENTRAL_DB_PORT
    INNGEST_BASE_URL=http://CENTRAL_VPN_IP:CENTRAL_INNGEST_HTTP_PORT
