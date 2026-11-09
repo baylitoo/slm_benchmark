@@ -1,10 +1,11 @@
 # slm_benchmark
 
-The project lives in [small-doc-ie-bench/](small-doc-ie-bench/README.md): a local
-small-language-model serving fabric and document-information-extraction platform,
-with a CPU-only benchmark harness for evaluating which model to trust for a given
-extraction task. It covers OCR/layout, model serving, constrained JSON extraction,
-validation, persistence, and benchmark reporting behind one OpenAI-compatible API,
-accessible either through the DocIE Studio web UI or the `docie` / `docie-bench` CLI.
+This repository holds **DocIE**, a document information-extraction platform
+built on small language models it runs itself: model serving on CPU hardware,
+one OpenAI-compatible API, durable extraction jobs, and a benchmark harness for
+choosing which model to trust with which document.
 
-See [small-doc-ie-bench/README.md](small-doc-ie-bench/README.md) for setup and usage.
+The project lives in [`small-doc-ie-bench/`](small-doc-ie-bench/README.md).
+
+- **Overview and quickstart:** [small-doc-ie-bench/README.md](small-doc-ie-bench/README.md)
+- **Documentation:** <https://baylitoo.github.io/slm_benchmark/>
