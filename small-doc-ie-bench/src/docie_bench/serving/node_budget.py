@@ -87,8 +87,12 @@ def budget_cache_path() -> Path:
     return serving_home() / BUDGET_CACHE_FILENAME
 
 
-def read_budget_cache() -> int | None | str:
+def read_budget_cache(node_id: str | None = None) -> int | None | str:
     """The last answer the catalog gave, or ``"unknown"`` when there is none.
+
+    The file lives in ``serving_home``, which the central api and serving
+    containers share. An answer recorded for a different node id is not this
+    node's answer, so it reads as ``"unknown"``.
 
     Three outcomes, and they are three different facts: an int is a validated
     override, ``None`` is a validated "no override", and ``"unknown"`` means
@@ -107,20 +111,23 @@ def read_budget_cache() -> int | None | str:
         return "unknown"
     if not isinstance(decoded, dict) or "budget_bytes" not in decoded:
         return "unknown"
+    if node_id is not None and decoded.get("node_id") != node_id:
+        return "unknown"
     value = decoded["budget_bytes"]
     if value is None:
         return None
     return int(value) if isinstance(value, int) and value > 0 else "unknown"
 
 
-def write_budget_cache(budget_bytes: int | None) -> None:
-    """Persist the catalog's answer, atomically, so an outage is defined."""
+def write_budget_cache(budget_bytes: int | None, *, node_id: str | None = None) -> None:
+    """Persist the catalog's answer for ``node_id``, atomically."""
     path = budget_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
     try:
         temporary.write_text(
-            json.dumps({"budget_bytes": budget_bytes}, indent=2), encoding="utf-8"
+            json.dumps({"node_id": node_id, "budget_bytes": budget_bytes}, indent=2),
+            encoding="utf-8",
         )
         os.replace(temporary, path)
     finally:
@@ -177,13 +184,39 @@ def resolve_budget(
     return resolution
 
 
+def _known_node_id() -> str | None:
+    """This node's id if one is already established, without minting one.
+
+    Only the snapshot publisher may generate an id (#529). The api and the
+    doctor also size, and a budget lookup that minted an id in them would
+    create an identity the serving container never uses.
+    """
+    from docie_bench.serving.node_identity import (
+        NODE_ID_ENV_VAR,
+        _read_persisted,
+        node_id_path,
+        validate_node_id,
+    )
+
+    override = os.environ.get(NODE_ID_ENV_VAR, "").strip()
+    if override:
+        return validate_node_id(override)
+    try:
+        return _read_persisted(node_id_path())
+    except Exception:  # noqa: BLE001 - an unreadable id means "not known yet"
+        return None
+
+
 def _resolve_uncached(node_id: str | None) -> BudgetResolution:
     from docie_bench.serving.catalog import ModelCatalog
-    from docie_bench.serving.node_identity import resolve_node_id
 
     setting = setting_budget_bytes()
+    name = node_id if node_id is not None else _known_node_id()
+    if name is None:
+        # No identity yet, so there is no row to read. The first publish
+        # establishes one; until then the setting is all there is.
+        return _from_setting(setting)
     try:
-        name = node_id if node_id is not None else resolve_node_id()
         row = ModelCatalog().read_node_budget(name)
     except Exception:  # noqa: BLE001 - an unreachable catalog must not break sizing
         # ONE branch for every failure, and the CACHE decides -- not the
@@ -197,7 +230,7 @@ def _resolve_uncached(node_id: str | None) -> BudgetResolution:
         # own row, which proves a catalog exists. That is the evidence worth
         # branching on.
         logger.debug("node budget read failed; using the last known answer", exc_info=True)
-        cached = read_budget_cache()
+        cached = read_budget_cache(name)
         if cached == "unknown":
             # Never read its row: a single-node stack, or a node that has not
             # reached the catalog once. The setting is all there is.
@@ -214,7 +247,7 @@ def _resolve_uncached(node_id: str | None) -> BudgetResolution:
     # catalog answered, it simply has nothing for this machine yet.
     override = row.get("mem_budget_bytes") if row else None
     value = int(override) if isinstance(override, int) and override > 0 else None
-    write_budget_cache(value)
+    write_budget_cache(value, node_id=name)
     if value is not None:
         return BudgetResolution(budget_bytes=value, source="catalog")
     return _from_setting(setting)

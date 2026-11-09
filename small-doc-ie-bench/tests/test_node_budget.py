@@ -147,7 +147,7 @@ def test_an_outage_with_a_validated_no_override_uses_the_setting_but_says_stale(
     right -- and one may have been set since, so it is flagged."""
     _setting(monkeypatch, "8g")
     assert resolve_budget().source == "setting"  # caches the validated NULL
-    assert read_budget_cache() is None
+    assert read_budget_cache(NODE) is None
 
     db.dispose_engine()
     reset_budget_cache()
@@ -186,7 +186,7 @@ def test_the_error_type_does_not_decide_the_outage_path(
     DATABASE_URL" -- so reading the error as "single-node stack" would widen a
     fleet node's budget during an outage. The CACHE decides instead."""
     _setting(monkeypatch, "8g")
-    write_budget_cache(6 * GIB)
+    write_budget_cache(6 * GIB, node_id=NODE)
 
     def unavailable(self: ModelCatalog, node_id: str) -> dict[str, object] | None:
         raise CatalogUnavailableError("DATABASE_URL is not configured")
@@ -215,10 +215,10 @@ def test_an_unreadable_cache_file_does_not_invent_a_budget(
 def test_the_cache_survives_a_restart(node_home: None) -> None:
     """Durable beside the node's other state, so outage behaviour after a
     restart is the same as before one."""
-    write_budget_cache(6 * GIB)
+    write_budget_cache(6 * GIB, node_id=NODE)
     reset_budget_cache()  # the in-process TTL is what a restart clears
 
-    assert read_budget_cache() == 6 * GIB
+    assert read_budget_cache(NODE) == 6 * GIB
 
 
 # --- the read cost ---------------------------------------------------------
@@ -600,3 +600,42 @@ def test_a_node_publish_does_not_overwrite_the_operators_budget(node_home: None)
     )
 
     assert ModelCatalog().read_node_budget(NODE)["mem_budget_bytes"] == 6 * GIB
+
+
+# --- identity --------------------------------------------------------------
+
+
+def test_resolving_a_budget_never_mints_a_node_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The api and the doctor size too, and only the publisher may mint."""
+    from docie_bench.serving.node_identity import node_id_path
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path / "serving"))
+    monkeypatch.delenv("DOCIE_SERVING_NODE_ID", raising=False)
+    _setting(monkeypatch, "8g")
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path / 'catalog.db'}")
+    try:
+        resolution = resolve_budget()
+    finally:
+        db.dispose_engine()
+
+    assert resolution == BudgetResolution(budget_bytes=8 * GIB, source="setting")
+    assert not node_id_path().exists()
+
+
+def test_another_nodes_cached_answer_is_not_this_nodes(
+    node_home: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cache sits in a volume the api and serving containers share. An
+    answer written under another id must not stand in for this node's during
+    an outage."""
+    _setting(monkeypatch, "8g")
+    write_budget_cache(2 * GIB, node_id="some-other-node")
+
+    assert read_budget_cache(NODE) == "unknown"
+
+    db.dispose_engine()
+    reset_budget_cache()
+    assert resolve_budget().budget_bytes == 8 * GIB
