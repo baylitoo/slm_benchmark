@@ -452,6 +452,9 @@ def create_app(
         """
         from docie_bench.serving.preflight import Severity, collect_facts, evaluate, worst
 
+        # An unreachable database should be a quick FAIL, not a doctor that
+        # hangs on the driver's default connect timeout.
+        os.environ.setdefault("PGCONNECT_TIMEOUT", "5")
         checks = evaluate(collect_facts(probe_ports=probe_ports, probe_inngest=probe_inngest))
         if _state(ctx).json_output:
             _emit(ctx, [check.as_dict() for check in checks])
