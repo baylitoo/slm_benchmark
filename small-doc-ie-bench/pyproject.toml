@@ -1,12 +1,26 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "small-doc-ie-bench"
 version = "1.0.0"
-description = "CPU-only benchmark harness for structured document extraction with small LLMs"
+description = "Document information extraction on self-hosted small language models: serving, extraction jobs and benchmarks"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = ["document extraction", "llm", "llama.cpp", "ocr", "benchmark"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Text Processing",
+]
 dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.30.0",
@@ -91,6 +105,12 @@ dev = [
   "mypy>=1.11.1",
   "types-PyYAML>=6.0.12.20240808"
 ]
+
+[project.urls]
+Homepage = "https://github.com/baylitoo/slm_benchmark"
+Documentation = "https://baylitoo.github.io/slm_benchmark/"
+Changelog = "https://github.com/baylitoo/slm_benchmark/blob/master/small-doc-ie-bench/CHANGELOG.md"
+Issues = "https://github.com/baylitoo/slm_benchmark/issues"
 
 [project.scripts]
 docie-bench = "docie_bench.cli:app"
