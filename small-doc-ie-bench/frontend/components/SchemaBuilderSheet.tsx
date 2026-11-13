@@ -8,6 +8,7 @@ import {
 } from "@/lib/api";
 import { Alert, Button, Field, Select, Sheet, TextInput } from "./ui";
 import { T, useI18n } from "@/lib/i18n";
+import { SCHEMA_STARTERS } from "./schemaStarters";
 
 const emptyField = (): DynamicFieldSpec => ({ name: "", type: "string" });
 const NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
@@ -19,59 +20,6 @@ const TYPES: { value: DynamicFieldType; label: string }[] = [
   { value: "list", label: "List of objects" },
 ];
 const isContainer = (field: DynamicFieldSpec) => field.type === "object" || field.type === "list";
-
-export const RESUME_SCHEMA: DynamicSchemaSpec = {
-  document_type: "adbi_resume",
-  fields: [
-    { name: "name", type: "string" },
-    { name: "title", type: "string", description: "Intitule de poste affiche en tete du CV, pas l'intitule d'une mission particuliere" },
-    { name: "years_experience", type: "number", description: "Nombre total d'annees d'experience professionnelle, en chiffres" },
-    { name: "contact", type: "object", fields: [
-      { name: "email", type: "string" },
-      { name: "phone", type: "string" },
-      { name: "linkedin", type: "string" },
-      { name: "github", type: "string" },
-      { name: "location", type: "string", description: "Ville de residence du candidat, pas le lieu d'une mission" },
-    ] },
-    { name: "experience", type: "list", fields: [
-      { name: "company", type: "string", description: "Employeur qui salarie ou porte le consultant sur cette mission, pas le client final" },
-      { name: "end_client", type: "string", description: "Client final chez qui la mission a ete realisee, quand le CV le nomme, distinct de l'employeur" },
-      { name: "via", type: "string", description: "Societe intermediaire par laquelle la mission a ete realisee, quand le CV en nomme une, distincte du client final et de l'employeur" },
-      { name: "title", type: "string", description: "Role tenu sur cette mission, pas l'intitule de poste affiche en tete du CV" },
-      { name: "start_date", type: "date", description: "Date de debut de cette mission" },
-      { name: "end_date", type: "date", description: "Date de fin de cette mission, vide si la mission est en cours" },
-      { name: "location", type: "string", description: "Lieu ou cette mission a ete realisee, pas la ville de residence du candidat" },
-      { name: "context", type: "string", description: "Contexte de la mission en une ou deux phrases (projet, enjeu, client), sans les realisations ni la stack" },
-      { name: "achievements", type: "list", description: "Realisations ou taches de la mission, une par entree, recopiees telles qu'ecrites : une puce du CV = une entree", fields: [
-        { name: "achievement", type: "string" },
-      ] },
-      { name: "env_technique", type: "string", description: "Technologies et outils de la mission, separes par des virgules, sans phrase" },
-    ] },
-    { name: "education", type: "list", fields: [
-      { name: "degree", type: "string" },
-      { name: "institution", type: "string" },
-      { name: "year", type: "string" },
-    ] },
-    { name: "skills", type: "list", fields: [
-      { name: "category", type: "string" },
-      { name: "items", type: "list", fields: [
-        { name: "item", type: "string" },
-      ] },
-    ] },
-    { name: "languages", type: "list", fields: [
-      { name: "language", type: "string" },
-      { name: "level", type: "string", description: "Niveau declare pour cette langue, recopie tel qu'imprime" },
-    ] },
-    { name: "certifications", type: "list", fields: [
-      { name: "name", type: "string" },
-      { name: "issuer", type: "string" },
-      { name: "year", type: "string" },
-    ] },
-    { name: "interests", type: "list", fields: [
-      { name: "interest", type: "string" },
-    ] },
-  ],
-};
 
 function cleanFields(fields: DynamicFieldSpec[]): DynamicFieldSpec[] {
   return fields.map((field) => ({
@@ -177,6 +125,7 @@ export function SchemaBuilderSheet({ open, onClose, onCreated, initialSpec, edit
   open: boolean; onClose: () => void; onCreated: (name: string) => void;
   initialSpec?: DynamicSchemaSpec; editName?: string;
 }) {
+  const { t } = useI18n();
   const [documentType, setDocumentType] = useState("");
   const [fields, setFields] = useState<DynamicFieldSpec[]>([emptyField()]);
   const [submitting, setSubmitting] = useState(false);
@@ -218,10 +167,15 @@ export function SchemaBuilderSheet({ open, onClose, onCreated, initialSpec, edit
         </T></p>
       </div>
       <fieldset disabled={submitting} className="space-y-5">
-        {!editName && !initialSpec && <Button type="button" variant="secondary" size="sm"
-          onClick={() => { setDocumentType(RESUME_SCHEMA.document_type); setFields(structuredClone(RESUME_SCHEMA.fields)); setError(null); }}>
-          <T>Use resume starter</T>
-        </Button>}
+        {!editName && !initialSpec && <Select className="w-64" value="" aria-label="Start from a starter"
+          onChange={(event) => {
+            const starter = SCHEMA_STARTERS.find((spec) => spec.document_type === event.target.value);
+            if (!starter) return;
+            setDocumentType(starter.document_type); setFields(structuredClone(starter.fields)); setError(null);
+          }}>
+          <option value="">{t("Start from a starter…")}</option>
+          {SCHEMA_STARTERS.map((spec) => <option key={spec.document_type} value={spec.document_type}>{spec.document_type}</option>)}
+        </Select>}
         <Field label="Document type" required hint={editName
           ? "The saved name stays the same so existing references continue to work."
           : "Lower snake_case, e.g. purchase_order."}>
