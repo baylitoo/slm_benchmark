@@ -105,6 +105,32 @@ export const TYPE_PIECE_SCHEMA: DynamicSchemaSpec = {
   ],
 };
 
+export const CNI_SCHEMA: DynamicSchemaSpec = {
+  document_type: "cni",
+  fields: [
+    { name: "surname", type: "string", description: "Nom de famille du titulaire, tel qu'imprime (nom de naissance)" },
+    { name: "given_names", type: "string", description: "Prenom(s) du titulaire, tels qu'imprimes, dans l'ordre du document" },
+    { name: "document_number", type: "string", description: "Numero du titre tel qu'imprime en clair sur la carte" },
+    { name: "nationality", type: "string", description: "Nationalite du titulaire telle qu'imprimee" },
+    { name: "birth_date", type: "date", description: "Date de naissance du titulaire" },
+    { name: "sex", type: "string", description: "Sexe du titulaire tel qu'imprime (F ou M sur une carte francaise)" },
+    { name: "issue_date", type: "date", description: "Date de delivrance de la carte" },
+    { name: "expiry_date", type: "date", description: "Date d'expiration de la carte" },
+    { name: "mrz_line1", type: "string", description: "Premiere ligne de la zone de lecture automatique (MRZ), 30 caracteres A-Z, 0-9 ou < , recopiee telle quelle" },
+    { name: "mrz_line2", type: "string", description: "Deuxieme ligne de la zone de lecture automatique (MRZ), 30 caracteres A-Z, 0-9 ou < , recopiee telle quelle" },
+  ],
+};
+
+export const RIB_SCHEMA: DynamicSchemaSpec = {
+  document_type: "rib",
+  fields: [
+    { name: "account_holder", type: "string", description: "Titulaire du compte tel qu'imprime sur le RIB (denomination de la societe)" },
+    { name: "iban", type: "string", description: "IBAN complet tel qu'imprime, espaces de groupement compris" },
+    { name: "bic", type: "string", description: "Code BIC (SWIFT) de la banque, 8 ou 11 caracteres" },
+    { name: "bank_name", type: "string", description: "Nom de la banque ou de l'agence de domiciliation" },
+  ],
+};
+
 export const CARTE_VITALE_SCHEMA: DynamicSchemaSpec = {
   document_type: "adbi_carte_vitale",
   fields: [
@@ -135,6 +161,6 @@ export const DIPLOME_SCHEMA: DynamicSchemaSpec = {
 };
 
 export const SCHEMA_STARTERS: DynamicSchemaSpec[] = [
-  RESUME_SCHEMA, RECU_SCHEMA, FACTURE_SCHEMA, TYPE_PIECE_SCHEMA,
+  RESUME_SCHEMA, RECU_SCHEMA, FACTURE_SCHEMA, TYPE_PIECE_SCHEMA, CNI_SCHEMA, RIB_SCHEMA,
   CARTE_VITALE_SCHEMA, JUSTIFICATIF_DOMICILE_SCHEMA, DIPLOME_SCHEMA,
 ];
