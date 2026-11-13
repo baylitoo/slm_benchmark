@@ -69,7 +69,7 @@ describe("SchemaBuilderSheet", () => {
 it("creates the complete ADBI resume starter with variable-length nested lists", async () => {
   createDynamicSchema.mockResolvedValue({ name: "adbi_resume" });
   render(<SchemaBuilderSheet open onClose={vi.fn()} onCreated={vi.fn()} />);
-  await userEvent.click(screen.getByRole("button", { name: "Use resume starter" }));
+  await userEvent.selectOptions(screen.getByRole("combobox", { name: "Start from a starter" }), "adbi_resume");
   expect(screen.getByPlaceholderText("purchase_order")).toHaveValue("adbi_resume");
   await userEvent.click(screen.getByRole("button", { name: "Save schema" }));
   const spec = createDynamicSchema.mock.calls.at(-1)![0];
@@ -130,6 +130,23 @@ it("creates the complete ADBI resume starter with variable-length nested lists",
   ]);
 });
 
+
+it("loads an ADBI module starter with its nested list and descriptions", async () => {
+  createDynamicSchema.mockResolvedValue({ name: "adbi_facture" });
+  render(<SchemaBuilderSheet open onClose={vi.fn()} onCreated={vi.fn()} />);
+  await userEvent.selectOptions(screen.getByRole("combobox", { name: "Start from a starter" }), "adbi_facture");
+  await userEvent.click(screen.getByRole("button", { name: "Save schema" }));
+  const spec = createDynamicSchema.mock.calls.at(-1)![0];
+  expect(spec.document_type).toBe("adbi_facture");
+  expect(spec.fields.map((field: { name: string }) => field.name)).toEqual([
+    "fournisseur", "siren", "siret", "tva_intracom", "numero", "date_facture", "date_echeance",
+    "lignes", "total_ht", "total_tva", "total_ttc", "devise", "iban", "bic",
+  ]);
+  expect(spec.fields[7].fields.map((field: { name: string; type: string }) => `${field.name}:${field.type}`)).toEqual([
+    "designation:string", "quantite:number", "pu_ht:number", "taux_tva:number", "total_ht:number",
+  ]);
+  expect(spec.fields[0].description).toMatch(/Raison sociale du fournisseur/);
+});
 
 it("edits nested objects and lists without flattening their item structure", async () => {
   updateDynamicSchema.mockResolvedValue({ name: "resume" });
