@@ -103,6 +103,11 @@ class FamilyContract:
     # embeddings. Deployments of a reranker family are typed "reranker" and
     # routed by the rerank API, same shape as the embedding family above.
     reranker: bool = False
+    # A native decision model (llama.cpp #29818): a GGUF whose decision head
+    # scores caller-supplied options, answered on /v1/systemone — never
+    # chat/extraction. The GGUF's own decision metadata switches llama-server
+    # into decision mode, so no launch flag is needed.
+    decision: bool = False
     # An analyzer (encoder) family: a transformers/safetensors checkpoint served
     # by the ENCODER runtime (docie encoder), NOT llama.cpp. Stored as a
     # directory snapshot rather than a single GGUF, and typed "encoder".
@@ -484,6 +489,29 @@ FAMILIES: dict[str, FamilyContract] = {
         prompt_profile="strict_extraction_v1",
         llama_server_args=("--reranking", "--embedding", "--pooling", "rank"),
         reranker=True,
+        ollama_faithful=False,
+    ),
+    # Decision models (Laya, Julia-1, Kev, lev, lfm2-d1, ...): an encoder or
+    # decoder backbone with a decision head, served by llama-server on
+    # /v1/systemone (choice / score / yes-no questions about a state, answered
+    # with probabilities). No template, no schema, no launch flags.
+    "decision": FamilyContract(
+        name="decision",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,  # unused on /v1/systemone
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        decision=True,
+        ollama_faithful=False,
+    ),
+    # The same with image input (OpenJev, Clef, lfm2-d1): needs the projector.
+    "decision_vl": FamilyContract(
+        name="decision_vl",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        decision=True,
+        needs_mmproj=True,
+        vision=True,
         ollama_faithful=False,
     ),
     # Multi-vector / late-interaction retrievers (ColBERT, PyLate checkpoints:

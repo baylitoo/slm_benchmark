@@ -100,7 +100,7 @@ VISION_ARCHS = frozenset(
 
 # Families that are multimodal — a repo whose family resolves to one of these
 # is already vision, no upgrade needed.
-VISION_FAMILIES = frozenset({"lfm2_vl", "lfm3_vl", "nuextract3", "vision_ocr"})
+VISION_FAMILIES = frozenset({"lfm2_vl", "lfm3_vl", "nuextract3", "vision_ocr", "decision_vl"})
 
 # When a repo ships an mmproj it is MULTIMODAL regardless of the reported base
 # LM architecture: llama.cpp reports the backbone (e.g. "lfm2" for LFM2-VL,
@@ -227,6 +227,86 @@ def _audio_only(signals: RepoSignals) -> bool:
         "image-to-text",
     }
 
+
+
+# Encoder backbones as GGUF `general.architecture` or config `model_type`.
+ENCODER_ARCHS = frozenset(
+    {
+        "bert",
+        "modern-bert",
+        "modernbert",
+        "nomic-bert",
+        "roberta",
+        "xlm-roberta",
+        "deberta",
+        "deberta-v2",
+        "distilbert",
+        "electra",
+    }
+)
+_CLASSIFICATION_PIPELINES = frozenset({"text-classification", "zero-shot-classification"})
+
+DECISION_RUNTIME_NOTE = (
+    "served on /v1/systemone; needs a llama-server built after "
+    "ggml-org/llama.cpp#29818 (merged 2026-10-02). Some models (laya, clef) "
+    "evaluate the whole prompt in one batch, so long states need a larger "
+    "--ubatch-size."
+)
+
+
+def _decision_confidence(signals: RepoSignals) -> Confidence | None:
+    """Native decision models (llama.cpp #29818) share their backbone with
+    embedding encoders (``modern-bert``) or chat models (``qwen35``), so the
+    arch cannot tell them apart.
+
+    * ``"confirmed"`` -- the ``decision-model`` Hub tag, which every ggml-org
+      conversion carries (Laya, Julia-1, Kev, lev, OpenJev).
+    * ``"guessed"`` -- an encoder backbone whose task is classification. Only
+      a GGUF with decision metadata answers /v1/systemone, so it needs the
+      operator's confirmation.
+    """
+    tag_set = {str(t).strip().lower() for t in signals.tags or ()}
+    if "decision-model" in tag_set:
+        return "confirmed"
+    if (
+        signals.arch in ENCODER_ARCHS
+        and signals.pipeline_tag in _CLASSIFICATION_PIPELINES
+        # Older cross-encoders are tagged text-classification too.
+        and _reranker_confidence(signals) is None
+        and _multi_vector_confidence(signals) is None
+    ):
+        return "guessed"
+    return None
+
+
+def _decision_verdict(
+    confidence: Confidence, *, architecture: str | None, has_gguf: bool, has_mmproj: bool
+) -> SupportVerdict:
+    family = "decision_vl" if has_mmproj else "decision"
+    if not has_gguf:
+        return SupportVerdict(
+            "needs_family",
+            family,
+            f"decision model ({architecture!r} backbone) without a GGUF: decision "
+            "models are served by llama-server, which needs one. ggml-org publishes "
+            "conversions as ggml-org/<name>-GGUF.",
+            runtime_note=DECISION_RUNTIME_NOTE,
+        )
+    if confidence == "guessed":
+        return SupportVerdict(
+            "needs_family",
+            family,
+            f"classification encoder ({architecture!r} backbone): /v1/systemone "
+            "answers only when the GGUF carries decision metadata; confirm the "
+            "family before deploying",
+            runtime_note=DECISION_RUNTIME_NOTE,
+        )
+    return SupportVerdict(
+        "supported",
+        family,
+        f"decision model ({architecture!r} backbone) → {family} (/v1/systemone)",
+        runtime_note=DECISION_RUNTIME_NOTE,
+    )
 
 
 def _multi_vector_confidence(signals: RepoSignals) -> Confidence | None:
@@ -388,6 +468,18 @@ def resolve_family(
     if _is_gliformer(signals):
         return SupportVerdict(
             "supported", "encoder_gliformer", "GLiFormer analyzer (library_name=gliformer)"
+        )
+
+    # Decision models before every arch-based branch: Kev and lev report
+    # "qwen35" and would otherwise resolve to a chat family, Laya and Julia-1
+    # report "modern-bert" like an embedding encoder.
+    decision_confidence = _decision_confidence(signals)
+    if decision_confidence is not None:
+        return _decision_verdict(
+            decision_confidence,
+            architecture=architecture,
+            has_gguf=has_gguf,
+            has_mmproj=has_mmproj,
         )
 
     if not architecture:
