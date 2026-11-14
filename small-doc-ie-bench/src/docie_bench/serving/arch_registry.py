@@ -206,6 +206,10 @@ class RepoSignals:
     pipeline_tag: str | None = None
     base_model: str | None = None
     library_name: str | None = None
+    # From the GGUF header, when hf_hub read it (see read_gguf_decision_type).
+    gguf_decision_type: str | None = None
+    gguf_header_read: bool = False
+
 
 def _is_gliformer(signals: RepoSignals) -> bool:
     """A GLiFormer repo, by how it describes itself rather than by its backbone."""
@@ -244,7 +248,8 @@ ENCODER_ARCHS = frozenset(
         "electra",
     }
 )
-_CLASSIFICATION_PIPELINES = frozenset({"text-classification", "zero-shot-classification"})
+CLASSIFICATION_PIPELINES = frozenset({"text-classification", "zero-shot-classification"})
+DECISION_HUB_TAG = "decision-model"
 
 DECISION_RUNTIME_NOTE = (
     "served on /v1/systemone; needs a llama-server built after "
@@ -259,18 +264,24 @@ def _decision_confidence(signals: RepoSignals) -> Confidence | None:
     embedding encoders (``modern-bert``) or chat models (``qwen35``), so the
     arch cannot tell them apart.
 
-    * ``"confirmed"`` -- the ``decision-model`` Hub tag, which every ggml-org
-      conversion carries (Laya, Julia-1, Kev, lev, OpenJev).
-    * ``"guessed"`` -- an encoder backbone whose task is classification. Only
-      a GGUF with decision metadata answers /v1/systemone, so it needs the
-      operator's confirmation.
+    * ``"confirmed"`` -- the GGUF header carries ``{arch}.decision.type``, the
+      key llama-server itself switches on.
+    * ``None`` -- the header was read and has no such key. The
+      ``decision-model`` Hub tag is not trusted over it: most repos carrying
+      the tag are chat fine-tunes that answer in text.
+    * ``"guessed"`` -- header unread, and either the tag or an encoder
+      backbone with a classification task. Needs the operator's confirmation.
     """
-    tag_set = {str(t).strip().lower() for t in signals.tags or ()}
-    if "decision-model" in tag_set:
+    if signals.gguf_decision_type:
         return "confirmed"
+    if signals.gguf_header_read:
+        return None
+    tag_set = {str(t).strip().lower() for t in signals.tags or ()}
+    if DECISION_HUB_TAG in tag_set:
+        return "guessed"
     if (
         signals.arch in ENCODER_ARCHS
-        and signals.pipeline_tag in _CLASSIFICATION_PIPELINES
+        and signals.pipeline_tag in CLASSIFICATION_PIPELINES
         # Older cross-encoders are tagged text-classification too.
         and _reranker_confidence(signals) is None
         and _multi_vector_confidence(signals) is None
@@ -280,31 +291,38 @@ def _decision_confidence(signals: RepoSignals) -> Confidence | None:
 
 
 def _decision_verdict(
-    confidence: Confidence, *, architecture: str | None, has_gguf: bool, has_mmproj: bool
+    confidence: Confidence,
+    *,
+    architecture: str | None,
+    decision_type: str | None,
+    has_gguf: bool,
+    has_mmproj: bool,
 ) -> SupportVerdict:
     family = "decision_vl" if has_mmproj else "decision"
+    if confidence == "confirmed":
+        return SupportVerdict(
+            "supported",
+            family,
+            f"decision model ({decision_type!r} head on a {architecture!r} backbone) "
+            f"→ {family} (/v1/systemone)",
+            runtime_note=DECISION_RUNTIME_NOTE,
+        )
     if not has_gguf:
         return SupportVerdict(
             "needs_family",
             family,
-            f"decision model ({architecture!r} backbone) without a GGUF: decision "
-            "models are served by llama-server, which needs one. ggml-org publishes "
-            "conversions as ggml-org/<name>-GGUF.",
-            runtime_note=DECISION_RUNTIME_NOTE,
-        )
-    if confidence == "guessed":
-        return SupportVerdict(
-            "needs_family",
-            family,
-            f"classification encoder ({architecture!r} backbone): /v1/systemone "
-            "answers only when the GGUF carries decision metadata; confirm the "
-            "family before deploying",
+            f"possible decision model ({architecture!r} backbone) without a GGUF: "
+            "decision models are served by llama-server, which needs a GGUF with "
+            "decision metadata (ggml-org publishes them as ggml-org/<name>-GGUF). "
+            "A model that answers in text needs a chat family instead.",
             runtime_note=DECISION_RUNTIME_NOTE,
         )
     return SupportVerdict(
-        "supported",
+        "needs_family",
         family,
-        f"decision model ({architecture!r} backbone) → {family} (/v1/systemone)",
+        f"possible decision model ({architecture!r} backbone): /v1/systemone "
+        "answers only when the GGUF carries decision metadata, which could not be "
+        "checked; confirm the family before deploying",
         runtime_note=DECISION_RUNTIME_NOTE,
     )
 
@@ -401,6 +419,8 @@ def resolve_family(
     pipeline_tag: str | None = None,
     base_model: str | None = None,
     library_name: str | None = None,
+    gguf_decision_type: str | None = None,
+    gguf_header_read: bool = False,
 ) -> SupportVerdict:
     """Map a detected architecture (+ repo shape) to a family and a verdict.
 
@@ -423,6 +443,8 @@ def resolve_family(
         pipeline_tag=pipeline_tag,
         base_model=base_model,
         library_name=library_name,
+        gguf_decision_type=gguf_decision_type,
+        gguf_header_read=gguf_header_read,
     )
 
     # EmbeddingGemma 2 has optional media towers upstream, but our embeddings
@@ -478,6 +500,7 @@ def resolve_family(
         return _decision_verdict(
             decision_confidence,
             architecture=architecture,
+            decision_type=gguf_decision_type,
             has_gguf=has_gguf,
             has_mmproj=has_mmproj,
         )
