@@ -205,6 +205,8 @@ export interface StoreEntry {
   embedding?: boolean;
   /** True for reranker families (served via /v1/rerank). */
   reranker?: boolean;
+  /** True for decision-model families (served via /v1/systemone). */
+  decision?: boolean;
   /** True for analyzer (encoder) families (served by the encoder runtime). */
   analyzer?: boolean;
   /** Backends that can serve THIS model faithfully — the runtime picker source. */
@@ -244,6 +246,8 @@ export interface ModelFamily {
   /** True for reranker families — served with --reranking --embedding --pooling
    * rank, used via /v1/rerank. */
   reranker?: boolean;
+  /** True for decision-model families — llama-server /v1/systemone. */
+  decision?: boolean;
   /** True when the family answers a schema with records (GLiFormer's
    * structure() head), so it belongs in the extraction picker even when it
    * is served by the encoder runtime. */

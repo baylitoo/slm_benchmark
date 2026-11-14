@@ -8,8 +8,10 @@ import {
   enableMcpServer,
   getCodeInterpreterWorkers,
   getDeployments,
+  getStore,
   listMcpCatalog,
   selectableDeployments,
+  withoutDecisionModels,
   testMcpServer,
   type CodeInterpreterQueue,
   type McpCatalogEntry,
@@ -32,13 +34,14 @@ export function McpView({ active = true }: { active?: boolean }) {
   // default_model_profile) — a select of live chat-capable deployments so a
   // typo'd profile name is a config-time error, not a silent call_llm failure.
   const deployments = useAsync("deployments", getDeployments);
+  const store = useAsync("store", getStore);
   const chatDeployments = useMemo(
     () =>
-      selectableDeployments(deployments.data ?? [])
+      withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data)
         .filter((d) => deploymentModelType(d) === "chat")
         .map((d) => d.spec?.name)
         .filter((n): n is string => !!n),
-    [deployments.data],
+    [deployments.data, store.data],
   );
   const { toast } = useToast();
   const [busy, setBusy] = useState<string | null>(null);

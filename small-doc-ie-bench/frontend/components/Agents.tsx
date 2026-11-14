@@ -46,6 +46,7 @@ import {
   listRoutingPolicies,
   listSchemas,
   selectableDeployments,
+  withoutDecisionModels,
   testMcpServer,
   updateAgent,
   visionDeploymentNames,
@@ -683,13 +684,14 @@ export function CreateView({
   );
   // Managed deployments, segmented by semantic type — every model an agent
   // uses is a deployment the platform orchestrates, picked (not typed).
+  const store = useAsync<StoreEntry[]>("store", getStore);
   const chatDeployments = useMemo(
     () =>
-      selectableDeployments(deployments.data ?? [])
+      withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data)
         .filter((d) => deploymentModelType(d) === "chat")
         .map((d) => d.spec?.name)
         .filter((n): n is string => !!n),
-    [deployments.data],
+    [deployments.data, store.data],
   );
   const encoderDeployments = useMemo(
     () =>
@@ -704,7 +706,6 @@ export function CreateView({
   // Analyzer models SEEDED into the store but not yet deployed — offered as
   // one-click "Deploy" shortcuts (store path, no hardcoded repo, no
   // download-at-boot). Generic: whatever analyzer entries the store holds.
-  const store = useAsync<StoreEntry[]>("store", getStore);
   const seededUndeployedEncoders = useMemo(() => {
     const deployed = new Set(encoderDeployments.map((d) => d.name));
     return (store.data ?? [])

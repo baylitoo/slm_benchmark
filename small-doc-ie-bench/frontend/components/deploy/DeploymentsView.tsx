@@ -23,6 +23,7 @@ import {
   repairDeployment,
   updateDeployment,
   getDeploymentLogs,
+  decisionDeploymentNames,
   deploymentModelType,
   formatBytes,
   type DeploymentLogs,
@@ -411,8 +412,9 @@ export function DeploymentsView({
   const [page, setPage] = useState(1);
   // Segment by semantic model type (chat SLMs / encoder analyzers / embeddings / rerankers).
   const [typeFilter, setTypeFilter] = useState<
-    "all" | "chat" | "encoder" | "embedding" | "reranker"
+    "all" | "chat" | "encoder" | "embedding" | "reranker" | "decision"
   >("all");
+  const decisionNames = useMemo(() => decisionDeploymentNames(store.data), [store.data]);
   // Which row's runtime log is expanded (click a row to see WHY it failed).
   const [expanded, setExpanded] = useState<string | null>(null);
   // One in-flight lifecycle action at a time, keyed "name:action" so exactly
@@ -533,7 +535,10 @@ export function DeploymentsView({
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return all.filter((r) => {
-      if (typeFilter !== "all" && deploymentModelType(r, embeddingNames, rerankerNames) !== typeFilter)
+      if (
+        typeFilter !== "all" &&
+        deploymentModelType(r, embeddingNames, rerankerNames, decisionNames) !== typeFilter
+      )
         return false;
       if (!q) return true;
       const hay = [r.spec?.name, r.spec?.launch?.model, r.spec?.launch?.runtime, r.state]
@@ -542,7 +547,7 @@ export function DeploymentsView({
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [all, filter, typeFilter]);
+  }, [all, filter, typeFilter, embeddingNames, rerankerNames, decisionNames]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const clampedPage = Math.min(page, pageCount);
@@ -626,15 +631,17 @@ export function DeploymentsView({
     {
       key: "type",
       header: "Type",
-      sortAccessor: (r) => deploymentModelType(r, embeddingNames, rerankerNames),
+      sortAccessor: (r) => deploymentModelType(r, embeddingNames, rerankerNames, decisionNames),
       render: (r) => {
-        const t = deploymentModelType(r, embeddingNames, rerankerNames);
+        const t = deploymentModelType(r, embeddingNames, rerankerNames, decisionNames);
         return t === "encoder" ? (
           <Badge tone="info">Encoder</Badge>
         ) : t === "embedding" ? (
           <Badge tone="warn">Embedding</Badge>
         ) : t === "reranker" ? (
           <Badge tone="warn">Reranker</Badge>
+        ) : t === "decision" ? (
+          <Badge tone="info">Decision</Badge>
         ) : (
           <Badge tone="neutral">Chat</Badge>
         );
@@ -853,6 +860,7 @@ export function DeploymentsView({
             { value: "encoder", label: "Encoders" },
             { value: "embedding", label: "Embeddings" },
             { value: "reranker", label: "Rerankers" },
+            { value: "decision", label: "Decision" },
           ]}
         />
         <div className="ml-auto">
