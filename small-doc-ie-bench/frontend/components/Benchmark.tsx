@@ -19,7 +19,9 @@ import {
   getBenchmarks,
   listDatasets,
   getDeployments,
+  getStore,
   selectableDeployments,
+  withoutDecisionModels,
   listSchemas,
   listModelProfiles,
   createPipelineProfile,
@@ -98,12 +100,13 @@ export function Benchmark({ view = "run" }: { view?: string }) {
     "routing-policies",
     listRoutingPolicies,
   );
+  const store = useAsync("store", getStore);
   const modelOptions = useMemo(
     () =>
-      selectableDeployments(deployments.data ?? [])
+      withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data)
         .map((d) => d.spec?.name)
         .filter((n): n is string => !!n),
-    [deployments.data],
+    [deployments.data, store.data],
   );
 
   const [dataset, setDataset] = useState("");

@@ -40,7 +40,7 @@ logger = logging.getLogger("docie_bench.studio.usage_store")
 # identical pattern for the sibling new-table migrations.
 _USAGE_RECORD_LOCK_KEY = 0x0D0C1E0B
 
-SURFACES = ("chat", "extract", "embed", "rerank", "agent")
+SURFACES = ("chat", "extract", "embed", "rerank", "decide", "agent")
 
 # window query param -> hours of history it covers.
 WINDOW_HOURS = {"24h": 24, "7d": 7 * 24, "30d": 30 * 24}

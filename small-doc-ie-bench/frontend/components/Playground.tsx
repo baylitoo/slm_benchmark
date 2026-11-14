@@ -20,6 +20,7 @@ import {
   Paperclip,
   Pencil,
   RotateCcw,
+  Scale,
   Square,
   Wrench,
   X,
@@ -34,6 +35,8 @@ import {
   type McpRegisteredServer,
   embed,
   rerank,
+  decide,
+  decisionDeploymentNames,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
   structuringDeploymentNames,
@@ -58,6 +61,9 @@ import {
   type StoreEntry,
   type ModelFamily,
   type RerankResponse,
+  type DecisionAnswer,
+  type DecisionQuestion,
+  type DecisionResponse,
   type DynamicSchemaSummary,
   type RoutingPolicySummary,
   type AgentToolCallTrace,
@@ -92,7 +98,7 @@ import { ToolCallItem } from "./ToolCallTrace";
 import { JsonView } from "./JsonView";
 import { RoutingSummary } from "./RoutingSummary";
 
-type PlaygroundMode = "chat" | "arena" | "embedrerank";
+type PlaygroundMode = "chat" | "arena" | "embedrerank" | "decide";
 
 // Deep-link callback threaded from AppShell so first-run empty states can send
 // the user straight to Models to deploy a model. Optional everywhere: when it
@@ -127,6 +133,7 @@ export function Playground({
     () => structuringDeploymentNames(store.data, families.data),
     [store.data, families.data],
   );
+  const decisionNames = useMemo(() => decisionDeploymentNames(store.data), [store.data]);
   // Encoders AND embedding models are excluded from chat/arena: they don't
   // answer chat prompts. Embedding/reranker models live in the Embed/Rerank
   // mode instead. Vision and extraction ride the SAME deployment list — Chat
@@ -142,9 +149,11 @@ export function Playground({
           (d.spec?.launch?.runtime !== "encoder" ||
             Boolean(d.spec?.name && structuringNames.has(d.spec.name))) &&
           d.spec?.launch?.runtime !== "dense_embedding" &&
-          !(d.spec?.name && embeddingNames.has(d.spec.name)),
+          !(d.spec?.name && embeddingNames.has(d.spec.name)) &&
+          // Decision models only answer /v1/systemone (Decide mode).
+          !(d.spec?.name && decisionNames.has(d.spec.name)),
       ),
-    [deployments.data, embeddingNames, structuringNames],
+    [deployments.data, embeddingNames, structuringNames, decisionNames],
   );
 
   return (
@@ -156,7 +165,9 @@ export function Playground({
             ? "Chat, attach a file or image, or turn on extraction — one place for every synchronous request."
             : mode === "arena"
               ? "Send one prompt to two deployments side by side and compare their answers."
-              : "Compute embeddings or rerank documents with your deployed models (RAG-ready)."
+              : mode === "decide"
+                ? "Score your own options about a text with a decision model: choices, levels, yes/no."
+                : "Compute embeddings or rerank documents with your deployed models (RAG-ready)."
         }
         actions={
           <div className="inline-flex rounded-lg border border-border bg-muted p-0.5 text-sm">
@@ -165,6 +176,7 @@ export function Playground({
                 ["chat", "Chat", MessageSquare],
                 ["arena", "Arena", Swords],
                 ["embedrerank", "Embed/Rerank", Fingerprint],
+                ["decide", "Decide", Scale],
               ] as [PlaygroundMode, string, typeof Sparkles][]
             ).map(([m, label, Icon]) => (
               <button
@@ -204,6 +216,13 @@ export function Playground({
           deployments={deployments.data ?? []}
           embeddingNames={embeddingNames}
           rerankerNames={rerankerNames}
+          onNavigate={onNavigate}
+        />
+      </div>
+      <div hidden={mode !== "decide"}>
+        <DecidePanel
+          deployments={deployments.data ?? []}
+          decisionNames={decisionNames}
           onNavigate={onNavigate}
         />
       </div>
@@ -2715,6 +2734,342 @@ export function EmbedRerankPanel({
 }
 
 // ---------------------------------------------------------------------------
+// Decide mode — typed questions about a state, answered by a decision model on
+// /v1/systemone with a probability per option. Only decision deployments are
+// offered: every other model answers 501 there.
+// ---------------------------------------------------------------------------
+
+type DecisionKind = DecisionQuestion["type"];
+
+interface QuestionDraft {
+  id: string;
+  type: DecisionKind;
+  instructions: string;
+  /** choice: "option" or "option: description" per line; score: levels, lowest first. */
+  options: string;
+}
+
+const DECISION_EXAMPLE_STATE =
+  "Bonjour, j'ai été facturé deux fois pour la facture F-2026-0412 (5 400 € TTC). Merci de me rembourser rapidement, sinon je saisis mon avocat.";
+
+const DECISION_EXAMPLE_QUESTIONS: QuestionDraft[] = [
+  {
+    id: "route",
+    type: "choice",
+    instructions: "Which team should handle this?",
+    options: "billing: invoices, payments, refunds\nsupport: product questions\nlegal: disputes and legal threats",
+  },
+  { id: "urgent", type: "noul", instructions: "Does this need a human today?", options: "" },
+  {
+    id: "frustration",
+    type: "score",
+    instructions: "How frustrated is the customer?",
+    options: "calm\nmildly annoyed\nannoyed\nangry",
+  },
+];
+
+function lines(text: string): string[] {
+  return text.split("\n").map((l) => l.trim()).filter(Boolean);
+}
+
+/** The request body's `questions`, or an error naming the first bad draft. */
+export function buildDecisionQuestions(
+  drafts: QuestionDraft[],
+): Record<string, DecisionQuestion> | string {
+  const out: Record<string, DecisionQuestion> = {};
+  for (const d of drafts) {
+    const id = d.id.trim();
+    if (!id) return "Every question needs an id.";
+    if (out[id]) return `Question id "${id}" is used twice.`;
+    const instructions = d.instructions.trim() || undefined;
+    if (d.type === "choice") {
+      const criteria: Record<string, string | null> = {};
+      for (const line of lines(d.options)) {
+        const at = line.indexOf(":");
+        const option = (at >= 0 ? line.slice(0, at) : line).trim();
+        const description = at >= 0 ? line.slice(at + 1).trim() : "";
+        if (option) criteria[option] = description || null;
+      }
+      if (Object.keys(criteria).length < 2) return `"${id}" needs at least two options.`;
+      out[id] = { type: "choice", instructions, criteria };
+    } else if (d.type === "score") {
+      const levels = lines(d.options);
+      if (levels.length < 2 || levels.length > 10)
+        return `"${id}" needs 2 to 10 levels, lowest first.`;
+      out[id] = { type: "score", instructions, criteria: levels };
+    } else {
+      out[id] = { type: "noul", instructions };
+    }
+  }
+  if (Object.keys(out).length === 0) return "Add at least one question.";
+  return out;
+}
+
+/** A JSON object/array is sent as structured state; anything else as text. */
+function parseState(text: string): unknown {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return text;
+    }
+  }
+  return text;
+}
+
+function ProbabilityBars({
+  probabilities,
+  labels,
+  top,
+}: {
+  probabilities: Record<string, number>;
+  labels?: Record<string, string>;
+  top?: string;
+}) {
+  const rows = Object.entries(probabilities).sort((a, b) => b[1] - a[1]);
+  return (
+    <div className="space-y-1">
+      {rows.map(([key, p]) => (
+        <div key={key} className="flex items-center gap-2 text-xs">
+          <span
+            className={cn(
+              "w-40 shrink-0 truncate",
+              key === top ? "font-semibold text-foreground" : "text-muted-foreground",
+            )}
+            title={labels?.[key] ?? key}
+          >
+            {labels?.[key] ?? key}
+          </span>
+          <div className="h-2 flex-1 overflow-hidden rounded bg-muted">
+            <div
+              className={cn("h-full rounded", key === top ? "bg-primary" : "bg-primary/40")}
+              style={{ width: `${Math.max(0, Math.min(1, p)) * 100}%` }}
+            />
+          </div>
+          <span className="w-14 shrink-0 text-right tabular-nums">{(p * 100).toFixed(1)}%</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DecisionAnswerView({ id, answer }: { id: string; answer: DecisionAnswer }) {
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-card p-3">
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <span className="font-medium">{id}</span>
+        <Badge tone="neutral">{answer.type ?? "?"}</Badge>
+        {answer.choice != null && <Badge tone="ok">{answer.choice}</Badge>}
+        {answer.score != null && <Badge tone="ok">score {answer.score.toFixed(2)}</Badge>}
+        {answer.noul != null && (
+          <Badge tone={answer.noul >= 0.5 ? "ok" : "neutral"}>
+            yes {(answer.noul * 100).toFixed(1)}%
+          </Badge>
+        )}
+        {answer.confidence != null && (
+          <Badge tone="info">confidence {answer.confidence.toFixed(2)}</Badge>
+        )}
+      </div>
+      {answer.probabilities && (
+        <ProbabilityBars
+          probabilities={answer.probabilities}
+          labels={answer.legend}
+          top={
+            answer.choice ??
+            Object.entries(answer.probabilities).sort((a, b) => b[1] - a[1])[0]?.[0]
+          }
+        />
+      )}
+    </div>
+  );
+}
+
+// Exported for tests: rendered by Playground with its polled deployment state.
+export function DecidePanel({
+  deployments,
+  decisionNames,
+  onNavigate,
+}: {
+  deployments: DeploymentRecord[];
+  decisionNames: Set<string>;
+  onNavigate?: NavigateToDeploy;
+}) {
+  const names = useMemo(
+    () =>
+      selectableDeployments(deployments)
+        .map((d) => d.spec?.name ?? "")
+        .filter((n) => n && decisionNames.has(n)),
+    [deployments, decisionNames],
+  );
+  const [model, setModel] = useState("");
+  useEffect(() => {
+    if (names.length === 0) {
+      if (model !== "") setModel("");
+      return;
+    }
+    if (!names.includes(model)) setModel(names[0]);
+  }, [names, model]);
+
+  const [state, setState] = useState(DECISION_EXAMPLE_STATE);
+  const [drafts, setDrafts] = useState<QuestionDraft[]>(DECISION_EXAMPLE_QUESTIONS);
+  const [result, setResult] = useState<DecisionResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function update(index: number, patch: Partial<QuestionDraft>) {
+    setDrafts((prev) => prev.map((d, i) => (i === index ? { ...d, ...patch } : d)));
+  }
+
+  async function run() {
+    const questions = buildDecisionQuestions(drafts);
+    if (typeof questions === "string") {
+      setError(questions);
+      return;
+    }
+    if (!model) {
+      setError("No live decision deployment — deploy a decision model (family: decision).");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      setResult(await decide(model, parseState(state), questions));
+    } catch (e) {
+      setError(
+        e instanceof ApiError || e instanceof ApiUnavailable || e instanceof Error
+          ? e.message
+          : "Decision request failed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card
+      icon={<Scale className="h-5 w-5" />}
+      title="Decide"
+      subtitle="Ask a decision model typed questions about a text — it scores your options, it does not write."
+    >
+      <div className="space-y-4">
+        <Field
+          label="Decision deployment"
+          hint="Deploy a decision model, e.g. ggml-org/Julia-1-GGUF or ggml-org/Laya-GGUF (family 'decision')."
+        >
+          {names.length === 0 ? (
+            <EmptyModelState noun="decision" onNavigate={onNavigate} />
+          ) : (
+            <Select value={model} onChange={(e) => setModel(e.target.value)}>
+              {names.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+
+        <Field label="State" hint="Text, or a JSON object/array sent as structured state.">
+          <TextArea rows={4} value={state} onChange={(e) => setState(e.target.value)} />
+        </Field>
+
+        <div className="space-y-3">
+          {drafts.map((d, i) => (
+            <div key={i} className="space-y-2 rounded-md border border-border p-3">
+              <div className="flex flex-wrap items-end gap-2">
+                <Field label="Id">
+                  <TextInput
+                    aria-label={`Question ${i + 1} id`}
+                    value={d.id}
+                    onChange={(e) => update(i, { id: e.target.value })}
+                  />
+                </Field>
+                <Field label="Type">
+                  <Select
+                    aria-label={`Question ${i + 1} type`}
+                    value={d.type}
+                    onChange={(e) => update(i, { type: e.target.value as DecisionKind })}
+                  >
+                    <option value="choice">choice</option>
+                    <option value="score">score</option>
+                    <option value="noul">yes / no</option>
+                  </Select>
+                </Field>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  aria-label={`Remove question ${i + 1}`}
+                  onClick={() => setDrafts((prev) => prev.filter((_, j) => j !== i))}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+              <Field label="Question">
+                <TextInput
+                  value={d.instructions}
+                  onChange={(e) => update(i, { instructions: e.target.value })}
+                />
+              </Field>
+              {d.type !== "noul" && (
+                <Field
+                  label={d.type === "choice" ? "Options" : "Levels"}
+                  hint={
+                    d.type === "choice"
+                      ? "One per line: option, or option: description."
+                      : "2 to 10 levels, one per line, lowest first."
+                  }
+                >
+                  <TextArea
+                    rows={3}
+                    value={d.options}
+                    onChange={(e) => update(i, { options: e.target.value })}
+                  />
+                </Field>
+              )}
+            </div>
+          ))}
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            onClick={() =>
+              setDrafts((prev) => [
+                ...prev,
+                { id: `q${prev.length + 1}`, type: "noul", instructions: "", options: "" },
+              ])
+            }
+          >
+            Add question
+          </Button>
+        </div>
+
+        {error && <Alert tone="err">{error}</Alert>}
+
+        <Button type="button" loading={busy} onClick={() => void run()} disabled={!model}>
+          <Scale className="h-4 w-4" />
+          Decide
+        </Button>
+
+        {result?.answers && (
+          <div className="space-y-2 rounded-md border border-border bg-muted/20 p-4">
+            {Object.entries(result.answers).map(([id, answer]) => (
+              <DecisionAnswerView key={id} id={id} answer={answer} />
+            ))}
+            {result.usage?.input_tokens != null && (
+              <p className="text-xs text-muted-foreground">
+                {result.usage.input_tokens} input tokens · no text generated
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Deployment selector — a dropdown of routable deployments: live ones plus
 // evicted/loading `managed` ones (a request auto-reloads those; PR-4). Falls
 // back to clear, non-crashing states for loading / unavailable / empty.
@@ -2728,7 +3083,7 @@ function EmptyModelState({
   noun,
   onNavigate,
 }: {
-  noun: "chat" | "embedding" | "reranker";
+  noun: "chat" | "embedding" | "reranker" | "decision";
   onNavigate?: NavigateToDeploy;
 }) {
   const { t } = useI18n();
