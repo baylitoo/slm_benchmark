@@ -107,19 +107,28 @@ def save_evaluation(
     run_id: str,
     evaluator: str,
     agent: str,
+    tenant_id: str,
     verdicts: list[dict[str, Any]],
     review_reasons: list[str],
     now: dt.datetime | None = None,
 ) -> None:
+    """One row per (run, evaluator): a retried step replaces, never duplicates."""
     created = now or utcnow()
     with session_scope() as session:
         if session is None:
             return
+        session.execute(
+            delete(EvaluationResultRecord).where(
+                EvaluationResultRecord.run_id == run_id,
+                EvaluationResultRecord.evaluator == evaluator,
+            )
+        )
         session.add(
             EvaluationResultRecord(
                 run_id=run_id,
                 evaluator=evaluator,
                 agent=agent,
+                tenant_id=tenant_id,
                 verdicts_json=verdicts,
                 review_reasons_json=review_reasons,
                 created_at=created,
@@ -128,16 +137,22 @@ def save_evaluation(
         )
 
 
-def list_evaluations(evaluator: str, *, limit: int = 100) -> list[dict[str, Any]]:
-    """An evaluator's most recent results, newest first."""
+def list_evaluations(
+    evaluator: str, *, tenant_id: str | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
+    """An evaluator's most recent results, newest first; one tenant's when given."""
     with session_scope() as session:
         if session is None:
             return []
+        statement = select(EvaluationResultRecord).where(
+            EvaluationResultRecord.evaluator == evaluator
+        )
+        if tenant_id is not None:
+            statement = statement.where(EvaluationResultRecord.tenant_id == tenant_id)
         rows = session.execute(
-            select(EvaluationResultRecord)
-            .where(EvaluationResultRecord.evaluator == evaluator)
-            .order_by(EvaluationResultRecord.created_at.desc(), EvaluationResultRecord.id.desc())
-            .limit(limit)
+            statement.order_by(
+                EvaluationResultRecord.created_at.desc(), EvaluationResultRecord.id.desc()
+            ).limit(limit)
         ).scalars()
         return [
             {

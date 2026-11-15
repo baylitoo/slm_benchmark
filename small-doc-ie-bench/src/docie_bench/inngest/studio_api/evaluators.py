@@ -7,10 +7,25 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 from docie_bench.evaluators.spec import EvaluatorSpec
+from docie_bench.security import TenantContext, TenantDependency
 
 from . import _shared
 
 router = APIRouter()
+
+
+def _sees_all(tenant: TenantContext) -> bool:
+    """Operators, signed-in Studio users and an auth-disabled stack see every
+    tenant's runs. A Studio-issued client key sees its own tenant only."""
+    return tenant.operator or tenant.studio_user or not tenant.authenticated
+
+
+def _require_manager(tenant: TenantContext) -> None:
+    if not _sees_all(tenant):
+        raise HTTPException(
+            status_code=403,
+            detail="managing evaluators needs an operator key or a Studio sign-in",
+        )
 
 
 def _check_agents(spec: EvaluatorSpec) -> None:
@@ -49,18 +64,27 @@ async def evaluator_templates_route() -> dict[str, Any]:
 
 
 @router.get("/evaluators/{name}/results")
-async def evaluator_results_route(name: str, limit: int = 100) -> list[dict[str, Any]]:
+async def evaluator_results_route(
+    name: str, tenant: TenantDependency, limit: int = 100
+) -> list[dict[str, Any]]:
     from docie_bench.studio.agent_run_store import list_evaluations
 
-    return list_evaluations(name, limit=max(1, min(limit, 500)))
+    return list_evaluations(
+        name,
+        tenant_id=None if _sees_all(tenant) else tenant.tenant_id,
+        limit=max(1, min(limit, 500)),
+    )
 
 
 @router.get("/agent-runs/{run_id}")
-async def agent_run_route(run_id: str) -> dict[str, Any]:
-    """A stored run, for the review view. 404 once it has expired."""
+async def agent_run_route(run_id: str, tenant: TenantDependency) -> dict[str, Any]:
+    """A stored run, for the review view. 404 once expired, and for a client
+    key asking about another tenant's run."""
     from docie_bench.studio.agent_run_store import get_agent_run
 
     run = get_agent_run(run_id)
+    if run is not None and not _sees_all(tenant) and run["tenant_id"] != tenant.tenant_id:
+        run = None
     if run is None:
         raise HTTPException(
             status_code=404,
@@ -83,13 +107,16 @@ async def get_evaluator_route(name: str) -> dict[str, Any]:
 
 
 @router.post("/evaluators", status_code=201)
-async def create_evaluator_route(spec: EvaluatorSpec) -> dict[str, Any]:
+async def create_evaluator_route(
+    spec: EvaluatorSpec, tenant: TenantDependency
+) -> dict[str, Any]:
     from docie_bench.studio.evaluator_store import (
         EvaluatorConflictError,
         EvaluatorUnavailableError,
         create_evaluator,
     )
 
+    _require_manager(tenant)
     _check_agents(spec)
     try:
         return create_evaluator(spec)
@@ -100,7 +127,9 @@ async def create_evaluator_route(spec: EvaluatorSpec) -> dict[str, Any]:
 
 
 @router.put("/evaluators/{name}")
-async def update_evaluator_route(name: str, spec: EvaluatorSpec) -> dict[str, Any]:
+async def update_evaluator_route(
+    name: str, spec: EvaluatorSpec, tenant: TenantDependency
+) -> dict[str, Any]:
     from docie_bench.studio.evaluator_store import (
         EvaluatorNotFoundError,
         EvaluatorStoreError,
@@ -108,6 +137,7 @@ async def update_evaluator_route(name: str, spec: EvaluatorSpec) -> dict[str, An
         update_evaluator,
     )
 
+    _require_manager(tenant)
     _check_agents(spec)
     try:
         return update_evaluator(name, spec)
@@ -120,13 +150,14 @@ async def update_evaluator_route(name: str, spec: EvaluatorSpec) -> dict[str, An
 
 
 @router.delete("/evaluators/{name}")
-async def delete_evaluator_route(name: str) -> dict[str, Any]:
+async def delete_evaluator_route(name: str, tenant: TenantDependency) -> dict[str, Any]:
     from docie_bench.studio.evaluator_store import (
         EvaluatorNotFoundError,
         EvaluatorUnavailableError,
         delete_evaluator,
     )
 
+    _require_manager(tenant)
     try:
         delete_evaluator(name)
     except EvaluatorNotFoundError as exc:

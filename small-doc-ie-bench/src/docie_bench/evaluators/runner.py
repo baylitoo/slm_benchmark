@@ -59,6 +59,7 @@ async def evaluate_run(
             run_id=run_id,
             evaluator=spec.name,
             agent=run["agent"],
+            tenant_id=run["tenant_id"],
             verdicts=rows,
             review_reasons=reasons,
         )
@@ -120,4 +121,14 @@ async def _judge(
         ),
         metadata={"agent": run["agent"]},
     )
-    return await spec.build_judge(profile).judge(subject, client=client)
+    verdicts = await spec.build_judge(profile).judge(subject, client=client)
+    if any(v.ok for v in verdicts):
+        # A judge call is traffic: without the stamp a deployment that only
+        # judges looks idle to the autoloader and gets evicted.
+        try:
+            from docie_bench.serving import recency
+
+            recency.stamp_served_profile(profile.name)
+        except Exception:
+            logger.warning("recency stamp failed for %s", profile.name, exc_info=True)
+    return verdicts

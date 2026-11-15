@@ -171,9 +171,45 @@ def test_templates_results_and_runs_routes(client: TestClient) -> None:
     )
     save_evaluation(
         run_id=str(run_id), evaluator="task-completion", agent="billing-bot",
-        verdicts=[{"question_id": "completed", "noul": 0.9}], review_reasons=[],
+        tenant_id="acme", verdicts=[{"question_id": "completed", "noul": 0.9}],
+        review_reasons=[],
     )
     results = client.get("/v1/studio/evaluators/task-completion/results").json()
     assert results[0]["run_id"] == run_id
     assert client.get(f"/v1/studio/agent-runs/{run_id}").json()["output"] == "hello"
     assert client.get("/v1/studio/agent-runs/unknown").status_code == 404
+
+
+def _as_client_key(tenant_id: str):
+    from docie_bench.security import TenantContext, tenant_guard
+
+    api.app.dependency_overrides[tenant_guard] = lambda: TenantContext(
+        tenant_id=tenant_id, authenticated=True
+    )
+
+
+def test_a_client_key_sees_only_its_tenant_and_cannot_manage(client: TestClient) -> None:
+    from docie_bench.studio.agent_run_store import save_agent_run, save_evaluation
+
+    client.post("/v1/studio/evaluators", json=_spec())
+    run_id = save_agent_run(
+        agent="billing-bot", tenant_id="acme", api_key_id=None,
+        messages=[], output_text="hello", tool_calls=[], evaluators=["task-completion"],
+    )
+    for tenant in ("acme", "acme"):  # saved twice: a retried step must not duplicate
+        save_evaluation(
+            run_id=str(run_id), evaluator="task-completion", agent="billing-bot",
+            tenant_id=tenant, verdicts=[], review_reasons=[],
+        )
+    try:
+        _as_client_key("globex")
+        assert client.get(f"/v1/studio/agent-runs/{run_id}").status_code == 404
+        assert client.get("/v1/studio/evaluators/task-completion/results").json() == []
+        assert client.post("/v1/studio/evaluators", json=_spec(name="other")).status_code == 403
+        assert client.delete("/v1/studio/evaluators/task-completion").status_code == 403
+
+        _as_client_key("acme")
+        assert client.get(f"/v1/studio/agent-runs/{run_id}").status_code == 200
+        assert len(client.get("/v1/studio/evaluators/task-completion/results").json()) == 1
+    finally:
+        api.app.dependency_overrides.clear()

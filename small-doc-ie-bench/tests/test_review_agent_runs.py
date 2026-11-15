@@ -122,3 +122,16 @@ def test_the_kind_column_is_added_to_an_existing_table(tmp_path: Path) -> None:
     with engine.connect() as connection:
         assert connection.execute(sa_text("SELECT kind FROM review_task")).scalar() == "extraction"
     assert ensure_review_task_kind_column(engine) is False
+
+
+def test_the_review_api_defaults_to_documents() -> None:
+    from fastapi.testclient import TestClient
+
+    from docie_bench import api
+
+    _agent_review()
+    _extraction_review()
+    client = TestClient(api.app)
+    assert [t["kind"] for t in client.get("/v1/reviews").json()] == ["extraction"]
+    assert [t["kind"] for t in client.get("/v1/reviews?kind=agent_run").json()] == ["agent_run"]
+    assert len(client.get("/v1/reviews?kind=all").json()) == 2

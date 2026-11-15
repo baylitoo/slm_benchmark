@@ -1,15 +1,24 @@
-"""Keep an agent run for evaluation and announce it, without ever failing the request."""
+"""Keep an agent run for evaluation and announce it, without ever failing or
+delaying the request."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from docie_bench.evaluators.judges import _text_of
+
 logger = logging.getLogger("docie_bench.evaluators.capture")
 
 AGENT_RUN_EVENT = "agent/run.completed"
+# Per message and for the answer. Images, files and audio parts are never
+# kept: only the text a judge reads.
+MAX_STORED_CHARS = 20_000
+
+_pending: set[asyncio.Task[Any]] = set()
 
 
 def completion_text(completion: Mapping[str, Any]) -> str:
@@ -30,6 +39,17 @@ def completion_tool_calls(completion: Mapping[str, Any]) -> list[dict[str, Any]]
         for c in calls or []
         if isinstance(c, dict)
     ]
+
+
+def text_messages(body: Mapping[str, Any]) -> list[dict[str, str]]:
+    """The request's messages reduced to role + capped text."""
+    out = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, Mapping):
+            continue
+        text = _text_of(message.get("content"))[:MAX_STORED_CHARS]
+        out.append({"role": str(message.get("role") or ""), "content": text})
+    return out
 
 
 async def _emit(run_id: str, evaluators: list[str]) -> None:
@@ -67,15 +87,12 @@ async def capture_agent_run(
         sampled = [e.name for e in evaluators_for_agent(agent) if rng() < e.sample_rate]
         if not sampled:
             return None
-        messages = [
-            dict(m) for m in body.get("messages") or [] if isinstance(m, Mapping)
-        ]
         run_id = save_agent_run(
             agent=agent,
             tenant_id=tenant_id,
             api_key_id=api_key_id,
-            messages=messages,
-            output_text=output,
+            messages=text_messages(body),
+            output_text=output[:MAX_STORED_CHARS],
             tool_calls=[dict(c) for c in tool_calls],
             evaluators=sampled,
         )
@@ -86,3 +103,18 @@ async def capture_agent_run(
     except Exception:
         logger.warning("agent run capture failed for %s", agent, exc_info=True)
         return None
+
+
+def schedule_capture(**kwargs: Any) -> None:
+    """Run ``capture_agent_run`` off the response path.
+
+    The database lookup, the insert and the event send must not delay the
+    agent's answer, nor make it wait on an unreachable queue.
+    """
+    try:
+        task = asyncio.get_running_loop().create_task(capture_agent_run(**kwargs))
+    except RuntimeError:
+        logger.warning("agent run capture skipped: no running event loop")
+        return
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)

@@ -475,6 +475,7 @@ class EvaluationResultRecord(Base):
     run_id: Mapped[str] = mapped_column(String(36), index=True)
     evaluator: Mapped[str] = mapped_column(String(64), index=True)
     agent: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
     verdicts_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     review_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     created_at: Mapped[dt.datetime] = mapped_column(

@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 import inngest
 
+from docie_bench.evaluators.capture import AGENT_RUN_EVENT
 from docie_bench.extract.routing import RoutingPolicy, RoutingResult, live_routing_audit
 from docie_bench.extract.service import ExtractionService, hash_bytes
 from docie_bench.inngest.client import inngest_client, serving_client
@@ -480,6 +481,7 @@ async def _ensure_deployment_live(
     *,
     step_budget_s: float = _AUTOLOAD_STEP_BUDGET_S,
     poll_interval_s: float = _AUTOLOAD_POLL_INTERVAL_S,
+    step_prefix: str = "",
 ) -> str | None:
     """Durable cold-start-on-demand orchestration for ``extract_document``.
 
@@ -498,14 +500,16 @@ async def _ensure_deployment_live(
       ceiling while the durable graph still carries the full size-aware
       budget. Raises ``TimeoutError`` only after the whole budget.
     """
-    plan = await step.run("plan-autoload", lambda: _autoload_target(data))
+    # step_prefix keeps step ids unique when one function warms several
+    # deployments (agent-run-evaluate, one per judge model).
+    plan = await step.run(f"{step_prefix}plan-autoload", lambda: _autoload_target(data))
     if plan is None:
         return None
     # step.run memoization JSON-round-trips the tuple into a list.
     target, budget_s = str(plan[0]), float(plan[1])
     await publish(channel, TOPIC_STATUS, {"state": "loading", "deployment": target})
     await step.send_event(
-        "request-load",
+        f"{step_prefix}request-load",
         inngest.Event(name=LOAD_EVENT, data={"name": target}),
     )
     remaining = budget_s
@@ -514,7 +518,7 @@ async def _ensure_deployment_live(
     while remaining > 0:
         chunk = min(step_budget_s, remaining)
         last = await step.run(
-            f"await-deployment-ready:{index}",
+            f"{step_prefix}await-deployment-ready:{index}",
             lambda chunk=chunk: _poll_deployment_live(
                 target, timeout_s=chunk, interval_s=poll_interval_s
             ),
@@ -2309,6 +2313,18 @@ def _gc_studio_runs_sync() -> dict[str, int]:
     return summary
 
 
+def _judge_models(names: list[str]) -> list[str]:
+    """Distinct judge models of the enabled evaluators among ``names``."""
+    from docie_bench.studio.evaluator_store import get_evaluator
+
+    models: list[str] = []
+    for name in names:
+        spec = get_evaluator(name)
+        if spec is not None and spec.enabled and spec.model not in models:
+            models.append(spec.model)
+    return models
+
+
 def _gc_agent_runs_sync() -> dict[str, int]:
     """Delete agent runs (and their evaluation results) past retention."""
     from docie_bench.studio.agent_run_store import purge_expired_runs
@@ -2352,7 +2368,7 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
 
 @inngest_client.create_function(
     fn_id="agent-run-evaluate",
-    trigger=inngest.TriggerEvent(event="agent/run.completed"),
+    trigger=inngest.TriggerEvent(event=AGENT_RUN_EVENT),
     # Judges share deployments with live traffic (one slot by default), so a
     # burst of finished runs is scored a couple at a time, never all at once.
     concurrency=[inngest.Concurrency(limit=2)],
@@ -2372,6 +2388,23 @@ async def evaluate_agent_run_job(ctx: inngest.Context) -> dict[str, Any]:
     names = [str(n) for n in raw] if isinstance(raw, list) else []
     if not run_id or not names:
         return {"run_id": run_id, "status": "nothing_to_evaluate"}
+
+    # A judge model evicted since the run happened is loaded and waited
+    # for, like a cold extraction model, instead of failing every verdict.
+    async def _plan() -> list[str]:
+        return _judge_models(names)
+
+    models: list[str] = await ctx.step.run("plan-judge-models", _plan)
+    for model in models:
+        try:
+            await _ensure_deployment_live(
+                ctx.step,
+                {"model_profile": model},
+                f"agent-run:{run_id}",
+                step_prefix=f"{model}:",
+            )
+        except TimeoutError:
+            logger.warning("judge model %s did not load; its verdicts will fail", model)
 
     async def _evaluate() -> dict[str, Any]:
         async with httpx.AsyncClient() as client:

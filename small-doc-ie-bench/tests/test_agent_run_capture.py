@@ -163,20 +163,23 @@ def agent_api(tmp_path: Path, monkeypatch):
 
     captured: list[dict] = []
 
-    async def fake_capture(**kwargs) -> None:
-        captured.append(kwargs)
+    monkeypatch.setattr(
+        "docie_bench.agents.api.schedule_capture", lambda **kw: captured.append(kw)
+    )
 
-    monkeypatch.setattr("docie_bench.agents.api.capture_agent_run", fake_capture)
-
-    async def chunks() -> AsyncIterator[bytes]:
+    async def chunks(abort: bool) -> AsyncIterator[bytes]:
         for piece in ("5 400", " €"):
             yield f'data: {{"choices":[{{"delta":{{"content":"{piece}"}}}}]}}\n\n'.encode()
+            if abort:
+                raise httpx.ReadError("upstream dropped")
         yield b"data: [DONE]\n\n"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if json.loads(request.content).get("stream"):
+        body = json.loads(request.content)
+        if body.get("stream"):
+            abort = "abort" in body["messages"][-1]["content"]
             return httpx.Response(
-                200, headers={"content-type": "text/event-stream"}, content=chunks()
+                200, headers={"content-type": "text/event-stream"}, content=chunks(abort)
             )
         return httpx.Response(
             200, json={"choices": [{"message": {"role": "assistant", "content": "5 400 €"}}]}
@@ -202,3 +205,43 @@ def test_the_agent_api_hands_the_finished_run_to_capture(agent_api, stream) -> N
     assert captured[0]["agent"] == "billing-bot"
     assert captured[0]["output"] == "5 400 €"
     assert captured[0]["body"]["messages"][0]["content"] == "Total of F-12?"
+
+
+def test_an_aborted_stream_is_not_captured(agent_api) -> None:
+    import httpx
+
+    client, captured = agent_api
+
+    def post() -> bytes:
+        return client.post(
+            "/v1/agents/chat/completions",
+            json={
+                "model": "billing-bot",
+                "stream": True,
+                "messages": [{"role": "user", "content": "abort please"}],
+            },
+        ).content
+
+    with pytest.raises(httpx.ReadError):
+        post()
+    assert captured == []
+
+
+def test_only_capped_text_is_kept_from_messages() -> None:
+    from docie_bench.evaluators.capture import text_messages
+
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Read this invoice"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            },
+            {"role": "user", "content": "x" * 50_000},
+        ]
+    }
+    kept = text_messages(body)
+    assert kept[0] == {"role": "user", "content": "Read this invoice"}
+    assert len(kept[1]["content"]) == 20_000
