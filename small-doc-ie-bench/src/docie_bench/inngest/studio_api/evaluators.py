@@ -41,6 +41,35 @@ async def list_evaluators_route() -> list[dict[str, Any]]:
     return list_evaluators()
 
 
+@router.get("/evaluators/templates")
+async def evaluator_templates_route() -> dict[str, Any]:
+    from docie_bench.evaluators.templates import CATEGORIES, TEMPLATES
+
+    return {"categories": CATEGORIES, "templates": TEMPLATES}
+
+
+@router.get("/evaluators/{name}/results")
+async def evaluator_results_route(name: str, limit: int = 100) -> list[dict[str, Any]]:
+    from docie_bench.studio.agent_run_store import list_evaluations
+
+    return list_evaluations(name, limit=max(1, min(limit, 500)))
+
+
+@router.get("/agent-runs/{run_id}")
+async def agent_run_route(run_id: str) -> dict[str, Any]:
+    """A stored run, for the review view. 404 once it has expired."""
+    from docie_bench.studio.agent_run_store import get_agent_run
+
+    run = get_agent_run(run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"agent run {run_id!r} not found or expired",
+            headers=_shared._DOMAIN_404,
+        )
+    return run
+
+
 @router.get("/evaluators/{name}")
 async def get_evaluator_route(name: str) -> dict[str, Any]:
     from docie_bench.studio.evaluator_store import get_evaluator

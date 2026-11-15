@@ -144,3 +144,36 @@ def test_an_evaluator_cannot_be_renamed(client: TestClient) -> None:
     client.post("/v1/studio/evaluators", json=_spec())
     renamed = client.put("/v1/studio/evaluators/task-completion", json=_spec(name="other"))
     assert renamed.status_code == 422
+
+
+def test_every_template_becomes_a_valid_evaluator() -> None:
+    from docie_bench.evaluators.templates import CATEGORIES, TEMPLATES
+
+    category_ids = {c["id"] for c in CATEGORIES}
+    for template in TEMPLATES:
+        assert template["category"] in category_ids
+        if not template["questions"]:
+            continue  # the from-scratch templates start empty on purpose
+        fields = {k: template[k] for k in ("judge", "questions", "review_when")}
+        EvaluatorSpec.model_validate({**fields, "name": template["id"], "model": "m"})
+
+
+def test_templates_results_and_runs_routes(client: TestClient) -> None:
+    from docie_bench.studio.agent_run_store import save_agent_run, save_evaluation
+
+    templates = client.get("/v1/studio/evaluators/templates").json()
+    assert templates["templates"][0]["id"] == "task-completion"
+
+    run_id = save_agent_run(
+        agent="billing-bot", tenant_id="acme", api_key_id=None,
+        messages=[{"role": "user", "content": "hi"}], output_text="hello",
+        tool_calls=[], evaluators=["task-completion"],
+    )
+    save_evaluation(
+        run_id=str(run_id), evaluator="task-completion", agent="billing-bot",
+        verdicts=[{"question_id": "completed", "noul": 0.9}], review_reasons=[],
+    )
+    results = client.get("/v1/studio/evaluators/task-completion/results").json()
+    assert results[0]["run_id"] == run_id
+    assert client.get(f"/v1/studio/agent-runs/{run_id}").json()["output"] == "hello"
+    assert client.get("/v1/studio/agent-runs/unknown").status_code == 404
