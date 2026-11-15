@@ -441,7 +441,32 @@ class EvaluatorRecord(Base):
     )
 
 
+class AgentRunRecord(Base):
+    """One agent run kept for evaluation: what was asked and what came back.
+
+    Written only for an agent that an enabled evaluator targets, never for a
+    proxy_security agent, and deleted after ``expires_at``. Conversation text
+    is stored nowhere else: the usage ledger keeps counts and tool names only.
+    """
+
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    api_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    messages_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    output_text: Mapped[str] = mapped_column(Text)
+    tool_calls_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    evaluators_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 __all__ = [
+    "AgentRunRecord",
     "EvaluatorRecord",
     "BatchItem",
     "BatchRun",

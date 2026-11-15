@@ -358,9 +358,11 @@ def init_engine(database_url: str | None = None) -> None:
 
     ensure_routing_policy_table(_engine)
     # Same race again: evaluators is new (saved agent-run evaluators).
+    from docie_bench.studio.agent_run_store import ensure_agent_run_table
     from docie_bench.studio.evaluator_store import ensure_evaluator_table
 
     ensure_evaluator_table(_engine)
+    ensure_agent_run_table(_engine)
     # Same race again: seed_runs is also new (durable index for Ollama/HF
     # seed-download jobs, alongside dynamic_schemas/routing_policies above).
     from docie_bench.studio.seed_store import ensure_seed_run_table
