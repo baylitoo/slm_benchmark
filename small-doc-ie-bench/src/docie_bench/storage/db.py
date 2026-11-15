@@ -90,6 +90,11 @@ class ReviewTask(Base):
     model_profile: Mapped[str] = mapped_column(String(128), index=True)
     document_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), index=True, default="pending")
+    # "extraction" (a document's fields) or "agent_run" (an evaluator flagged
+    # an agent run). Only extraction tasks carry fields to correct and export.
+    kind: Mapped[str] = mapped_column(
+        String(16), default="extraction", server_default="extraction"
+    )
     priority: Mapped[float] = mapped_column(Float, index=True)
     priority_reasons_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     original_prediction_json: Mapped[dict[str, Any]] = mapped_column(JSON)
@@ -248,6 +253,42 @@ def ensure_review_task_validation_warnings_column(engine: Engine) -> bool:
     return added
 
 
+def ensure_review_task_kind_column(engine: Engine) -> bool:
+    """Forward migration: add ``review_task.kind``, defaulting existing rows to
+    "extraction". Same locking and sqlite fallback as the column above."""
+    inspector = sa_inspect(engine)
+    if not inspector.has_table("review_task"):
+        return False
+    ddl = "VARCHAR(16) NOT NULL DEFAULT 'extraction'"
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                sa_text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _REVIEW_TASK_MIGRATION_LOCK_KEY},
+            )
+            existing = {
+                row[0]
+                for row in connection.execute(
+                    sa_text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'review_task'"
+                    )
+                )
+            }
+            connection.execute(
+                sa_text(f"ALTER TABLE review_task ADD COLUMN IF NOT EXISTS kind {ddl}")
+            )
+            added = "kind" not in existing
+        else:
+            existing = {column["name"] for column in inspector.get_columns("review_task")}
+            added = "kind" not in existing
+            if added:
+                connection.execute(sa_text(f"ALTER TABLE review_task ADD COLUMN kind {ddl}"))
+    if added:
+        logger.info("review_task migration: added kind")
+    return added
+
+
 _REVIEW_EVIDENCE_LOCK_KEY = 0x0D0C1E09
 _SCHEMA_INIT_LOCK_KEY = 0x0D0C1E00
 
@@ -329,6 +370,7 @@ def init_engine(database_url: str | None = None) -> None:
     # arithmetic-reconciliation warning enrichment): a pre-existing table needs
     # it added explicitly, create_all only completes brand-new tables.
     ensure_review_task_validation_warnings_column(_engine)
+    ensure_review_task_kind_column(_engine)
     # review_evidence is a NEW table (evidence-aware Review workspace), same
     # concurrent-init_engine race as the other new tables below.
     ensure_review_evidence_table(_engine)
