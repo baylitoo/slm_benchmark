@@ -21,9 +21,13 @@ from docie_bench.evaluators.judges import (
     Verdict,
     render_transcript,
 )
+from docie_bench.evaluators.spec import EvaluatorSpec, QuestionSpec, ReviewRule
 
 __all__ = [
     "DecisionJudge",
+    "EvaluatorSpec",
+    "QuestionSpec",
+    "ReviewRule",
     "EvalSubject",
     "Judge",
     "JudgeQuestion",

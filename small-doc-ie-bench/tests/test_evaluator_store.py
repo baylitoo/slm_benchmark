@@ -1,0 +1,146 @@
+"""Evaluator specs, their review rules, and the /v1/studio/evaluators routes."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+import docie_bench.api as api
+from docie_bench.agents.registry import AgentRegistry
+from docie_bench.agents.spec import AgentSpec
+from docie_bench.evaluators import EvaluatorSpec, Verdict
+from docie_bench.storage.db import dispose_engine, init_engine
+from docie_bench.studio.evaluator_store import evaluators_for_agent
+
+
+def _spec(**overrides) -> dict:
+    spec = {
+        "name": "task-completion",
+        "judge": "decision",
+        "model": "laya-q8_0",
+        "questions": [
+            {"id": "completed", "type": "noul", "instructions": "Was the request fully done?"},
+            {
+                "id": "intent",
+                "type": "choice",
+                "instructions": "What did the user want?",
+                "criteria": {"invoice": None, "other": None},
+            },
+            {
+                "id": "tone",
+                "type": "score",
+                "instructions": "Tone?",
+                "criteria": ["poor", "ok", "good"],
+            },
+        ],
+        "agents": ["billing-bot"],
+        "review_when": [{"question": "completed", "when": "noul_below", "value": 0.5}],
+    }
+    spec.update(overrides)
+    return spec
+
+
+def _verdict(qid: str, qtype: str, **fields) -> Verdict:
+    return Verdict("task-completion", qid, qtype, "measured", **fields)  # type: ignore[arg-type]
+
+
+def test_review_rules_fire_on_their_question_only() -> None:
+    spec = EvaluatorSpec.model_validate(
+        _spec(
+            review_when=[
+                {"question": "completed", "when": "noul_below", "value": 0.5},
+                {"question": "intent", "when": "choice_in", "value": ["other"]},
+                {"question": "tone", "when": "score_below", "value": 1.0},
+            ]
+        )
+    )
+    verdicts = [
+        _verdict("completed", "noul", noul=0.2),
+        _verdict("intent", "choice", choice="invoice"),
+        _verdict("tone", "score", score=0.4),
+    ]
+    assert spec.review_reasons(verdicts) == ["completed: 0.20 < 0.5", "tone: 0.40 < 1.0"]
+    passing = [_verdict("completed", "noul", noul=0.9), _verdict("tone", "score", score=1.8)]
+    assert spec.review_reasons(passing) == []
+
+
+def test_failed_judgements_go_to_review_only_when_asked() -> None:
+    failed = [_verdict("completed", "noul", error="unreachable")]
+    assert EvaluatorSpec.model_validate(_spec()).review_reasons(failed) == []
+    on_error = EvaluatorSpec.model_validate(_spec(review_on_error=True))
+    assert on_error.review_reasons(failed) == ["completed: judge failed (unreachable)"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"review_when": [{"question": "ghost", "when": "noul_below", "value": 0.5}]}, "unknown"),
+        ({"review_when": [{"question": "tone", "when": "noul_below", "value": 0.5}]}, "score"),
+        (
+            {
+                "questions": [
+                    {"id": "q", "type": "choice", "instructions": "x", "criteria": {"a": None}}
+                ],
+                "review_when": [],
+            },
+            "two options",
+        ),
+        (
+            {"questions": [{"id": "q", "type": "score", "instructions": "x", "criteria": ["a"]}],
+             "review_when": []},
+            "2 to 10",
+        ),
+        ({"name": "Has Spaces"}, "pattern"),
+    ],
+)
+def test_invalid_specs_are_rejected(overrides, message) -> None:
+    with pytest.raises(ValidationError, match=message):
+        EvaluatorSpec.model_validate(_spec(**overrides))
+
+
+@pytest.fixture
+def client(tmp_path: Path, monkeypatch) -> TestClient:
+    init_engine(f"sqlite:///{tmp_path / 'evaluators.db'}")
+    agents = tmp_path / "agents.json"
+    monkeypatch.setenv("DOCIE_AGENTS_PATH", str(agents))
+    registry = AgentRegistry(agents)
+    registry.create(AgentSpec(name="billing-bot", kind="custom", model_profile="lfm2.5-1.2b"))
+    registry.create(
+        AgentSpec.model_validate(
+            {"name": "pii-proxy", "kind": "proxy_security", "model_profile": "lfm2.5-1.2b"}
+        )
+    )
+    yield TestClient(api.app)
+    dispose_engine()
+
+
+def test_crud_round_trip_and_agent_lookup(client: TestClient) -> None:
+    assert client.post("/v1/studio/evaluators", json=_spec()).status_code == 201
+    assert client.post("/v1/studio/evaluators", json=_spec()).status_code == 409
+    assert [e["name"] for e in client.get("/v1/studio/evaluators").json()] == ["task-completion"]
+    assert [s.name for s in evaluators_for_agent("billing-bot")] == ["task-completion"]
+    assert evaluators_for_agent("other-agent") == []
+
+    disabled = client.put("/v1/studio/evaluators/task-completion", json=_spec(enabled=False))
+    assert disabled.status_code == 200
+    assert evaluators_for_agent("billing-bot") == []
+
+    assert client.delete("/v1/studio/evaluators/task-completion").status_code == 200
+    assert client.get("/v1/studio/evaluators/task-completion").status_code == 404
+
+
+def test_targets_must_be_existing_non_proxy_agents(client: TestClient) -> None:
+    unknown = client.post("/v1/studio/evaluators", json=_spec(agents=["ghost"]))
+    assert unknown.status_code == 422
+    proxy = client.post("/v1/studio/evaluators", json=_spec(agents=["pii-proxy"]))
+    assert proxy.status_code == 422
+    assert "never stored" in proxy.json()["detail"]
+
+
+def test_an_evaluator_cannot_be_renamed(client: TestClient) -> None:
+    client.post("/v1/studio/evaluators", json=_spec())
+    renamed = client.put("/v1/studio/evaluators/task-completion", json=_spec(name="other"))
+    assert renamed.status_code == 422
