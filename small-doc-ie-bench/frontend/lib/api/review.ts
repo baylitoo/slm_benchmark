@@ -22,7 +22,9 @@ export interface ReviewReason {
     | "arithmetic_mismatch"
     | "model_disagreement"
     | "learning_value"
-    | "manual";
+    | "routing_escalated"
+    | "manual"
+    | "evaluator";
   score: number;
   detail: string;
 }
@@ -56,6 +58,8 @@ export interface ReviewEventView {
 
 export interface ReviewTaskView {
   id: number;
+  /** "agent_run": an evaluator flagged an agent run; there are no fields to correct. */
+  kind?: "extraction" | "agent_run";
   source_request_id: string;
   schema_name: string;
   model_profile: string;
@@ -121,10 +125,12 @@ const REVIEWER_ID = "studio-operator";
 
 export function listReviews(params?: {
   status?: ReviewStatus;
+  kind?: "extraction" | "agent_run";
   limit?: number;
 }): Promise<ReviewTaskView[]> {
   const qs = new URLSearchParams();
   if (params?.status) qs.set("status", params.status);
+  if (params?.kind) qs.set("kind", params.kind);
   if (params?.limit) qs.set("limit", String(params.limit));
   const suffix = qs.toString() ? `?${qs}` : "";
   return request<ReviewTaskView[]>(`/v1/reviews${suffix}`);

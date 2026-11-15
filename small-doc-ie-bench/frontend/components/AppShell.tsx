@@ -9,6 +9,7 @@ import { Agents } from "./Agents";
 import { Benchmark } from "./Benchmark";
 import { Schemas } from "./Schemas";
 import { Review } from "./Review";
+import { Evaluators } from "./Evaluators";
 import { Observability } from "./Observability";
 import { ApiKeys } from "./ApiKeys";
 import { Fleet } from "./Fleet";
@@ -118,7 +119,10 @@ export function AppShell() {
                   )}
                   {id === "benchmark" && <Benchmark view={viewFor(id)} />}
                   {id === "schemas" && <Schemas />}
-                  {id === "review" && <Review active={active === "review"} />}
+                  {id === "review" && (
+                    <Review active={active === "review"} view={viewFor(id)} />
+                  )}
+                  {id === "evaluators" && <Evaluators active={active === "evaluators"} />}
                   {id === "fleet" && <Fleet active={active === "fleet"} />}
                   {id === "routing" && <Routing active={active === "routing"} />}
                   {id === "api-keys" && <ApiKeys active={active === "api-keys"} />}
