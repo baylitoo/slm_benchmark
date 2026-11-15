@@ -465,8 +465,27 @@ class AgentRunRecord(Base):
     expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class EvaluationResultRecord(Base):
+    """One evaluator's verdicts on one agent run. Expires with the run: an LLM
+    judge's ``reason`` can quote the conversation."""
+
+    __tablename__ = "evaluation_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    evaluator: Mapped[str] = mapped_column(String(64), index=True)
+    agent: Mapped[str] = mapped_column(String(64), index=True)
+    verdicts_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    review_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 __all__ = [
     "AgentRunRecord",
+    "EvaluationResultRecord",
     "EvaluatorRecord",
     "BatchItem",
     "BatchRun",

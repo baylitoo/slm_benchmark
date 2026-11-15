@@ -2304,8 +2304,16 @@ def _gc_studio_runs_sync() -> dict[str, int]:
     # The serving-volume sweep needs no database — run it either way.
     summary.update(_gc_seed_leftovers_sync())
     summary.update(_gc_session_documents_sync())
+    summary.update(_gc_agent_runs_sync())
     logger.info("studio run GC: %s", summary)
     return summary
+
+
+def _gc_agent_runs_sync() -> dict[str, int]:
+    """Delete agent runs (and their evaluation results) past retention."""
+    from docie_bench.studio.agent_run_store import purge_expired_runs
+
+    return {"deleted_agent_runs": purge_expired_runs()}
 
 
 def _gc_session_documents_sync() -> dict[str, int]:
@@ -2342,6 +2350,36 @@ async def gc_studio_runs_job(ctx: inngest.Context) -> dict[str, int]:
     return await ctx.step.run("gc-studio-runs", _gc_studio_runs)
 
 
+@inngest_client.create_function(
+    fn_id="agent-run-evaluate",
+    trigger=inngest.TriggerEvent(event="agent/run.completed"),
+    # Judges share deployments with live traffic (one slot by default), so a
+    # burst of finished runs is scored a couple at a time, never all at once.
+    concurrency=[inngest.Concurrency(limit=2)],
+)
+async def evaluate_agent_run_job(ctx: inngest.Context) -> dict[str, Any]:
+    """Score one captured agent run with the evaluators that sampled it.
+
+    Event ``data``: ``run_id`` and ``evaluators`` (names), as emitted by
+    ``evaluators.capture``. Verdicts are stored per evaluator; a fired review
+    rule queues one agent-run review carrying every reason.
+    """
+    from docie_bench.evaluators.runner import evaluate_run
+
+    data = dict(ctx.event.data or {})
+    run_id = str(data.get("run_id") or "")
+    raw = data.get("evaluators")
+    names = [str(n) for n in raw] if isinstance(raw, list) else []
+    if not run_id or not names:
+        return {"run_id": run_id, "status": "nothing_to_evaluate"}
+
+    async def _evaluate() -> dict[str, Any]:
+        async with httpx.AsyncClient() as client:
+            return await evaluate_run(run_id, names, client=client)
+
+    return await ctx.step.run("evaluate", _evaluate)
+
+
 # --------------------------------------------------------------------- roles
 # P1 (design doc §0.1): the compose topology splits the old `worker` into a
 # dedicated single-replica `serving` service (owns every function that spawns
@@ -2367,6 +2405,7 @@ worker_functions = [
     batch_extract_job,
     run_benchmark_job,
     gc_studio_runs_job,
+    evaluate_agent_run_job,
 ]
 
 serving_functions = [

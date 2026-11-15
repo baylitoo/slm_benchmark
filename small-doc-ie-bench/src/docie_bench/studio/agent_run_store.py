@@ -13,7 +13,12 @@ from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from docie_bench.storage.db import session_scope
-from docie_bench.studio.models import AgentRunRecord, isoformat, utcnow
+from docie_bench.studio.models import (
+    AgentRunRecord,
+    EvaluationResultRecord,
+    isoformat,
+    utcnow,
+)
 
 # Arbitrary-but-stable advisory-lock key ("docie agent runs v1").
 _AGENT_RUN_LOCK_KEY = 0x0D0C1E0F
@@ -21,19 +26,22 @@ RETENTION = dt.timedelta(days=30)
 
 
 def ensure_agent_run_table(engine: Engine) -> bool:
-    """Race-safe forward migration, same shape as ``ensure_evaluator_table``."""
-    table = AgentRunRecord.__table__
-    assert isinstance(table, Table)
+    """Race-safe forward migration for ``agent_runs`` and ``evaluation_results``,
+    same shape as ``ensure_evaluator_table``."""
+    created = False
     with engine.begin() as connection:
         if engine.dialect.name == "postgresql":
             connection.execute(
                 sa_text("SELECT pg_advisory_xact_lock(:key)"), {"key": _AGENT_RUN_LOCK_KEY}
             )
-        existed = sa_inspect(connection).has_table("agent_runs")
-        connection.execute(CreateTable(table, if_not_exists=True))
-        for index in table.indexes:
-            connection.execute(CreateIndex(index, if_not_exists=True))
-    return not existed
+        for model in (AgentRunRecord, EvaluationResultRecord):
+            table = model.__table__
+            assert isinstance(table, Table)
+            created |= not sa_inspect(connection).has_table(table.name)
+            connection.execute(CreateTable(table, if_not_exists=True))
+            for index in table.indexes:
+                connection.execute(CreateIndex(index, if_not_exists=True))
+    return created
 
 
 def save_agent_run(
@@ -94,15 +102,67 @@ def get_agent_run(run_id: str) -> dict[str, Any] | None:
         return _view(row) if row is not None else None
 
 
+def save_evaluation(
+    *,
+    run_id: str,
+    evaluator: str,
+    agent: str,
+    verdicts: list[dict[str, Any]],
+    review_reasons: list[str],
+    now: dt.datetime | None = None,
+) -> None:
+    created = now or utcnow()
+    with session_scope() as session:
+        if session is None:
+            return
+        session.add(
+            EvaluationResultRecord(
+                run_id=run_id,
+                evaluator=evaluator,
+                agent=agent,
+                verdicts_json=verdicts,
+                review_reasons_json=review_reasons,
+                created_at=created,
+                expires_at=created + RETENTION,
+            )
+        )
+
+
+def list_evaluations(evaluator: str, *, limit: int = 100) -> list[dict[str, Any]]:
+    """An evaluator's most recent results, newest first."""
+    with session_scope() as session:
+        if session is None:
+            return []
+        rows = session.execute(
+            select(EvaluationResultRecord)
+            .where(EvaluationResultRecord.evaluator == evaluator)
+            .order_by(EvaluationResultRecord.created_at.desc(), EvaluationResultRecord.id.desc())
+            .limit(limit)
+        ).scalars()
+        return [
+            {
+                "run_id": row.run_id,
+                "agent": row.agent,
+                "verdicts": row.verdicts_json,
+                "review_reasons": row.review_reasons_json,
+                "created_at": isoformat(row.created_at),
+            }
+            for row in rows
+        ]
+
+
 def purge_expired_runs(now: dt.datetime | None = None) -> int:
-    """Delete runs past their retention; returns how many were removed."""
+    """Delete runs and evaluation results past their retention; returns how
+    many runs were removed."""
+    cutoff = now or utcnow()
     with session_scope() as session:
         if session is None:
             return 0
+        session.execute(
+            delete(EvaluationResultRecord).where(EvaluationResultRecord.expires_at < cutoff)
+        )
         result = cast(
             CursorResult[Any],
-            session.execute(
-                delete(AgentRunRecord).where(AgentRunRecord.expires_at < (now or utcnow()))
-            ),
+            session.execute(delete(AgentRunRecord).where(AgentRunRecord.expires_at < cutoff)),
         )
         return int(result.rowcount or 0)
