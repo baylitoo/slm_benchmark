@@ -110,8 +110,7 @@ def test_a_failure_never_reaches_the_request(emitted, monkeypatch) -> None:
     assert _capture() is None
 
 
-def test_runs_expire_after_the_retention_window(emitted) -> None:
-    old = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+def _old_run(old: dt.datetime) -> str:
     run_id = save_agent_run(
         agent="billing-bot",
         tenant_id="acme",
@@ -122,10 +121,29 @@ def test_runs_expire_after_the_retention_window(emitted) -> None:
         evaluators=["completion"],
         now=old,
     )
-    assert purge_expired_runs(now=old + dt.timedelta(days=29)) == 0
-    assert purge_expired_runs(now=old + dt.timedelta(days=31)) == 1
     assert run_id is not None
+    return run_id
+
+
+def test_a_never_scored_run_is_purged_after_the_backstop(emitted) -> None:
+    old = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    run_id = _old_run(old)
+    assert purge_expired_runs(now=old + dt.timedelta(days=6)) == 0
+    assert purge_expired_runs(now=old + dt.timedelta(days=8)) == 1
     assert get_agent_run(run_id) is None
+
+
+def test_a_run_with_an_open_review_is_never_purged(emitted) -> None:
+    from docie_bench.review import enqueue_agent_run_review
+
+    old = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    run_id = _old_run(old)
+    enqueue_agent_run_review(
+        run_id=run_id, agent="billing-bot", evaluators=["completion"],
+        reasons=["completed: 0.10 < 0.5"], verdicts=[],
+    )
+    assert purge_expired_runs(now=old + dt.timedelta(days=365)) == 0
+    assert get_agent_run(run_id) is not None
 
 
 def test_completion_text_reads_the_assistant_message() -> None:

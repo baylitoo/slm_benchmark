@@ -15,8 +15,12 @@ from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.review import list_reviews
 from docie_bench.serving.profile_resolver import ProfileResolutionError
 from docie_bench.storage.db import dispose_engine, init_engine
-from docie_bench.studio.agent_run_store import list_evaluations, save_agent_run
-from docie_bench.studio.evaluator_store import create_evaluator, update_evaluator
+from docie_bench.studio.agent_run_store import (
+    get_agent_run,
+    list_evaluations,
+    save_agent_run,
+)
+from docie_bench.studio.evaluator_store import create_evaluator
 
 LAYA = ModelProfile(name="laya-q8_0", model="laya", base_url="http://up/v1", api_key="k")
 
@@ -86,6 +90,8 @@ def test_a_passing_run_is_stored_but_not_queued(run_id: str) -> None:
     assert result["review_id"] is None
     assert list_reviews(kind="agent_run") == []
     assert len(list_evaluations("task-completion")) == 1
+    # Nothing to review: the run's text is deleted right away.
+    assert get_agent_run(run_id) is None
 
 
 def test_an_unavailable_judge_model_is_a_failed_judgement(run_id: str) -> None:
@@ -99,9 +105,37 @@ def test_an_unavailable_judge_model_is_a_failed_judgement(run_id: str) -> None:
     [stored] = list_evaluations("task-completion")
     assert "unavailable" in stored["verdicts"][0]["error"]
 
-    update_evaluator("task-completion", _spec(review_on_error=True))
+    assert get_agent_run(run_id) is None  # nothing queued, so not kept
+
+
+def test_a_failed_judgement_is_queued_when_asked(run_id: str) -> None:
+    def missing(_model: str) -> ModelProfile:
+        raise ProfileResolutionError("laya-q8_0 is not ready")
+
+    create_evaluator(_spec(review_on_error=True))
     result, _ = _evaluate(run_id, noul=0.1, resolve=missing)
     assert result["review_id"] is not None
+    assert get_agent_run(run_id) is not None  # kept while the review is open
+
+
+def test_deciding_the_review_deletes_the_run_and_the_judge_reasons(run_id: str) -> None:
+    from docie_bench.review import claim_review, decide_review
+    from docie_bench.schemas.review import ReviewStatus
+
+    create_evaluator(_spec())
+    result, _ = _evaluate(run_id, noul=0.1)
+    review = list_reviews(kind="agent_run")[0]
+    claimed = claim_review(
+        review.id, reviewer_id="alice", expected_version=review.version, lease_seconds=60
+    )
+    decide_review(
+        review.id, reviewer_id="alice", expected_version=claimed.version,
+        decision=ReviewStatus.REJECTED,
+    )
+    assert get_agent_run(run_id) is None
+    [stored] = list_evaluations("task-completion")
+    assert stored["verdicts"][0]["noul"] == 0.1  # the verdict stays
+    assert stored["verdicts"][0]["reason"] is None
 
 
 def test_disabled_or_deleted_evaluators_and_expired_runs_are_skipped(run_id: str) -> None:

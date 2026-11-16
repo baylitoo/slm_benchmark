@@ -37,7 +37,11 @@ async def evaluate_run(
     is skipped rather than failed: there is nothing left to judge.
     """
     from docie_bench.review import enqueue_agent_run_review
-    from docie_bench.studio.agent_run_store import get_agent_run, save_evaluation
+    from docie_bench.studio.agent_run_store import (
+        delete_agent_run,
+        get_agent_run,
+        save_evaluation,
+    )
     from docie_bench.studio.evaluator_store import get_evaluator
 
     run = get_agent_run(run_id)
@@ -79,6 +83,9 @@ async def evaluate_run(
             verdicts=all_verdicts,
         )
         review_id = review.id
+    else:
+        # Nothing for a human to look at: the run's text is no longer needed.
+        delete_agent_run(run_id)
     return {
         "run_id": run_id,
         "status": "evaluated",

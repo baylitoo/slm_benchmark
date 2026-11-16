@@ -729,7 +729,13 @@ def decide_review(
         task.updated_at = task.decided_at
         _event(task, decision.value, actor_id=reviewer_id, from_status=ReviewStatus.CLAIMED)
         _flush(session)
-        return _task_view(task)
+        view = _task_view(task)
+    if view.kind == "agent_run":
+        # An agent run is kept only until its review is decided.
+        from docie_bench.studio.agent_run_store import delete_agent_run
+
+        delete_agent_run(view.source_request_id)
+    return view
 
 
 def export_annotations(

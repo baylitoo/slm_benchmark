@@ -1,4 +1,10 @@
-"""Agent runs kept for evaluation (``AgentRunRecord``), with bounded retention."""
+"""Agent runs kept for evaluation (``AgentRunRecord``).
+
+Retention: a run lives until it is scored and, when an evaluator flags it,
+until its review is decided. ``delete_agent_run`` is called at both points.
+``UNEVALUATED_TTL`` is only the backstop for a run that was never scored
+(queue down, event lost); a run with an open review is never purged.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +28,10 @@ from docie_bench.studio.models import (
 
 # Arbitrary-but-stable advisory-lock key ("docie agent runs v1").
 _AGENT_RUN_LOCK_KEY = 0x0D0C1E0F
+# Evaluation results: verdicts only (an LLM judge's reason is cleared when
+# its run is deleted), kept for the Evaluators page history.
 RETENTION = dt.timedelta(days=30)
+UNEVALUATED_TTL = dt.timedelta(days=7)
 
 
 def ensure_agent_run_table(engine: Engine) -> bool:
@@ -72,7 +81,7 @@ def save_agent_run(
                 tool_calls_json=tool_calls,
                 evaluators_json=evaluators,
                 created_at=created,
-                expires_at=created + RETENTION,
+                expires_at=created + UNEVALUATED_TTL,
             )
         )
         return run_id
@@ -166,6 +175,26 @@ def list_evaluations(
         ]
 
 
+def delete_agent_run(run_id: str) -> bool:
+    """Delete a run's text, and the LLM judges' reasons that may quote it.
+
+    The verdicts themselves stay for the Evaluators page history.
+    """
+    with session_scope() as session:
+        if session is None:
+            return False
+        results = session.execute(
+            select(EvaluationResultRecord).where(EvaluationResultRecord.run_id == run_id)
+        ).scalars()
+        for row in results:
+            row.verdicts_json = [{**v, "reason": None} for v in row.verdicts_json or []]
+        result = cast(
+            CursorResult[Any],
+            session.execute(delete(AgentRunRecord).where(AgentRunRecord.id == run_id)),
+        )
+        return bool(result.rowcount)
+
+
 def purge_expired_runs(now: dt.datetime | None = None) -> int:
     """Delete runs and evaluation results past their retention; returns how
     many runs were removed."""
@@ -176,8 +205,19 @@ def purge_expired_runs(now: dt.datetime | None = None) -> int:
         session.execute(
             delete(EvaluationResultRecord).where(EvaluationResultRecord.expires_at < cutoff)
         )
+        from docie_bench.storage.db import ReviewTask
+
+        open_review = select(ReviewTask.source_request_id).where(
+            ReviewTask.kind == "agent_run",
+            ReviewTask.status.in_(("pending", "claimed")),
+        )
         result = cast(
             CursorResult[Any],
-            session.execute(delete(AgentRunRecord).where(AgentRunRecord.expires_at < cutoff)),
+            session.execute(
+                delete(AgentRunRecord).where(
+                    AgentRunRecord.expires_at < cutoff,
+                    AgentRunRecord.id.not_in(open_review),
+                )
+            ),
         )
         return int(result.rowcount or 0)

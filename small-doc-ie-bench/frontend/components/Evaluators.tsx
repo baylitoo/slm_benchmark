@@ -583,7 +583,10 @@ function EditorDialog({
             ))}
           </Select>
         </Field>
-        <Field label="Agents to score" hint="Their runs are kept 30 days for evaluation.">
+        <Field
+          label="Agents to score"
+          hint="A run is kept until it is scored, or until its review is decided."
+        >
           <div className="flex flex-wrap gap-2">
             {agents.length === 0 && (
               <span className="text-xs text-muted-foreground">No agents yet.</span>

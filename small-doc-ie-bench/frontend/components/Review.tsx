@@ -937,7 +937,8 @@ function AgentRunDetail({
           </p>
           {runError ? (
             <Alert tone="info">
-              The run is no longer stored (runs are kept 30 days). The verdicts remain.
+              The run is no longer stored: runs are deleted once their review is decided.
+              The verdicts remain.
             </Alert>
           ) : !run ? (
             <Skeleton className="h-24" />
