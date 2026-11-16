@@ -480,6 +480,46 @@ def enqueue_agent_run_review(
         return _task_view(task)
 
 
+AGENT_REVIEW_MAX_AGE = dt.timedelta(days=30)
+
+
+def expire_undecided_agent_reviews(now: dt.datetime | None = None) -> list[str]:
+    """Close agent-run reviews left undecided past ``AGENT_REVIEW_MAX_AGE``.
+
+    A run is kept until its review is decided, so a queue nobody works would
+    keep conversation text forever. These tasks become ``expired``, a status
+    of their own so nothing reads them as a human verdict. Returns the run ids
+    whose text the caller should now delete.
+    """
+    current = now or _utcnow()
+    cutoff = current - AGENT_REVIEW_MAX_AGE
+    with session_scope() as maybe_session:
+        session = _require_session(maybe_session)
+        tasks = list(
+            session.scalars(
+                select(ReviewTask)
+                .where(
+                    ReviewTask.kind == "agent_run",
+                    ReviewTask.status.in_((ReviewStatus.PENDING, ReviewStatus.CLAIMED)),
+                    ReviewTask.created_at < cutoff,
+                )
+                .options(selectinload(ReviewTask.events))
+            )
+        )
+        for task in tasks:
+            from_status = task.status
+            task.status = ReviewStatus.EXPIRED
+            task.claimed_by = None
+            task.claim_expires_at = None
+            task.decided_at = current
+            task.decision_comment = "not reviewed within 30 days"
+            task.version += 1
+            task.updated_at = current
+            _event(task, "expired", from_status=from_status)
+        _flush(session)
+        return [task.source_request_id for task in tasks]
+
+
 def list_reviews(
     *,
     status: ReviewStatus | None = None,

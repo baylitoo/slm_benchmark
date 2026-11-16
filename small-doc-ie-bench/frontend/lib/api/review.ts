@@ -12,7 +12,7 @@
 
 import { request } from "./core";
 
-export type ReviewStatus = "pending" | "claimed" | "approved" | "rejected";
+export type ReviewStatus = "pending" | "claimed" | "approved" | "rejected" | "expired";
 
 export interface ReviewReason {
   code:

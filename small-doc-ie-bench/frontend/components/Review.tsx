@@ -38,6 +38,7 @@ const STATUS_TONE: Record<ReviewStatus, BadgeTone> = {
   claimed: "info",
   approved: "ok",
   rejected: "err",
+  expired: "neutral",
 };
 
 const STATUS_FILTERS: { value: ReviewStatus | "all"; label: string }[] = [

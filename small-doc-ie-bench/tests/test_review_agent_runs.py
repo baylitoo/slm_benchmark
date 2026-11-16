@@ -135,3 +135,21 @@ def test_the_review_api_defaults_to_documents() -> None:
     assert [t["kind"] for t in client.get("/v1/reviews").json()] == ["extraction"]
     assert [t["kind"] for t in client.get("/v1/reviews?kind=agent_run").json()] == ["agent_run"]
     assert len(client.get("/v1/reviews?kind=all").json()) == 2
+
+
+def test_undecided_agent_reviews_expire_after_30_days() -> None:
+    import datetime as dt
+
+    from docie_bench.review import expire_undecided_agent_reviews, get_review
+
+    task = _agent_review()
+    extraction = _extraction_review()
+    now = task.created_at
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.UTC)
+    assert expire_undecided_agent_reviews(now=now + dt.timedelta(days=29)) == []
+    assert expire_undecided_agent_reviews(now=now + dt.timedelta(days=31)) == [RUN_ID]
+    assert get_review(task.id).status == ReviewStatus.EXPIRED
+    # Extraction reviews are untouched; a second sweep finds nothing new.
+    assert get_review(extraction.id).status == ReviewStatus.PENDING
+    assert expire_undecided_agent_reviews(now=now + dt.timedelta(days=60)) == []

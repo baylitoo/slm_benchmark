@@ -2326,10 +2326,22 @@ def _judge_models(names: list[str]) -> list[str]:
 
 
 def _gc_agent_runs_sync() -> dict[str, int]:
-    """Delete agent runs (and their evaluation results) past retention."""
-    from docie_bench.studio.agent_run_store import purge_expired_runs
+    """Expire agent-run reviews nobody decided, delete their runs, then purge
+    runs that were never scored."""
+    from docie_bench.review import expire_undecided_agent_reviews
+    from docie_bench.studio.agent_run_store import delete_agent_run, purge_expired_runs
 
-    return {"deleted_agent_runs": purge_expired_runs()}
+    try:
+        expired = expire_undecided_agent_reviews()
+    except Exception:
+        logger.warning("agent review expiry skipped", exc_info=True)
+        expired = []
+    for run_id in expired:
+        delete_agent_run(run_id)
+    return {
+        "expired_agent_reviews": len(expired),
+        "deleted_agent_runs": purge_expired_runs() + len(expired),
+    }
 
 
 def _gc_session_documents_sync() -> dict[str, int]:

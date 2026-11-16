@@ -14,6 +14,8 @@ class ReviewStatus(StrEnum):
     CLAIMED = "claimed"
     APPROVED = "approved"
     REJECTED = "rejected"
+    # An agent-run review nobody decided in time; not a human verdict.
+    EXPIRED = "expired"
 
 
 class ReviewReason(BaseModel):
