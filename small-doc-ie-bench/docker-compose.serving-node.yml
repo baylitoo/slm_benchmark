@@ -55,7 +55,7 @@ services:
         # model, and nothing reports it. Empty here meant master HEAD on the
         # day the node was built, so two nodes added a month apart ran
         # different engines.
-        LLAMA_REF: ${LLAMA_REF:-19ff817fb25e9a1b838b1d7f9f4325f7bf9779c4}
+        LLAMA_REF: ${LLAMA_REF:-b1b770d90d94cad9e9ea5b993bdbc383a522fb28}
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:

@@ -15,8 +15,8 @@ Both artifact formats serve **text** on `/v1/embeddings`, not chat or extraction
 
 Select the repository in Hub onboarding, seed its snapshot or GGUF, then deploy
 the detected family. For GGUF text embeddings no `mmproj` is required. The
-serving image pins llama.cpp to commit
-`19ff817fb25e9a1b838b1d7f9f4325f7bf9779c4`; binaries older than v0.7.0 / b11669
+serving image pins llama.cpp to v1.0.0, commit
+`b1b770d90d94cad9e9ea5b993bdbc383a522fb28`; binaries older than v0.7.0 / b11669
 do not recognize `gemma-embedding2`. Rebuild the serving image to pick up the pin.
 
 The native checkpoint requires SentenceTransformers >=6.1 and Transformers

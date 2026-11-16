@@ -186,7 +186,7 @@ services:
         # cannot coexist with EmbeddingGemma 2 in the encoder interpreter.
         INSTALL_EMBEDDINGS: "true"
         # Pinned commit with gemma-embedding2 and LFM3 support; an override must retain both.
-        LLAMA_REF: ${LLAMA_REF:-19ff817fb25e9a1b838b1d7f9f4325f7bf9779c4}
+        LLAMA_REF: ${LLAMA_REF:-b1b770d90d94cad9e9ea5b993bdbc383a522fb28}
     env_file: .env
     mem_limit: ${DOCIE_SERVING_MEM_LIMIT:-8g}
     environment:
