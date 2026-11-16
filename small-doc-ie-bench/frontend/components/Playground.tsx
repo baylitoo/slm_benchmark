@@ -2955,7 +2955,7 @@ export function DecidePanel({
       <div className="space-y-4">
         <Field
           label="Decision deployment"
-          hint="Deploy a decision model, e.g. ggml-org/Julia-1-GGUF or ggml-org/Laya-GGUF (family 'decision')."
+          hint="Deploy a decision model, e.g. LiquidAI/d1-omni-600M-GGUF or LiquidAI/d1-3B-GGUF (family 'decision')."
         >
           {names.length === 0 ? (
             <EmptyModelState noun="decision" onNavigate={onNavigate} />

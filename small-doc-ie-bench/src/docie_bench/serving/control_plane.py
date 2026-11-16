@@ -1114,7 +1114,7 @@ class _DefaultSupervisor:
         # model and the family's encoder_backend rides in as --backend (no
         # name-based guessing), so the checkpoint loads locally with zero
         # network at boot.
-        from docie_bench.serving.model_store import get_family
+        from docie_bench.serving.model_store import decision_batch_defaults, get_family
 
         contract = get_family(entry.family)
         if contract.analyzer:
@@ -1145,6 +1145,7 @@ class _DefaultSupervisor:
         else:
             runtime_kind = RuntimeKind.LLAMACPP
             launch_extra_args = store.family_launch_args(name)
+            batch_size, ubatch_size = decision_batch_defaults(contract, batch_size, ubatch_size)
 
         def _launch_and_await(chosen: int) -> Any:
             launch = reachable_launch(

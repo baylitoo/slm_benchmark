@@ -355,3 +355,16 @@ def test_header_candidate_skips_imatrix_and_prefers_the_decision_build() -> None
 def test_header_is_not_read_without_a_hint() -> None:
     files = [HfGgufFile("chat-Q4_K_M.gguf", 1, "Q4_K_M", False, False)]
     assert _decision_header_candidate(files, "qwen35", ["gguf"], "text-generation") is None
+
+
+def test_decision_families_default_to_a_large_micro_batch() -> None:
+    from docie_bench.serving.model_store import DECISION_UBATCH_SIZE, decision_batch_defaults
+
+    decision = get_family("decision")
+    assert decision_batch_defaults(decision, None, None) == (
+        DECISION_UBATCH_SIZE,
+        DECISION_UBATCH_SIZE,
+    )
+    # An operator's own size always wins, and other families are untouched.
+    assert decision_batch_defaults(decision, None, 1024) == (None, 1024)
+    assert decision_batch_defaults(get_family("lfm2"), None, None) == (None, None)

@@ -616,6 +616,21 @@ FAMILIES: dict[str, FamilyContract] = {
 }
 
 
+# Some decision models (laya, clef, lfm2-d1-omni) evaluate the whole prompt in
+# one micro-batch, and llama-server's default --ubatch-size of 512 rejects a
+# state of a few hundred words. Applied only when the operator set neither size.
+DECISION_UBATCH_SIZE = 4096
+
+
+def decision_batch_defaults(
+    contract: FamilyContract, batch_size: int | None, ubatch_size: int | None
+) -> tuple[int | None, int | None]:
+    """(batch_size, ubatch_size) for a launch, with the decision default filled in."""
+    if not contract.decision or batch_size is not None or ubatch_size is not None:
+        return batch_size, ubatch_size
+    return DECISION_UBATCH_SIZE, DECISION_UBATCH_SIZE
+
+
 def get_family(name: str) -> FamilyContract:
     try:
         return FAMILIES[name]

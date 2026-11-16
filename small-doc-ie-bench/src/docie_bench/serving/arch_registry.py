@@ -253,9 +253,10 @@ DECISION_HUB_TAG = "decision-model"
 
 DECISION_RUNTIME_NOTE = (
     "served on /v1/systemone; needs a llama-server built after "
-    "ggml-org/llama.cpp#29818 (merged 2026-10-02). Some models (laya, clef) "
-    "evaluate the whole prompt in one batch, so long states need a larger "
-    "--ubatch-size."
+    "ggml-org/llama.cpp#29818 (merged 2026-10-02), and lfm3-d1 models "
+    "(LiquidAI/d1-2B) need llama.cpp v1.0.0. Store deploys default to "
+    "--ubatch-size 4096, since some (laya, clef, lfm2-d1-omni) evaluate the "
+    "whole prompt in one batch."
 )
 
 
