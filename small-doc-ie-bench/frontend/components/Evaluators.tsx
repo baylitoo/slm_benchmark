@@ -20,6 +20,7 @@ import {
   type EvaluatorSpec,
   type EvaluatorTemplate,
   type QuestionType,
+  type ReadScope,
   type ReviewRule,
   type ReviewRuleWhen,
 } from "@/lib/api";
@@ -99,6 +100,7 @@ interface Draft {
   name: string;
   description: string;
   judge: EvaluatorJudge;
+  reads: ReadScope;
   model: string;
   agents: string[];
   samplePercent: number;
@@ -114,6 +116,7 @@ function draftFromTemplate(t: EvaluatorTemplate): Draft {
     name: t.questions.length ? t.id : "",
     description: t.summary,
     judge: t.judge,
+    reads: t.reads ?? "run",
     model: "",
     agents: [],
     samplePercent: 100,
@@ -132,6 +135,7 @@ function draftFromSpec(s: EvaluatorSpec): Draft {
     name: s.name,
     description: s.description ?? "",
     judge: s.judge,
+    reads: s.reads ?? "run",
     model: s.model,
     agents: s.agents,
     samplePercent: Math.round(s.sample_rate * 100),
@@ -147,6 +151,7 @@ function specFromDraft(d: Draft): EvaluatorSpec {
     name: d.name.trim(),
     description: d.description,
     judge: d.judge,
+    reads: d.reads,
     model: d.model,
     agents: d.agents,
     sample_rate: Math.min(100, Math.max(0, d.samplePercent)) / 100,
@@ -582,6 +587,20 @@ function EditorDialog({
               </option>
             ))}
           </Select>
+        </Field>
+        <Field
+          label="Reads"
+          hint="A question about the user should not see the answer: a refusal reads as an attack."
+        >
+          <Segmented
+            value={d.reads}
+            onChange={(reads) => patch({ reads })}
+            options={[
+              { value: "run", label: "Whole run" },
+              { value: "user", label: "User messages" },
+              { value: "answer", label: "Final answer" },
+            ]}
+          />
         </Field>
         <Field
           label="Agents to score"

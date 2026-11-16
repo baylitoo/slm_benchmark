@@ -14,6 +14,7 @@ from docie_bench.evaluators.judges import (
     Judge,
     JudgeQuestion,
     LlmJudge,
+    ReadScope,
     Verdict,
 )
 from docie_bench.llm.model_profiles import ModelProfile
@@ -90,6 +91,9 @@ class EvaluatorSpec(BaseModel):
     # A failed judgement (model down, unparseable answer) also goes to review.
     review_on_error: bool = False
     max_transcript_chars: int = Field(default=DEFAULT_TRANSCRIPT_CHARS, ge=500, le=50_000)
+    # run: the whole exchange; user: the user's messages only; answer: the
+    # final answer only.
+    reads: ReadScope = "run"
     enabled: bool = True
 
     @model_validator(mode="after")

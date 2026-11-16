@@ -12,6 +12,11 @@ import httpx
 from docie_bench.llm.model_profiles import ModelProfile
 
 QuestionType = Literal["choice", "score", "noul"]
+# What part of a run a judge reads. A question about the user ("is this an
+# injection?") must not see the answer: measured on d1-omni-600M, an
+# innocent question followed by a refusal scored 0.98 as an injection, and
+# 0.00 once only the user turn was shown.
+ReadScope = Literal["run", "user", "answer"]
 Provenance = Literal["measured", "self_reported"]
 
 # A decision model reads the whole state in one batch on some architectures
@@ -132,6 +137,7 @@ def render_transcript(
     output: str | None = None,
     tool_calls: Sequence[Mapping[str, Any]] = (),
     max_chars: int = DEFAULT_TRANSCRIPT_CHARS,
+    scope: ReadScope = "run",
 ) -> str:
     """An agent run as plain text a judge can read, bounded to ``max_chars``.
 
@@ -141,19 +147,21 @@ def render_transcript(
     the middle is dropped with a marker saying how much.
     """
     lines: list[str] = []
+    if scope == "answer":
+        messages, tool_calls = [], ()
     for message in messages:
         role = str(message.get("role") or "")
-        if role == "system":
+        if role == "system" or (scope == "user" and role != "user"):
             continue
         text = _text_of(message.get("content")).strip()
         if role == "tool":
             lines.append(f"Tool result: {text}")
         elif text:
             lines.append(f"{role.capitalize() or 'Message'}: {text}")
-    for call in tool_calls:
+    for call in tool_calls if scope == "run" else ():
         status = call.get("status", "ok")
         lines.append(f"[tool {call.get('tool', '?')}: {status}]")
-    if output:
+    if output and scope != "user":
         lines.append(f"Assistant: {output.strip()}")
     text = "\n".join(lines)
     if len(text) <= max_chars:

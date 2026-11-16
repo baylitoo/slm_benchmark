@@ -125,6 +125,7 @@ async def _judge(
             output=run["output"],
             tool_calls=run["tool_calls"],
             max_chars=spec.max_transcript_chars,
+            scope=spec.reads,
         ),
         metadata={"agent": run["agent"]},
     )

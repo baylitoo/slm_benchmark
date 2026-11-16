@@ -154,7 +154,11 @@ def test_every_template_becomes_a_valid_evaluator() -> None:
         assert template["category"] in category_ids
         if not template["questions"]:
             continue  # the from-scratch templates start empty on purpose
-        fields = {k: template[k] for k in ("judge", "questions", "review_when")}
+        fields = {
+            k: template[k]
+            for k in ("judge", "questions", "review_when", "reads")
+            if k in template
+        }
         EvaluatorSpec.model_validate({**fields, "name": template["id"], "model": "m"})
 
 

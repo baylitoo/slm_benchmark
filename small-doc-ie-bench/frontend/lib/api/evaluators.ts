@@ -5,6 +5,7 @@ import { request } from "./core";
 
 export type EvaluatorJudge = "decision" | "llm_judge";
 export type QuestionType = "choice" | "score" | "noul";
+export type ReadScope = "run" | "user" | "answer";
 export type ReviewRuleWhen =
   | "noul_above"
   | "noul_below"
@@ -37,6 +38,8 @@ export interface EvaluatorSpec {
   review_when: ReviewRule[];
   review_on_error: boolean;
   max_transcript_chars?: number;
+  /** run: the whole exchange; user: the user's messages only; answer: the final answer. */
+  reads?: ReadScope;
   enabled: boolean;
   created_at?: string;
   updated_at?: string;
@@ -49,6 +52,7 @@ export interface EvaluatorTemplate {
   summary: string;
   recommended?: boolean;
   judge: EvaluatorJudge;
+  reads?: ReadScope;
   questions: EvaluatorQuestion[];
   review_when: ReviewRule[];
 }
