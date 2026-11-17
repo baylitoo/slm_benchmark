@@ -130,6 +130,9 @@ class NodeFacts:
     heartbeat_age_s: float | None = None
     #: How old a snapshot may be before the fleet treats the node as silent.
     heartbeat_stale_after_s: float | None = None
+    #: This node's record names whose placement row another node owns, as
+    #: (name, owner); None when either side could not be read.
+    name_collisions: tuple[tuple[str, str], ...] | None = None
 
 
 def _role_check(facts: NodeFacts) -> Check:
@@ -400,6 +403,29 @@ def _blobs_check(facts: NodeFacts) -> Check:
     )
 
 
+def _record_names_check(facts: NodeFacts) -> Check:
+    collisions = facts.name_collisions
+    if collisions is None:
+        return Check(
+            "record names",
+            Severity.INFO,
+            "cannot compare this node's records against the catalog's placements",
+        )
+    if not collisions:
+        return Check("record names", Severity.PASS, "no local record name is owned by another node")
+    return Check(
+        "record names",
+        Severity.WARN,
+        f"{len(collisions)} local record(s) share a placement row with another "
+        f"node: {', '.join(f'{name} (owned by {owner})' for name, owner in collisions)}",
+        "The placement row is keyed by name, so two nodes with one name share "
+        "a single row: one replica is unroutable while still holding its RAM. "
+        "Stop and remove the local record (`docie-serving stop <name>`) and "
+        "redeploy it under a distinct name -- `docie-serving up` mints one on "
+        "a fleet, or pass --deployment-name.",
+    )
+
+
 #: Every check, in the order an operator should read them: what the node is,
 #: then whether the fleet can see it, then what it will actually do.
 _CHECKS = (
@@ -413,6 +439,7 @@ _CHECKS = (
     _desired_apply_check,
     _ports_check,
     _blobs_check,
+    _record_names_check,
     _clock_check,
 )
 
@@ -572,6 +599,7 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
     heartbeat_published: bool | None = None
     heartbeat_age: float | None = None
     stale_after: float | None = None
+    placement_owners: dict[str, str] | None = None
     database_url = str(getattr(settings, "database_url", "") or "")
     try:
         import docie_bench.storage.db as db
@@ -601,6 +629,10 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
             for row in rows
             if str(row.get("node_id") or "") and str(row.get("node_id") or "") != node_id
         )
+        placement_owners = {
+            str(row.get("name") or ""): str(row.get("node_id") or "")
+            for row in catalog.list_placements()
+        }
         db_detail = (
             f"{_database_target(database_url)} reachable; {len(rows)} node(s) "
             f"known, {len(catalog_models)} model(s)"
@@ -639,6 +671,23 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
         logger.debug("could not read this node's blob store", exc_info=True)
         store_models = None
 
+    name_collisions: tuple[tuple[str, str], ...] | None = None
+    if placement_owners is not None and node_id:
+        try:
+            from docie_bench.serving.supervisor import PersistentSupervisor
+
+            local_names = {
+                record.spec.name
+                for record in PersistentSupervisor(home / "deployments.json").list()
+            }
+            name_collisions = tuple(
+                (name, owner)
+                for name, owner in sorted(placement_owners.items())
+                if name in local_names and owner and owner != node_id
+            )
+        except Exception:  # noqa: BLE001 - an unreadable file leaves the compare unknown
+            logger.debug("could not read this node's deployment records", exc_info=True)
+
     inngest_url = os.getenv("INNGEST_BASE_URL") or None
     inngest_reachable: bool | None = None
     if probe_inngest and inngest_url:
@@ -669,6 +718,7 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
         heartbeat_published=heartbeat_published,
         heartbeat_age_s=heartbeat_age,
         heartbeat_stale_after_s=stale_after,
+        name_collisions=name_collisions,
     )
 
 

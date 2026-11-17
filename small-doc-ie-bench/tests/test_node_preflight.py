@@ -484,6 +484,7 @@ def test_the_report_is_stable_so_a_bringup_script_can_diff_it() -> None:
         "desired-state apply",
         "port window",
         "blob store",
+        "record names",
         "clocks",
     ]
 
@@ -687,3 +688,16 @@ def test_collect_facts_reads_this_nodes_own_heartbeat(
     assert after.heartbeat_published is True
     assert after.heartbeat_age_s is not None
     assert after.heartbeat_age_s < 60
+
+
+def test_a_local_record_whose_placement_another_node_owns_warns() -> None:
+    facts = NodeFacts(
+        **{**_healthy().__dict__, "name_collisions": (("nuextract3", "ovh-cpu-01"),)}
+    )
+
+    check = _check(facts, "record names")
+
+    assert check.severity is Severity.WARN  # type: ignore[attr-defined]
+    assert "nuextract3 (owned by ovh-cpu-01)" in check.detail  # type: ignore[attr-defined]
+    clean = NodeFacts(**{**_healthy().__dict__, "name_collisions": ()})
+    assert _check(clean, "record names").severity is Severity.PASS  # type: ignore[attr-defined]
