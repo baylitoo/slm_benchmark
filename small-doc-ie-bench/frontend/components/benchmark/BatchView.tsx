@@ -80,6 +80,12 @@ function ProgressCell({ r }: { r: BatchRunSummary }) {
   );
 }
 
+/** The serving node that answered a done item; null for a configured profile. */
+export function servedByNode(i: BatchItemView): string | null {
+  const servedBy = i.result?.served_by as { node?: unknown } | null | undefined;
+  return typeof servedBy?.node === "string" && servedBy.node ? servedBy.node : null;
+}
+
 function BatchDetail({ eventId }: { eventId: string }) {
   const detail = usePolling<BatchRunDetail>(() => getBatch(eventId), DETAIL_POLL_MS, true);
   const [open, setOpen] = useState<number | null>(null);
@@ -114,6 +120,13 @@ function BatchDetail({ eventId }: { eventId: string }) {
         <span className="text-xs text-muted-foreground tabular-nums">
           {i.latency_ms != null ? `${i.latency_ms} ms` : "—"}
         </span>
+      ),
+    },
+    {
+      key: "node",
+      header: "Node",
+      render: (i) => (
+        <span className="font-mono text-xs text-muted-foreground">{servedByNode(i) ?? "—"}</span>
       ),
     },
     {

@@ -1071,6 +1071,7 @@ def _flatten_batch_row(outcome: dict[str, Any], columns: list[str]) -> dict[str,
     row: dict[str, Any] = {c: outcome.get(c) for c in base_cols}
     result = outcome.get("result") or {}
     row["model_profile"] = result.get("model_profile")
+    row["node_id"] = (result.get("served_by") or {}).get("node")
     for field, node in (result.get("result") or {}).items():
         keys: tuple[str, ...]
         if isinstance(node, dict) and "amount" in node:
@@ -1098,7 +1099,15 @@ def _batch_write_results(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]
     from docie_bench.studio.store import default_blob_store
 
     jsonl = "".join(json.dumps(o, ensure_ascii=False, sort_keys=True) + "\n" for o in outcomes)
-    columns: list[str] = ["position", "filename", "status", "error", "latency_ms", "model_profile"]
+    columns: list[str] = [
+        "position",
+        "filename",
+        "status",
+        "error",
+        "latency_ms",
+        "model_profile",
+        "node_id",
+    ]
     flat_rows = [_flatten_batch_row(o, columns) for o in outcomes]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
