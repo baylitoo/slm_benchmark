@@ -1,0 +1,8 @@
+# Copy to serving-nodes.yml (same directory) and list one entry per serving
+# node. The address is the node's WireGuard IP (its DOCIE_SERVING_PUBLISH_IP)
+# and the port of an exporter running on that host, e.g. node_exporter on 9100.
+# `node_id` must match the id the node publishes, so dashboards can join these
+# series to the Fleet page.
+- targets: ["NODE_VPN_IP:9100"]
+  labels:
+    node_id: rocky-llm

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import ContextVar
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -39,6 +40,7 @@ from docie_bench.extract.validators import INVOICE_TOLERANCE, money_amount
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.mcp_servers.calculator import check_sum
+from docie_bench.serving.placement_resolver import PlacementError
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
@@ -55,6 +57,21 @@ from docie_bench.studio.routing_policies import (
 )
 
 PROXY_MODES = ("placeholder", "block", "detect")
+
+# The caller's conversation id for this request, so every backing-model
+# resolution in it (workflow steps included) keeps the same store: replica.
+_SESSION_ID: ContextVar[str | None] = ContextVar("docie_agent_session_id", default=None)
+
+
+def bind_session(body: dict[str, Any]) -> None:
+    """Strip ``session_id`` from ``body`` and make it this request's affinity key.
+
+    Never forwarded upstream. A body without one leaves the current key alone,
+    so a nested workflow step cannot clear it.
+    """
+    raw = body.pop("session_id", None)
+    if isinstance(raw, str) and raw.strip():
+        _SESSION_ID.set(raw.strip())
 
 
 class AgentError(Exception):
@@ -1866,9 +1883,14 @@ def _build_policy_router(spec: AgentSpec, policy_name: str) -> ExtractionRouter:
 
 def _resolve_backing(selector: str | None) -> ModelProfile:
     try:
-        profile = resolve_extraction_profile(model_profile=selector)
+        profile = resolve_extraction_profile(
+            model_profile=selector, session_id=_SESSION_ID.get()
+        )
     except ProfileResolutionError as exc:
         raise AgentError(str(exc), status_code=400, error_type="model_not_found") from exc
+    except PlacementError as exc:
+        # A store: model with no live replica: an honest 409, not a 500.
+        raise AgentError(str(exc), status_code=409, error_type="model_not_ready") from exc
     if profile.kind != "passthrough":
         raise AgentError(
             f"backing profile {profile.name!r} is a {profile.kind!r} solution; "

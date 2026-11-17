@@ -21,3 +21,6 @@ models/*.safetensors
 
 # Sphinx build output
 docs/_build/
+
+# Per-fleet Prometheus targets (node addresses); the .example is tracked
+infra/prometheus/targets/serving-nodes*.yml

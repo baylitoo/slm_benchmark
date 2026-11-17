@@ -387,6 +387,8 @@ def _profile_from_placement(
     max_tokens = row.get("max_tokens") if isinstance(row.get("max_tokens"), int) else None
     timeout = row.get("timeout_seconds")
     timeout_seconds = float(timeout) if isinstance(timeout, (int, float)) else None
+    # Which machine answers, so results attribute a remote deployment's work.
+    node_id = str(row.get("node_id") or "") or None
 
     match = _match_yaml_profile(served_id, yaml_profiles)
     if match is not None:
@@ -400,6 +402,8 @@ def _profile_from_placement(
             max_tokens=max_tokens or match.max_tokens,
             timeout_seconds=timeout_seconds or match.timeout_seconds,
             deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+            served_by_deployment=name,
+            served_by_node=node_id,
         )
     traits = _family_traits(served_id)
     if traits is None:
@@ -421,6 +425,8 @@ def _profile_from_placement(
         max_tokens=max_tokens or traits.max_tokens,
         timeout_seconds=timeout_seconds or traits.timeout_seconds,
         deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+        served_by_deployment=name,
+        served_by_node=node_id,
     )
 
 

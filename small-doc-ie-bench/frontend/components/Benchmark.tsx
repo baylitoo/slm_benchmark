@@ -20,6 +20,7 @@ import {
   listDatasets,
   getDeployments,
   getStore,
+  modelPickerOptions,
   selectableDeployments,
   withoutDecisionModels,
   listSchemas,
@@ -101,13 +102,14 @@ export function Benchmark({ view = "run" }: { view?: string }) {
     listRoutingPolicies,
   );
   const store = useAsync("store", getStore);
-  const modelOptions = useMemo(
+  const modelPicker = useMemo(
     () =>
-      withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data)
-        .map((d) => d.spec?.name)
-        .filter((n): n is string => !!n),
+      modelPickerOptions(
+        withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data),
+      ),
     [deployments.data, store.data],
   );
+  const modelOptions = useMemo(() => modelPicker.map((o) => o.value), [modelPicker]);
 
   const [dataset, setDataset] = useState("");
   const [validateOpen, setValidateOpen] = useState(false);
@@ -344,9 +346,9 @@ export function Benchmark({ view = "run" }: { view?: string }) {
                     }}
                   >
                     <option value="">Default</option>
-                    {modelOptions.map((n) => (
-                      <option key={n} value={n}>
-                        {n}
+                    {modelPicker.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
                       </option>
                     ))}
                     <option value="__custom__">Other (type a profile name)…</option>

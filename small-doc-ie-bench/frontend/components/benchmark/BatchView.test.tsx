@@ -2,10 +2,10 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { SWRConfig } from "swr";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { BatchView } from "@/components/benchmark/BatchView";
+import { BatchView, servedByNode } from "@/components/benchmark/BatchView";
 import { ToastProvider } from "@/components/Toast";
 import * as api from "@/lib/api";
-import type { BatchRunSummary } from "@/lib/api";
+import type { BatchItemView, BatchRunSummary } from "@/lib/api";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -178,5 +178,25 @@ describe("BatchView", () => {
 
     await userEvent.click(retry);
     expect(api.retryBatchFailed).toHaveBeenCalledWith("ev-4");
+  });
+});
+
+describe("servedByNode", () => {
+  const item = (result: Record<string, unknown> | null): BatchItemView => ({
+    position: 0,
+    filename: "inv-1.pdf",
+    status: "done",
+    result,
+    error: null,
+    latency_ms: 812,
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+
+  it("names the node that answered, and nothing for a configured profile", () => {
+    expect(servedByNode(item({ served_by: { deployment: "lfm2.5-350m-2", node: "rocky-llm" } }))).toBe(
+      "rocky-llm",
+    );
+    expect(servedByNode(item({ model_profile: "lfm2.5-350m" }))).toBeNull();
+    expect(servedByNode(item(null))).toBeNull();
   });
 });

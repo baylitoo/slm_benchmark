@@ -269,3 +269,12 @@ def test_chat_warnings_read_a_remote_deployments_placement(
 
     assert chat_api._tool_calls_supported_for_profile(profile) is False
     assert chat_api._context_length_for_profile(profile) == 8192
+
+def test_a_remote_deployment_profile_says_which_node_answers(sqlite_catalog: None) -> None:
+    """A replica picked by its own name is attributed, like a store: pick."""
+    _place("lfm2.5-350m-2", node_id="rocky-llm", model_name="lfm2.5-350m")
+
+    profile = _resolve(deployment="lfm2.5-350m-2")
+
+    assert profile.served_by_deployment == "lfm2.5-350m-2"
+    assert profile.served_by_node == "rocky-llm"

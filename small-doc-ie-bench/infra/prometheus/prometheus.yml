@@ -9,3 +9,11 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["api:8080"]
+
+  # One target per serving node, over its WireGuard address. Empty until an
+  # operator adds infra/prometheus/targets/serving-nodes.yml (see the
+  # .example beside it and docs/operations/fleet-runbook.md). Prometheus
+  # re-reads the file on change, so adding a node needs no restart.
+  - job_name: serving-nodes
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/serving-nodes*.yml"]

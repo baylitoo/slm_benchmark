@@ -45,6 +45,7 @@ import {
   listMcpServers,
   listRoutingPolicies,
   listSchemas,
+  modelPickerOptions,
   selectableDeployments,
   withoutDecisionModels,
   testMcpServer,
@@ -685,13 +686,19 @@ export function CreateView({
   // Managed deployments, segmented by semantic type — every model an agent
   // uses is a deployment the platform orchestrates, picked (not typed).
   const store = useAsync<StoreEntry[]>("store", getStore);
-  const chatDeployments = useMemo(
+  const chatPicker = useMemo(
     () =>
-      withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data)
-        .filter((d) => deploymentModelType(d) === "chat")
-        .map((d) => d.spec?.name)
-        .filter((n): n is string => !!n),
+      modelPickerOptions(
+        withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data).filter(
+          (d) => deploymentModelType(d) === "chat",
+        ),
+      ),
     [deployments.data, store.data],
+  );
+  const chatDeployments = useMemo(() => chatPicker.map((o) => o.value), [chatPicker]);
+  const chatLabels = useMemo(
+    () => new Map(chatPicker.map((o) => [o.value, o.label])),
+    [chatPicker],
   );
   const encoderDeployments = useMemo(
     () =>
@@ -1163,7 +1170,7 @@ export function CreateView({
                   <option value="">Studio default</option>
                   {chatDeployments.map((n) => (
                     <option key={n} value={n}>
-                      {n}
+                      {chatLabels.get(n) ?? n}
                     </option>
                   ))}
                   <option value="__custom__">Custom reference…</option>
@@ -1373,7 +1380,7 @@ export function CreateView({
                       <optgroup label="Chat deployments">
                         {chatDeployments.map((n) => (
                           <option key={n} value={n}>
-                            {n}
+                            {chatLabels.get(n) ?? n}
                           </option>
                         ))}
                       </optgroup>
@@ -1725,7 +1732,7 @@ export function CreateView({
                           <option value="">Choose a model…</option>
                           {chatDeployments.map((n) => (
                             <option key={n} value={n}>
-                              {n}
+                              {chatLabels.get(n) ?? n}
                             </option>
                           ))}
                         </Select>

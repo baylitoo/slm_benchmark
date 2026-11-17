@@ -475,6 +475,7 @@ def test_results_materialize_as_jsonl_and_flattened_csv(batch_database) -> None:
             "latency_ms": 5,
             "result": {
                 "model_profile": "cheap",
+                "served_by": {"deployment": "lfm2.5-350m-2", "node": "rocky-llm"},
                 "result": {
                     "invoice_number": {"value": "INV-1"},
                     "total_ttc": {"amount": "10.00", "currency": "EUR"},
@@ -500,6 +501,8 @@ def test_results_materialize_as_jsonl_and_flattened_csv(batch_database) -> None:
     assert {"invoice_number.value", "total_ttc.amount", "total_ttc.currency", "line_items"} <= set(
         cols
     )
+    assert row_a.split(",")[cols.index("node_id")] == "rocky-llm"
+    assert row_b.split(",")[cols.index("node_id")] == ""
     assert "INV-1" in row_a
     assert "10.00" in row_a
     assert "EUR" in row_a

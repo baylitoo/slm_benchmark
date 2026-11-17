@@ -12,6 +12,7 @@ import {
   getStore,
   listBatches,
   listRoutingPolicies,
+  modelPickerOptions,
   retryBatchFailed,
   selectableDeployments,
   triggerBatchExtract,
@@ -80,6 +81,12 @@ function ProgressCell({ r }: { r: BatchRunSummary }) {
   );
 }
 
+/** The serving node that answered a done item; null for a configured profile. */
+export function servedByNode(i: BatchItemView): string | null {
+  const servedBy = i.result?.served_by as { node?: unknown } | null | undefined;
+  return typeof servedBy?.node === "string" && servedBy.node ? servedBy.node : null;
+}
+
 function BatchDetail({ eventId }: { eventId: string }) {
   const detail = usePolling<BatchRunDetail>(() => getBatch(eventId), DETAIL_POLL_MS, true);
   const [open, setOpen] = useState<number | null>(null);
@@ -114,6 +121,13 @@ function BatchDetail({ eventId }: { eventId: string }) {
         <span className="text-xs text-muted-foreground tabular-nums">
           {i.latency_ms != null ? `${i.latency_ms} ms` : "—"}
         </span>
+      ),
+    },
+    {
+      key: "node",
+      header: "Node",
+      render: (i) => (
+        <span className="font-mono text-xs text-muted-foreground">{servedByNode(i) ?? "—"}</span>
       ),
     },
     {
@@ -174,12 +188,13 @@ export function BatchView({ active = true }: { active?: boolean }) {
   const fileInput = useRef<HTMLInputElement>(null);
 
   const store = useAsync("store", getStore);
-  const deploymentNames = useMemo(
+  const deploymentOptions = useMemo(
     () =>
-      withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data)
-        .filter((d) => !["encoder", "dense_embedding"].includes(d.spec?.launch?.runtime ?? ""))
-        .map((d) => d.spec?.name)
-        .filter((n): n is string => Boolean(n)),
+      modelPickerOptions(
+        withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data).filter(
+          (d) => !["encoder", "dense_embedding"].includes(d.spec?.launch?.runtime ?? ""),
+        ),
+      ),
     [deployments.data, store.data],
   );
 
@@ -205,13 +220,16 @@ export function BatchView({ active = true }: { active?: boolean }) {
       // One select carries both selector kinds: a "policy:" prefix marks a
       // saved routing policy (mirrors the Agents form); anything else is a
       // deployment name. Exactly one reaches the API -- they are mutually
-      // exclusive server-side.
+      // exclusive server-side. A "store:" model is a profile reference, not a
+      // deployment record, so it travels as model_profile.
       const isPolicy = deployment.startsWith("policy:");
+      const isStore = deployment.startsWith("store:");
       const res = await triggerBatchExtract({
         ...payload,
         name: name.trim() || undefined,
         schema_name: schemaName.trim() || "invoice",
-        deployment: !isPolicy && deployment ? deployment : undefined,
+        deployment: !isPolicy && !isStore && deployment ? deployment : undefined,
+        model_profile: isStore ? deployment : undefined,
         routing_policy: isPolicy ? deployment.slice("policy:".length) : undefined,
       });
       toast({ title: "Batch started", description: res.channel, tone: "success" });
@@ -372,9 +390,9 @@ export function BatchView({ active = true }: { active?: boolean }) {
             <Select value={deployment} onChange={(e) => setDeployment(e.target.value)} aria-label="Model">
               <option value="">(default)</option>
               <optgroup label="Deployments">
-                {deploymentNames.map((n) => (
-                  <option key={n} value={n}>
-                    {n}
+                {deploymentOptions.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
                   </option>
                 ))}
               </optgroup>
