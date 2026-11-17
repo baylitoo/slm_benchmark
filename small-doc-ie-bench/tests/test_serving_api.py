@@ -644,3 +644,15 @@ def test_deployment_slots_reaches_a_deployment_owned_by_another_node(
 
     assert payload["slots"] == [{"id": 0, "is_processing": True}]
     assert seen["endpoint"] == "http://10.8.0.3:8088/v1"
+
+
+def test_logs_for_a_deployment_only_another_node_knows_are_attributed_not_404(
+    serving_home: Path, sqlite_catalog: None
+) -> None:
+    _place("lfm3-1.7b_test-f09ae4", node_id="rocky-llm")
+
+    payload = asyncio.run(deployment_logs("lfm3-1.7b_test-f09ae4"))
+
+    assert payload["lines"] == []
+    assert payload["owner_node_id"] == "rocky-llm"
+    assert "rocky-llm" in (payload["detail"] or "")

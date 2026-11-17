@@ -1125,7 +1125,10 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
                 else None
             )
     except (KeyError, ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        placement = _owning_placement(name)
+        if placement is None:
+            raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        last_error = placement.get("last_error")
 
     tail: list[str] = []
     found_locally = False

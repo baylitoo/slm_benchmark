@@ -77,6 +77,11 @@ export interface DeploymentLogs {
   last_error?: string | null;
   /** Raw stdout/stderr tail (most recent last). */
   lines: string[];
+  /** The node holding the log when it is not on the node serving the API. */
+  owner_node_id?: string | null;
+  logs_found_locally?: boolean;
+  /** Why the tail is empty, when the log lives on another node. */
+  detail?: string | null;
 }
 
 export function getDeploymentLogs(name: string, lines = 200): Promise<DeploymentLogs> {

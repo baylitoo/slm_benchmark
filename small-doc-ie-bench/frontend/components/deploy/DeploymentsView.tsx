@@ -1066,6 +1066,7 @@ function DeploymentLogsPanel({
           <span className="break-words font-mono">{data.last_error}</span>
         </Alert>
       )}
+      {data?.detail && <Alert tone="info">{data.detail}</Alert>}
       <pre className="scroll-thin max-h-72 overflow-auto rounded-md border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground/90">
         {logs.loading && !data
           ? "Loading log…"
