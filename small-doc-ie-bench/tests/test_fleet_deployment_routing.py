@@ -204,3 +204,17 @@ def test_a_model_with_no_live_replica_still_refuses(sqlite_catalog: None) -> Non
 
     with pytest.raises(ProfileResolutionError):
         _resolve(deployment=REMOTE)
+
+
+def test_a_bare_name_on_a_drained_node_is_not_routed(sqlite_catalog: None) -> None:
+    catalog = ModelCatalog()
+    catalog.publish_node_snapshot(
+        node_id="node-b", total_bytes=1 << 33, free_bytes=1 << 32, source="cgroup", sum_rss_bytes=0
+    )
+    _place(REMOTE, node_id="node-b")
+    assert _resolve(model_profile=REMOTE).base_url == "http://node-b:8088/v1"
+
+    catalog.set_node_drain("node-b", drained=True)
+
+    with pytest.raises(Exception, match=REMOTE):
+        _resolve(model_profile=REMOTE)

@@ -451,9 +451,12 @@ def _profiles_on_other_nodes(
     DATABASE_URL is exactly what it was.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.placement_resolver import _drained_node_ids
 
     try:
-        rows = ModelCatalog().list_placements()
+        catalog = ModelCatalog()
+        rows = catalog.list_placements()
+        drained = _drained_node_ids(list(catalog.list_node_snapshots()))
     except CatalogUnavailableError:
         return {}
     except Exception:  # noqa: BLE001 - routing must not break on a DB hiccup
@@ -463,6 +466,10 @@ def _profiles_on_other_nodes(
     for row in rows:
         name = str(row.get("name") or "")
         if not name or name in known:
+            continue
+        # Same exclusions store: routing applies: an operator's drain, and a
+        # deployment its owner reports unhealthy (None = not probed yet).
+        if str(row.get("node_id") or "") in drained or row.get("health_ok") is False:
             continue
         profile = _profile_from_placement(row, yaml_profiles)
         if profile is not None:
