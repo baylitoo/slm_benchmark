@@ -16,6 +16,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     getEvaluatorTemplates: vi.fn(),
     getAgents: vi.fn(),
     getDeployments: vi.fn(),
+    getStore: vi.fn(),
     createEvaluator: vi.fn(),
     listEvaluationResults: vi.fn(),
     listReviews: vi.fn(),
@@ -91,6 +92,10 @@ describe("Evaluators", () => {
     vi.mocked(api.getDeployments).mockResolvedValue([
       { spec: { name: "laya-q8_0", launch: { runtime: "llama_cpp" } }, state: "ready", endpoint: "http://x" },
     ] as never);
+    vi.mocked(api.getStore).mockResolvedValue([
+      { name: "laya-q8_0", family: "decision", decision: true },
+      { name: "lfm2.5-350m", family: "lfm2" },
+    ]);
     vi.mocked(api.createEvaluator).mockImplementation(async (spec) => spec);
   });
 
@@ -126,6 +131,31 @@ describe("Evaluators", () => {
       questions: [{ id: "completed", type: "noul", instructions: "Done?" }],
       review_when: [{ question: "completed", when: "noul_below", value: 0.5 }],
     });
+  });
+
+  it("offers a decision judge only decision models, by model first, then per node", async () => {
+    vi.mocked(api.getDeployments).mockResolvedValue([
+      {
+        spec: { name: "laya-q8_0-f09ae4", launch: { runtime: "llama_cpp", alias: "laya-q8_0" } },
+        replica_group: "laya-q8_0",
+        node_id: "rocky-llm",
+        state: "ready",
+        endpoint: "http://rocky-llm:8090/v1",
+      },
+      { spec: { name: "lfm2.5-350m", launch: { runtime: "llama_cpp" } }, state: "ready", endpoint: "http://x" },
+    ] as never);
+    const user = userEvent.setup();
+    renderPage(<Evaluators />);
+    await user.click(await screen.findByText("Task completion"));
+
+    const picker = screen.getByRole("combobox", { name: "" });
+    await waitFor(() =>
+      expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual([
+        "Select a deployment…",
+        "laya-q8_0",
+        "laya-q8_0-f09ae4 · on rocky-llm",
+      ]),
+    );
   });
 });
 

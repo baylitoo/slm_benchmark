@@ -70,4 +70,12 @@ describe("Agents CreateView — seeded guard encoder", () => {
     await screen.findByRole("option", { name: /gliner-pii-f09ae4/ });
     expect(screen.queryByRole("button", { name: "gliner-pii" })).toBeNull();
   });
+
+  it("lists the guard by model first, then each replica with its node", async () => {
+    vi.mocked(api.getDeployments).mockResolvedValue([PLACED_GUARD]);
+    renderProxy();
+
+    await screen.findByRole("option", { name: "gliner-pii-f09ae4 · on rocky-llm" });
+    expect(screen.getByRole("option", { name: "gliner-pii" })).toHaveValue("gliner-pii");
+  });
 });
