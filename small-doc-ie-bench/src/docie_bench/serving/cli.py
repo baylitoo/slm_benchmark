@@ -17,7 +17,7 @@ from typing import Any
 
 import typer
 
-from docie_bench.serving.control_plane import ControlPlane, to_data
+from docie_bench.serving.control_plane import ControlPlane, mint_deployment_name, to_data
 from docie_bench.serving.drain_wait import (
     DEFAULT_WAIT_TIMEOUT_S,
     assess_node,
@@ -372,20 +372,20 @@ def create_app(
         deployment_name: str | None = typer.Option(
             None,
             "--deployment-name",
-            help="Record name. Defaults to the store name, which is NOT unique "
-            "across nodes -- pass a distinct name per node in a fleet.",
+            help="Record name. Defaults to the store name on a single node and "
+            "to a minted <name>-<suffix> when the catalog knows another node.",
         ),
     ) -> None:
         """Serve a store model in the background with its family's llama-server flags.
 
-        FLEET NOTE: the record name defaults to the store name, so running this
-        on two nodes for the same model creates two records with the same name.
-        `ModelPlacement.name` is the primary key, so the second node's publish
-        overwrites the first's and one replica becomes unroutable while still
-        holding its RAM. Pass ``--deployment-name`` to give each node's record a
-        distinct name. The scale path mints names for this reason (#530); this
-        direct path keeps the store name so single-node use is unchanged.
+        FLEET NOTE: `ModelPlacement.name` is the primary key, so two nodes
+        recording the same name share one placement row and one replica becomes
+        unroutable while still holding its RAM. When the catalog shows another
+        live node the record name is minted (#530); ``--deployment-name`` still
+        wins, and a single node keeps the store name.
         """
+        if deployment_name is None and _catalog_knows_another_node():
+            deployment_name = mint_deployment_name(name)
         _execute(
             ctx,
             lambda plane: plane.up(
@@ -399,7 +399,7 @@ def create_app(
             hint=lambda record: (
                 f"\nServing '{name}' in the background on {_deploy_endpoint(record)}\n"
                 f"The model is still loading; once it answers, run:\n"
-                f"docie-bench benchmark run --model-profile {name}"
+                f"docie-bench benchmark run --model-profile {deployment_name or name}"
             ),
         )
 
@@ -748,6 +748,36 @@ def _deploy_endpoint(record: object) -> str:
                 if port is not None:
                     return f"http://127.0.0.1:{port}/v1"
     return "the allocated port (see the record above)"
+
+
+def _catalog_knows_another_node() -> bool:
+    """Whether a live node other than this one has published to the catalog.
+
+    Same liveness rule as ``FleetView.is_fleet``. An unreadable catalog is a
+    single node, so ``up`` keeps the store name there.
+    """
+    try:
+        import docie_bench.storage.db as db
+        from docie_bench.serving.catalog import ModelCatalog
+        from docie_bench.serving.node_identity import resolve_node_id
+        from docie_bench.serving.node_liveness import stale_node_ids
+        from docie_bench.serving.node_selection import UNREPORTED_CAPACITY
+
+        # Same bound as doctor: an unreachable database must not stall `up`.
+        os.environ.setdefault("PGCONNECT_TIMEOUT", "5")
+        if db.get_session_factory() is None:
+            db.init_engine()
+        snapshots = list(ModelCatalog().list_node_snapshots())
+        own = resolve_node_id()
+    except Exception:  # noqa: BLE001 - no catalog = single node
+        return False
+    stale = stale_node_ids(snapshots)
+    live = {
+        str(s.get("node_id") or "")
+        for s in snapshots
+        if s.get("source") != UNREPORTED_CAPACITY
+    }
+    return bool(live - stale - {"", own})
 
 
 def _execute(
