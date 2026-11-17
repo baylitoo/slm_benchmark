@@ -247,7 +247,8 @@ export interface ModelPickerOption {
  * Picker options that offer a model by its replica group first, which the
  * backend load-balances across replicas, then each replica labelled with its
  * node, which pins that one node. A record that is its own group stays one
- * option under its name.
+ * option under its name. The group is offered only while a replica is live:
+ * an evicted record reloads when named, the group does not.
  */
 export function modelPickerOptions(records: DeploymentRecord[]): ModelPickerOption[] {
   const groups = new Map<string, DeploymentRecord[]>();
@@ -266,10 +267,12 @@ export function modelPickerOptions(records: DeploymentRecord[]): ModelPickerOpti
     // `store:` because a replica may carry the group's own name, and a bare
     // name resolves to that one record before load balancing is considered.
     const scaled = members.length > 1;
-    options.push({
-      value: scaled ? `store:${group}` : group,
-      label: scaled ? `${group} · ${members.length} replicas` : group,
-    });
+    if (members.some(isLiveDeployment)) {
+      options.push({
+        value: scaled ? `store:${group}` : group,
+        label: scaled ? `${group} · ${members.length} replicas` : group,
+      });
+    }
     for (const m of members) {
       const name = m.spec?.name as string;
       options.push({ value: name, label: `${name} · on ${m.node_id || "unknown node"}` });
