@@ -590,7 +590,20 @@ def _context_length_for_profile(profile: ModelProfile) -> int | None:
     for record in _default_live_deployments():
         if record.spec.name == profile.name:
             return record.spec.launch.context_length
-    return None
+    value = _remote_placement_field(profile.name, "context_length")
+    return value if isinstance(value, int) else None
+
+
+def _remote_placement_field(name: str, field: str) -> Any:
+    """``field`` off ``name``'s placement row, for a deployment on another
+    node (no local record). None when unknown or the catalog is unreadable."""
+    from docie_bench.serving.catalog import ModelCatalog
+
+    try:
+        row = ModelCatalog().get_placement(name)
+    except Exception:  # noqa: BLE001 - a warning lookup must never fail the request
+        return None
+    return row.get(field) if row else None
 
 
 def _tool_calls_supported_for_profile(profile: ModelProfile) -> bool | None:
@@ -615,7 +628,8 @@ def _tool_calls_supported_for_profile(profile: ModelProfile) -> bool | None:
     for record in _default_live_deployments():
         if record.spec.name == profile.name:
             return record.tool_calls_supported
-    return None
+    value = _remote_placement_field(profile.name, "tool_calls_supported")
+    return value if isinstance(value, bool) else None
 
 
 async def _post_upstream_streamed(

@@ -297,6 +297,12 @@ class ObservedDeployment:
     # stale cycle: a deployment that stops being live publishes None here,
     # same policy as the throughput fields.
     slot_count: int | None = None
+    # Launch settings + persisted tool-calls verdict: config, not liveness, so
+    # published in every phase for readers without this node's file.
+    tool_calls_supported: bool | None = None
+    context_length: int | None = None
+    max_tokens: int | None = None
+    timeout_seconds: float | None = None
 
 
 def default_fit_check(
@@ -409,6 +415,10 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
                 throughput_measured_at=observed.throughput_measured_at,
                 throughput_source=observed.throughput_source,
                 slot_count=observed.slot_count,
+                tool_calls_supported=observed.tool_calls_supported,
+                context_length=observed.context_length,
+                max_tokens=observed.max_tokens,
+                timeout_seconds=observed.timeout_seconds,
             )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: observed state not published (repair-only cycle)")
@@ -1657,6 +1667,10 @@ class ServingReconciler:
             throughput_measured_at=throughput_at,
             throughput_source=throughput_source,
             slot_count=slot_count,
+            tool_calls_supported=record.tool_calls_supported,
+            context_length=record.spec.launch.context_length,
+            max_tokens=record.spec.launch.max_tokens,
+            timeout_seconds=record.spec.launch.timeout_seconds,
         )
 
 
