@@ -38,6 +38,20 @@ describe("decision deployments in pickers", () => {
   it("a vision decision model is not offered as a vision extractor", () => {
     expect([...api.visionDeploymentNames(STORE)]).toEqual(["lfm2.5-vl-1.6b"]);
   });
+
+  it("types a node-placed record by the model it serves, not its minted name", () => {
+    const placedJulia: DeploymentRecord = {
+      ...makeDeployment("julia-1-q8_0-f09ae4"),
+      replica_group: "julia-1-q8_0",
+      node_id: "rocky-llm",
+    };
+    const placedVl = makeDeployment("lfm2.5-vl-1.6b-3c1d2e");
+    placedVl.spec!.launch!.alias = "lfm2.5-vl-1.6b";
+    const names = api.decisionDeploymentNames(STORE);
+    expect(api.deploymentModelType(placedJulia, undefined, undefined, names)).toBe("decision");
+    expect(api.withoutDecisionModels([placedJulia, CHAT], STORE)).toEqual([CHAT]);
+    expect(api.deploymentServesAny(placedVl, api.visionDeploymentNames(STORE))).toBe(true);
+  });
 });
 
 describe("buildDecisionQuestions", () => {
