@@ -125,8 +125,8 @@ def _remote_deployment(name: str) -> dict[str, Any] | None:
     stay ABSENT rather than guessed. ``_autoload_target`` therefore still
     declines to autoload a deployment owned by another node -- but now because
     the record says nothing about desired state, not because the deployment
-    looked nonexistent. Loading on another node needs desired state that can
-    express it (#590).
+    looked nonexistent. Request-driven autoload still does not reach another
+    node; an operator's load does, through a desired-state request (#590).
 
     No staleness gate, matching ``profile_resolver._profile_from_placement``:
     a node that stopped reporting has not necessarily stopped serving, and
