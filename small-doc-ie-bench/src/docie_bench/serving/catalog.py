@@ -163,6 +163,12 @@ class ModelPlacement(Base):
     # an unhealthy deployment, --no-slots, an older build). Feeds the
     # concurrency-mismatch warning in model_gateway._state_for.
     slot_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Last request served, stamped by whichever process served it (api,
+    # worker, benchmark). The owning node's reconciler folds it into
+    # last_served, so idle unload sees traffic routed from other machines.
+    last_served_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -520,6 +526,7 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     # Owning node (#530). Listed here, not just mapped above, or an existing
     # database would throw UndefinedColumn on the reconciler's first publish.
     ("node_id", String(32)),
+    ("last_served_at", DateTime(timezone=True)),
 )
 
 
@@ -1570,6 +1577,47 @@ class ModelCatalog:
                 return False
             session.delete(row)
             return True
+
+    def touch_served(self, name: str, at: dt.datetime) -> int:
+        """Max-wins ``last_served_at`` for placement ``name``, or for every
+        replica of store model ``name``. Never creates a row; leaves
+        ``updated_at`` alone so placement freshness is not faked by traffic.
+        Returns the number of rows moved forward.
+        """
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            result = session.execute(
+                update(ModelPlacement)
+                .where(
+                    (ModelPlacement.name == name) | (ModelPlacement.model_name == name),
+                    (ModelPlacement.last_served_at.is_(None))
+                    | (ModelPlacement.last_served_at < at),
+                )
+                .values(last_served_at=at, updated_at=ModelPlacement.updated_at)
+                .execution_options(synchronize_session=False)
+            )
+            return int(getattr(result, "rowcount", 0) or 0)
+
+    def last_served_for(self, names: Sequence[str]) -> dict[str, float]:
+        """``last_served_at`` as epoch seconds for the given placements."""
+        if not names:
+            return {}
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            rows = session.execute(
+                select(ModelPlacement.name, ModelPlacement.last_served_at).where(
+                    ModelPlacement.name.in_(names),
+                    ModelPlacement.last_served_at.is_not(None),
+                )
+            ).all()
+        result: dict[str, float] = {}
+        for name, served in rows:
+            if served.tzinfo is None:  # sqlite drops the zone
+                served = served.replace(tzinfo=dt.UTC)
+            result[str(name)] = served.timestamp()
+        return result
 
     def get_placement(self, name: str) -> dict[str, Any] | None:
         """Placement by deployment ``name`` (the table's primary key)."""

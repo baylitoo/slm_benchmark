@@ -173,6 +173,16 @@ RUNTIME_BY_ENGINE: dict[str, str] = {
 }
 
 
+def _catalog_last_served(names: list[str]) -> dict[str, float]:
+    """Catalog ``last_served_at`` for ``names``; empty without a database."""
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    try:
+        return ModelCatalog().last_served_for(names)
+    except CatalogUnavailableError:
+        return {}
+
+
 class ReconcilerSingletonError(RuntimeError):
     """Another live serving replica already holds the reconciler lease."""
 
@@ -420,6 +430,7 @@ class ServingReconciler:
         create_time: Callable[[int], float | None] = _default_create_time,
         publisher: Callable[[list[ObservedDeployment]], None] = _publish_via_catalog,
         recency_home: Path | None = None,
+        catalog_recency: Callable[[list[str]], dict[str, float]] | None = None,
         healthy_reset_threshold: int = 30,
         lease: ReconcilerLease | None = None,
         tracker: ResourceTracker | None = None,
@@ -462,6 +473,10 @@ class ServingReconciler:
         self._create_time = create_time
         self._publisher = publisher
         self._recency_home = recency_home
+        self._catalog_recency = catalog_recency or _catalog_last_served
+        # False when this cycle could not read catalog recency: idle unload
+        # then waits, since a remote caller's traffic may be invisible.
+        self._recency_complete = True
         self._lease = lease
         # PR-2 resource tracker: node RAM snapshot + steady-state footprint
         # calibration each cycle. The default persists footprint sidecars
@@ -1180,6 +1195,14 @@ class ServingReconciler:
         # Fold worker-written recency sidecars first so this cycle's view (and
         # PR-4's idle/LRU decisions) see the freshest last_served.
         stamps = recency.read_for(names, home=self._recency_home)
+        self._recency_complete = True
+        try:
+            for name, served in self._catalog_recency(names).items():
+                if served > stamps.get(name, 0.0):
+                    stamps[name] = served
+        except Exception:  # noqa: BLE001 - never break the cycle
+            self._recency_complete = False
+            logger.debug("catalog recency read failed", exc_info=True)
         if stamps:
             self.supervisor.fold_recency(stamps)
         observations: list[ObservedDeployment] = []
@@ -1458,7 +1481,7 @@ class ServingReconciler:
         pre-PR-4 deployment that never respawned) is left alone: with no
         honest age there is no honest idle verdict.
         """
-        if self.idle_ttl_s <= 0 or record.pinned:
+        if self.idle_ttl_s <= 0 or record.pinned or not self._recency_complete:
             return False
         now = self._clock()
         if record.loaded_at is not None and now - record.loaded_at < self.min_hot_s:

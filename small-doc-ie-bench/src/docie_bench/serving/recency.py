@@ -28,6 +28,11 @@ from docie_bench.serving.paths import serving_home
 
 logger = logging.getLogger(__name__)
 
+# The catalog stamp is throttled per name: the idle TTL is minutes, and a
+# benchmark stamps once per prediction.
+CATALOG_STAMP_INTERVAL_S = 30.0
+_catalog_stamped: dict[str, float] = {}
+
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -124,6 +129,35 @@ def stamp_served_profile(
             target = candidate
     if target:
         stamp(target, timestamp=timestamp, home=home)
+    # The local file only covers deployments this machine owns. The catalog
+    # stamp reaches the owning node wherever it runs, so it is not gated on
+    # the local deployments.json.
+    catalog_name = target
+    if catalog_name is None and profile_name:
+        catalog_name = str(profile_name).removeprefix(STORE_PROFILE_PREFIX)
+    if catalog_name:
+        stamp_catalog(catalog_name, timestamp=timestamp)
+
+
+def stamp_catalog(name: str, *, timestamp: float | None = None) -> None:
+    """Stamp ``last_served_at`` on the placement row(s) for ``name``
+    (best-effort, throttled, never raises)."""
+    import datetime as dt
+
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+
+    now = time.monotonic()
+    last = _catalog_stamped.get(name)
+    if timestamp is None and last is not None and now - last < CATALOG_STAMP_INTERVAL_S:
+        return
+    _catalog_stamped[name] = now
+    value = timestamp if timestamp is not None else time.time()
+    try:
+        ModelCatalog().touch_served(name, dt.datetime.fromtimestamp(value, dt.UTC))
+    except CatalogUnavailableError:
+        pass
+    except Exception:  # noqa: BLE001 - recency must not fail the request
+        logger.debug("catalog recency stamp failed for %r", name, exc_info=True)
 
 
 def read_for(names: list[str], *, home: Path | None = None) -> dict[str, float]:
