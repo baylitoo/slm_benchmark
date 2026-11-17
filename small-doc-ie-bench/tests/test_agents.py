@@ -701,6 +701,26 @@ def test_agent_session_id_pins_backing_replica_and_is_not_forwarded(
     assert sessions == ["conv-7f3a", None]
 
 
+def test_agent_backed_by_an_evicted_store_model_is_a_409(
+    api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.serving.placement_resolver import PlacementNotReadyError
+
+    client, _captured = api
+
+    def evicted(**_: object) -> ModelProfile:
+        raise PlacementNotReadyError("store model 'lfm2.5-350m' placement is 'stopped'")
+
+    monkeypatch.setattr("docie_bench.agents.runtime.resolve_extraction_profile", evicted)
+    _create_proxy(client, model_profile="store:lfm2.5-350m")
+    response = client.post(
+        "/v1/agents/chat/completions",
+        json={"model": "pii-proxy", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "model_not_ready"
+
+
 def test_proxy_block_mode_refuses(api) -> None:
     client, captured = api
     _create_proxy(client, name="blocker", options={"mode": "block"})

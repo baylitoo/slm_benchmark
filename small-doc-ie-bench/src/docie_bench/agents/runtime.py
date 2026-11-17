@@ -40,6 +40,7 @@ from docie_bench.extract.validators import INVOICE_TOLERANCE, money_amount
 from docie_bench.llm.model_gateway import ModelGatewayError
 from docie_bench.llm.model_profiles import ModelProfile
 from docie_bench.mcp_servers.calculator import check_sum
+from docie_bench.serving.placement_resolver import PlacementError
 from docie_bench.serving.profile_resolver import (
     ProfileResolutionError,
     resolve_extraction_profile,
@@ -1887,6 +1888,9 @@ def _resolve_backing(selector: str | None) -> ModelProfile:
         )
     except ProfileResolutionError as exc:
         raise AgentError(str(exc), status_code=400, error_type="model_not_found") from exc
+    except PlacementError as exc:
+        # A store: model with no live replica: an honest 409, not a 500.
+        raise AgentError(str(exc), status_code=409, error_type="model_not_ready") from exc
     if profile.kind != "passthrough":
         raise AgentError(
             f"backing profile {profile.name!r} is a {profile.kind!r} solution; "
