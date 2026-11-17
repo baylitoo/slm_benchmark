@@ -1264,7 +1264,7 @@ export function CreateView({
                     <option value="">None — regex analyzer</option>
                     {guardModel.startsWith("store:") &&
                       !encoderDeployments.some((d) => d.value === guardModel) && (
-                        <option value={guardModel}>{guardModel.slice("store:".length)}</option>
+                        <option value={guardModel}>{`${guardModel.slice("store:".length)} · any live replica`}</option>
                       )}
                     {encoderDeployments.map((d) => (
                       <option key={d.value} value={d.value}>

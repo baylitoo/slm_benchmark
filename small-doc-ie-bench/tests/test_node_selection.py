@@ -373,8 +373,8 @@ def test_an_explicit_name_cannot_be_combined_with_replicas(catalog_db: None) -> 
 
 
 def test_an_untargeted_deploy_is_unchanged_by_any_of_this(catalog_db: None) -> None:
-    """The single-node path must not acquire a catalog dependency: without
-    auto_place or node_id nothing above runs."""
+    """Without auto_place or node_id the request defaults leave the fleet
+    check to decide between placement and the untargeted event."""
     from docie_bench.inngest.studio_api.deploy import DeployRequest
 
     payload = DeployRequest(model=MODEL)
