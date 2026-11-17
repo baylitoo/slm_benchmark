@@ -703,7 +703,7 @@ def test_resources_endpoint_serves_snapshot_and_source_flag() -> None:
     assert payload["node"]["free_bytes"] == 6 * GIB
     assert payload["node"]["sum_rss_bytes"] == 2 * GIB
     assert payload["deployments"] == [
-        {"name": "invoice", "rss_bytes": 2 * GIB, "phase": "hot"}
+        {"name": "invoice", "node_id": "testnode", "rss_bytes": 2 * GIB, "phase": "hot"}
     ]
     assert payload["detail"] is None
 

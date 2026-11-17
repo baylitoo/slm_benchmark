@@ -183,6 +183,8 @@ def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]
     apply rather than being guessed here.
     """
 
+    from docie_bench.serving.control_plane import DESIRED_LAUNCH_KNOBS
+
     def deploy(name: str, spec: dict[str, Any]) -> object:
         kwargs: dict[str, Any] = {"deployment_name": name}
         port = spec.get("port")
@@ -191,6 +193,9 @@ def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]
         context_length = spec.get("context_length")
         if isinstance(context_length, int):
             kwargs["context_length"] = context_length
+        for knob in DESIRED_LAUNCH_KNOBS:
+            if spec.get(knob) is not None:
+                kwargs[knob] = spec[knob]
         return control_plane.supervisor.serve_store_model(
             str(spec.get("model") or name), **kwargs
         )
