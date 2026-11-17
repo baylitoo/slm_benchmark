@@ -454,6 +454,8 @@ class ServingReconciler:
         throughput: ThroughputStore | None = None,
         probe: Callable[[ProbeRequest], ThroughputSample | None] = probe_deployment,
         probe_hot_cycles: int = _PROBE_HOT_CYCLES,
+        seed_gc: Callable[[], object] | None = None,
+        seed_gc_interval_s: float = 3600.0,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -536,6 +538,11 @@ class ServingReconciler:
         # machine came back smaller. A deploy would reallocate a port and
         # rebuild a launch that never went away.
         self._loader = loader
+        # Seed-staging sweep (#664 B7): downloads land on this node's volume,
+        # so this node reclaims them. Unset (tests, CLI) = no sweep.
+        self._seed_gc = seed_gc
+        self._seed_gc_interval_s = seed_gc_interval_s
+        self._seed_gc_last: float | None = None
         self._repairs_due: list[str] = []
         self._repair_last: dict[str, float] = {}
         # Measured throughput: one fixed generation probe per model path, run
@@ -655,12 +662,28 @@ class ServingReconciler:
             self._converge_desired_state()
         except Exception:  # noqa: BLE001 - convergence hiccup != broken cycle
             logger.warning("desired-state convergence failed this cycle", exc_info=True)
+        self._maybe_gc_seed_leftovers()
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
             self._lease.refresh()
         return observations
 
+
+    def _maybe_gc_seed_leftovers(self) -> None:
+        """Run the seed-staging sweep on the first cycle, then once per interval."""
+        if self._seed_gc is None:
+            return
+        now = self._clock()
+        if self._seed_gc_last is not None and now - self._seed_gc_last < self._seed_gc_interval_s:
+            return
+        self._seed_gc_last = now
+        try:
+            summary = self._seed_gc()
+        except Exception:  # noqa: BLE001 - a disk hiccup != broken cycle
+            logger.warning("seed leftover sweep failed this cycle", exc_info=True)
+            return
+        logger.info("seed leftover sweep: %s", summary)
 
     # ------------------------------------------------- desired state (#534)
     def _converge_desired_state(self) -> object:

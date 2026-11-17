@@ -234,6 +234,32 @@ def test_launch_settings_and_tool_calls_verdict_are_published(tmp_path: Path) ->
     assert observed.timeout_seconds == 240.0
 
 
+def test_seed_leftover_sweep_runs_on_this_nodes_reconciler_hourly(tmp_path: Path) -> None:
+    """Downloads land on the serving node, so its reconciler sweeps them: on
+    the first cycle, then at most once per interval (#664 B7)."""
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json", adapters={RuntimeKind.LLAMACPP: ScriptedAdapter()}
+    )
+    now = [1000.0]
+    sweeps: list[float] = []
+    reconciler = ServingReconciler(
+        supervisor,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+        clock=lambda: now[0],
+        seed_gc=lambda: sweeps.append(now[0]),
+        seed_gc_interval_s=3600.0,
+    )
+
+    reconciler.run_cycle()
+    now[0] += 60.0
+    reconciler.run_cycle()
+    now[0] += 3600.0
+    reconciler.run_cycle()
+
+    assert sweeps == [1000.0, 4660.0]
+
+
 def test_run_cycle_exports_deployment_metrics(tmp_path: Path) -> None:
     """Each cycle must export the deployment's health/phase as Prometheus
     gauges (docie_deployment_healthy / docie_deployment_phase) -- otherwise a

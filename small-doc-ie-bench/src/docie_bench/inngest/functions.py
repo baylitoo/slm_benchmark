@@ -2283,44 +2283,6 @@ async def seed_hf_job(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
-# Seed leftovers older than this are unreachable-by-resume in practice: the
-# staging dir is only reused when the SAME store name is re-seeded, and a
-# week-old .part is stale enough that restarting the download costs less than
-# multi-GB files sitting on the volume forever.
-_SEED_LEFTOVER_MAX_AGE_S = 7 * 86400.0
-
-
-def _gc_seed_leftovers_sync() -> dict[str, int]:
-    """Prune stale seed staging dirs + progress sidecars (blocking, best-effort).
-
-    Both are cleaned on a successful seed; a SIGKILL mid-download leaves the
-    multi-GB ``models/.hf-downloads/<name>`` staging dir and the run's
-    ``seed-progress`` sidecar behind with no other reclaimer.
-    """
-    from docie_bench.serving.seed_progress import prune_stale
-
-    removed_staging = 0
-    staging_root = model_store_root() / ".hf-downloads"
-    now = time.time()
-    try:
-        children = list(staging_root.iterdir())
-    except OSError:
-        children = []
-    for child in children:
-        try:
-            # Newest mtime under the dir: directory mtime alone misses writes
-            # into an existing .part file.
-            stamps = [child.stat().st_mtime]
-            stamps += [p.stat().st_mtime for p in child.rglob("*")]
-        except OSError:
-            continue
-        if now - max(stamps) > _SEED_LEFTOVER_MAX_AGE_S:
-            shutil.rmtree(child, ignore_errors=True)
-            removed_staging += 1
-    removed_progress = prune_stale(max_age_s=_SEED_LEFTOVER_MAX_AGE_S)
-    return {"deleted_seed_staging": removed_staging, "deleted_seed_progress": removed_progress}
-
-
 def _gc_studio_runs_sync() -> dict[str, int]:
     """Apply the retention policy to the durable Studio run index (blocking)."""
     from docie_bench.studio.store import default_run_store
@@ -2338,8 +2300,6 @@ def _gc_studio_runs_sync() -> dict[str, int]:
     else:
         logger.info("studio run GC skipped: no DATABASE_URL")
         summary = {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
-    # The serving-volume sweep needs no database — run it either way.
-    summary.update(_gc_seed_leftovers_sync())
     summary.update(_gc_session_documents_sync())
     summary.update(_gc_agent_runs_sync())
     logger.info("studio run GC: %s", summary)
