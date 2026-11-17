@@ -221,6 +221,9 @@ def _records_for_other_nodes(
                 "endpoint": row.get("endpoint"),
                 "last_error": row.get("last_error"),
                 "node_id": row.get("node_id"),
+                # ``evicted`` is the owner's idle unload (activation managed),
+                # ``cold`` a manual stop; a request may reload only the first.
+                "activation": "managed" if row.get("phase") == "evicted" else None,
                 # The UI needs to know this record is a catalog projection and
                 # not the owning node's own record, so it does not offer
                 # actions that need the file it does not have.

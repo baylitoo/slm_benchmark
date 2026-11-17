@@ -3190,7 +3190,9 @@ function DeploymentSelect({
         const runtime = d.spec?.launch?.runtime ?? "?";
         const suffix = isLiveDeployment(d)
           ? ""
-          : d.state === "stopped"
+          : d.node_reporting === false
+            ? " · server not reporting"
+            : d.state === "stopped"
             ? " · evicted — loads on request"
             : " · loading";
         return (

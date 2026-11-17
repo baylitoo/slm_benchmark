@@ -10,7 +10,9 @@ import type { DeploymentRecord, ModelFamily, StoreEntry } from "./serving";
  * `endpoint`. Mirrors the backend resolver's `_is_live` gate.
  */
 export function isLiveDeployment(r: DeploymentRecord): boolean {
-  return r.state === "ready" && !!r.endpoint;
+  // A node that stopped reporting keeps its last "ready" row; its deployments
+  // are not offered as live until it reports again.
+  return r.state === "ready" && !!r.endpoint && r.node_reporting !== false;
 }
 
 /**
