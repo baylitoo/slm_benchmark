@@ -70,4 +70,18 @@ describe("DeploymentsView on a fleet", () => {
     await userEvent.selectOptions(screen.getByLabelText("Node"), "rocky-llm");
     expect(rowNames()).toEqual(["lfm3-1.7b"]);
   });
+
+  it("gives a remote row the same actions as a local one, with its queued request", () => {
+    const remote = {
+      ...record("lfm3-1.7b", "rocky-llm", 2),
+      record_source: "catalog",
+      node_request: { id: "r1", node_id: "rocky-llm", verb: "pin", status: "pending" },
+    } as DeploymentRecord;
+    renderView([record("nuextract3", "central", 5), remote]);
+
+    expect(screen.getAllByTitle("Edit deployment runtime settings")).toHaveLength(2);
+    expect(screen.getAllByTitle(/^Delete: stop the process/)).toHaveLength(2);
+    expect(screen.getByText("pin pending")).toBeInTheDocument();
+    expect(screen.queryByText("remote")).not.toBeInTheDocument();
+  });
 });

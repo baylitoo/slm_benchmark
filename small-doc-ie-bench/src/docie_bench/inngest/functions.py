@@ -171,8 +171,20 @@ def _request_remote_load(name: str) -> bool:
     """
     from fastapi import HTTPException
 
-    from docie_bench.inngest.serving_api import _owning_placement, _remote_lifecycle
+    from docie_bench.inngest.serving_api import (
+        _owning_placement,
+        _remote_lifecycle,
+        _route_to_owner,
+    )
 
+    # On a fleet the owner is asked directly, this node included: the event
+    # would reach whichever node Inngest picks.
+    try:
+        if _route_to_owner(name, event=LOAD_EVENT, extra=None, remote_action="load"):
+            return True
+    except HTTPException as exc:
+        logger.warning("load of %r not routed: %s", name, exc.detail)
+        return True
     record = _read_deployment(name)
     if record is None or record.get("record_source") != "catalog":
         return False

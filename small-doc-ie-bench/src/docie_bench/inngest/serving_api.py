@@ -225,6 +225,10 @@ def _records_for_other_nodes(
                         "model": row.get("model_name"),
                         "runtime": RUNTIME_BY_ENGINE.get(str(row.get("engine") or "")),
                         "port": _endpoint_port(row.get("endpoint")),
+                        # The owner's launch settings, so the edit form opens
+                        # prefilled for a row this process has no file for.
+                        "context_length": row.get("context_length"),
+                        "max_tokens": row.get("max_tokens"),
                     },
                 },
                 "state": row.get("state"),
@@ -234,6 +238,7 @@ def _records_for_other_nodes(
                 # ``evicted`` is the owner's idle unload (activation managed),
                 # ``cold`` a manual stop; a request may reload only the first.
                 "activation": "managed" if row.get("phase") == "evicted" else None,
+                "pinned": bool(row.get("pinned")),
                 # The UI needs to know this record is a catalog projection and
                 # not the owning node's own record, so it does not offer
                 # actions that need the file it does not have.
@@ -304,7 +309,31 @@ async def list_deployments() -> Any:
         # withheld-restart reason to it), so prefer it over the raw record's.
         last_error = (obs or {}).get("last_error") or record.get("last_error")
         record["failure_kind"] = classify_failure(record.get("state"), last_error)
+    _attach_node_requests(records)
     return records
+
+
+def _attach_node_requests(records: list[Any]) -> None:
+    """The newest queued action per deployment (#590), so a row shows an
+    action that is pending on its node, or why it failed."""
+    from docie_bench.serving.catalog import ModelCatalog
+
+    names = [
+        str((r.get("spec") or {}).get("name") or "")
+        for r in records
+        if isinstance(r, dict)
+    ]
+    try:
+        catalog = ModelCatalog()
+        catalog.expire_node_requests(NODE_REQUEST_TTL_S)
+        latest = catalog.latest_node_requests([n for n in names if n])
+    except Exception:  # noqa: BLE001 - the listing must not depend on it
+        return
+    for record in records:
+        if isinstance(record, dict):
+            name = str((record.get("spec") or {}).get("name") or "")
+            if name in latest:
+                record["node_request"] = latest[name]
 
 
 # The api NEVER measures RAM itself: a psutil call in this process would
@@ -1527,6 +1556,83 @@ def _remote_lifecycle(
     }
 
 
+# How long a queued request may wait for its node before it reads as expired.
+NODE_REQUEST_TTL_S = 600.0
+
+
+def _route_to_owner(
+    name: str,
+    *,
+    event: str,
+    extra: dict[str, Any] | None,
+    remote_action: str | None,
+) -> dict[str, Any] | None:
+    """Send a lifecycle action to the node that owns ``name`` (#590).
+
+    ``None`` leaves the caller on the event path: a single node (every event
+    lands on it), no catalog, or no known owner. Otherwise a load or unload
+    of a deployment desired state manages goes through desired state, as
+    before; every other action is queued as a request the owner runs on its
+    next cycle. A delete also removes the desired row, so convergence
+    cannot start the deployment again.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    placement = _owning_placement(name)
+    owner = str((placement or {}).get("node_id") or "")
+    if not owner:
+        return None
+    try:
+        catalog = ModelCatalog()
+        snapshots = list(catalog.list_node_snapshots())
+    except CatalogUnavailableError:
+        return None
+    stale = stale_node_ids(snapshots)
+    reporting = [s for s in snapshots if str(s.get("node_id") or "") not in stale]
+    if len(reporting) < 2:
+        return None
+    if owner in stale:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"deployment {name!r} runs on serving node {owner!r}, which has "
+                f"stopped reporting; a request queued for it would not run"
+            ),
+        )
+    verb = {
+        DELETE_EVENT: "delete",
+        LOAD_EVENT: "load",
+        UNLOAD_EVENT: "unload",
+        REPAIR_EVENT: "repair",
+        RECONFIGURE_EVENT: "reconfigure",
+        PIN_EVENT: "pin" if (extra or {}).get("pinned", True) else "unpin",
+    }.get(event)
+    if verb is None:
+        return None
+    desired_rows = catalog.desired_snapshot(owner).get("deployments") or []
+    desired = next(
+        (row for row in desired_rows if isinstance(row, dict) and row.get("name") == name),
+        None,
+    )
+    if desired is not None and remote_action and verb in ("load", "unload"):
+        return _remote_lifecycle(name, placement or {}, action=remote_action)
+    if desired is not None and verb == "delete":
+        catalog.delete_desired_deployment(
+            owner, name, expected_generation=int(desired.get("generation") or 0)
+        )
+    args = {k: v for k, v in (extra or {}).items() if k != "pinned"}
+    request = catalog.enqueue_node_request(owner, name, verb, args)
+    return {
+        "event_ids": [],
+        "channel": None,
+        "name": name,
+        "node_id": owner,
+        "request_id": request["id"],
+        "detail": f"{verb} queued for serving node {owner!r}; it runs on that node's next cycle",
+    }
+
+
 async def _fire_lifecycle_event(
     name: str,
     *,
@@ -1537,12 +1643,19 @@ async def _fire_lifecycle_event(
 ) -> dict[str, Any]:
     """404-gate ``name`` then fire one ``serving/*`` lifecycle event.
 
+    On a fleet the event is not used: it would reach whichever node Inngest
+    picks. The action goes to the owning node as a request instead
+    (:func:`_route_to_owner`), for this node's own deployments too.
+
     Shared shape for delete/load/unload/pin: the api can neither spawn nor
     kill a runtime (different PID namespace, and only the serving service may
     write ``deployments.json``), so every mutation is an event handled on the
     single-replica ``serving`` service. Returns the event id(s) + channel to
     poll; 404 for an unknown deployment so a typo never queues a no-op job.
     """
+    routed = _route_to_owner(name, event=event, extra=extra, remote_action=remote_action)
+    if routed is not None:
+        return routed
     try:
         await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:

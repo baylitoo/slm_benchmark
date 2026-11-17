@@ -183,6 +183,25 @@ def _catalog_last_served(names: list[str]) -> dict[str, float]:
         return {}
 
 
+def _forget_applied(name: str) -> None:
+    """Drop ``name`` from what this node applied from desired state, so a
+    deleted deployment is not recreated or re-removed by convergence."""
+    from dataclasses import replace as _replace
+
+    from docie_bench.serving.applied_state import read_applied_state, write_applied_state
+
+    state = read_applied_state()
+    if name not in state.names and name not in state.loads:
+        return
+    write_applied_state(
+        _replace(
+            state,
+            names=frozenset(state.names - {name}),
+            loads={k: v for k, v in state.loads.items() if k != name},
+        )
+    )
+
+
 class ReconcilerSingletonError(RuntimeError):
     """Another live serving replica already holds the reconciler lease."""
 
@@ -303,6 +322,7 @@ class ObservedDeployment:
     context_length: int | None = None
     max_tokens: int | None = None
     timeout_seconds: float | None = None
+    pinned: bool | None = None
 
 
 def default_fit_check(
@@ -419,6 +439,7 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
                 context_length=observed.context_length,
                 max_tokens=observed.max_tokens,
                 timeout_seconds=observed.timeout_seconds,
+                pinned=observed.pinned,
             )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: observed state not published (repair-only cycle)")
@@ -455,6 +476,7 @@ class ServingReconciler:
         probe: Callable[[ProbeRequest], ThroughputSample | None] = probe_deployment,
         probe_hot_cycles: int = _PROBE_HOT_CYCLES,
         seed_gc: Callable[[], object] | None = None,
+        request_executor: Callable[[str, str, dict[str, Any]], object] | None = None,
         seed_gc_interval_s: float = 3600.0,
     ) -> None:
         if interval_s <= 0:
@@ -541,6 +563,7 @@ class ServingReconciler:
         # Seed-staging sweep (#664 B7): downloads land on this node's volume,
         # so this node reclaims them. Unset (tests, CLI) = no sweep.
         self._seed_gc = seed_gc
+        self._request_executor = request_executor
         self._seed_gc_interval_s = seed_gc_interval_s
         self._seed_gc_last: float | None = None
         self._repairs_due: list[str] = []
@@ -663,12 +686,42 @@ class ServingReconciler:
         except Exception:  # noqa: BLE001 - convergence hiccup != broken cycle
             logger.warning("desired-state convergence failed this cycle", exc_info=True)
         self._maybe_gc_seed_leftovers()
+        try:
+            self._run_node_requests()
+        except Exception:  # noqa: BLE001 - a request hiccup != broken cycle
+            logger.warning("node requests failed this cycle", exc_info=True)
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
             self._lease.refresh()
         return observations
 
+
+    def _run_node_requests(self) -> None:
+        """Run this node's queued lifecycle requests (#590), recording each
+        outcome. Verbs are idempotent, so a crash between running one and
+        marking it done only re-runs it."""
+        if self._request_executor is None:
+            return
+        from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+        from docie_bench.serving.node_identity import resolve_node_id
+
+        catalog = ModelCatalog()
+        try:
+            pending = catalog.pending_node_requests(resolve_node_id())
+        except CatalogUnavailableError:
+            return
+        for request in pending:
+            name, verb = str(request["deployment"]), str(request["verb"])
+            error: str | None = None
+            try:
+                self._request_executor(verb, name, dict(request.get("args") or {}))
+                if verb == "delete":
+                    _forget_applied(name)
+            except Exception as exc:  # noqa: BLE001 - reported on the request
+                error = str(exc) or type(exc).__name__
+                logger.warning("node request %s %s failed: %s", verb, name, error)
+            catalog.finish_node_request(str(request["id"]), error=error)
 
     def _maybe_gc_seed_leftovers(self) -> None:
         """Run the seed-staging sweep on the first cycle, then once per interval."""
@@ -1694,6 +1747,7 @@ class ServingReconciler:
             context_length=record.spec.launch.context_length,
             max_tokens=record.spec.launch.max_tokens,
             timeout_seconds=record.spec.launch.timeout_seconds,
+            pinned=record.pinned,
         )
 
 
