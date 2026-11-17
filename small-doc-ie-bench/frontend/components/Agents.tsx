@@ -35,6 +35,7 @@ import {
   deleteAgent,
   deployModel,
   deploymentModelType,
+  deploymentServesAny,
   fileToBase64,
   getAgents,
   getAgentTemplates,
@@ -874,8 +875,9 @@ export function CreateView({
   const visionModels = useMemo(() => {
     const visionSet = visionDeploymentNames(store.data);
     return selectableDeployments(deployments.data ?? [])
+      .filter((d) => deploymentServesAny(d, visionSet))
       .map((d) => d.spec?.name)
-      .filter((n): n is string => !!n && visionSet.has(n));
+      .filter((n): n is string => !!n);
   }, [deployments.data, store.data]);
   // Saved routing policies — a policy can BE the OCR→extract step's extractor
   // (options.extractor = "policy:<name>"), running its confidence-gated

@@ -27,6 +27,25 @@ export function isLiveDeployment(r: DeploymentRecord): boolean {
  */
 export type DeployedModelType = "chat" | "encoder" | "embedding" | "reranker" | "decision";
 
+/**
+ * The store model a deployment serves. A node-placed record has a minted name
+ * (`<model>-<hex>`), so its store name comes from the group or launch alias.
+ */
+export function deploymentServedModel(r: DeploymentRecord): string | undefined {
+  return r.replica_group || r.spec?.launch?.alias || r.spec?.name || undefined;
+}
+
+/** Whether a deployment serves one of `names` (store model names). */
+export function deploymentServesAny(
+  r: DeploymentRecord,
+  names: Set<string> | null | undefined,
+): boolean {
+  if (!names || names.size === 0) return false;
+  const served = deploymentServedModel(r);
+  const name = r.spec?.name;
+  return (!!served && names.has(served)) || (!!name && names.has(name));
+}
+
 export function deploymentModelType(
   r: DeploymentRecord,
   embeddingNames?: Set<string>,
@@ -35,10 +54,9 @@ export function deploymentModelType(
 ): DeployedModelType {
   if (r.spec?.launch?.runtime === "encoder") return "encoder";
   if (r.spec?.launch?.runtime === "dense_embedding") return "embedding";
-  const name = r.spec?.name;
-  if (name && decisionNames?.has(name)) return "decision";
-  if (name && embeddingNames?.has(name)) return "embedding";
-  if (name && rerankerNames?.has(name)) return "reranker";
+  if (deploymentServesAny(r, decisionNames)) return "decision";
+  if (deploymentServesAny(r, embeddingNames)) return "embedding";
+  if (deploymentServesAny(r, rerankerNames)) return "reranker";
   return "chat";
 }
 
@@ -131,7 +149,7 @@ export function withoutDecisionModels<T extends DeploymentRecord>(
   store: StoreEntry[] | null | undefined,
 ): T[] {
   const names = decisionDeploymentNames(store);
-  return deployments.filter((d) => !(d.spec?.name && names.has(d.spec.name)));
+  return deployments.filter((d) => !deploymentServesAny(d, names));
 }
 
 export type DecisionQuestion =
