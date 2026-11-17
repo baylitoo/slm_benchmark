@@ -51,6 +51,10 @@ export interface SizingView {
   };
   per_model: SizingModelFit[];
   node?: NodeSnapshot | null;
+  /** The node these numbers price. */
+  node_id?: string | null;
+  /** Every node that publishes capacity — the selector's options. */
+  nodes?: string[];
   [k: string]: unknown;
 }
 
@@ -89,8 +93,9 @@ export interface WhatIfView {
 }
 
 /** Per-model fit table + capacity numbers, from the observed surface. */
-export function getSizing(): Promise<SizingView> {
-  return request<SizingView>("/v1/serving/sizing");
+export function getSizing(nodeId?: string): Promise<SizingView> {
+  const query = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : "";
+  return request<SizingView>(`/v1/serving/sizing${query}`);
 }
 
 /** Price a hypothetical deployment mix — fits or an explicit deficit.
@@ -99,10 +104,15 @@ export function getSizing(): Promise<SizingView> {
 export function whatifSizing(
   plan: WhatIfPlanEntry[],
   n_parallel?: number,
+  node_id?: string,
 ): Promise<WhatIfView> {
   return request<WhatIfView>("/v1/serving/sizing/whatif", {
     method: "POST",
-    body: JSON.stringify({ plan, ...(n_parallel && n_parallel > 1 ? { n_parallel } : {}) }),
+    body: JSON.stringify({
+      plan,
+      ...(n_parallel && n_parallel > 1 ? { n_parallel } : {}),
+      ...(node_id ? { node_id } : {}),
+    }),
   });
 }
 
