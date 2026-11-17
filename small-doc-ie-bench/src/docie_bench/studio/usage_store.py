@@ -65,11 +65,10 @@ def ensure_usage_record_table(engine: Engine) -> bool:
             )
         existed = sa_inspect(connection).has_table("usage_records")
         connection.execute(CreateTable(usage_table, if_not_exists=True))
-        for index in usage_table.indexes:
-            connection.execute(CreateIndex(index, if_not_exists=True))
-        # Forward migration for tables created before tool_calls_json existed
-        # (#261) -- same ADD-COLUMN-if-missing shape as ensure_batch_tables.
-        # Nullable, no rewrite.
+        # Forward migration for tables created before these columns existed
+        # (#261, node_id) -- same ADD-COLUMN-if-missing shape as
+        # ensure_batch_tables. Nullable, no rewrite. BEFORE the index loop: an
+        # index on a column an older table lacks fails startup.
         added = (("tool_calls_json", "JSON"), ("node_id", "VARCHAR(32)"))
         if engine.dialect.name == "postgresql":
             for column, kind in added:
@@ -83,6 +82,8 @@ def ensure_usage_record_table(engine: Engine) -> bool:
                     connection.execute(
                         sa_text(f"ALTER TABLE usage_records ADD COLUMN {column} {kind}")
                     )
+        for index in usage_table.indexes:
+            connection.execute(CreateIndex(index, if_not_exists=True))
     return not existed
 
 
