@@ -91,16 +91,29 @@ def _record_event_owners(event_ids: list[str], tenant_id: str) -> None:
         pass
 
 
-def _annotate_fits(cards: list[dict[str, Any]], budget: int | None) -> list[dict[str, Any]]:
+def _annotate_fits(
+    cards: list[dict[str, Any]],
+    budget: int | None,
+    *,
+    budgets: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
     """Stamp ``fits_node`` (bool | None) + ``node_available_bytes`` on each card.
 
     ``None`` when the estimate or the budget is unknown -- the badge reads
-    "unknown", never a false "fits". Pure so the fit logic is tested without a
-    node snapshot / database."""
+    "unknown", never a false "fits". With per-node ``budgets``, also stamps
+    ``fits_node_count`` / ``node_count``. Pure so the fit logic is tested
+    without a node snapshot / database."""
     for card in cards:
         est = card.get("size_est_bytes")
         card["node_available_bytes"] = budget
         card["fits_node"] = (
             est <= budget if isinstance(est, int) and isinstance(budget, int) else None
         )
+        if budgets:
+            card["node_count"] = len(budgets)
+            card["fits_node_count"] = (
+                sum(1 for room in budgets.values() if est <= room)
+                if isinstance(est, int)
+                else None
+            )
     return cards

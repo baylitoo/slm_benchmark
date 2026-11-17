@@ -298,6 +298,15 @@ def _target_node_deploy(
                 f"(`docie-serving store seed-ollama ...` on that node)"
             ),
         )
+    from docie_bench.inngest.serving_api import admit_replica_ram
+
+    admit_replica_ram(
+        payload.model,
+        1,
+        payload.context_length,
+        n_parallel=payload.n_parallel,
+        node_id=str(payload.node_id),
+    )
 
     deployment_name = payload.name or mint_deployment_name(payload.model)
     try:
@@ -332,13 +341,32 @@ def _desired_spec(payload: DeployRequest) -> dict[str, Any]:
     rather than a frozen command line -- which is also what lets a node that
     joins later converge on a row written before it existed.
     """
+    from docie_bench.serving.control_plane import DESIRED_LAUNCH_KNOBS
+
     spec: dict[str, Any] = {
         "model": payload.model,
         "context_length": payload.context_length,
     }
     if payload.port is not None:
         spec["port"] = payload.port
+    for knob in DESIRED_LAUNCH_KNOBS:
+        value = getattr(payload, knob)
+        if value is not None and not (knob == "n_parallel" and value == 1):
+            spec[knob] = value
     return spec
+
+
+def _refuse_runtime_on_desired_path(payload: DeployRequest) -> None:
+    """The owning node starts desired rows from the store; it cannot honour an
+    explicit runtime, so say so instead of launching a different one."""
+    if payload.runtime:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "an explicit runtime cannot be combined with node_id or "
+                "auto_place: the owning node deploys store entries (Auto) only"
+            ),
+        )
 
 
 def _auto_place_deploy(
@@ -368,6 +396,7 @@ def _auto_place_deploy(
     )
     from docie_bench.serving.node_liveness import stale_node_ids
     from docie_bench.serving.node_selection import select_nodes
+    from docie_bench.settings import get_settings
 
     if payload.name and payload.replicas > 1:
         raise HTTPException(
@@ -411,6 +440,7 @@ def _auto_place_deploy(
         stale=stale_node_ids(snapshots),
         context_length=payload.context_length,
         n_parallel=payload.n_parallel,
+        margin_fraction=get_settings().serving_sizing_margin_fraction,
     )
     if len(chosen) < payload.replicas:
         rejected = [
@@ -485,8 +515,10 @@ async def trigger_deploy(
             ),
         )
     if payload.auto_place:
+        _refuse_runtime_on_desired_path(payload)
         return _auto_place_deploy(payload, tenant)
     if payload.node_id:
+        _refuse_runtime_on_desired_path(payload)
         return _target_node_deploy(payload, tenant)
     if payload.replicas > 1:
         return await _trigger_replicated_deploy(payload, tenant)
@@ -580,37 +612,54 @@ async def hf_repo_ggufs(repo: Annotated[str, Query(min_length=3)]) -> dict[str, 
     }
 
 
-def _node_available_bytes() -> int | None:
-    """Deploy budget for a new model after margin and in-flight reservations.
+def _node_budgets() -> dict[str, int]:
+    """Deploy budget per admitting node, after margin and in-flight reservations.
 
-    Uses the same sizing engine as the deployment fit gate, including RAM still
-    owed to models that are loading. A missing, stale, or unreachable snapshot
-    returns None, so preflight says "unknown" rather than manufacturing a fit.
+    Uses the same sizing engine as the deployment fit gate, each node priced
+    with only its own placements. Drained, silent, unmeasured and stale nodes
+    are left out, so an empty result reads "unknown", never a fit.
     """
-    from docie_bench.inngest.serving_api import _gate_snapshot_staleness
+    from docie_bench.inngest.serving_api import (
+        _capacity_reporting,
+        _gate_snapshot_staleness,
+        _placements_on,
+    )
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
     from docie_bench.serving.resources import FootprintStore
     from docie_bench.serving.sizing import compute_sizing
     from docie_bench.settings import get_settings
 
+    budgets: dict[str, int] = {}
     try:
         catalog = ModelCatalog()
-        snapshot, _detail = _gate_snapshot_staleness(catalog.get_node_snapshot())
-        if snapshot is None:
-            return None
-        report = compute_sizing(
-            catalog.list(),
-            snapshot,
-            catalog.list_placements(),
-            footprints=FootprintStore(),
-            margin_fraction=get_settings().serving_sizing_margin_fraction,
-        )
+        snapshots = _capacity_reporting(catalog.list_node_snapshots())
+        models = catalog.list()
+        placements = list(catalog.list_placements())
+        for row in snapshots:
+            node_id = str(row.get("node_id") or "")
+            snapshot, _detail = _gate_snapshot_staleness(row)
+            if not node_id or snapshot is None or snapshot.get("drained_at"):
+                continue
+            report = compute_sizing(
+                models,
+                snapshot,
+                _placements_on(node_id, placements, sole_node=len(snapshots) == 1),
+                footprints=FootprintStore(),
+                margin_fraction=get_settings().serving_sizing_margin_fraction,
+            )
+            if report.free_effective_bytes is not None:
+                budgets[node_id] = max(report.free_effective_bytes, 0)
     except CatalogUnavailableError:
-        return None
+        return {}
     except Exception:  # noqa: BLE001 - a DB hiccup must not fail the search
-        return None
-    available = report.free_effective_bytes
-    return max(available, 0) if available is not None else None
+        return {}
+    return budgets
+
+
+def _node_available_bytes() -> int | None:
+    """The roomiest admitting node's deploy budget; None when none is known."""
+    budgets = _node_budgets()
+    return max(budgets.values()) if budgets else None
 
 
 @router.get("/hf/search")
@@ -657,9 +706,12 @@ async def hf_search(
     except HfHubError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    # Annotate "fits this node": compare each card's coarse size estimate to the
-    # node's deploy budget (free - safety margin). None on either side → unknown.
-    return _shared._annotate_fits(cards, _node_available_bytes())
+    # Annotate "fits": each card's coarse size estimate against the roomiest
+    # admitting node's deploy budget, plus how many nodes it fits on.
+    budgets = _node_budgets()
+    return _shared._annotate_fits(
+        cards, max(budgets.values()) if budgets else None, budgets=budgets
+    )
 
 
 @router.get("/hf/inspect")

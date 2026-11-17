@@ -37,7 +37,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from docie_bench.serving.sizing import compute_sizing
+from docie_bench.serving.sizing import DEFAULT_MARGIN_FRACTION, compute_sizing
 
 #: ``source`` value of a node row that exists without a measurement.
 UNREPORTED_CAPACITY = "unreported"
@@ -109,6 +109,7 @@ def rank_nodes(
     stale: Collection[str] = (),
     context_length: int | None = None,
     n_parallel: int = 1,
+    margin_fraction: float = DEFAULT_MARGIN_FRACTION,
 ) -> list[NodeCandidate]:
     """Every known node, judged for ``model``, best first.
 
@@ -155,6 +156,7 @@ def rank_nodes(
                 ],
                 context_length=context_length,
                 n_parallel=n_parallel,
+                margin_fraction=margin_fraction,
             )
             free_effective = report.free_effective_bytes
             for fit in report.per_model:
@@ -197,6 +199,7 @@ def select_nodes(
     stale: Collection[str] = (),
     context_length: int | None = None,
     n_parallel: int = 1,
+    margin_fraction: float = DEFAULT_MARGIN_FRACTION,
 ) -> tuple[list[str], list[NodeCandidate]]:
     """``(chosen, all_candidates)`` -- up to ``count`` DISTINCT nodes.
 
@@ -217,6 +220,7 @@ def select_nodes(
         stale=stale,
         context_length=context_length,
         n_parallel=n_parallel,
+        margin_fraction=margin_fraction,
     )
     chosen = [c.node_id for c in candidates if c.eligible][: max(0, count)]
     return chosen, candidates

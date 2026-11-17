@@ -7,7 +7,17 @@ import { LiveIndicator } from "../LiveIndicator";
 import { Table, type Column } from "../patterns/Table";
 import { stateTone } from "./shared";
 
-type PortRow = PortsViewData["deployments"][number];
+type PortRow = PortsViewData["deployments"][number] & { node_id?: string };
+
+/** The api host's records plus every other node's live ports (by_node). */
+function portRows(data: PortsViewData | null): PortRow[] | null {
+  if (!data) return null;
+  const local = new Set(data.deployments.map((r) => r.name));
+  const remote = Object.entries(data.by_node ?? {}).flatMap(([node_id, rows]) =>
+    rows.filter((r) => !local.has(r.name)).map((r) => ({ ...r, node_id })),
+  );
+  return [...data.deployments, ...remote];
+}
 
 const COLUMNS: Column<PortRow>[] = [
   {
@@ -15,6 +25,12 @@ const COLUMNS: Column<PortRow>[] = [
     header: "Name",
     sortAccessor: (r) => r.name ?? "",
     render: (r) => r.name ?? <span className="text-muted-foreground">—</span>,
+  },
+  {
+    key: "node",
+    header: "Node",
+    sortAccessor: (r) => r.node_id ?? "",
+    render: (r) => r.node_id ?? <span className="text-muted-foreground">this host</span>,
   },
   {
     key: "port",
@@ -65,7 +81,7 @@ export function PortsAdmin({ ports }: { ports: ReturnType<typeof usePolling<Port
     >
       <Table
         columns={COLUMNS}
-        rows={data?.deployments ?? null}
+        rows={portRows(data)}
         loading={ports.loading}
         error={ports.error}
         // Index-fallback like every sibling Table caller (DeploymentsView,

@@ -257,8 +257,11 @@ export interface CatalogCard {
    *  exact quantity the deploy fit-check uses). false = too big; null = unknown
    *  (no node snapshot / DB down) — never render a false "fits" for null. */
   fits_node: boolean | null;
-  /** That deploy budget in bytes, for a tooltip. */
+  /** That deploy budget in bytes, for a tooltip — the roomiest admitting node. */
   node_available_bytes: number | null;
+  /** On a fleet: how many admitting nodes the model fits on, of `node_count`. */
+  fits_node_count?: number | null;
+  node_count?: number | null;
 }
 
 /** Query for the enriched catalog search. All fields optional/defensive. */

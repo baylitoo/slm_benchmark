@@ -12,6 +12,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     getPorts: vi.fn(),
+    getFleet: vi.fn(),
     deployModel: vi.fn(),
   };
 });
@@ -290,5 +291,51 @@ describe("DeployForm — auto placement", () => {
 
     expect(await screen.findByText(/cannot be combined with replicas/)).toBeInTheDocument();
     expect(api.deployModel).not.toHaveBeenCalled();
+  });
+
+  it("disables a drained or silent node with the reason, but not a node that has not started", async () => {
+    const node = (node_id: string, extra: Partial<api.FleetNode>): api.FleetNode => ({
+      node_id,
+      total_bytes: 0,
+      free_bytes: 0,
+      source: "cgroup",
+      sum_rss_bytes: 0,
+      reporting: true,
+      never_reported: false,
+      deployments: 0,
+      drain_state: "admitting",
+      ...extra,
+    });
+    vi.mocked(api.getFleet).mockResolvedValue({
+      observed_available: true,
+      nodes: [
+        node("rocky-llm", {}),
+        node("ovh-cpu-02", { drain_state: "drained", drained_at: "2026-11-17T08:00:00Z" }),
+        node("edge-01", { reporting: false }),
+        node("edge-02", { reporting: false, never_reported: true }),
+      ],
+    });
+    const user = userEvent.setup();
+    renderForm([
+      {
+        name: "lfm2.5-350m",
+        available_backends: ["llamacpp"],
+        nodes: {
+          present: ["rocky-llm", "ovh-cpu-02", "edge-01"],
+          missing: [],
+          unreported: ["edge-02"],
+        },
+      },
+    ]);
+
+    await user.click(screen.getByText("lfm2.5-350m"));
+    const picker = screen.getByLabelText("Target node") as HTMLSelectElement;
+    const option = (name: RegExp) =>
+      within(picker).getByRole("option", { name }) as HTMLOptionElement;
+
+    await waitFor(() => expect(option(/ovh-cpu-02 — drained/).disabled).toBe(true));
+    expect(option(/edge-01 — stopped reporting/).disabled).toBe(true);
+    expect(option(/edge-02/).disabled).toBe(false);
+    expect(option(/rocky-llm/).disabled).toBe(false);
   });
 });

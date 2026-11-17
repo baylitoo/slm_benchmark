@@ -126,9 +126,13 @@ function TierBadge({ tier }: { tier: Tier }) {
 function FitBadge({ card }: { card: CatalogCard }) {
   const { t } = useI18n();
   if (card.fits_node == null) return null;
+  const fleet =
+    card.node_count != null && card.node_count > 1 && card.fits_node_count != null
+      ? `fits on ${card.fits_node_count} of ${card.node_count} nodes; `
+      : "";
   const budget =
     card.node_available_bytes != null
-      ? `node has ~${formatBytes(card.node_available_bytes)} free (after margin)`
+      ? `${fleet}${fleet ? "roomiest" : "node"} has ~${formatBytes(card.node_available_bytes)} free (after margin)`
       : undefined;
   return (
     <Badge tone={card.fits_node ? "ok" : "err"} className={budget ? "cursor-help" : undefined}>
