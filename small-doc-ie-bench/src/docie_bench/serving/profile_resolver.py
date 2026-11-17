@@ -383,6 +383,8 @@ def _profile_from_placement(
     served_id = str(row.get("model_name") or name)
     slot_count = row.get("slot_count")
     negotiated = row.get("negotiated_style")
+    # Which machine answers, so results attribute a remote deployment's work.
+    node_id = str(row.get("node_id") or "") or None
 
     match = _match_yaml_profile(served_id, yaml_profiles)
     if match is not None:
@@ -394,6 +396,8 @@ def _profile_from_placement(
             kind="passthrough",
             response_format_style=str(negotiated) if negotiated else match.response_format_style,
             deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+            served_by_deployment=name,
+            served_by_node=node_id,
         )
     traits = _family_traits(served_id)
     if traits is None:
@@ -415,6 +419,8 @@ def _profile_from_placement(
         max_tokens=traits.max_tokens,
         timeout_seconds=traits.timeout_seconds,
         deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+        served_by_deployment=name,
+        served_by_node=node_id,
     )
 
 

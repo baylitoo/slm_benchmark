@@ -218,3 +218,13 @@ def test_a_bare_name_on_a_drained_node_is_not_routed(sqlite_catalog: None) -> No
 
     with pytest.raises(Exception, match=REMOTE):
         _resolve(model_profile=REMOTE)
+
+
+def test_a_remote_deployment_profile_says_which_node_answers(sqlite_catalog: None) -> None:
+    """A replica picked by its own name is attributed, like a store: pick."""
+    _place("lfm2.5-350m-2", node_id="rocky-llm", model_name="lfm2.5-350m")
+
+    profile = _resolve(deployment="lfm2.5-350m-2")
+
+    assert profile.served_by_deployment == "lfm2.5-350m-2"
+    assert profile.served_by_node == "rocky-llm"
