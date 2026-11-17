@@ -6,6 +6,7 @@ import {
   approveReview,
   claimReview,
   correctReview,
+  getAgentRun,
   getReviewEvidence,
   listReviews,
   rejectReview,
@@ -16,6 +17,8 @@ import {
   type ReviewEvidenceView,
   type ReviewStatus,
   type ReviewTaskView,
+  type AgentRunView,
+  type EvaluatorVerdict,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { toUserMessage } from "@/lib/errors";
@@ -35,6 +38,7 @@ const STATUS_TONE: Record<ReviewStatus, BadgeTone> = {
   claimed: "info",
   approved: "ok",
   rejected: "err",
+  expired: "neutral",
 };
 
 const STATUS_FILTERS: { value: ReviewStatus | "all"; label: string }[] = [
@@ -51,7 +55,8 @@ const STATUS_FILTERS: { value: ReviewStatus | "all"; label: string }[] = [
  * yet" gap it used to point at). One view: the status filter lives on the
  * queue table itself, nothing to split into sub-tabs.
  */
-export function Review({ active = true }: { active?: boolean }) {
+export function Review({ active = true, view }: { active?: boolean; view?: string }) {
+  const kind = view === "agent-runs" ? "agent_run" : "extraction";
   const { toast } = useToast();
   const [status, setStatus] = useState<ReviewStatus | "all">("pending");
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -65,10 +70,14 @@ export function Review({ active = true }: { active?: boolean }) {
   const [pinnedTask, setPinnedTask] = useState<ReviewTaskView | null>(null);
 
   const queue = usePolling<ReviewTaskView[]>(
-    () => listReviews(status === "all" ? undefined : { status }),
+    () => listReviews(status === "all" ? { kind } : { status, kind }),
     POLL_MS,
     active,
   );
+  useEffect(() => {
+    setExpanded(null);
+    setPinnedTask(null);
+  }, [kind]);
   const notEnabled = queue.error instanceof ApiError && queue.error.status === 422;
 
   const displayRows = useMemo(() => {
@@ -165,8 +174,12 @@ export function Review({ active = true }: { active?: boolean }) {
   return (
     <div>
       <PageHeader
-        title="Review"
-        subtitle="Extractions admitted for human review — low confidence, weak evidence, arithmetic mismatches, or model disagreement."
+        title={kind === "agent_run" ? "Review · Agent runs" : "Review · Documents"}
+        subtitle={
+          kind === "agent_run"
+            ? "Agent runs an evaluator flagged — read the run and its verdicts, then approve or reject."
+            : "Extractions admitted for human review — low confidence, weak evidence, arithmetic mismatches, or model disagreement."
+        }
       />
 
       {notEnabled ? (
@@ -213,7 +226,17 @@ export function Review({ active = true }: { active?: boolean }) {
             emptyIcon={<ClipboardCheck className="h-5 w-5" />}
             expandedKey={expanded != null ? String(expanded) : null}
             onRowClick={selectRow}
-            renderExpanded={(t) => (
+            renderExpanded={(t) =>
+              t.kind === "agent_run" ? (
+                <AgentRunDetail
+                  task={t}
+                  onChanged={(updated) => {
+                    if (expanded === updated.id) setPinnedTask(updated);
+                    queue.refresh();
+                  }}
+                  onConflict={handleConflict}
+                />
+              ) : (
               <TaskDetail
                 task={t}
                 onChanged={(updated) => {
@@ -226,7 +249,8 @@ export function Review({ active = true }: { active?: boolean }) {
                 }}
                 onConflict={handleConflict}
               />
-            )}
+              )
+            }
           />
         </>
       )}
@@ -730,6 +754,21 @@ function TaskDetail({
         </div>
       )}
 
+      <ReviewActions task={task} busy={busy} run={run} />
+    </div>
+  );
+}
+
+function ReviewActions({
+  task,
+  busy,
+  run,
+}: {
+  task: ReviewTaskView;
+  busy: boolean;
+  run: (action: () => Promise<ReviewTaskView>) => Promise<void>;
+}) {
+  return (
       <div className="flex flex-wrap items-center gap-2">
         {task.status === "pending" && (
           <Button
@@ -779,6 +818,156 @@ function TaskDetail({
           </p>
         )}
       </div>
+  );
+}
+
+function verdictSummary(v: EvaluatorVerdict): string {
+  if (v.error) return `failed: ${v.error}`;
+  if (v.type === "noul" && v.noul != null) return `yes ${(v.noul * 100).toFixed(0)}%`;
+  if (v.type === "score" && v.score != null) return `score ${v.score.toFixed(2)}`;
+  if (v.type === "choice" && v.choice != null) return v.choice;
+  return "—";
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) =>
+        part && typeof part === "object" && "text" in part
+          ? String((part as { text: unknown }).text)
+          : "",
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+  return content == null ? "" : JSON.stringify(content);
+}
+
+function AgentRunDetail({
+  task,
+  onChanged,
+  onConflict,
+}: {
+  task: ReviewTaskView;
+  onChanged: (updated: ReviewTaskView) => void;
+  onConflict: (err: unknown) => Promise<boolean>;
+}) {
+  const { toast } = useToast();
+  const [busy, setBusy] = useState(false);
+  const [run, setRun] = useState<AgentRunView | null>(null);
+  const [runError, setRunError] = useState<unknown>(null);
+  const runId = String(task.original_prediction.run_id ?? task.source_request_id);
+  const verdicts = (task.original_prediction.verdicts ?? []) as EvaluatorVerdict[];
+
+  useEffect(() => {
+    let cancelled = false;
+    setRun(null);
+    setRunError(null);
+    getAgentRun(runId)
+      .then((r) => {
+        if (!cancelled) setRun(r);
+      })
+      .catch((e) => {
+        if (!cancelled) setRunError(e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+
+  async function act(action: () => Promise<ReviewTaskView>) {
+    setBusy(true);
+    try {
+      onChanged(await action());
+    } catch (err) {
+      if (!(await onConflict(err))) {
+        toast({
+          title: "Action failed",
+          description: toUserMessage(err, { fallback: "Action failed." }),
+          tone: "error",
+        });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-1.5">
+        {task.priority_reasons.map((r, i) => (
+          <Alert key={i} tone="warn">
+            {r.detail}
+          </Alert>
+        ))}
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div>
+          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            <T>Verdicts</T>
+          </p>
+          <div className="space-y-1.5">
+            {verdicts.map((v, i) => (
+              <div key={i} className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium text-foreground">
+                    {v.evaluator} · {v.question_id}
+                  </span>
+                  <Badge tone={v.error ? "err" : "neutral"}>{verdictSummary(v)}</Badge>
+                  <span
+                    className="text-muted-foreground"
+                    title={
+                      v.provenance === "measured"
+                        ? "Read off a decision model's classifier head"
+                        : "Written by an LLM judge"
+                    }
+                  >
+                    {v.provenance === "measured" ? "model probability" : "LLM judgement"}
+                  </span>
+                </div>
+                {v.reason && <p className="mt-1 text-foreground/90">{v.reason}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+        <div>
+          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Run{run ? ` — ${run.agent}` : ""}
+          </p>
+          {runError ? (
+            <Alert tone="info">
+              The run is no longer stored: runs are deleted once their review is decided.
+              The verdicts remain.
+            </Alert>
+          ) : !run ? (
+            <Skeleton className="h-24" />
+          ) : (
+            <div className="space-y-1.5 text-sm">
+              {run.messages
+                .filter((m) => m.role !== "system")
+                .map((m, i) => (
+                  <div key={i} className="rounded-md border border-border px-3 py-2">
+                    <p className="text-xs font-medium text-muted-foreground">{m.role}</p>
+                    <p className="whitespace-pre-wrap">{messageText(m.content)}</p>
+                  </div>
+                ))}
+              {run.tool_calls.length > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  Tools: {run.tool_calls.map((c) => `${c.tool} (${c.status})`).join(", ")}
+                </p>
+              )}
+              <div className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
+                <p className="text-xs font-medium text-muted-foreground">assistant</p>
+                <p className="whitespace-pre-wrap">{run.output}</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <ReviewActions task={task} busy={busy} run={act} />
     </div>
   );
 }

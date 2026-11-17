@@ -14,6 +14,8 @@ class ReviewStatus(StrEnum):
     CLAIMED = "claimed"
     APPROVED = "approved"
     REJECTED = "rejected"
+    # An agent-run review nobody decided in time; not a human verdict.
+    EXPIRED = "expired"
 
 
 class ReviewReason(BaseModel):
@@ -26,6 +28,7 @@ class ReviewReason(BaseModel):
         "learning_value",
         "routing_escalated",
         "manual",
+        "evaluator",
     ]
     score: float = Field(ge=0.0)
     detail: str
@@ -127,6 +130,7 @@ class ReviewEventView(BaseModel):
 
 class ReviewTaskView(BaseModel):
     id: int
+    kind: Literal["extraction", "agent_run"] = "extraction"
     source_request_id: str
     schema_name: str
     model_profile: str

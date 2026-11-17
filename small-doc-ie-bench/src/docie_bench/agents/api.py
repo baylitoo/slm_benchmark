@@ -36,6 +36,11 @@ from docie_bench.agents.registry import (
 from docie_bench.agents.runtime import AgentError, complete_agent
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.agents.templates import AGENT_TEMPLATES, template_by_id
+from docie_bench.evaluators.capture import (
+    completion_text,
+    completion_tool_calls,
+    schedule_capture,
+)
 from docie_bench.openai_protocol import openai_error, single_chunk_stream, sse_event
 from docie_bench.security import TenantContext, get_quota_manager
 from docie_bench.studio import usage_store
@@ -341,6 +346,7 @@ async def _serve_completion(spec: AgentSpec, request: Request, tenant: TenantCon
     AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
     _record_pii_metrics(spec.name, completion)
     _record_agent_usage(spec, tenant, started, completion)
+    _capture(spec, tenant, body, completion_text(completion), completion_tool_calls(completion))
     if wants_stream:
         return _single_chunk_sse(completion)
     return JSONResponse(completion)
@@ -373,6 +379,8 @@ async def _serve_raw_stream(
         # chat_api._stream_chat_completions -- this must never become a
         # de-facto buffering point for what the client receives.
         usage: dict[str, Any] | None = None
+        text_parts: list[str] = []
+        completed = False
         parse_buffer: bytearray | None = bytearray()
         try:
             async for chunk in byte_iterator:
@@ -397,11 +405,17 @@ async def _serve_raw_stream(
                             continue
                         if isinstance(frame, dict) and isinstance(frame.get("usage"), dict):
                             usage = frame["usage"]
+                        text_parts.append(_delta_text(frame))
+            completed = True
         finally:
             AGENT_REQUESTS.labels(spec.name, spec.kind, "ok").inc()
             AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
             outcome = {"usage": usage} if usage is not None else {}
             _record_agent_usage(spec, tenant, started, outcome)
+            # Only a stream that ran to its end, and was short enough to scan,
+            # is captured: a partial answer would be judged as the whole run.
+            if completed and parse_buffer is not None:
+                _capture(spec, tenant, body, "".join(text_parts), [])
 
     return StreamingResponse(relay(), status_code=status_code, media_type=media_type)
 
@@ -443,9 +457,39 @@ async def _serve_queue_stream(
                     "stream ended with no content", status_code=500, error_type="internal_error"
                 )
             _record_agent_usage(spec, tenant, started, outcome)
+            if isinstance(outcome, dict):
+                _capture(
+                    spec, tenant, body, completion_text(outcome), completion_tool_calls(outcome)
+                )
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(relay(), media_type="text/event-stream")
+
+
+def _delta_text(frame: Any) -> str:
+    try:
+        content = frame["choices"][0]["delta"].get("content")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+    return content if isinstance(content, str) else ""
+
+
+def _capture(
+    spec: AgentSpec,
+    tenant: TenantContext,
+    body: dict[str, Any],
+    output: str,
+    tool_calls: list[dict[str, Any]],
+) -> None:
+    schedule_capture(
+        agent=spec.name,
+        agent_kind=spec.kind,
+        tenant_id=tenant.tenant_id,
+        api_key_id=tenant.api_key_id,
+        body=body,
+        output=output,
+        tool_calls=tool_calls,
+    )
 
 
 def _record_pii_metrics(agent_name: str, completion: dict[str, Any]) -> None:

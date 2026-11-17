@@ -10,7 +10,7 @@ import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -760,10 +760,17 @@ def review_queue(
     _tenant: TenantDependency,
     status: ReviewStatus | None = None,
     reviewer_id: str | None = None,
+    # Defaults to extraction so existing API clients keep seeing documents only.
+    kind: Literal["extraction", "agent_run", "all"] = "extraction",
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> list[ReviewTaskView]:
     try:
-        return list_reviews(status=status, reviewer_id=reviewer_id, limit=limit)
+        return list_reviews(
+            status=status,
+            reviewer_id=reviewer_id,
+            kind=None if kind == "all" else kind,
+            limit=limit,
+        )
     except Exception as exc:
         raise _review_http_error(exc) from exc
 

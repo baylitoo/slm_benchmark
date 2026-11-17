@@ -129,6 +129,7 @@ from .routing_policies import (
 from .routing_policies import (
     router as _routing_policies_router,
 )
+from .evaluators import router as _evaluators_router
 from .runs import (
     ComparisonRequest,
     create_comparison,
@@ -152,6 +153,7 @@ for _sub_router in (
     _model_profiles_router,
     _dynamic_schemas_router,
     _routing_policies_router,
+    _evaluators_router,
     _benchmark_router,
     _deploy_router,
     _runs_router,

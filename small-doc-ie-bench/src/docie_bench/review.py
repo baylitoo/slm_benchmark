@@ -327,6 +327,7 @@ def _suggest_arithmetic_corrections(prediction: dict[str, Any]) -> list[FieldCor
 def _task_view(task: ReviewTask, *, include_history: bool = True) -> ReviewTaskView:
     return ReviewTaskView(
         id=task.id,
+        kind=task.kind or "extraction",  # type: ignore[arg-type]
         source_request_id=task.source_request_id,
         schema_name=task.schema_name,
         model_profile=task.model_profile,
@@ -432,10 +433,98 @@ def enqueue_review(payload: ReviewTaskCreate, *, force: bool = False) -> ReviewT
         return _task_view(task)
 
 
+def enqueue_agent_run_review(
+    *,
+    run_id: str,
+    agent: str,
+    evaluators: list[str],
+    reasons: list[str],
+    verdicts: list[dict[str, Any]],
+) -> ReviewTaskView:
+    """Queue an agent run that an evaluator flagged, once per run.
+
+    The task holds the run id and the verdicts, not the conversation: the
+    reviewer reads that from ``agent_runs``, which expires on its own
+    schedule, so review history never extends how long run text is kept.
+    A repeat call for the same run (an Inngest retry) returns the existing task.
+    """
+    with session_scope() as maybe_session:
+        session = _require_session(maybe_session)
+        existing = session.scalars(
+            select(ReviewTask).where(ReviewTask.source_request_id == run_id)
+        ).first()
+        if existing is not None:
+            return _task_view(existing)
+        prediction = {"run_id": run_id, "agent": agent, "verdicts": verdicts}
+        task = ReviewTask(
+            kind="agent_run",
+            source_request_id=run_id,
+            schema_name=agent[:64],
+            model_profile=",".join(evaluators)[:128],
+            priority=float(len(reasons)),
+            priority_reasons_json=[
+                ReviewReason(code="evaluator", score=1.0, detail=reason).model_dump(mode="json")
+                for reason in reasons
+            ],
+            original_prediction_json=prediction,
+            latest_prediction_json=prediction,
+            validation_errors_json=[],
+            validation_warnings_json=[],
+            metadata_json={"agent": agent},
+            status=ReviewStatus.PENDING,
+            version=1,
+        )
+        _event(task, "enqueued", details={"evaluators": evaluators})
+        session.add(task)
+        _flush(session)
+        return _task_view(task)
+
+
+AGENT_REVIEW_MAX_AGE = dt.timedelta(days=30)
+
+
+def expire_undecided_agent_reviews(now: dt.datetime | None = None) -> list[str]:
+    """Close agent-run reviews left undecided past ``AGENT_REVIEW_MAX_AGE``.
+
+    A run is kept until its review is decided, so a queue nobody works would
+    keep conversation text forever. These tasks become ``expired``, a status
+    of their own so nothing reads them as a human verdict. Returns the run ids
+    whose text the caller should now delete.
+    """
+    current = now or _utcnow()
+    cutoff = current - AGENT_REVIEW_MAX_AGE
+    with session_scope() as maybe_session:
+        session = _require_session(maybe_session)
+        tasks = list(
+            session.scalars(
+                select(ReviewTask)
+                .where(
+                    ReviewTask.kind == "agent_run",
+                    ReviewTask.status.in_((ReviewStatus.PENDING, ReviewStatus.CLAIMED)),
+                    ReviewTask.created_at < cutoff,
+                )
+                .options(selectinload(ReviewTask.events))
+            )
+        )
+        for task in tasks:
+            from_status = task.status
+            task.status = ReviewStatus.EXPIRED
+            task.claimed_by = None
+            task.claim_expires_at = None
+            task.decided_at = current
+            task.decision_comment = "not reviewed within 30 days"
+            task.version += 1
+            task.updated_at = current
+            _event(task, "expired", from_status=from_status)
+        _flush(session)
+        return [task.source_request_id for task in tasks]
+
+
 def list_reviews(
     *,
     status: ReviewStatus | None = None,
     reviewer_id: str | None = None,
+    kind: str | None = None,
     limit: int = 100,
 ) -> list[ReviewTaskView]:
     now = _utcnow()
@@ -464,6 +553,8 @@ def list_reviews(
             statement = statement.where(ReviewTask.status == status)
         if reviewer_id is not None:
             statement = statement.where(ReviewTask.claimed_by == reviewer_id)
+        if kind is not None:
+            statement = statement.where(ReviewTask.kind == kind)
         tasks = list(session.scalars(statement.limit(limit)))
         return [_task_view(task, include_history=False) for task in tasks]
 
@@ -619,6 +710,10 @@ def correct_review(
         _expire_task_claim(task, _utcnow())
         _assert_version(task, expected_version)
         _assert_claim_owner(task, reviewer_id)
+        if task.kind == "agent_run":
+            raise ReviewValidationError(
+                "an agent-run review is approved or rejected, not corrected"
+            )
         _validate_correction_paths(task, corrections)
         corrected = copy.deepcopy(task.latest_prediction_json)
         for correction in corrections:
@@ -674,7 +769,13 @@ def decide_review(
         task.updated_at = task.decided_at
         _event(task, decision.value, actor_id=reviewer_id, from_status=ReviewStatus.CLAIMED)
         _flush(session)
-        return _task_view(task)
+        view = _task_view(task)
+    if view.kind == "agent_run":
+        # An agent run is kept only until its review is decided.
+        from docie_bench.studio.agent_run_store import delete_agent_run
+
+        delete_agent_run(view.source_request_id)
+    return view
 
 
 def export_annotations(
@@ -695,7 +796,10 @@ def export_annotations(
 
     with session_scope() as maybe_session:
         session = _require_session(maybe_session)
-        statement = select(ReviewTask).where(ReviewTask.status == ReviewStatus.APPROVED)
+        # Agent-run reviews carry no corrected fields: never training data.
+        statement = select(ReviewTask).where(
+            ReviewTask.status == ReviewStatus.APPROVED, ReviewTask.kind == "extraction"
+        )
         if task_ids is not None:
             statement = statement.where(ReviewTask.id.in_(task_ids))
         tasks = list(session.scalars(statement.order_by(ReviewTask.id)))
@@ -754,9 +858,9 @@ def review_metrics() -> ReviewMetricsView:
         session = _require_session(maybe_session)
         tasks = list(
             session.scalars(
-                select(ReviewTask).options(
-                    selectinload(ReviewTask.corrections), selectinload(ReviewTask.events)
-                )
+                select(ReviewTask)
+                .where(ReviewTask.kind == "extraction")
+                .options(selectinload(ReviewTask.corrections), selectinload(ReviewTask.events))
             )
         )
         queue_depth = Counter(task.status for task in tasks)

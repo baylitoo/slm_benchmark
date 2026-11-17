@@ -56,6 +56,7 @@ export * from "./seeding";
 export * from "./batch";
 export * from "./mcp";
 export * from "./review";
+export * from "./evaluators";
 export * from "./agents";
 export * from "./helpers";
 export * from "./browser";

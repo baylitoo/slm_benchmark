@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -416,7 +417,77 @@ class BatchItem(Base):
     run: Mapped[BatchRun] = relationship(back_populates="items")
 
 
+class EvaluatorRecord(Base):
+    """A saved evaluator (``evaluators.spec.EvaluatorSpec``): a judge, its
+    questions, the agents it scores and its review rules.
+
+    Shared operator config, like ``RoutingPolicyRecord``: no tenant column.
+    Unlike routing policies it is editable in place, because enabling,
+    disabling and retargeting an evaluator are routine. ``enabled`` and
+    ``agents`` are copied out of ``spec_json`` so capture can ask "is any
+    enabled evaluator attached to this agent" without decoding every row.
+    """
+
+    __tablename__ = "evaluators"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    spec_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    agents_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AgentRunRecord(Base):
+    """One agent run kept for evaluation: what was asked and what came back.
+
+    Written only for an agent that an enabled evaluator targets, never for a
+    proxy_security agent, and deleted after ``expires_at``. Conversation text
+    is stored nowhere else: the usage ledger keeps counts and tool names only.
+    """
+
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    api_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    messages_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    output_text: Mapped[str] = mapped_column(Text)
+    tool_calls_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    evaluators_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class EvaluationResultRecord(Base):
+    """One evaluator's verdicts on one agent run. Expires with the run: an LLM
+    judge's ``reason`` can quote the conversation."""
+
+    __tablename__ = "evaluation_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    evaluator: Mapped[str] = mapped_column(String(64), index=True)
+    agent: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")
+    verdicts_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    review_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 __all__ = [
+    "AgentRunRecord",
+    "EvaluationResultRecord",
+    "EvaluatorRecord",
     "BatchItem",
     "BatchRun",
     "DynamicSchema",

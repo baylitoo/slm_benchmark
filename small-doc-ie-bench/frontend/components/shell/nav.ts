@@ -30,6 +30,8 @@ import {
   KeyRound,
   Network,
   GitBranch,
+  Scale,
+  Bot as BotIcon,
   type LucideIcon,
 } from "lucide-react";
 
@@ -43,6 +45,7 @@ export type SectionId =
   | "observability"
   | "fleet"
   | "routing"
+  | "evaluators"
   | "api-keys";
 
 export interface NavItem {
@@ -85,6 +88,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { id: "agents", label: "My Agents", icon: Bot, view: "instances" },
       { id: "agents", label: "Create", icon: PlusCircle, view: "create" },
       { id: "schemas", label: "Schemas", icon: FileStack },
+      { id: "evaluators", label: "Evaluators", icon: Scale },
     ],
   },
   {
@@ -101,10 +105,12 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     heading: "Review",
-    // A single view — the queue table itself carries the status filter, so
-    // there's nothing left to split into separate sub-tabs (mirrors
-    // Observability/Playground's single-view sections).
-    items: [{ id: "review", label: "Queue", icon: ClipboardCheck }],
+    // Two queues over one table: documents (fields to correct) and agent runs
+    // flagged by an evaluator (approve or reject only).
+    items: [
+      { id: "review", label: "Documents", icon: ClipboardCheck, view: "documents" },
+      { id: "review", label: "Agent runs", icon: BotIcon, view: "agent-runs" },
+    ],
   },
   {
     heading: "Settings",
@@ -132,6 +138,7 @@ export const SECTIONS: SectionId[] = [
   "observability",
   "fleet",
   "routing",
+  "evaluators",
   "api-keys",
 ];
 
@@ -142,9 +149,10 @@ export const DEFAULT_VIEW: Record<SectionId, string> = {
   agents: "catalog",
   benchmark: "run",
   schemas: "",
-  review: "",
+  review: "documents",
   observability: "",
   fleet: "",
   routing: "",
+  evaluators: "",
   "api-keys": "",
 };

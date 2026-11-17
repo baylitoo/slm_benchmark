@@ -767,6 +767,7 @@ def test_role_partition_is_disjoint_and_complete() -> None:
         "batch-extract",
         "benchmark-run",
         "studio-runs-gc",
+        "agent-run-evaluate",
     }
     assert serving_ids.isdisjoint(worker_ids)
     assert ids(fn.functions) == serving_ids | worker_ids

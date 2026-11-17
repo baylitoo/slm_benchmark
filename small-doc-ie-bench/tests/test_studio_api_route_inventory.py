@@ -43,6 +43,14 @@ EXPECTED_STUDIO_ROUTES = {
     ("GET", "/v1/studio/routing-policies/{name}"),
     ("POST", "/v1/studio/routing-policies"),
     ("DELETE", "/v1/studio/routing-policies/{name}"),
+    ("GET", "/v1/studio/evaluators"),
+    ("GET", "/v1/studio/evaluators/templates"),
+    ("GET", "/v1/studio/evaluators/{name}"),
+    ("GET", "/v1/studio/evaluators/{name}/results"),
+    ("POST", "/v1/studio/evaluators"),
+    ("PUT", "/v1/studio/evaluators/{name}"),
+    ("DELETE", "/v1/studio/evaluators/{name}"),
+    ("GET", "/v1/studio/agent-runs/{run_id}"),
     ("POST", "/v1/studio/benchmark"),
     ("POST", "/v1/studio/deploy"),
     ("POST", "/v1/studio/seed-hf"),
@@ -85,4 +93,4 @@ def test_studio_api_route_surface_is_unchanged() -> None:
         for method in methods
     }
     assert actual == EXPECTED_STUDIO_ROUTES
-    assert len(EXPECTED_STUDIO_ROUTES) == 43
+    assert len(EXPECTED_STUDIO_ROUTES) == 51
