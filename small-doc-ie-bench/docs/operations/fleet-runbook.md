@@ -531,6 +531,40 @@ leaves that model's requests going to a machine that is off.
    off, which is exactly why they are not reaped.
 4. Its `serving_node` row stays as a tombstone showing when it last reported.
 
+## Metrics from serving nodes
+
+The central Prometheus scrapes the api, which reports requests, latency and
+extraction outcomes for the whole fleet. It does not see a node's host: RAM
+pressure, CPU and disk on the machine that runs the models.
+
+The `serving-nodes` scrape job adds one target per node. It reads
+`infra/prometheus/targets/serving-nodes.yml`, which is git-ignored because it
+holds your fleet's addresses. Copy the `.example` beside it and add one entry
+per node:
+
+```yaml
+- targets: ["NODE_VPN_IP:9100"]
+  labels:
+    node_id: rocky-llm
+```
+
+- `NODE_VPN_IP` is the node's WireGuard address, the same value as its
+  `DOCIE_SERVING_PUBLISH_IP`.
+- `9100` is the port of an exporter **you** run on that host, such as
+  node_exporter. A serving node ships no `/metrics` endpoint of its own: the
+  `serving` container runs the reconciler, not an HTTP server.
+- `node_id` must be the id the node publishes, as shown on the Fleet page, so
+  that dashboards can join host series to placements.
+
+The central host must reach `NODE_VPN_IP:9100` over the tunnel, so the hub's
+`AllowedIPs` for that peer must include the node's address. Prometheus re-reads
+the file when it changes, so adding a node needs no restart. With no file, the
+job has no targets and nothing alerts.
+
+Per-model llama-server metrics are not scraped. Each deployment listens on a
+port allocated at deploy time, and DocIE does not start llama-server with
+`--metrics`, so there is no stable target to list.
+
 ## Diagnose
 
 | Symptom | Likely cause |
