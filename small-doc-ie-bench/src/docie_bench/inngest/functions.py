@@ -1573,16 +1573,9 @@ async def _run_deploy(data: dict[str, Any]) -> Any:
 @serving_client.create_function(
     fn_id="serving-deploy",
     trigger=inngest.TriggerEvent(event="serving/deploy.requested"),
-    # Global (not per-model/per-host key), limit=1: unlike serving-load's
-    # LoadCoordinator, the deploy path (ControlPlane.serve/up ->
-    # _DefaultSupervisor.serve/serve_store_model) never checks RAM fit against
-    # other in-flight deploys before spawning. Serving is single-replica by
-    # construction (see _guard_deterministic_advertise and this fn's own
-    # docstring), so every deploy lands on the same node's RAM regardless of
-    # which model it names -- a per-model key would let two unrelated deploys
-    # spawn concurrently and jointly overcommit the host, which is exactly the
-    # gap this closes.
-    concurrency=[inngest.Concurrency(limit=1)],
+    # No platform concurrency limit: a global one let a long load on one node
+    # block deploys on every node. Overcommit is prevented per node by
+    # control_plane._DEPLOY_LOCK around _DefaultSupervisor.serve/serve_store_model.
 )
 async def deploy_model_job(ctx: inngest.Context) -> Any:
     """Deploy a model so it can serve the gateway/benchmark.
