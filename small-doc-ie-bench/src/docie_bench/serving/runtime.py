@@ -454,6 +454,11 @@ def fetch_llamacpp_slots(
     return tuple(normalize_llamacpp_slot(slot) for slot in raw)
 
 
+# Deployments already warned about; health runs every few seconds, the
+# warning is logged once per deployment until its verdict changes.
+_TOOL_CALLS_WARNED: set[tuple[str, str]] = set()
+
+
 def llamacpp_tool_calls_mismatch(props: Mapping[str, Any]) -> str | None:
     """Compare llama-server's own ``GET /props`` report against
     ``RuntimeFeature.TOOL_CALLS`` (#290): ``LlamaCppRuntime.features``
@@ -900,7 +905,11 @@ class LlamaCppRuntime(RuntimeAdapter):
             if isinstance(caps, dict) and isinstance(caps.get("supports_tool_calls"), bool):
                 tool_calls_supported = caps["supports_tool_calls"]
             mismatch = llamacpp_tool_calls_mismatch(props)
-            if mismatch is not None:
+            key = (spec.alias, base)
+            if mismatch is None:
+                _TOOL_CALLS_WARNED.discard(key)
+            elif key not in _TOOL_CALLS_WARNED:
+                _TOOL_CALLS_WARNED.add(key)
                 logger.warning("%s (alias=%r, endpoint=%r)", mismatch, spec.alias, base)
         observed_slots = self.slots(spec, timeout=timeout)
         slot_count = len(observed_slots) or None

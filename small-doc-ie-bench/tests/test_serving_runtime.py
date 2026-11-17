@@ -772,3 +772,28 @@ def test_find_processes_exempts_shared_and_remote_runtimes(
     assert (
         RemoteRuntime().find_processes(_spec(RuntimeKind.REMOTE, endpoint="http://x/v1")) == ()
     )
+
+
+def test_llamacpp_tool_calls_warning_logs_once_until_the_verdict_changes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caps = {"supports_tool_calls": False}
+    adapter = LlamaCppRuntime(
+        which=lambda name: "llama-server",
+        health_get=lambda url, timeout, headers: HealthResult(True, 200),
+        json_get=lambda url, timeout, headers: {"chat_template_caps": dict(caps)},
+    )
+    spec = _spec(RuntimeKind.LLAMACPP, alias="nuextract3-warn-once")
+
+    def warnings() -> int:
+        return sum("nuextract3-warn-once" in r.message for r in caplog.records)
+
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            assert adapter.health(spec).tool_calls_supported is False
+        assert warnings() == 1
+        caps["supports_tool_calls"] = True
+        adapter.health(spec)
+        caps["supports_tool_calls"] = False
+        adapter.health(spec)
+    assert warnings() == 2
