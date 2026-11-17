@@ -321,6 +321,7 @@ async def _serve_completion(spec: AgentSpec, request: Request, tenant: TenantCon
             status_code=400,
             error_type="invalid_request_error",
         )
+    runtime.bind_session(body)
     wants_stream = bool(body.get("stream"))
     started = time.monotonic()
 
