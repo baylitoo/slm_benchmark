@@ -216,6 +216,13 @@ async def run_benchmark(
             ]
     if not selected_profiles:
         raise ValueError("No extraction model profiles selected")
+    # A selector served by the fleet rather than models.yaml is re-resolved per
+    # task; the up-front profile still fixes task identity for resume.
+    live_selector = (
+        model_profile
+        if routing_policy is None and model_profile and model_profile not in profiles
+        else None
+    )
 
     document_hashes = {item.file_path: hash_file(Path(item.file_path)) for item in base_items}
     task_config = {
@@ -430,7 +437,12 @@ async def run_benchmark(
                 "metadata": {"doc_id": item.doc_id, **item.metadata},
             }
             started = time.perf_counter()
+            node_id = getattr(profile, "served_by_node", None)
             try:
+                if live_selector is not None:
+                    # Per task, so a scaled model's replicas share the load.
+                    profile = await asyncio.to_thread(_select_profile, profiles, live_selector)
+                    node_id = getattr(profile, "served_by_node", None)
                 if routing_active:
                     assert routing_policy is not None
                     router = build_extraction_router(routing_policy, profiles)
@@ -467,6 +479,8 @@ async def run_benchmark(
                     "language": item.language,
                     "dynamic_schema": response.dynamic_schema,
                     "model_profile": label,
+                    "node_id": (getattr(response, "served_by", None) or {}).get("node")
+                    or node_id,
                     "ingestion_path": ingestion_path,
                     "response_format_style": getattr(response, "response_format_style", None),
                     # The style the profile *requested* (None under routing, which
@@ -526,6 +540,7 @@ async def run_benchmark(
                     "language": item.language,
                     "dynamic_schema": item.dynamic_schema,
                     "model_profile": label,
+                    "node_id": node_id,
                     "ingestion_path": ingestion_path,
                     "ok": False,
                     "latency_ms": int((time.perf_counter() - started) * 1000),

@@ -259,3 +259,63 @@ def test_select_profile_error_names_what_is_available(monkeypatch):
     assert "typo-name" in message
     assert "alpha" in message  # lists what is actually available
     assert "deploy" in message.lower()  # tells the user what to do
+
+
+def test_fleet_model_is_resolved_per_task_and_rows_record_the_node(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A scaled model spreads across its replicas, and each row says which node answered."""
+    from docie_bench.llm.model_profiles import ModelProfile
+
+    _, models = _inputs(tmp_path)
+    dataset = tmp_path / "fleet.jsonl"
+    lines = []
+    for i in range(4):
+        (tmp_path / f"inv-{i}.txt").write_text(f"Invoice INV-{i}\n", encoding="utf-8")
+        lines.append(json.dumps({"doc_id": f"inv-{i}", "file_path": f"inv-{i}.txt"}))
+    dataset.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    replicas = [
+        ModelProfile(
+            name="store:lfm2.5-350m",
+            model="lfm2.5-350m",
+            base_url=f"http://{node}:8090/v1",
+            api_key="k",
+            response_format_style="json_object",
+            capability_discovery="disabled",
+            served_by_deployment=f"lfm2.5-350m-{node}",
+            served_by_node=node,
+        )
+        for node in ("rocky-llm", "ash-llm")
+    ]
+    calls: list[str | None] = []
+
+    def round_robin(**kwargs: Any) -> ModelProfile:
+        calls.append(kwargs.get("model_profile"))
+        return replicas[(len(calls) - 1) % 2]
+
+    monkeypatch.setattr(
+        "docie_bench.serving.profile_resolver.resolve_extraction_profile", round_robin
+    )
+    _install_stub_transport(monkeypatch, lambda request: _completion(_VALID_EXTRACTION))
+
+    result = asyncio.run(
+        run_benchmark(
+            dataset_path=dataset,
+            models_config_path=models,
+            model_profile="lfm2.5-350m",
+            output_dir=tmp_path / "run",
+        )
+    )
+
+    rows = [
+        json.loads(line)
+        for line in result.predictions_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # One up-front resolve for task identity, then one per document.
+    assert calls == ["lfm2.5-350m"] * 5
+    assert all(row["ok"] for row in rows)
+    nodes = sorted(row["node_id"] for row in rows)
+    assert nodes == ["ash-llm", "ash-llm", "rocky-llm", "rocky-llm"]
+    assert {row["model_profile"] for row in rows} == {"store:lfm2.5-350m"}
