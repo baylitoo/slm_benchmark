@@ -27,6 +27,22 @@ the Inngest dashboard has no authentication at all. Put the fleet on a private
 network (WireGuard is what this was designed against) and use those addresses
 throughout.
 
+### The api and the worker share a disk
+
+Serving nodes need no shared filesystem. The central `api` and `worker` do:
+one writes files that the other opens by path, and nothing checks at startup
+that the two see the same ones. Keep both services on one host with these
+mounts in common, or put each of them on a volume both can reach:
+
+| Path in the container | Why both need it |
+|---|---|
+| `/app/configs` | the api's profile routes edit `models.yaml`; the worker resolves profiles from it |
+| `/app/data` | `datasets.yaml` and the dataset files: the api lists and validates them, the worker benchmarks them |
+| `/app/artifacts` (`artifact-store`) | the api stores batch uploads the worker extracts; the worker stores run artifacts the api serves |
+
+Scaling the worker onto a second host without them fails per job, with a
+missing-file error, rather than at startup.
+
 ## Add a node
 
 1. **Copy the central `.env`** to the new machine, so every application setting
