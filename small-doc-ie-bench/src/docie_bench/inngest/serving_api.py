@@ -1360,7 +1360,8 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     * never deployed (no placement row at all) -- fires the same
       ``serving/deploy.requested`` a first :func:`scale_store_model` replica
       would, using the base name as the deployment name (the established
-      convention: the first replica of ``name`` IS the bare store name).
+      convention: the first replica of ``name`` IS the bare store name). On
+      a fleet, one minted replica is placed as desired state instead.
     * deployed then evicted / not yet ready (a placement row exists but none
       is live) -- fires :data:`LOAD_EVENT`, same as ``POST
       /deployments/{name}/load``.
@@ -1396,6 +1397,9 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     eta = load_timeout_s(None, size_bytes=size_bytes if isinstance(size_bytes, int) else None)
 
     if not placements:
+        fleet_target = _place_first_fleet_replica(name)
+        if fleet_target is not None:
+            return fleet_target, eta
         channel = f"deploy:{uuid.uuid4().hex}"
         data = {
             "model": name,
@@ -1420,6 +1424,28 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
             return None
         return target, eta
     return name, eta
+
+
+def _place_first_fleet_replica(name: str) -> str | None:
+    """On a fleet, the replica a load-on-demand of ``name`` should wait for.
+
+    An untargeted deploy event lands on whichever node Inngest picks, maybe one
+    without the blob, under a name another node may also use. Instead one
+    replica is placed by fit as desired state. A replica already asked for
+    (desired, not yet converged) is reused, so concurrent first requests do not
+    place one each; the read and the write have no ``await`` between them.
+    Returns None off a fleet, where the deploy event is still right.
+    """
+    from docie_bench.inngest.fleet_scale import place_replicas, read_fleet_view
+    from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
+    view = read_fleet_view(name)
+    if view is None or not view.is_fleet:
+        return None
+    if view.owners:
+        return sorted(view.owners)[0]
+    placed = place_replicas(name, 1, view, context_length=DEFAULT_DEPLOY_CONTEXT_LENGTH)
+    return str(placed[0]["name"])
 
 
 def _owning_placement(name: str) -> dict[str, Any] | None:
