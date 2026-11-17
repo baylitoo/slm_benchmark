@@ -163,8 +163,31 @@ HTML_TEMPLATE = Template(
     </tbody>
   </table>
 
+  {% if hardware and hardware.nodes %}
+  <h2>Serving Nodes</h2>
+  <table>
+    <thead><tr>
+      <th>Node</th><th>Memory</th><th>Free</th><th>Budget</th><th>Measured at</th>
+    </tr></thead>
+    <tbody>
+    {% for node_id, hw in hardware.nodes.items() %}
+      <tr>
+        <td>{{ node_id }}</td>
+        {% for key in ('total_bytes', 'free_bytes', 'effective_budget_bytes') %}
+        <td>{{ '%.1f GiB'|format(hw[key] / 1073741824) if hw[key] else '—' }}</td>
+        {% endfor %}
+        <td>{{ hw.updated_at or '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
   <div class="cpu-section">
     <h2>CPU Usage During Benchmark</h2>
+    {% if hardware and hardware.source == 'serving_node' %}
+      <p class="cpu-meta">Sampled on the benchmark worker, not on the serving nodes above.</p>
+    {% endif %}
     {% if cpu_chart %}
       <p class="cpu-meta">
         Sampled every 1 s &nbsp;|&nbsp;
@@ -300,6 +323,7 @@ def write_report(run_dir: Path, metrics: dict[str, Any]) -> Path:
             summary=metrics.get("summary", []),
             rows=metrics.get("rows", []),
             reproducibility=metrics.get("reproducibility"),
+            hardware=metrics.get("hardware"),
             manifest_json=manifest_json,
             cpu_chart=cpu_chart,
             cpu_peak=f"{max(cpus):.0f}" if cpus else "—",

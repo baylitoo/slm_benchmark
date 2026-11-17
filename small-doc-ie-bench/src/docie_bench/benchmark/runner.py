@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -50,6 +51,8 @@ from docie_bench.ocr.service import processor_from_settings
 from docie_bench.serving import recency
 from docie_bench.settings import get_settings
 
+logger = logging.getLogger(__name__)
+
 try:
     import psutil as _psutil
 
@@ -90,6 +93,38 @@ class CpuSampler:
         while not self._stop.wait(self._interval):
             if _psutil is not None:
                 self._samples.append((time.time() - self._t0, _psutil.cpu_percent()))
+
+
+_NODE_HARDWARE_KEYS = (
+    "total_bytes",
+    "free_bytes",
+    "ceiling_bytes",
+    "effective_budget_bytes",
+    "source",
+    "updated_at",
+)
+
+
+def serving_hardware(node_ids: list[str | None]) -> dict[str, Any]:
+    """Memory of the serving nodes that answered, from their ``serving_node`` rows.
+
+    The row carries no CPU, so ``cpu_samples`` stay the worker's own psutil
+    readings either way. ``source`` is "worker" when no node is known.
+    """
+    wanted = {node for node in node_ids if node}
+    nodes: dict[str, dict[str, Any]] = {}
+    if wanted:
+        try:
+            from docie_bench.serving.catalog import ModelCatalog
+
+            for snapshot in ModelCatalog().list_node_snapshots():
+                if snapshot.get("node_id") in wanted:
+                    nodes[str(snapshot["node_id"])] = {
+                        key: snapshot.get(key) for key in _NODE_HARDWARE_KEYS
+                    }
+        except Exception:  # noqa: BLE001 - attribution must never fail a run
+            logger.warning("could not read serving node rows for the report", exc_info=True)
+    return {"source": "serving_node" if nodes else "worker", "cpu_source": "worker", "nodes": nodes}
 
 
 @dataclass(frozen=True)
@@ -579,6 +614,7 @@ async def run_benchmark(
         eval_mode=eval_mode,
     )
     metrics["dataset"] = dataset_metadata
+    metrics["hardware"] = serving_hardware([row.get("node_id") for row in prediction_rows])
     threshold = (
         valid_rate_threshold
         if valid_rate_threshold is not None

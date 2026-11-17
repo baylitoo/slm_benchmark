@@ -319,3 +319,23 @@ def test_fleet_model_is_resolved_per_task_and_rows_record_the_node(
     nodes = sorted(row["node_id"] for row in rows)
     assert nodes == ["ash-llm", "ash-llm", "rocky-llm", "rocky-llm"]
     assert {row["model_profile"] for row in rows} == {"store:lfm2.5-350m"}
+
+
+def test_hardware_comes_from_the_answering_nodes_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from docie_bench.benchmark.runner import serving_hardware
+
+    class FakeCatalog:
+        def list_node_snapshots(self) -> list[dict[str, Any]]:
+            return [
+                {"node_id": "rocky-llm", "total_bytes": 16 * 2**30, "free_bytes": 9 * 2**30},
+                {"node_id": "idle-box", "total_bytes": 8 * 2**30, "free_bytes": 8 * 2**30},
+            ]
+
+    monkeypatch.setattr("docie_bench.serving.catalog.ModelCatalog", FakeCatalog)
+    hardware = serving_hardware(["rocky-llm", None, "rocky-llm"])
+    assert hardware["source"] == "serving_node"
+    assert list(hardware["nodes"]) == ["rocky-llm"]
+    assert hardware["nodes"]["rocky-llm"]["total_bytes"] == 16 * 2**30
+
+    # No node known (a models.yaml profile): the worker's own readings stand.
+    assert serving_hardware([None]) == {"source": "worker", "cpu_source": "worker", "nodes": {}}

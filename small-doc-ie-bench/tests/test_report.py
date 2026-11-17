@@ -77,3 +77,17 @@ def test_report_names_the_node_behind_each_flagged_document(tmp_path):
     assert "<th>Node</th>" in report
     # Once in the arithmetic table, once in the ungrounded-fields table.
     assert report.count("<td>rocky-llm</td>") == 2
+
+
+def test_report_lists_serving_node_memory_and_labels_worker_cpu(tmp_path):
+    hardware = {
+        "source": "serving_node",
+        "cpu_source": "worker",
+        "nodes": {"rocky-llm": {"total_bytes": 16 * 2**30, "free_bytes": 9 * 2**30}},
+    }
+    metrics = {"summary": [], "rows": [], "hardware": hardware}
+    report = write_report(tmp_path, metrics).read_text(encoding="utf-8")
+
+    assert "Serving Nodes" in report
+    assert "16.0 GiB" in report
+    assert "not on the serving nodes" in report
