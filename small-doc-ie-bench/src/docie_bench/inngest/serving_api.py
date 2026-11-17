@@ -1198,11 +1198,20 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     from docie_bench.serving.lifecycle import load_timeout_s
     from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
+    target: str | None = None
     try:
         catalog = ModelCatalog()
         entry = catalog.get(name)
         if entry is None:
-            return None
+            # A minted deployment name (``<model>-f09ae4``) is not a store entry;
+            # its placement names the model it serves.
+            placement = catalog.get_placement(name)
+            model_name = str((placement or {}).get("model_name") or "")
+            entry = catalog.get(model_name) if model_name else None
+            if entry is None:
+                return None
+            target = name
+            name = model_name
         placements = catalog.list_placements_for_model(name)
     except CatalogUnavailableError:
         return None
@@ -1220,12 +1229,20 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
         }
         await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
     else:
+        names = [str(row.get("name") or "") for row in placements]
+        if target not in names:
+            target = name if name in names else names[0]
         try:
-            await _fire_lifecycle_event(name, event=LOAD_EVENT, prefix="load")
+            # remote_action: a deployment owned by another node is loaded
+            # through its desired state, not an event any node may pick.
+            await _fire_lifecycle_event(
+                target, event=LOAD_EVENT, prefix="load", remote_action="load"
+            )
         except HTTPException:
             # The deployment record vanished between the catalog read above and
             # this call (rare race) -- nothing sane left to trigger.
             return None
+        return target, eta
     return name, eta
 
 

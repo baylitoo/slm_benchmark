@@ -150,11 +150,40 @@ def _remote_deployment(name: str) -> dict[str, Any] | None:
         "endpoint": row.get("endpoint"),
         "last_error": row.get("last_error"),
         "node_id": row.get("node_id"),
+        # The owner publishes ``evicted`` only for a deployment its idle
+        # policy unloaded (activation managed) and ``cold`` for a manual stop,
+        # so the phase carries the one bit autoload needs.
+        "activation": "managed" if row.get("phase") == "evicted" else None,
         # Same marker the Studio projection uses, for the same reason:
         # a caller must be able to tell a catalog projection from the
         # owning node's own record.
         "record_source": "catalog",
     }
+
+
+def _request_remote_load(name: str) -> bool:
+    """Ask the owning node to load ``name`` through its desired state when
+    another node owns it. False when this node's own file has the record (the
+    load event is then the right channel) or there is no owner to ask.
+
+    An event reaches whichever node Inngest picks, so a load meant for another
+    machine has to go through the one node-scoped channel (#590, #653).
+    """
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import _owning_placement, _remote_lifecycle
+
+    record = _read_deployment(name)
+    if record is None or record.get("record_source") != "catalog":
+        return False
+    placement = _owning_placement(name)
+    if placement is None or not placement.get("node_id"):
+        return False
+    try:
+        _remote_lifecycle(name, placement, action="load")
+    except HTTPException as exc:
+        logger.warning("remote load of %r refused: %s", name, exc.detail)
+    return True
 
 
 def _read_deployment(name: str) -> dict[str, Any] | None:
@@ -508,10 +537,14 @@ async def _ensure_deployment_live(
     # step.run memoization JSON-round-trips the tuple into a list.
     target, budget_s = str(plan[0]), float(plan[1])
     await publish(channel, TOPIC_STATUS, {"state": "loading", "deployment": target})
-    await step.send_event(
-        f"{step_prefix}request-load",
-        inngest.Event(name=LOAD_EVENT, data={"name": target}),
+    remote = await step.run(
+        f"{step_prefix}request-remote-load", lambda: _request_remote_load(target)
     )
+    if not remote:
+        await step.send_event(
+            f"{step_prefix}request-load",
+            inngest.Event(name=LOAD_EVENT, data={"name": target}),
+        )
     remaining = budget_s
     index = 0
     last: dict[str, Any] | None = None
