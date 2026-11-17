@@ -70,18 +70,19 @@ def ensure_usage_record_table(engine: Engine) -> bool:
         # Forward migration for tables created before tool_calls_json existed
         # (#261) -- same ADD-COLUMN-if-missing shape as ensure_batch_tables.
         # Nullable, no rewrite.
+        added = (("tool_calls_json", "JSON"), ("node_id", "VARCHAR(32)"))
         if engine.dialect.name == "postgresql":
-            connection.execute(
-                sa_text(
-                    "ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS tool_calls_json JSON"
+            for column, kind in added:
+                connection.execute(
+                    sa_text(f"ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS {column} {kind}")
                 )
-            )
         else:
             present = {col["name"] for col in sa_inspect(connection).get_columns("usage_records")}
-            if "tool_calls_json" not in present:
-                connection.execute(
-                    sa_text("ALTER TABLE usage_records ADD COLUMN tool_calls_json JSON")
-                )
+            for column, kind in added:
+                if column not in present:
+                    connection.execute(
+                        sa_text(f"ALTER TABLE usage_records ADD COLUMN {column} {kind}")
+                    )
     return not existed
 
 
@@ -96,6 +97,7 @@ def record_usage(
     status: str = "ok",
     tool_calls: list[dict[str, Any]] | None = None,
     api_key_id: str | None = None,
+    node_id: str | None = None,
 ) -> bool:
     """Insert one usage row. Best-effort by contract: NEVER raises.
 
@@ -107,6 +109,8 @@ def record_usage(
     for tests.
     """
     try:
+        if node_id is None:
+            node_id = _owner_of(deployment)
         with session_scope() as session:
             if session is None:
                 return False
@@ -121,6 +125,7 @@ def record_usage(
                     status=status if status in ("ok", "error") else "error",
                     api_key_id=api_key_id,
                     tool_calls_json=tool_calls or None,
+                    node_id=(node_id or None) and node_id[:32],
                 )
             )
         return True
@@ -132,6 +137,20 @@ def record_usage(
             exc_info=True,
         )
         return False
+
+
+def _owner_of(deployment: str) -> str | None:
+    """The node owning deployment ``deployment``, when it names one (a
+    ``store:`` route spread over replicas does not). Best-effort."""
+    if not deployment or deployment.startswith("store:"):
+        return None
+    try:
+        from docie_bench.serving.catalog import ModelCatalog
+
+        placement = ModelCatalog().get_placement(deployment)
+    except Exception:  # noqa: BLE001 - attribution must not fail the ledger
+        return None
+    return str((placement or {}).get("node_id") or "") or None
 
 
 def percentile(sorted_values: list[int], fraction: float) -> float | None:
@@ -267,6 +286,33 @@ def usage_summary(*, tenant_id: str, window_hours: int) -> list[dict[str, Any]]:
         return aggregate_usage([tuple(row) for row in rows])
 
 
+def usage_by_node(*, tenant_id: str, window_hours: int) -> list[dict[str, Any]]:
+    """The same aggregates as :func:`usage_summary`, one entry per serving node
+    (``node_id`` None = not attributed)."""
+    since = utcnow() - dt.timedelta(hours=window_hours)
+    with session_scope() as session:
+        if session is None:
+            return []
+        rows = session.execute(
+            select(
+                UsageRecord.node_id,
+                UsageRecord.status,
+                UsageRecord.prompt_tokens,
+                UsageRecord.completion_tokens,
+                UsageRecord.latency_ms,
+                UsageRecord.created_at,
+                UsageRecord.tool_calls_json,
+            )
+            .where(UsageRecord.tenant_id == tenant_id)
+            .where(UsageRecord.created_at >= since)
+        ).all()
+    by_node = []
+    for entry in aggregate_usage([(row[0] or "", *row[1:]) for row in rows]):
+        entry.pop("tool_calls", None)  # per agent, not per node
+        by_node.append({"node_id": entry.pop("deployment") or None, **entry})
+    return by_node
+
+
 __all__ = [
     "SURFACES",
     "WINDOW_HOURS",
@@ -274,5 +320,6 @@ __all__ = [
     "ensure_usage_record_table",
     "percentile",
     "record_usage",
+    "usage_by_node",
     "usage_summary",
 ]

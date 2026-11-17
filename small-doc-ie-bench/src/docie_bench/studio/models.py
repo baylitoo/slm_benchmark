@@ -223,6 +223,9 @@ class UsageRecord(Base):
     # "latency_ms": int}, ...]. Null for every request that never touched a
     # tool (every other surface, and a custom agent without options.mcp_servers).
     tool_calls_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    # The serving node that answered, so traffic, errors and latency can be
+    # read per machine. Null when unknown (a store route spread over replicas).
+    node_id: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )

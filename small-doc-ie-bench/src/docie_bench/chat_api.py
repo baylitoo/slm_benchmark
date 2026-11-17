@@ -139,6 +139,7 @@ def _record_usage_outcome(
     started: float,
     outcome: Any,
     api_key_id: str | None = None,
+    node_id: str | None = None,
 ) -> None:
     """One usage-ledger row for a request that RESOLVED to a deployment.
 
@@ -173,6 +174,7 @@ def _record_usage_outcome(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         status=status,
+        node_id=node_id,
     )
 
 
@@ -349,7 +351,13 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
         # final completion's usage block, so this one row carries the whole
         # exchange's token cost.
         _record_usage_outcome(
-            profile.name, "chat", tenant.tenant_id, started, outcome, tenant.api_key_id
+            profile.name,
+            "chat",
+            tenant.tenant_id,
+            started,
+            outcome,
+            tenant.api_key_id,
+            node_id=profile.served_by_node,
         )
         return outcome
 
@@ -368,7 +376,13 @@ async def chat_completions(payload: ChatCompletionRequest, tenant: TenantParam) 
 
     completion = await _post_upstream(client, url, headers, forward, profile)
     _record_usage_outcome(
-        profile.name, "chat", tenant.tenant_id, started, completion, tenant.api_key_id
+        profile.name,
+        "chat",
+        tenant.tenant_id,
+        started,
+        completion,
+        tenant.api_key_id,
+        node_id=profile.served_by_node,
     )
     if isinstance(completion, JSONResponse):
         return completion

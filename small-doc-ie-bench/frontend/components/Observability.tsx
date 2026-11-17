@@ -568,6 +568,7 @@ export function UsageCard({ active }: { active: boolean }) {
   }, [usageWindow, refresh]);
 
   const entries = usage.data?.deployments ?? [];
+  const nodes = usage.data?.nodes ?? [];
   const maxTokens = Math.max(1, ...entries.map(totalTokens));
   const anyTokens = entries.some((entry) => totalTokens(entry) > 0);
 
@@ -778,6 +779,35 @@ export function UsageCard({ active }: { active: boolean }) {
           <p className="text-xs text-muted-foreground">
             <T>Streamed chats count tokens when the upstream sends a final usage frame; older runtimes or a caller that opts out still count requests and latency only.</T>
           </p>
+          {nodes.filter((n) => n.node_id).length > 1 && (
+            <div className="overflow-x-auto">
+              <p className="mb-1 text-xs font-medium text-muted-foreground">
+                <T>By server</T>
+              </p>
+              <table className="w-full text-xs">
+                <thead className="text-left text-muted-foreground">
+                  <tr>
+                    <th className="py-1 pr-3 font-medium"><T>Server</T></th>
+                    <th className="py-1 pr-3 font-medium"><T>Requests</T></th>
+                    <th className="py-1 pr-3 font-medium"><T>Errors</T></th>
+                    <th className="py-1 pr-3 font-medium">p95</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {nodes.map((n) => (
+                    <tr key={n.node_id ?? "unattributed"} className="border-t border-border">
+                      <td className="py-1 pr-3 font-mono">{n.node_id ?? "—"}</td>
+                      <td className="py-1 pr-3 tabular-nums">{n.requests}</td>
+                      <td className="py-1 pr-3 tabular-nums">{n.errors}</td>
+                      <td className="py-1 pr-3 tabular-nums">
+                        {n.p95_latency_ms != null ? `${Math.round(n.p95_latency_ms)} ms` : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </Card>

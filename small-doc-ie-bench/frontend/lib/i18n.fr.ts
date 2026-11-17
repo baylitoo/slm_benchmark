@@ -785,6 +785,10 @@ export const FR_MESSAGES: Record<string, string> = {
   "Files": "Fichiers",
   "Show all metrics": "Afficher toutes les métriques",
   "Hide all metrics": "Masquer toutes les métriques",
+  "By server": "Par serveur",
+  "Server": "Serveur",
+  "Requests": "Requêtes",
+  "Errors": "Erreurs",
 };
 
 /** A small set of UI messages contain user/model names and cannot be exact keys. */

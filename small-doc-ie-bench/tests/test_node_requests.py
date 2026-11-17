@@ -242,3 +242,25 @@ def test_activity_does_not_count_a_replica_on_a_drained_node_as_live(central: li
     catalog.set_node_drain("rocky-llm", drained=True)
 
     assert catalog.list_activity()[0]["live_replica_count"] == 0
+
+
+def test_usage_is_attributed_to_the_node_that_served_it(central: list[Any]) -> None:
+    from docie_bench.studio.usage_store import record_usage, usage_by_node
+
+    _place(NAME, "rocky-llm")
+    record_usage(deployment=NAME, surface="chat", tenant_id="ops", latency_ms=120)
+    record_usage(
+        deployment="nuextract3",
+        surface="chat",
+        tenant_id="ops",
+        latency_ms=80,
+        node_id="central",
+        status="error",
+    )
+    record_usage(deployment="store:lfm3-1.7b", surface="chat", tenant_id="ops", latency_ms=50)
+
+    rows = {r["node_id"]: r for r in usage_by_node(tenant_id="ops", window_hours=24)}
+
+    assert rows["rocky-llm"]["requests"] == 1
+    assert rows["central"]["errors"] == 1
+    assert rows[None]["requests"] == 1

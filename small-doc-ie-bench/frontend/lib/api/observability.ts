@@ -89,9 +89,22 @@ export interface UsageDeployment {
   tool_calls: UsageToolCall[];
 }
 
+/** The same aggregates per serving node (``node_id`` null = not attributed). */
+export interface UsageNode {
+  node_id: string | null;
+  requests: number;
+  errors: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  avg_latency_ms: number | null;
+  p95_latency_ms: number | null;
+  last_used_at: string | null;
+}
+
 export interface UsageSummaryView {
   window: UsageWindow;
   deployments: UsageDeployment[];
+  nodes?: UsageNode[];
 }
 
 /** Per-deployment usage over a bounded window (requests, errors, tokens
