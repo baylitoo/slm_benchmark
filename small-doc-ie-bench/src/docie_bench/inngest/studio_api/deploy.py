@@ -150,6 +150,7 @@ async def _trigger_replicated_deploy(
             view,
             context_length=payload.context_length,
             n_parallel=payload.n_parallel,
+            launch=_desired_spec(payload),
         )
         where = ", ".join(f"{row['name']} on {row['node_id']}" for row in placed)
         return _shared.TriggerResponse(

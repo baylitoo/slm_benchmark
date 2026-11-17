@@ -141,6 +141,7 @@ def place_replicas(
     *,
     context_length: int | None,
     n_parallel: int = 1,
+    launch: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Record ``count`` new replicas as desired state on distinct fitting nodes.
 
@@ -176,7 +177,10 @@ def place_replicas(
             ),
         )
     catalog = ModelCatalog()
-    spec: dict[str, Any] = {"model": base}
+    # ``launch`` is the deploy's own desired spec (all launch settings); a
+    # scale call without one carries model and context only.
+    spec: dict[str, Any] = {**(launch or {}), "model": base}
+    spec.pop("port", None)  # each replica gets its own port on its node
     if context_length is not None:
         spec["context_length"] = context_length
     placed: list[dict[str, Any]] = []

@@ -184,3 +184,24 @@ def test_a_leftover_node_row_does_not_switch_off_the_event_path(
 
     assert len(fleet) == 1  # the ordinary deploy event
     assert result["channel"] is not None
+
+
+def test_replicas_placed_on_the_fleet_keep_the_deploys_launch_settings(
+    fleet: list[Any],
+) -> None:
+    from docie_bench.inngest.studio_api.deploy import DeployRequest, trigger_deploy
+
+    _node("rocky-llm")
+    _node("gpu-box")
+
+    asyncio.run(
+        trigger_deploy(
+            DeployRequest(model=MODEL, replicas=2, max_tokens=512, cpu_threads=6),
+            tenant=None,  # type: ignore[arg-type]
+        )
+    )
+
+    for node in ("rocky-llm", "gpu-box"):
+        (row,) = _desired(node)
+        assert row["spec"]["max_tokens"] == 512
+        assert row["spec"]["cpu_threads"] == 6
