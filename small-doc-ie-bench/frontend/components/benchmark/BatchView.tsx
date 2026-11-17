@@ -9,11 +9,13 @@ import {
   fileToBase64,
   getBatch,
   getDeployments,
+  getStore,
   listBatches,
   listRoutingPolicies,
   retryBatchFailed,
   selectableDeployments,
   triggerBatchExtract,
+  withoutDecisionModels,
   type BatchDocumentInput,
   type BatchItemView,
   type BatchRunDetail,
@@ -171,13 +173,14 @@ export function BatchView({ active = true }: { active?: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
+  const store = useAsync("store", getStore);
   const deploymentNames = useMemo(
     () =>
-      selectableDeployments(deployments.data ?? [])
+      withoutDecisionModels(selectableDeployments(deployments.data ?? []), store.data)
         .filter((d) => !["encoder", "dense_embedding"].includes(d.spec?.launch?.runtime ?? ""))
         .map((d) => d.spec?.name)
         .filter((n): n is string => Boolean(n)),
-    [deployments.data],
+    [deployments.data, store.data],
   );
 
   async function onSubmit(e: React.FormEvent) {

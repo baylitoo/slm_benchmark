@@ -17,21 +17,24 @@ export function isLiveDeployment(r: DeploymentRecord): boolean {
  * The semantic model type of a deployment — what it can be USED for.
  * "chat" (generative SLMs: extraction, agent backing, Playground chat),
  * "encoder" (analyzers: agent guard models), "embedding" (vectors:
- * /v1/embeddings, RAG), "reranker" (relevance scoring: /v1/rerank). Encoder is
+ * /v1/embeddings, RAG), "reranker" (relevance scoring: /v1/rerank), "decision"
+ * (scored choices: /v1/systemone). Encoder is
  * derived from the launch runtime; embedding/reranker need the family, so pass
  * `embeddingNames`/`rerankerNames` (deployment names whose store family is
  * that family — see embeddingDeploymentNames / rerankerDeploymentNames).
  */
-export type DeployedModelType = "chat" | "encoder" | "embedding" | "reranker";
+export type DeployedModelType = "chat" | "encoder" | "embedding" | "reranker" | "decision";
 
 export function deploymentModelType(
   r: DeploymentRecord,
   embeddingNames?: Set<string>,
   rerankerNames?: Set<string>,
+  decisionNames?: Set<string>,
 ): DeployedModelType {
   if (r.spec?.launch?.runtime === "encoder") return "encoder";
   if (r.spec?.launch?.runtime === "dense_embedding") return "embedding";
   const name = r.spec?.name;
+  if (name && decisionNames?.has(name)) return "decision";
   if (name && embeddingNames?.has(name)) return "embedding";
   if (name && rerankerNames?.has(name)) return "reranker";
   return "chat";
@@ -105,7 +108,68 @@ export function rerankerDeploymentNames(
 export function visionDeploymentNames(
   store: StoreEntry[] | null | undefined,
 ): Set<string> {
-  return new Set((store ?? []).filter((e) => e.vision).map((e) => e.name));
+  // A vision decision model reads images but only answers /v1/systemone.
+  return new Set((store ?? []).filter((e) => e.vision && !e.decision).map((e) => e.name));
+}
+
+/**
+ * Deployment names that are decision models (store entry flagged `decision`).
+ * They score caller-supplied options on /v1/systemone and never answer chat or
+ * an extraction schema, so every chat/extraction picker leaves them out.
+ */
+export function decisionDeploymentNames(
+  store: StoreEntry[] | null | undefined,
+): Set<string> {
+  return new Set((store ?? []).filter((e) => e.decision).map((e) => e.name));
+}
+
+/** Drop decision deployments from a chat/extraction picker's candidates. */
+export function withoutDecisionModels<T extends DeploymentRecord>(
+  deployments: T[],
+  store: StoreEntry[] | null | undefined,
+): T[] {
+  const names = decisionDeploymentNames(store);
+  return deployments.filter((d) => !(d.spec?.name && names.has(d.spec.name)));
+}
+
+export type DecisionQuestion =
+  | { type: "choice"; instructions?: string; criteria: Record<string, string | null> }
+  | { type: "score"; instructions?: string; criteria: string[] }
+  | { type: "noul"; instructions?: string; criteria?: { true?: string; false?: string } };
+
+export interface DecisionAnswer {
+  type?: string;
+  choice?: string;
+  score?: number;
+  noul?: number;
+  legend?: Record<string, string>;
+  probabilities?: Record<string, number>;
+  confidence?: number;
+}
+
+export interface DecisionResponse {
+  model?: string;
+  answers?: Record<string, DecisionAnswer>;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  [k: string]: unknown;
+}
+
+/** Ask a decision deployment typed questions about a state (POST /v1/systemone). */
+export function decide(
+  model: string,
+  state: unknown,
+  questions: Record<string, DecisionQuestion>,
+  images?: string[],
+): Promise<DecisionResponse> {
+  return request<DecisionResponse>("/v1/systemone", {
+    method: "POST",
+    body: JSON.stringify({
+      model,
+      state,
+      questions,
+      ...(images && images.length ? { images } : {}),
+    }),
+  });
 }
 
 /** One embedding vector from GET-shaped /v1/embeddings response. */

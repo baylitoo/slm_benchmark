@@ -24,6 +24,7 @@ gated/private repos work; anonymous access covers the common public case.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Awaitable, Callable
@@ -34,6 +35,8 @@ from typing import Any
 import httpx
 
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
+logger = logging.getLogger("docie_bench.serving.hf_hub")
 
 HF_BASE = "https://huggingface.co"
 
@@ -784,6 +787,120 @@ def _size_est_bytes(params: int | None, *, has_gguf: bool) -> int | None:
     return int(params * (0.6 if has_gguf else 2.0))
 
 
+_GGUF_SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+_GGUF_STRING, _GGUF_ARRAY = 8, 9
+# The metadata block of a large-vocabulary GGUF is a few MB; past this the
+# file is not one we can classify cheaply.
+_GGUF_HEADER_CAP = 64 * 1024 * 1024
+
+
+class _HeaderReader:
+    def __init__(self, chunks: Any) -> None:
+        self._chunks = chunks
+        self._buf = bytearray()
+        self._consumed = 0
+
+    async def take(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            if self._consumed > _GGUF_HEADER_CAP:
+                raise HfHubError("GGUF metadata exceeds the header read cap")
+            chunk = await self._chunks.__anext__()
+            self._consumed += len(chunk)
+            self._buf += chunk
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    async def u32(self) -> int:
+        return int.from_bytes(await self.take(4), "little")
+
+    async def u64(self) -> int:
+        return int.from_bytes(await self.take(8), "little")
+
+    async def string(self) -> str:
+        return (await self.take(await self.u64())).decode("utf-8", "replace")
+
+    async def skip_value(self, value_type: int) -> None:
+        if value_type == _GGUF_STRING:
+            await self.take(await self.u64())
+        elif value_type == _GGUF_ARRAY:
+            element_type = await self.u32()
+            for _ in range(await self.u64()):
+                await self.skip_value(element_type)
+        elif value_type in _GGUF_SCALAR_SIZES:
+            await self.take(_GGUF_SCALAR_SIZES[value_type])
+        else:
+            raise HfHubError(f"unknown GGUF metadata type {value_type}")
+
+
+def _decision_header_candidate(
+    ggufs: list[HfGgufFile], architecture: str | None, tags: list[str], pipeline_tag: Any
+) -> HfGgufFile | None:
+    """The GGUF whose header settles "decision model or not", when the Hub
+    metadata hints at one. Every quant of a repo shares its metadata, so the
+    smallest single file is read."""
+    from docie_bench.serving.arch_registry import (
+        CLASSIFICATION_PIPELINES,
+        DECISION_HUB_TAG,
+    )
+
+    hinted = DECISION_HUB_TAG in {t.strip().lower() for t in tags} or (
+        pipeline_tag in CLASSIFICATION_PIPELINES
+    )
+    if not hinted:
+        return None
+    # imatrix GGUFs hold calibration data, not a model.
+    candidates = [
+        g
+        for g in ggufs
+        if not g.is_mmproj and not g.is_multipart and "imatrix" not in g.filename.lower()
+    ]
+    if not candidates:
+        return None
+    # A repo can ship a chat build beside a "-decision" build.
+    return min(
+        candidates,
+        key=lambda g: (
+            "decision" not in g.filename.lower(),
+            g.size_bytes is None,
+            g.size_bytes or 0,
+        ),
+    )
+
+
+async def read_gguf_decision_type(
+    repo: str, filename: str, *, client: httpx.AsyncClient, revision: str = "main"
+) -> str | None:
+    """The ``{arch}.decision.type`` of a GGUF on the Hub, or None if it has none.
+
+    Streams only the metadata block, never the tensors. This is the signal
+    llama-server itself uses to switch into decision mode (ggml-org/llama.cpp
+    #29818); the ``decision-model`` Hub tag is not, and many chat fine-tunes
+    carry it.
+    """
+    url = f"{HF_BASE}/{repo}/resolve/{revision}/{filename}"
+    try:
+        async with client.stream(
+            "GET", url, headers=hf_headers(), follow_redirects=True, timeout=30.0
+        ) as response:
+            if response.status_code >= 400:
+                raise HfHubError(f"Hub returned HTTP {response.status_code} for {filename!r}")
+            reader = _HeaderReader(response.aiter_bytes(1 << 16))
+            if await reader.take(4) != b"GGUF":
+                raise HfHubError(f"{filename!r} is not a GGUF file")
+            await reader.take(4)  # version
+            await reader.u64()  # tensor count
+            for _ in range(await reader.u64()):
+                key = await reader.string()
+                value_type = await reader.u32()
+                if key.endswith(".decision.type") and value_type == _GGUF_STRING:
+                    return await reader.string()
+                await reader.skip_value(value_type)
+    except (httpx.RequestError, StopAsyncIteration) as exc:
+        raise HfHubError(f"could not read the GGUF header of {filename!r}: {exc}") from exc
+    return None
+
+
 async def inspect_repo(
     repo: str,
     *,
@@ -849,6 +966,20 @@ async def inspect_repo(
     tags = [str(t) for t in (payload.get("tags") or []) if isinstance(t, str)]
     pipe = payload.get("pipeline_tag")
     card_data = payload.get("cardData") if isinstance(payload.get("cardData"), dict) else {}
+    decision_type: str | None = None
+    decision_header_read = False
+    header_file = _decision_header_candidate(ggufs, architecture, tags, pipe)
+    if header_file is not None:
+        try:
+            decision_type = await read_gguf_decision_type(
+                repo,
+                header_file.filename,
+                client=client,
+                revision=str(payload.get("sha") or "main"),
+            )
+            decision_header_read = True
+        except HfHubError:
+            logger.warning("decision header unreadable for %s/%s", repo, header_file.filename)
     result = resolve_family(
         architecture,
         has_gguf=has_gguf,
@@ -859,6 +990,8 @@ async def inspect_repo(
         pipeline_tag=str(pipe) if pipe else None,
         base_model=_extract_base_model(card_data),
         library_name=str(payload["library_name"]) if payload.get("library_name") else None,
+        gguf_decision_type=decision_type,
+        gguf_header_read=decision_header_read,
     )
     snapshot_files = snapshot_files_for(siblings) if not has_gguf else []
     from docie_bench.serving.model_store import FAMILIES

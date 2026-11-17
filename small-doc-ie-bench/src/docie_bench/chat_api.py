@@ -159,8 +159,9 @@ def _record_usage_outcome(
     elif isinstance(outcome, dict):
         usage = outcome.get("usage")
         if isinstance(usage, dict):
-            raw_prompt = usage.get("prompt_tokens")
-            raw_completion = usage.get("completion_tokens")
+            # /v1/systemone reports input_tokens/output_tokens.
+            raw_prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+            raw_completion = usage.get("completion_tokens", usage.get("output_tokens"))
             prompt_tokens = raw_prompt if isinstance(raw_prompt, int) else None
             completion_tokens = raw_completion if isinstance(raw_completion, int) else None
     usage_store.record_usage(
@@ -1475,6 +1476,96 @@ async def rerank(request: Request, tenant: TenantParam) -> Any:
     )
     _record_usage_outcome(
         profile.name, "rerank", tenant.tenant_id, started, result, tenant.api_key_id
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    recency.stamp_served_profile(profile.name)  # PR-4 recency, see chat_completions
+    return result
+
+
+_DECISION_QUESTION_TYPES = frozenset({"choice", "score", "noul"})
+
+
+@router.post("/v1/systemone")
+async def systemone(request: Request, tenant: TenantParam) -> Any:
+    """Answer typed questions about a state with a decision-model deployment.
+
+    Body: ``model`` (deployment/profile), ``state``, ``questions`` (id ->
+    ``{type: choice|score|noul, instructions, criteria}``), optional
+    ``files``/``images`` (data URLs). Forwarded verbatim to the upstream's
+    ``/v1/systemone`` (llama.cpp #29818) with the served model id; the answers
+    carry per-option probabilities and a confidence.
+    """
+    try:
+        body = await request.json()
+    except ValueError:
+        return openai_error(
+            "request body must be valid JSON",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    if not isinstance(body, dict):
+        return openai_error(
+            "request body must be a JSON object",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    model = str(body.get("model") or "")
+    if not model:
+        return openai_error(
+            "missing required 'model' field (a decision deployment)",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    # lfm2-d1 accepts a null state when the question is about images only.
+    if "state" not in body and not body.get("files") and not body.get("images"):
+        return openai_error(
+            "missing required 'state' field",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    questions = body.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        return openai_error(
+            "missing required 'questions' field (an object of question id -> question)",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    for qid, question in questions.items():
+        qtype = question.get("type", "choice") if isinstance(question, dict) else None
+        if qtype not in _DECISION_QUESTION_TYPES:
+            return openai_error(
+                f"question {qid!r} must be an object whose 'type' is one of "
+                "choice, score, noul",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
+    resolved = await _resolve_or_error(model)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    profile = resolved
+
+    forward = dict(body)
+    forward["model"] = profile.model
+    url = f"{profile.base_url}/systemone"
+    headers = {
+        "Authorization": f"Bearer {profile.api_key}",
+        "Content-Type": "application/json",
+    }
+    client: httpx.AsyncClient = _client()
+    started = time.perf_counter()
+    result = await _post_upstream(
+        client,
+        url,
+        headers,
+        forward,
+        profile,
+        error_hint=" (is this a decision deployment? families 'decision' / "
+        "'decision_vl' need a GGUF with decision metadata and a llama-server "
+        "built after ggml-org/llama.cpp#29818)",
+    )
+    _record_usage_outcome(
+        profile.name, "decide", tenant.tenant_id, started, result, tenant.api_key_id
     )
     if isinstance(result, JSONResponse):
         return result

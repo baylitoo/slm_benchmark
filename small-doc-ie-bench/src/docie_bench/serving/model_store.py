@@ -103,6 +103,11 @@ class FamilyContract:
     # embeddings. Deployments of a reranker family are typed "reranker" and
     # routed by the rerank API, same shape as the embedding family above.
     reranker: bool = False
+    # A native decision model (llama.cpp #29818): a GGUF whose decision head
+    # scores caller-supplied options, answered on /v1/systemone — never
+    # chat/extraction. The GGUF's own decision metadata switches llama-server
+    # into decision mode, so no launch flag is needed.
+    decision: bool = False
     # An analyzer (encoder) family: a transformers/safetensors checkpoint served
     # by the ENCODER runtime (docie encoder), NOT llama.cpp. Stored as a
     # directory snapshot rather than a single GGUF, and typed "encoder".
@@ -486,6 +491,29 @@ FAMILIES: dict[str, FamilyContract] = {
         reranker=True,
         ollama_faithful=False,
     ),
+    # Decision models (Laya, Julia-1, Kev, lev, lfm2-d1, ...): an encoder or
+    # decoder backbone with a decision head, served by llama-server on
+    # /v1/systemone (choice / score / yes-no questions about a state, answered
+    # with probabilities). No template, no schema, no launch flags.
+    "decision": FamilyContract(
+        name="decision",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,  # unused on /v1/systemone
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        decision=True,
+        ollama_faithful=False,
+    ),
+    # The same with image input (OpenJev, Clef, lfm2-d1): needs the projector.
+    "decision_vl": FamilyContract(
+        name="decision_vl",
+        template_delivery=TemplateDelivery.OPENAI_JSON_SCHEMA,
+        response_format_style="none",
+        prompt_profile="strict_extraction_v1",
+        decision=True,
+        needs_mmproj=True,
+        vision=True,
+        ollama_faithful=False,
+    ),
     # Multi-vector / late-interaction retrievers (ColBERT, PyLate checkpoints:
     # mixedbread-ai/mxbai-edge-colbert-*, lightonai/LateOn, colbert-ir/
     # colbertv2.0, ...) served by the MULTI-VECTOR runtime -- sentence-
@@ -586,6 +614,21 @@ FAMILIES: dict[str, FamilyContract] = {
         ollama_faithful=False,
     ),
 }
+
+
+# Some decision models (laya, clef, lfm2-d1-omni) evaluate the whole prompt in
+# one micro-batch, and llama-server's default --ubatch-size of 512 rejects a
+# state of a few hundred words. Applied only when the operator set neither size.
+DECISION_UBATCH_SIZE = 4096
+
+
+def decision_batch_defaults(
+    contract: FamilyContract, batch_size: int | None, ubatch_size: int | None
+) -> tuple[int | None, int | None]:
+    """(batch_size, ubatch_size) for a launch, with the decision default filled in."""
+    if not contract.decision or batch_size is not None or ubatch_size is not None:
+        return batch_size, ubatch_size
+    return DECISION_UBATCH_SIZE, DECISION_UBATCH_SIZE
 
 
 def get_family(name: str) -> FamilyContract:
