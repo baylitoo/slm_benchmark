@@ -396,7 +396,7 @@ class WhatIfRequest(BaseModel):
     # parameter, which prices every row in the plan under the same llama-server
     # slot count (#248/#321) rather than per-row.
     n_parallel: int = Field(default=1, ge=1, le=32)
-    # Price against this node; omitted with several nodes = the first by id.
+    # Price against this node; omitted with several nodes = the first admitting one.
     node_id: str | None = None
 
 
@@ -413,14 +413,22 @@ def _placements_on(
 
 
 def _capacity_node_ids() -> list[str]:
-    """Sorted ids of the nodes that published a capacity measurement."""
+    """Ids of the nodes that published a capacity measurement.
+
+    Fresh, admitting nodes first, then by id, so a default pick is one that
+    can actually be priced.
+    """
     from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
 
     try:
         snapshots = _capacity_reporting(ModelCatalog().list_node_snapshots())
     except Exception:  # noqa: BLE001 - the selector degrades, never 500s
         return []
-    return sorted({str(row.get("node_id") or "") for row in snapshots} - {""})
+    stale = stale_node_ids(snapshots)
+    drained = {str(row.get("node_id") or "") for row in snapshots if row.get("drained_at")}
+    ids = {str(row.get("node_id") or "") for row in snapshots} - {""}
+    return sorted(ids, key=lambda node: (node in stale or node in drained, node))
 
 
 def _sizing_inputs(node_id: str | None = None) -> tuple[
@@ -876,8 +884,8 @@ async def serving_nodes() -> dict[str, Any]:
 def _sizing_target(node_id: str | None) -> tuple[str | None, list[str], str | None]:
     """(node to price, every capacity-reporting node, note) for the Sizing tab.
 
-    With several nodes and none named, the first by id is priced and the note
-    says so, instead of withholding every fit.
+    With several nodes and none named, the first fresh admitting node is
+    priced and the note says so, instead of withholding every fit.
     """
     nodes = _capacity_node_ids()
     if node_id is not None or len(nodes) <= 1:

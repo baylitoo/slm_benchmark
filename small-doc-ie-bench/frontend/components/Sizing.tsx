@@ -471,6 +471,8 @@ function WhatIf({ data, nodeId }: { data: SizingView | null; nodeId?: string }) 
   // Call-level (mirrors the server's WhatIfRequest.n_parallel): prices every
   // staged row under the same llama-server slot count, not per-row.
   const [nParallel, setNParallel] = useState("1");
+  // A verdict for one node must not stay on screen under another.
+  useEffect(() => setResult(null), [nodeId]);
 
   function addRow() {
     setStaged((s) => [
