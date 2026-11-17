@@ -811,6 +811,37 @@ def _local_store_models() -> list[str]:
         return []
 
 
+def _local_model_footprints(home: Path | None = None) -> dict[str, dict[str, int]]:
+    """Per store model on THIS node: calibrated steady RSS and mmproj size.
+
+    Both are node-local (footprint sidecars, the projector file), so they are
+    published with the snapshot for central sizing (#664 B5). Best-effort.
+    """
+    from docie_bench.serving.model_store import ModelStore
+    from docie_bench.serving.paths import model_store_root
+
+    try:
+        entries = ModelStore(model_store_root()).list()
+        footprints = FootprintStore(home)
+    except Exception:  # noqa: BLE001 - never break the reconcile cycle
+        logger.debug("could not read local footprints", exc_info=True)
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    for entry in entries:
+        measured: dict[str, int] = {}
+        rss = footprints.get(entry.model_path.as_posix()) or footprints.get(
+            str(entry.model_path)
+        )
+        if rss:
+            measured["steady_rss_bytes"] = rss
+        if entry.mmproj_path is not None:
+            with contextlib.suppress(OSError):
+                measured["mmproj_bytes"] = entry.mmproj_path.stat().st_size
+        if measured:
+            out[entry.name] = measured
+    return out
+
+
 def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
     """Default snapshot publisher: per-node upsert, best-effort, DB-optional.
 
@@ -831,6 +862,7 @@ def publish_snapshot_via_catalog(snapshot: NodeSnapshot) -> None:
         ModelCatalog().publish_node_snapshot(
             node_id=resolve_node_id(),
             store_models=_local_store_models(),
+            model_footprints=_local_model_footprints(),
             total_bytes=snapshot.total_bytes,
             free_bytes=snapshot.free_bytes,
             source=snapshot.source,

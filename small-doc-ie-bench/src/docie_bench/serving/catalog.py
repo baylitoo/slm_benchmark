@@ -16,7 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from sqlalchemy import (
@@ -217,6 +217,10 @@ class ServingNode(Base):
     # chosen to serve it has the file, and without this nothing shows which
     # nodes do. NULL means a node that has not reported its store yet.
     store_models: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Per store model, what THIS node measured: steady-state RSS and the
+    # projector size, as a JSON object keyed by model name. Both live on the
+    # node's disk, so central sizing reads them here. NULL = not reported.
+    model_footprints: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Bumped by every desired-state write touching this node (#534). A node
     # compares it against the last generation it applied, which is what lets a
     # READER decide in one read whether the catalog is provably current for it
@@ -401,6 +405,8 @@ _SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any], bool], ...] = (
     ("effective_budget_bytes", BigInteger(), True),
     ("budget_source", String(16), True),
     ("budget_stale", Boolean(), True),
+    # Per-model steady RSS + mmproj size measured on the node (#664 B5).
+    ("model_footprints", Text(), True),
 )
 
 
@@ -736,6 +742,28 @@ def _decode_store_models(raw: str | None) -> list[str] | None:
     return [str(item) for item in decoded] if isinstance(decoded, list) else None
 
 
+def _decode_model_footprints(raw: str | None) -> dict[str, dict[str, int]] | None:
+    """``{model: {"steady_rss_bytes"?, "mmproj_bytes"?}}``; None = not reported."""
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    out: dict[str, dict[str, int]] = {}
+    for name, entry in decoded.items():
+        if not isinstance(entry, dict):
+            continue
+        out[str(name)] = {
+            key: int(value)
+            for key, value in entry.items()
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        }
+    return out
+
+
 def _desired_view(row: ServingDesiredDeployment) -> dict[str, Any]:
     try:
         spec = json.loads(row.spec)
@@ -799,6 +827,7 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         # never mistake one machine's capacity for the whole fleet's.
         "node_id": row.id,
         "store_models": _decode_store_models(row.store_models),
+        "model_footprints": _decode_model_footprints(row.model_footprints),
         "desired_generation": row.desired_generation,
         # None means admitting. Reported on the capacity row because every
         # reader that sizes or routes against a node needs to know the operator
@@ -1198,6 +1227,7 @@ class ModelCatalog:
         sum_rss_bytes: int,
         reclaimable_bytes: int = 0,
         store_models: Sequence[str] | None = None,
+        model_footprints: Mapping[str, Mapping[str, int]] | None = None,
         ceiling_bytes: int | None = None,
         working_set_bytes: int | None = None,
         effective_budget_bytes: int | None = None,
@@ -1231,6 +1261,11 @@ class ModelCatalog:
         }
         if store_models is not None:
             values["store_models"] = json.dumps(sorted(set(store_models)))
+        if model_footprints is not None:
+            values["model_footprints"] = json.dumps(
+                {name: dict(entry) for name, entry in model_footprints.items()},
+                sort_keys=True,
+            )
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")

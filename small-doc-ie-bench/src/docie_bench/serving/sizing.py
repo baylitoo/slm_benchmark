@@ -80,7 +80,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from docie_bench.serving.resources import (
     DEFAULT_DEPLOY_CONTEXT_LENGTH,
@@ -88,6 +88,51 @@ from docie_bench.serving.resources import (
     footprint_bytes,
     predicted_footprint_for_model,
 )
+
+
+class FootprintReader(Protocol):
+    """Calibrated steady RSS by launch model path (``FootprintStore`` shape)."""
+
+    def get(self, model: str) -> int | None: ...
+
+
+class _PublishedFootprints:
+    """A node's published calibrations (#664 B5), read by launch model path."""
+
+    def __init__(self, by_path: Mapping[str, int]) -> None:
+        self._by_path = dict(by_path)
+
+    def get(self, model: str) -> int | None:
+        return self._by_path.get(model)
+
+
+def _node_measurements(
+    models: Sequence[Mapping[str, Any]],
+    snapshot: Mapping[str, Any] | None,
+    store: FootprintReader,
+) -> tuple[Sequence[Mapping[str, Any]], FootprintReader]:
+    """Price with what the snapshot's node measured, not the api host's disk.
+
+    A node that published ``model_footprints`` is the authority for its own
+    calibrations and projector sizes; one that did not (older node, no
+    snapshot) keeps the local sidecar/stat behaviour.
+    """
+    published = snapshot.get("model_footprints") if snapshot is not None else None
+    if not isinstance(published, Mapping):
+        return models, store
+    rows: list[Mapping[str, Any]] = []
+    by_path: dict[str, int] = {}
+    for row in models:
+        measured = published.get(str(row.get("name") or "")) or {}
+        mmproj = measured.get("mmproj_bytes")
+        if isinstance(mmproj, int) and mmproj > 0:
+            row = {**row, "mmproj_bytes": mmproj}
+        rss = measured.get("steady_rss_bytes")
+        if isinstance(rss, int) and rss > 0 and row.get("model_path"):
+            by_path[str(row["model_path"])] = rss
+        rows.append(row)
+    return rows, _PublishedFootprints(by_path)
+
 
 # Default safety margin as a fraction of node total RAM (design doc §3 brackets
 # 10-15%; take the low end — the margin is visible, not padding on padding).
@@ -243,6 +288,9 @@ def _mmproj_bytes(row: Mapping[str, Any]) -> int:
     rule as the reconciler's restart fit gate). Unreadable degrades to 0: the
     fit table under-counting a projector beats refusing to price the model.
     """
+    published = row.get("mmproj_bytes")
+    if isinstance(published, int) and published > 0:
+        return published
     mmproj_path = row.get("mmproj_path")
     if not mmproj_path:
         return 0
@@ -255,7 +303,7 @@ def _mmproj_bytes(row: Mapping[str, Any]) -> int:
 def price_model(
     row: Mapping[str, Any],
     *,
-    footprints: FootprintStore,
+    footprints: FootprintReader,
     context_length: int | None,
     n_parallel: int = 1,
 ) -> tuple[int | None, int | None, int | None]:
@@ -309,7 +357,7 @@ def _loading_reservation(
     models_by_name: Mapping[str, Mapping[str, Any]],
     placements: Sequence[Mapping[str, Any]],
     *,
-    footprints: FootprintStore,
+    footprints: FootprintReader,
     context_length: int,
     n_parallel: int,
 ) -> int:
@@ -390,7 +438,8 @@ def compute_sizing(
     deploy will actually consume.
     """
     _check_margin(margin_fraction)
-    store = footprints if footprints is not None else FootprintStore()
+    store: FootprintReader = footprints if footprints is not None else FootprintStore()
+    models, store = _node_measurements(models, snapshot, store)
     context = (
         context_length if context_length is not None else DEFAULT_DEPLOY_CONTEXT_LENGTH
     )
@@ -474,7 +523,8 @@ def compute_whatif(
     with silent zero-priced lines would be a lie, not an estimate.
     """
     _check_margin(margin_fraction)
-    store = footprints if footprints is not None else FootprintStore()
+    store: FootprintReader = footprints if footprints is not None else FootprintStore()
+    models, store = _node_measurements(models, snapshot, store)
     by_name = {str(row["name"]): row for row in models}
     _, _, margin, free_effective, _ = _free_budget(snapshot, margin_fraction)
     loading_reserved = _loading_reservation(
@@ -542,6 +592,7 @@ def compute_whatif(
 
 __all__ = [
     "DEFAULT_MARGIN_FRACTION",
+    "FootprintReader",
     "LIVE_PHASES",
     "ModelFit",
     "SizingReport",
