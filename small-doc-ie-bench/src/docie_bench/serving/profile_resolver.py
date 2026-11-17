@@ -383,6 +383,10 @@ def _profile_from_placement(
     served_id = str(row.get("model_name") or name)
     slot_count = row.get("slot_count")
     negotiated = row.get("negotiated_style")
+    # The owning node's launch settings, as _synthesize_profile reads them.
+    max_tokens = row.get("max_tokens") if isinstance(row.get("max_tokens"), int) else None
+    timeout = row.get("timeout_seconds")
+    timeout_seconds = float(timeout) if isinstance(timeout, (int, float)) else None
 
     match = _match_yaml_profile(served_id, yaml_profiles)
     if match is not None:
@@ -393,6 +397,8 @@ def _profile_from_placement(
             base_url=endpoint,
             kind="passthrough",
             response_format_style=str(negotiated) if negotiated else match.response_format_style,
+            max_tokens=max_tokens or match.max_tokens,
+            timeout_seconds=timeout_seconds or match.timeout_seconds,
             deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
         )
     traits = _family_traits(served_id)
@@ -412,8 +418,8 @@ def _profile_from_placement(
         vision=traits.vision,
         stop_sequences=traits.stop_sequences,
         temperature=traits.temperature,
-        max_tokens=traits.max_tokens,
-        timeout_seconds=traits.timeout_seconds,
+        max_tokens=max_tokens or traits.max_tokens,
+        timeout_seconds=timeout_seconds or traits.timeout_seconds,
         deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
     )
 

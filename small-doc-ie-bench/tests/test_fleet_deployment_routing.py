@@ -218,3 +218,54 @@ def test_a_bare_name_on_a_drained_node_is_not_routed(sqlite_catalog: None) -> No
 
     with pytest.raises(Exception, match=REMOTE):
         _resolve(model_profile=REMOTE)
+
+
+def _publish_launch(name: str, *, node_id: str) -> None:
+    """What the owning node's reconciler publishes for its deployment."""
+    ModelCatalog().publish_observed(
+        name,
+        node_id=node_id,
+        engine="llama-server",
+        state="ready",
+        endpoint=f"http://{node_id}:8088/v1",
+        phase="hot",
+        pid=4242,
+        pid_create_time=1.0,
+        rss_bytes=1,
+        health_ok=True,
+        last_error=None,
+        tool_calls_supported=False,
+        context_length=8192,
+        max_tokens=1536,
+        timeout_seconds=240.0,
+    )
+
+
+def test_a_remote_profile_carries_the_owning_nodes_launch_settings(
+    sqlite_catalog: None,
+) -> None:
+    """Without them a remote deployment ran on family defaults (#664 B6)."""
+    _place(REMOTE, node_id="rocky-llm")
+    _publish_launch(REMOTE, node_id="rocky-llm")
+
+    profile = _resolve(deployment=REMOTE)
+
+    assert profile.max_tokens == 1536
+    assert profile.timeout_seconds == 240.0
+
+
+def test_chat_warnings_read_a_remote_deployments_placement(
+    sqlite_catalog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool-calls and context-budget warnings fire for a deployment this
+    process has no local record for."""
+    from docie_bench import chat_api
+    from docie_bench.serving import profile_resolver
+
+    monkeypatch.setattr(profile_resolver, "_default_live_deployments", lambda: [])
+    _place(REMOTE, node_id="rocky-llm")
+    _publish_launch(REMOTE, node_id="rocky-llm")
+    profile = _resolve(deployment=REMOTE)
+
+    assert chat_api._tool_calls_supported_for_profile(profile) is False
+    assert chat_api._context_length_for_profile(profile) == 8192

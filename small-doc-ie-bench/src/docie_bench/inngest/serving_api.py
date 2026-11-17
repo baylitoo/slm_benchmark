@@ -1616,8 +1616,19 @@ async def scale_store_model(
     real teardown job (kill process, free port, DELETE placement row), so a
     drained replica leaves the load-balancing rotation exactly like a deleted
     deployment.
+
+    Counts span the fleet (placements + desired state). With more than one
+    node reporting, new replicas are placed by fit as desired state on
+    distinct nodes and surplus ones removed through their owner's desired
+    state, so the response carries no channel (#664 A4).
     """
     del tenant  # authenticated principal required; ops surface, no per-tenant scoping
+    from docie_bench.inngest.fleet_scale import (
+        merged_records,
+        place_replicas,
+        read_fleet_view,
+        remove_replicas,
+    )
     from docie_bench.serving.control_plane import (
         count_replica_deployments,
         replica_names_to_add,
@@ -1625,10 +1636,34 @@ async def scale_store_model(
     )
     from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
-    existing = await existing_deployment_records()
+    view = read_fleet_view(name)
+    existing = merged_records(name, await existing_deployment_records(), view)
     to_add = replica_names_to_add(name, existing, request.replicas)
     to_remove = replica_names_to_remove(name, existing, request.replicas)
     current = count_replica_deployments(name, existing)
+    if view is not None and view.is_fleet and (to_add or to_remove):
+        placed = (
+            place_replicas(
+                name,
+                len(to_add),
+                view,
+                context_length=request.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH,
+                n_parallel=request.n_parallel,
+            )
+            if to_add
+            else []
+        )
+        removed = remove_replicas(name, len(to_remove), view) if to_remove else []
+        return {
+            "model": name,
+            "target": request.replicas,
+            "current": current,
+            "adding": [row["name"] for row in placed],
+            "removing": [row["name"] for row in removed],
+            "placed": placed + removed,
+            "event_ids": [],
+            "channel": None,
+        }
     if to_add:
         admit_replica_ram(
             name, len(to_add), request.context_length, n_parallel=request.n_parallel

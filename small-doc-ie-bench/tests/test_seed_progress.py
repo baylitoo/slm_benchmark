@@ -78,3 +78,29 @@ def test_prune_stale_removes_only_old_sidecars(tmp_path, monkeypatch) -> None:
     assert removed == 1
     assert not stale_path.exists()
     assert seed_progress.read_progress("seed:fresh") == {"percent": 10}
+
+
+def test_seed_gc_removes_only_stale_staging_dirs(tmp_path, monkeypatch) -> None:
+    """The node-side sweep: a week-old interrupted download goes, a fresh one
+    (possibly still resuming) stays."""
+    import os
+    import time
+
+    from docie_bench.serving.seed_gc import gc_seed_leftovers
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path))
+    staging = tmp_path / ".hf-downloads"
+    (staging / "nuextract3").mkdir(parents=True)
+    (staging / "lfm2.5-350m").mkdir(parents=True)
+    stale_part = staging / "nuextract3" / "model.gguf.part"
+    stale_part.write_bytes(b"x")
+    (staging / "lfm2.5-350m" / "model.gguf.part").write_bytes(b"x")
+    old = time.time() - 8 * 86400
+    for path in (stale_part, staging / "nuextract3"):
+        os.utime(path, (old, old))
+
+    summary = gc_seed_leftovers(staging_root=staging)
+
+    assert summary["deleted_seed_staging"] == 1
+    assert not (staging / "nuextract3").exists()
+    assert (staging / "lfm2.5-350m").exists()

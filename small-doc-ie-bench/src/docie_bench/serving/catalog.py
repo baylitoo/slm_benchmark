@@ -169,6 +169,13 @@ class ModelPlacement(Base):
     last_served_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Launch settings and the /props tool-calls verdict, published by the
+    # owning reconciler so a process without that node's deployments.json
+    # (chat warnings, remote profiles) sees them. NULL = unknown/unset.
+    tool_calls_supported: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    context_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timeout_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -527,6 +534,10 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     # database would throw UndefinedColumn on the reconciler's first publish.
     ("node_id", String(32)),
     ("last_served_at", DateTime(timezone=True)),
+    ("tool_calls_supported", Boolean()),
+    ("context_length", Integer()),
+    ("max_tokens", Integer()),
+    ("timeout_seconds", Float()),
 )
 
 
@@ -715,6 +726,10 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "throughput_measured_at": isoformat(row.throughput_measured_at),
         "throughput_source": row.throughput_source,
         "slot_count": row.slot_count,
+        "tool_calls_supported": row.tool_calls_supported,
+        "context_length": row.context_length,
+        "max_tokens": row.max_tokens,
+        "timeout_seconds": row.timeout_seconds,
         "created_at": isoformat(row.created_at),
         "updated_at": isoformat(row.updated_at),
     }
@@ -1121,6 +1136,10 @@ class ModelCatalog:
         throughput_measured_at: dt.datetime | None = None,
         throughput_source: str | None = None,
         slot_count: int | None = None,
+        tool_calls_supported: bool | None = None,
+        context_length: int | None = None,
+        max_tokens: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Publish one reconciler observation (the reconciler is the sole caller).
 
@@ -1184,6 +1203,10 @@ class ModelCatalog:
             row.throughput_measured_at = throughput_measured_at
             row.throughput_source = throughput_source
             row.slot_count = slot_count
+            row.tool_calls_supported = tool_calls_supported
+            row.context_length = context_length
+            row.max_tokens = max_tokens
+            row.timeout_seconds = timeout_seconds
             session.flush()
             return _placement_view(row)
 

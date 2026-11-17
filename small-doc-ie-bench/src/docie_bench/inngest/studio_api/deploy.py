@@ -132,8 +132,32 @@ async def _trigger_replicated_deploy(
                 "name/port to deploy replicas"
             ),
         )
-    existing = await existing_deployment_records()
+    from docie_bench.inngest.fleet_scale import (
+        merged_records,
+        place_replicas,
+        read_fleet_view,
+    )
+
+    view = read_fleet_view(payload.model)
+    existing = merged_records(payload.model, await existing_deployment_records(), view)
     to_add = replica_names_to_add(payload.model, existing, payload.replicas)
+    if view is not None and view.is_fleet and to_add:
+        # More than one node: an untargeted event may land anywhere, so place
+        # by fit as desired state instead (#664 A4).
+        placed = place_replicas(
+            payload.model,
+            len(to_add),
+            view,
+            context_length=payload.context_length,
+            n_parallel=payload.n_parallel,
+        )
+        where = ", ".join(f"{row['name']} on {row['node_id']}" for row in placed)
+        return _shared.TriggerResponse(
+            event_ids=[],
+            channel=None,
+            topics=[],
+            detail=f"placed by fit as desired state: {where}",
+        )
     admit_replica_ram(
         payload.model, len(to_add), payload.context_length, n_parallel=payload.n_parallel
     )
