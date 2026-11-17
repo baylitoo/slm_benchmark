@@ -1188,16 +1188,41 @@ export function ChatPanel({
         return;
       }
       let content = "";
-      const appendToken = (token: string) => {
-        content += token;
+      let thinking = "";
+      const render = () => {
+        const msg: ChatMsg = {
+          role: "assistant",
+          content,
+          ...(thinking ? { trace: [{ kind: "reasoning" as const, text: thinking }] } : {}),
+        };
         setMsgs((prev) =>
           prev.length <= next.length
-            ? [...next, { role: "assistant", content }]
-            : prev.map((m, i) => (i === next.length ? { role: "assistant", content } : m)),
+            ? [...next, msg]
+            : prev.map((m, i) => (i === next.length ? msg : m)),
         );
       };
-      await chatCompletionStream(model, payload, appendToken, controller.signal, buildSamplingParams());
-      if (!content) setMsgs([...next, { role: "assistant", content: t("(empty response)") }]);
+      const appendToken = (token: string) => {
+        content += token;
+        render();
+      };
+      const appendThought = (text: string) => {
+        thinking += text;
+        render();
+      };
+      await chatCompletionStream(
+        model,
+        payload,
+        appendToken,
+        controller.signal,
+        buildSamplingParams(),
+        appendThought,
+      );
+      if (!content) {
+        setMsgs((prev) => {
+          const kept = prev.length > next.length ? prev[next.length] : undefined;
+          return [...next, { ...kept, role: "assistant", content: t("(empty response)") }];
+        });
+      }
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
         setMsgs((prev) =>

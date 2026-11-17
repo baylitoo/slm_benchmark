@@ -1040,7 +1040,17 @@ async def deployment_slots(name: str) -> dict[str, Any]:
     try:
         record = await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        # Another node's deployment: its placement row carries the endpoint
+        # and engine, and /slots is reachable over the fleet network.
+        placement = _owning_placement(name)
+        if placement is None:
+            raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        from docie_bench.serving.reconciler import RUNTIME_BY_ENGINE
+
+        record = {
+            "spec": {"launch": {"runtime": RUNTIME_BY_ENGINE.get(str(placement.get("engine")))}},
+            "endpoint": placement.get("endpoint") or None,
+        }
     launch = (record.get("spec") or {}).get("launch") or {} if isinstance(record, dict) else {}
     if launch.get("runtime") != "llamacpp":
         raise HTTPException(

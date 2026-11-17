@@ -615,3 +615,32 @@ def test_the_route_never_resolves_a_node_id_of_its_own(serving_home: Path) -> No
 
     source = inspect.getsource(serving_api.deployment_logs)
     assert "resolve_node_id" not in source
+
+
+@pytest.mark.usefixtures("sqlite_catalog")
+def test_deployment_slots_reaches_a_deployment_owned_by_another_node(
+    serving_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docie_bench.inngest import serving_api
+    from docie_bench.serving.catalog import ModelCatalog
+
+    ModelCatalog().record_placement(
+        "lfm3-1.7b_test-f09ae4",
+        model_name="lfm3-1.7b_test",
+        engine="llama-server",
+        endpoint="http://10.8.0.3:8088/v1",
+        state="ready",
+        node_id="rocky-llm",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_fetch(endpoint: str, *, headers: dict | None = None, **kwargs: object) -> tuple:
+        seen["endpoint"] = endpoint
+        return ({"id": 0, "is_processing": True},)
+
+    monkeypatch.setattr("docie_bench.serving.runtime.fetch_llamacpp_slots", fake_fetch)
+
+    payload = asyncio.run(serving_api.deployment_slots("lfm3-1.7b_test-f09ae4"))
+
+    assert payload["slots"] == [{"id": 0, "is_processing": True}]
+    assert seen["endpoint"] == "http://10.8.0.3:8088/v1"
