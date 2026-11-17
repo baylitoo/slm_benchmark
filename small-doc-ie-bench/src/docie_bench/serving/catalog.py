@@ -736,6 +736,7 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "context_length": row.context_length,
         "max_tokens": row.max_tokens,
         "timeout_seconds": row.timeout_seconds,
+        "last_served_at": isoformat(row.last_served_at),
         "created_at": isoformat(row.created_at),
         "updated_at": isoformat(row.updated_at),
     }

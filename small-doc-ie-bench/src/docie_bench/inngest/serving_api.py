@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -175,6 +176,14 @@ def _nodes_that_stopped_reporting() -> frozenset[str]:
         return frozenset()
 
 
+def _endpoint_port(endpoint: object) -> int | None:
+    """The port of an advertised endpoint (``http://host:8088/v1``), if any."""
+    try:
+        return urllib.parse.urlsplit(str(endpoint or "")).port
+    except ValueError:
+        return None
+
+
 def _records_for_other_nodes(
     local: list[Any], observed: dict[str, dict[str, Any]] | None
 ) -> list[dict[str, Any]]:
@@ -215,6 +224,7 @@ def _records_for_other_nodes(
                         "alias": row.get("model_name") or name,
                         "model": row.get("model_name"),
                         "runtime": RUNTIME_BY_ENGINE.get(str(row.get("engine") or "")),
+                        "port": _endpoint_port(row.get("endpoint")),
                     },
                 },
                 "state": row.get("state"),

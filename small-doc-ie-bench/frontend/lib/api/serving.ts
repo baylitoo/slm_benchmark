@@ -124,6 +124,8 @@ export interface ObservedPlacement {
    * measurement), "wall-clock" (timed by the caller), "not-applicable" (a
    * deployment that generates no tokens), "unmeasured". */
   throughput_source?: string | null;
+  /** Last request served, from any machine (ISO). */
+  last_served_at?: string | null;
   [k: string]: unknown;
 }
 

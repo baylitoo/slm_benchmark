@@ -38,7 +38,7 @@ import { cn } from "@/lib/cn";
 import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
-import { Alert, Badge, Button, Card, Dialog, Field, Segmented, TextInput } from "../ui";
+import { Alert, Badge, Button, Card, Dialog, Field, Segmented, Select, TextInput } from "../ui";
 import { LiveIndicator } from "../LiveIndicator";
 import { Toolbar } from "../patterns/Toolbar";
 import { ResultLine } from "../patterns/ResultLine";
@@ -187,6 +187,27 @@ function Dash({ title }: { title: string }) {
   return (
     <span className="text-muted-foreground" title={title}>
       —
+    </span>
+  );
+}
+
+/** Last request served, in ms since epoch: the node's own record or the
+ * catalog stamp written by whichever machine routed the request. */
+function lastUsedMs(record: DeploymentRecord): number {
+  const own = typeof record.last_served === "number" ? record.last_served * 1000 : 0;
+  const stamped = record.observed?.last_served_at
+    ? Date.parse(record.observed.last_served_at)
+    : 0;
+  return Math.max(own, Number.isFinite(stamped) ? stamped : 0);
+}
+
+function LastUsedCell({ record }: { record: DeploymentRecord }) {
+  const ms = lastUsedMs(record);
+  if (!ms) return <Dash title="No request served since it was deployed." />;
+  const age = elapsedSince(new Date(ms).toISOString());
+  return (
+    <span className="text-xs text-muted-foreground" title={new Date(ms).toLocaleString()}>
+      {age ? `${age.label} ago` : "just now"}
     </span>
   );
 }
@@ -415,6 +436,7 @@ export function DeploymentsView({
   const [typeFilter, setTypeFilter] = useState<
     "all" | "chat" | "encoder" | "embedding" | "reranker" | "decision"
   >("all");
+  const [nodeFilter, setNodeFilter] = useState("all");
   const decisionNames = useMemo(() => decisionDeploymentNames(store.data), [store.data]);
   // Which row's runtime log is expanded (click a row to see WHY it failed).
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -534,7 +556,8 @@ export function DeploymentsView({
   const total = all.length;
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    return all.filter((r) => {
+    const rows = all.filter((r) => {
+      if (nodeFilter !== "all" && (r.node_id ?? "") !== nodeFilter) return false;
       if (
         typeFilter !== "all" &&
         deploymentModelType(r, embeddingNames, rerankerNames, decisionNames) !== typeFilter
@@ -547,7 +570,12 @@ export function DeploymentsView({
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [all, filter, typeFilter, embeddingNames, rerankerNames, decisionNames]);
+    // Most recently used first, so the models people actually use sit on page 1.
+    return rows.sort(
+      (a, b) =>
+        lastUsedMs(b) - lastUsedMs(a) || (a.spec?.name ?? "").localeCompare(b.spec?.name ?? ""),
+    );
+  }, [all, filter, typeFilter, nodeFilter, embeddingNames, rerankerNames, decisionNames]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const clampedPage = Math.min(page, pageCount);
@@ -712,6 +740,12 @@ export function DeploymentsView({
       render: (r) => <PhaseChip record={r} />,
     },
     {
+      key: "last_used",
+      header: "Last used",
+      sortAccessor: (r) => lastUsedMs(r),
+      render: (r) => <LastUsedCell record={r} />,
+    },
+    {
       key: "speed",
       header: "Speed",
       sortAccessor: (r) => r.observed?.tokens_per_second ?? -1,
@@ -841,9 +875,10 @@ export function DeploymentsView({
         onReset={() => {
           setFilter("");
           setTypeFilter("all");
+          setNodeFilter("all");
           setPage(1);
         }}
-        resetDisabled={filter === "" && typeFilter === "all"}
+        resetDisabled={filter === "" && typeFilter === "all" && nodeFilter === "all"}
       >
         <TextInput
           value={filter}
@@ -869,6 +904,24 @@ export function DeploymentsView({
             { value: "decision", label: "Decision" },
           ]}
         />
+        {showNode && (
+          <Select
+            aria-label="Node"
+            value={nodeFilter}
+            onChange={(e) => {
+              setNodeFilter(e.target.value);
+              setPage(1);
+            }}
+            className="h-8 w-44 text-xs"
+          >
+            <option value="all">All nodes</option>
+            {[...nodeIds].sort().map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </Select>
+        )}
         <div className="ml-auto">
           <LiveIndicator
             live={deployments.live}
