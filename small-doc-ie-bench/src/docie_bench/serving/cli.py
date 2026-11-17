@@ -399,7 +399,7 @@ def create_app(
             hint=lambda record: (
                 f"\nServing '{name}' in the background on {_deploy_endpoint(record)}\n"
                 f"The model is still loading; once it answers, run:\n"
-                f"docie-bench benchmark run --model-profile {name}"
+                f"docie-bench benchmark run --model-profile {deployment_name or name}"
             ),
         )
 
@@ -763,6 +763,8 @@ def _catalog_knows_another_node() -> bool:
         from docie_bench.serving.node_liveness import stale_node_ids
         from docie_bench.serving.node_selection import UNREPORTED_CAPACITY
 
+        # Same bound as doctor: an unreachable database must not stall `up`.
+        os.environ.setdefault("PGCONNECT_TIMEOUT", "5")
         if db.get_session_factory() is None:
             db.init_engine()
         snapshots = list(ModelCatalog().list_node_snapshots())

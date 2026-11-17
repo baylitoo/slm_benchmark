@@ -76,7 +76,8 @@ def reachable_launch(
 # always reachable at these, so the round-robin guard never applies to them.
 _LOOPBACK_ADVERTISE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-#: Serializes deploys on this node (Inngest jobs, CLI, desired-state starts).
+#: Serializes deploys in this serving process (Inngest deploy jobs and
+#: desired-state starts); a separate `docie-serving up` process is not covered.
 #: A deploy never checks RAM fit against another in flight, and free RAM does
 #: not drop until the spawned model loads, so two at once can overcommit the
 #: host. Process-local on purpose: deploys on other nodes are not held up.

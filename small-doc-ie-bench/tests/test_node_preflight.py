@@ -517,6 +517,7 @@ def test_a_reachable_catalog_is_reported_with_a_usable_skew(
     assert facts.db_reachable is True
     assert facts.catalog_models == ()
     assert facts.other_node_ids == ()
+    assert facts.name_collisions == ()
     assert isinstance(facts.db_clock_skew_s, float)
     # A naive stamp read as UTC can be hours off a local clock; the point is
     # that it is a NUMBER and nothing raised.
