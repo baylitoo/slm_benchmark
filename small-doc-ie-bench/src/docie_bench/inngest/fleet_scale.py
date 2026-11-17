@@ -36,8 +36,22 @@ class FleetView:
 
     @property
     def is_fleet(self) -> bool:
-        """More than one node reported: an untargeted event may miss its node."""
-        return len(self.node_ids) > 1
+        """More than one node that matters: a live one, or one owning a replica.
+
+        A leftover row from a replaced node does not make a fleet, or a
+        single-node install would switch to desired state nobody applies.
+        """
+        from docie_bench.serving.node_liveness import stale_node_ids
+        from docie_bench.serving.node_selection import UNREPORTED_CAPACITY
+
+        stale = stale_node_ids(self.snapshots)
+        live = {
+            str(s.get("node_id") or "")
+            for s in self.snapshots
+            if s.get("source") != UNREPORTED_CAPACITY
+        } - stale - {""}
+        holders = {node for node in self.owners.values() if node}
+        return len(live | holders) > 1
 
 
 def _spec_model(row: Mapping[str, Any]) -> str:

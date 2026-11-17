@@ -161,3 +161,26 @@ def test_deploy_with_replicas_spreads_over_the_fleet(fleet: list[Any]) -> None:
     assert result.channel is None
     assert len(_desired("rocky-llm")) == 1
     assert len(_desired("gpu-box")) == 1
+
+
+def test_a_leftover_node_row_does_not_switch_off_the_event_path(
+    fleet: list[Any],
+) -> None:
+    """One live node plus the stale row of a replaced one is not a fleet."""
+    import datetime as dt
+
+    from docie_bench.serving.catalog import ServingNode
+    from docie_bench.storage.db import session_scope
+
+    _node("rocky-llm")
+    _node("rocky-llm-old")
+    with session_scope() as session:
+        assert session is not None
+        row = session.get(ServingNode, "rocky-llm-old")
+        assert row is not None
+        row.updated_at = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
+
+    result = _scale(1)
+
+    assert len(fleet) == 1  # the ordinary deploy event
+    assert result["channel"] is not None
