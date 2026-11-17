@@ -381,3 +381,53 @@ def test_an_untargeted_deploy_is_unchanged_by_any_of_this(catalog_db: None) -> N
 
     assert payload.auto_place is False
     assert payload.node_id is None
+
+
+def _capture_events(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    import docie_bench.inngest.studio_api.deploy as deploy_api
+
+    sent: list[Any] = []
+
+    async def fake_send(_client: Any, event: Any) -> list[str]:
+        sent.append(event)
+        return ["evt-1"]
+
+    monkeypatch.setattr(deploy_api, "send_or_503", fake_send)
+    monkeypatch.setattr(deploy_api._shared, "_record_event_owners", lambda *_a: None)
+    return sent
+
+
+def test_an_untargeted_deploy_on_a_fleet_is_placed_by_fit(
+    catalog_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without this the event lands on whichever node Inngest picks."""
+    sent = _capture_events(monkeypatch)
+    _seed_model()
+    _publish("roomy", free_gib=7)
+    _publish("cramped", free_gib=1.2)
+
+    result = _deploy()
+
+    assert sent == []
+    assert result.event_ids == []
+    assert len(_desired("roomy")) == 1
+    assert _desired("cramped") == []
+
+
+def test_an_untargeted_deploy_on_one_node_still_sends_the_event(
+    catalog_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent = _capture_events(monkeypatch)
+    _seed_model()
+    _publish("only")
+    from types import SimpleNamespace
+
+    from docie_bench.inngest.studio_api.deploy import DeployRequest, trigger_deploy
+
+    result = asyncio.run(
+        trigger_deploy(DeployRequest(model=MODEL), tenant=SimpleNamespace(tenant_id="tests"))  # type: ignore[arg-type]
+    )
+
+    assert len(sent) == 1
+    assert result.event_ids == ["evt-1"]
+    assert _desired("only") == []

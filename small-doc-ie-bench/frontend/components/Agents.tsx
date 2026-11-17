@@ -35,6 +35,7 @@ import {
   deleteAgent,
   deployModel,
   deploymentModelType,
+  deploymentServedModel,
   deploymentServesAny,
   fileToBase64,
   getAgents,
@@ -715,11 +716,16 @@ export function CreateView({
   // one-click "Deploy" shortcuts (store path, no hardcoded repo, no
   // download-at-boot). Generic: whatever analyzer entries the store holds.
   const seededUndeployedEncoders = useMemo(() => {
-    const deployed = new Set(encoderDeployments.map((d) => d.name));
+    // By served model: a node-placed encoder's record name is minted.
+    const deployed = new Set(
+      (deployments.data ?? [])
+        .filter((d) => deploymentModelType(d) === "encoder")
+        .map(deploymentServedModel),
+    );
     return (store.data ?? [])
       .filter((e) => e.analyzer && !deployed.has(e.name))
       .map((e) => e.name);
-  }, [store.data, encoderDeployments]);
+  }, [store.data, deployments.data]);
 
   const [templateId, setTemplateId] = useState(prefill?.id ?? "custom");
   const [name, setName] = useState("");
@@ -745,8 +751,10 @@ export function CreateView({
   async function deploySeededEncoder(storeName: string) {
     setDeployingGuard(true);
     try {
-      await deployModel({ model: storeName, name: storeName });
-      setGuardModel(storeName);
+      // No fixed name: on a fleet the record name is minted per node, so the
+      // guard names the model and resolves to whichever replica is live.
+      await deployModel({ model: storeName });
+      setGuardModel(`store:${storeName}`);
       toast({
         title: "Encoder deploy started",
         description: `${storeName} — follow progress under Deployments.`,
@@ -1252,6 +1260,10 @@ export function CreateView({
                     onChange={(e) => setGuardModel(e.target.value)}
                   >
                     <option value="">None — regex analyzer</option>
+                    {guardModel.startsWith("store:") &&
+                      !encoderDeployments.some((d) => d.name === guardModel) && (
+                        <option value={guardModel}>{guardModel.slice("store:".length)}</option>
+                      )}
                     {encoderDeployments.map((d) => (
                       <option key={d.name} value={d.name}>
                         {d.name}
