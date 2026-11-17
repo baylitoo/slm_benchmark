@@ -176,6 +176,17 @@ def _nodes_that_stopped_reporting() -> frozenset[str]:
         return frozenset()
 
 
+def _drained_nodes() -> frozenset[str]:
+    """Nodes an operator drained (best-effort)."""
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.placement_resolver import _drained_node_ids
+
+    try:
+        return _drained_node_ids(list(ModelCatalog().list_node_snapshots()))
+    except Exception:  # noqa: BLE001 - attribution must not 500 the Board
+        return frozenset()
+
+
 def _endpoint_port(endpoint: object) -> int | None:
     """The port of an advertised endpoint (``http://host:8088/v1``), if any."""
     try:
@@ -281,6 +292,7 @@ async def list_deployments() -> Any:
     # whole fleet; a missing deployment is worse than a partial one.
     records.extend(_records_for_other_nodes(records, observed))
     stale_nodes = _nodes_that_stopped_reporting()
+    drained_nodes = _drained_nodes()
     group_sizes: dict[str, int] = {}
     for record in records:
         if isinstance(record, dict) and (base := _replica_base(record)):
@@ -300,6 +312,7 @@ async def list_deployments() -> Any:
         record.setdefault("record_source", "node")
         node_id = record.get("node_id")
         record["node_reporting"] = not (node_id and node_id in stale_nodes)
+        record["node_drained"] = bool(node_id and node_id in drained_nodes)
         base = _replica_base(record)
         record["replica_group"] = base
         record["replicas"] = group_sizes.get(base, 1) if base else 1

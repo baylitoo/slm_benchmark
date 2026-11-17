@@ -229,3 +229,16 @@ def test_a_studio_sign_in_may_still_act(central: list[Any]) -> None:
     _require_fleet_manager(TenantContext(tenant_id="ops", authenticated=True, studio_user=True))
     _require_fleet_manager(TenantContext(tenant_id="ops", authenticated=True, operator=True))
     _require_fleet_manager(None)
+
+
+def test_activity_does_not_count_a_replica_on_a_drained_node_as_live(central: list[Any]) -> None:
+    catalog = ModelCatalog()
+    _node("central")
+    _node("rocky-llm")
+    _place(NAME, "rocky-llm")
+    catalog.record_activity("lfm3-1.7b")
+    assert catalog.list_activity()[0]["live_replica_count"] == 1
+
+    catalog.set_node_drain("rocky-llm", drained=True)
+
+    assert catalog.list_activity()[0]["live_replica_count"] == 0

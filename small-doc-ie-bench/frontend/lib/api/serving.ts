@@ -184,6 +184,8 @@ export interface DeploymentRecord {
   /** False when the owning node's snapshot has gone stale. The deployment is
    * still listed rather than hidden: unreachable is not the same as gone. */
   node_reporting?: boolean;
+  /** True when an operator drained the owning node: routing skips it. */
+  node_drained?: boolean;
   /** The newest lifecycle action queued for the owning node (fleet only). */
   node_request?: NodeRequest | null;
   [k: string]: unknown;

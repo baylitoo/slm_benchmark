@@ -340,7 +340,9 @@ export function candidatesFrom(records: DeploymentRecord[]): Candidate[] {
   for (const record of records) {
     const model = record.replica_group ?? record.spec?.name;
     if (!model) continue;
-    const phase = record.observed?.phase ?? null;
+    // A replica on a drained or silent node is not one routing can use.
+    const usable = record.node_reporting !== false && !record.node_drained;
+    const phase = usable ? (record.observed?.phase ?? null) : null;
     const existing = byModel.get(model);
     if (!existing) {
       byModel.set(model, {

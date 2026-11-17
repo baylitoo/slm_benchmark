@@ -1905,6 +1905,12 @@ class ModelCatalog:
         # shadows the builtin for any bare `list[...]` annotation appearing
         # after it (a pre-existing mypy false-positive on
         # list_placements_for_model, left as-is; not reproducing it here).
+        from docie_bench.serving.node_liveness import stale_node_ids
+        from docie_bench.serving.placement_resolver import _drained_node_ids
+
+        snapshots = list(self.list_node_snapshots())
+        # A replica routing will not use is not live here either.
+        unusable = stale_node_ids(snapshots) | _drained_node_ids(snapshots)
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")
@@ -1926,7 +1932,11 @@ class ModelCatalog:
                 if placement.model_name is None:
                     continue
                 total_counts[placement.model_name] = total_counts.get(placement.model_name, 0) + 1
-                if placement.state == "ready" and (placement.endpoint or "").strip():
+                if (
+                    placement.state == "ready"
+                    and (placement.endpoint or "").strip()
+                    and (placement.node_id or "") not in unusable
+                ):
                     live_counts[placement.model_name] = live_counts.get(placement.model_name, 0) + 1
             return [
                 {
