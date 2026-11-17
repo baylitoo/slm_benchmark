@@ -95,6 +95,9 @@ class CpuSampler:
                 self._samples.append((time.time() - self._t0, _psutil.cpu_percent()))
 
 
+# What differs between replicas of one model.
+_REPLICA_FIELDS = ("base_url", "served_by_deployment", "served_by_node", "deployment_slot_count")
+
 _NODE_HARDWARE_KEYS = (
     "total_bytes",
     "free_bytes",
@@ -252,12 +255,19 @@ async def run_benchmark(
     if not selected_profiles:
         raise ValueError("No extraction model profiles selected")
     # A selector served by the fleet rather than models.yaml is re-resolved per
-    # task; the up-front profile still fixes task identity for resume.
+    # task, so its identity leaves out which replica the up-front pick landed on.
     live_selector = (
         model_profile
         if routing_policy is None and model_profile and model_profile not in profiles
         else None
     )
+
+    def identity_snapshot(profile: ModelProfile) -> dict[str, Any]:
+        snapshot = profile_snapshot(profile)
+        if live_selector is not None:
+            for key in _REPLICA_FIELDS:
+                snapshot.pop(key, None)
+        return snapshot
 
     document_hashes = {item.file_path: hash_file(Path(item.file_path)) for item in base_items}
     task_config = {
@@ -286,7 +296,7 @@ async def run_benchmark(
                     "model_profile": (
                         routing_policy.model_dump(mode="json")
                         if routing_policy is not None
-                        else profile_snapshot(profile)
+                        else identity_snapshot(profile)
                     ),
                     "task_config": task_config,
                 }
@@ -319,7 +329,7 @@ async def run_benchmark(
     inputs = {
         "git": git,
         "models_config_hash": hash_file(models_config_path),
-        "selected_profiles": [profile_snapshot(profile) for profile in selected_profiles],
+        "selected_profiles": [identity_snapshot(profile) for profile in selected_profiles],
         "judge_profile": profile_snapshot(selected_judge) if selected_judge else None,
         "dataset": {
             "kind": "dataset" if dataset_path is not None else "document",
@@ -472,7 +482,8 @@ async def run_benchmark(
                 "metadata": {"doc_id": item.doc_id, **item.metadata},
             }
             started = time.perf_counter()
-            node_id = getattr(profile, "served_by_node", None)
+            # With a live selector the up-front replica is not this task's.
+            node_id = None if live_selector else getattr(profile, "served_by_node", None)
             try:
                 if live_selector is not None:
                     # Per task, so a scaled model's replicas share the load.

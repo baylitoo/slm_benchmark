@@ -339,3 +339,44 @@ def test_hardware_comes_from_the_answering_nodes_rows(monkeypatch: pytest.Monkey
 
     # No node known (a models.yaml profile): the worker's own readings stand.
     assert serving_hardware([None]) == {"source": "worker", "cpu_source": "worker", "nodes": {}}
+
+
+def test_resuming_a_fleet_benchmark_tolerates_a_different_up_front_replica(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from docie_bench.llm.model_profiles import ModelProfile
+
+    dataset, models = _inputs(tmp_path)
+    replicas = [
+        ModelProfile(
+            name="store:lfm2.5-350m",
+            model="lfm2.5-350m",
+            base_url=f"http://{node}:8090/v1",
+            api_key="k",
+            response_format_style="json_object",
+            served_by_deployment=f"lfm2.5-350m-{node}",
+            served_by_node=node,
+        )
+        for node in ("rocky-llm", "ash-llm")
+    ]
+    picks = iter([0, 0, 1])  # run, its one task, then the resume's up-front pick
+
+    monkeypatch.setattr(
+        "docie_bench.serving.profile_resolver.resolve_extraction_profile",
+        lambda **_: replicas[next(picks)],
+    )
+    _install_stub_transport(monkeypatch, lambda request: _completion(_VALID_EXTRACTION))
+    run_dir = tmp_path / "run"
+    kwargs: dict[str, Any] = {
+        "dataset_path": dataset,
+        "models_config_path": models,
+        "model_profile": "lfm2.5-350m",
+        "output_dir": run_dir,
+    }
+    asyncio.run(run_benchmark(**kwargs))
+    (run_dir / "metrics.json").unlink()
+
+    # Raises ResumeDriftError if the task ids hashed the replica's address.
+    result = asyncio.run(run_benchmark(**kwargs, resume=True))
+    metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert metrics["reproducibility"]["tasks_skipped"] == 1
