@@ -167,6 +167,10 @@ _ENGINE_BY_RUNTIME: dict[RuntimeKind, str] = {
     RuntimeKind.MULTI_VECTOR: "multi_vector",
     RuntimeKind.DENSE_EMBEDDING: "dense_embedding",
 }
+# The inverse, for records rebuilt from a placement row on another node.
+RUNTIME_BY_ENGINE: dict[str, str] = {
+    engine: runtime.value for runtime, engine in _ENGINE_BY_RUNTIME.items()
+}
 
 
 class ReconcilerSingletonError(RuntimeError):

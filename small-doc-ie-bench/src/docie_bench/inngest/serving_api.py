@@ -194,6 +194,8 @@ def _records_for_other_nodes(
     """
     if not observed:
         return []
+    from docie_bench.serving.reconciler import RUNTIME_BY_ENGINE
+
     known = {
         str((record.get("spec") or {}).get("name") or "")
         for record in local
@@ -212,6 +214,7 @@ def _records_for_other_nodes(
                     "launch": {
                         "alias": row.get("model_name") or name,
                         "model": row.get("model_name"),
+                        "runtime": RUNTIME_BY_ENGINE.get(str(row.get("engine") or "")),
                     },
                 },
                 "state": row.get("state"),

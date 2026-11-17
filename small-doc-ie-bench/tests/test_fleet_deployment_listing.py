@@ -259,3 +259,29 @@ def test_a_placement_with_no_owner_is_still_a_404(serving_home: Path) -> None:
         asyncio.run(_fire_lifecycle_event("legacy", event="serving/x", prefix="x"))
 
     assert caught.value.status_code == 404
+
+
+def test_a_remote_record_carries_its_runtime(serving_home: Path) -> None:
+    """The Playground labels and filters by ``launch.runtime``; a remote record
+    rebuilt from its placement must carry it, not render ``(?)``."""
+    _seed_local(serving_home)
+    _place(LOCAL, node_id="node-a")
+    _place(REMOTE, node_id="node-b")
+    ModelCatalog().record_placement(
+        "encoder-remote",
+        model_name="encoder-remote",
+        engine="encoder",
+        endpoint="http://node-b:8090/v1",
+        state="ready",
+        node_id="node-b",
+    )
+
+    by_name = {str((r.get("spec") or {}).get("name")): r for r in _listing()}
+
+    def runtime(name: str) -> object:
+        spec = by_name[name]["spec"]
+        assert isinstance(spec, dict)
+        return spec["launch"]["runtime"]
+
+    assert runtime(REMOTE) == "llamacpp"
+    assert runtime("encoder-remote") == "encoder"
