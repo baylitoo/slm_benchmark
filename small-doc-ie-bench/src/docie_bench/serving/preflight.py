@@ -35,6 +35,7 @@ import datetime as dt
 import enum
 import logging
 import os
+import re
 import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -100,6 +101,10 @@ class NodeFacts:
     advertise_resolved: tuple[str, ...] | None = None
     #: This host's own addresses, for comparison against the above.
     local_addresses: frozenset[str] = field(default_factory=frozenset)
+    #: DOCIE_SERVING_PUBLISH_IP: the host address Docker publishes the runtime
+    #: ports on. Inside a container that address belongs to the Docker host, so
+    #: it is not among ``local_addresses`` and should not be expected there.
+    publish_ip: str = ""
     bind_host: str = "0.0.0.0"  # noqa: S104 - container service bind default
     port_range: tuple[int, int] = (8088, 8188)
     #: Ports in the window already held by something else; None when not probed.
@@ -117,6 +122,14 @@ class NodeFacts:
     store_models: tuple[str, ...] | None = None
     #: Other nodes with a row in the catalog.
     other_node_ids: tuple[str, ...] | None = None
+    #: This node's own catalog row: None when the catalog could not be read,
+    #: False when there is no row or only a staged one, True when it has
+    #: published at least once.
+    heartbeat_published: bool | None = None
+    #: Seconds since this node's last published snapshot, when known.
+    heartbeat_age_s: float | None = None
+    #: How old a snapshot may be before the fleet treats the node as silent.
+    heartbeat_stale_after_s: float | None = None
 
 
 def _role_check(facts: NodeFacts) -> Check:
@@ -200,6 +213,27 @@ def _advertise_check(facts: NodeFacts) -> Check:
             "network that matters -- but a name that resolves nowhere here is "
             "usually a name that resolves to the wrong thing there.",
         )
+    publish_ip = (facts.publish_ip or "").strip()
+    if publish_ip and publish_ip not in UNROUTABLE_ADVERTISE_HOSTS:
+        if publish_ip in resolved:
+            # The Docker case: the runtime ports are published on this host
+            # address, which the container cannot see among its own interfaces.
+            return Check(
+                "advertise host",
+                Severity.PASS,
+                f"{host} -> {', '.join(sorted(resolved))}, where the runtime "
+                f"ports are published (DOCIE_SERVING_PUBLISH_IP)",
+            )
+        return Check(
+            "advertise host",
+            Severity.FAIL,
+            f"{host!r} resolves to {', '.join(sorted(resolved))}, but the "
+            f"runtime ports are published on {publish_ip}",
+            "Deploys record http://{advertise}:{port}/v1, and nothing listens on "
+            "that address. The central api's requests for this node's models "
+            "fail, or reach another machine. Set both to this node's "
+            "private-network address.",
+        )
     if facts.local_addresses and not (set(resolved) & facts.local_addresses):
         return Check(
             "advertise host",
@@ -225,6 +259,34 @@ def _catalog_check(facts: NodeFacts) -> Check:
         "already loaded, but it is invisible to the fleet and converges on "
         "nothing.",
     )
+
+
+def _heartbeat_check(facts: NodeFacts) -> Check:
+    if facts.heartbeat_published is None:
+        return Check("fleet heartbeat", Severity.INFO, "unknown: the catalog could not be read")
+    if not facts.heartbeat_published:
+        return Check(
+            "fleet heartbeat",
+            Severity.WARN,
+            f"node {facts.node_id or '?'} has not published a snapshot yet",
+            "The serving worker publishes one every reconcile interval, so a "
+            "running node appears in the Fleet page within seconds. If this "
+            "persists, the serving container is not running or its worker "
+            "failed at startup; its logs say why.",
+        )
+    age, window = facts.heartbeat_age_s, facts.heartbeat_stale_after_s
+    if age is not None and window is not None and age > window:
+        return Check(
+            "fleet heartbeat",
+            Severity.WARN,
+            f"last snapshot {age:.0f}s ago, stale after {window:.0f}s",
+            "Routing demotes this node's placements while it is silent. The "
+            "worker has stopped publishing: it may be wedged, restarting, or "
+            "unable to reach the database.",
+        )
+    if age is None:
+        return Check("fleet heartbeat", Severity.PASS, "published")
+    return Check("fleet heartbeat", Severity.PASS, f"last snapshot {age:.0f}s ago")
 
 
 def _clock_check(facts: NodeFacts) -> Check:
@@ -346,6 +408,7 @@ _CHECKS = (
     _node_id_check,
     _advertise_check,
     _catalog_check,
+    _heartbeat_check,
     _inngest_check,
     _desired_apply_check,
     _ports_check,
@@ -383,6 +446,38 @@ def _local_addresses() -> frozenset[str]:
     except OSError:
         pass
     return frozenset(found)
+
+
+_CREDENTIALS_IN_URL = re.compile(r"(\w+://)[^/\s:@]+(?::[^/\s@]*)?@")
+
+
+def _database_target(url: str) -> str:
+    """``host:port/database`` for a database URL, with no credentials."""
+    try:
+        from sqlalchemy.engine import make_url
+
+        parsed = make_url(url)
+    except Exception:  # noqa: BLE001 - an unparseable URL is reported, never echoed
+        return "an unparseable DATABASE_URL"
+    host = parsed.host or "localhost"
+    port = f":{parsed.port}" if parsed.port else ""
+    database = f"/{parsed.database}" if parsed.database else ""
+    return f"{host}{port}{database}"
+
+
+def _redact(message: str, url: str | None) -> str:
+    """One line of an error, with any credentials from ``url`` removed."""
+    line = message.strip().splitlines()[0] if message.strip() else ""
+    if url:
+        try:
+            from sqlalchemy.engine import make_url
+
+            password = make_url(url).password
+        except Exception:  # noqa: BLE001
+            password = None
+        if password:
+            line = line.replace(str(password), "***")
+    return _CREDENTIALS_IN_URL.sub(r"\1***@", line)
 
 
 def _resolve(host: str) -> tuple[str, ...] | None:
@@ -474,10 +569,20 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
     catalog_models: tuple[str, ...] | None = None
     store_models: tuple[str, ...] | None = None
     other_nodes: tuple[str, ...] | None = None
+    heartbeat_published: bool | None = None
+    heartbeat_age: float | None = None
+    stale_after: float | None = None
+    database_url = str(getattr(settings, "database_url", "") or "")
     try:
         import docie_bench.storage.db as db
         from docie_bench.serving.catalog import ModelCatalog
 
+        # A fresh CLI process has no engine yet: the worker initialises one at
+        # startup, but `docie-serving doctor` is its own process. Without this
+        # the probe below saw no session and reported a configured URL as
+        # missing.
+        if db.get_session_factory() is None:
+            db.init_engine()
         with db.session_scope() as session:
             if session is None:
                 raise RuntimeError("DATABASE_URL is not configured")
@@ -496,9 +601,25 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
             for row in rows
             if str(row.get("node_id") or "") and str(row.get("node_id") or "") != node_id
         )
-        db_detail = f"reachable; {len(rows)} node(s) known, {len(catalog_models)} model(s)"
+        db_detail = (
+            f"{_database_target(database_url)} reachable; {len(rows)} node(s) "
+            f"known, {len(catalog_models)} model(s)"
+        )
+        from docie_bench.serving.node_liveness import snapshot_age_s, snapshot_stale_after_s
+
+        stale_after = snapshot_stale_after_s()
+        own = next((row for row in rows if row.get("node_id") == node_id), None)
+        heartbeat_published = own is not None and own.get("source") != "unreported"
+        if heartbeat_published and own is not None:
+            heartbeat_age = snapshot_age_s(own)
     except Exception as exc:  # noqa: BLE001 - every failure here is a finding
-        db_detail = f"{type(exc).__name__}: {exc}"
+        if not database_url:
+            db_detail = "DATABASE_URL is not configured"
+        else:
+            db_detail = (
+                f"cannot use the catalog at {_database_target(database_url)}: "
+                f"{type(exc).__name__}: {_redact(str(exc), database_url)}"
+            )
 
     try:
         from docie_bench.serving.model_store import ModelStore
@@ -532,6 +653,7 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
         advertise_host=advertise,
         advertise_resolved=_resolve(advertise) if advertise else None,
         local_addresses=_local_addresses(),
+        publish_ip=os.getenv("DOCIE_SERVING_PUBLISH_IP", "").strip(),
         bind_host=bind_host,
         port_range=(start, end),
         ports_in_use=_ports_held(bind_host, start, end) if probe_ports else None,
@@ -544,6 +666,9 @@ def collect_facts(*, probe_ports: bool = False, probe_inngest: bool = True) -> N
         catalog_models=catalog_models,
         store_models=store_models,
         other_node_ids=other_nodes,
+        heartbeat_published=heartbeat_published,
+        heartbeat_age_s=heartbeat_age,
+        heartbeat_stale_after_s=stale_after,
     )
 
 
