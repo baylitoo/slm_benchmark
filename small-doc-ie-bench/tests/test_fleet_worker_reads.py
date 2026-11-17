@@ -68,6 +68,7 @@ def _observe(
     node_id: str,
     state: str = "ready",
     slot_count: int | None = None,
+    phase: str | None = None,
 ) -> None:
     """A placement row as the owning node's reconciler would publish it."""
     ModelCatalog().publish_observed(
@@ -76,7 +77,7 @@ def _observe(
         engine="llama-server",
         state=state,
         endpoint=f"http://{node_id}:8088/v1" if state == "ready" else "",
-        phase="hot" if state == "ready" else "cold",
+        phase=phase or ("hot" if state == "ready" else "cold"),
         pid=None,
         pid_create_time=None,
         rss_bytes=0,
@@ -150,17 +151,68 @@ def test_this_nodes_own_record_still_wins(serving_home: Path) -> None:
 def test_a_remote_record_carries_no_desired_state_so_autoload_declines(
     serving_home: Path,
 ) -> None:
-    """The scope line. A placement row has no ``desired_state`` or
-    ``activation``, so a cold deployment on another node still does not
-    autoload -- but now because the record says nothing about desired state,
-    not because the deployment looked nonexistent. Loading on another node
-    needs a desired state that can express it (#590).
-    """
+    """``cold`` is how the owner publishes a manual stop: it stays stopped."""
     _write_local(serving_home, {})
     _observe(REMOTE, node_id="node-b", state="cold")
 
     assert functions._read_deployment(REMOTE) is not None
     assert functions._autoload_target({"deployment": REMOTE}) is None
+
+
+def test_an_idle_evicted_remote_deployment_autoloads_through_its_owner(
+    serving_home: Path,
+) -> None:
+    """``evicted`` is the owner's idle unload: a request may bring it back,
+    and the load goes to the owning node's desired state, not to an event any
+    node could pick up."""
+    _write_local(serving_home, {})
+    _node_snapshot("node-b")
+    _observe(REMOTE, node_id="node-b", state="stopped", phase="evicted")
+
+    plan = functions._autoload_target({"deployment": REMOTE})
+    assert plan is not None
+    assert plan[0] == REMOTE
+    assert functions._request_remote_load(REMOTE) is True
+
+    desired = ModelCatalog().desired_snapshot("node-b")
+    assert REMOTE in str(desired)
+
+
+def test_a_local_record_loads_through_the_event(serving_home: Path) -> None:
+    _write_local(serving_home, {REMOTE: _local_record(state="stopped")})
+    assert functions._request_remote_load(REMOTE) is False
+
+
+def test_a_request_for_a_minted_remote_name_loads_it_on_its_owner(
+    serving_home: Path,
+) -> None:
+    """The chat gateway passes the deployment name the Playground shows
+    (``<model>-f09ae4``), which is not a store entry; the trigger maps it to
+    its model and loads that replica through the owner's desired state."""
+    import asyncio
+
+    from docie_bench.inngest.serving_api import trigger_deployment_load
+    from docie_bench.serving.model_store import StoreEntry
+
+    _write_local(serving_home, {})
+    _node_snapshot("node-b")
+    ModelCatalog().upsert(
+        StoreEntry(name="lfm3", family="openai_chat", model_path=Path("/models/lfm3.gguf"))
+    )
+    ModelCatalog().record_placement(
+        "lfm3-f09ae4",
+        model_name="lfm3",
+        engine="llama-server",
+        endpoint="",
+        state="stopped",
+        node_id="node-b",
+    )
+
+    triggered = asyncio.run(trigger_deployment_load("lfm3-f09ae4"))
+
+    assert triggered is not None
+    assert triggered[0] == "lfm3-f09ae4"
+    assert "lfm3-f09ae4" in str(ModelCatalog().desired_snapshot("node-b"))
 
 
 # --- fan-out prices the fleet ----------------------------------------------

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -50,6 +51,8 @@ from docie_bench.ocr.service import processor_from_settings
 from docie_bench.serving import recency
 from docie_bench.settings import get_settings
 
+logger = logging.getLogger(__name__)
+
 try:
     import psutil as _psutil
 
@@ -90,6 +93,41 @@ class CpuSampler:
         while not self._stop.wait(self._interval):
             if _psutil is not None:
                 self._samples.append((time.time() - self._t0, _psutil.cpu_percent()))
+
+
+# What differs between replicas of one model.
+_REPLICA_FIELDS = ("base_url", "served_by_deployment", "served_by_node", "deployment_slot_count")
+
+_NODE_HARDWARE_KEYS = (
+    "total_bytes",
+    "free_bytes",
+    "ceiling_bytes",
+    "effective_budget_bytes",
+    "source",
+    "updated_at",
+)
+
+
+def serving_hardware(node_ids: list[str | None]) -> dict[str, Any]:
+    """Memory of the serving nodes that answered, from their ``serving_node`` rows.
+
+    The row carries no CPU, so ``cpu_samples`` stay the worker's own psutil
+    readings either way. ``source`` is "worker" when no node is known.
+    """
+    wanted = {node for node in node_ids if node}
+    nodes: dict[str, dict[str, Any]] = {}
+    if wanted:
+        try:
+            from docie_bench.serving.catalog import ModelCatalog
+
+            for snapshot in ModelCatalog().list_node_snapshots():
+                if snapshot.get("node_id") in wanted:
+                    nodes[str(snapshot["node_id"])] = {
+                        key: snapshot.get(key) for key in _NODE_HARDWARE_KEYS
+                    }
+        except Exception:  # noqa: BLE001 - attribution must never fail a run
+            logger.warning("could not read serving node rows for the report", exc_info=True)
+    return {"source": "serving_node" if nodes else "worker", "cpu_source": "worker", "nodes": nodes}
 
 
 @dataclass(frozen=True)
@@ -216,6 +254,20 @@ async def run_benchmark(
             ]
     if not selected_profiles:
         raise ValueError("No extraction model profiles selected")
+    # A selector served by the fleet rather than models.yaml is re-resolved per
+    # task, so its identity leaves out which replica the up-front pick landed on.
+    live_selector = (
+        model_profile
+        if routing_policy is None and model_profile and model_profile not in profiles
+        else None
+    )
+
+    def identity_snapshot(profile: ModelProfile) -> dict[str, Any]:
+        snapshot = profile_snapshot(profile)
+        if live_selector is not None:
+            for key in _REPLICA_FIELDS:
+                snapshot.pop(key, None)
+        return snapshot
 
     document_hashes = {item.file_path: hash_file(Path(item.file_path)) for item in base_items}
     task_config = {
@@ -244,7 +296,7 @@ async def run_benchmark(
                     "model_profile": (
                         routing_policy.model_dump(mode="json")
                         if routing_policy is not None
-                        else profile_snapshot(profile)
+                        else identity_snapshot(profile)
                     ),
                     "task_config": task_config,
                 }
@@ -277,7 +329,7 @@ async def run_benchmark(
     inputs = {
         "git": git,
         "models_config_hash": hash_file(models_config_path),
-        "selected_profiles": [profile_snapshot(profile) for profile in selected_profiles],
+        "selected_profiles": [identity_snapshot(profile) for profile in selected_profiles],
         "judge_profile": profile_snapshot(selected_judge) if selected_judge else None,
         "dataset": {
             "kind": "dataset" if dataset_path is not None else "document",
@@ -430,7 +482,13 @@ async def run_benchmark(
                 "metadata": {"doc_id": item.doc_id, **item.metadata},
             }
             started = time.perf_counter()
+            # With a live selector the up-front replica is not this task's.
+            node_id = None if live_selector else getattr(profile, "served_by_node", None)
             try:
+                if live_selector is not None:
+                    # Per task, so a scaled model's replicas share the load.
+                    profile = await asyncio.to_thread(_select_profile, profiles, live_selector)
+                    node_id = getattr(profile, "served_by_node", None)
                 if routing_active:
                     assert routing_policy is not None
                     router = build_extraction_router(routing_policy, profiles)
@@ -467,6 +525,8 @@ async def run_benchmark(
                     "language": item.language,
                     "dynamic_schema": response.dynamic_schema,
                     "model_profile": label,
+                    "node_id": (getattr(response, "served_by", None) or {}).get("node")
+                    or node_id,
                     "ingestion_path": ingestion_path,
                     "response_format_style": getattr(response, "response_format_style", None),
                     # The style the profile *requested* (None under routing, which
@@ -526,6 +586,7 @@ async def run_benchmark(
                     "language": item.language,
                     "dynamic_schema": item.dynamic_schema,
                     "model_profile": label,
+                    "node_id": node_id,
                     "ingestion_path": ingestion_path,
                     "ok": False,
                     "latency_ms": int((time.perf_counter() - started) * 1000),
@@ -564,6 +625,7 @@ async def run_benchmark(
         eval_mode=eval_mode,
     )
     metrics["dataset"] = dataset_metadata
+    metrics["hardware"] = serving_hardware([row.get("node_id") for row in prediction_rows])
     threshold = (
         valid_rate_threshold
         if valid_rate_threshold is not None

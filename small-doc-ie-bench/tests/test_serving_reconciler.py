@@ -209,6 +209,57 @@ def test_slot_count_is_published_only_while_hot(tmp_path: Path) -> None:
     assert _only(observations, "invoice").slot_count is None
 
 
+def test_launch_settings_and_tool_calls_verdict_are_published(tmp_path: Path) -> None:
+    """Another node has no deployments.json for this one, so the placement row
+    must carry the launch settings and the /props verdict (#664 B6)."""
+    supervisor, adapter, reconciler, _ = _build(tmp_path)
+    adapter.tool_calls_supported["invoice"] = False
+    launch = RuntimeLaunchSpec(
+        runtime=RuntimeKind.LLAMACPP,
+        model="/models/invoice.gguf",
+        alias="invoice",
+        port=8090,
+        context_length=8192,
+        max_tokens=1536,
+        timeout_seconds=240.0,
+    )
+    supervisor.deploy(_spec(launch=launch))
+
+    reconciler.run_cycle()
+    observed = _only(reconciler.run_cycle(), "invoice")
+
+    assert observed.tool_calls_supported is False
+    assert observed.context_length == 8192
+    assert observed.max_tokens == 1536
+    assert observed.timeout_seconds == 240.0
+
+
+def test_seed_leftover_sweep_runs_on_this_nodes_reconciler_hourly(tmp_path: Path) -> None:
+    """Downloads land on the serving node, so its reconciler sweeps them: on
+    the first cycle, then at most once per interval (#664 B7)."""
+    supervisor = PersistentSupervisor(
+        tmp_path / "deployments.json", adapters={RuntimeKind.LLAMACPP: ScriptedAdapter()}
+    )
+    now = [1000.0]
+    sweeps: list[float] = []
+    reconciler = ServingReconciler(
+        supervisor,
+        publisher=lambda observations: None,
+        recency_home=tmp_path,
+        clock=lambda: now[0],
+        seed_gc=lambda: sweeps.append(now[0]),
+        seed_gc_interval_s=3600.0,
+    )
+
+    reconciler.run_cycle()
+    now[0] += 60.0
+    reconciler.run_cycle()
+    now[0] += 3600.0
+    reconciler.run_cycle()
+
+    assert sweeps == [1000.0, 4660.0]
+
+
 def test_run_cycle_exports_deployment_metrics(tmp_path: Path) -> None:
     """Each cycle must export the deployment's health/phase as Prometheus
     gauges (docie_deployment_healthy / docie_deployment_phase) -- otherwise a
@@ -649,6 +700,10 @@ def test_migration_adds_observed_columns_to_a_legacy_table(tmp_path: Path) -> No
         "slot_count",
         "node_id",
         "last_served_at",
+        "tool_calls_supported",
+        "context_length",
+        "max_tokens",
+        "timeout_seconds",
     ]
     columns = {column["name"] for column in sa_inspect(engine).get_columns("model_placement")}
     assert {"phase", "pid", "rss_bytes", "health_ok", "last_probe_at", "last_error"} <= columns

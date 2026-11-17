@@ -150,11 +150,40 @@ def _remote_deployment(name: str) -> dict[str, Any] | None:
         "endpoint": row.get("endpoint"),
         "last_error": row.get("last_error"),
         "node_id": row.get("node_id"),
+        # The owner publishes ``evicted`` only for a deployment its idle
+        # policy unloaded (activation managed) and ``cold`` for a manual stop,
+        # so the phase carries the one bit autoload needs.
+        "activation": "managed" if row.get("phase") == "evicted" else None,
         # Same marker the Studio projection uses, for the same reason:
         # a caller must be able to tell a catalog projection from the
         # owning node's own record.
         "record_source": "catalog",
     }
+
+
+def _request_remote_load(name: str) -> bool:
+    """Ask the owning node to load ``name`` through its desired state when
+    another node owns it. False when this node's own file has the record (the
+    load event is then the right channel) or there is no owner to ask.
+
+    An event reaches whichever node Inngest picks, so a load meant for another
+    machine has to go through the one node-scoped channel (#590, #653).
+    """
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import _owning_placement, _remote_lifecycle
+
+    record = _read_deployment(name)
+    if record is None or record.get("record_source") != "catalog":
+        return False
+    placement = _owning_placement(name)
+    if placement is None or not placement.get("node_id"):
+        return False
+    try:
+        _remote_lifecycle(name, placement, action="load")
+    except HTTPException as exc:
+        logger.warning("remote load of %r refused: %s", name, exc.detail)
+    return True
 
 
 def _read_deployment(name: str) -> dict[str, Any] | None:
@@ -508,10 +537,14 @@ async def _ensure_deployment_live(
     # step.run memoization JSON-round-trips the tuple into a list.
     target, budget_s = str(plan[0]), float(plan[1])
     await publish(channel, TOPIC_STATUS, {"state": "loading", "deployment": target})
-    await step.send_event(
-        f"{step_prefix}request-load",
-        inngest.Event(name=LOAD_EVENT, data={"name": target}),
+    remote = await step.run(
+        f"{step_prefix}request-remote-load", lambda: _request_remote_load(target)
     )
+    if not remote:
+        await step.send_event(
+            f"{step_prefix}request-load",
+            inngest.Event(name=LOAD_EVENT, data={"name": target}),
+        )
     remaining = budget_s
     index = 0
     last: dict[str, Any] | None = None
@@ -1038,6 +1071,7 @@ def _flatten_batch_row(outcome: dict[str, Any], columns: list[str]) -> dict[str,
     row: dict[str, Any] = {c: outcome.get(c) for c in base_cols}
     result = outcome.get("result") or {}
     row["model_profile"] = result.get("model_profile")
+    row["node_id"] = (result.get("served_by") or {}).get("node")
     for field, node in (result.get("result") or {}).items():
         keys: tuple[str, ...]
         if isinstance(node, dict) and "amount" in node:
@@ -1065,7 +1099,15 @@ def _batch_write_results(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]
     from docie_bench.studio.store import default_blob_store
 
     jsonl = "".join(json.dumps(o, ensure_ascii=False, sort_keys=True) + "\n" for o in outcomes)
-    columns: list[str] = ["position", "filename", "status", "error", "latency_ms", "model_profile"]
+    columns: list[str] = [
+        "position",
+        "filename",
+        "status",
+        "error",
+        "latency_ms",
+        "model_profile",
+        "node_id",
+    ]
     flat_rows = [_flatten_batch_row(o, columns) for o in outcomes]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
@@ -2250,44 +2292,6 @@ async def seed_hf_job(ctx: inngest.Context) -> dict[str, Any]:
     return result
 
 
-# Seed leftovers older than this are unreachable-by-resume in practice: the
-# staging dir is only reused when the SAME store name is re-seeded, and a
-# week-old .part is stale enough that restarting the download costs less than
-# multi-GB files sitting on the volume forever.
-_SEED_LEFTOVER_MAX_AGE_S = 7 * 86400.0
-
-
-def _gc_seed_leftovers_sync() -> dict[str, int]:
-    """Prune stale seed staging dirs + progress sidecars (blocking, best-effort).
-
-    Both are cleaned on a successful seed; a SIGKILL mid-download leaves the
-    multi-GB ``models/.hf-downloads/<name>`` staging dir and the run's
-    ``seed-progress`` sidecar behind with no other reclaimer.
-    """
-    from docie_bench.serving.seed_progress import prune_stale
-
-    removed_staging = 0
-    staging_root = model_store_root() / ".hf-downloads"
-    now = time.time()
-    try:
-        children = list(staging_root.iterdir())
-    except OSError:
-        children = []
-    for child in children:
-        try:
-            # Newest mtime under the dir: directory mtime alone misses writes
-            # into an existing .part file.
-            stamps = [child.stat().st_mtime]
-            stamps += [p.stat().st_mtime for p in child.rglob("*")]
-        except OSError:
-            continue
-        if now - max(stamps) > _SEED_LEFTOVER_MAX_AGE_S:
-            shutil.rmtree(child, ignore_errors=True)
-            removed_staging += 1
-    removed_progress = prune_stale(max_age_s=_SEED_LEFTOVER_MAX_AGE_S)
-    return {"deleted_seed_staging": removed_staging, "deleted_seed_progress": removed_progress}
-
-
 def _gc_studio_runs_sync() -> dict[str, int]:
     """Apply the retention policy to the durable Studio run index (blocking)."""
     from docie_bench.studio.store import default_run_store
@@ -2305,8 +2309,6 @@ def _gc_studio_runs_sync() -> dict[str, int]:
     else:
         logger.info("studio run GC skipped: no DATABASE_URL")
         summary = {"deleted_runs": 0, "deleted_blobs": 0, "retained_runs": 0}
-    # The serving-volume sweep needs no database — run it either way.
-    summary.update(_gc_seed_leftovers_sync())
     summary.update(_gc_session_documents_sync())
     summary.update(_gc_agent_runs_sync())
     logger.info("studio run GC: %s", summary)

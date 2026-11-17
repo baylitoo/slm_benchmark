@@ -16,7 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from sqlalchemy import (
@@ -169,6 +169,13 @@ class ModelPlacement(Base):
     last_served_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Launch settings and the /props tool-calls verdict, published by the
+    # owning reconciler so a process without that node's deployments.json
+    # (chat warnings, remote profiles) sees them. NULL = unknown/unset.
+    tool_calls_supported: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    context_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timeout_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -217,6 +224,10 @@ class ServingNode(Base):
     # chosen to serve it has the file, and without this nothing shows which
     # nodes do. NULL means a node that has not reported its store yet.
     store_models: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Per store model, what THIS node measured: steady-state RSS and the
+    # projector size, as a JSON object keyed by model name. Both live on the
+    # node's disk, so central sizing reads them here. NULL = not reported.
+    model_footprints: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Bumped by every desired-state write touching this node (#534). A node
     # compares it against the last generation it applied, which is what lets a
     # READER decide in one read whether the catalog is provably current for it
@@ -401,6 +412,8 @@ _SERVING_NODE_ADDED_COLUMNS: tuple[tuple[str, TypeEngine[Any], bool], ...] = (
     ("effective_budget_bytes", BigInteger(), True),
     ("budget_source", String(16), True),
     ("budget_stale", Boolean(), True),
+    # Per-model steady RSS + mmproj size measured on the node (#664 B5).
+    ("model_footprints", Text(), True),
 )
 
 
@@ -527,6 +540,10 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     # database would throw UndefinedColumn on the reconciler's first publish.
     ("node_id", String(32)),
     ("last_served_at", DateTime(timezone=True)),
+    ("tool_calls_supported", Boolean()),
+    ("context_length", Integer()),
+    ("max_tokens", Integer()),
+    ("timeout_seconds", Float()),
 )
 
 
@@ -715,6 +732,10 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "throughput_measured_at": isoformat(row.throughput_measured_at),
         "throughput_source": row.throughput_source,
         "slot_count": row.slot_count,
+        "tool_calls_supported": row.tool_calls_supported,
+        "context_length": row.context_length,
+        "max_tokens": row.max_tokens,
+        "timeout_seconds": row.timeout_seconds,
         "created_at": isoformat(row.created_at),
         "updated_at": isoformat(row.updated_at),
     }
@@ -734,6 +755,28 @@ def _decode_store_models(raw: str | None) -> list[str] | None:
     except ValueError:
         return None
     return [str(item) for item in decoded] if isinstance(decoded, list) else None
+
+
+def _decode_model_footprints(raw: str | None) -> dict[str, dict[str, int]] | None:
+    """``{model: {"steady_rss_bytes"?, "mmproj_bytes"?}}``; None = not reported."""
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    out: dict[str, dict[str, int]] = {}
+    for name, entry in decoded.items():
+        if not isinstance(entry, dict):
+            continue
+        out[str(name)] = {
+            key: int(value)
+            for key, value in entry.items()
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        }
+    return out
 
 
 def _desired_view(row: ServingDesiredDeployment) -> dict[str, Any]:
@@ -799,6 +842,7 @@ def _node_view(row: ServingNode) -> dict[str, Any]:
         # never mistake one machine's capacity for the whole fleet's.
         "node_id": row.id,
         "store_models": _decode_store_models(row.store_models),
+        "model_footprints": _decode_model_footprints(row.model_footprints),
         "desired_generation": row.desired_generation,
         # None means admitting. Reported on the capacity row because every
         # reader that sizes or routes against a node needs to know the operator
@@ -1121,6 +1165,10 @@ class ModelCatalog:
         throughput_measured_at: dt.datetime | None = None,
         throughput_source: str | None = None,
         slot_count: int | None = None,
+        tool_calls_supported: bool | None = None,
+        context_length: int | None = None,
+        max_tokens: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Publish one reconciler observation (the reconciler is the sole caller).
 
@@ -1184,6 +1232,10 @@ class ModelCatalog:
             row.throughput_measured_at = throughput_measured_at
             row.throughput_source = throughput_source
             row.slot_count = slot_count
+            row.tool_calls_supported = tool_calls_supported
+            row.context_length = context_length
+            row.max_tokens = max_tokens
+            row.timeout_seconds = timeout_seconds
             session.flush()
             return _placement_view(row)
 
@@ -1198,6 +1250,7 @@ class ModelCatalog:
         sum_rss_bytes: int,
         reclaimable_bytes: int = 0,
         store_models: Sequence[str] | None = None,
+        model_footprints: Mapping[str, Mapping[str, int]] | None = None,
         ceiling_bytes: int | None = None,
         working_set_bytes: int | None = None,
         effective_budget_bytes: int | None = None,
@@ -1231,6 +1284,11 @@ class ModelCatalog:
         }
         if store_models is not None:
             values["store_models"] = json.dumps(sorted(set(store_models)))
+        if model_footprints is not None:
+            values["model_footprints"] = json.dumps(
+                {name: dict(entry) for name, entry in model_footprints.items()},
+                sort_keys=True,
+            )
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")

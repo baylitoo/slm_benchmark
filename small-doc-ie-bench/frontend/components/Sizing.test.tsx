@@ -92,3 +92,34 @@ describe("Sizing — What if parallel slots", () => {
     expect(nParallel).toBe(4);
   });
 });
+
+describe("Sizing — node selector on a fleet", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getSizing).mockImplementation(async (nodeId?: string) => ({
+      ...makeSizing(),
+      node_id: nodeId ?? "ovh-cpu-02",
+      nodes: ["ovh-cpu-02", "rocky-llm"],
+    }));
+    vi.mocked(api.whatifSizing).mockResolvedValue(makeWhatIfResult());
+  });
+
+  it("prices the picked node in the fit table and the what-if", async () => {
+    const user = userEvent.setup();
+    render(
+      <ToastProvider>
+        <Sizing active />
+      </ToastProvider>,
+    );
+
+    const picker = (await screen.findByLabelText("Node")) as HTMLSelectElement;
+    expect(picker.value).toBe("ovh-cpu-02");
+    await user.selectOptions(picker, "rocky-llm");
+    await waitFor(() => expect(api.getSizing).toHaveBeenCalledWith("rocky-llm"));
+
+    await user.click(await screen.findByText("Add model"));
+    await user.click(screen.getByText("Check fit"));
+    await waitFor(() => expect(api.whatifSizing).toHaveBeenCalled());
+    expect(vi.mocked(api.whatifSizing).mock.calls[0][2]).toBe("rocky-llm");
+  });
+});

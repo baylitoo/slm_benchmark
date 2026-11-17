@@ -13,8 +13,10 @@ import {
 } from "lucide-react";
 import {
   getPorts,
+  getFleet,
   deployModel,
   formatBytes,
+  type FleetView,
   type StoreEntry,
   type PortsView as PortsViewData,
   type TriggerResponse,
@@ -112,13 +114,19 @@ export function DeployForm({
 
   // Prefill the field from the recommended port until the operator types — never
   // clobber their edit.
+  // The recommendation describes the api host's records, so it is not
+  // prefilled for a deploy aimed at another node.
   useEffect(() => {
-    if (!portDirty && portsData?.recommended_next != null) {
+    if (!portDirty && !nodeId && portsData?.recommended_next != null) {
       setPort(String(portsData.recommended_next));
+    } else if (!portDirty && nodeId) {
+      setPort("");
     }
-  }, [portsData?.recommended_next, portDirty]);
+  }, [portsData?.recommended_next, portDirty, nodeId]);
 
-  const usedPorts = portsData?.used ?? [];
+  const usedPorts = nodeId
+    ? (portsData?.by_node?.[nodeId] ?? []).map((row) => row.port)
+    : (portsData?.used ?? []);
   const portConflict =
     portDirty && port.trim() !== "" && usedPorts.includes(Number(port));
 
@@ -154,6 +162,21 @@ export function DeployForm({
     ];
     return rows.length > 1 ? rows : null;
   }, [selectedEntry]);
+
+  // Node health from /nodes: the server refuses a drained or silent target
+  // with a 409, so those are disabled here with the reason.
+  const fleet = usePolling<FleetView>(getFleet, POLL_MS, active && nodeTargets !== null);
+  const nodeBlockers = useMemo(() => {
+    const blockers = new Map<string, string>();
+    for (const node of fleet.data?.nodes ?? []) {
+      if (node.drain_state === "drained" || node.drain_state === "draining" || node.drained_at) {
+        blockers.set(node.node_id, node.drain_state === "draining" ? "draining" : "drained");
+      } else if (node.reporting === false && !node.never_reported) {
+        blockers.set(node.node_id, "stopped reporting");
+      }
+    }
+    return blockers;
+  }, [fleet.data]);
 
   function pick(modelName: string) {
     setSelected(modelName);
@@ -338,14 +361,16 @@ export function DeployForm({
                     // The server refuses a node that reported its store without
                     // this model in it. A node that has NOT reported is allowed
                     // — unknown is not absent — so it stays selectable.
-                    disabled={target.state === "missing"}
+                    disabled={target.state === "missing" || nodeBlockers.has(target.id)}
                   >
                     {target.id}
-                    {target.state === "missing"
-                      ? " — blob not seeded here"
-                      : target.state === "unreported"
-                        ? " — store not reported yet"
-                        : ""}
+                    {nodeBlockers.has(target.id)
+                      ? ` — ${nodeBlockers.get(target.id)}`
+                      : target.state === "missing"
+                        ? " — blob not seeded here"
+                        : target.state === "unreported"
+                          ? " — store not reported yet"
+                          : ""}
                   </option>
                 ))}
               </Select>

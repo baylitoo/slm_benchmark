@@ -285,3 +285,26 @@ def test_a_remote_record_carries_its_runtime(serving_home: Path) -> None:
 
     assert runtime(REMOTE) == "llamacpp"
     assert runtime("encoder-remote") == "encoder"
+
+
+def test_an_idle_evicted_remote_record_is_offered_as_reloadable(serving_home: Path) -> None:
+    _seed_local(serving_home)
+    for name, phase in (("evicted-remote", "evicted"), ("stopped-remote", "cold")):
+        ModelCatalog().publish_observed(
+            name,
+            node_id="node-b",
+            engine="llama-server",
+            state="stopped",
+            endpoint="",
+            phase=phase,
+            pid=None,
+            pid_create_time=None,
+            rss_bytes=0,
+            health_ok=False,
+            last_error=None,
+        )
+
+    by_name = {str((r.get("spec") or {}).get("name")): r for r in _listing()}
+
+    assert by_name["evicted-remote"]["activation"] == "managed"
+    assert by_name["stopped-remote"]["activation"] is None

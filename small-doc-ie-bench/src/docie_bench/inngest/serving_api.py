@@ -221,6 +221,9 @@ def _records_for_other_nodes(
                 "endpoint": row.get("endpoint"),
                 "last_error": row.get("last_error"),
                 "node_id": row.get("node_id"),
+                # ``evicted`` is the owner's idle unload (activation managed),
+                # ``cold`` a manual stop; a request may reload only the first.
+                "activation": "managed" if row.get("phase") == "evicted" else None,
                 # The UI needs to know this record is a catalog projection and
                 # not the owning node's own record, so it does not offer
                 # actions that need the file it does not have.
@@ -300,7 +303,7 @@ async def list_deployments() -> Any:
 # cycle. Auth: the whole serving router is mounted behind tenant_guard
 # (api.py); reads and mutations alike require a key.
 @router.get("/resources")
-async def serving_resources() -> dict[str, Any]:
+async def serving_resources(node_id: str | None = None) -> dict[str, Any]:
     """Node RAM snapshot + per-deployment memory usage (read-only).
 
     Serves the last published node measurement, taken inside the serving
@@ -315,6 +318,7 @@ async def serving_resources() -> dict[str, Any]:
     deployments: list[dict[str, Any]] = []
     detail: str | None = None
     node_count = 0
+    node_ids: list[str] = []
     try:
         catalog = ModelCatalog()
         # Every node that has published, newest measurement first. Reading the
@@ -325,26 +329,41 @@ async def serving_resources() -> dict[str, Any]:
         # fleet has capacity nobody has measured.
         snapshots = _capacity_reporting(catalog.list_node_snapshots())
         node_count = len(snapshots)
-        if not snapshots:
+        node_ids = sorted({str(row.get("node_id") or "") for row in snapshots} - {""})
+        shown = (
+            next((row for row in snapshots if row.get("node_id") == node_id), None)
+            if node_id is not None
+            else (snapshots[0] if snapshots else None)
+        )
+        if shown is None:
             detail = (
-                "no capacity measurement published yet — is the serving "
+                f"serving node {node_id!r} has not published a capacity measurement"
+                if node_id is not None
+                else "no capacity measurement published yet — is the serving "
                 "service running?"
             )
         else:
-            node, detail = _gate_snapshot_staleness(snapshots[0])
+            node, detail = _gate_snapshot_staleness(shown)
             if node is not None and node_count > 1:
                 detail = (
                     f"showing node {node['node_id']}; {node_count} nodes are "
                     f"publishing capacity — these numbers describe that one "
                     f"node, not the fleet total"
                 )
+        placements = list(catalog.list_placements())
+        if shown is not None and shown.get("node_id"):
+            # Only the shown node's RSS belongs next to its totals.
+            placements = _placements_on(
+                str(shown["node_id"]), placements, sole_node=node_count == 1
+            )
         deployments = [
             {
                 "name": placement["name"],
+                "node_id": placement.get("node_id"),
                 "rss_bytes": placement["rss_bytes"],
                 "phase": placement["phase"],
             }
-            for placement in catalog.list_placements()
+            for placement in placements
         ]
     except CatalogUnavailableError:
         detail = "observed state unavailable: DATABASE_URL is not configured"
@@ -357,6 +376,7 @@ async def serving_resources() -> dict[str, Any]:
         # How many nodes published a snapshot, so the UI can show that `node`
         # is one of several instead of implying it is the whole capacity.
         "node_count": node_count,
+        "nodes": node_ids,
         "deployments": deployments,
         "detail": detail,
     }
@@ -376,12 +396,48 @@ class WhatIfRequest(BaseModel):
     # parameter, which prices every row in the plan under the same llama-server
     # slot count (#248/#321) rather than per-row.
     n_parallel: int = Field(default=1, ge=1, le=32)
+    # Price against this node; omitted with several nodes = the first admitting one.
+    node_id: str | None = None
 
 
-def _sizing_inputs() -> tuple[
+def _placements_on(
+    node_id: str, placements: list[dict[str, Any]], *, sole_node: bool
+) -> list[dict[str, Any]]:
+    """The placements one node owns; unattributed rows count only on a sole node."""
+    return [
+        row
+        for row in placements
+        if str(row.get("node_id") or "") == node_id
+        or (sole_node and not row.get("node_id"))
+    ]
+
+
+def _capacity_node_ids() -> list[str]:
+    """Ids of the nodes that published a capacity measurement.
+
+    Fresh, admitting nodes first, then by id, so a default pick is one that
+    can actually be priced.
+    """
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    try:
+        snapshots = _capacity_reporting(ModelCatalog().list_node_snapshots())
+    except Exception:  # noqa: BLE001 - the selector degrades, never 500s
+        return []
+    stale = stale_node_ids(snapshots)
+    drained = {str(row.get("node_id") or "") for row in snapshots if row.get("drained_at")}
+    ids = {str(row.get("node_id") or "") for row in snapshots} - {""}
+    return sorted(ids, key=lambda node: (node in stale or node in drained, node))
+
+
+def _sizing_inputs(node_id: str | None = None) -> tuple[
     list[dict[str, Any]], dict[str, Any] | None, list[dict[str, Any]], str | None
 ]:
     """(models, snapshot, placements, degradation detail) for the sizing engine.
+
+    ``node_id`` prices that one node: its snapshot and only the placements it
+    owns, so another node's running or loading instances never shrink it.
 
     All three inputs come from the observed Postgres surface the reconciler
     publishes (design doc §3) — the api never measures locally. A missing
@@ -406,6 +462,24 @@ def _sizing_inputs() -> tuple[
         return [], None, [], "observed state unavailable: DATABASE_URL is not configured"
     except Exception:  # noqa: BLE001 - a DB hiccup must not 500 the Sizing tab
         return [], None, [], "observed state unavailable: database error"
+    if node_id is not None:
+        target = next(
+            (row for row in snapshots if str(row.get("node_id") or "") == node_id), None
+        )
+        if target is None:
+            return (
+                models,
+                None,
+                [],
+                f"serving node {node_id!r} has not published a capacity measurement",
+            )
+        target, detail = _gate_snapshot_staleness(target)
+        return (
+            models,
+            target,
+            _placements_on(node_id, placements, sole_node=len(snapshots) == 1),
+            detail,
+        )
     if len(snapshots) > 1:
         return (
             models,
@@ -423,7 +497,10 @@ def _sizing_inputs() -> tuple[
             placements,
             "no capacity measurement published yet — is the serving service running?",
         )
+    sole = str(snapshot.get("node_id") or "")
     snapshot, detail = _gate_snapshot_staleness(snapshot)
+    if sole:
+        placements = _placements_on(sole, placements, sole_node=True)
     return models, snapshot, placements, detail
 
 
@@ -804,8 +881,25 @@ async def serving_nodes() -> dict[str, Any]:
     }
 
 
+def _sizing_target(node_id: str | None) -> tuple[str | None, list[str], str | None]:
+    """(node to price, every capacity-reporting node, note) for the Sizing tab.
+
+    With several nodes and none named, the first fresh admitting node is
+    priced and the note says so, instead of withholding every fit.
+    """
+    nodes = _capacity_node_ids()
+    if node_id is not None or len(nodes) <= 1:
+        return node_id, nodes, None
+    return (
+        nodes[0],
+        nodes,
+        f"showing node {nodes[0]}; {len(nodes)} nodes publish capacity — "
+        f"pick a node to size another one",
+    )
+
+
 @router.get("/sizing")
-async def serving_sizing() -> dict[str, Any]:
+async def serving_sizing(node_id: str | None = None) -> dict[str, Any]:
     """Per-model fit table: how many MORE instances fit right now.
 
     Footprint per candidate instance is ``max(measured steady-state RSS,
@@ -824,7 +918,10 @@ async def serving_sizing() -> dict[str, Any]:
     from docie_bench.serving.resources import FootprintStore
     from docie_bench.serving.sizing import compute_sizing
 
-    models, snapshot, placements, detail = _sizing_inputs()
+    target, nodes, note = _sizing_target(node_id)
+    models, snapshot, placements, detail = (
+        _sizing_inputs(target) if target is not None else _sizing_inputs()
+    )
     report = compute_sizing(
         models,
         snapshot,
@@ -834,8 +931,10 @@ async def serving_sizing() -> dict[str, Any]:
     )
     payload = report.as_dict()
     payload["node"] = snapshot  # full snapshot view: capacity bar input
-    if detail is not None:
-        payload["detail"] = detail
+    payload["node_id"] = (snapshot or {}).get("node_id") or target
+    payload["nodes"] = nodes
+    if detail is not None or note is not None:
+        payload["detail"] = detail or note
     return payload
 
 
@@ -886,7 +985,10 @@ async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
         compute_whatif,
     )
 
-    models, snapshot, placements, detail = _sizing_inputs()
+    target, nodes, note = _sizing_target(request.node_id)
+    models, snapshot, placements, detail = (
+        _sizing_inputs(target) if target is not None else _sizing_inputs()
+    )
     if not models:
         # No store to resolve plan models against: the DB-down degrade path.
         raise HTTPException(
@@ -906,8 +1008,10 @@ async def serving_sizing_whatif(request: WhatIfRequest) -> dict[str, Any]:
     except (UnknownModelError, UnpriceableModelError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     payload = report.as_dict()
-    if detail is not None:
-        payload["detail"] = detail
+    payload["node_id"] = (snapshot or {}).get("node_id") or target
+    payload["nodes"] = nodes
+    if detail is not None or note is not None:
+        payload["detail"] = detail or note
     return payload
 
 
@@ -964,7 +1068,40 @@ async def serving_ports() -> dict[str, Any]:
         "deployments": sorted(deployments, key=lambda item: item["port"]),
         "used": sorted(used),
         "free_sample": free_sample,
+        # A hint for THIS api host's records only; a targeted deploy checks
+        # its node's ports in ``by_node`` instead.
         "recommended_next": recommended_next,
+        "by_node": _ports_by_node(),
+    }
+
+
+def _ports_by_node() -> dict[str, list[dict[str, Any]]]:
+    """Live ports per owning node, from the catalog's placement endpoints.
+
+    A stopped placement keeps no endpoint, so its reservation is invisible
+    here; the owning node still re-probes at deploy time.
+    """
+    from urllib.parse import urlsplit
+
+    observed = _observed_placements() or {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for name, row in observed.items():
+        node_id = str(row.get("node_id") or "")
+        endpoint = str(row.get("endpoint") or "")
+        if not node_id or not endpoint:
+            continue
+        try:
+            port = urlsplit(endpoint).port
+        except ValueError:
+            continue
+        if port is None:
+            continue
+        grouped.setdefault(node_id, []).append(
+            {"name": name, "port": port, "state": row.get("state")}
+        )
+    return {
+        node_id: sorted(rows, key=lambda item: item["port"])
+        for node_id, rows in sorted(grouped.items())
     }
 
 
@@ -1040,7 +1177,17 @@ async def deployment_slots(name: str) -> dict[str, Any]:
     try:
         record = await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        # Another node's deployment: its placement row carries the endpoint
+        # and engine, and /slots is reachable over the fleet network.
+        placement = _owning_placement(name)
+        if placement is None:
+            raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        from docie_bench.serving.reconciler import RUNTIME_BY_ENGINE
+
+        record = {
+            "spec": {"launch": {"runtime": RUNTIME_BY_ENGINE.get(str(placement.get("engine")))}},
+            "endpoint": placement.get("endpoint") or None,
+        }
     launch = (record.get("spec") or {}).get("launch") or {} if isinstance(record, dict) else {}
     if launch.get("runtime") != "llamacpp":
         raise HTTPException(
@@ -1115,7 +1262,10 @@ async def deployment_logs(name: str, lines: int = 200) -> dict[str, Any]:
                 else None
             )
     except (KeyError, ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        placement = _owning_placement(name)
+        if placement is None:
+            raise HTTPException(status_code=404, detail=str(exc), headers=_DOMAIN_404) from exc
+        last_error = placement.get("last_error")
 
     tail: list[str] = []
     found_locally = False
@@ -1185,11 +1335,20 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     from docie_bench.serving.lifecycle import load_timeout_s
     from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
+    target: str | None = None
     try:
         catalog = ModelCatalog()
         entry = catalog.get(name)
         if entry is None:
-            return None
+            # A minted deployment name (``<model>-f09ae4``) is not a store entry;
+            # its placement names the model it serves.
+            placement = catalog.get_placement(name)
+            model_name = str((placement or {}).get("model_name") or "")
+            entry = catalog.get(model_name) if model_name else None
+            if entry is None:
+                return None
+            target = name
+            name = model_name
         placements = catalog.list_placements_for_model(name)
     except CatalogUnavailableError:
         return None
@@ -1207,12 +1366,20 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
         }
         await send_or_503(inngest_client, inngest.Event(name=DEPLOY_EVENT, data=data))
     else:
+        names = [str(row.get("name") or "") for row in placements]
+        if target not in names:
+            target = name if name in names else names[0]
         try:
-            await _fire_lifecycle_event(name, event=LOAD_EVENT, prefix="load")
+            # remote_action: a deployment owned by another node is loaded
+            # through its desired state, not an event any node may pick.
+            await _fire_lifecycle_event(
+                target, event=LOAD_EVENT, prefix="load", remote_action="load"
+            )
         except HTTPException:
             # The deployment record vanished between the catalog read above and
             # this call (rare race) -- nothing sane left to trigger.
             return None
+        return target, eta
     return name, eta
 
 
@@ -1473,9 +1640,14 @@ def admit_replica_ram(
     added_instances: int,
     context_length: int | None,
     n_parallel: int = 1,
+    node_id: str | None = None,
 ) -> None:
     """RAM admission gate for launching ``added_instances`` MORE instances of
     ``model``: N x the per-instance footprint must fit the sizing budget.
+
+    ``node_id`` prices the node a targeted deploy will land on. Without it and
+    with several nodes, the gate refuses only when every eligible node is
+    priced and together they cannot take ``added_instances``.
 
     Prices with the SAME engine as ``/sizing/whatif`` (``compute_whatif`` —
     footprint formula, safety margin, loading-placement reservation, and now
@@ -1497,7 +1669,12 @@ def admit_replica_ram(
         compute_whatif,
     )
 
-    models, snapshot, placements, _detail = _sizing_inputs()
+    models, snapshot, placements, _detail = (
+        _sizing_inputs(node_id) if node_id is not None else _sizing_inputs()
+    )
+    if node_id is None and models and snapshot is None:
+        _admit_across_fleet(model, added_instances, context_length, n_parallel)
+        return
     if not models or snapshot is None:
         return
     try:
@@ -1521,10 +1698,11 @@ def admit_replica_ram(
     if report.ok is False:
         item = report.per_item[0]
         free = report.free_effective_bytes or 0
+        where = f" on node {node_id!r}" if node_id is not None else ""
         raise HTTPException(
             status_code=422,
             detail=(
-                f"not enough RAM to launch {added_instances} more instance(s) of "
+                f"not enough RAM{where} to launch {added_instances} more instance(s) of "
                 f"{model!r}: {added_instances} x {_gib(item.footprint_bytes)} per "
                 f"instance = {_gib(report.total_predicted_bytes)} needed, but only "
                 f"{_gib(max(free, 0))} is available after the safety margin and "
@@ -1533,6 +1711,55 @@ def admit_replica_ram(
                 f"deployment (see the Sizing tab)."
             ),
         )
+
+
+def _admit_across_fleet(
+    model: str, added_instances: int, context_length: int | None, n_parallel: int
+) -> None:
+    """Untargeted admission with several nodes: refuse only a provable deficit.
+
+    An untargeted deploy lands on whichever node Inngest picks, so no single
+    node's budget decides it; the fleet's summed ``fits_now`` over eligible,
+    fully priced nodes does. Anything unknowable admits.
+    """
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
+    from docie_bench.serving.node_selection import rank_nodes
+
+    try:
+        catalog = ModelCatalog()
+        models = catalog.list()
+        snapshots = _capacity_reporting(catalog.list_node_snapshots())
+        placements = list(catalog.list_placements())
+    except Exception:  # noqa: BLE001 - fail open, like the single-node gate
+        return
+    if len(snapshots) < 2:
+        return
+    candidates = rank_nodes(
+        model,
+        models=models,
+        snapshots=snapshots,
+        placements=placements,
+        stale=stale_node_ids(snapshots),
+        context_length=context_length,
+        n_parallel=n_parallel,
+        margin_fraction=get_settings().serving_sizing_margin_fraction,
+    )
+    eligible = [c for c in candidates if c.eligible or c.fits_now == 0]
+    if not eligible or any(c.fits_now is None for c in eligible):
+        return
+    room = sum(c.fits_now or 0 for c in eligible)
+    if room >= added_instances:
+        return
+    per_node = "; ".join(f"{c.node_id}: {c.fits_now}" for c in eligible)
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"not enough RAM in the fleet to launch {added_instances} more "
+            f"instance(s) of {model!r}: the admitting nodes fit {room} in total "
+            f"({per_node}). Lower the replica count, free RAM on a node, or add one."
+        ),
+    )
 
 
 class ScaleRequest(BaseModel):
@@ -1583,8 +1810,19 @@ async def scale_store_model(
     real teardown job (kill process, free port, DELETE placement row), so a
     drained replica leaves the load-balancing rotation exactly like a deleted
     deployment.
+
+    Counts span the fleet (placements + desired state). With more than one
+    node reporting, new replicas are placed by fit as desired state on
+    distinct nodes and surplus ones removed through their owner's desired
+    state, so the response carries no channel (#664 A4).
     """
     del tenant  # authenticated principal required; ops surface, no per-tenant scoping
+    from docie_bench.inngest.fleet_scale import (
+        merged_records,
+        place_replicas,
+        read_fleet_view,
+        remove_replicas,
+    )
     from docie_bench.serving.control_plane import (
         count_replica_deployments,
         replica_names_to_add,
@@ -1592,10 +1830,34 @@ async def scale_store_model(
     )
     from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
-    existing = await existing_deployment_records()
+    view = read_fleet_view(name)
+    existing = merged_records(name, await existing_deployment_records(), view)
     to_add = replica_names_to_add(name, existing, request.replicas)
     to_remove = replica_names_to_remove(name, existing, request.replicas)
     current = count_replica_deployments(name, existing)
+    if view is not None and view.is_fleet and (to_add or to_remove):
+        placed = (
+            place_replicas(
+                name,
+                len(to_add),
+                view,
+                context_length=request.context_length or DEFAULT_DEPLOY_CONTEXT_LENGTH,
+                n_parallel=request.n_parallel,
+            )
+            if to_add
+            else []
+        )
+        removed = remove_replicas(name, len(to_remove), view) if to_remove else []
+        return {
+            "model": name,
+            "target": request.replicas,
+            "current": current,
+            "adding": [row["name"] for row in placed],
+            "removing": [row["name"] for row in removed],
+            "placed": placed + removed,
+            "event_ids": [],
+            "channel": None,
+        }
     if to_add:
         admit_replica_ram(
             name, len(to_add), request.context_length, n_parallel=request.n_parallel

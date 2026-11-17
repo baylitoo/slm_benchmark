@@ -383,6 +383,12 @@ def _profile_from_placement(
     served_id = str(row.get("model_name") or name)
     slot_count = row.get("slot_count")
     negotiated = row.get("negotiated_style")
+    # The owning node's launch settings, as _synthesize_profile reads them.
+    max_tokens = row.get("max_tokens") if isinstance(row.get("max_tokens"), int) else None
+    timeout = row.get("timeout_seconds")
+    timeout_seconds = float(timeout) if isinstance(timeout, (int, float)) else None
+    # Which machine answers, so results attribute a remote deployment's work.
+    node_id = str(row.get("node_id") or "") or None
 
     match = _match_yaml_profile(served_id, yaml_profiles)
     if match is not None:
@@ -393,7 +399,11 @@ def _profile_from_placement(
             base_url=endpoint,
             kind="passthrough",
             response_format_style=str(negotiated) if negotiated else match.response_format_style,
+            max_tokens=max_tokens or match.max_tokens,
+            timeout_seconds=timeout_seconds or match.timeout_seconds,
             deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+            served_by_deployment=name,
+            served_by_node=node_id,
         )
     traits = _family_traits(served_id)
     if traits is None:
@@ -412,9 +422,11 @@ def _profile_from_placement(
         vision=traits.vision,
         stop_sequences=traits.stop_sequences,
         temperature=traits.temperature,
-        max_tokens=traits.max_tokens,
-        timeout_seconds=traits.timeout_seconds,
+        max_tokens=max_tokens or traits.max_tokens,
+        timeout_seconds=timeout_seconds or traits.timeout_seconds,
         deployment_slot_count=slot_count if isinstance(slot_count, int) else None,
+        served_by_deployment=name,
+        served_by_node=node_id,
     )
 
 
@@ -451,9 +463,12 @@ def _profiles_on_other_nodes(
     DATABASE_URL is exactly what it was.
     """
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.placement_resolver import _drained_node_ids
 
     try:
-        rows = ModelCatalog().list_placements()
+        catalog = ModelCatalog()
+        rows = catalog.list_placements()
+        drained = _drained_node_ids(list(catalog.list_node_snapshots()))
     except CatalogUnavailableError:
         return {}
     except Exception:  # noqa: BLE001 - routing must not break on a DB hiccup
@@ -463,6 +478,10 @@ def _profiles_on_other_nodes(
     for row in rows:
         name = str(row.get("name") or "")
         if not name or name in known:
+            continue
+        # Same exclusions store: routing applies: an operator's drain, and a
+        # deployment its owner reports unhealthy (None = not probed yet).
+        if str(row.get("node_id") or "") in drained or row.get("health_ok") is False:
             continue
         profile = _profile_from_placement(row, yaml_profiles)
         if profile is not None:

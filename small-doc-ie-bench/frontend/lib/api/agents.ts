@@ -289,6 +289,7 @@ export async function chatCompletionStream(
   onToken: (text: string) => void,
   signal?: AbortSignal,
   samplingParams?: SamplingParams,
+  onReasoning?: (text: string) => void,
 ): Promise<void> {
   let res: Response;
   try {
@@ -354,8 +355,12 @@ export async function chatCompletionStream(
         const data = line.slice(5).trim();
         if (data === "[DONE]") return;
         try {
-          const delta = JSON.parse(data)?.choices?.[0]?.delta?.content;
-          if (typeof delta === "string" && delta) onToken(delta);
+          const delta = JSON.parse(data)?.choices?.[0]?.delta;
+          if (typeof delta?.content === "string" && delta.content) onToken(delta.content);
+          // A thinking model streams its reasoning before any content; without
+          // this the chat shows nothing until the answer itself starts.
+          const thought = delta?.reasoning_content;
+          if (onReasoning && typeof thought === "string" && thought) onReasoning(thought);
         } catch {
           // Malformed/partial frame — skip it rather than kill the stream.
         }

@@ -60,7 +60,10 @@ export interface PortsView {
   deployments: { name: string | null; port: number; state: string | null }[];
   used: number[];
   free_sample: number[];
+  /** Hint for the api host's own records; a targeted deploy uses `by_node`. */
   recommended_next: number | null;
+  /** Live ports per owning node, from the catalog's placements. */
+  by_node?: Record<string, { name: string; port: number; state: string | null }[]>;
 }
 
 /** One runtime → compatibility record on a model manifest. */

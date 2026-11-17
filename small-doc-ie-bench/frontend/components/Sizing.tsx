@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Gauge,
   Scale,
@@ -47,12 +47,40 @@ const POLL_MS = 5000;
  * decision time; see serving.sizing for the honest delta).
  */
 export function Sizing({ active = true }: { active?: boolean }) {
-  const sizing = usePolling<SizingView>(getSizing, POLL_MS, active);
+  // "" = let the server pick (the only node, or the first by id on a fleet).
+  const [nodeId, setNodeId] = useState("");
+  const sizing = usePolling<SizingView>(
+    () => getSizing(nodeId || undefined),
+    POLL_MS,
+    active,
+  );
   const data = sizing.data;
+  const nodes = data?.nodes ?? [];
+  const { refresh } = sizing;
+  const pickedNode = useRef(nodeId);
+  useEffect(() => {
+    if (pickedNode.current === nodeId) return;
+    pickedNode.current = nodeId;
+    refresh();
+  }, [nodeId, refresh]);
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-end gap-3">
+        {nodes.length > 1 && (
+          <Select
+            aria-label="Node"
+            value={nodeId || data?.node_id || ""}
+            onChange={(e) => setNodeId(e.target.value)}
+            className="h-8 w-48 text-xs"
+          >
+            {nodes.map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </Select>
+        )}
         <LiveIndicator
           live={sizing.live}
           refreshing={sizing.refreshing}
@@ -72,7 +100,7 @@ export function Sizing({ active = true }: { active?: boolean }) {
       <CapacityBar data={data} />
       <NodeBudgets active={active} />
       <FitTable sizing={sizing} />
-      <WhatIf data={data} />
+      <WhatIf data={data} nodeId={nodes.length > 1 ? (data?.node_id ?? undefined) : undefined} />
     </div>
   );
 }
@@ -431,7 +459,7 @@ interface StagedItem {
   contextLength: string; // "" = server default
 }
 
-function WhatIf({ data }: { data: SizingView | null }) {
+function WhatIf({ data, nodeId }: { data: SizingView | null; nodeId?: string }) {
   const modelNames = useMemo(
     () => (data?.per_model ?? []).map((m) => m.name),
     [data],
@@ -443,6 +471,8 @@ function WhatIf({ data }: { data: SizingView | null }) {
   // Call-level (mirrors the server's WhatIfRequest.n_parallel): prices every
   // staged row under the same llama-server slot count, not per-row.
   const [nParallel, setNParallel] = useState("1");
+  // A verdict for one node must not stay on screen under another.
+  useEffect(() => setResult(null), [nodeId]);
 
   function addRow() {
     setStaged((s) => [
@@ -491,7 +521,9 @@ function WhatIf({ data }: { data: SizingView | null }) {
     }
     setSubmitting(true);
     try {
-      setResult(await whatifSizing(plan, parallel));
+      setResult(
+        await (nodeId ? whatifSizing(plan, parallel, nodeId) : whatifSizing(plan, parallel)),
+      );
     } catch (err) {
       setError(
         toUserMessage(err, {

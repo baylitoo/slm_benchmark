@@ -540,6 +540,7 @@ async def test_autoload_plan_is_durable_and_replays_an_identical_step_graph(
     first_graph = list(step.calls)
     assert first_graph == [
         "plan-autoload",
+        "request-remote-load",
         "request-load",
         "await-deployment-ready:0",
         "await-deployment-ready:1",

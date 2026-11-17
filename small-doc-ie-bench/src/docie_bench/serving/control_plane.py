@@ -1373,6 +1373,27 @@ class _DefaultSupervisor:
         return self.backend.pin(name, pinned=pinned)
 
 
+#: ``serve_store_model`` launch knobs a desired-state deploy spec carries, so a
+#: targeted or auto-placed deploy launches like an untargeted one (#664 A5).
+DESIRED_LAUNCH_KNOBS: tuple[str, ...] = (
+    "max_tokens",
+    "n_parallel",
+    "cache_reuse",
+    "chat_template_file",
+    "batch_size",
+    "ubatch_size",
+    "numa",
+    "cpu_threads",
+    "cpu_threads_batch",
+    "cache_type_k",
+    "cache_type_v",
+    "reasoning_budget",
+    "reasoning_budget_message",
+    "flash_attn",
+    "timeout_seconds",
+)
+
+
 def mint_deployment_name(base: str) -> str:
     """A globally unique record name for a new deployment of ``base`` (#530).
 

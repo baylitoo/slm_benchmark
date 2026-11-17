@@ -119,46 +119,75 @@ HTML_TEMPLATE = Template(
 
   <h2>Arithmetic Validation Warnings</h2>
   <table>
-    <thead><tr><th>Document</th><th>Model profile</th><th>Warning</th></tr></thead>
+    <thead><tr><th>Document</th><th>Model profile</th><th>Node</th><th>Warning</th></tr></thead>
     <tbody>
     {% set arith_warnings = [] %}
     {% for row in rows %}
       {% for w in (row.get('validation') or {}).get('warnings', []) %}
-        {% set _ = arith_warnings.append((row.get('doc_id', ''), row.get('model_profile', ''), w)) %}
+        {% set _ = arith_warnings.append((
+             row.get('doc_id', ''), row.get('model_profile', ''), row.get('node_id') or '—', w
+           )) %}
       {% endfor %}
     {% endfor %}
     {% if arith_warnings %}
-      {% for doc_id, profile, warning in arith_warnings %}
+      {% for doc_id, profile, node, warning in arith_warnings %}
       <tr>
         <td>{{ doc_id }}</td>
         <td>{{ profile }}</td>
+        <td>{{ node }}</td>
         <td class="bad">{{ warning }}</td>
       </tr>
       {% endfor %}
     {% else %}
-      <tr><td colspan="3" class="ok">No arithmetic validation warnings.</td></tr>
+      <tr><td colspan="4" class="ok">No arithmetic validation warnings.</td></tr>
     {% endif %}
     </tbody>
   </table>
 
   <h2>Ungrounded Fields</h2>
   <table>
-    <thead><tr><th>Document</th><th>Model profile</th><th>Potential hallucinations</th></tr></thead>
+    <thead><tr>
+      <th>Document</th><th>Model profile</th><th>Node</th><th>Potential hallucinations</th>
+    </tr></thead>
     <tbody>
     {% for row in rows if row.score and row.score.ungrounded_fields %}
       <tr>
         <td>{{ row.doc_id }}</td>
         <td>{{ row.model_profile }}</td>
+        <td>{{ row.get('node_id') or '—' }}</td>
         <td class="bad">{{ row.score.ungrounded_fields | join(', ') }}</td>
       </tr>
     {% else %}
-      <tr><td colspan="3" class="ok">All extracted fields are grounded.</td></tr>
+      <tr><td colspan="4" class="ok">All extracted fields are grounded.</td></tr>
     {% endfor %}
     </tbody>
   </table>
 
+  {% if hardware and hardware.nodes %}
+  <h2>Serving Nodes</h2>
+  <table>
+    <thead><tr>
+      <th>Node</th><th>Memory</th><th>Free</th><th>Budget</th><th>Measured at</th>
+    </tr></thead>
+    <tbody>
+    {% for node_id, hw in hardware.nodes.items() %}
+      <tr>
+        <td>{{ node_id }}</td>
+        {% for key in ('total_bytes', 'free_bytes', 'effective_budget_bytes') %}
+        <td>{{ '%.1f GiB'|format(hw[key] / 1073741824) if hw[key] else '—' }}</td>
+        {% endfor %}
+        <td>{{ hw.updated_at or '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
   <div class="cpu-section">
     <h2>CPU Usage During Benchmark</h2>
+    {% if hardware and hardware.source == 'serving_node' %}
+      <p class="cpu-meta">Sampled on the benchmark worker, not on the serving nodes above.</p>
+    {% endif %}
     {% if cpu_chart %}
       <p class="cpu-meta">
         Sampled every 1 s &nbsp;|&nbsp;
@@ -294,6 +323,7 @@ def write_report(run_dir: Path, metrics: dict[str, Any]) -> Path:
             summary=metrics.get("summary", []),
             rows=metrics.get("rows", []),
             reproducibility=metrics.get("reproducibility"),
+            hardware=metrics.get("hardware"),
             manifest_json=manifest_json,
             cpu_chart=cpu_chart,
             cpu_peak=f"{max(cpus):.0f}" if cpus else "—",

@@ -100,6 +100,24 @@ describe("ChatPanel", () => {
     expect(messages.at(-1)).toEqual({ role: "user", content: "hello" });
   });
 
+  it("shows a thinking model's reasoning while it streams, before any answer", async () => {
+    let finish: () => void = () => {};
+    vi.mocked(api.chatCompletionStream).mockImplementation(
+      (_model, _messages, _onToken, _signal, _sampling, onReasoning) =>
+        new Promise<void>((resolve) => {
+          onReasoning?.("Use a monotonic deque.");
+          finish = resolve;
+        }),
+    );
+    renderChat();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/Type a message/), "sliding window minimum?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Use a monotonic deque.")).toBeInTheDocument();
+    finish();
+  });
+
   it("omits sampling params entirely when nothing is set (#384)", async () => {
     renderChat();
     const user = userEvent.setup();

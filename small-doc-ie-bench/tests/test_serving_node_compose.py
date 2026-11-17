@@ -346,3 +346,17 @@ def test_a_generated_node_id_is_not_offered_without_its_condition() -> None:
 
     assert "SET IT EXPLICITLY" in identity
     assert "orphaned" in identity
+
+
+def test_prometheus_scrapes_serving_nodes_from_an_operator_file() -> None:
+    from fnmatch import fnmatch
+
+    config = _load(REPO_ROOT / "infra/prometheus/prometheus.yml")
+    job = next(j for j in config["scrape_configs"] if j["job_name"] == "serving-nodes")
+    (pattern,) = job["file_sd_configs"][0]["files"]
+    volumes = _load(CENTRAL_COMPOSE)["services"]["prometheus"]["volumes"]
+    assert "./infra/prometheus/targets:/etc/prometheus/targets:ro" in volumes
+    # The tracked example must not be scraped as a real target.
+    assert fnmatch("/etc/prometheus/targets/serving-nodes.yml", pattern)
+    assert not fnmatch("/etc/prometheus/targets/serving-nodes.yml.example", pattern)
+    assert (REPO_ROOT / "infra/prometheus/targets/serving-nodes.yml.example").exists()

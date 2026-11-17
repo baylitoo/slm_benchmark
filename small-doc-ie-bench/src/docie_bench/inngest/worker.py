@@ -130,6 +130,7 @@ def _build_reconciler(instance_id: str) -> Any:
     from docie_bench.inngest.functions import _serving_control_plane
     from docie_bench.serving.paths import serving_home
     from docie_bench.serving.reconciler import ReconcilerLease, ServingReconciler
+    from docie_bench.serving.seed_gc import gc_seed_leftovers
 
     control_plane = _serving_control_plane()
     supervisor = control_plane.supervisor.backend  # the shared PersistentSupervisor
@@ -162,6 +163,8 @@ def _build_reconciler(instance_id: str) -> Any:
         # placement row -- a deploy would reallocate a port that was never
         # released.
         loader=control_plane.supervisor.load,
+        # Seed leftovers live on this node's volume (#664 B7).
+        seed_gc=gc_seed_leftovers,
     )
 
 
@@ -183,6 +186,8 @@ def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]
     apply rather than being guessed here.
     """
 
+    from docie_bench.serving.control_plane import DESIRED_LAUNCH_KNOBS
+
     def deploy(name: str, spec: dict[str, Any]) -> object:
         kwargs: dict[str, Any] = {"deployment_name": name}
         port = spec.get("port")
@@ -191,6 +196,9 @@ def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]
         context_length = spec.get("context_length")
         if isinstance(context_length, int):
             kwargs["context_length"] = context_length
+        for knob in DESIRED_LAUNCH_KNOBS:
+            if spec.get(knob) is not None:
+                kwargs[knob] = spec[knob]
         return control_plane.supervisor.serve_store_model(
             str(spec.get("model") or name), **kwargs
         )

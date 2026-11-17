@@ -297,6 +297,12 @@ class ObservedDeployment:
     # stale cycle: a deployment that stops being live publishes None here,
     # same policy as the throughput fields.
     slot_count: int | None = None
+    # Launch settings + persisted tool-calls verdict: config, not liveness, so
+    # published in every phase for readers without this node's file.
+    tool_calls_supported: bool | None = None
+    context_length: int | None = None
+    max_tokens: int | None = None
+    timeout_seconds: float | None = None
 
 
 def default_fit_check(
@@ -409,6 +415,10 @@ def _publish_via_catalog(observations: list[ObservedDeployment]) -> None:
                 throughput_measured_at=observed.throughput_measured_at,
                 throughput_source=observed.throughput_source,
                 slot_count=observed.slot_count,
+                tool_calls_supported=observed.tool_calls_supported,
+                context_length=observed.context_length,
+                max_tokens=observed.max_tokens,
+                timeout_seconds=observed.timeout_seconds,
             )
     except CatalogUnavailableError:
         logger.debug("no DATABASE_URL: observed state not published (repair-only cycle)")
@@ -444,6 +454,8 @@ class ServingReconciler:
         throughput: ThroughputStore | None = None,
         probe: Callable[[ProbeRequest], ThroughputSample | None] = probe_deployment,
         probe_hot_cycles: int = _PROBE_HOT_CYCLES,
+        seed_gc: Callable[[], object] | None = None,
+        seed_gc_interval_s: float = 3600.0,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -526,6 +538,11 @@ class ServingReconciler:
         # machine came back smaller. A deploy would reallocate a port and
         # rebuild a launch that never went away.
         self._loader = loader
+        # Seed-staging sweep (#664 B7): downloads land on this node's volume,
+        # so this node reclaims them. Unset (tests, CLI) = no sweep.
+        self._seed_gc = seed_gc
+        self._seed_gc_interval_s = seed_gc_interval_s
+        self._seed_gc_last: float | None = None
         self._repairs_due: list[str] = []
         self._repair_last: dict[str, float] = {}
         # Measured throughput: one fixed generation probe per model path, run
@@ -645,12 +662,28 @@ class ServingReconciler:
             self._converge_desired_state()
         except Exception:  # noqa: BLE001 - convergence hiccup != broken cycle
             logger.warning("desired-state convergence failed this cycle", exc_info=True)
+        self._maybe_gc_seed_leftovers()
         # Heartbeat the singleton lease each completed cycle so a second
         # serving replica joining later sees a live holder and refuses.
         if self._lease is not None:
             self._lease.refresh()
         return observations
 
+
+    def _maybe_gc_seed_leftovers(self) -> None:
+        """Run the seed-staging sweep on the first cycle, then once per interval."""
+        if self._seed_gc is None:
+            return
+        now = self._clock()
+        if self._seed_gc_last is not None and now - self._seed_gc_last < self._seed_gc_interval_s:
+            return
+        self._seed_gc_last = now
+        try:
+            summary = self._seed_gc()
+        except Exception:  # noqa: BLE001 - a disk hiccup != broken cycle
+            logger.warning("seed leftover sweep failed this cycle", exc_info=True)
+            return
+        logger.info("seed leftover sweep: %s", summary)
 
     # ------------------------------------------------- desired state (#534)
     def _converge_desired_state(self) -> object:
@@ -1657,6 +1690,10 @@ class ServingReconciler:
             throughput_measured_at=throughput_at,
             throughput_source=throughput_source,
             slot_count=slot_count,
+            tool_calls_supported=record.tool_calls_supported,
+            context_length=record.spec.launch.context_length,
+            max_tokens=record.spec.launch.max_tokens,
+            timeout_seconds=record.spec.launch.timeout_seconds,
         )
 
 
