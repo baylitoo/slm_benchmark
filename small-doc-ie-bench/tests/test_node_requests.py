@@ -200,3 +200,32 @@ def test_a_deleted_deployment_is_forgotten_by_convergence(central: list[Any]) ->
         assert not plan.to_start
         assert not plan.to_remove
         assert not plan.to_stop
+
+
+@pytest.mark.parametrize("route", ["delete", "drain"])
+def test_a_client_tier_key_cannot_change_nodes_or_deployments(
+    central: list[Any], route: str
+) -> None:
+    from fastapi import HTTPException
+
+    from docie_bench.inngest.serving_api import NodeDrainRequest, delete_deployment, drain_node
+    from docie_bench.security import TenantContext
+
+    client_key = TenantContext(tenant_id="adbi-app", authenticated=True, api_key_id="k1")
+    call = (
+        delete_deployment(NAME, tenant=client_key)
+        if route == "delete"
+        else drain_node("rocky-llm", NodeDrainRequest(), tenant=client_key)
+    )
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(call)
+    assert exc.value.status_code == 403
+
+
+def test_a_studio_sign_in_may_still_act(central: list[Any]) -> None:
+    from docie_bench.inngest.serving_api import _require_fleet_manager
+    from docie_bench.security import TenantContext
+
+    _require_fleet_manager(TenantContext(tenant_id="ops", authenticated=True, studio_user=True))
+    _require_fleet_manager(TenantContext(tenant_id="ops", authenticated=True, operator=True))
+    _require_fleet_manager(None)

@@ -626,7 +626,7 @@ async def drain_node(
       runs on the node, so it needs the node's reconciler to be alive and
       converging.
     """
-    del tenant  # authenticated principal required; no per-tenant scoping (ops)
+    _require_fleet_manager(tenant)
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
     try:
@@ -696,7 +696,7 @@ async def resume_node(node_id: str, tenant: TenantDependency) -> dict[str, Any]:
     off, puts the node back in the rotation with its runtimes still stopped --
     the same asymmetry the drain has, in the other direction.
     """
-    del tenant  # authenticated principal required; no per-tenant scoping (ops)
+    _require_fleet_manager(tenant)
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
     try:
@@ -1560,6 +1560,25 @@ def _remote_lifecycle(
 NODE_REQUEST_TTL_S = 600.0
 
 
+def _require_fleet_manager(tenant: Any) -> None:
+    """Node and lifecycle changes need an operator key or a Studio sign-in.
+
+    A Studio-issued key is the client tier: it calls the serving surfaces and
+    is handed to applications, so it must not drain nodes or delete deployments.
+    Unauthenticated access (auth switched off) is unchanged.
+    """
+    if getattr(tenant, "authenticated", False) and not (
+        getattr(tenant, "operator", False) or getattr(tenant, "studio_user", False)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "changing serving nodes or deployments needs an operator key "
+                "or a Studio sign-in"
+            ),
+        )
+
+
 def _route_to_owner(
     name: str,
     *,
@@ -1696,7 +1715,7 @@ async def delete_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     Handled on the serving service (the only process that can stop the
     runtime); also removes the deployment's observed placement row.
     """
-    del tenant  # authenticated principal required; no per-tenant scoping (ops surface)
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(name, event=DELETE_EVENT, prefix="delete")
 
 
@@ -1711,7 +1730,7 @@ async def load_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]
     A deployment owned by another node gets a durable load request instead of
     an event, and the response carries no channel.
     """
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name, event=LOAD_EVENT, prefix="load", remote_action="load"
     )
@@ -1732,7 +1751,7 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     response then carries no channel -- the owning node converges on its own
     cycle, so there is no progress stream to follow.
     """
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name, event=UNLOAD_EVENT, prefix="unload", remote_action="unload"
     )
@@ -1939,7 +1958,7 @@ async def scale_store_model(
     distinct nodes and surplus ones removed through their owner's desired
     state, so the response carries no channel (#664 A4).
     """
-    del tenant  # authenticated principal required; ops surface, no per-tenant scoping
+    _require_fleet_manager(tenant)
     from docie_bench.inngest.fleet_scale import (
         merged_records,
         place_replicas,
@@ -2088,7 +2107,7 @@ async def repair_deployment(
     losing the deployment's config. ``port=None`` picks a free port
     automatically; an explicit port is honored.
     """
-    del tenant
+    _require_fleet_manager(tenant)
     extra = {"port": request.port} if request.port is not None else None
     return await _fire_lifecycle_event(name, event=REPAIR_EVENT, prefix="repair", extra=extra)
 
@@ -2110,7 +2129,7 @@ async def reconfigure_deployment(
     name: str, request: ReconfigureRequest, tenant: TenantDependency
 ) -> dict[str, Any]:
     """Edit a deployment in place and restart it when currently running."""
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name,
         event=RECONFIGURE_EVENT,
@@ -2135,7 +2154,7 @@ async def pin_deployment(
     # An event (not an in-place write) because ``pinned`` lives in
     # deployments.json and only the serving service writes that file.
     """Pin or unpin a deployment — pinned deployments are never auto-unloaded."""
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name, event=PIN_EVENT, prefix="pin", extra={"pinned": request.pinned}
     )
