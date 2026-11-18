@@ -941,9 +941,23 @@ class _DefaultSupervisor:
         # Accumulating them keeps reallocation deterministic and prober-independent.
         tried: set[int] = set()
         record: Any = None
+        # A redeploy of an existing record keeps its own port first. Its process
+        # still holds that port, so the allocator's socket probe would move it,
+        # and a moved port is a changed launch: a retried or repeated deploy of a
+        # loaded model would restart it instead of being a no-op.
+        own_port = next(
+            (
+                r.spec.launch.port
+                for r in self.backend.list()
+                if exclude_name is not None and r.spec.name == exclude_name
+            ),
+            None,
+        )
         for _attempt in range(_MAX_PORT_ALLOC_ATTEMPTS):
             if port_override is not None:
                 chosen = port_override
+            elif own_port is not None and own_port not in tried:
+                chosen = own_port
             else:
                 reserved = self._reserved_ports(exclude_name=exclude_name) | tried
                 chosen = allocator.allocate(bind_host=bind_host, reserved=reserved)
