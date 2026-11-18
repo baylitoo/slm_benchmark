@@ -3,12 +3,13 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import logging
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.orm.exc import StaleDataError
@@ -34,6 +35,8 @@ from docie_bench.storage.db import (
     ReviewTask,
     session_scope,
 )
+
+logger = logging.getLogger("docie_bench.review")
 
 
 class ReviewError(RuntimeError):
@@ -433,10 +436,43 @@ def enqueue_review(payload: ReviewTaskCreate, *, force: bool = False) -> ReviewT
         return _task_view(task)
 
 
+def _strip_verdict_reasons(task: ReviewTask) -> None:
+    """Drop the LLM judges' free-text reasons from an agent-run task.
+
+    A reason may quote the conversation, so it may live no longer than the
+    run text: it goes when the review is closed, as the run itself does.
+    """
+    for attr in ("original_prediction_json", "latest_prediction_json"):
+        prediction = getattr(task, attr)
+        if not isinstance(prediction, dict) or not prediction.get("verdicts"):
+            continue
+        setattr(
+            task,
+            attr,
+            {
+                **prediction,
+                "verdicts": [
+                    {**v, "reason": None} if isinstance(v, dict) else v
+                    for v in prediction["verdicts"]
+                ],
+            },
+        )
+
+
+def review_owner(task_id: int) -> tuple[str, str | None]:
+    """A task's kind and, for an agent-run review, the tenant whose run it is."""
+    with session_scope() as maybe_session:
+        session = _require_session(maybe_session)
+        task = _query_task(session, task_id)
+        tenant = (task.metadata_json or {}).get("tenant_id")
+        return task.kind, tenant if isinstance(tenant, str) else None
+
+
 def enqueue_agent_run_review(
     *,
     run_id: str,
     agent: str,
+    tenant_id: str,
     evaluators: list[str],
     reasons: list[str],
     verdicts: list[dict[str, Any]],
@@ -445,7 +481,10 @@ def enqueue_agent_run_review(
 
     The task holds the run id and the verdicts, not the conversation: the
     reviewer reads that from ``agent_runs``, which expires on its own
-    schedule, so review history never extends how long run text is kept.
+    schedule. The judges' reasons, which may quote the conversation, are
+    dropped from the task when the review is closed, so review history never
+    extends how long run text is kept. ``tenant_id`` is the run's tenant: a
+    client key sees and decides only its own tenant's agent-run reviews.
     A repeat call for the same run (an Inngest retry) returns the existing task.
     """
     with session_scope() as maybe_session:
@@ -470,7 +509,7 @@ def enqueue_agent_run_review(
             latest_prediction_json=prediction,
             validation_errors_json=[],
             validation_warnings_json=[],
-            metadata_json={"agent": agent},
+            metadata_json={"agent": agent, "tenant_id": tenant_id},
             status=ReviewStatus.PENDING,
             version=1,
         )
@@ -513,6 +552,7 @@ def expire_undecided_agent_reviews(now: dt.datetime | None = None) -> list[str]:
             task.claim_expires_at = None
             task.decided_at = current
             task.decision_comment = "not reviewed within 30 days"
+            _strip_verdict_reasons(task)
             task.version += 1
             task.updated_at = current
             _event(task, "expired", from_status=from_status)
@@ -526,7 +566,9 @@ def list_reviews(
     reviewer_id: str | None = None,
     kind: str | None = None,
     limit: int = 100,
+    agent_run_tenant: str | None = None,
 ) -> list[ReviewTaskView]:
+    """``agent_run_tenant`` set: agent-run reviews of other tenants are left out."""
     now = _utcnow()
     with session_scope() as maybe_session:
         session = _require_session(maybe_session)
@@ -555,6 +597,13 @@ def list_reviews(
             statement = statement.where(ReviewTask.claimed_by == reviewer_id)
         if kind is not None:
             statement = statement.where(ReviewTask.kind == kind)
+        if agent_run_tenant is not None:
+            statement = statement.where(
+                or_(
+                    ReviewTask.kind != "agent_run",
+                    ReviewTask.metadata_json["tenant_id"].as_string() == agent_run_tenant,
+                )
+            )
         tasks = list(session.scalars(statement.limit(limit)))
         return [_task_view(task, include_history=False) for task in tasks]
 
@@ -765,16 +814,27 @@ def decide_review(
         task.decided_at = _utcnow()
         task.decided_by = reviewer_id
         task.decision_comment = comment
+        if task.kind == "agent_run":
+            _strip_verdict_reasons(task)
         task.version += 1
         task.updated_at = task.decided_at
         _event(task, decision.value, actor_id=reviewer_id, from_status=ReviewStatus.CLAIMED)
         _flush(session)
         view = _task_view(task)
     if view.kind == "agent_run":
-        # An agent run is kept only until its review is decided.
+        # An agent run is kept only until its review is decided. The decision
+        # is already committed: a failed delete must not turn it into an
+        # error. The run then goes with the retention purge.
         from docie_bench.studio.agent_run_store import delete_agent_run
 
-        delete_agent_run(view.source_request_id)
+        try:
+            delete_agent_run(view.source_request_id)
+        except Exception:
+            logger.warning(
+                "could not delete agent run %s after its review was decided",
+                view.source_request_id,
+                exc_info=True,
+            )
     return view
 
 

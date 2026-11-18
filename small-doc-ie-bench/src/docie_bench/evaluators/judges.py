@@ -219,7 +219,13 @@ class DecisionJudge:
                 self.name, self.questions, "measured",
                 f"/v1/systemone answered {response.status_code}: {response.text[:200]}",
             )
-        answers = (response.json() or {}).get("answers") or {}
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            return _failed(self.name, self.questions, "measured", f"unparseable answer: {exc}")
+        answers = payload.get("answers") if isinstance(payload, dict) else None
+        if not isinstance(answers, dict):
+            answers = {}
         verdicts = []
         for q in self.questions:
             answer = answers.get(q.id)
@@ -331,6 +337,11 @@ class LlmJudge:
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             return _failed(
                 self.name, self.questions, "self_reported", f"unparseable verdict: {exc}"
+            )
+        if not isinstance(parsed, dict):
+            return _failed(
+                self.name, self.questions, "self_reported",
+                f"unparseable verdict: expected an object, got {type(parsed).__name__}",
             )
         return [self._verdict(q, parsed.get(q.id)) for q in self.questions]
 

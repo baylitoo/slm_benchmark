@@ -482,6 +482,50 @@ const RULES_FOR: Record<QuestionType, { value: ReviewRuleWhen; label: string }[]
   choice: [{ value: "choice_in", label: "answer is one of" }],
 };
 
+function defaultRule(q: Pick<QuestionDraft, "id" | "type">): ReviewRule {
+  const when = RULES_FOR[q.type][0].value;
+  return { question: q.id, when, value: when === "choice_in" ? [] : 0.5 };
+}
+
+/** The rule's value as typed. The text is kept as is while the user types
+ * ("0.", "a,"), and only the parsed value goes up to the draft. */
+function RuleValueInput({
+  label,
+  rule,
+  onChange,
+}: {
+  label: string;
+  rule: ReviewRule;
+  onChange: (value: ReviewRule["value"]) => void;
+}) {
+  const [text, setText] = useState(
+    Array.isArray(rule.value) ? rule.value.join(", ") : String(rule.value),
+  );
+  return (
+    <TextInput
+      aria-label={label}
+      className="w-40"
+      inputMode={rule.when === "choice_in" ? undefined : "decimal"}
+      value={text}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        if (rule.when === "choice_in") {
+          onChange(
+            raw
+              .split(",")
+              .map((v) => v.trim())
+              .filter(Boolean),
+          );
+          return;
+        }
+        const n = Number(raw.replace(",", "."));
+        if (raw.trim() !== "" && Number.isFinite(n)) onChange(n);
+      }}
+    />
+  );
+}
+
 function EditorDialog({
   draft: initial,
   agents,
@@ -505,10 +549,22 @@ function EditorDialog({
     setD((cur) => ({ ...cur, ...p }));
   }
   function patchQuestion(i: number, p: Partial<QuestionDraft>) {
-    setD((cur) => ({
-      ...cur,
-      questions: cur.questions.map((q, j) => (j === i ? { ...q, ...p } : q)),
-    }));
+    setD((cur) => {
+      const before = cur.questions[i];
+      const after = { ...before, ...p };
+      // Rules point at a question by id and fit its type: follow a rename,
+      // and reset a rule whose condition no longer applies to the new type.
+      const rules = cur.rules.map((r) => {
+        if (r.question !== before.id) return r;
+        if (after.type !== before.type) return defaultRule(after);
+        return { ...r, question: after.id };
+      });
+      return {
+        ...cur,
+        questions: cur.questions.map((q, j) => (j === i ? after : q)),
+        rules,
+      };
+    });
   }
 
   async function save() {
@@ -673,7 +729,10 @@ function EditorDialog({
                   variant="secondary"
                   aria-label={`Remove question ${i + 1}`}
                   onClick={() =>
-                    patch({ questions: d.questions.filter((_, j) => j !== i) })
+                    patch({
+                      questions: d.questions.filter((_, j) => j !== i),
+                      rules: d.rules.filter((r) => r.question !== q.id),
+                    })
                   }
                 >
                   <Trash2 className="h-4 w-4" />
@@ -730,13 +789,8 @@ function EditorDialog({
                   value={r.question}
                   onChange={(e) => {
                     const next = d.questions.find((q) => q.id === e.target.value);
-                    const when = RULES_FOR[next?.type ?? "noul"][0].value;
                     const rules = [...d.rules];
-                    rules[i] = {
-                      question: e.target.value,
-                      when,
-                      value: when === "choice_in" ? [] : 0.5,
-                    };
+                    rules[i] = defaultRule(next ?? { id: e.target.value, type: "noul" });
                     patch({ rules });
                   }}
                 >
@@ -761,22 +815,14 @@ function EditorDialog({
                     </option>
                   ))}
                 </Select>
-                <TextInput
-                  aria-label={`Rule ${i + 1} value`}
-                  className="w-40"
-                  value={Array.isArray(r.value) ? r.value.join(", ") : String(r.value)}
-                  onChange={(e) => {
+                <RuleValueInput
+                  // A new question or condition starts a fresh text buffer.
+                  key={`${i}:${r.question}:${r.when}`}
+                  label={`Rule ${i + 1} value`}
+                  rule={r}
+                  onChange={(value) => {
                     const rules = [...d.rules];
-                    rules[i] = {
-                      ...r,
-                      value:
-                        r.when === "choice_in"
-                          ? e.target.value
-                              .split(",")
-                              .map((v) => v.trim())
-                              .filter(Boolean)
-                          : Number(e.target.value),
-                    };
+                    rules[i] = { ...r, value };
                     patch({ rules });
                   }}
                 />
@@ -797,14 +843,7 @@ function EditorDialog({
               variant="secondary"
               disabled={!questionIds.length}
               onClick={() => {
-                const first = d.questions[0];
-                const when = RULES_FOR[first.type][0].value;
-                patch({
-                  rules: [
-                    ...d.rules,
-                    { question: first.id, when, value: when === "choice_in" ? [] : 0.5 },
-                  ],
-                });
+                patch({ rules: [...d.rules, defaultRule(d.questions[0])] });
               }}
             >
               Add rule

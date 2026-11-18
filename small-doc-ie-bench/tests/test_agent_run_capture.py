@@ -139,7 +139,7 @@ def test_a_run_with_an_open_review_is_never_purged(emitted) -> None:
     old = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
     run_id = _old_run(old)
     enqueue_agent_run_review(
-        run_id=run_id, agent="billing-bot", evaluators=["completion"],
+        run_id=run_id, agent="billing-bot", tenant_id="tenant-a", evaluators=["completion"],
         reasons=["completed: 0.10 < 0.5"], verdicts=[],
     )
     assert purge_expired_runs(now=old + dt.timedelta(days=365)) == 0
@@ -185,19 +185,24 @@ def agent_api(tmp_path: Path, monkeypatch):
         "docie_bench.agents.api.schedule_capture", lambda **kw: captured.append(kw)
     )
 
-    async def chunks(abort: bool) -> AsyncIterator[bytes]:
+    async def chunks(prompt: str) -> AsyncIterator[bytes]:
         for piece in ("5 400", " €"):
             yield f'data: {{"choices":[{{"delta":{{"content":"{piece}"}}}}]}}\n\n'.encode()
-            if abort:
+            if "abort" in prompt:
                 raise httpx.ReadError("upstream dropped")
+            if "error" in prompt:
+                yield b'data: {"error":{"message":"upstream failed","type":"server_error"}}\n\n'
+                return
+        if "cut" in prompt:
+            return  # the upstream closed without a terminal frame
         yield b"data: [DONE]\n\n"
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         if body.get("stream"):
-            abort = "abort" in body["messages"][-1]["content"]
+            prompt = body["messages"][-1]["content"]
             return httpx.Response(
-                200, headers={"content-type": "text/event-stream"}, content=chunks(abort)
+                200, headers={"content-type": "text/event-stream"}, content=chunks(prompt)
             )
         return httpx.Response(
             200, json={"choices": [{"message": {"role": "assistant", "content": "5 400 €"}}]}
@@ -243,6 +248,49 @@ def test_an_aborted_stream_is_not_captured(agent_api) -> None:
     with pytest.raises(httpx.ReadError):
         post()
     assert captured == []
+
+
+@pytest.mark.parametrize("prompt", ["error frame please", "cut please"])
+def test_a_stream_that_did_not_finish_cleanly_is_not_captured(agent_api, prompt) -> None:
+    client, captured = agent_api
+    response = client.post(
+        "/v1/agents/chat/completions",
+        json={
+            "model": "billing-bot",
+            "stream": True,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+    )
+    assert response.status_code == 200
+    _ = response.content
+    assert captured == []
+
+
+def test_capture_does_its_database_work_off_the_event_loop(monkeypatch) -> None:
+    import threading
+
+    from docie_bench.evaluators import capture
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def lookup(agent: str) -> list:
+        seen.append(threading.get_ident())
+        return []
+
+    monkeypatch.setattr("docie_bench.studio.evaluator_store.evaluators_for_agent", lookup)
+
+    async def run() -> object:
+        nonlocal loop_thread
+        loop_thread = threading.get_ident()
+        return await capture.capture_agent_run(
+            agent="billing-bot", agent_kind="custom", tenant_id="t", api_key_id=None,
+            body=BODY, output="5 400 €",
+        )
+
+    assert asyncio.run(run()) is None
+    assert seen
+    assert seen[0] != loop_thread
 
 
 def test_only_capped_text_is_kept_from_messages() -> None:

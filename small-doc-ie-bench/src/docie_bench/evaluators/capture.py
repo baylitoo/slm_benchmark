@@ -80,13 +80,14 @@ async def capture_agent_run(
     """
     if agent_kind == "proxy_security" or not output:
         return None
-    try:
+
+    def store() -> tuple[str | None, list[str]]:
         from docie_bench.studio.agent_run_store import save_agent_run
         from docie_bench.studio.evaluator_store import evaluators_for_agent
 
         sampled = [e.name for e in evaluators_for_agent(agent) if rng() < e.sample_rate]
         if not sampled:
-            return None
+            return None, []
         run_id = save_agent_run(
             agent=agent,
             tenant_id=tenant_id,
@@ -96,6 +97,12 @@ async def capture_agent_run(
             tool_calls=[dict(c) for c in tool_calls],
             evaluators=sampled,
         )
+        return run_id, sampled
+
+    try:
+        # The lookup and the insert are blocking database calls: off the event
+        # loop, or every concurrent stream on this worker waits on them.
+        run_id, sampled = await asyncio.to_thread(store)
         if run_id is None:
             return None
         await _emit(run_id, sampled)

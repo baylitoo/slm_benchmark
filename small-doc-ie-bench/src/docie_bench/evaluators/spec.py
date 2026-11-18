@@ -78,6 +78,33 @@ class ReviewRule(BaseModel):
         return f"{self.question}: {observed:.2f} {side} {self.value}"
 
 
+def _check_rule_value(rule: ReviewRule, question: QuestionSpec) -> None:
+    """A rule whose value can never match would silently never fire."""
+    if rule.when == "choice_in":
+        if not isinstance(rule.value, list) or not rule.value:
+            raise ValueError(f"review rule on {rule.question!r} needs a list of options")
+        unknown = set(rule.value) - set(question.to_question().options())
+        if unknown:
+            raise ValueError(
+                f"review rule on {rule.question!r} names unknown options {sorted(unknown)!r}"
+            )
+        return
+    if isinstance(rule.value, list):
+        raise ValueError(f"review rule {rule.when!r} on {rule.question!r} needs a number")
+    if rule.when.startswith("noul") and not 0.0 <= rule.value <= 1.0:
+        raise ValueError(
+            f"review rule {rule.when!r} on {rule.question!r} compares a probability: "
+            "use a value between 0 and 1"
+        )
+    if rule.when.startswith("score"):
+        levels = len(question.to_question().options())
+        if not 0.0 <= rule.value <= levels - 1:
+            raise ValueError(
+                f"review rule {rule.when!r} on {rule.question!r} compares a level: "
+                f"use a value between 0 and {levels - 1}"
+            )
+
+
 class EvaluatorSpec(BaseModel):
     name: str = Field(min_length=1, max_length=64, pattern=_SLUG)
     description: str = Field(default="", max_length=500)
@@ -112,6 +139,7 @@ class EvaluatorSpec(BaseModel):
                     f"review rule {rule.when!r} does not apply to {kind} question "
                     f"{rule.question!r}"
                 )
+            _check_rule_value(rule, next(q for q in self.questions if q.id == rule.question))
         return self
 
     def build_judge(self, profile: ModelProfile) -> Judge:

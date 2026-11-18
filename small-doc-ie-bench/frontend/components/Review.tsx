@@ -936,10 +936,17 @@ function AgentRunDetail({
           <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Run{run ? ` — ${run.agent}` : ""}
           </p>
-          {runError ? (
+          {runError instanceof ApiError && runError.status === 404 ? (
             <Alert tone="info">
               The run is no longer stored: runs are deleted once their review is decided.
               The verdicts remain.
+            </Alert>
+          ) : runError ? (
+            // Anything else is a failed load, not a deleted run: deciding now
+            // would delete a run nobody read.
+            <Alert tone="err">
+              Could not load the run: {toUserMessage(runError, { fallback: "request failed." })}{" "}
+              Reload before deciding.
             </Alert>
           ) : !run ? (
             <Skeleton className="h-24" />

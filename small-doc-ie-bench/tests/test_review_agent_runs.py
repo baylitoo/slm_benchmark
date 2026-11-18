@@ -37,6 +37,7 @@ def _agent_review():
     return enqueue_agent_run_review(
         run_id=RUN_ID,
         agent="billing-bot",
+        tenant_id="tenant-a",
         evaluators=["task-completion"],
         reasons=["completed: 0.20 < 0.5"],
         verdicts=[{"question_id": "completed", "noul": 0.2, "provenance": "measured"}],
@@ -153,3 +154,101 @@ def test_undecided_agent_reviews_expire_after_30_days() -> None:
     # Extraction reviews are untouched; a second sweep finds nothing new.
     assert get_review(extraction.id).status == ReviewStatus.PENDING
     assert expire_undecided_agent_reviews(now=now + dt.timedelta(days=60)) == []
+
+
+# ── Retention and tenancy (follow-up review of #661) ──
+
+
+def _agent_review_with_reason(run_id: str = RUN_ID, tenant_id: str = "tenant-a"):
+    return enqueue_agent_run_review(
+        run_id=run_id,
+        agent="billing-bot",
+        tenant_id=tenant_id,
+        evaluators=["safety"],
+        reasons=["safety · unsafe: answered 'yes'"],
+        verdicts=[
+            {
+                "question_id": "unsafe",
+                "noul": 1.0,
+                "provenance": "self_reported",
+                "reason": "The user wrote 'call me on 06 12 34 56 78'",
+            }
+        ],
+    )
+
+
+def _reasons(view) -> list:
+    return [
+        v.get("reason")
+        for prediction in (view.original_prediction, view.latest_prediction)
+        for v in prediction["verdicts"]
+    ]
+
+
+def test_a_decided_review_drops_the_judges_reasons() -> None:
+    from docie_bench.review import get_review
+
+    task = _agent_review_with_reason()
+    assert "06 12 34 56 78" in _reasons(task)[0]
+    _approve(task.id, task.version)
+    assert _reasons(get_review(task.id)) == [None, None]
+
+
+def test_an_expired_review_drops_the_judges_reasons() -> None:
+    import datetime as dt
+
+    from docie_bench.review import expire_undecided_agent_reviews, get_review
+
+    task = _agent_review_with_reason()
+    now = task.created_at if task.created_at.tzinfo else task.created_at.replace(tzinfo=dt.UTC)
+    assert expire_undecided_agent_reviews(now=now + dt.timedelta(days=31)) == [RUN_ID]
+    assert _reasons(get_review(task.id)) == [None, None]
+
+
+def test_a_failed_run_delete_does_not_fail_the_decision(monkeypatch) -> None:
+    def broken(run_id: str) -> bool:
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr("docie_bench.studio.agent_run_store.delete_agent_run", broken)
+    task = _agent_review_with_reason()
+    claimed = claim_review(task.id, reviewer_id="alice", expected_version=task.version,
+                           lease_seconds=60)
+    decided = decide_review(task.id, reviewer_id="alice", expected_version=claimed.version,
+                            decision=ReviewStatus.APPROVED)
+    assert decided.status == ReviewStatus.APPROVED
+
+
+def test_the_queue_can_be_limited_to_one_tenants_agent_runs() -> None:
+    _agent_review_with_reason(RUN_ID, "tenant-a")
+    _agent_review_with_reason("7d9a3c1e-0000-4000-8000-000000000002", "tenant-b")
+    _extraction_review()
+    mine = list_reviews(kind=None, agent_run_tenant="tenant-a")
+    assert sorted(t.kind for t in mine) == ["agent_run", "extraction"]
+    assert [t.source_request_id for t in mine if t.kind == "agent_run"] == [RUN_ID]
+
+
+def test_a_client_key_cannot_read_or_decide_another_tenants_agent_review() -> None:
+    from fastapi.testclient import TestClient
+
+    from docie_bench import api
+    from docie_bench.security import TenantContext, tenant_guard
+
+    other = _agent_review_with_reason(RUN_ID, "tenant-a")
+    client = TestClient(api.app)
+    api.app.dependency_overrides[tenant_guard] = lambda: TenantContext(
+        tenant_id="tenant-b", authenticated=True
+    )
+    try:
+        assert client.get("/v1/reviews?kind=agent_run").json() == []
+        assert client.get(f"/v1/reviews/{other.id}").status_code == 404
+        claim = client.post(f"/v1/reviews/{other.id}/claim",
+                            json={"reviewer_id": "bob", "expected_version": other.version})
+        assert claim.status_code == 404
+        # The owner's client key still works.
+        api.app.dependency_overrides[tenant_guard] = lambda: TenantContext(
+            tenant_id="tenant-a", authenticated=True
+        )
+        assert [t["id"] for t in client.get("/v1/reviews?kind=agent_run").json()] == [other.id]
+        assert client.get(f"/v1/reviews/{other.id}").status_code == 200
+    finally:
+        api.app.dependency_overrides.clear()
