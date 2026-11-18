@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -175,6 +176,25 @@ def _nodes_that_stopped_reporting() -> frozenset[str]:
         return frozenset()
 
 
+def _drained_nodes() -> frozenset[str]:
+    """Nodes an operator drained (best-effort)."""
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.placement_resolver import _drained_node_ids
+
+    try:
+        return _drained_node_ids(list(ModelCatalog().list_node_snapshots()))
+    except Exception:  # noqa: BLE001 - attribution must not 500 the Board
+        return frozenset()
+
+
+def _endpoint_port(endpoint: object) -> int | None:
+    """The port of an advertised endpoint (``http://host:8088/v1``), if any."""
+    try:
+        return urllib.parse.urlsplit(str(endpoint or "")).port
+    except ValueError:
+        return None
+
+
 def _records_for_other_nodes(
     local: list[Any], observed: dict[str, dict[str, Any]] | None
 ) -> list[dict[str, Any]]:
@@ -215,6 +235,11 @@ def _records_for_other_nodes(
                         "alias": row.get("model_name") or name,
                         "model": row.get("model_name"),
                         "runtime": RUNTIME_BY_ENGINE.get(str(row.get("engine") or "")),
+                        "port": _endpoint_port(row.get("endpoint")),
+                        # The owner's launch settings, so the edit form opens
+                        # prefilled for a row this process has no file for.
+                        "context_length": row.get("context_length"),
+                        "max_tokens": row.get("max_tokens"),
                     },
                 },
                 "state": row.get("state"),
@@ -224,6 +249,7 @@ def _records_for_other_nodes(
                 # ``evicted`` is the owner's idle unload (activation managed),
                 # ``cold`` a manual stop; a request may reload only the first.
                 "activation": "managed" if row.get("phase") == "evicted" else None,
+                "pinned": bool(row.get("pinned")),
                 # The UI needs to know this record is a catalog projection and
                 # not the owning node's own record, so it does not offer
                 # actions that need the file it does not have.
@@ -266,6 +292,7 @@ async def list_deployments() -> Any:
     # whole fleet; a missing deployment is worse than a partial one.
     records.extend(_records_for_other_nodes(records, observed))
     stale_nodes = _nodes_that_stopped_reporting()
+    drained_nodes = _drained_nodes()
     group_sizes: dict[str, int] = {}
     for record in records:
         if isinstance(record, dict) and (base := _replica_base(record)):
@@ -285,6 +312,7 @@ async def list_deployments() -> Any:
         record.setdefault("record_source", "node")
         node_id = record.get("node_id")
         record["node_reporting"] = not (node_id and node_id in stale_nodes)
+        record["node_drained"] = bool(node_id and node_id in drained_nodes)
         base = _replica_base(record)
         record["replica_group"] = base
         record["replicas"] = group_sizes.get(base, 1) if base else 1
@@ -294,7 +322,31 @@ async def list_deployments() -> Any:
         # withheld-restart reason to it), so prefer it over the raw record's.
         last_error = (obs or {}).get("last_error") or record.get("last_error")
         record["failure_kind"] = classify_failure(record.get("state"), last_error)
+    _attach_node_requests(records)
     return records
+
+
+def _attach_node_requests(records: list[Any]) -> None:
+    """The newest queued action per deployment (#590), so a row shows an
+    action that is pending on its node, or why it failed."""
+    from docie_bench.serving.catalog import ModelCatalog
+
+    names = [
+        str((r.get("spec") or {}).get("name") or "")
+        for r in records
+        if isinstance(r, dict)
+    ]
+    try:
+        catalog = ModelCatalog()
+        catalog.expire_node_requests(NODE_REQUEST_TTL_S)
+        latest = catalog.latest_node_requests([n for n in names if n])
+    except Exception:  # noqa: BLE001 - the listing must not depend on it
+        return
+    for record in records:
+        if isinstance(record, dict):
+            name = str((record.get("spec") or {}).get("name") or "")
+            if name in latest:
+                record["node_request"] = latest[name]
 
 
 # The api NEVER measures RAM itself: a psutil call in this process would
@@ -587,7 +639,7 @@ async def drain_node(
       runs on the node, so it needs the node's reconciler to be alive and
       converging.
     """
-    del tenant  # authenticated principal required; no per-tenant scoping (ops)
+    _require_fleet_manager(tenant)
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
     try:
@@ -657,7 +709,7 @@ async def resume_node(node_id: str, tenant: TenantDependency) -> dict[str, Any]:
     off, puts the node back in the rotation with its runtimes still stopped --
     the same asymmetry the drain has, in the other direction.
     """
-    del tenant  # authenticated principal required; no per-tenant scoping (ops)
+    _require_fleet_manager(tenant)
     from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
 
     try:
@@ -1321,7 +1373,8 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     * never deployed (no placement row at all) -- fires the same
       ``serving/deploy.requested`` a first :func:`scale_store_model` replica
       would, using the base name as the deployment name (the established
-      convention: the first replica of ``name`` IS the bare store name).
+      convention: the first replica of ``name`` IS the bare store name). On
+      a fleet, one minted replica is placed as desired state instead.
     * deployed then evicted / not yet ready (a placement row exists but none
       is live) -- fires :data:`LOAD_EVENT`, same as ``POST
       /deployments/{name}/load``.
@@ -1357,6 +1410,9 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
     eta = load_timeout_s(None, size_bytes=size_bytes if isinstance(size_bytes, int) else None)
 
     if not placements:
+        fleet_target = _place_first_fleet_replica(name)
+        if fleet_target is not None:
+            return fleet_target, eta
         channel = f"deploy:{uuid.uuid4().hex}"
         data = {
             "model": name,
@@ -1381,6 +1437,28 @@ async def trigger_deployment_load(name: str) -> tuple[str, float] | None:
             return None
         return target, eta
     return name, eta
+
+
+def _place_first_fleet_replica(name: str) -> str | None:
+    """On a fleet, the replica a load-on-demand of ``name`` should wait for.
+
+    An untargeted deploy event lands on whichever node Inngest picks, maybe one
+    without the blob, under a name another node may also use. Instead one
+    replica is placed by fit as desired state. A replica already asked for
+    (desired, not yet converged) is reused, so concurrent first requests do not
+    place one each; the read and the write have no ``await`` between them.
+    Returns None off a fleet, where the deploy event is still right.
+    """
+    from docie_bench.inngest.fleet_scale import place_replicas, read_fleet_view
+    from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
+
+    view = read_fleet_view(name)
+    if view is None or not view.is_fleet:
+        return None
+    if view.owners:
+        return sorted(view.owners)[0]
+    placed = place_replicas(name, 1, view, context_length=DEFAULT_DEPLOY_CONTEXT_LENGTH)
+    return str(placed[0]["name"])
 
 
 def _owning_placement(name: str) -> dict[str, Any] | None:
@@ -1517,6 +1595,102 @@ def _remote_lifecycle(
     }
 
 
+# How long a queued request may wait for its node before it reads as expired.
+NODE_REQUEST_TTL_S = 600.0
+
+
+def _require_fleet_manager(tenant: Any) -> None:
+    """Node and lifecycle changes need an operator key or a Studio sign-in.
+
+    A Studio-issued key is the client tier: it calls the serving surfaces and
+    is handed to applications, so it must not drain nodes or delete deployments.
+    Unauthenticated access (auth switched off) is unchanged.
+    """
+    if getattr(tenant, "authenticated", False) and not (
+        getattr(tenant, "operator", False) or getattr(tenant, "studio_user", False)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "changing serving nodes or deployments needs an operator key "
+                "or a Studio sign-in"
+            ),
+        )
+
+
+def _route_to_owner(
+    name: str,
+    *,
+    event: str,
+    extra: dict[str, Any] | None,
+    remote_action: str | None,
+) -> dict[str, Any] | None:
+    """Send a lifecycle action to the node that owns ``name`` (#590).
+
+    ``None`` leaves the caller on the event path: a single node (every event
+    lands on it), no catalog, or no known owner. Otherwise a load or unload
+    of a deployment desired state manages goes through desired state, as
+    before; every other action is queued as a request the owner runs on its
+    next cycle. A delete also removes the desired row, so convergence
+    cannot start the deployment again.
+    """
+    from docie_bench.serving.catalog import CatalogUnavailableError, ModelCatalog
+    from docie_bench.serving.node_liveness import stale_node_ids
+
+    placement = _owning_placement(name)
+    owner = str((placement or {}).get("node_id") or "")
+    if not owner:
+        return None
+    try:
+        catalog = ModelCatalog()
+        snapshots = list(catalog.list_node_snapshots())
+    except CatalogUnavailableError:
+        return None
+    stale = stale_node_ids(snapshots)
+    reporting = [s for s in snapshots if str(s.get("node_id") or "") not in stale]
+    if len(reporting) < 2:
+        return None
+    if owner in stale:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"deployment {name!r} runs on serving node {owner!r}, which has "
+                f"stopped reporting; a request queued for it would not run"
+            ),
+        )
+    verb = {
+        DELETE_EVENT: "delete",
+        LOAD_EVENT: "load",
+        UNLOAD_EVENT: "unload",
+        REPAIR_EVENT: "repair",
+        RECONFIGURE_EVENT: "reconfigure",
+        PIN_EVENT: "pin" if (extra or {}).get("pinned", True) else "unpin",
+    }.get(event)
+    if verb is None:
+        return None
+    desired_rows = catalog.desired_snapshot(owner).get("deployments") or []
+    desired = next(
+        (row for row in desired_rows if isinstance(row, dict) and row.get("name") == name),
+        None,
+    )
+    if desired is not None and remote_action and verb in ("load", "unload"):
+        return _remote_lifecycle(name, placement or {}, action=remote_action)
+    if desired is not None and verb == "delete":
+        catalog.delete_desired_deployment(
+            owner, name, expected_generation=int(desired.get("generation") or 0)
+        )
+    args = {k: v for k, v in (extra or {}).items() if k != "pinned"}
+    request = catalog.enqueue_node_request(owner, name, verb, args)
+    return {
+        "event_ids": [],
+        "channel": None,
+        "name": name,
+        "node_id": owner,
+        "request_id": request["id"],
+        "detail": f"{verb} queued for serving node {owner!r}; it runs on that node's next cycle",
+    }
+
+
 async def _fire_lifecycle_event(
     name: str,
     *,
@@ -1527,12 +1701,19 @@ async def _fire_lifecycle_event(
 ) -> dict[str, Any]:
     """404-gate ``name`` then fire one ``serving/*`` lifecycle event.
 
+    On a fleet the event is not used: it would reach whichever node Inngest
+    picks. The action goes to the owning node as a request instead
+    (:func:`_route_to_owner`), for this node's own deployments too.
+
     Shared shape for delete/load/unload/pin: the api can neither spawn nor
     kill a runtime (different PID namespace, and only the serving service may
     write ``deployments.json``), so every mutation is an event handled on the
     single-replica ``serving`` service. Returns the event id(s) + channel to
     poll; 404 for an unknown deployment so a typo never queues a no-op job.
     """
+    routed = _route_to_owner(name, event=event, extra=extra, remote_action=remote_action)
+    if routed is not None:
+        return routed
     try:
         await _control_plane().deployment_status(name)
     except (KeyError, ValueError, FileNotFoundError) as exc:
@@ -1573,7 +1754,7 @@ async def delete_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     Handled on the serving service (the only process that can stop the
     runtime); also removes the deployment's observed placement row.
     """
-    del tenant  # authenticated principal required; no per-tenant scoping (ops surface)
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(name, event=DELETE_EVENT, prefix="delete")
 
 
@@ -1588,7 +1769,7 @@ async def load_deployment(name: str, tenant: TenantDependency) -> dict[str, Any]
     A deployment owned by another node gets a durable load request instead of
     an event, and the response carries no channel.
     """
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name, event=LOAD_EVENT, prefix="load", remote_action="load"
     )
@@ -1609,7 +1790,7 @@ async def unload_deployment(name: str, tenant: TenantDependency) -> dict[str, An
     response then carries no channel -- the owning node converges on its own
     cycle, so there is no progress stream to follow.
     """
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name, event=UNLOAD_EVENT, prefix="unload", remote_action="unload"
     )
@@ -1816,7 +1997,7 @@ async def scale_store_model(
     distinct nodes and surplus ones removed through their owner's desired
     state, so the response carries no channel (#664 A4).
     """
-    del tenant  # authenticated principal required; ops surface, no per-tenant scoping
+    _require_fleet_manager(tenant)
     from docie_bench.inngest.fleet_scale import (
         merged_records,
         place_replicas,
@@ -1965,7 +2146,7 @@ async def repair_deployment(
     losing the deployment's config. ``port=None`` picks a free port
     automatically; an explicit port is honored.
     """
-    del tenant
+    _require_fleet_manager(tenant)
     extra = {"port": request.port} if request.port is not None else None
     return await _fire_lifecycle_event(name, event=REPAIR_EVENT, prefix="repair", extra=extra)
 
@@ -1987,7 +2168,7 @@ async def reconfigure_deployment(
     name: str, request: ReconfigureRequest, tenant: TenantDependency
 ) -> dict[str, Any]:
     """Edit a deployment in place and restart it when currently running."""
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name,
         event=RECONFIGURE_EVENT,
@@ -2012,7 +2193,7 @@ async def pin_deployment(
     # An event (not an in-place write) because ``pinned`` lives in
     # deployments.json and only the serving service writes that file.
     """Pin or unpin a deployment — pinned deployments are never auto-unloaded."""
-    del tenant
+    _require_fleet_manager(tenant)
     return await _fire_lifecycle_event(
         name, event=PIN_EVENT, prefix="pin", extra={"pinned": request.pinned}
     )

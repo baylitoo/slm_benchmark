@@ -4,16 +4,22 @@ import { useMemo, useState } from "react";
 import { Code2, ListChecks, Plus, Scale, Search, Sparkles, Trash2 } from "lucide-react";
 import {
   createEvaluator,
+  decisionDeploymentNames,
   deleteEvaluator,
+  deploymentModelType,
+  deploymentServesAny,
   getAgents,
   getDeployments,
   getEvaluatorTemplates,
+  getStore,
   listEvaluationResults,
   listEvaluators,
+  modelPickerOptions,
   selectableDeployments,
   updateEvaluator,
   type AgentView,
   type DeploymentRecord,
+  type StoreEntry,
   type EvaluationResult,
   type EvaluatorJudge,
   type EvaluatorQuestion,
@@ -172,6 +178,7 @@ export function Evaluators({ active = true }: { active?: boolean }) {
   const templates = useAsync("evaluator-templates", getEvaluatorTemplates);
   const agents = useAsync<AgentView[]>("agents", getAgents);
   const deployments = useAsync<DeploymentRecord[]>("deployments", getDeployments);
+  const store = useAsync<StoreEntry[]>("store", getStore);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [showGallery, setShowGallery] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -276,6 +283,7 @@ export function Evaluators({ active = true }: { active?: boolean }) {
           draft={draft}
           agents={(agents.data ?? []).filter((a) => a.kind !== "proxy_security")}
           deployments={selectableDeployments(deployments.data ?? [])}
+          store={store.data}
           onClose={() => setDraft(null)}
           onSaved={() => {
             setDraft(null);
@@ -486,12 +494,14 @@ function EditorDialog({
   draft: initial,
   agents,
   deployments,
+  store,
   onClose,
   onSaved,
 }: {
   draft: Draft;
   agents: AgentView[];
   deployments: DeploymentRecord[];
+  store?: StoreEntry[] | null;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -499,7 +509,21 @@ function EditorDialog({
   const [d, setD] = useState<Draft>(initial);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const modelNames = deployments.map((x) => x.spec?.name ?? "").filter(Boolean);
+  // A decision judge must be a decision model (others answer 501); an LLM
+  // judge must be a chat model.
+  const modelOptions = useMemo(() => {
+    const decision = decisionDeploymentNames(store);
+    const judges = deployments.filter((x) =>
+      d.judge === "decision"
+        ? deploymentServesAny(x, decision)
+        : !deploymentServesAny(x, decision) && deploymentModelType(x) === "chat",
+    );
+    const options = modelPickerOptions(judges);
+    if (d.model && !options.some((o) => o.value === d.model)) {
+      options.unshift({ value: d.model, label: d.model });
+    }
+    return options;
+  }, [deployments, store, d.judge, d.model]);
 
   function patch(p: Partial<Draft>) {
     setD((cur) => ({ ...cur, ...p }));
@@ -581,9 +605,9 @@ function EditorDialog({
         >
           <Select value={d.model} onChange={(e) => patch({ model: e.target.value })}>
             <option value="">Select a deployment…</option>
-            {modelNames.map((n) => (
-              <option key={n} value={n}>
-                {n}
+            {modelOptions.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
               </option>
             ))}
           </Select>

@@ -8,6 +8,7 @@ operations API.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import re
@@ -20,7 +21,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence, Se
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ParamSpec, Protocol, TypeVar, cast
 
 from docie_bench.serving.resources import DEFAULT_DEPLOY_CONTEXT_LENGTH
 
@@ -74,6 +75,25 @@ def reachable_launch(
 # Advertise hosts that are same-host by construction: a deploy on this node is
 # always reachable at these, so the round-robin guard never applies to them.
 _LOOPBACK_ADVERTISE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+#: Serializes deploys in this serving process (Inngest deploy jobs and
+#: desired-state starts); a separate `docie-serving up` process is not covered.
+#: A deploy never checks RAM fit against another in flight, and free RAM does
+#: not drop until the spawned model loads, so two at once can overcommit the
+#: host. Process-local on purpose: deploys on other nodes are not held up.
+_DEPLOY_LOCK = threading.RLock()
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _serialized_deploy(method: Callable[_P, _R]) -> Callable[_P, _R]:
+    @functools.wraps(method)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with _DEPLOY_LOCK:
+            return method(*args, **kwargs)
+
+    return wrapper
 
 # Bound on the reallocate-on-bind-collision loop in serve_store_model. Keeps a
 # genuinely wedged host from spinning through the whole range × restarts; each
@@ -921,9 +941,23 @@ class _DefaultSupervisor:
         # Accumulating them keeps reallocation deterministic and prober-independent.
         tried: set[int] = set()
         record: Any = None
+        # A redeploy of an existing record keeps its own port first. Its process
+        # still holds that port, so the allocator's socket probe would move it,
+        # and a moved port is a changed launch: a retried or repeated deploy of a
+        # loaded model would restart it instead of being a no-op.
+        own_port = next(
+            (
+                r.spec.launch.port
+                for r in self.backend.list()
+                if exclude_name is not None and r.spec.name == exclude_name
+            ),
+            None,
+        )
         for _attempt in range(_MAX_PORT_ALLOC_ATTEMPTS):
             if port_override is not None:
                 chosen = port_override
+            elif own_port is not None and own_port not in tried:
+                chosen = own_port
             else:
                 reserved = self._reserved_ports(exclude_name=exclude_name) | tried
                 chosen = allocator.allocate(bind_host=bind_host, reserved=reserved)
@@ -945,6 +979,7 @@ class _DefaultSupervisor:
             # reachable_launch so the advertised endpoint reflects the new port.
         return record
 
+    @_serialized_deploy
     def serve(
         self,
         model: str,
@@ -1059,6 +1094,7 @@ class _DefaultSupervisor:
             port_override=None,
         )
 
+    @_serialized_deploy
     def serve_store_model(
         self,
         name: str,

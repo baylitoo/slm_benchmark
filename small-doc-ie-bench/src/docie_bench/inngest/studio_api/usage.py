@@ -24,7 +24,7 @@ async def usage_summary_route(
     DATABASE_URL degrades to an empty listing, same contract as every other
     Studio listing route (``GET /seeds``/``GET /batches``/etc).
     """
-    from docie_bench.studio.usage_store import WINDOW_HOURS, usage_summary
+    from docie_bench.studio.usage_store import WINDOW_HOURS, usage_by_node, usage_summary
 
     hours = WINDOW_HOURS.get(window)
     if hours is None:
@@ -35,4 +35,5 @@ async def usage_summary_route(
     return {
         "window": window,
         "deployments": usage_summary(tenant_id=tenant.tenant_id, window_hours=hours),
+        "nodes": usage_by_node(tenant_id=tenant.tenant_id, window_hours=hours),
     }

@@ -124,6 +124,8 @@ export interface ObservedPlacement {
    * measurement), "wall-clock" (timed by the caller), "not-applicable" (a
    * deployment that generates no tokens), "unmeasured". */
   throughput_source?: string | null;
+  /** Last request served, from any machine (ISO). */
+  last_served_at?: string | null;
   [k: string]: unknown;
 }
 
@@ -182,7 +184,22 @@ export interface DeploymentRecord {
   /** False when the owning node's snapshot has gone stale. The deployment is
    * still listed rather than hidden: unreachable is not the same as gone. */
   node_reporting?: boolean;
+  /** True when an operator drained the owning node: routing skips it. */
+  node_drained?: boolean;
+  /** The newest lifecycle action queued for the owning node (fleet only). */
+  node_request?: NodeRequest | null;
   [k: string]: unknown;
+}
+
+/** A lifecycle action the owning node runs on its next cycle (#590). */
+export interface NodeRequest {
+  id: string;
+  node_id: string;
+  verb: string;
+  status: "pending" | "done" | "failed" | "expired";
+  error?: string | null;
+  created_at?: string | null;
+  finished_at?: string | null;
 }
 
 /** Response of the lifecycle action endpoints (load/unload/pin/delete). */

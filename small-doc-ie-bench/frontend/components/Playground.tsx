@@ -37,6 +37,7 @@ import {
   rerank,
   decide,
   decisionDeploymentNames,
+  deploymentServesAny,
   embeddingDeploymentNames,
   rerankerDeploymentNames,
   structuringDeploymentNames,
@@ -147,11 +148,11 @@ export function Playground({
       selectableDeployments(deployments.data ?? []).filter(
         (d) =>
           (d.spec?.launch?.runtime !== "encoder" ||
-            Boolean(d.spec?.name && structuringNames.has(d.spec.name))) &&
+            deploymentServesAny(d, structuringNames)) &&
           d.spec?.launch?.runtime !== "dense_embedding" &&
-          !(d.spec?.name && embeddingNames.has(d.spec.name)) &&
+          !deploymentServesAny(d, embeddingNames) &&
           // Decision models only answer /v1/systemone (Decide mode).
-          !(d.spec?.name && decisionNames.has(d.spec.name)),
+          !deploymentServesAny(d, decisionNames),
       ),
     [deployments.data, embeddingNames, structuringNames, decisionNames],
   );
@@ -378,7 +379,10 @@ export function ChatPanel({
   }, [chatNames, liveNames, model]);
 
   const visionNames = useMemo(() => visionDeploymentNames(store.data), [store.data]);
-  const modelHasVision = visionNames.has(model);
+  const modelHasVision = useMemo(() => {
+    const rec = selectable.find((d) => d.spec?.name === model);
+    return rec ? deploymentServesAny(rec, visionNames) : visionNames.has(model);
+  }, [selectable, model, visionNames]);
   // Explicit toggle, not implicit-forever: an image/PDF attachment only
   // rides the message as image_url content when this is on. Defaults to
   // following the deployment's own capability (vision model -> on), but the
@@ -2527,7 +2531,7 @@ export function EmbedRerankPanel({
     () =>
       selectableDeployments(deployments).filter(
         (d) => d.spec?.name && (
-          activeNames.has(d.spec.name) ||
+          deploymentServesAny(d, activeNames) ||
           (subMode === "embed" && d.spec.launch?.runtime === "dense_embedding")
         ),
       ),
@@ -2923,8 +2927,9 @@ export function DecidePanel({
   const names = useMemo(
     () =>
       selectableDeployments(deployments)
+        .filter((d) => deploymentServesAny(d, decisionNames))
         .map((d) => d.spec?.name ?? "")
-        .filter((n) => n && decisionNames.has(n)),
+        .filter(Boolean),
     [deployments, decisionNames],
   );
   const [model, setModel] = useState("");

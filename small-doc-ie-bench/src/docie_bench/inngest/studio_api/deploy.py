@@ -503,6 +503,13 @@ def _auto_place_deploy(
     )
 
 
+def _is_fleet(model: str) -> bool:
+    from docie_bench.inngest.fleet_scale import read_fleet_view
+
+    view = read_fleet_view(model)
+    return view is not None and view.is_fleet
+
+
 @router.post("/deploy", response_model=_shared.TriggerResponse)
 async def trigger_deploy(
     payload: DeployRequest, tenant: TenantDependency
@@ -523,6 +530,9 @@ async def trigger_deploy(
         return _target_node_deploy(payload, tenant)
     if payload.replicas > 1:
         return await _trigger_replicated_deploy(payload, tenant)
+    if not payload.runtime and _is_fleet(payload.model):
+        # An untargeted event on a fleet lands on whichever node Inngest picks.
+        return _auto_place_deploy(payload, tenant)
     channel = f"deploy:{uuid.uuid4().hex}"
     data: dict[str, Any] = payload.model_dump(exclude_none=True)
     data["channel"] = channel

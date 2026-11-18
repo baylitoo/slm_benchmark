@@ -308,3 +308,16 @@ def test_an_idle_evicted_remote_record_is_offered_as_reloadable(serving_home: Pa
 
     assert by_name["evicted-remote"]["activation"] == "managed"
     assert by_name["stopped-remote"]["activation"] is None
+
+
+def test_a_remote_record_shows_its_port_and_last_use(serving_home: Path) -> None:
+    import datetime as dt
+
+    _seed_local(serving_home)
+    _place(REMOTE, node_id="node-b")
+    ModelCatalog().touch_served(REMOTE, dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.UTC))
+
+    by_name = {str((r.get("spec") or {}).get("name")): r for r in _listing()}
+
+    assert by_name[REMOTE]["spec"]["launch"]["port"] == 8088
+    assert by_name[REMOTE]["observed"]["last_served_at"].startswith("2026-11-17T12:00")

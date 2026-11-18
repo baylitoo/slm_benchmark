@@ -9,8 +9,6 @@ import {
   Pin,
   PinOff,
   Pencil,
-  Power,
-  PowerOff,
   RefreshCw,
   Trash2,
 } from "lucide-react";
@@ -38,7 +36,7 @@ import { cn } from "@/lib/cn";
 import { T } from "@/lib/i18n";
 import { toUserMessage } from "@/lib/errors";
 import { useToast } from "../Toast";
-import { Alert, Badge, Button, Card, Dialog, Field, Segmented, TextInput } from "../ui";
+import { Alert, Badge, Button, Card, Dialog, Field, Segmented, Select, TextInput } from "../ui";
 import { LiveIndicator } from "../LiveIndicator";
 import { Toolbar } from "../patterns/Toolbar";
 import { ResultLine } from "../patterns/ResultLine";
@@ -187,6 +185,27 @@ function Dash({ title }: { title: string }) {
   return (
     <span className="text-muted-foreground" title={title}>
       —
+    </span>
+  );
+}
+
+/** Last request served, in ms since epoch: the node's own record or the
+ * catalog stamp written by whichever machine routed the request. */
+function lastUsedMs(record: DeploymentRecord): number {
+  const own = typeof record.last_served === "number" ? record.last_served * 1000 : 0;
+  const stamped = record.observed?.last_served_at
+    ? Date.parse(record.observed.last_served_at)
+    : 0;
+  return Math.max(own, Number.isFinite(stamped) ? stamped : 0);
+}
+
+function LastUsedCell({ record }: { record: DeploymentRecord }) {
+  const ms = lastUsedMs(record);
+  if (!ms) return <Dash title="No request served since it was deployed." />;
+  const age = elapsedSince(new Date(ms).toISOString());
+  return (
+    <span className="text-xs text-muted-foreground" title={new Date(ms).toLocaleString()}>
+      {age ? `${age.label} ago` : "just now"}
     </span>
   );
 }
@@ -415,6 +434,7 @@ export function DeploymentsView({
   const [typeFilter, setTypeFilter] = useState<
     "all" | "chat" | "encoder" | "embedding" | "reranker" | "decision"
   >("all");
+  const [nodeFilter, setNodeFilter] = useState("all");
   const decisionNames = useMemo(() => decisionDeploymentNames(store.data), [store.data]);
   // Which row's runtime log is expanded (click a row to see WHY it failed).
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -490,16 +510,20 @@ export function DeploymentsView({
     }
     setBusy(`${name}:${action}`);
     try {
-      let detail: string | null = null;
-      if (action === "load" || action === "unload") {
-        // A remote load or unload answers with no channel and a sentence
-        // describing what was recorded for which node. Reporting a bare
-        // "requested" would read as "done".
-        const res = await (action === "load" ? loadDeployment(name) : unloadDeployment(name));
-        detail = res.channel === null ? (res.detail ?? null) : null;
-      } else if (action === "delete") await deleteDeployment(name);
-      else if (action === "repair") await repairDeployment(name, port ?? null);
-      else await pinDeployment(name, action === "pin");
+      // On a fleet an action is queued for the owning node and answers with
+      // no channel and a sentence naming that node. Reporting a bare
+      // "requested" would read as "done".
+      const res =
+        action === "load"
+          ? await loadDeployment(name)
+          : action === "unload"
+            ? await unloadDeployment(name)
+            : action === "delete"
+              ? await deleteDeployment(name)
+              : action === "repair"
+                ? await repairDeployment(name, port ?? null)
+                : await pinDeployment(name, action === "pin");
+      const detail = res?.channel === null ? (res.detail ?? null) : null;
       toast({
         title:
           action === "load"
@@ -534,7 +558,8 @@ export function DeploymentsView({
   const total = all.length;
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    return all.filter((r) => {
+    const rows = all.filter((r) => {
+      if (nodeFilter !== "all" && (r.node_id ?? "") !== nodeFilter) return false;
       if (
         typeFilter !== "all" &&
         deploymentModelType(r, embeddingNames, rerankerNames, decisionNames) !== typeFilter
@@ -547,7 +572,12 @@ export function DeploymentsView({
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [all, filter, typeFilter, embeddingNames, rerankerNames, decisionNames]);
+    // Most recently used first, so the models people actually use sit on page 1.
+    return rows.sort(
+      (a, b) =>
+        lastUsedMs(b) - lastUsedMs(a) || (a.spec?.name ?? "").localeCompare(b.spec?.name ?? ""),
+    );
+  }, [all, filter, typeFilter, nodeFilter, embeddingNames, rerankerNames, decisionNames]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const clampedPage = Math.min(page, pageCount);
@@ -712,6 +742,12 @@ export function DeploymentsView({
       render: (r) => <PhaseChip record={r} />,
     },
     {
+      key: "last_used",
+      header: "Last used",
+      sortAccessor: (r) => lastUsedMs(r),
+      render: (r) => <LastUsedCell record={r} />,
+    },
+    {
       key: "speed",
       header: "Speed",
       sortAccessor: (r) => r.observed?.tokens_per_second ?? -1,
@@ -724,55 +760,6 @@ export function DeploymentsView({
       render: (r) => {
         const name = r.spec?.name;
         if (!name) return null;
-        // A catalog projection: the owning node holds the deployments.json
-        // record and every mutation below needs it. The API does answer 409
-        // naming that node, but refusing here beats a toast after the click —
-        // and on a single node no row is ever a projection, so nothing changes.
-        if (r.record_source === "catalog") {
-          // A catalog projection: this process holds no local record, so the
-          // actions that need one cannot run here. Load and unload are the
-          // exceptions: both are expressible as desired state, the one channel
-          // that can be aimed at a node. Delete, pin and repair are not yet
-          // (#590), so they stay off the row rather than offering a 409.
-          const remotePhase = derivePhase(r);
-          const remoteRunning = remotePhase === "hot" || remotePhase === "loading";
-          const remoteAction = remoteRunning ? "unload" : "load";
-          return (
-            <div
-              className="flex items-center justify-end gap-2"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <span
-                className="text-xs text-muted-foreground"
-                title={
-                  `Runs on serving node ${r.node_id ?? "unknown"}. This process has no ` +
-                  `local record for it, so delete, pin and repair must run on ` +
-                  `that node.`
-                }
-              >
-                on {r.node_id ?? "another node"}
-              </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                loading={busy === `${name}:${remoteAction}`}
-                disabled={busy !== null}
-                aria-label={remoteRunning ? "Unload" : "Load"}
-                title={
-                  `${remoteRunning ? "Unload" : "Load"} on ${r.node_id ?? "its node"}: ` +
-                  `recorded as desired state, which that node converges on its own cycle.`
-                }
-                onClick={() => act(name, remoteAction)}
-              >
-                {remoteRunning ? (
-                  <PowerOff className="h-3.5 w-3.5" />
-                ) : (
-                  <Power className="h-3.5 w-3.5" />
-                )}
-              </Button>
-            </div>
-          );
-        }
         const phase = derivePhase(r);
         const running = phase === "hot" || phase === "loading";
         const transitioning =
@@ -841,9 +828,10 @@ export function DeploymentsView({
         onReset={() => {
           setFilter("");
           setTypeFilter("all");
+          setNodeFilter("all");
           setPage(1);
         }}
-        resetDisabled={filter === "" && typeFilter === "all"}
+        resetDisabled={filter === "" && typeFilter === "all" && nodeFilter === "all"}
       >
         <TextInput
           value={filter}
@@ -869,6 +857,24 @@ export function DeploymentsView({
             { value: "decision", label: "Decision" },
           ]}
         />
+        {showNode && (
+          <Select
+            aria-label="Node"
+            value={nodeFilter}
+            onChange={(e) => {
+              setNodeFilter(e.target.value);
+              setPage(1);
+            }}
+            className="h-8 w-44 text-xs"
+          >
+            <option value="all">All nodes</option>
+            {[...nodeIds].sort().map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </Select>
+        )}
         <div className="ml-auto">
           <LiveIndicator
             live={deployments.live}
@@ -1198,8 +1204,8 @@ function NodeCell({ record }: { record: DeploymentRecord }) {
       </span>
     );
   }
-  const projection = record.record_source === "catalog";
   const silent = record.node_reporting === false;
+  const request = record.node_request;
   return (
     <span className="inline-flex items-center gap-1.5">
       <span className="font-mono text-[11px]">{nodeId}</span>
@@ -1208,9 +1214,16 @@ function NodeCell({ record }: { record: DeploymentRecord }) {
           <Badge tone="err">unreachable</Badge>
         </span>
       )}
-      {projection && (
-        <span title="Projected from the catalog — this process has no local record, so lifecycle actions must run on the owning node">
-          <Badge tone="neutral">remote</Badge>
+      {request?.status === "pending" && (
+        <span title={`Queued for ${nodeId}; it runs on that node's next cycle.`}>
+          <Badge tone="warn">{request.verb} pending</Badge>
+        </span>
+      )}
+      {(request?.status === "failed" || request?.status === "expired") && (
+        <span title={request.error ?? undefined}>
+          <Badge tone="err">
+            {request.verb} {request.status}
+          </Badge>
         </span>
       )}
     </span>

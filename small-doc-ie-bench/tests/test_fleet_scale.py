@@ -205,3 +205,25 @@ def test_replicas_placed_on_the_fleet_keep_the_deploys_launch_settings(
         (row,) = _desired(node)
         assert row["spec"]["max_tokens"] == 512
         assert row["spec"]["cpu_threads"] == 6
+
+
+def test_load_on_demand_of_a_never_deployed_model_places_one_replica(
+    fleet: list[Any],
+) -> None:
+    """A first chat/upload request on a fleet must not send an untargeted
+    deploy event, and a second request before it converges reuses the replica."""
+    from docie_bench.inngest.serving_api import trigger_deployment_load
+
+    _node("rocky-llm")
+    _node("gpu-box")
+
+    first = asyncio.run(trigger_deployment_load(MODEL))
+    second = asyncio.run(trigger_deployment_load(MODEL))
+
+    assert fleet == []
+    assert first is not None
+    assert second is not None
+    assert first[0] == second[0]
+    assert first[0].startswith(f"{MODEL}-")
+    rows = _desired("rocky-llm") + _desired("gpu-box")
+    assert [row["name"] for row in rows] == [first[0]]

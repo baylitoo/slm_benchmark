@@ -165,7 +165,40 @@ def _build_reconciler(instance_id: str) -> Any:
         loader=control_plane.supervisor.load,
         # Seed leftovers live on this node's volume (#664 B7).
         seed_gc=gc_seed_leftovers,
+        request_executor=_node_request_executor(control_plane),
     )
+
+
+def _node_request_executor(control_plane: Any) -> Callable[[str, str, dict[str, Any]], object]:
+    """Run a queued lifecycle request on this node (#590), through the same
+    synchronous supervisor calls the event handlers reach. Idempotent per
+    verb: a delete of a deployment that is already gone succeeds."""
+
+    def execute(verb: str, name: str, args: dict[str, Any]) -> object:
+        supervisor = control_plane.supervisor
+        if verb == "load":
+            return supervisor.load(name)
+        if verb == "unload":
+            return supervisor.unload(name)
+        if verb in ("pin", "unpin"):
+            return supervisor.pin(name, pinned=verb == "pin")
+        if verb == "repair":
+            port = args.get("port")
+            return supervisor.repair(name, port=port if isinstance(port, int) else None)
+        if verb == "reconfigure":
+            return supervisor.reconfigure(
+                name,
+                context_length=int(args["context_length"]),
+                max_tokens=args.get("max_tokens"),
+            )
+        if verb == "delete":
+            try:
+                return supervisor.remove(name)
+            except KeyError:
+                return None
+        raise ValueError(f"unknown node request verb {verb!r}")
+
+    return execute
 
 
 def _desired_state_deployer(control_plane: Any) -> Callable[[str, dict[str, Any]], object]:

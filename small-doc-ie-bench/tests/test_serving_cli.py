@@ -384,3 +384,39 @@ def test_fleet_resume_posts_and_says_nothing_about_waiting(
 
     assert result.exit_code == 0
     assert fleet_api["posts"][0][0].endswith("/v1/serving/nodes/node-a/resume")
+
+
+def test_up_mints_the_record_name_when_the_catalog_knows_another_node(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two nodes recording ``nuextract3`` would share one placement row."""
+    import docie_bench.storage.db as db
+    from docie_bench.serving.catalog import ModelCatalog
+    from docie_bench.serving.node_identity import resolve_node_id
+    from docie_bench.settings import get_settings
+
+    monkeypatch.setenv("DOCIE_SERVING_HOME", str(tmp_path / "serving"))
+    monkeypatch.setenv("DOCIE_SERVING_NODE_ID", "rocky-llm")
+    get_settings.cache_clear()
+    resolve_node_id.cache_clear()
+    db.dispose_engine()
+    db.init_engine(f"sqlite:///{tmp_path / 'catalog.db'}")
+    try:
+        ModelCatalog().publish_node_snapshot(
+            node_id="gpu-box",
+            total_bytes=8 * 1024**3,
+            free_bytes=6 * 1024**3,
+            source="cgroup",
+            sum_rss_bytes=0,
+        )
+        plane = FakePlane()
+        result = runner.invoke(create_app(plane), ["up", "nuextract3"])
+    finally:
+        db.dispose_engine()
+        get_settings.cache_clear()
+        resolve_node_id.cache_clear()
+
+    assert result.exit_code == 0, result.output
+    (call,) = plane.calls
+    assert call[1] == "nuextract3"
+    assert str(call[2]["deployment_name"]).startswith("nuextract3-")

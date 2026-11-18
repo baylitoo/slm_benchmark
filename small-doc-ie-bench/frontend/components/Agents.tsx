@@ -35,6 +35,8 @@ import {
   deleteAgent,
   deployModel,
   deploymentModelType,
+  deploymentServedModel,
+  deploymentServesAny,
   fileToBase64,
   getAgents,
   getAgentTemplates,
@@ -700,25 +702,30 @@ export function CreateView({
     () => new Map(chatPicker.map((o) => [o.value, o.label])),
     [chatPicker],
   );
-  const encoderDeployments = useMemo(
-    () =>
-      (deployments.data ?? [])
-        .filter((d) => deploymentModelType(d) === "encoder" && !!d.spec?.name)
-        .map((d) => ({
-          name: d.spec?.name as string,
-          live: isLiveDeployment(d),
-        })),
-    [deployments.data],
-  );
+  const encoderDeployments = useMemo(() => {
+    const records = (deployments.data ?? []).filter(
+      (d) => deploymentModelType(d) === "encoder" && !!d.spec?.name,
+    );
+    return modelPickerOptions(records).map((o) => {
+      // A model-level option is offered only while a replica is live.
+      const record = records.find((r) => r.spec?.name === o.value);
+      return { ...o, live: record ? isLiveDeployment(record) : true };
+    });
+  }, [deployments.data]);
   // Analyzer models SEEDED into the store but not yet deployed — offered as
   // one-click "Deploy" shortcuts (store path, no hardcoded repo, no
   // download-at-boot). Generic: whatever analyzer entries the store holds.
   const seededUndeployedEncoders = useMemo(() => {
-    const deployed = new Set(encoderDeployments.map((d) => d.name));
+    // By served model: a node-placed encoder's record name is minted.
+    const deployed = new Set(
+      (deployments.data ?? [])
+        .filter((d) => deploymentModelType(d) === "encoder")
+        .map(deploymentServedModel),
+    );
     return (store.data ?? [])
       .filter((e) => e.analyzer && !deployed.has(e.name))
       .map((e) => e.name);
-  }, [store.data, encoderDeployments]);
+  }, [store.data, deployments.data]);
 
   const [templateId, setTemplateId] = useState(prefill?.id ?? "custom");
   const [name, setName] = useState("");
@@ -744,8 +751,10 @@ export function CreateView({
   async function deploySeededEncoder(storeName: string) {
     setDeployingGuard(true);
     try {
-      await deployModel({ model: storeName, name: storeName });
-      setGuardModel(storeName);
+      // No fixed name: on a fleet the record name is minted per node, so the
+      // guard names the model and resolves to whichever replica is live.
+      await deployModel({ model: storeName });
+      setGuardModel(`store:${storeName}`);
       toast({
         title: "Encoder deploy started",
         description: `${storeName} — follow progress under Deployments.`,
@@ -871,12 +880,15 @@ export function CreateView({
 
   // Vision deployments (store family flagged vision) — the model picker for the
   // vision→structured stage.
-  const visionModels = useMemo(() => {
+  const visionPicker = useMemo(() => {
     const visionSet = visionDeploymentNames(store.data);
-    return selectableDeployments(deployments.data ?? [])
-      .map((d) => d.spec?.name)
-      .filter((n): n is string => !!n && visionSet.has(n));
+    return modelPickerOptions(
+      selectableDeployments(deployments.data ?? []).filter((d) =>
+        deploymentServesAny(d, visionSet),
+      ),
+    );
   }, [deployments.data, store.data]);
+  const visionModels = useMemo(() => visionPicker.map((o) => o.value), [visionPicker]);
   // Saved routing policies — a policy can BE the OCR→extract step's extractor
   // (options.extractor = "policy:<name>"), running its confidence-gated
   // cascade instead of a single model. Shared SWR key with Benchmark/Playground.
@@ -1250,9 +1262,13 @@ export function CreateView({
                     onChange={(e) => setGuardModel(e.target.value)}
                   >
                     <option value="">None — regex analyzer</option>
+                    {guardModel.startsWith("store:") &&
+                      !encoderDeployments.some((d) => d.value === guardModel) && (
+                        <option value={guardModel}>{`${guardModel.slice("store:".length)} · any live replica`}</option>
+                      )}
                     {encoderDeployments.map((d) => (
-                      <option key={d.name} value={d.name}>
-                        {d.name}
+                      <option key={d.value} value={d.value}>
+                        {d.label}
                         {d.live ? "" : " · not live — Load it in Deployments"}
                       </option>
                     ))}
@@ -1408,9 +1424,9 @@ export function CreateView({
                       onChange={(e) => setVisionModel(e.target.value)}
                     >
                       <option value="">Select a vision model…</option>
-                      {visionModels.map((n) => (
-                        <option key={n} value={n}>
-                          {n}
+                      {visionPicker.map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
                         </option>
                       ))}
                     </Select>
@@ -1505,9 +1521,9 @@ export function CreateView({
                         </optgroup>
                         {ocrMode === "ocr_extract" && visionModels.length > 0 && (
                           <optgroup label="Vision model (VLM as OCR)">
-                            {visionModels.map((n) => (
-                              <option key={n} value={n}>
-                                {n} — transcribe with this VLM
+                            {visionPicker.map((o) => (
+                              <option key={o.value} value={o.value}>
+                                {o.label} — transcribe with this VLM
                               </option>
                             ))}
                           </optgroup>

@@ -18,6 +18,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
+from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -176,6 +177,8 @@ class ModelPlacement(Base):
     context_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     timeout_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Mirror of the owner's pin, so a row read from another node shows it.
+    pinned: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -284,6 +287,50 @@ class ServingNode(Base):
     budget_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     budget_stale: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class NodeRequest(Base):
+    """A one-shot lifecycle action for the node that owns a deployment.
+
+    Lifecycle events reach whichever serving node Inngest picks, so on a fleet
+    they cannot be aimed. A request row is: the owning node's reconciler runs
+    its own ``pending`` rows each cycle and records the outcome. A request,
+    not a state: a pin or a setting written as standing state would be undone
+    by an unrelated desired-state write.
+    """
+
+    __tablename__ = "serving_node_request"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    deployment: Mapped[str] = mapped_column(String(200), index=True)
+    verb: Mapped[str] = mapped_column(String(16))
+    args: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(16), index=True, default="pending")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+NODE_REQUEST_VERBS = frozenset(
+    {"load", "unload", "pin", "unpin", "repair", "reconfigure", "delete"}
+)
+
+
+def _node_request_view(row: NodeRequest) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "node_id": row.node_id,
+        "deployment": row.deployment,
+        "verb": row.verb,
+        "args": json.loads(row.args or "{}"),
+        "status": row.status,
+        "error": row.error,
+        "created_at": isoformat(row.created_at),
+        "finished_at": isoformat(row.finished_at),
+    }
 
 
 class ServingDesiredDeployment(Base):
@@ -544,6 +591,7 @@ _OBSERVED_COLUMNS: tuple[tuple[str, TypeEngine[Any]], ...] = (
     ("context_length", Integer()),
     ("max_tokens", Integer()),
     ("timeout_seconds", Float()),
+    ("pinned", Boolean()),
 )
 
 
@@ -736,6 +784,8 @@ def _placement_view(row: ModelPlacement) -> dict[str, Any]:
         "context_length": row.context_length,
         "max_tokens": row.max_tokens,
         "timeout_seconds": row.timeout_seconds,
+        "pinned": row.pinned,
+        "last_served_at": isoformat(row.last_served_at),
         "created_at": isoformat(row.created_at),
         "updated_at": isoformat(row.updated_at),
     }
@@ -1169,6 +1219,7 @@ class ModelCatalog:
         context_length: int | None = None,
         max_tokens: int | None = None,
         timeout_seconds: float | None = None,
+        pinned: bool | None = None,
     ) -> dict[str, Any]:
         """Publish one reconciler observation (the reconciler is the sole caller).
 
@@ -1236,6 +1287,7 @@ class ModelCatalog:
             row.context_length = context_length
             row.max_tokens = max_tokens
             row.timeout_seconds = timeout_seconds
+            row.pinned = pinned
             session.flush()
             return _placement_view(row)
 
@@ -1677,6 +1729,93 @@ class ModelCatalog:
             result[str(name)] = served.timestamp()
         return result
 
+    # ------------------------------------------------ node requests (#590)
+    def enqueue_node_request(
+        self, node_id: str, deployment: str, verb: str, args: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Queue one lifecycle action for ``node_id`` to run on its next cycle."""
+        if verb not in NODE_REQUEST_VERBS:
+            raise ValueError(f"unknown node request verb {verb!r}")
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = NodeRequest(
+                id=uuid4().hex,
+                node_id=node_id,
+                deployment=deployment,
+                verb=verb,
+                args=json.dumps(args or {}),
+                status="pending",
+                created_at=_utcnow(),
+            )
+            session.add(row)
+            session.flush()
+            return _node_request_view(row)
+
+    def pending_node_requests(self, node_id: str) -> Sequence[dict[str, Any]]:
+        """This node's pending requests, oldest first."""
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            rows = session.scalars(
+                select(NodeRequest)
+                .where(NodeRequest.node_id == node_id, NodeRequest.status == "pending")
+                .order_by(NodeRequest.created_at)
+            ).all()
+            return [_node_request_view(row) for row in rows]
+
+    def finish_node_request(self, request_id: str, *, error: str | None = None) -> None:
+        """Mark a request ``done``, or ``failed`` with its error."""
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            row = session.get(NodeRequest, request_id)
+            if row is None:
+                return
+            row.status = "failed" if error else "done"
+            row.error = error
+            row.finished_at = _utcnow()
+
+    def expire_node_requests(self, max_age_s: float) -> int:
+        """Requests no node picked up in time become ``expired``: a silent
+        node, or one running a build that does not read them, shows as such
+        instead of leaving the request pending forever."""
+        cutoff = _utcnow() - dt.timedelta(seconds=max_age_s)
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            result = session.execute(
+                update(NodeRequest)
+                .where(NodeRequest.status == "pending", NodeRequest.created_at < cutoff)
+                .values(
+                    status="expired",
+                    error="the owning node did not pick this request up",
+                    finished_at=_utcnow(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            return int(getattr(result, "rowcount", 0) or 0)
+
+    def latest_node_requests(
+        self, deployments: Sequence[str], *, within_s: float = 3600.0
+    ) -> dict[str, dict[str, Any]]:
+        """The newest request per deployment from the last ``within_s``."""
+        if not deployments:
+            return {}
+        cutoff = _utcnow() - dt.timedelta(seconds=within_s)
+        with session_scope() as session:
+            if session is None:
+                raise CatalogUnavailableError("DATABASE_URL is not configured")
+            rows = session.scalars(
+                select(NodeRequest)
+                .where(
+                    NodeRequest.deployment.in_(list(deployments)),
+                    NodeRequest.created_at >= cutoff,
+                )
+                .order_by(NodeRequest.created_at)
+            ).all()
+            return {row.deployment: _node_request_view(row) for row in rows}
+
     def get_placement(self, name: str) -> dict[str, Any] | None:
         """Placement by deployment ``name`` (the table's primary key)."""
         with session_scope() as session:
@@ -1766,6 +1905,12 @@ class ModelCatalog:
         # shadows the builtin for any bare `list[...]` annotation appearing
         # after it (a pre-existing mypy false-positive on
         # list_placements_for_model, left as-is; not reproducing it here).
+        from docie_bench.serving.node_liveness import stale_node_ids
+        from docie_bench.serving.placement_resolver import _drained_node_ids
+
+        snapshots = list(self.list_node_snapshots())
+        # A replica routing will not use is not live here either.
+        unusable = stale_node_ids(snapshots) | _drained_node_ids(snapshots)
         with session_scope() as session:
             if session is None:
                 raise CatalogUnavailableError("DATABASE_URL is not configured")
@@ -1787,7 +1932,11 @@ class ModelCatalog:
                 if placement.model_name is None:
                     continue
                 total_counts[placement.model_name] = total_counts.get(placement.model_name, 0) + 1
-                if placement.state == "ready" and (placement.endpoint or "").strip():
+                if (
+                    placement.state == "ready"
+                    and (placement.endpoint or "").strip()
+                    and (placement.node_id or "") not in unusable
+                ):
                     live_counts[placement.model_name] = live_counts.get(placement.model_name, 0) + 1
             return [
                 {
