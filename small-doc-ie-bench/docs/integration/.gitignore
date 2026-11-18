@@ -1,0 +1,8 @@
+# LaTeX build artifacts. The .tex source is the deliverable; the PDF is
+# generated (see README.md) and regenerating it is one command.
+*.pdf
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
