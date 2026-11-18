@@ -96,6 +96,101 @@ AGENT_TEMPLATES: list[dict[str, Any]] = [
             "options": {"mcp_servers": ["docs-search"], "mcp_tools": None},
         },
     },
+    # --- Low-latency (encoder-family) templates -------------------------
+    #
+    # These three exist to make the encoder models usable without reading the
+    # architecture docs first. All of them run a DeBERTa-class encoder
+    # (0.2-0.4B) on CPU in tens of milliseconds, which is a different
+    # operating point from a generative SLM: no tokens are generated, so
+    # latency does not scale with how much you ask for.
+    #
+    # The shared limitation is worth stating once: an encoder extractor COPIES
+    # SPANS. It cannot compute a total, normalise "le 12 mars 2019" into a
+    # date, or infer a value that is not written down. Fields like those need
+    # a generative model, which is why the first template keeps the extractor
+    # slot overridable rather than pretending one model covers everything.
+    {
+        "id": "low-latency-extraction",
+        "kind": "ocr",
+        "display_name": "Low-latency Extraction",
+        "description": (
+            "OCR plus an encoder extractor (GLiFormer / GLiNER2), end to end "
+            "on CPU in tens of milliseconds. Point `extractor` at a deployed "
+            "encoder and `schema` at the document type; the schema's field "
+            "names become the labels the model fills from spans it finds. "
+            "Because every value is a span, the evidence offsets are exact "
+            "rather than fuzzy-matched after the fact, which is what the "
+            "Review tab needs. Use it for fields written verbatim on the "
+            "page -- numbers, dates as printed, names, line items. Computed "
+            "or normalised fields (a total that must be summed, a date that "
+            "must be reformatted) need a generative extractor instead."
+        ),
+        "defaults": {
+            "system_prompt": None,
+            "options": {
+                "backend": "tesseract",
+                "language": None,
+                # A deployed encoder, e.g. a `docie encoder` GLiFormer
+                # deployment. Empty so the create form makes you choose one
+                # that actually exists on this node.
+                "extractor": "",
+                "schema": "invoice",
+            },
+        },
+    },
+    {
+        "id": "document-triage",
+        "kind": "custom",
+        "display_name": "Document Triage",
+        "description": (
+            "Zero-shot multi-label classification on a deployed GLiClass "
+            "encoder: one CPU pass answers 'what kind of document is this', "
+            "scoring every candidate label together rather than once per "
+            "label as an NLI classifier would. Labels come from the request "
+            "(`labels`) or from the deployment's defaults, so new categories "
+            "need no retraining. Built to sit in front of extraction, where "
+            "the caller should not have to know the document type in "
+            "advance. It classifies only -- it locates nothing and fills no "
+            "schema."
+        ),
+        "defaults": {
+            "system_prompt": None,
+            "options": {},
+        },
+    },
+    {
+        "id": "low-latency-pii-guard",
+        "kind": "proxy_security",
+        "display_name": "Low-latency PII Guard",
+        "description": (
+            "The security proxy with its encoder analyzer switched on: a "
+            "GLiNER-family guard replaces the regex detector, so PII is "
+            "found by meaning rather than by pattern -- names and addresses, "
+            "which no regex catches, and fewer false positives on strings "
+            "that merely look like an id. Point `guard_model` at a deployed "
+            "encoder. With a GLiNER2 guardrails checkpoint, `guard_tasks` "
+            "additionally screens for unsafe prompts and jailbreaks in the "
+            "same pass. Fails closed by default: if the guard is "
+            "unreachable the request is refused rather than quietly "
+            "falling back to regex -- set `guard_fallback` to opt into "
+            "degraded analysis."
+        ),
+        "defaults": {
+            "system_prompt": None,
+            "options": {
+                "entities": list(PII_TYPES),
+                "mode": "placeholder",
+                "restore_pii": False,
+                # Empty rather than None: this template exists to be pointed
+                # at an encoder, so the form should prompt for one.
+                "guard_model": "",
+                "guard_labels": None,
+                "guard_threshold": None,
+                "guard_fallback": None,
+                "guard_tasks": None,
+            },
+        },
+    },
     {
         "id": "workflow-agent",
         "kind": "workflow",

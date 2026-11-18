@@ -612,6 +612,8 @@ def test_templates_listed(api) -> None:
     ids = {t["id"] for t in client.get("/v1/agents/templates").json()}
     assert ids == {
         "proxy-security", "ocr-agent", "custom", "docs-search-agent", "workflow-agent",
+        # Encoder-family starting points (see tests/test_agent_templates.py).
+        "low-latency-extraction", "document-triage", "low-latency-pii-guard",
     }
 
 
