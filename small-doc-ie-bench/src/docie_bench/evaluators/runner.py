@@ -78,6 +78,7 @@ async def evaluate_run(
         review = enqueue_agent_run_review(
             run_id=run_id,
             agent=run["agent"],
+            tenant_id=run["tenant_id"],
             evaluators=flagged_by,
             reasons=all_reasons,
             verdicts=all_verdicts,

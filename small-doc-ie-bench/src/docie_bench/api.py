@@ -54,6 +54,7 @@ from docie_bench.review import (
     list_reviews,
     release_review,
     review_metrics,
+    review_owner,
 )
 from docie_bench.schemas.api import BenchmarkRunRequest, ExtractTextRequest
 from docie_bench.schemas.common import ExtractionResponse
@@ -77,6 +78,7 @@ from docie_bench.security import (
     get_quota_manager,
     read_validated_upload,
     redact_fields,
+    sees_all_tenants,
     tenant_guard,
 )
 from docie_bench.serving import recency
@@ -737,6 +739,22 @@ def _review_http_error(exc: Exception) -> HTTPException:
     raise exc
 
 
+def _agent_run_scope(tenant: TenantContext) -> str | None:
+    """The tenant a caller's agent-run reviews are limited to; None: all."""
+    return None if sees_all_tenants(tenant) else tenant.tenant_id
+
+
+def _guard_review(task_id: int, tenant: TenantContext) -> None:
+    """404 for a client key reaching another tenant's agent-run review, as
+    /v1/studio/agent-runs/{id} does for the run itself."""
+    scope = _agent_run_scope(tenant)
+    if scope is None:
+        return
+    kind, owner = review_owner(task_id)
+    if kind == "agent_run" and owner != scope:
+        raise ReviewNotFoundError(f"Review task {task_id} was not found")
+
+
 @app.post("/v1/reviews", response_model=ReviewTaskView | None)
 def create_review(
     payload: ReviewTaskCreate, _tenant: TenantDependency, force: bool = Query(default=False)
@@ -757,7 +775,7 @@ def create_review(
 
 @app.get("/v1/reviews", response_model=list[ReviewTaskView])
 def review_queue(
-    _tenant: TenantDependency,
+    tenant: TenantDependency,
     status: ReviewStatus | None = None,
     reviewer_id: str | None = None,
     # Defaults to extraction so existing API clients keep seeing documents only.
@@ -770,6 +788,7 @@ def review_queue(
             reviewer_id=reviewer_id,
             kind=None if kind == "all" else kind,
             limit=limit,
+            agent_run_tenant=_agent_run_scope(tenant),
         )
     except Exception as exc:
         raise _review_http_error(exc) from exc
@@ -804,16 +823,18 @@ def export_review_annotations(
 
 
 @app.get("/v1/reviews/{task_id}", response_model=ReviewTaskView)
-def review_detail(task_id: int, _tenant: TenantDependency) -> ReviewTaskView:
+def review_detail(task_id: int, tenant: TenantDependency) -> ReviewTaskView:
     try:
+        _guard_review(task_id, tenant)
         return get_review(task_id)
     except Exception as exc:
         raise _review_http_error(exc) from exc
 
 
 @app.get("/v1/reviews/{task_id}/evidence", response_model=ReviewEvidenceView)
-def review_evidence(task_id: int, _tenant: TenantDependency) -> ReviewEvidenceView:
+def review_evidence(task_id: int, tenant: TenantDependency) -> ReviewEvidenceView:
     try:
+        _guard_review(task_id, tenant)
         return get_review_evidence(task_id)
     except Exception as exc:
         raise _review_http_error(exc) from exc
@@ -824,6 +845,7 @@ def claim_review_task(
     task_id: int, payload: ClaimRequest, tenant: TenantDependency
 ) -> ReviewTaskView:
     try:
+        _guard_review(task_id, tenant)
         result = claim_review(
             task_id,
             reviewer_id=tenant.tenant_id,  # B2: provenance = authenticated principal
@@ -841,6 +863,7 @@ def release_review_task(
     task_id: int, payload: ReleaseRequest, tenant: TenantDependency
 ) -> ReviewTaskView:
     try:
+        _guard_review(task_id, tenant)
         result = release_review(
             task_id,
             reviewer_id=tenant.tenant_id,  # B2
@@ -858,6 +881,7 @@ def correct_review_task(
     task_id: int, payload: CorrectionRequest, tenant: TenantDependency
 ) -> ReviewTaskView:
     try:
+        _guard_review(task_id, tenant)
         result = correct_review(
             task_id,
             reviewer_id=tenant.tenant_id,  # B2
@@ -876,6 +900,7 @@ def approve_review_task(
     task_id: int, payload: DecisionRequest, tenant: TenantDependency
 ) -> ReviewTaskView:
     try:
+        _guard_review(task_id, tenant)
         result = decide_review(
             task_id,
             reviewer_id=tenant.tenant_id,  # B2
@@ -894,6 +919,7 @@ def reject_review_task(
     task_id: int, payload: DecisionRequest, tenant: TenantDependency
 ) -> ReviewTaskView:
     try:
+        _guard_review(task_id, tenant)
         result = decide_review(
             task_id,
             reviewer_id=tenant.tenant_id,  # B2

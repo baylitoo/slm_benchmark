@@ -53,6 +53,13 @@ class TenantContext:
     operator: bool = False
 
 
+def sees_all_tenants(tenant: TenantContext) -> bool:
+    """Operators, signed-in Studio users and an auth-disabled stack see every
+    tenant's agent runs and their reviews. A Studio-issued client key sees its
+    own tenant only."""
+    return tenant.operator or tenant.studio_user or not tenant.authenticated
+
+
 def parse_api_keys(raw: str) -> dict[str, str]:
     if not raw.strip():
         return {}

@@ -7,21 +7,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 from docie_bench.evaluators.spec import EvaluatorSpec
-from docie_bench.security import TenantContext, TenantDependency
+from docie_bench.security import TenantContext, TenantDependency, sees_all_tenants
 
 from . import _shared
 
 router = APIRouter()
 
 
-def _sees_all(tenant: TenantContext) -> bool:
-    """Operators, signed-in Studio users and an auth-disabled stack see every
-    tenant's runs. A Studio-issued client key sees its own tenant only."""
-    return tenant.operator or tenant.studio_user or not tenant.authenticated
-
-
 def _require_manager(tenant: TenantContext) -> None:
-    if not _sees_all(tenant):
+    if not sees_all_tenants(tenant):
         raise HTTPException(
             status_code=403,
             detail="managing evaluators needs an operator key or a Studio sign-in",
@@ -71,7 +65,7 @@ async def evaluator_results_route(
 
     return list_evaluations(
         name,
-        tenant_id=None if _sees_all(tenant) else tenant.tenant_id,
+        tenant_id=None if sees_all_tenants(tenant) else tenant.tenant_id,
         limit=max(1, min(limit, 500)),
     )
 
@@ -83,7 +77,7 @@ async def agent_run_route(run_id: str, tenant: TenantDependency) -> dict[str, An
     from docie_bench.studio.agent_run_store import get_agent_run
 
     run = get_agent_run(run_id)
-    if run is not None and not _sees_all(tenant) and run["tenant_id"] != tenant.tenant_id:
+    if run is not None and not sees_all_tenants(tenant) and run["tenant_id"] != tenant.tenant_id:
         run = None
     if run is None:
         raise HTTPException(

@@ -94,6 +94,19 @@ def test_failed_judgements_go_to_review_only_when_asked() -> None:
             "2 to 10",
         ),
         ({"name": "Has Spaces"}, "pattern"),
+        # Rules whose value can never match would silently never fire.
+        ({"review_when": [{"question": "completed", "when": "noul_above", "value": 5}]},
+         "between 0 and 1"),
+        ({"review_when": [{"question": "completed", "when": "noul_above", "value": ["a"]}]},
+         "needs a number"),
+        ({"review_when": [{"question": "intent", "when": "choice_in", "value": ["Invoice"]}]},
+         "unknown options"),
+        ({"review_when": [{"question": "intent", "when": "choice_in", "value": []}]},
+         "list of options"),
+        ({"review_when": [{"question": "intent", "when": "choice_in", "value": 0.5}]},
+         "list of options"),
+        ({"review_when": [{"question": "tone", "when": "score_below", "value": 7}]},
+         "between 0 and 2"),
     ],
 )
 def test_invalid_specs_are_rejected(overrides, message) -> None:

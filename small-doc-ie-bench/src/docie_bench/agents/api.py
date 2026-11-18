@@ -37,6 +37,7 @@ from docie_bench.agents.runtime import AgentError, complete_agent
 from docie_bench.agents.spec import AgentSpec
 from docie_bench.agents.templates import AGENT_TEMPLATES, template_by_id
 from docie_bench.evaluators.capture import (
+    MAX_STORED_CHARS,
     completion_text,
     completion_tool_calls,
     schedule_capture,
@@ -381,7 +382,13 @@ async def _serve_raw_stream(
         # de-facto buffering point for what the client receives.
         usage: dict[str, Any] | None = None
         text_parts: list[str] = []
+        text_chars = 0
         completed = False
+        # Capture needs proof the answer is whole: a terminal frame ([DONE] or
+        # a finish_reason) and no error frame. A stream the upstream cut off,
+        # or that carried an error, would be judged as if it were the run.
+        finished = False
+        errored = False
         parse_buffer: bytearray | None = bytearray()
         try:
             async for chunk in byte_iterator:
@@ -398,24 +405,39 @@ async def _serve_raw_stream(
                         if not line.startswith(b"data:"):
                             continue
                         payload = line[len(b"data:") :].strip()
-                        if payload in (b"", b"[DONE]"):
+                        if payload == b"[DONE]":
+                            finished = True
+                            continue
+                        if payload == b"":
                             continue
                         try:
                             frame = json.loads(payload)
                         except ValueError:
                             continue
-                        if isinstance(frame, dict) and isinstance(frame.get("usage"), dict):
+                        if not isinstance(frame, dict):
+                            continue
+                        if isinstance(frame.get("usage"), dict):
                             usage = frame["usage"]
-                        text_parts.append(_delta_text(frame))
+                        if frame.get("error") is not None:
+                            errored = True
+                        if _finish_reason(frame):
+                            finished = True
+                        # The stored answer is capped anyway: stop collecting
+                        # there rather than holding a long stream in memory.
+                        if text_chars < MAX_STORED_CHARS:
+                            text = _delta_text(frame)
+                            text_parts.append(text)
+                            text_chars += len(text)
             completed = True
         finally:
             AGENT_REQUESTS.labels(spec.name, spec.kind, "ok").inc()
             AGENT_LATENCY.labels(spec.name, spec.kind).observe(time.monotonic() - started)
             outcome = {"usage": usage} if usage is not None else {}
             _record_agent_usage(spec, tenant, started, outcome)
-            # Only a stream that ran to its end, and was short enough to scan,
+            # Only a stream that ran to its end, finished cleanly and whose
+            # every line could be scanned (no single line over the scan limit)
             # is captured: a partial answer would be judged as the whole run.
-            if completed and parse_buffer is not None:
+            if completed and finished and not errored and parse_buffer is not None:
                 _capture(spec, tenant, body, "".join(text_parts), [])
 
     return StreamingResponse(relay(), status_code=status_code, media_type=media_type)
@@ -465,6 +487,14 @@ async def _serve_queue_stream(
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(relay(), media_type="text/event-stream")
+
+
+def _finish_reason(frame: Any) -> str | None:
+    try:
+        reason = frame["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return reason if isinstance(reason, str) and reason else None
 
 
 def _delta_text(frame: Any) -> str:

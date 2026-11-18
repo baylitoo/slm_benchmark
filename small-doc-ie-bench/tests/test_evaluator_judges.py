@@ -6,6 +6,7 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
 from docie_bench.evaluators import (
     DecisionJudge,
@@ -186,6 +187,29 @@ def test_llm_judge_rejects_answers_outside_the_question() -> None:
 def test_llm_judge_reports_unparseable_output() -> None:
     def handler(_r: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"choices": [{"message": {"content": "not json"}}]})
+
+    verdicts = _run(LlmJudge("quality", CHAT, QUESTIONS), handler)
+    assert all("unparseable" in (v.error or "") for v in verdicts)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, text="<html>proxy page</html>"),
+        httpx.Response(200, content=b""),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json={"answers": ["not", "a", "map"]}),
+    ],
+)
+def test_decision_judge_never_raises_on_a_malformed_2xx(response) -> None:
+    verdicts = _run(DecisionJudge("quality", DECIDER, QUESTIONS), lambda _r: response)
+    assert len(verdicts) == 3
+    assert all(not v.ok for v in verdicts)
+
+
+def test_llm_judge_never_raises_on_a_json_list() -> None:
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "[1, 2]"}}]})
 
     verdicts = _run(LlmJudge("quality", CHAT, QUESTIONS), handler)
     assert all("unparseable" in (v.error or "") for v in verdicts)
