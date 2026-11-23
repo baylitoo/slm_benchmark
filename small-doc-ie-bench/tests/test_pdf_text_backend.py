@@ -145,3 +145,13 @@ def test_ocria_nano_on_an_old_liteparse_says_what_to_upgrade(
 
     with pytest.raises(RuntimeError, match="liteparse>=2.21.0"):
         backend.extract(Path("scan.pdf"))
+
+
+def test_each_engine_reports_its_own_backend_name() -> None:
+    """OCR artifacts and benchmark summaries group by the backend name, so two
+    engines sharing one would merge their scores into a single row."""
+    from docie_bench.ocr.factory import get_ocr_backend
+
+    assert get_ocr_backend("liteparse").name == "pdf_text"
+    assert get_ocr_backend("ocria-nano").name == "liteparse+ocria-nano"
+    assert get_ocr_backend("liteparse+ocria-nano").name == "liteparse+ocria-nano"

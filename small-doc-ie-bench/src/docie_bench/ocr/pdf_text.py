@@ -50,6 +50,9 @@ class PdfTextBackend(OCRBackend):
         # Always named: once OCRia-nano is pulled, LiteParse's own default
         # switches to it, which would silently change every extraction.
         self._ocr_engine = ocr_engine
+        # The artifact and OCR benchmark rows group by this name, so each engine
+        # needs its own; Tesseract keeps the historical "pdf_text".
+        self.name = "pdf_text" if ocr_engine == "tesseract" else f"liteparse+{ocr_engine}"
 
     def version(self) -> str:
         return f"1:liteparse-{_liteparse_version()}"
