@@ -59,6 +59,7 @@ def test_pdf_text_maps_liteparse_items_to_blocks(monkeypatch: pytest.MonkeyPatch
         "dpi": 200,
         "ocr_server_url": "http://vlm/ocr",
         "language": "fr",
+        "ocr_engine": "tesseract",
     }
     assert backend.version().startswith("1:liteparse-")
 
@@ -83,3 +84,74 @@ def test_pdf_text_rejects_unsupported_suffix(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("docie_bench.ocr.pdf_text.LiteParse", _FakeParser)
     with pytest.raises(ValueError, match="supports .pdf and .txt only"):
         PdfTextBackend().extract(Path("scan.png"))
+
+
+class _FakeParser221(_FakeParser):
+    """LiteParse 2.21+: the engine is a named argument."""
+
+    def __init__(self, *, ocr_backend: str | None = None, **kwargs) -> None:
+        super().__init__(ocr_backend=ocr_backend, **kwargs)
+
+
+def test_liteparse_names_tesseract_so_a_pulled_ocria_cannot_take_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("docie_bench.ocr.pdf_text.LiteParse", _FakeParser221)
+
+    PdfTextBackend(ocr_server_url="").extract(Path("scan.pdf"))
+
+    assert _FakeParser221.last_init["ocr_backend"] == "tesseract"
+
+
+def test_ocria_nano_engine_pulls_its_models_once_and_keys_the_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    from docie_bench.ocr.factory import get_ocr_backend
+
+    pulled: list[str] = []
+    installed: list[object] = []
+
+    def pull(spec: str, **kwargs: object) -> str:
+        pulled.append(spec)
+        installed.append(SimpleNamespace(name="ocria-nano"))
+        return "/models/ocria-nano"
+
+    fake_models = SimpleNamespace(pull=pull, list=lambda: list(installed))
+    monkeypatch.setitem(sys.modules, "liteparse.models", fake_models)
+    monkeypatch.setattr("liteparse.models", fake_models, raising=False)
+    monkeypatch.setattr("docie_bench.ocr.pdf_text.LiteParse", _FakeParser221)
+    monkeypatch.setattr("docie_bench.ocr.pdf_text.get_settings", lambda: SimpleNamespace(
+        ocr_language="fra", ocr_server_url=None, ocr_dpi=200
+    ))
+
+    backend = get_ocr_backend("ocria-nano")
+    blocks = backend.extract(Path("scan.pdf"))
+    backend.extract(Path("scan.pdf"))
+
+    assert _FakeParser221.last_init["ocr_backend"] == "ocria-nano"
+    assert pulled == ["ocria-nano"]
+    assert blocks[0].bbox is not None  # evidence ids keep their boxes
+    assert backend.configuration()["ocr_engine"] == "ocria-nano"
+    assert get_ocr_backend("liteparse").configuration() != backend.configuration()
+
+
+def test_ocria_nano_on_an_old_liteparse_says_what_to_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("docie_bench.ocr.pdf_text.LiteParse", _FakeParser)
+    backend = PdfTextBackend(ocr_engine="ocria-nano", ocr_server_url="")
+
+    with pytest.raises(RuntimeError, match="liteparse>=2.21.0"):
+        backend.extract(Path("scan.pdf"))
+
+
+def test_each_engine_reports_its_own_backend_name() -> None:
+    """OCR artifacts and benchmark summaries group by the backend name, so two
+    engines sharing one would merge their scores into a single row."""
+    from docie_bench.ocr.factory import get_ocr_backend
+
+    assert get_ocr_backend("liteparse").name == "pdf_text"
+    assert get_ocr_backend("ocria-nano").name == "liteparse+ocria-nano"
+    assert get_ocr_backend("liteparse+ocria-nano").name == "liteparse+ocria-nano"
