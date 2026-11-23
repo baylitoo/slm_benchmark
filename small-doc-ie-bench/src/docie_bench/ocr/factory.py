@@ -3,7 +3,7 @@ from __future__ import annotations
 from docie_bench.ocr.base import OCRBackend
 from docie_bench.ocr.minicpm_backend import MiniCPMOCRBackend
 from docie_bench.ocr.paddle_backend import PaddleOCRBackend
-from docie_bench.ocr.pdf_text import PdfTextBackend
+from docie_bench.ocr.pdf_text import PdfTextBackend, ocria_nano_supported
 from docie_bench.ocr.tesseract_backend import TesseractBackend
 from docie_bench.ocr.xiaomi_backend import XiaomiOCRBackend
 
@@ -12,6 +12,9 @@ from docie_bench.ocr.xiaomi_backend import XiaomiOCRBackend
 # the module being importable rather than by building one on a GET.
 OCR_BACKENDS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
     ("liteparse", ("pdf_text",), None),
+    # LiteParse with LlamaIndex's OCRia-nano-1 as its OCR engine (8.1M-param
+    # ONNX pipeline, CPU). Same text-item boxes, so evidence ids work.
+    ("liteparse+ocria-nano", ("ocria-nano",), None),
     ("tesseract", (), "pytesseract"),
     ("paddleocr", (), "paddleocr"),
     # No module: this one is a MODEL, not a library. Its availability is
@@ -34,6 +37,8 @@ def available_ocr_backends() -> list[dict[str, object]]:
             "available": (
                 _served_backend_available(name)
                 if name in _SERVED_BACKENDS
+                else ocria_nano_supported()
+                if name == "liteparse+ocria-nano"
                 else module is None or importlib.util.find_spec(module) is not None
             ),
         }
@@ -74,6 +79,8 @@ def get_ocr_backend(name: str, *, language: str | None = None) -> OCRBackend:
     # fallback). Lightweight and the sensible default for PDFs.
     if normalized in ("liteparse", "pdf_text"):
         return PdfTextBackend(language=language)
+    if normalized in ("liteparse+ocria-nano", "ocria-nano"):
+        return PdfTextBackend(language=language, ocr_engine="ocria-nano")
     if normalized == "tesseract":
         return TesseractBackend()
     if normalized == "paddleocr":
@@ -84,5 +91,5 @@ def get_ocr_backend(name: str, *, language: str | None = None) -> OCRBackend:
         return MiniCPMOCRBackend()
     raise ValueError(
         f"Unknown OCR backend {name!r}. "
-        "Expected liteparse, tesseract, paddleocr, xiaomi, or minicpm."
+        "Expected liteparse, liteparse+ocria-nano, tesseract, paddleocr, xiaomi, or minicpm."
     )

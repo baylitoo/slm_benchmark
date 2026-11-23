@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import threading
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,10 @@ from docie_bench.ocr.base import OCRBackend, stable_block_id, text_to_blocks
 from docie_bench.ocr.layout import merge_lines, reading_order
 from docie_bench.schemas.common import BoundingBox, OCRBlock
 from docie_bench.settings import get_settings
+
+#: OCR engines LiteParse runs itself when no ``ocr_server_url`` is set.
+OCR_ENGINES = ("tesseract", "ocria-nano")
+_PULL_LOCK = threading.Lock()
 
 
 class PdfTextBackend(OCRBackend):
@@ -29,6 +35,7 @@ class PdfTextBackend(OCRBackend):
         self,
         *,
         language: str | None = None,
+        ocr_engine: str = "tesseract",
         ocr_server_url: str | None = None,
         dpi: int | None = None,
     ) -> None:
@@ -38,12 +45,14 @@ class PdfTextBackend(OCRBackend):
             ocr_server_url if ocr_server_url is not None else settings.ocr_server_url
         )
         self._dpi = int(dpi if dpi is not None else settings.ocr_dpi)
+        if ocr_engine not in OCR_ENGINES:
+            raise ValueError(f"unknown liteparse OCR engine {ocr_engine!r}; expected {OCR_ENGINES}")
+        # Always named: once OCRia-nano is pulled, LiteParse's own default
+        # switches to it, which would silently change every extraction.
+        self._ocr_engine = ocr_engine
 
     def version(self) -> str:
-        try:
-            return f"1:liteparse-{version('liteparse')}"
-        except PackageNotFoundError:
-            return "1:liteparse-unknown"
+        return f"1:liteparse-{_liteparse_version()}"
 
     def configuration(self) -> dict[str, Any]:
         # Part of the OCR cache key: changing the OCR route/dpi/language must
@@ -54,6 +63,7 @@ class PdfTextBackend(OCRBackend):
             "dpi": self._dpi,
             "ocr_server_url": self._ocr_server_url or "",
             "language": self._language or "",
+            "ocr_engine": self._ocr_engine,
         }
 
     def extract(self, path: Path) -> list[OCRBlock]:
@@ -65,12 +75,23 @@ class PdfTextBackend(OCRBackend):
         if suffix != ".pdf":
             raise ValueError(f"pdf_text backend supports .pdf and .txt only, got {path.suffix}")
 
+        engine: dict[str, Any] = {}
+        if not self._ocr_server_url and _accepts_ocr_backend():
+            if self._ocr_engine == "ocria-nano":
+                _ensure_ocria_nano()
+            engine["ocr_backend"] = self._ocr_engine
+        elif self._ocr_engine != "tesseract" and not self._ocr_server_url:
+            raise RuntimeError(
+                f"the {self._ocr_engine!r} OCR engine needs liteparse>=2.21.0 "
+                f"(installed: {_liteparse_version()})"
+            )
         parser = LiteParse(
             ocr_enabled=True,
             ocr_server_url=self._ocr_server_url,
             ocr_language=self._language,
             dpi=float(self._dpi),
             quiet=True,
+            **engine,
         )
         result = parser.parse(path)
 
@@ -104,3 +125,32 @@ class PdfTextBackend(OCRBackend):
             block.model_copy(update={"id": stable_block_id(block.page, idx, block.text)})
             for idx, block in enumerate(ordered)
         ]
+
+
+def _liteparse_version() -> str:
+    try:
+        return version("liteparse")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _accepts_ocr_backend() -> bool:
+    """Whether the installed LiteParse lets the caller pick its engine (2.21+)."""
+    return "ocr_backend" in inspect.signature(LiteParse.__init__).parameters
+
+
+def ocria_nano_supported() -> bool:
+    """Whether this LiteParse can run OCRia-nano (its ``models`` API exists)."""
+    import importlib.util
+
+    return _accepts_ocr_backend() and importlib.util.find_spec("liteparse.models") is not None
+
+
+def _ensure_ocria_nano() -> None:
+    """Download OCRia-nano's model files once (LiteParse verifies each sha256)."""
+    from liteparse import models  # type: ignore[attr-defined]  # liteparse>=2.21
+
+    with _PULL_LOCK:
+        installed = [str(getattr(m, "name", m)) for m in models.list()]
+        if not any(name.startswith("ocria-nano") for name in installed):
+            models.pull("ocria-nano", quiet=True)
